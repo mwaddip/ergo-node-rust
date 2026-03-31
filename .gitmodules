@@ -1,3 +1,15 @@
 [submodule "facts"]
 	path = facts
 	url = git@github.com:mwaddip/ergo-node-facts.git
+[submodule "p2p"]
+	path = p2p
+	url = git@github.com:mwaddip/enr-p2p.git
+[submodule "chain"]
+	path = chain
+	url = git@github.com:mwaddip/enr-chain.git
+[submodule "state"]
+	path = state
+	url = git@github.com:mwaddip/enr-state.git
+[submodule "store"]
+	path = store
+	url = git@github.com:mwaddip/enr-store.git
