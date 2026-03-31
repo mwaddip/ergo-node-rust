@@ -1,0 +1,189 @@
+---
+# Ergo Header Serialization & PoW Validation Specification
+# Machine-readable format for code generation and LLM consumption.
+# Reverse-engineered from JVM reference node (ergoplatform/ergo v6.0.3).
+# Verified against sigma-rust and testnet traffic 2026-03-31.
+
+header:
+  modifier_type_id: 101  # NOT 1. All block sections >= 50.
+  note: "Community docs incorrectly cite type 1. The actual NetworkObjectTypeId is 101."
+
+  all_modifier_types:
+    - { id: 101, name: Header }
+    - { id: 102, name: BlockTransactions }
+    - { id: 104, name: ADProofs }
+    - { id: 108, name: Extension }
+    # Transaction (id: 2) is mempool Inv only, not block modifier responses.
+
+serialization:
+  description: "Scorex framework serialization. Field order is fixed."
+
+  common_fields:
+    - name: version
+      type: raw_byte
+      size: 1
+      description: "1 = Autolykos v1, 2+ = Autolykos v2"
+
+    - name: parent_id
+      type: raw_bytes
+      size: 32
+      description: "blake2b256 hash of parent header"
+
+    - name: ad_proofs_root
+      type: raw_bytes
+      size: 32
+
+    - name: transactions_root
+      type: raw_bytes
+      size: 32
+
+    - name: state_root
+      type: raw_bytes
+      size: 33
+      description: "AVL+ tree digest. 33 bytes — extra byte is tree height."
+
+    - name: timestamp
+      type: vlq_unsigned
+      size: 1-10
+      description: "Milliseconds since Unix epoch"
+
+    - name: extension_root
+      type: raw_bytes
+      size: 32
+
+    - name: n_bits
+      type: fixed_u32_be
+      size: 4
+      description: "Compact difficulty. 4-byte big-endian. NOT VLQ."
+
+    - name: height
+      type: vlq_unsigned
+      size: 1-5
+
+    - name: votes
+      type: raw_bytes
+      size: 3
+      description: "Soft-fork parameter voting"
+
+  version_gt_1_fields:
+    - name: unparsed_bytes_length
+      type: raw_byte
+      size: 1
+      description: "Currently 0 on all networks"
+
+    - name: unparsed_bytes
+      type: raw_bytes
+      size: unparsed_bytes_length
+
+  autolykos_solution_v1:
+    description: "version == 1"
+    fields:
+      - name: miner_pk
+        type: raw_bytes
+        size: 33
+        description: "Compressed secp256k1 EC point"
+
+      - name: pow_onetime_pk
+        type: raw_bytes
+        size: 33
+        description: "Compressed EC point, one-time key"
+
+      - name: nonce
+        type: raw_bytes
+        size: 8
+
+      - name: d_length
+        type: raw_byte
+        size: 1
+
+      - name: pow_distance
+        type: raw_bytes
+        size: d_length
+        description: "Unsigned big-endian integer. JVM uses BigIntegers.fromUnsignedByteArray."
+
+  autolykos_solution_v2:
+    description: "version != 1. pow_onetime_pk and pow_distance are OMITTED."
+    fields:
+      - name: miner_pk
+        type: raw_bytes
+        size: 33
+
+      - name: nonce
+        type: raw_bytes
+        size: 8
+
+header_id:
+  description: "Not on the wire. Computed after deserialization."
+  algorithm: "blake2b256(serialize_without_pow(header) ++ serialize_pow_solution(version, solution))"
+  note: "Both JVM and sigma-rust create header with zero id, serialize, hash, assign."
+
+pow_verification:
+  autolykos_v2:
+    description: "Current network. Verify that miner's solution meets difficulty."
+
+    formula:
+      hit: "pow_hit(header)  # Autolykos v2 algorithm"
+      target: "secp256k1_group_order / decode_compact_bits(n_bits)"
+      valid: "hit < target  # STRICT less-than"
+
+    secp256k1_group_order: "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"
+    jvm_name: "q (mining.scala)"
+
+    comparison:
+      validation: "<   # strict, from checkPoWForVersion2"
+      mining: "<=  # from checkNonces, accepts boundary"
+      note: "For consensus: use strict <"
+
+    division: "Integer truncating division. Both JVM BigInt./ and Rust BigInt div truncate."
+
+    table_size_n:
+      initial: "2^26 = 67108864"
+      growth: "Doubles in steps after height 614400"
+      note: "gen_indexes uses N to compute 32 table indices"
+
+  n_bits_encoding:
+    type: "compact difficulty (same concept as Bitcoin nBits)"
+    wire_format: "4 bytes big-endian"
+    byte_0: "exponent (number of bytes in full target)"
+    bytes_1_3: "mantissa (most significant 3 bytes)"
+    note: "NOT VLQ. DifficultySerializer reads/writes 4 fixed bytes."
+
+known_bugs_sigma_rust_0_15_0:
+  - name: gen_indexes_zero_modulo
+    severity: "consensus-affecting crash"
+    description: "to_u32_digits().1[0] panics on BigInt(0). Triggers when hash window % N == 0."
+    fix: ".1.first().copied().unwrap_or(0)"
+    probability: "~25% cumulative across all mainnet blocks during initial sync"
+
+  - name: pow_distance_signed_encoding
+    severity: "incorrect V1 header parsing"
+    description: "Uses BigInt::from_signed_bytes_be() for unsigned wire data. High-bit values misinterpreted."
+    fix: "Use BigUint::from_bytes_be()"
+
+  - name: n_bits_type
+    severity: "minor type mismatch"
+    description: "Stored as u64, wire format is u32. Functionally equivalent but technically wrong."
+    fix: "Use u32"
+
+chain_sync_behavior:
+  description: "Initial sync does NOT use unsolicited Inv flow."
+  flow:
+    - "Node sends SyncInfo (code 65) with known header IDs"
+    - "Peer responds with Inv for unknown headers"
+    - "Node sends ModifierRequest for those IDs"
+    - "Peer responds with ModifierResponse"
+  implication: |
+    Modifier IDs in ModifierRequest come from Inv triggered by SyncInfo,
+    not from unsolicited Inv announcements. Relays that route ModifierRequest
+    only via an inv table will silently drop sync traffic.
+  verified: "JVM node syncing through Rust relay, 2026-03-31"
+
+sources:
+  jvm_node: "ergoplatform/ergo v6.0.3"
+  sigma_rust: "ergoplatform/sigma-rust (ergo-chain-types)"
+  key_files:
+    - "ergo-core/.../modifiers/history/header/HeaderSerializer.scala"
+    - "ergo-core/.../mining/AutolykosPowScheme.scala"
+    - "ergo-core/.../mining/difficulty/DifficultySerializer.scala"
+    - "ergo-core/.../modifiers/NetworkObjectTypeId.scala"
+  testnet_verification: "2026-03-31, JVM node syncing through ergo-node-rust relay"

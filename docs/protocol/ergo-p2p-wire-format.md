@@ -266,6 +266,25 @@ Chain synchronization state. Body format depends on protocol version and is comp
 
 **Note:** These are `NetworkObjectTypeId` values from the JVM source, NOT sequential from 1. All block section types are >= 50. Transaction type is used only in mempool Inv messages (type 2), not in block modifier responses.
 
+## Chain Sync vs Gossip: Two Modifier Request Flows
+
+There are two distinct flows that produce ModifierRequest messages:
+
+**Gossip flow (steady-state):**
+1. Peer sends unsolicited `Inv` announcing new modifiers
+2. Node sends `ModifierRequest` for desired IDs
+3. Peer responds with `ModifierResponse`
+
+**Sync flow (initial chain sync):**
+1. Node sends `SyncInfo` with its known chain tip
+2. Peer responds with `Inv` for modifiers the node doesn't have
+3. Node sends `ModifierRequest` for those IDs
+4. Peer responds with `ModifierResponse`
+
+The critical difference: in the gossip flow, the Inv arrives unsolicited — a relay can record which peer announced each modifier and route requests to that peer. In the sync flow, the Inv is a response to SyncInfo — a relay that only tracks unsolicited Inv announcements will have no routing entry for sync-initiated requests.
+
+**Implementation impact:** Relays and proxies must handle ModifierRequest for modifier IDs not present in their inv table. Dropping these silently causes chain sync to fail and the requesting peer to accumulate NonDeliveryPenalty.
+
 ## Peer Management Behavior (JVM Reference Node)
 
 These are implementation behaviors, not protocol requirements, but they affect how peers interact.
