@@ -1,0 +1,137 @@
+---
+# Ergo Difficulty Adjustment Specification
+# Machine-readable format for code generation and LLM consumption.
+# Reverse-engineered from JVM reference node (ergoplatform/ergo v6.0.3).
+# Verified against Rust implementation and JVM test vectors 2026-03-31.
+
+chain_parameters:
+  testnet:
+    epoch_length: 128
+    block_interval_ms: 45000
+    use_last_epochs: 8
+    initial_difficulty: 1
+    eip37_activation: null
+
+  mainnet_pre_eip37:
+    epoch_length: 1024
+    block_interval_ms: 120000
+    use_last_epochs: 8
+    eip37_activation: null
+
+  mainnet_post_eip37:
+    epoch_length: 128
+    block_interval_ms: 120000
+    use_last_epochs: 8
+    eip37_activation: 844673
+
+recalculation_trigger:
+  condition: "parent.height % epoch_length == 0 && parent.height > 0"
+  otherwise: "child inherits parent.n_bits unchanged"
+
+previous_heights_for_recalculation:
+  description: "Heights of epoch-boundary headers needed for difficulty recalculation"
+  input:
+    h: "height of the block being validated"
+    epoch_length: "blocks per epoch"
+    use_last_epochs: "number of past epochs to consider"
+
+  branches:
+    - condition: "(h-1) % epoch_length == 0 && epoch_length > 1"
+      result: "(0..=use_last_epochs).map(|i| (h-1) - i*epoch_length).filter(>= 0).reverse()"
+      note: "Normal case. Filter removes heights before genesis."
+
+    - condition: "(h-1) % epoch_length == 0 && h > epoch_length * use_last_epochs"
+      result: "(0..=use_last_epochs).map(|i| (h-1) - i*epoch_length).reverse()"
+      note: "epoch_length == 1 with enough history. No filter — guard ensures non-negative."
+
+    - condition: "else"
+      result: "[h-1]"
+      note: "Mid-epoch — only the parent."
+
+pre_eip37_algorithm:
+  name: "calculate"
+  description: "Linear regression over epoch boundary difficulties"
+
+  steps:
+    - name: "edge_cases"
+      condition: "headers.len() == 1 || headers.first.timestamp >= headers.last.timestamp"
+      result: "required_difficulty(headers[0])"
+
+    - name: "build_data_points"
+      description: "For each consecutive pair of epoch-boundary headers"
+      formula: |
+        desired_ms = block_interval_ms * epoch_length
+        time_delta = end.timestamp - start.timestamp
+        difficulty = end.required_difficulty * desired_ms / time_delta
+        data_point = (end.height, difficulty)
+
+    - name: "linear_regression"
+      description: "Fit y = a + bx using integer arithmetic"
+      precision_constant: 1000000000
+      formulas:
+        b: "(Σ(xy) * n - Σx * Σy) * PRECISION / (Σ(x²) * n - (Σx)²)"
+        a: "(Σy * PRECISION - b * Σx) / n / PRECISION"
+        extrapolation_point: "max(data.x) + epoch_length"
+        result: "a + b * point / PRECISION"
+      single_point: "return data[0].difficulty directly"
+
+    - name: "floor_and_normalize"
+      floor: "if result < 1: use initial_difficulty"
+      normalize: "decode_compact_bits(encode_compact_bits(result))"
+      note: "Roundtrip is consensus-critical — truncates to ~24 bits mantissa"
+
+eip37_algorithm:
+  name: "eip37Calculate"
+  description: "Average of predictive and classic, with 50%-150% capping"
+  activation: "mainnet height 844673"
+  minimum_headers: 2
+
+  steps:
+    - name: "predictive_capped"
+      formulas:
+        predictive: "calculate(headers, epoch_length)  # pre-EIP-37 algorithm"
+        cap_upper: "min(predictive, last_diff * 3 / 2)"
+        cap_lower: "max(predictive, last_diff / 2)"
+
+    - name: "classic_bitcoin"
+      description: "Uses only last two epoch-boundary headers"
+      formula: "end.required_difficulty * block_interval_ms * epoch_length / (end.timestamp - start.timestamp)"
+
+    - name: "average_and_cap"
+      formulas:
+        avg: "(classic + capped_predictive) / 2"
+        final_upper: "min(avg, last_diff * 3 / 2)"
+        final_lower: "max(avg, last_diff / 2)"
+
+    - name: "normalize"
+      formula: "decode_compact_bits(encode_compact_bits(result))"
+
+compact_encoding:
+  field: "n_bits"
+  wire_format: "4 bytes big-endian (NOT VLQ)"
+  structure:
+    byte_0: "exponent (number of bytes in full target)"
+    bytes_1_3: "mantissa (most significant 3 bytes)"
+  properties:
+    lossy: true
+    idempotent: true
+    mantissa_bits: "~24"
+  note: "Normalization roundtrip is applied to all computed difficulties"
+
+header_validation:
+  non_genesis: "header.n_bits == expected_difficulty_after(parent)"
+  genesis: "header.n_bits == encode_compact_bits(initial_difficulty)"
+
+integer_arithmetic:
+  type: "arbitrary-precision BigInt"
+  division: "truncating (toward zero)"
+  note: "Same behavior in JVM BigInt./ and Rust num_bigint"
+
+sources:
+  jvm_files:
+    - "ergo-core/.../mining/difficulty/DifficultyAdjustment.scala"
+    - "ergo-core/.../mining/difficulty/DifficultySerializer.scala"
+    - "ergo-core/.../settings/ChainSettings.scala"
+    - ".../history/storage/modifierprocessors/HeadersProcessor.scala"
+  test_vectors: "ergo-core/.../difficulty/DifficultyAdjustmentSpecification.scala"
+  verification: "Rust implementation cross-referenced against all JVM paths, 2026-03-31"
