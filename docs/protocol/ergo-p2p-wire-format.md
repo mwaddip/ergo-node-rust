@@ -259,11 +259,12 @@ Chain synchronization state. Body format depends on protocol version and is comp
 
 | ID | Type |
 |---|---|
-| 1 | Header |
-| 2 | Transaction |
-| 3 | BlockTransactions |
-| 4 | ADProofs |
-| 5 | Extension |
+| 101 | Header |
+| 102 | BlockTransactions |
+| 104 | ADProofs |
+| 108 | Extension |
+
+**Note:** These are `NetworkObjectTypeId` values from the JVM source, NOT sequential from 1. All block section types are >= 50. Transaction type is used only in mempool Inv messages (type 2), not in block modifier responses.
 
 ## Peer Management Behavior (JVM Reference Node)
 

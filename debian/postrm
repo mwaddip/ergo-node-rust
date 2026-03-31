@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    purge)
+        rm -rf /etc/ergo-node /var/log/ergo-node /var/lib/ergo-node
+        deluser --quiet ergo-node 2>/dev/null || true
+        ;;
+    remove)
+        systemctl daemon-reload
+        ;;
+esac

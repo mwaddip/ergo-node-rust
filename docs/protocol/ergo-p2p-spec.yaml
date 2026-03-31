@@ -282,11 +282,12 @@ messages:
     note: "Contains chain tip header IDs. Format depends on protocol version."
 
 modifier_types:
-  - { id: 1, name: Header }
-  - { id: 2, name: Transaction }
-  - { id: 3, name: BlockTransactions }
-  - { id: 4, name: ADProofs }
-  - { id: 5, name: Extension }
+  # NetworkObjectTypeId values from JVM source. All block sections >= 50.
+  - { id: 101, name: Header }
+  - { id: 102, name: BlockTransactions }
+  - { id: 104, name: ADProofs }
+  - { id: 108, name: Extension }
+  # Transaction (id: 2) appears in mempool Inv messages only, not block modifier responses.
 
 peer_management:
   note: "JVM reference node behavior, not protocol requirements"

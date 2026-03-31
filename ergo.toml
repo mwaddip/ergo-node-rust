@@ -1,0 +1,17 @@
+[proxy]
+network = "testnet"
+
+[listen.ipv6]
+address = "[::]:9030"
+mode = "full"
+max_inbound = 20
+
+[outbound]
+min_peers = 3
+max_peers = 10
+seed_peers = ["213.239.193.208:9023", "128.253.41.110:9020", "176.9.15.237:9021"]
+
+[identity]
+agent_name = "ergo-node-rust"
+peer_name = "ergo-node-rust"
+protocol_version = "6.0.3"

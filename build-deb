@@ -1,0 +1,43 @@
+#!/bin/bash
+set -euo pipefail
+
+VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
+PKG="ergo-node-rust_${VERSION}_${ARCH}"
+
+echo "Building ergo-node-rust v${VERSION} for ${ARCH}..."
+
+cargo build --release
+
+rm -rf "target/${PKG}"
+mkdir -p "target/${PKG}/DEBIAN"
+mkdir -p "target/${PKG}/usr/bin"
+mkdir -p "target/${PKG}/etc/ergo-node"
+mkdir -p "target/${PKG}/usr/lib/systemd/system"
+
+cp target/release/ergo-node-rust "target/${PKG}/usr/bin/"
+strip "target/${PKG}/usr/bin/ergo-node-rust"
+
+cp ergo.toml "target/${PKG}/etc/ergo-node/ergo.toml"
+
+cp deploy/ergo-node-rust.service "target/${PKG}/usr/lib/systemd/system/"
+
+sed "s/^Architecture:.*/Architecture: ${ARCH}/" debian/control > "target/${PKG}/DEBIAN/control"
+sed -i "s/^Version:.*/Version: ${VERSION}/" "target/${PKG}/DEBIAN/control"
+SIZE=$(du -sk "target/${PKG}" | cut -f1)
+echo "Installed-Size: ${SIZE}" >> "target/${PKG}/DEBIAN/control"
+
+cp debian/conffiles "target/${PKG}/DEBIAN/"
+
+for script in preinst postinst prerm postrm; do
+    cp "debian/${script}" "target/${PKG}/DEBIAN/"
+    chmod 755 "target/${PKG}/DEBIAN/${script}"
+done
+
+dpkg-deb --build "target/${PKG}"
+
+rm -rf "target/${PKG}"
+
+echo ""
+echo "Built: target/${PKG}.deb"
+ls -lh "target/${PKG}.deb"

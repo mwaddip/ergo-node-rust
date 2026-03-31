@@ -1,0 +1,13 @@
+Package: ergo-node-rust
+Version: 0.1.0
+Section: net
+Priority: optional
+Architecture: amd64
+Depends: libc6
+Conflicts: ergo-proxy-node
+Replaces: ergo-proxy-node
+Maintainer: Muad'Dib <dev@blockhost.io>
+Description: Ergo blockchain full node in Rust
+ Ground-up Rust implementation of the Ergo blockchain node.
+ Header-validating proxy with PoW verification, evolving toward
+ a full validating node.

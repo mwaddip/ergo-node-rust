@@ -1,0 +1,25 @@
+[Unit]
+Description=Ergo Node (Rust)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ergo-node
+Group=ergo-node
+ExecStart=/usr/bin/ergo-node-rust /etc/ergo-node/ergo.toml
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/var/log/ergo-node/ergo-node.log
+StandardError=append:/var/log/ergo-node/ergo-node.log
+Environment=RUST_LOG=info
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/ergo-node /var/log/ergo-node
+PrivateTmp=yes
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

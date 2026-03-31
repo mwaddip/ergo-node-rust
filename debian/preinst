@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+if ! getent passwd ergo-node >/dev/null 2>&1; then
+    adduser --system --group --no-create-home --home /var/lib/ergo-node ergo-node
+fi
+
+mkdir -p /var/lib/ergo-node /var/log/ergo-node
+chown ergo-node:ergo-node /var/lib/ergo-node /var/log/ergo-node

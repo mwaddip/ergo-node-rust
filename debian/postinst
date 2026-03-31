@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure|reconfigure)
+        # Stop and disable old proxy if it was running
+        if systemctl is-active --quiet ergo-proxy-node 2>/dev/null; then
+            systemctl stop ergo-proxy-node 2>/dev/null || true
+            systemctl disable ergo-proxy-node 2>/dev/null || true
+        fi
+        systemctl daemon-reload
+        systemctl enable ergo-node-rust 2>/dev/null || true
+        systemctl start ergo-node-rust 2>/dev/null || true
+        ;;
+esac
