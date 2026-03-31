@@ -253,7 +253,76 @@ Deliver requested modifiers.
 
 ### SyncInfo (code 65)
 
-Chain synchronization state. Body format depends on protocol version and is complex (contains header IDs for chain tip comparison). Proxies should treat this as opaque and forward without parsing.
+Chain synchronization state. Peers exchange SyncInfo messages to compare chain tips and determine who has headers the other doesn't.
+
+Two wire formats exist. V2 is used by all nodes >= 4.0.16. V1 is legacy but must be parseable.
+
+#### SyncInfo V1 (legacy)
+
+A list of header IDs representing the sender's chain tip.
+
+```
+[count]          putUShort     VLQ unsigned, number of header IDs (max 1001)
+[ids...]         putBytes(32)  repeated 32-byte header IDs, count times
+```
+
+Nodes send a selection of header IDs from their best chain, typically including the tip and headers at exponentially decreasing heights (similar to Bitcoin's `getblocks`).
+
+#### SyncInfo V2 (current, >= 4.0.16)
+
+Full serialized headers from the sender's chain tip. Allows the receiver to verify PoW and chain linkage directly from the sync message.
+
+```
+[v1_count]       putUShort     VLQ unsigned, always 0 (stops V1 parser)
+[mode]           put(byte)     0xFF (-1 as signed byte, signals V2)
+[header_count]   putUByte      raw byte, unsigned, max 50
+[headers...]                   repeated, header_count times:
+  [header_size]  putUShort     VLQ unsigned, size of serialized header (max 1000 bytes)
+  [header_bytes] putBytes      header_size bytes, Scorex-serialized Header
+```
+
+The `[0x00][0xFF]` prefix is a backwards-compatibility trick: a V1 parser reads count=0, consumes zero IDs, and stops. A V2-aware parser checks `count == 0 && remaining > 1`, reads the mode byte, and proceeds with V2 parsing.
+
+#### V2 Header Selection
+
+The sender includes headers at specific offsets from the chain tip, enabling the receiver to efficiently locate fork points:
+
+- **Full mode**: headers at offsets `[0, 16, 128, 512]` from tip height (4 headers)
+- **Reduced mode**: header at offset `[0]` only (just the tip, 1 header)
+
+Full mode is used during initial sync. Reduced mode is used once synced, as a lightweight "I'm at height X" announcement.
+
+For example, with a tip at height 10000, full mode sends headers at heights `[10000, 9984, 9872, 9488]`. The receiver can quickly determine the fork point by checking which of these headers it recognizes.
+
+Headers are ordered from highest to lowest height (tip first).
+
+#### V2 Constraints
+
+- Maximum 50 headers per message (enforced by parser, allows future expansion of offset list)
+- Maximum 1000 bytes per serialized header (enforced by parser)
+- Headers ordered highest to lowest height (tip first)
+
+#### V2 Empty Chain
+
+A node with no chain data sends a V2 SyncInfo with zero headers:
+
+```
+[0x00]           count = 0 (VLQ)
+[0xFF]           v2 mode
+[0x00]           header count = 0
+```
+
+Total body: 3 bytes. This is what a fresh node sends on first connection.
+
+#### Example: Empty SyncInfo (from pcap)
+
+```
+02030203         magic: [2, 3, 2, 3] (testnet)
+41               code: 65 (SyncInfo)
+00000003         body length: 3 (4-byte big-endian)
+45a14b86         checksum: blake2b256([00, ff, 00])[0..4]
+00ff00           body: V2, zero headers
+```
 
 ### Modifier Types
 

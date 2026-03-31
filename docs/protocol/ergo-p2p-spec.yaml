@@ -278,8 +278,64 @@ messages:
 
   - code: 65
     name: SyncInfo
-    body: opaque
-    note: "Contains chain tip header IDs. Format depends on protocol version."
+    description: "Chain tip comparison. Two wire formats."
+
+    v1_format:
+      description: "Legacy (pre-4.0.16). List of header IDs."
+      fields:
+        - name: count
+          type: vlq_unsigned
+          description: "Number of header IDs (max 1001)"
+        - name: ids
+          type: repeated
+          count: count
+          item:
+            type: raw_bytes
+            length: 32
+
+    v2_format:
+      description: "Current (>= 4.0.16). Full serialized headers from chain tip."
+      fields:
+        - name: v1_count
+          type: vlq_unsigned
+          description: "Always 0. Stops V1 parser."
+        - name: mode
+          type: raw_byte
+          description: "0xFF (-1 signed). Signals V2."
+        - name: header_count
+          type: raw_byte
+          description: "Unsigned. Max 50."
+        - name: headers
+          type: repeated
+          count: header_count
+          item:
+            - name: header_size
+              type: vlq_unsigned
+              description: "Max 1000 bytes"
+            - name: header_bytes
+              type: raw_bytes
+              length: header_size
+              description: "Scorex-serialized Header"
+
+      empty_chain: { bytes: [0x00, 0xFF, 0x00], description: "V2 with zero headers" }
+
+      header_selection:
+        full_mode:
+          offsets: [0, 16, 128, 512]
+          description: "Headers at these offsets from tip height. Used during initial sync."
+        reduced_mode:
+          offsets: [0]
+          description: "Just the tip. Used once synced."
+        example: "Tip at 10000 → full mode sends headers at [10000, 9984, 9872, 9488]"
+
+      constraints:
+        max_headers: 50
+        max_header_size: 1000
+        ordering: "Tip first (highest to lowest height)"
+
+      backwards_compat: |
+        V1 parser reads count=0, consumes zero IDs, stops.
+        V2 parser checks count==0 && remaining>1, reads mode byte, proceeds.
 
 modifier_types:
   # NetworkObjectTypeId values from JVM source. All block sections >= 50.
