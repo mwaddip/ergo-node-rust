@@ -1,26 +1,34 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use enr_chain::{ChainError, HeaderChain, HeaderTracker};
+use enr_chain::{BlockId, ChainError, Header, HeaderChain, HeaderTracker};
 use enr_p2p::routing::validator::{ModifierValidator, ModifierVerdict};
 use tokio::sync::Mutex;
 
 /// Modifier type ID for headers (NetworkObjectTypeId in JVM source).
 const HEADER_TYPE_ID: u8 = 101;
 
+/// Max pending headers before we start dropping old entries.
+const MAX_PENDING: usize = 10_000;
+
 /// Validates header modifiers via enr-chain before the router forwards them.
 ///
 /// Uses two levels of validation:
 /// - **Chain validation**: if the header extends the validated chain (parent exists,
 ///   timestamps correct, difficulty correct, PoW valid), it's appended to the chain.
-/// - **PoW-only fallback**: if chain validation fails because the parent is missing
-///   (bootstrapping, gaps), the header still gets PoW-verified before forwarding.
-///   This prevents garbage from being forwarded while allowing sync to proceed.
+/// - **PoW-only with buffering**: if chain validation fails because the parent is
+///   missing (out-of-order delivery), the header is PoW-verified and buffered.
+///   When a header IS chained, the buffer is drained: any buffered header whose
+///   parent is now the new tip gets chained too, iteratively.
 ///
 /// Headers that fail PoW verification are always rejected.
 /// All other modifier types pass through unconditionally.
 pub struct HeaderValidator {
     chain: Arc<Mutex<HeaderChain>>,
     tracker: HeaderTracker,
+    /// Headers that passed PoW but couldn't chain yet (parent not in chain).
+    /// Keyed by parent_id — the ID they need to chain after.
+    pending: HashMap<BlockId, Header>,
 }
 
 impl HeaderValidator {
@@ -28,6 +36,7 @@ impl HeaderValidator {
         Self {
             chain,
             tracker: HeaderTracker::new(),
+            pending: HashMap::new(),
         }
     }
 }
@@ -51,20 +60,48 @@ impl ModifierValidator for HeaderValidator {
         // Try full chain validation first.
         // Use try_lock since we're called from a sync context inside the async
         // event loop. If the lock is held (sync machine reading), fall through
-        // to PoW-only validation.
+        // to PoW-only validation + buffering.
         if let Ok(mut chain) = self.chain.try_lock() {
             match chain.try_append(header.clone()) {
                 Ok(()) => {
-                    drop(chain);
                     self.tracker.observe(&header);
                     tracing::debug!("chain-validated header at height {height}");
+
+                    // Drain pending buffer: chain any buffered headers whose
+                    // parent is now in the chain.
+                    let mut next_parent = header.id;
+                    while let Some(buffered) = self.pending.remove(&next_parent) {
+                        let bh = buffered.height;
+                        let bid = buffered.id;
+                        match chain.try_append(buffered.clone()) {
+                            Ok(()) => {
+                                self.tracker.observe(&buffered);
+                                next_parent = bid;
+                            }
+                            Err(e) => {
+                                tracing::debug!("buffered header at height {bh} failed: {e}");
+                                break;
+                            }
+                        }
+                    }
+
+                    let chain_height = chain.height();
+                    drop(chain);
+
+                    if chain_height > height {
+                        tracing::info!(
+                            chain_height,
+                            "drained pending buffer from height {height}"
+                        );
+                    }
+
                     return ModifierVerdict::Accept;
                 }
                 Err(ChainError::ParentNotFound { .. })
                 | Err(ChainError::InvalidGenesisParent { .. })
                 | Err(ChainError::InvalidGenesisHeight { .. }) => {
                     drop(chain);
-                    // Can't place this header in our chain — fall back to PoW-only.
+                    // Can't place this header in our chain — fall back to PoW + buffer.
                 }
                 Err(e) => {
                     drop(chain);
@@ -74,14 +111,19 @@ impl ModifierValidator for HeaderValidator {
             }
         }
 
-        // Fallback: PoW-only validation
+        // Fallback: PoW-only validation + buffer for later
         if let Err(e) = enr_chain::verify_pow(&header) {
             tracing::debug!("rejecting unchained header at height {height}: {e}");
             return ModifierVerdict::Reject;
         }
 
         self.tracker.observe(&header);
-        tracing::debug!("pow-validated header at height {height} (not chained)");
+
+        // Buffer for when the parent arrives
+        if self.pending.len() < MAX_PENDING {
+            self.pending.insert(header.parent_id, header);
+        }
+
         ModifierVerdict::Accept
     }
 }

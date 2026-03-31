@@ -30,10 +30,12 @@ enum State {
 
 /// Header chain sync state machine.
 ///
-/// Drives the P2P layer to request headers by sending SyncInfo to peers.
-/// The P2P router handles the Inv→ModifierRequest→ModifierResponse relay.
-/// The sync machine observes chain height progress and sends more SyncInfo
-/// when progress stalls.
+/// Drives header sync by sending SyncInfo to peers and requesting announced
+/// headers directly. When a peer responds to SyncInfo with an Inv of header
+/// IDs, the sync machine sends ModifierRequest back to that peer. The router's
+/// validator processes the resulting ModifierResponse, adding valid headers to
+/// the chain. The sync machine tracks chain height progress and sends new
+/// SyncInfo rounds to fetch the next batch.
 pub struct HeaderSync<T: SyncTransport, C: SyncChain> {
     transport: T,
     chain: C,
@@ -140,7 +142,7 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
     /// Handle an event during syncing.
     async fn handle_event(&mut self, event: ProtocolEvent) {
         match event {
-            ProtocolEvent::Message { message, .. } => {
+            ProtocolEvent::Message { peer_id, message } => {
                 match message {
                     ProtocolMessage::Inv { modifier_type, ids }
                         if modifier_type == HEADER_TYPE_ID && ids.is_empty() =>
@@ -149,6 +151,19 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                         let height = self.chain.chain_height().await;
                         tracing::info!(height, "peer reports no more headers");
                         self.state = State::Synced;
+                    }
+                    ProtocolMessage::Inv { modifier_type, ids }
+                        if modifier_type == HEADER_TYPE_ID =>
+                    {
+                        // Request announced headers directly from the announcing peer
+                        tracing::debug!(count = ids.len(), "requesting announced headers");
+                        let _ = self
+                            .transport
+                            .send_to(
+                                peer_id,
+                                ProtocolMessage::ModifierRequest { modifier_type, ids },
+                            )
+                            .await;
                     }
                     ProtocolMessage::SyncInfo { body } => {
                         // Incoming SyncInfo — check if peer is ahead
@@ -196,14 +211,16 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                 event = self.transport.next_event() => {
                     match event {
                         Some(event) => {
-                            // Check if we're falling behind
-                            if let ProtocolEvent::Message { message: ProtocolMessage::Inv {
+                            if let ProtocolEvent::Message { peer_id, message: ProtocolMessage::Inv {
                                 modifier_type, ids
-                            }, .. } = &event {
-                                if *modifier_type == HEADER_TYPE_ID && !ids.is_empty() {
+                            }} = event {
+                                if modifier_type == HEADER_TYPE_ID && !ids.is_empty() {
                                     let height = self.chain.chain_height().await;
                                     tracing::debug!(height, new_headers = ids.len(), "new headers while synced");
-                                    // Router handles requesting them via normal relay flow
+                                    let _ = self.transport.send_to(
+                                        peer_id,
+                                        ProtocolMessage::ModifierRequest { modifier_type, ids },
+                                    ).await;
                                 }
                             }
                         }
