@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use enr_chain::{ChainConfig, HeaderChain};
-use ergo_node_rust::{HeaderValidator, P2pTransport, SharedChain};
+use ergo_node_rust::{P2pTransport, SharedChain, ValidationPipeline};
 use ergo_sync::HeaderSync;
 use tokio::sync::Mutex;
 
@@ -26,14 +26,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         enr_p2p::types::Network::Mainnet => ChainConfig::mainnet(),
     };
 
-    // Shared header chain: validator writes, sync reads
+    // Shared header chain: pipeline writes, sync reads
     let chain = Arc::new(Mutex::new(HeaderChain::new(chain_config)));
 
-    // Validator for the P2P layer
-    let validator = Box::new(HeaderValidator::new(chain.clone()));
+    // Modifier channel — P2P produces, pipeline consumes
+    let (modifier_tx, modifier_rx) = tokio::sync::mpsc::channel(4096);
 
-    // Start P2P
-    let p2p = Arc::new(enr_p2p::node::P2pNode::start(config, Some(validator)).await?);
+    // Start P2P with modifier sink (no validator)
+    let p2p = Arc::new(enr_p2p::node::P2pNode::start(config, Some(modifier_tx)).await?);
+
+    // Validation pipeline
+    let pipeline_chain = chain.clone();
+    tokio::spawn(async move {
+        let mut pipeline = ValidationPipeline::new(modifier_rx, pipeline_chain);
+        pipeline.run().await;
+    });
 
     // Subscribe to events for the sync machine
     let events = p2p.subscribe().await;

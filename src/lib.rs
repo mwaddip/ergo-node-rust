@@ -1,5 +1,5 @@
 mod bridge;
-mod validator;
+mod pipeline;
 
 pub use bridge::{P2pTransport, SharedChain};
-pub use validator::HeaderValidator;
+pub use pipeline::ValidationPipeline;
