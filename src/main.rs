@@ -1,4 +1,9 @@
-use ergo_node_rust::HeaderValidator;
+use std::sync::Arc;
+
+use enr_chain::{ChainConfig, HeaderChain};
+use ergo_node_rust::{HeaderValidator, P2pTransport, SharedChain};
+use ergo_sync::HeaderSync;
+use tokio::sync::Mutex;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -17,21 +22,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Derive chain config from P2P network setting
     let chain_config = match config.proxy.network {
-        enr_p2p::types::Network::Testnet => enr_chain::ChainConfig::testnet(),
-        enr_p2p::types::Network::Mainnet => enr_chain::ChainConfig::mainnet(),
+        enr_p2p::types::Network::Testnet => ChainConfig::testnet(),
+        enr_p2p::types::Network::Mainnet => ChainConfig::mainnet(),
     };
-    let validator = Box::new(HeaderValidator::new(chain_config));
 
-    let p2p = enr_p2p::node::P2pNode::start(config, Some(validator)).await?;
+    // Shared header chain: validator writes, sync reads
+    let chain = Arc::new(Mutex::new(HeaderChain::new(chain_config)));
+
+    // Validator for the P2P layer
+    let validator = Box::new(HeaderValidator::new(chain.clone()));
+
+    // Start P2P
+    let p2p = Arc::new(enr_p2p::node::P2pNode::start(config, Some(validator)).await?);
+
+    // Subscribe to events for the sync machine
+    let events = p2p.subscribe().await;
+
+    // Bridge implementations
+    let transport = P2pTransport::new(p2p.clone(), events);
+    let sync_chain = SharedChain::new(chain.clone());
+
+    // Start sync in a background task
+    tokio::spawn(async move {
+        let mut sync = HeaderSync::new(transport, sync_chain);
+        sync.run().await;
+    });
 
     tracing::info!("Ergo node running");
 
     // Run until interrupted
     tokio::signal::ctrl_c().await?;
 
-    if let Some(height) = p2p.peer_count().await.checked_sub(0) {
-        tracing::info!(peers = height, "Shutting down");
-    }
+    let height = chain.lock().await.height();
+    let peers = p2p.peer_count().await;
+    tracing::info!(chain_height = height, peers, "Shutting down");
 
     Ok(())
 }

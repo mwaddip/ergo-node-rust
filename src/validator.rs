@@ -1,5 +1,8 @@
-use enr_chain::{ChainConfig, ChainError, HeaderChain, HeaderTracker};
+use std::sync::Arc;
+
+use enr_chain::{ChainError, HeaderChain, HeaderTracker};
 use enr_p2p::routing::validator::{ModifierValidator, ModifierVerdict};
+use tokio::sync::Mutex;
 
 /// Modifier type ID for headers (NetworkObjectTypeId in JVM source).
 const HEADER_TYPE_ID: u8 = 101;
@@ -16,26 +19,16 @@ const HEADER_TYPE_ID: u8 = 101;
 /// Headers that fail PoW verification are always rejected.
 /// All other modifier types pass through unconditionally.
 pub struct HeaderValidator {
-    chain: HeaderChain,
+    chain: Arc<Mutex<HeaderChain>>,
     tracker: HeaderTracker,
 }
 
 impl HeaderValidator {
-    pub fn new(config: ChainConfig) -> Self {
+    pub fn new(chain: Arc<Mutex<HeaderChain>>) -> Self {
         Self {
-            chain: HeaderChain::new(config),
+            chain,
             tracker: HeaderTracker::new(),
         }
-    }
-
-    /// Height of the validated chain tip, or 0 if no contiguous chain built yet.
-    pub fn chain_height(&self) -> u32 {
-        self.chain.height()
-    }
-
-    /// Height of the highest PoW-valid header seen, regardless of chain linkage.
-    pub fn observed_height(&self) -> Option<u32> {
-        self.tracker.best_height()
     }
 }
 
@@ -55,30 +48,33 @@ impl ModifierValidator for HeaderValidator {
 
         let height = header.height;
 
-        // Try full chain validation first
-        match self.chain.try_append(header.clone()) {
-            Ok(()) => {
-                self.tracker.observe(&header);
-                tracing::debug!("chain-validated header at height {height}");
-                return ModifierVerdict::Accept;
-            }
-            Err(ChainError::ParentNotFound { .. })
-            | Err(ChainError::InvalidGenesisParent { .. })
-            | Err(ChainError::InvalidGenesisHeight { .. }) => {
-                // Can't place this header in our chain — either parent is
-                // missing, or the chain is empty and this isn't the real
-                // genesis. Fall back to PoW-only validation.
-            }
-            Err(e) => {
-                // Chain validation failed for a reason other than missing parent
-                // (wrong height, wrong difficulty, bad timestamp, bad PoW).
-                // This header is genuinely invalid.
-                tracing::debug!("rejecting header at height {height}: {e}");
-                return ModifierVerdict::Reject;
+        // Try full chain validation first.
+        // Use try_lock since we're called from a sync context inside the async
+        // event loop. If the lock is held (sync machine reading), fall through
+        // to PoW-only validation.
+        if let Ok(mut chain) = self.chain.try_lock() {
+            match chain.try_append(header.clone()) {
+                Ok(()) => {
+                    drop(chain);
+                    self.tracker.observe(&header);
+                    tracing::debug!("chain-validated header at height {height}");
+                    return ModifierVerdict::Accept;
+                }
+                Err(ChainError::ParentNotFound { .. })
+                | Err(ChainError::InvalidGenesisParent { .. })
+                | Err(ChainError::InvalidGenesisHeight { .. }) => {
+                    drop(chain);
+                    // Can't place this header in our chain — fall back to PoW-only.
+                }
+                Err(e) => {
+                    drop(chain);
+                    tracing::debug!("rejecting header at height {height}: {e}");
+                    return ModifierVerdict::Reject;
+                }
             }
         }
 
-        // Fallback: PoW-only validation for headers we can't chain-link yet
+        // Fallback: PoW-only validation
         if let Err(e) = enr_chain::verify_pow(&header) {
             tracing::debug!("rejecting unchained header at height {height}: {e}");
             return ModifierVerdict::Reject;
@@ -93,10 +89,12 @@ impl ModifierValidator for HeaderValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use enr_chain::ChainConfig;
     use enr_p2p::routing::validator::ModifierVerdict;
 
     fn testnet_validator() -> HeaderValidator {
-        HeaderValidator::new(ChainConfig::testnet())
+        let chain = Arc::new(Mutex::new(HeaderChain::new(ChainConfig::testnet())));
+        HeaderValidator::new(chain)
     }
 
     #[test]
@@ -104,8 +102,6 @@ mod tests {
         let mut v = testnet_validator();
         let verdict = v.validate(HEADER_TYPE_ID, &[0xaa; 32], &[0xff, 0x00, 0x01]);
         assert_eq!(verdict, ModifierVerdict::Reject);
-        assert_eq!(v.chain_height(), 0);
-        assert_eq!(v.observed_height(), None);
     }
 
     #[test]
@@ -113,13 +109,10 @@ mod tests {
         let mut v = testnet_validator();
         let verdict = v.validate(102, &[0xaa; 32], &[0xff; 100]);
         assert_eq!(verdict, ModifierVerdict::Accept);
-        assert_eq!(v.chain_height(), 0);
     }
 
     #[test]
     fn accepts_valid_pow_header_without_chain() {
-        // A real header with valid PoW but no parent in our chain —
-        // falls back to PoW-only validation and accepts
         use enr_chain::Header;
         use sigma_ser::ScorexSerializable;
 
@@ -149,8 +142,5 @@ mod tests {
         let mut v = testnet_validator();
         let verdict = v.validate(HEADER_TYPE_ID, &[0xaa; 32], &bytes);
         assert_eq!(verdict, ModifierVerdict::Accept);
-        // Not chain-validated (no parent), but tracked
-        assert_eq!(v.chain_height(), 0);
-        assert_eq!(v.observed_height(), Some(614400));
     }
 }
