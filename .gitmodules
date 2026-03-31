@@ -1,0 +1,3 @@
+[submodule "facts"]
+	path = facts
+	url = git@github.com:mwaddip/ergo-node-facts.git

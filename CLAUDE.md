@@ -2,6 +2,30 @@
 
 Full Ergo blockchain node in Rust. Not a port of the JVM node — a ground-up implementation using existing Rust crates for cryptography and script evaluation, with a new P2P networking layer already built and tested.
 
+## SETTINGS.md (HIGHEST PRIORITY)
+
+**Read and internalize `SETTINGS.md` at the start of every session.** It defines persona, preferences, and behavioral overrides. It takes precedence over all other instructions in this file.
+
+## Plan Mode (PERSISTENT RULE)
+
+**Every plan must begin by reading `SETTINGS.md`.** When entering plan mode, the first action before any exploration or planning is to read and internalize `SETTINGS.md`. Context clears between plan mode and implementation — the persona and preferences do not survive unless explicitly reloaded.
+
+## Interface Integrity (PERSISTENT RULE)
+
+**When interfaces don't match, fix the interface — never wrap the mismatch.** If two components miscommunicate, the problem is in the contract definition, not in missing glue code. Do not write adapters, shims, or wrappers to paper over interface disagreements. Trace the mismatch to whichever side is wrong and fix it at the source. This applies across all boundaries: crate APIs, P2P message parsing, trait contracts, and inter-component protocols.
+
+## Interface Contracts (REFERENCE)
+
+**Contract specs live in the `facts/` directory.** Read and internalize the relevant contract before modifying any code that touches that boundary. Do not rely on memory or assumptions about how a component interfaces — read the contract. When a contract needs changing, change it first, then update the implementations.
+
+## Submodule Separation (RULE)
+
+When the project grows to multiple repos, the same rule as BlockHost applies: **You CANNOT modify files in submodule directories.** Instead, provide the user with a complete prompt to send to that submodule's Claude session. Format the prompt clearly so the user can copy-paste it directly. Prompts go in `prompts/` as markdown files.
+
+## Skill Ownership (PERSISTENT RULE)
+
+**You own the `ergo-node-development` skill.** Maintain it when new patterns emerge. When the user gives instructions that conflict with the skill, call it out — don't silently override. The skill is the accumulated wisdom of the project; it should be updated, not bypassed.
+
 ## Goal
 
 Replace the JVM reference node with a Rust implementation that is memory-safe, efficient, and IPv6-native. The P2P layer (`ergo-proxy-node`) is complete and running on testnet. This project builds everything above it: header validation, block validation, UTXO state management, mempool, chain sync, and storage.
