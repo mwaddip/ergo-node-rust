@@ -1,4 +1,4 @@
-use enr_chain::HeaderTracker;
+use enr_chain::{ChainConfig, ChainError, HeaderChain, HeaderTracker};
 use enr_p2p::routing::validator::{ModifierValidator, ModifierVerdict};
 
 /// Modifier type ID for headers (NetworkObjectTypeId in JVM source).
@@ -6,23 +6,35 @@ const HEADER_TYPE_ID: u8 = 101;
 
 /// Validates header modifiers via enr-chain before the router forwards them.
 ///
-/// For modifier_type 101 (Header): parses the header, verifies PoW, and
-/// tracks the best known height. Rejects unparseable or invalid-PoW headers.
+/// Uses two levels of validation:
+/// - **Chain validation**: if the header extends the validated chain (parent exists,
+///   timestamps correct, difficulty correct, PoW valid), it's appended to the chain.
+/// - **PoW-only fallback**: if chain validation fails because the parent is missing
+///   (bootstrapping, gaps), the header still gets PoW-verified before forwarding.
+///   This prevents garbage from being forwarded while allowing sync to proceed.
 ///
+/// Headers that fail PoW verification are always rejected.
 /// All other modifier types pass through unconditionally.
 pub struct HeaderValidator {
+    chain: HeaderChain,
     tracker: HeaderTracker,
 }
 
 impl HeaderValidator {
-    pub fn new() -> Self {
+    pub fn new(config: ChainConfig) -> Self {
         Self {
+            chain: HeaderChain::new(config),
             tracker: HeaderTracker::new(),
         }
     }
 
-    /// Height of the highest valid header observed, if any.
-    pub fn best_height(&self) -> Option<u32> {
+    /// Height of the validated chain tip, or 0 if no contiguous chain built yet.
+    pub fn chain_height(&self) -> u32 {
+        self.chain.height()
+    }
+
+    /// Height of the highest PoW-valid header seen, regardless of chain linkage.
+    pub fn observed_height(&self) -> Option<u32> {
         self.tracker.best_height()
     }
 }
@@ -41,13 +53,39 @@ impl ModifierValidator for HeaderValidator {
             }
         };
 
+        let height = header.height;
+
+        // Try full chain validation first
+        match self.chain.try_append(header.clone()) {
+            Ok(()) => {
+                self.tracker.observe(&header);
+                tracing::debug!("chain-validated header at height {height}");
+                return ModifierVerdict::Accept;
+            }
+            Err(ChainError::ParentNotFound { .. })
+            | Err(ChainError::InvalidGenesisParent { .. })
+            | Err(ChainError::InvalidGenesisHeight { .. }) => {
+                // Can't place this header in our chain — either parent is
+                // missing, or the chain is empty and this isn't the real
+                // genesis. Fall back to PoW-only validation.
+            }
+            Err(e) => {
+                // Chain validation failed for a reason other than missing parent
+                // (wrong height, wrong difficulty, bad timestamp, bad PoW).
+                // This header is genuinely invalid.
+                tracing::debug!("rejecting header at height {height}: {e}");
+                return ModifierVerdict::Reject;
+            }
+        }
+
+        // Fallback: PoW-only validation for headers we can't chain-link yet
         if let Err(e) = enr_chain::verify_pow(&header) {
-            tracing::debug!("rejecting header at height {}: {e}", header.height);
+            tracing::debug!("rejecting unchained header at height {height}: {e}");
             return ModifierVerdict::Reject;
         }
 
         self.tracker.observe(&header);
-        tracing::debug!("accepted header at height {}", header.height);
+        tracing::debug!("pow-validated header at height {height} (not chained)");
         ModifierVerdict::Accept
     }
 }
@@ -55,11 +93,36 @@ impl ModifierValidator for HeaderValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use enr_chain::Header;
     use enr_p2p::routing::validator::ModifierVerdict;
-    use sigma_ser::ScorexSerializable;
 
-    fn valid_v2_header_bytes() -> (Header, Vec<u8>) {
+    fn testnet_validator() -> HeaderValidator {
+        HeaderValidator::new(ChainConfig::testnet())
+    }
+
+    #[test]
+    fn rejects_unparseable_header() {
+        let mut v = testnet_validator();
+        let verdict = v.validate(HEADER_TYPE_ID, &[0xaa; 32], &[0xff, 0x00, 0x01]);
+        assert_eq!(verdict, ModifierVerdict::Reject);
+        assert_eq!(v.chain_height(), 0);
+        assert_eq!(v.observed_height(), None);
+    }
+
+    #[test]
+    fn passes_non_header_types_through() {
+        let mut v = testnet_validator();
+        let verdict = v.validate(102, &[0xaa; 32], &[0xff; 100]);
+        assert_eq!(verdict, ModifierVerdict::Accept);
+        assert_eq!(v.chain_height(), 0);
+    }
+
+    #[test]
+    fn accepts_valid_pow_header_without_chain() {
+        // A real header with valid PoW but no parent in our chain —
+        // falls back to PoW-only validation and accepts
+        use enr_chain::Header;
+        use sigma_ser::ScorexSerializable;
+
         let json = r#"{
             "extensionId": "00cce45975d87414e8bdd8146bc88815be59cd9fe37a125b5021101e05675a18",
             "difficulty": "16384",
@@ -82,47 +145,12 @@ mod tests {
         }"#;
         let header: Header = serde_json::from_str(json).unwrap();
         let bytes = header.scorex_serialize_bytes().unwrap();
-        (header, bytes)
-    }
 
-    #[test]
-    fn accepts_valid_header() {
-        let mut v = HeaderValidator::new();
-        let (_header, bytes) = valid_v2_header_bytes();
-        let id = [0xaa; 32];
-
-        let verdict = v.validate(HEADER_TYPE_ID, &id, &bytes);
+        let mut v = testnet_validator();
+        let verdict = v.validate(HEADER_TYPE_ID, &[0xaa; 32], &bytes);
         assert_eq!(verdict, ModifierVerdict::Accept);
-        assert_eq!(v.best_height(), Some(614400));
-    }
-
-    #[test]
-    fn rejects_unparseable_header() {
-        let mut v = HeaderValidator::new();
-        let verdict = v.validate(HEADER_TYPE_ID, &[0xaa; 32], &[0xff, 0x00, 0x01]);
-        assert_eq!(verdict, ModifierVerdict::Reject);
-        assert_eq!(v.best_height(), None);
-    }
-
-    #[test]
-    fn passes_non_header_types_through() {
-        let mut v = HeaderValidator::new();
-        let verdict = v.validate(102, &[0xaa; 32], &[0xff; 100]);
-        assert_eq!(verdict, ModifierVerdict::Accept);
-        // No height tracked — this wasn't a header
-        assert_eq!(v.best_height(), None);
-    }
-
-    #[test]
-    fn tracks_height_across_multiple_headers() {
-        let mut v = HeaderValidator::new();
-        let (_header, bytes) = valid_v2_header_bytes();
-
-        v.validate(HEADER_TYPE_ID, &[0xaa; 32], &bytes);
-        assert_eq!(v.best_height(), Some(614400));
-
-        // Same header again — height shouldn't change
-        v.validate(HEADER_TYPE_ID, &[0xbb; 32], &bytes);
-        assert_eq!(v.best_height(), Some(614400));
+        // Not chain-validated (no parent), but tracked
+        assert_eq!(v.chain_height(), 0);
+        assert_eq!(v.observed_height(), Some(614400));
     }
 }

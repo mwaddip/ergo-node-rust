@@ -14,7 +14,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "ergo.toml".to_string());
 
     let config = enr_p2p::config::Config::load(&config_path)?;
-    let validator = Box::new(HeaderValidator::new());
+
+    // Derive chain config from P2P network setting
+    let chain_config = match config.proxy.network {
+        enr_p2p::types::Network::Testnet => enr_chain::ChainConfig::testnet(),
+        enr_p2p::types::Network::Mainnet => enr_chain::ChainConfig::mainnet(),
+    };
+    let validator = Box::new(HeaderValidator::new(chain_config));
 
     let p2p = enr_p2p::node::P2pNode::start(config, Some(validator)).await?;
 
