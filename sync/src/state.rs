@@ -6,6 +6,7 @@ use enr_p2p::types::PeerId;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
+use crate::delivery::{DeliveryEvent, DeliveryTracker};
 use crate::traits::{SyncChain, SyncTransport};
 
 /// Header modifier type ID (NetworkObjectTypeId).
@@ -22,6 +23,14 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often to send SyncInfo when synced, to check for new blocks.
 const SYNCED_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How often to check for timed-out delivery requests (JVM: 5s check cycle).
+const DELIVERY_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Minimum interval between SyncInfo sends to the same peer.
+/// The JVM drops SyncInfo received within 100ms of the previous one
+/// (`PerPeerSyncLockTime`). We use 200ms for safety margin.
+const MIN_SYNC_SEND_INTERVAL: Duration = Duration::from_millis(200);
+
 /// Header chain sync state machine.
 ///
 /// Event-driven loop matching the JVM's sync exchange pattern:
@@ -33,6 +42,8 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain> {
     transport: T,
     chain: C,
     progress: mpsc::Receiver<u32>,
+    delivery_rx: mpsc::Receiver<DeliveryEvent>,
+    tracker: DeliveryTracker,
     /// Peer we're currently syncing from.
     sync_peer: Option<PeerId>,
     /// Peers that failed to produce progress — skipped during peer selection.
@@ -41,20 +52,30 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain> {
     last_progress: Instant,
     /// When we last sent a scheduled SyncInfo (20s floor applies to these).
     last_scheduled_sync: Instant,
+    /// When we last sent ANY SyncInfo (rate-limit gate for PerPeerSyncLockTime).
+    last_sync_sent: Instant,
     /// Total SyncInfo messages sent this session (diagnostics).
     sync_sent_count: u32,
 }
 
 impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
-    pub fn new(transport: T, chain: C, progress: mpsc::Receiver<u32>) -> Self {
+    pub fn new(
+        transport: T,
+        chain: C,
+        progress: mpsc::Receiver<u32>,
+        delivery_rx: mpsc::Receiver<DeliveryEvent>,
+    ) -> Self {
         Self {
             transport,
             chain,
             progress,
+            delivery_rx,
+            tracker: DeliveryTracker::new(),
             sync_peer: None,
             stalled_peers: HashSet::new(),
             last_progress: Instant::now(),
             last_scheduled_sync: Instant::now(),
+            last_sync_sent: Instant::now(),
             sync_sent_count: 0,
         }
     }
@@ -136,6 +157,7 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
             return SyncOutcome::PeerDisconnected;
         }
         self.last_scheduled_sync = Instant::now();
+        let mut last_delivery_check = Instant::now();
         // One progress-triggered send per 20s cycle — gives the two-batch
         // pattern (one scheduled + one progress) matching JVM behavior.
         let mut progress_send_used = false;
@@ -143,6 +165,8 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
         loop {
             let until_next = MIN_SYNC_INTERVAL
                 .saturating_sub(self.last_scheduled_sync.elapsed());
+            let until_delivery = DELIVERY_CHECK_INTERVAL
+                .saturating_sub(last_delivery_check.elapsed());
 
             tokio::select! {
                 // P2P events: Inv, peer SyncInfo, disconnect
@@ -152,10 +176,31 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                             match self.handle_event(peer, event).await {
                                 EventResult::Continue => {}
                                 EventResult::Synced => return SyncOutcome::Synced,
-                                EventResult::PeerGone => return SyncOutcome::PeerDisconnected,
+                                EventResult::PeerGone => {
+                                    // Re-request any modifiers that were pending from this peer
+                                    let orphaned = self.tracker.purge_peer(peer);
+                                    if !orphaned.is_empty() {
+                                        self.rerequest_from_any(&orphaned).await;
+                                    }
+                                    return SyncOutcome::PeerDisconnected;
+                                }
                             }
                         }
                         None => return SyncOutcome::StreamEnded,
+                    }
+                }
+
+                // Pipeline delivery notifications: received / evicted modifiers
+                Some(event) = self.delivery_rx.recv() => {
+                    match event {
+                        DeliveryEvent::Received(ids) => {
+                            for id in &ids {
+                                self.tracker.mark_received(id);
+                            }
+                        }
+                        DeliveryEvent::Evicted(ids) => {
+                            self.tracker.schedule_rerequest(&ids);
+                        }
                     }
                 }
 
@@ -169,6 +214,13 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                         tracing::debug!(height, "progress → second batch SyncInfo");
                         let _ = self.send_sync_info(peer).await;
                     }
+                }
+
+                // Delivery check: re-request timed-out modifiers
+                _ = tokio::time::sleep(until_delivery) => {
+                    last_delivery_check = Instant::now();
+                    let result = self.tracker.check_timeouts();
+                    self.handle_delivery_check(result, peer).await;
                 }
 
                 // Scheduled SyncInfo: 20-second cycle start
@@ -189,16 +241,24 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
     async fn handle_event(&mut self, peer: PeerId, event: ProtocolEvent) -> EventResult {
         match event {
             ProtocolEvent::Message { peer_id, message } => match message {
-                // Inv with header IDs: request them
+                // Inv with header IDs: request them and track delivery
                 ProtocolMessage::Inv { modifier_type, ids }
                     if modifier_type == HEADER_TYPE_ID && !ids.is_empty() =>
                 {
-                    tracing::debug!(count = ids.len(), "requesting announced headers");
+                    tracing::debug!(
+                        count = ids.len(),
+                        sync_count = self.sync_sent_count,
+                        "Inv received → requesting headers"
+                    );
+                    self.tracker.mark_requested(&ids, peer_id);
                     let _ = self
                         .transport
                         .send_to(
                             peer_id,
-                            ProtocolMessage::ModifierRequest { modifier_type, ids },
+                            ProtocolMessage::ModifierRequest {
+                                modifier_type,
+                                ids,
+                            },
                         )
                         .await;
                     EventResult::Continue
@@ -213,24 +273,10 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                     EventResult::Synced
                 }
 
-                // Peer's SyncInfo: check if caught up, but don't respond during
-                // active sync. The progress-triggered send (after batch processing)
-                // serves as the response with the correct updated chain tip.
-                // Responding here would send our OLD tip before the batch is processed.
+                // Peer's SyncInfo: respond with ours to keep the bidirectional
+                // exchange alive. The JVM expects this — without it, per-peer
+                // sync state goes stale and the JVM stops sending Inv.
                 ProtocolMessage::SyncInfo { body } => {
-                    // Log first time we see peer's SyncInfo for encoding comparison
-                    if self.sync_sent_count <= 2 {
-                        let hex_prefix: String = body.iter().take(40)
-                            .map(|b| format!("{:02x}", b))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        tracing::info!(
-                            body_len = body.len(),
-                            hex = %hex_prefix,
-                            "received peer SyncInfo"
-                        );
-                    }
-
                     if let Ok(info) = self.chain.parse_sync_info(&body) {
                         let peer_heights = C::sync_info_heights(&info);
                         let our_height = self.chain.chain_height().await;
@@ -242,6 +288,9 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                             }
                         }
                     }
+
+                    // Respond with our SyncInfo — mirrors JVM's syncSendNeeded behavior
+                    let _ = self.send_sync_info(peer).await;
                     EventResult::Continue
                 }
 
@@ -254,6 +303,68 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
             }
 
             _ => EventResult::Continue,
+        }
+    }
+
+    /// Handle delivery check results: re-request timed-out and evicted modifiers.
+    async fn handle_delivery_check(
+        &mut self,
+        result: crate::delivery::CheckResult,
+        current_peer: PeerId,
+    ) {
+        // Re-request timed-out modifiers from a different peer
+        if !result.retries.is_empty() {
+            let peers = self.transport.outbound_peers().await;
+            for retry in &result.retries {
+                // Pick a peer different from the one that failed
+                let target = peers.iter()
+                    .find(|&&p| p != retry.failed_peer)
+                    .copied()
+                    .unwrap_or(current_peer);
+
+                self.tracker.mark_requested(&[retry.id], target);
+                let _ = self.transport.send_to(
+                    target,
+                    ProtocolMessage::ModifierRequest {
+                        modifier_type: HEADER_TYPE_ID,
+                        ids: vec![retry.id],
+                    },
+                ).await;
+            }
+            tracing::debug!(count = result.retries.len(), "re-requested timed-out modifiers");
+        }
+
+        // Request evicted modifiers from any available peer
+        if !result.fresh.is_empty() {
+            self.rerequest_from_any(&result.fresh).await;
+        }
+
+        if !result.abandoned.is_empty() {
+            tracing::warn!(
+                count = result.abandoned.len(),
+                "abandoned modifiers after max delivery attempts"
+            );
+        }
+
+        let pending = self.tracker.pending_count();
+        if pending > 0 {
+            tracing::debug!(pending, "delivery tracker status");
+        }
+    }
+
+    /// Re-request modifier IDs from any available outbound peer.
+    async fn rerequest_from_any(&mut self, ids: &[[u8; 32]]) {
+        let peers = self.transport.outbound_peers().await;
+        if let Some(&target) = peers.first() {
+            self.tracker.mark_requested(ids, target);
+            let _ = self.transport.send_to(
+                target,
+                ProtocolMessage::ModifierRequest {
+                    modifier_type: HEADER_TYPE_ID,
+                    ids: ids.to_vec(),
+                },
+            ).await;
+            tracing::debug!(count = ids.len(), peer = %target, "re-requested modifiers");
         }
     }
 
@@ -282,6 +393,7 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                             }} = event {
                                 if modifier_type == HEADER_TYPE_ID && !ids.is_empty() {
                                     tracing::debug!(new_headers = ids.len(), "new headers while synced");
+                                    self.tracker.mark_requested(&ids, peer_id);
                                     let _ = self.transport.send_to(
                                         peer_id,
                                         ProtocolMessage::ModifierRequest { modifier_type, ids },
@@ -305,13 +417,20 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
         }
     }
 
-    /// Send our current SyncInfo to a peer.
+    /// Send our current SyncInfo to a peer, respecting the JVM's PerPeerSyncLockTime.
+    /// Returns Ok(()) even if rate-limited (skipped sends are not errors).
     async fn send_sync_info(
         &mut self,
         peer: PeerId,
     ) -> Result<(), Box<dyn std::error::Error + Send>> {
+        // Rate-limit: JVM drops SyncInfo received within 100ms of previous
+        if self.last_sync_sent.elapsed() < MIN_SYNC_SEND_INTERVAL {
+            return Ok(());
+        }
+
         let body = self.chain.build_sync_info().await;
         self.sync_sent_count += 1;
+        self.last_sync_sent = Instant::now();
 
         // Diagnostic: log SyncInfo content + first 40 hex bytes for wire analysis
         if let Ok(info) = self.chain.parse_sync_info(&body) {

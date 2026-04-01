@@ -1,27 +1,33 @@
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use enr_chain::{BlockId, ChainError, Header, HeaderChain, HeaderTracker};
+use ergo_sync::delivery::DeliveryEvent;
+use lru::LruCache;
 use sigma_ser::ScorexSerializable;
 use tokio::sync::{mpsc, Mutex};
 
 /// Modifier type ID for headers (NetworkObjectTypeId in JVM source).
 const HEADER_TYPE_ID: u8 = 101;
 
-/// Max pending headers before we start dropping old entries.
-const MAX_PENDING: usize = 10_000;
+/// LRU buffer capacity for out-of-order headers (JVM: `headersCache` = 8192).
+const BUFFER_CAPACITY: usize = 8_192;
 
 /// Async validation pipeline for modifiers.
 ///
 /// Receives raw modifier data from the P2P layer via a channel, validates
 /// in batches (sort by height, PoW check, chain-validate), and updates
 /// the shared HeaderChain. Runs as a single tokio task.
+///
+/// Out-of-order headers are buffered in an LRU cache. Evicted headers are
+/// reported to the delivery tracker for re-request.
 pub struct ValidationPipeline {
     rx: mpsc::Receiver<(u8, [u8; 32], Vec<u8>)>,
     chain: Arc<Mutex<HeaderChain>>,
     progress_tx: mpsc::Sender<u32>,
+    delivery_tx: mpsc::Sender<DeliveryEvent>,
     tracker: HeaderTracker,
-    pending: HashMap<BlockId, Header>,
+    buffer: LruCache<BlockId, Header>,
 }
 
 impl ValidationPipeline {
@@ -29,13 +35,15 @@ impl ValidationPipeline {
         rx: mpsc::Receiver<(u8, [u8; 32], Vec<u8>)>,
         chain: Arc<Mutex<HeaderChain>>,
         progress_tx: mpsc::Sender<u32>,
+        delivery_tx: mpsc::Sender<DeliveryEvent>,
     ) -> Self {
         Self {
             rx,
             chain,
             progress_tx,
+            delivery_tx,
             tracker: HeaderTracker::new(),
-            pending: HashMap::new(),
+            buffer: LruCache::new(NonZeroUsize::new(BUFFER_CAPACITY).unwrap()),
         }
     }
 
@@ -62,6 +70,13 @@ impl ValidationPipeline {
 
     /// Process a batch of raw modifiers.
     pub(crate) async fn process_batch(&mut self, batch: Vec<(u8, [u8; 32], Vec<u8>)>) {
+        // Collect received modifier IDs for delivery tracker notification
+        let received_ids: Vec<[u8; 32]> = batch
+            .iter()
+            .filter(|(t, _, _)| *t == HEADER_TYPE_ID)
+            .map(|(_, id, _)| *id)
+            .collect();
+
         // Filter to headers only
         let raw_headers: Vec<&[u8]> = batch
             .iter()
@@ -71,6 +86,11 @@ impl ValidationPipeline {
 
         if raw_headers.is_empty() {
             return;
+        }
+
+        // Notify delivery tracker that these modifiers arrived
+        if !received_ids.is_empty() {
+            let _ = self.delivery_tx.try_send(DeliveryEvent::Received(received_ids));
         }
 
         // Parse, round-trip check, and PoW-verify
@@ -126,6 +146,7 @@ impl ValidationPipeline {
         let mut chained = 0u32;
         let mut buffered = 0u32;
         let mut rejected = 0u32;
+        let mut evicted_ids: Vec<[u8; 32]> = Vec::new();
 
         for header in &valid_headers {
             // Skip headers already at or below the chain tip (duplicates
@@ -143,9 +164,9 @@ impl ValidationPipeline {
                     if h % 400 < 2 || h == 4789 || h == 4773 || h == 4661 || h == 4277 {
                         tracing::info!(height = h, id = %header.id, "chained header ID");
                     }
-                    // Drain pending buffer from this header
+                    // Drain buffer: follow the chain of buffered children
                     let mut next_parent = header.id;
-                    while let Some(buf) = self.pending.remove(&next_parent) {
+                    while let Some(buf) = self.buffer.pop(&next_parent) {
                         let bid = buf.id;
                         match chain.try_append(buf.clone()) {
                             Ok(()) => {
@@ -161,8 +182,9 @@ impl ValidationPipeline {
                 | Err(ChainError::InvalidGenesisParent { .. })
                 | Err(ChainError::InvalidGenesisHeight { .. }) => {
                     buffered += 1;
-                    if self.pending.len() < MAX_PENDING {
-                        self.pending.insert(header.parent_id, header.clone());
+                    if let Some((_, evicted)) = self.buffer.push(header.parent_id, header.clone()) {
+                        // LRU eviction — track for re-request
+                        evicted_ids.push(evicted.id.0.0);
                     }
                 }
                 Err(_) => {
@@ -174,16 +196,28 @@ impl ValidationPipeline {
         let height_after = chain.height();
         drop(chain);
 
-        // Purge pending entries at or below the chain tip (stale duplicates)
-        let before_purge = self.pending.len();
-        self.pending.retain(|_, h| h.height > height_after);
-        let purged = before_purge - self.pending.len();
+        // Purge buffer entries at or below the chain tip (stale duplicates)
+        let before_purge = self.buffer.len();
+        let stale_keys: Vec<BlockId> = self.buffer.iter()
+            .filter(|(_, h)| h.height <= height_after)
+            .map(|(k, _)| *k)
+            .collect();
+        for key in &stale_keys {
+            self.buffer.pop(key);
+        }
+        let purged = before_purge - self.buffer.len();
+
+        // Notify delivery tracker of evicted modifier IDs for re-request
+        if !evicted_ids.is_empty() {
+            tracing::debug!(count = evicted_ids.len(), "buffer evictions → re-request");
+            let _ = self.delivery_tx.try_send(DeliveryEvent::Evicted(evicted_ids));
+        }
 
         if height_after > height_before {
             tracing::info!(
                 chain_height = height_after,
                 chained,
-                pending = self.pending.len(),
+                buffer = self.buffer.len(),
                 "pipeline: chained headers from height {height_before}"
             );
             let _ = self.progress_tx.try_send(height_after);
@@ -205,17 +239,19 @@ mod tests {
     use super::*;
     use enr_chain::ChainConfig;
 
-    /// Build a pipeline with a testnet chain and a channel.
+    /// Build a pipeline with a testnet chain and channels.
     fn test_pipeline() -> (
         ValidationPipeline,
         mpsc::Sender<(u8, [u8; 32], Vec<u8>)>,
         mpsc::Receiver<u32>,
+        mpsc::Receiver<DeliveryEvent>,
     ) {
         let (tx, rx) = mpsc::channel(256);
         let (progress_tx, progress_rx) = mpsc::channel(4);
+        let (delivery_tx, delivery_rx) = mpsc::channel(64);
         let chain = Arc::new(Mutex::new(HeaderChain::new(ChainConfig::testnet())));
-        let pipeline = ValidationPipeline::new(rx, chain, progress_tx);
-        (pipeline, tx, progress_rx)
+        let pipeline = ValidationPipeline::new(rx, chain, progress_tx, delivery_tx);
+        (pipeline, tx, progress_rx, delivery_rx)
     }
 
     #[test]
@@ -251,7 +287,7 @@ mod tests {
 
     #[test]
     fn rejects_unparseable_header() {
-        let (mut pipeline, _tx, _progress_rx) = test_pipeline();
+        let (mut pipeline, _tx, _progress_rx, _delivery_rx) = test_pipeline();
         let batch = vec![(HEADER_TYPE_ID, [0xaa; 32], vec![0xff, 0x00, 0x01])];
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(pipeline.process_batch(batch));
@@ -261,7 +297,7 @@ mod tests {
 
     #[test]
     fn ignores_non_header_modifier_types() {
-        let (mut pipeline, _tx, _progress_rx) = test_pipeline();
+        let (mut pipeline, _tx, _progress_rx, _delivery_rx) = test_pipeline();
         let batch = vec![(102, [0xaa; 32], vec![0xff; 100])];
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(pipeline.process_batch(batch));
@@ -296,13 +332,13 @@ mod tests {
         let header: Header = serde_json::from_str(json).unwrap();
         let bytes = header.scorex_serialize_bytes().unwrap();
 
-        let (mut pipeline, _tx, _progress_rx) = test_pipeline();
+        let (mut pipeline, _tx, _progress_rx, _delivery_rx) = test_pipeline();
         let batch = vec![(HEADER_TYPE_ID, [0xaa; 32], bytes)];
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(pipeline.process_batch(batch));
 
-        // Header has valid PoW but parent is missing, so it goes to pending
-        assert_eq!(pipeline.pending.len(), 1, "valid PoW header should be buffered");
+        // Header has valid PoW but parent is missing, so it goes to the LRU buffer
+        assert_eq!(pipeline.buffer.len(), 1, "valid PoW header should be buffered");
         let chain = rt.block_on(pipeline.chain.lock());
         assert_eq!(chain.height(), 0, "unchainable header should not increase height");
     }
