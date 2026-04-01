@@ -4,7 +4,7 @@ A ground-up Ergo blockchain full node in Rust. Not a port of the JVM reference n
 
 ## Status
 
-**Highly experimental.** Currently syncing the header chain: connects to Ergo testnet peers, syncs headers via SyncInfo/Inv exchange, validates PoW and chain rules (parent linkage, timestamps, difficulty adjustment), and builds a validated header chain. Running on testnet — syncs 17,000+ headers from genesis.
+**Highly experimental.** Currently syncing the header chain: connects to Ergo testnet peers, syncs headers via SyncInfo/Inv exchange, validates PoW and chain rules (parent linkage, timestamps, difficulty adjustment), and builds a validated header chain. Running on testnet — continuous sync from genesis with no stalls.
 
 ## Roadmap
 
@@ -23,11 +23,13 @@ A ground-up Ergo blockchain full node in Rust. Not a port of the JVM reference n
 - Connects to Ergo testnet peers and maintains persistent connections
 - Accepts inbound connections from other nodes
 - Routes all P2P messages between peers (Inv, ModifierRequest/Response, SyncInfo, GetPeers)
-- **Header chain sync**: sends SyncInfo, requests headers via Inv/ModifierRequest exchange
+- **Header chain sync**: bidirectional SyncInfo exchange, Inv/ModifierRequest header download
+- **Delivery tracker**: 10-second timeout retry, re-request from different peer, LRU modifier buffer (8192 headers) with eviction-triggered re-request — matches JVM's `DeliveryTracker`
 - **Async validation pipeline**: batch-drain processing, sort-by-height, PoW + chain validation
 - **Full chain validation**: parent linkage, timestamp bounds, difficulty adjustment, PoW
-- **Event-driven sync**: two-batch cycles matching JVM behavior, peer rotation on stall
-- Syncs 17,000+ validated headers from genesis on testnet (~400 headers/second burst)
+- **Event-driven sync**: progress-triggered and timer-based SyncInfo cycles, peer rotation on stall
+- Continuous header sync from genesis on testnet — no connection stalls
+- Wire format fully compatible: verified byte-identical serialization against JVM test vectors
 - Tested: a JVM reference node syncs its full header chain exclusively through this relay
 
 ## Architecture
