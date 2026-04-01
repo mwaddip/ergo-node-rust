@@ -1,16 +1,20 @@
-# Delivery Tracker — Design Spec (Follow-up)
+# Delivery Tracker + Modifier Buffer — Design Spec (Follow-up)
 
-> Track pending modifier requests with timeouts and retry. Not implemented in the sync rework — specced here for the next phase.
+> Track pending modifier requests with timeouts and retry. Buffer out-of-order modifiers with LRU eviction. Re-request evicted modifiers automatically.
 
 ## Problem
 
-The sync machine sends ModifierRequest and hopes headers arrive. If a response is lost (network glitch, peer unresponsive), the request is never retried. The only recovery is the stall timeout (60s), which wastes time and relies on the next SyncInfo cycle to re-discover the same headers.
+Two related issues:
 
-The JVM tracks every modifier request individually and re-requests from a different peer after 10 seconds.
+1. **No delivery tracking.** The sync machine sends ModifierRequest and hopes headers arrive. If a response is lost, the request is never retried. The only recovery is the stall timeout (60s).
+
+2. **Naive pending buffer.** The pipeline's `HashMap<BlockId, Header>` pending buffer has a hard cap (10,000) and drops new entries when full. Headers that can't chain are never re-requested. If a batch arrives from a wrong common point, hundreds of unchainable headers fill the buffer permanently.
+
+The JVM solves both with a delivery tracker (timeout + re-request) and an LRU modifier cache (buffer + evict + re-request evicted).
 
 ## Design
 
-### DeliveryTracker struct
+### Part 1: Delivery Tracker
 
 Lives in the sync crate (`sync/src/delivery.rs`). Tracks pending modifier requests:
 
@@ -21,14 +25,14 @@ struct PendingRequest {
     checks: u32,
 }
 
-struct DeliveryTracker {
-    pending: HashMap<[u8; 32], PendingRequest>,  // id → request info
-    timeout: Duration,       // 10s default, matching JVM
-    max_checks: u32,         // 100, matching JVM
+pub struct DeliveryTracker {
+    pending: HashMap<[u8; 32], PendingRequest>,
+    timeout: Duration,       // 10s, matching JVM deliveryTimeout
+    max_checks: u32,         // 100, matching JVM maxDeliveryChecks
 }
 ```
 
-### State machine per modifier
+#### State machine per modifier
 
 ```
 Unknown → Requested → Received
@@ -38,44 +42,88 @@ Unknown → Requested → Received
          (max checks) → Abandoned
 ```
 
-### Integration points
+#### Integration points
 
 **On ModifierRequest sent:** `tracker.mark_requested(id, peer)`
 
-**On pipeline progress (batch processed):** for each header ID in the batch, `tracker.mark_received(id)`
+**On modifier received by pipeline:** `tracker.mark_received(id)`
 
-**On check timer (every 5s, matching JVM's CheckModifiersToDownload interval):**
+**On check timer (every 5s):**
 - For each pending request where `elapsed > timeout`:
   - If `checks < max_checks`: re-request from a different outbound peer, increment checks
   - If `checks >= max_checks`: mark abandoned, log warning
 
 **On peer disconnect:** re-request all pending from that peer via a different peer
 
-### What this replaces
+**On eviction from modifier buffer (Part 2):** mark evicted IDs as Unknown → eligible for re-request on next check
 
-The current fire-and-forget in `handle_event`:
+### Part 2: Modifier Buffer (replaces pipeline pending HashMap)
+
+Replaces the current `HashMap<BlockId, Header>` in the pipeline with an LRU cache, matching the JVM's `ErgoModifiersCache`.
+
 ```rust
-let _ = self.transport.send_to(peer_id, ModifierRequest { ... }).await;
+pub struct ModifierBuffer {
+    cache: LinkedHashMap<BlockId, Header>,  // insertion-ordered for LRU
+    max_size: usize,                        // 8192, matching JVM headersCache
+}
 ```
 
-Becomes:
+#### Behavior
+
+**On header with missing parent:** `buffer.put(header.parent_id, header)` — if cache is full, evict LRU entry.
+
+**Drain after each successful chain append:** same recursive drain as today, but from the LRU cache instead of a plain HashMap.
+
+**On eviction:** evicted header IDs are sent to the delivery tracker as Unknown → will be re-requested automatically.
+
+**Fast path (matching JVM):** Before buffering, check if the batch starts at `tip + 1`. If so, apply sequentially without touching the buffer. Only buffer on the first gap.
+
+### Part 3: Integration
+
+The sync machine's `tokio::select!` gains a fourth event source — the delivery check timer (5s interval):
+
 ```rust
-self.delivery.request(peer_id, modifier_type, ids, &self.transport).await;
+tokio::select! {
+    event = self.transport.next_event() => { ... }
+    Some(height) = self.progress.recv() => { ... }
+    _ = tokio::time::sleep(until_next_sync) => { ... }
+    _ = tokio::time::sleep(until_next_delivery_check) => {
+        self.delivery.check_timeouts(&self.transport).await;
+    }
+}
 ```
 
 ### JVM reference
 
-| Setting | JVM Value | Our Value |
-|---------|-----------|-----------|
-| `deliveryTimeout` | 10s | 10s |
-| `maxDeliveryChecks` | 100 | 100 |
-| Check interval | 5s (syncInterval) | 5s |
-| Re-request penalty | NonDeliveryPenalty (2pts) | Not applicable (no penalty system yet) |
+| Component | JVM | Ours |
+|-----------|-----|------|
+| Delivery timeout | 10s | 10s |
+| Max re-request attempts | 100 | 100 |
+| Check interval | 5s | 5s |
+| Header buffer size | 8,192 (LRU) | 8,192 (LRU) |
+| Block section buffer | 384 (LRU) | Not needed yet (headers only) |
+| Re-request on eviction | Yes (mark Unknown) | Yes |
+| Penalty on non-delivery | 2 pts (NonDeliveryPenalty) | Not applicable yet |
 
-### Scope
+### What this replaces
 
-This is a sync crate change only. No P2P or pipeline changes needed. The delivery tracker wraps the existing `transport.send_to()` calls with tracking and retry logic.
+**In sync machine:** fire-and-forget `transport.send_to(ModifierRequest)` → tracked `delivery.request(ids, peer)`
+
+**In pipeline:** `HashMap<BlockId, Header>` pending buffer with hard cap → `ModifierBuffer` with LRU eviction and re-request signaling
 
 ### Dependencies
 
-Requires the sync machine rework (event-driven loop) to be in place first — the delivery check timer needs to be a fourth event source in the `tokio::select!`.
+- Sync machine rework (event-driven loop) — **done**
+- Pipeline progress channel — **done**
+- Modifier buffer needs a channel back to the delivery tracker for eviction notifications
+
+### Scope
+
+- `sync/src/delivery.rs` — new file, DeliveryTracker
+- `src/pipeline.rs` — replace HashMap pending with ModifierBuffer, add eviction channel
+- `sync/src/state.rs` — add delivery check timer to select!, wire tracker into handle_event
+- `src/main.rs` — wire eviction channel
+
+### Protocol reference
+
+See `docs/protocol/jvm-modifier-buffer.md` for the full JVM implementation analysis.
