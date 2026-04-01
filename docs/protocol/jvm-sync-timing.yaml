@@ -1,0 +1,209 @@
+# JVM Ergo Sync Protocol Timing — Machine Readable
+# Source: ergo v6.0.3, extracted 2026-04-01
+
+schedulers:
+  send_local_sync_info:
+    initial_delay_s: 2
+    interval_s: 5
+    config_key: scorex.network.syncInterval
+    type: fixed_delay  # scheduleWithFixedDelay
+    handler: sendSync
+
+  check_modifiers_to_download:
+    interval_s: 5
+    config_key: scorex.network.syncInterval
+    type: fixed_rate  # scheduleAtFixedRate
+    throttle_ms: 50  # min time between actual invocations
+    handler: checkModifiersToDownload
+
+  is_chain_healthy:
+    initial_delay_s: 1800  # 30 minutes
+    interval_s: 600  # 10 minutes
+    config_key: ergo.node.acceptableChainUpdateDelay
+    handler: isChainHealthy
+
+per_peer_rate_limits:
+  min_sync_interval_s: 20
+  sync_threshold_s: 60  # "outdated" after this
+  clear_threshold_s: 180  # status reset to Unknown
+  per_peer_sync_lock_ms: 100  # incoming SyncInfo anti-spam
+
+  source_file: ErgoSyncTracker.scala
+  hardcoded: true  # not configurable
+
+modifier_delivery:
+  timeout_s: 10
+  chunk_timeout_s: 40  # 4x deliveryTimeout, for UTXO snapshot chunks
+  max_checks: 100
+  config_keys:
+    timeout: scorex.network.deliveryTimeout
+    max_checks: scorex.network.maxDeliveryChecks
+
+  batch_sizes:
+    headers:
+      min: 50
+      max: 400
+    block_sections:
+      min: 8
+      max: 12
+
+  state_machine:
+    states: [Unknown, Requested, Received, Held, Invalid]
+    transitions:
+      - from: Unknown
+        to: Requested
+        trigger: download_requested
+      - from: Requested
+        to: Received
+        trigger: modifier_arrived
+      - from: Requested
+        to: Unknown
+        trigger: timeout_retry
+        condition: checks < max_checks
+      - from: Requested
+        to: Invalid
+        trigger: timeout_give_up
+        condition: checks >= max_checks AND modifier_type == header
+      - from: Received
+        to: Held
+        trigger: validation_passed
+
+penalties:
+  types:
+    non_delivery:
+      score: 2
+      permanent: false
+      trigger: block section not delivered after timeout
+    misbehavior:
+      score: 10
+      permanent: false
+      trigger: invalid modifiers, malformed data, semantic failures
+    spam:
+      score: 25
+      permanent: false
+      trigger: high-cost transactions, repeated already-applied TX
+    permanent:
+      score: 1000000000
+      permanent: true
+      trigger: critical protocol violations
+
+  thresholds:
+    ban_score: 500
+    ban_duration_m: 60
+    safe_interval_s: 120  # penalty won't accumulate within this window
+
+  config_keys:
+    ban_duration: scorex.network.temporalBanDuration
+    safe_interval: scorex.network.penaltySafeInterval
+    threshold: scorex.network.penaltyScoreThreshold
+
+connection_management:
+  handshake_timeout_s: 30
+  inactive_deadline_s: 600  # 10 minutes
+  peer_eviction_interval_s: 3600  # 1 hour
+  get_peers_interval_s: 120  # 2 minutes
+
+  config_keys:
+    handshake: scorex.network.handshakeTimeout
+    inactive: scorex.network.inactiveConnectionDeadline
+    eviction: scorex.network.peerEvictionInterval
+    get_peers: scorex.network.getPeersInterval
+
+observed_sync_cycle:
+  description: >
+    One full cycle from pcap of JVM testnet node syncing from genesis.
+    Two batches per cycle due to immediate re-send after processing.
+
+  phases:
+    - name: sync_request
+      direction: client_to_peer
+      message: SyncInfo
+      size_bytes: 224-891
+      offset_ms: 0
+
+    - name: inv_response
+      direction: peer_to_client
+      message: Inv
+      size_bytes: 12771
+      modifier_type: 101  # headers
+      id_count: ~400
+      offset_ms: 25
+
+    - name: peer_sync_back
+      direction: peer_to_client
+      message: SyncInfo
+      size_bytes: 891
+      offset_ms: 28
+
+    - name: modifier_request
+      direction: client_to_peer
+      message: RequestModifier
+      size_bytes: 12771  # mirrors Inv exactly
+      offset_ms: 38
+
+    - name: modifier_delivery
+      direction: peer_to_client
+      message: Modifier
+      size_bytes: 101000
+      header_count: ~400
+      offset_ms: 100
+
+    # second batch (immediate re-send after processing)
+    - name: sync_request_2
+      direction: client_to_peer
+      message: SyncInfo
+      size_bytes: 224-891
+      offset_ms: 170
+
+    - name: inv_response_2
+      direction: peer_to_client
+      message: Inv
+      size_bytes: 12771
+      offset_ms: 195
+
+    - name: modifier_request_2
+      direction: client_to_peer
+      message: RequestModifier
+      size_bytes: 12771
+      offset_ms: 203
+
+    - name: modifier_delivery_2
+      direction: peer_to_client
+      message: Modifier
+      size_bytes: 101000
+      offset_ms: 270
+
+    # wait for MinSyncInterval
+    - name: wait
+      duration_ms: 20000
+
+  headers_per_cycle: ~800  # two batches of 400
+
+peer_status_types:
+  - name: Unknown
+    description: no sync exchange yet, or status cleared after 3 minutes
+  - name: Younger
+    description: peer's chain tip is lower than ours
+  - name: Older
+    description: peer's chain tip is higher than ours
+  - name: Equal
+    description: same best header
+  - name: Fork
+    description: different headers at same height, shared ancestor found
+  - name: Nonsense
+    description: comparison produced invalid result
+
+message_codes:
+  get_peers: 1
+  peers: 2
+  request_modifier: 22
+  modifier: 33
+  inv: 55
+  sync_info: 65
+
+modifier_types:
+  header: 101
+  transaction: 102
+  block_transactions: 103
+  ad_proofs: 104
+  extension: 108
