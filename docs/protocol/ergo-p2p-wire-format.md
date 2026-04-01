@@ -174,12 +174,21 @@ After handshake, all communication uses framed messages.
 ### Frame Format
 
 ```
-[magic]        4 raw bytes              network magic
-[code]         1 raw byte               message type identifier
-[body_length]  4 bytes big-endian u32   NOT VLQ (this is raw big-endian)
-[checksum]     4 raw bytes              first 4 bytes of blake2b256(body)
-[body]         body_length raw bytes    message payload
+When body_length > 0:
+  [magic]        4 raw bytes              network magic
+  [code]         1 raw byte               message type identifier
+  [body_length]  4 bytes big-endian u32   NOT VLQ (this is raw big-endian)
+  [checksum]     4 raw bytes              first 4 bytes of blake2b256(body)
+  [body]         body_length raw bytes    message payload
+
+When body_length == 0 (e.g., GetPeers):
+  [magic]        4 raw bytes              network magic
+  [code]         1 raw byte               message type identifier
+  [body_length]  4 bytes (0x00000000)     zero
+  (no checksum, no body)
 ```
+
+**CRITICAL: The checksum is omitted when body_length is zero.** The JVM's `MessageSerializer.serialize` only writes checksum bytes when `dataLength > 0`. Sending a checksum for empty-body messages (GetPeers, etc.) leaves 4 extra bytes in the stream that the JVM's parser reads as the start of the next frame, desynchronizing the connection permanently. This is undocumented in ErgoDocs and only visible in the JVM source (`MessageSerializer.scala`).
 
 **Note:** The frame header uses fixed-width big-endian for `body_length`, unlike everything in the handshake which uses VLQ. This is because framing is implemented directly in the network layer, not through the Scorex serialization framework.
 
@@ -187,7 +196,7 @@ Maximum body size: 256 KB (enforced by well-behaved implementations).
 
 ### Checksum
 
-Blake2b-256 hash of the body, truncated to the first 4 bytes. Computed over the raw body bytes. Empty bodies hash to blake2b256 of the empty byte array.
+Blake2b-256 hash of the body, truncated to the first 4 bytes. Computed over the raw body bytes. **Only present when body_length > 0.**
 
 ## Message Types
 
