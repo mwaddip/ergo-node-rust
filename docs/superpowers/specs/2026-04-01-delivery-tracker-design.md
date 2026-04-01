@@ -4,13 +4,17 @@
 
 ## Problem
 
-Two related issues:
+The Ergo sync protocol is fundamentally lossy. Each step (SyncInfo → Inv → ModifierRequest → ModifierResponse) can fail silently. The JVM node survives this because its delivery tracker re-requests on 10-second timeouts. Without it, the protocol falls apart after the first glitch.
 
-1. **No delivery tracking.** The sync machine sends ModifierRequest and hopes headers arrive. If a response is lost, the request is never retried. The only recovery is the stall timeout (60s).
+**Observed behavior (2026-04-01):** Against both remote testnet peers and a local fully-synced JVM, our node consistently syncs ~12 batches (~4800 headers) per connection before the JVM stops processing our SyncInfo. JVM debug logs show the message is received but never reaches `processSync`. Reconnection starts a new session and syncs ~12 more batches. The protocol is correct — the delivery tracker is what makes it robust.
 
-2. **Naive pending buffer.** The pipeline's `HashMap<BlockId, Header>` pending buffer has a hard cap (10,000) and drops new entries when full. Headers that can't chain are never re-requested. If a batch arrives from a wrong common point, hundreds of unchainable headers fill the buffer permanently.
+Specific issues:
 
-The JVM solves both with a delivery tracker (timeout + re-request) and an LRU modifier cache (buffer + evict + re-request evicted).
+1. **No delivery tracking.** The sync machine sends ModifierRequest and hopes headers arrive. If a response is lost or the peer goes quiet, the request is never retried. The only recovery is the 60-second stall timeout — 6x slower than the JVM's 10-second retry.
+
+2. **Naive pending buffer.** The pipeline's `HashMap<BlockId, Header>` pending buffer has a hard cap (10,000) and drops new entries when full. Headers that can't chain are never re-requested. Duplicate batches from overlapping SyncInfo responses fill the buffer (mitigated by height check + stale purge, but not eliminated).
+
+The JVM solves both with a delivery tracker (timeout + re-request) and an LRU modifier cache (buffer + evict + re-request evicted). The tracker isn't optional — it's the mechanism that makes the lossy protocol usable.
 
 ## Design
 

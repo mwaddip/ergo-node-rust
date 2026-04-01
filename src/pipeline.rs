@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use enr_chain::{BlockId, ChainError, Header, HeaderChain, HeaderTracker};
+use sigma_ser::ScorexSerializable;
 use tokio::sync::{mpsc, Mutex};
 
 /// Modifier type ID for headers (NetworkObjectTypeId in JVM source).
@@ -72,7 +73,7 @@ impl ValidationPipeline {
             return;
         }
 
-        // Parse and PoW-verify
+        // Parse, round-trip check, and PoW-verify
         let mut valid_headers: Vec<Header> = Vec::with_capacity(raw_headers.len());
         for data in raw_headers {
             let header = match enr_chain::parse_header(data) {
@@ -82,6 +83,25 @@ impl ValidationPipeline {
                     continue;
                 }
             };
+
+            // Round-trip check: detect headers whose re-serialization produces
+            // different bytes. These would break SyncInfo (commonPoint fails).
+            if let Ok(reserialized) = header.scorex_serialize_bytes() {
+                if data != reserialized.as_slice() {
+                    let first_diff = data.iter().zip(reserialized.iter())
+                        .position(|(a, b)| a != b);
+                    tracing::error!(
+                        height = header.height,
+                        wire_len = data.len(),
+                        reser_len = reserialized.len(),
+                        first_diff_at = ?first_diff,
+                        wire_prefix = format!("{:02x?}", &data[..data.len().min(20)]),
+                        reser_prefix = format!("{:02x?}", &reserialized[..reserialized.len().min(20)]),
+                        "ROUND-TRIP MISMATCH"
+                    );
+                }
+            }
+
             if let Err(e) = enr_chain::verify_pow(&header) {
                 tracing::debug!(
                     "pipeline: rejecting header at height {}: {e}",
@@ -118,6 +138,11 @@ impl ValidationPipeline {
             match chain.try_append(header.clone()) {
                 Ok(()) => {
                     chained += 1;
+                    // Log IDs at SyncInfo offset heights for diagnostic comparison
+                    let h = header.height;
+                    if h % 400 < 2 || h == 4789 || h == 4773 || h == 4661 || h == 4277 {
+                        tracing::info!(height = h, id = %header.id, "chained header ID");
+                    }
                     // Drain pending buffer from this header
                     let mut next_parent = header.id;
                     while let Some(buf) = self.pending.remove(&next_parent) {

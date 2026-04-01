@@ -8,6 +8,7 @@ description = "Full Ergo blockchain node in Rust"
 enr-chain = { path = "chain" }
 enr-p2p = { path = "p2p" }
 ergo-sync = { path = "sync" }
+sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "6e76e82" }
 tracing = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

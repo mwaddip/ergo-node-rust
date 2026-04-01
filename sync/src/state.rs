@@ -136,9 +136,11 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
             return SyncOutcome::PeerDisconnected;
         }
         self.last_scheduled_sync = Instant::now();
+        // One progress-triggered send per 20s cycle — gives the two-batch
+        // pattern (one scheduled + one progress) matching JVM behavior.
+        let mut progress_send_used = false;
 
         loop {
-            // Compute time until next scheduled SyncInfo
             let until_next = MIN_SYNC_INTERVAL
                 .saturating_sub(self.last_scheduled_sync.elapsed());
 
@@ -157,22 +159,24 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                     }
                 }
 
-                // Pipeline progress: chain height increased → two-batch trigger
+                // Pipeline progress: send ONE SyncInfo per cycle for the two-batch pattern
                 Some(height) = self.progress.recv() => {
-                    tracing::debug!(height, "pipeline progress");
                     self.last_progress = Instant::now();
                     self.stalled_peers.clear();
 
-                    // Send SyncInfo with updated chain state (second batch)
-                    let _ = self.send_sync_info(peer).await;
+                    if !progress_send_used {
+                        progress_send_used = true;
+                        tracing::debug!(height, "progress → second batch SyncInfo");
+                        let _ = self.send_sync_info(peer).await;
+                    }
                 }
 
-                // Scheduled SyncInfo: 20-second floor
+                // Scheduled SyncInfo: 20-second cycle start
                 _ = tokio::time::sleep(until_next) => {
                     let _ = self.send_sync_info(peer).await;
                     self.last_scheduled_sync = Instant::now();
+                    progress_send_used = false; // allow one progress send next cycle
 
-                    // Check for stall
                     if self.last_progress.elapsed() > STALL_TIMEOUT {
                         return SyncOutcome::Stalled;
                     }
@@ -209,8 +213,24 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                     EventResult::Synced
                 }
 
-                // Peer's SyncInfo: respond with ours (bidirectional exchange)
+                // Peer's SyncInfo: check if caught up, but don't respond during
+                // active sync. The progress-triggered send (after batch processing)
+                // serves as the response with the correct updated chain tip.
+                // Responding here would send our OLD tip before the batch is processed.
                 ProtocolMessage::SyncInfo { body } => {
+                    // Log first time we see peer's SyncInfo for encoding comparison
+                    if self.sync_sent_count <= 2 {
+                        let hex_prefix: String = body.iter().take(40)
+                            .map(|b| format!("{:02x}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        tracing::info!(
+                            body_len = body.len(),
+                            hex = %hex_prefix,
+                            "received peer SyncInfo"
+                        );
+                    }
+
                     if let Ok(info) = self.chain.parse_sync_info(&body) {
                         let peer_heights = C::sync_info_heights(&info);
                         let our_height = self.chain.chain_height().await;
@@ -222,9 +242,6 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                             }
                         }
                     }
-
-                    // Respond with our SyncInfo (JVM does this when syncSendNeeded)
-                    let _ = self.send_sync_info(peer).await;
                     EventResult::Continue
                 }
 
@@ -295,6 +312,23 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
     ) -> Result<(), Box<dyn std::error::Error + Send>> {
         let body = self.chain.build_sync_info().await;
         self.sync_sent_count += 1;
+
+        // Diagnostic: log SyncInfo content + first 40 hex bytes for wire analysis
+        if let Ok(info) = self.chain.parse_sync_info(&body) {
+            let heights = C::sync_info_heights(&info);
+            let hex_prefix: String = body.iter().take(40)
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::info!(
+                body_len = body.len(),
+                headers = ?heights,
+                count = self.sync_sent_count,
+                hex = %hex_prefix,
+                "sending SyncInfo"
+            );
+        }
+
         self.transport
             .send_to(peer, ProtocolMessage::SyncInfo { body })
             .await
