@@ -294,7 +294,14 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                     EventResult::Continue
                 }
 
-                _ => EventResult::Continue,
+                other => {
+                    tracing::info!(
+                        peer = %peer_id,
+                        msg_type = %msg_type_name(&other),
+                        "unhandled message from peer"
+                    );
+                    EventResult::Continue
+                }
             },
 
             ProtocolEvent::PeerDisconnected { peer_id, .. } if peer_id == peer => {
@@ -474,4 +481,27 @@ enum SyncOutcome {
     PeerDisconnected,
     /// Event stream closed (shutdown).
     StreamEnded,
+}
+
+/// Human-readable message type name for diagnostics.
+fn msg_type_name(msg: &ProtocolMessage) -> &'static str {
+    match msg {
+        ProtocolMessage::GetPeers => "GetPeers",
+        ProtocolMessage::Peers { .. } => "Peers",
+        ProtocolMessage::SyncInfo { .. } => "SyncInfo",
+        ProtocolMessage::Inv { .. } => "Inv",
+        ProtocolMessage::ModifierRequest { .. } => "ModifierRequest",
+        ProtocolMessage::ModifierResponse { .. } => "ModifierResponse",
+        ProtocolMessage::Unknown { code, .. } => {
+            // Leak a static string for unknown codes — only a few will ever exist
+            // and this is diagnostics-only code
+            match code {
+                75 => "GetNipopowProof",
+                76 => "NipopowProof",
+                77 => "GetSnapshotsInfo",
+                78 => "SnapshotsInfo",
+                _ => "Unknown",
+            }
+        }
+    }
 }
