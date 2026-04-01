@@ -342,4 +342,49 @@ mod tests {
         let chain = rt.block_on(pipeline.chain.lock());
         assert_eq!(chain.height(), 0, "unchainable header should not increase height");
     }
+
+    /// Test vector from JVM ergo-core HeaderSerializationSpecification.
+    /// Mainnet block 418,138 (version 2). Verifies byte-level compatibility
+    /// with the JVM serializer — same bytes, same Blake2b256 header ID.
+    #[test]
+    fn jvm_header_v2_test_vector() {
+        use sigma_ser::ScorexSerializable;
+
+        // Real mainnet header, from ergo-core test suite
+        let json = r#"{
+            "extensionId": "0000000000000000000000000000000000000000000000000000000000000000",
+            "difficulty": "107976917",
+            "votes": "000000",
+            "timestamp": 1612465607426,
+            "size": 0,
+            "stateRoot": "995c0efe63744c5227e6ae213a2061c60f8db845d47707a6bff53f9ff1936a9e13",
+            "height": 418138,
+            "nBits": 107976917,
+            "version": 2,
+            "id": "f46c89e44f13a92d8409341490f97f05c85785fa8d2d2164332cc066eda95c39",
+            "adProofsRoot": "a80bbd4d69b4f017da6dd9250448ef1cde492121fc350727e755c7b7ae2988ad",
+            "transactionsRoot": "141bf3de015c44995858a435e4d6c50c51622d077760de32977ba5412aaaae03",
+            "extensionHash": "b1457df896bba9dc962f8e42187e1ac580842f1282c8c7fb9cf9f4cd520d1c07",
+            "powSolutions": {
+                "pk": "0315345f1fca9445eee5df74759d4c495094bcfc82a2831b26fca6efa599b509de",
+                "n": "1b95db2168f95fda"
+            },
+            "parentId": "7fbc70ec5913706ddef67bbcdb7700ea5f15dc709012491269c9c7eb545d720c"
+        }"#;
+        let header: Header = serde_json::from_str(json).unwrap();
+        let bytes = header.scorex_serialize_bytes().unwrap();
+
+        // Verify header ID matches JVM (Blake2b256 of serialized bytes)
+        let id_hex = format!("{}", header.id);
+        assert_eq!(
+            id_hex,
+            "f46c89e44f13a92d8409341490f97f05c85785fa8d2d2164332cc066eda95c39",
+            "header ID must match JVM test vector"
+        );
+
+        // Verify round-trip
+        let header2 = Header::scorex_parse_bytes(&bytes).unwrap();
+        let bytes2 = header2.scorex_serialize_bytes().unwrap();
+        assert_eq!(bytes, bytes2, "round-trip must be byte-identical");
+    }
 }
