@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Validation pipeline — progress channel feeds the sync machine
     let pipeline_chain = chain.clone();
-    let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(4);
+    let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(4);
     tokio::spawn(async move {
         let mut pipeline = ValidationPipeline::new(modifier_rx, pipeline_chain, progress_tx);
         pipeline.run().await;
@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start sync in a background task
     tokio::spawn(async move {
-        let mut sync = HeaderSync::new(transport, sync_chain);
+        let mut sync = HeaderSync::new(transport, sync_chain, progress_rx);
         sync.run().await;
     });
 

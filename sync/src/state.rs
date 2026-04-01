@@ -73,9 +73,9 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                 SyncOutcome::Synced => self.synced().await,
                 SyncOutcome::Stalled => {
                     if let Some(peer) = self.sync_peer.take() {
+                        let height = self.chain.chain_height().await;
                         tracing::warn!(
-                            peer = %peer,
-                            height = self.chain.chain_height().await,
+                            peer = %peer, height,
                             syncs_sent = self.sync_sent_count,
                             "sync stalled, rotating peer"
                         );
@@ -98,11 +98,8 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                 self.sync_peer = Some(peer);
                 self.last_progress = Instant::now();
                 self.sync_sent_count = 0;
-                tracing::info!(
-                    peer = %peer,
-                    height = self.chain.chain_height().await,
-                    "starting header sync"
-                );
+                let height = self.chain.chain_height().await;
+                tracing::info!(peer = %peer, height, "starting header sync");
                 return true;
             }
 
