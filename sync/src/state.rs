@@ -1,200 +1,251 @@
+use std::collections::HashSet;
+
 use enr_p2p::protocol::messages::ProtocolMessage;
 use enr_p2p::protocol::peer::ProtocolEvent;
 use enr_p2p::types::PeerId;
-use tokio::time::{interval, Duration, Instant};
+use tokio::sync::mpsc;
+use tokio::time::{Duration, Instant};
 
 use crate::traits::{SyncChain, SyncTransport};
 
 /// Header modifier type ID (NetworkObjectTypeId).
 const HEADER_TYPE_ID: u8 = 101;
 
+/// Minimum time between scheduled SyncInfo sends to the same peer.
+/// The JVM enforces a hard 20-second minimum per peer in
+/// `ErgoSyncTracker.MinSyncInterval`.
+const MIN_SYNC_INTERVAL: Duration = Duration::from_secs(20);
+
+/// How long without pipeline progress before rotating to a new peer.
+const STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// How often to send SyncInfo when synced, to check for new blocks.
 const SYNCED_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// How long to wait for progress before considering sync stalled.
-const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How long to wait between SyncInfo rounds during active sync.
-const SYNC_ROUND_INTERVAL: Duration = Duration::from_secs(3);
-
-/// Sync state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum State {
-    /// Waiting for outbound peers.
-    Idle,
-    /// Actively syncing headers from a peer.
-    Syncing,
-    /// Caught up with the network.
-    Synced,
-}
-
 /// Header chain sync state machine.
 ///
-/// Drives header sync by sending SyncInfo to peers and requesting announced
-/// headers directly. When a peer responds to SyncInfo with an Inv of header
-/// IDs, the sync machine sends ModifierRequest back to that peer. The router's
-/// validator processes the resulting ModifierResponse, adding valid headers to
-/// the chain. The sync machine tracks chain height progress and sends new
-/// SyncInfo rounds to fetch the next batch.
+/// Event-driven loop matching the JVM's sync exchange pattern:
+/// - Sends SyncInfo, receives Inv, sends ModifierRequest
+/// - On pipeline progress: sends SyncInfo again (two-batch cycle)
+/// - On peer SyncInfo: responds with our SyncInfo (bidirectional exchange)
+/// - On stall: rotates to a different peer
 pub struct HeaderSync<T: SyncTransport, C: SyncChain> {
     transport: T,
     chain: C,
-    state: State,
+    progress: mpsc::Receiver<u32>,
     /// Peer we're currently syncing from.
     sync_peer: Option<PeerId>,
-    /// Chain height at the start of the current sync round.
-    round_start_height: u32,
-    /// When the last progress was observed.
+    /// Peers that failed to produce progress — skipped during peer selection.
+    stalled_peers: HashSet<PeerId>,
+    /// When the last chain height increase was observed.
     last_progress: Instant,
+    /// When we last sent a scheduled SyncInfo (20s floor applies to these).
+    last_scheduled_sync: Instant,
+    /// Total SyncInfo messages sent this session (diagnostics).
+    sync_sent_count: u32,
 }
 
 impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
-    pub fn new(transport: T, chain: C) -> Self {
+    pub fn new(transport: T, chain: C, progress: mpsc::Receiver<u32>) -> Self {
         Self {
             transport,
             chain,
-            state: State::Idle,
+            progress,
             sync_peer: None,
-            round_start_height: 0,
+            stalled_peers: HashSet::new(),
             last_progress: Instant::now(),
+            last_scheduled_sync: Instant::now(),
+            sync_sent_count: 0,
         }
     }
 
-    /// Run the sync loop. Does not return unless the event stream ends.
+    /// Run the sync loop. Returns only if all event sources close.
     pub async fn run(&mut self) {
         tracing::info!("header sync started");
         loop {
-            match self.state {
-                State::Idle => self.idle().await,
-                State::Syncing => self.syncing().await,
-                State::Synced => self.synced().await,
+            // Phase 1: wait for outbound peers
+            if !self.pick_sync_peer().await {
+                return; // event stream ended
+            }
+
+            // Phase 2: sync from the selected peer
+            match self.sync_from_peer().await {
+                SyncOutcome::Synced => self.synced().await,
+                SyncOutcome::Stalled => {
+                    if let Some(peer) = self.sync_peer.take() {
+                        tracing::warn!(
+                            peer = %peer,
+                            height = self.chain.chain_height().await,
+                            syncs_sent = self.sync_sent_count,
+                            "sync stalled, rotating peer"
+                        );
+                        self.stalled_peers.insert(peer);
+                    }
+                }
+                SyncOutcome::PeerDisconnected | SyncOutcome::StreamEnded => {
+                    self.sync_peer = None;
+                }
             }
         }
     }
 
-    /// Idle: drain events until we have outbound peers, then start syncing.
-    async fn idle(&mut self) {
+    /// Wait until we have an outbound peer to sync from.
+    /// Returns false if the event stream ends.
+    async fn pick_sync_peer(&mut self) -> bool {
         loop {
             let peers = self.transport.outbound_peers().await;
-            if !peers.is_empty() {
-                let peer = peers[0];
+            if let Some(peer) = self.select_peer(&peers) {
                 self.sync_peer = Some(peer);
-                self.round_start_height = self.chain.chain_height().await;
                 self.last_progress = Instant::now();
-
-                tracing::info!(peer = %peer, height = self.round_start_height, "starting header sync");
-
-                if self.send_sync_info(peer).await.is_ok() {
-                    self.state = State::Syncing;
-                    return;
-                }
-                self.sync_peer = None;
+                self.sync_sent_count = 0;
+                tracing::info!(
+                    peer = %peer,
+                    height = self.chain.chain_height().await,
+                    "starting header sync"
+                );
+                return true;
             }
 
-            // Wait for an event (peer connect, etc.)
+            // No eligible peers — wait for a connection event
             match self.transport.next_event().await {
-                Some(_) => {} // loop back and check peers again
-                None => return, // stream ended
+                Some(_) => {}
+                None => return false,
             }
         }
     }
 
-    /// Syncing: process events, send SyncInfo rounds, track progress.
-    async fn syncing(&mut self) {
-        let mut round_timer = interval(SYNC_ROUND_INTERVAL);
-        round_timer.tick().await; // consume the immediate first tick
+    /// Pick an outbound peer, preferring those not in the stalled set.
+    fn select_peer(&mut self, peers: &[PeerId]) -> Option<PeerId> {
+        let choice = peers
+            .iter()
+            .find(|p| !self.stalled_peers.contains(p))
+            .or_else(|| {
+                // All peers stalled — clear and retry
+                self.stalled_peers.clear();
+                peers.first()
+            });
+        choice.copied()
+    }
+
+    /// Run the event-driven sync cycle with the current peer.
+    async fn sync_from_peer(&mut self) -> SyncOutcome {
+        let peer = match self.sync_peer {
+            Some(p) => p,
+            None => return SyncOutcome::StreamEnded,
+        };
+
+        // Send initial SyncInfo to kick off the exchange
+        if self.send_sync_info(peer).await.is_err() {
+            return SyncOutcome::PeerDisconnected;
+        }
+        self.last_scheduled_sync = Instant::now();
 
         loop {
+            // Compute time until next scheduled SyncInfo
+            let until_next = MIN_SYNC_INTERVAL
+                .saturating_sub(self.last_scheduled_sync.elapsed());
+
             tokio::select! {
+                // P2P events: Inv, peer SyncInfo, disconnect
                 event = self.transport.next_event() => {
                     match event {
-                        Some(event) => self.handle_event(event).await,
-                        None => {
-                            self.state = State::Idle;
-                            return;
+                        Some(event) => {
+                            match self.handle_event(peer, event).await {
+                                EventResult::Continue => {}
+                                EventResult::Synced => return SyncOutcome::Synced,
+                                EventResult::PeerGone => return SyncOutcome::PeerDisconnected,
+                            }
                         }
+                        None => return SyncOutcome::StreamEnded,
                     }
                 }
-                _ = round_timer.tick() => {
-                    let height = self.chain.chain_height().await;
 
-                    if height > self.round_start_height {
-                        // Made progress — start a new round
-                        tracing::debug!(height, prev = self.round_start_height, "sync progress");
-                        self.round_start_height = height;
-                        self.last_progress = Instant::now();
+                // Pipeline progress: chain height increased → two-batch trigger
+                Some(height) = self.progress.recv() => {
+                    tracing::debug!(height, "pipeline progress");
+                    self.last_progress = Instant::now();
+                    self.stalled_peers.clear();
 
-                        if let Some(peer) = self.sync_peer {
-                            let _ = self.send_sync_info(peer).await;
-                        }
-                    } else if self.last_progress.elapsed() > SYNC_TIMEOUT {
-                        // No progress for too long — stalled
-                        tracing::warn!(peer = ?self.sync_peer, height, "sync stalled");
-                        self.sync_peer = None;
-                        self.state = State::Idle;
-                        return;
+                    // Send SyncInfo with updated chain state (second batch)
+                    let _ = self.send_sync_info(peer).await;
+                }
+
+                // Scheduled SyncInfo: 20-second floor
+                _ = tokio::time::sleep(until_next) => {
+                    let _ = self.send_sync_info(peer).await;
+                    self.last_scheduled_sync = Instant::now();
+
+                    // Check for stall
+                    if self.last_progress.elapsed() > STALL_TIMEOUT {
+                        return SyncOutcome::Stalled;
                     }
                 }
             }
         }
     }
 
-    /// Handle an event during syncing.
-    async fn handle_event(&mut self, event: ProtocolEvent) {
+    /// Handle a single P2P event during sync.
+    async fn handle_event(&mut self, peer: PeerId, event: ProtocolEvent) -> EventResult {
         match event {
-            ProtocolEvent::Message { peer_id, message } => {
-                match message {
-                    ProtocolMessage::Inv { modifier_type, ids }
-                        if modifier_type == HEADER_TYPE_ID && ids.is_empty() =>
-                    {
-                        // Peer has nothing more — check if we're caught up
-                        let height = self.chain.chain_height().await;
-                        tracing::info!(height, "peer reports no more headers");
-                        self.state = State::Synced;
-                    }
-                    ProtocolMessage::Inv { modifier_type, ids }
-                        if modifier_type == HEADER_TYPE_ID =>
-                    {
-                        // Request announced headers directly from the announcing peer
-                        tracing::debug!(count = ids.len(), "requesting announced headers");
-                        let _ = self
-                            .transport
-                            .send_to(
-                                peer_id,
-                                ProtocolMessage::ModifierRequest { modifier_type, ids },
-                            )
-                            .await;
-                    }
-                    ProtocolMessage::SyncInfo { body } => {
-                        // Incoming SyncInfo — check if peer is ahead
-                        if let Ok(info) = self.chain.parse_sync_info(&body) {
-                            let peer_heights = C::sync_info_heights(&info);
-                            let our_height = self.chain.chain_height().await;
-                            if let Some(&peer_tip) = peer_heights.first() {
-                                if peer_tip <= our_height && self.state == State::Syncing {
-                                    tracing::info!(our_height, peer_tip, "caught up with peer");
-                                    self.state = State::Synced;
-                                }
+            ProtocolEvent::Message { peer_id, message } => match message {
+                // Inv with header IDs: request them
+                ProtocolMessage::Inv { modifier_type, ids }
+                    if modifier_type == HEADER_TYPE_ID && !ids.is_empty() =>
+                {
+                    tracing::debug!(count = ids.len(), "requesting announced headers");
+                    let _ = self
+                        .transport
+                        .send_to(
+                            peer_id,
+                            ProtocolMessage::ModifierRequest { modifier_type, ids },
+                        )
+                        .await;
+                    EventResult::Continue
+                }
+
+                // Empty Inv: peer has no more headers
+                ProtocolMessage::Inv { modifier_type, ids }
+                    if modifier_type == HEADER_TYPE_ID && ids.is_empty() =>
+                {
+                    let height = self.chain.chain_height().await;
+                    tracing::info!(height, "peer reports no more headers");
+                    EventResult::Synced
+                }
+
+                // Peer's SyncInfo: respond with ours (bidirectional exchange)
+                ProtocolMessage::SyncInfo { body } => {
+                    if let Ok(info) = self.chain.parse_sync_info(&body) {
+                        let peer_heights = C::sync_info_heights(&info);
+                        let our_height = self.chain.chain_height().await;
+
+                        if let Some(&peer_tip) = peer_heights.first() {
+                            if peer_tip <= our_height {
+                                tracing::info!(our_height, peer_tip, "caught up with peer");
+                                return EventResult::Synced;
                             }
                         }
                     }
-                    _ => {} // router handles Inv routing, ModifierRequest/Response
+
+                    // Respond with our SyncInfo (JVM does this when syncSendNeeded)
+                    let _ = self.send_sync_info(peer).await;
+                    EventResult::Continue
                 }
+
+                _ => EventResult::Continue,
+            },
+
+            ProtocolEvent::PeerDisconnected { peer_id, .. } if peer_id == peer => {
+                tracing::info!(peer = %peer_id, "sync peer disconnected");
+                EventResult::PeerGone
             }
-            ProtocolEvent::PeerDisconnected { peer_id, .. } => {
-                if self.sync_peer == Some(peer_id) {
-                    tracing::info!(peer = %peer_id, "sync peer disconnected");
-                    self.sync_peer = None;
-                    self.state = State::Idle;
-                }
-            }
-            _ => {}
+
+            _ => EventResult::Continue,
         }
     }
 
     /// Synced: periodically check for new blocks.
     async fn synced(&mut self) {
-        let mut ticker = interval(SYNCED_POLL_INTERVAL);
+        let mut ticker = tokio::time::interval(SYNCED_POLL_INTERVAL);
 
         loop {
             tokio::select! {
@@ -204,10 +255,11 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                         let _ = self.send_sync_info(peer).await;
                     } else {
                         tracing::info!("no outbound peers, returning to idle");
-                        self.state = State::Idle;
+                        self.sync_peer = None;
                         return;
                     }
                 }
+
                 event = self.transport.next_event() => {
                     match event {
                         Some(event) => {
@@ -215,8 +267,7 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                                 modifier_type, ids
                             }} = event {
                                 if modifier_type == HEADER_TYPE_ID && !ids.is_empty() {
-                                    let height = self.chain.chain_height().await;
-                                    tracing::debug!(height, new_headers = ids.len(), "new headers while synced");
+                                    tracing::debug!(new_headers = ids.len(), "new headers while synced");
                                     let _ = self.transport.send_to(
                                         peer_id,
                                         ProtocolMessage::ModifierRequest { modifier_type, ids },
@@ -225,10 +276,16 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                             }
                         }
                         None => {
-                            self.state = State::Idle;
+                            self.sync_peer = None;
                             return;
                         }
                     }
+                }
+
+                Some(height) = self.progress.recv() => {
+                    tracing::debug!(height, "pipeline progress while synced");
+                    // New headers validated — if we're still behind, go back to syncing
+                    // (will be detected on next SyncInfo exchange)
                 }
             }
         }
@@ -236,12 +293,35 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
 
     /// Send our current SyncInfo to a peer.
     async fn send_sync_info(
-        &self,
+        &mut self,
         peer: PeerId,
     ) -> Result<(), Box<dyn std::error::Error + Send>> {
         let body = self.chain.build_sync_info().await;
+        self.sync_sent_count += 1;
         self.transport
             .send_to(peer, ProtocolMessage::SyncInfo { body })
             .await
     }
+}
+
+/// Result of handling a single event.
+enum EventResult {
+    /// Keep syncing.
+    Continue,
+    /// Caught up with the peer.
+    Synced,
+    /// Sync peer disconnected.
+    PeerGone,
+}
+
+/// Outcome of a sync_from_peer session.
+enum SyncOutcome {
+    /// Caught up with the peer's chain tip.
+    Synced,
+    /// No progress for STALL_TIMEOUT — rotate peer.
+    Stalled,
+    /// Sync peer disconnected.
+    PeerDisconnected,
+    /// Event stream closed (shutdown).
+    StreamEnded,
 }
