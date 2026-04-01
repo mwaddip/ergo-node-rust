@@ -103,17 +103,29 @@ impl ValidationPipeline {
         let mut chain = self.chain.lock().await;
         let height_before = chain.height();
 
+        let mut chained = 0u32;
+        let mut buffered = 0u32;
+        let mut rejected = 0u32;
+
         for header in &valid_headers {
+            // Skip headers already at or below the chain tip (duplicates
+            // from overlapping SyncInfo responses)
+            if header.height <= chain.height() {
+                rejected += 1;
+                continue;
+            }
             self.tracker.observe(header);
             match chain.try_append(header.clone()) {
                 Ok(()) => {
+                    chained += 1;
                     // Drain pending buffer from this header
                     let mut next_parent = header.id;
-                    while let Some(buffered) = self.pending.remove(&next_parent) {
-                        let bid = buffered.id;
-                        match chain.try_append(buffered.clone()) {
+                    while let Some(buf) = self.pending.remove(&next_parent) {
+                        let bid = buf.id;
+                        match chain.try_append(buf.clone()) {
                             Ok(()) => {
-                                self.tracker.observe(&buffered);
+                                chained += 1;
+                                self.tracker.observe(&buf);
                                 next_parent = bid;
                             }
                             Err(_) => break,
@@ -123,15 +135,13 @@ impl ValidationPipeline {
                 Err(ChainError::ParentNotFound { .. })
                 | Err(ChainError::InvalidGenesisParent { .. })
                 | Err(ChainError::InvalidGenesisHeight { .. }) => {
+                    buffered += 1;
                     if self.pending.len() < MAX_PENDING {
                         self.pending.insert(header.parent_id, header.clone());
                     }
                 }
-                Err(e) => {
-                    tracing::debug!(
-                        "pipeline: rejecting header at height {}: {e}",
-                        header.height
-                    );
+                Err(_) => {
+                    rejected += 1;
                 }
             }
         }
@@ -139,14 +149,28 @@ impl ValidationPipeline {
         let height_after = chain.height();
         drop(chain);
 
+        // Purge pending entries at or below the chain tip (stale duplicates)
+        let before_purge = self.pending.len();
+        self.pending.retain(|_, h| h.height > height_after);
+        let purged = before_purge - self.pending.len();
+
         if height_after > height_before {
             tracing::info!(
                 chain_height = height_after,
-                batch_size = valid_headers.len(),
+                chained,
                 pending = self.pending.len(),
                 "pipeline: chained headers from height {height_before}"
             );
             let _ = self.progress_tx.try_send(height_after);
+        }
+
+        if buffered > 0 || rejected > 0 || purged > 0 {
+            tracing::info!(
+                batch_size = valid_headers.len(),
+                chained, buffered, rejected, purged,
+                chain_tip = height_after,
+                "pipeline: batch breakdown"
+            );
         }
     }
 }
