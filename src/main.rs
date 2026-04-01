@@ -35,10 +35,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start P2P with modifier sink (no validator)
     let p2p = Arc::new(enr_p2p::node::P2pNode::start(config, Some(modifier_tx)).await?);
 
-    // Validation pipeline
+    // Validation pipeline — progress channel feeds the sync machine
     let pipeline_chain = chain.clone();
+    let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(4);
     tokio::spawn(async move {
-        let mut pipeline = ValidationPipeline::new(modifier_rx, pipeline_chain);
+        let mut pipeline = ValidationPipeline::new(modifier_rx, pipeline_chain, progress_tx);
         pipeline.run().await;
     });
 

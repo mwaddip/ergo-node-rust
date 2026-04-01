@@ -18,6 +18,7 @@ const MAX_PENDING: usize = 10_000;
 pub struct ValidationPipeline {
     rx: mpsc::Receiver<(u8, [u8; 32], Vec<u8>)>,
     chain: Arc<Mutex<HeaderChain>>,
+    progress_tx: mpsc::Sender<u32>,
     tracker: HeaderTracker,
     pending: HashMap<BlockId, Header>,
 }
@@ -26,10 +27,12 @@ impl ValidationPipeline {
     pub fn new(
         rx: mpsc::Receiver<(u8, [u8; 32], Vec<u8>)>,
         chain: Arc<Mutex<HeaderChain>>,
+        progress_tx: mpsc::Sender<u32>,
     ) -> Self {
         Self {
             rx,
             chain,
+            progress_tx,
             tracker: HeaderTracker::new(),
             pending: HashMap::new(),
         }
@@ -143,6 +146,7 @@ impl ValidationPipeline {
                 pending = self.pending.len(),
                 "pipeline: chained headers from height {height_before}"
             );
+            let _ = self.progress_tx.try_send(height_after);
         }
     }
 }
@@ -156,11 +160,13 @@ mod tests {
     fn test_pipeline() -> (
         ValidationPipeline,
         mpsc::Sender<(u8, [u8; 32], Vec<u8>)>,
+        mpsc::Receiver<u32>,
     ) {
         let (tx, rx) = mpsc::channel(256);
+        let (progress_tx, progress_rx) = mpsc::channel(4);
         let chain = Arc::new(Mutex::new(HeaderChain::new(ChainConfig::testnet())));
-        let pipeline = ValidationPipeline::new(rx, chain);
-        (pipeline, tx)
+        let pipeline = ValidationPipeline::new(rx, chain, progress_tx);
+        (pipeline, tx, progress_rx)
     }
 
     #[test]
@@ -196,7 +202,7 @@ mod tests {
 
     #[test]
     fn rejects_unparseable_header() {
-        let (mut pipeline, _tx) = test_pipeline();
+        let (mut pipeline, _tx, _progress_rx) = test_pipeline();
         let batch = vec![(HEADER_TYPE_ID, [0xaa; 32], vec![0xff, 0x00, 0x01])];
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(pipeline.process_batch(batch));
@@ -206,7 +212,7 @@ mod tests {
 
     #[test]
     fn ignores_non_header_modifier_types() {
-        let (mut pipeline, _tx) = test_pipeline();
+        let (mut pipeline, _tx, _progress_rx) = test_pipeline();
         let batch = vec![(102, [0xaa; 32], vec![0xff; 100])];
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(pipeline.process_batch(batch));
@@ -241,7 +247,7 @@ mod tests {
         let header: Header = serde_json::from_str(json).unwrap();
         let bytes = header.scorex_serialize_bytes().unwrap();
 
-        let (mut pipeline, _tx) = test_pipeline();
+        let (mut pipeline, _tx, _progress_rx) = test_pipeline();
         let batch = vec![(HEADER_TYPE_ID, [0xaa; 32], bytes)];
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(pipeline.process_batch(batch));
