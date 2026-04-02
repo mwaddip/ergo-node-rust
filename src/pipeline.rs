@@ -167,9 +167,14 @@ impl ValidationPipeline {
         let mut store_entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = Vec::new();
 
         for (header, raw) in valid_headers {
-            // Skip headers already at or below the chain tip (duplicates
-            // from overlapping SyncInfo responses)
-            if header.height <= chain.height() {
+            // Skip headers strictly below the chain tip (duplicates).
+            // Headers AT tip height with a different ID are competing blocks —
+            // buffer them for potential 1-deep reorg.
+            if header.height < chain.height() {
+                rejected += 1;
+                continue;
+            }
+            if header.height == chain.height() && header.id == chain.tip().id {
                 rejected += 1;
                 continue;
             }
@@ -200,8 +205,71 @@ impl ValidationPipeline {
                         }
                     }
                 }
-                Err(ChainError::ParentNotFound { .. })
-                | Err(ChainError::InvalidGenesisParent { .. })
+                Err(ChainError::ParentNotFound { .. }) => {
+                    tracing::debug!(
+                        header_height,
+                        chain_height = chain.height(),
+                        id = %header_id,
+                        parent = %parent_id,
+                        "ParentNotFound"
+                    );
+                    // Check for 1-deep reorg: the header's parent might be in the
+                    // buffer (a competing block at tip height). If so, try to replace
+                    // our tip with the alternative chain.
+                    if header_height == chain.height() + 1 {
+                        // The alternative block shares our tip's parent. It would be
+                        // buffered under key = tip.parent_id (its own parent_id).
+                        let tip_parent = chain.tip().parent_id;
+                        tracing::info!(
+                            header_height,
+                            parent = %parent_id,
+                            tip_parent = %tip_parent,
+                            buffer_len = self.buffer.len(),
+                            "reorg check: looking for alternative at tip_parent"
+                        );
+                        if let Some((alt, alt_raw)) = self.buffer.pop(&tip_parent) {
+                            match chain.try_reorg(alt.clone(), header.clone()) {
+                                Ok(old_tip_id) => {
+                                    tracing::info!(
+                                        height = header_height,
+                                        old_tip = %old_tip_id,
+                                        new_tip = %header_id,
+                                        "1-deep reorg: replaced tip"
+                                    );
+                                    chained += 2; // alternative + continuation
+                                    store_entries.push((HEADER_TYPE_ID, alt.id.0.0, alt.height, alt_raw));
+                                    store_entries.push((HEADER_TYPE_ID, header_id.0.0, header_height, raw));
+                                    // Drain buffer from the new tip
+                                    let mut next_parent = header_id;
+                                    while let Some((buf, buf_raw)) = self.buffer.pop(&next_parent) {
+                                        let bid = buf.id;
+                                        let buf_height = buf.height;
+                                        match chain.try_append(buf.clone()) {
+                                            Ok(()) => {
+                                                chained += 1;
+                                                store_entries.push((HEADER_TYPE_ID, bid.0.0, buf_height, buf_raw));
+                                                self.tracker.observe(&buf);
+                                                next_parent = bid;
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                    continue;
+                                }
+                                Err(e) => {
+                                    tracing::debug!(height = header_height, "reorg failed: {e}");
+                                    // Put the alternative back in the buffer
+                                    self.buffer.push(parent_id, (alt, alt_raw));
+                                }
+                            }
+                        }
+                    }
+                    buffered += 1;
+                    if let Some((_, (evicted, _))) = self.buffer.push(parent_id, (header, raw)) {
+                        evicted_ids.push(evicted.id.0.0);
+                    }
+                }
+                Err(ChainError::InvalidGenesisParent { .. })
                 | Err(ChainError::InvalidGenesisHeight { .. }) => {
                     buffered += 1;
                     if let Some((_, (evicted, _))) = self.buffer.push(parent_id, (header, raw)) {
