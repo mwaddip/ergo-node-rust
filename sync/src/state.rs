@@ -14,7 +14,9 @@ use enr_chain::{
 use crate::traits::{SyncChain, SyncStore, SyncTransport};
 
 /// Number of block section requests to send per batch.
-const SECTION_REQUEST_BATCH_SIZE: usize = 64;
+/// Keep small — large ModifierResponse bodies can exceed JVM's TCP write buffer
+/// and get silently dropped by Akka's backpressure handler.
+const SECTION_REQUEST_BATCH_SIZE: usize = 8;
 
 fn is_block_section_type(type_id: u8) -> bool {
     matches!(type_id, BLOCK_TRANSACTIONS_TYPE_ID | AD_PROOFS_TYPE_ID | EXTENSION_TYPE_ID)
