@@ -1,5 +1,23 @@
+# Ergo Node Rust — Configuration
+#
+# Settings map to the JVM reference node's application.conf where applicable.
+# Commented-out values show defaults.
+
 [proxy]
 network = "testnet"
+
+[node]
+# Data directory for persistent storage (redb database, etc.)
+# data_dir = "/var/lib/ergo-node/data"
+
+# State type: "utxo" (full UTXO set) or "digest" (state root hash only)
+# state_type = "utxo"
+
+# Validate transactions (requires state_type = "utxo")
+# verify_transactions = true
+
+# Number of recent blocks to keep with full data (-1 = keep all from genesis)
+# blocks_to_keep = -1
 
 [listen.ipv6]
 address = "[::]:9030"

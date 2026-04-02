@@ -3,7 +3,7 @@ use std::sync::Arc;
 use enr_chain::{ChainConfig, HeaderChain, HEADER_TYPE_ID};
 use enr_store::{ModifierStore, RedbModifierStore};
 use ergo_node_rust::{P2pTransport, SharedChain, SharedStore, ValidationPipeline};
-use ergo_sync::HeaderSync;
+use ergo_sync::{HeaderSync, SyncConfig};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
@@ -12,10 +12,25 @@ use tokio::sync::Mutex;
 struct NodeConfig {
     #[serde(default = "default_data_dir")]
     data_dir: String,
+    #[serde(default = "default_state_type")]
+    state_type: String,
+    #[serde(default = "default_verify_transactions")]
+    verify_transactions: bool,
+    #[serde(default = "default_blocks_to_keep")]
+    blocks_to_keep: i64,
 }
 
 fn default_data_dir() -> String {
     "/var/lib/ergo-node/data".to_string()
+}
+fn default_state_type() -> String {
+    "utxo".to_string()
+}
+fn default_verify_transactions() -> bool {
+    true
+}
+fn default_blocks_to_keep() -> i64 {
+    -1
 }
 
 /// Top-level config wrapper — just the [node] section, P2P is parsed separately.
@@ -97,6 +112,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Modifier channel — P2P produces, pipeline consumes
     let (modifier_tx, modifier_rx) = tokio::sync::mpsc::channel(4096);
 
+    // Grab network settings before P2P takes ownership of config
+    let net_settings = config.network_settings();
+
     // Start P2P with modifier sink (no validator)
     let p2p = Arc::new(enr_p2p::node::P2pNode::start(config, Some(modifier_tx)).await?);
 
@@ -118,9 +136,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transport = P2pTransport::new(p2p.clone(), events);
     let sync_chain = SharedChain::new(chain.clone());
 
+    // Build sync config from P2P network settings
+    let net = net_settings;
+    let sync_config = SyncConfig {
+        delivery_timeout: std::time::Duration::from_secs(net.delivery_timeout_secs),
+        max_delivery_checks: net.max_delivery_checks,
+        ..SyncConfig::default()
+    };
+
     // Start sync in a background task (with delivery tracker channel)
     tokio::spawn(async move {
-        let mut sync = HeaderSync::new(transport, sync_chain, sync_store, progress_rx, delivery_rx);
+        let mut sync = HeaderSync::new(sync_config, transport, sync_chain, sync_store, progress_rx, delivery_rx);
         sync.run().await;
     });
 

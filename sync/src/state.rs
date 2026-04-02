@@ -20,24 +20,38 @@ fn is_block_section_type(type_id: u8) -> bool {
     matches!(type_id, BLOCK_TRANSACTIONS_TYPE_ID | AD_PROOFS_TYPE_ID | EXTENSION_TYPE_ID)
 }
 
-/// Minimum time between scheduled SyncInfo sends to the same peer.
-/// The JVM enforces a hard 20-second minimum per peer in
-/// `ErgoSyncTracker.MinSyncInterval`.
-const MIN_SYNC_INTERVAL: Duration = Duration::from_secs(20);
+/// Timing configuration for the sync state machine.
+/// Built from the P2P network config by the main crate.
+pub struct SyncConfig {
+    /// Minimum time between scheduled SyncInfo sends (JVM: MinSyncInterval = 20s).
+    pub sync_interval: Duration,
+    /// How long without progress before rotating peer (JVM: syncTimeout = 10s, ours = 60s).
+    pub stall_timeout: Duration,
+    /// SyncInfo poll interval when synced (JVM: syncIntervalStable = 30s).
+    pub synced_poll_interval: Duration,
+    /// Delivery check interval (JVM: 5s cycle).
+    pub delivery_check_interval: Duration,
+    /// Minimum gap between SyncInfo sends (JVM: PerPeerSyncLockTime = 100ms, ours = 200ms).
+    pub min_sync_send_interval: Duration,
+    /// Delivery timeout per modifier request (JVM: deliveryTimeout).
+    pub delivery_timeout: Duration,
+    /// Max delivery re-attempts (JVM: maxDeliveryChecks).
+    pub max_delivery_checks: u32,
+}
 
-/// How long without pipeline progress before rotating to a new peer.
-const STALL_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// How often to send SyncInfo when synced, to check for new blocks.
-const SYNCED_POLL_INTERVAL: Duration = Duration::from_secs(30);
-
-/// How often to check for timed-out delivery requests (JVM: 5s check cycle).
-const DELIVERY_CHECK_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Minimum interval between SyncInfo sends to the same peer.
-/// The JVM drops SyncInfo received within 100ms of the previous one
-/// (`PerPeerSyncLockTime`). We use 200ms for safety margin.
-const MIN_SYNC_SEND_INTERVAL: Duration = Duration::from_millis(200);
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            sync_interval: Duration::from_secs(20),
+            stall_timeout: Duration::from_secs(60),
+            synced_poll_interval: Duration::from_secs(30),
+            delivery_check_interval: Duration::from_secs(5),
+            min_sync_send_interval: Duration::from_millis(200),
+            delivery_timeout: Duration::from_secs(10),
+            max_delivery_checks: 100,
+        }
+    }
+}
 
 /// Header chain sync state machine.
 ///
@@ -47,6 +61,7 @@ const MIN_SYNC_SEND_INTERVAL: Duration = Duration::from_millis(200);
 /// - On peer SyncInfo: responds with our SyncInfo (bidirectional exchange)
 /// - On stall: rotates to a different peer
 pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore> {
+    config: SyncConfig,
     transport: T,
     chain: C,
     store: S,
@@ -73,19 +88,22 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore> {
 
 impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
     pub fn new(
+        config: SyncConfig,
         transport: T,
         chain: C,
         store: S,
         progress: mpsc::Receiver<u32>,
         delivery_rx: mpsc::Receiver<DeliveryEvent>,
     ) -> Self {
+        let tracker = DeliveryTracker::with_config(config.delivery_timeout, config.max_delivery_checks);
         Self {
+            config,
             transport,
             chain,
             store,
             progress,
             delivery_rx,
-            tracker: DeliveryTracker::new(),
+            tracker,
             sync_peer: None,
             stalled_peers: HashSet::new(),
             last_progress: Instant::now(),
@@ -212,9 +230,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
         let mut progress_send_used = false;
 
         loop {
-            let until_next = MIN_SYNC_INTERVAL
+            let until_next = self.config.sync_interval
                 .saturating_sub(self.last_scheduled_sync.elapsed());
-            let until_delivery = DELIVERY_CHECK_INTERVAL
+            let until_delivery = self.config.delivery_check_interval
                 .saturating_sub(last_delivery_check.elapsed());
 
             tokio::select! {
@@ -285,7 +303,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
                     self.last_scheduled_sync = Instant::now();
                     progress_send_used = false; // allow one progress send next cycle
 
-                    if self.last_progress.elapsed() > STALL_TIMEOUT {
+                    if self.last_progress.elapsed() > self.config.stall_timeout {
                         return SyncOutcome::Stalled;
                     }
                 }
@@ -463,7 +481,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
 
     /// Synced: periodically check for new blocks, download block sections.
     async fn synced(&mut self) {
-        let mut ticker = tokio::time::interval(SYNCED_POLL_INTERVAL);
+        let mut ticker = tokio::time::interval(self.config.synced_poll_interval);
 
         // Drain section queue on entry
         self.drain_section_queue().await;
@@ -523,10 +541,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
         }
 
         let peers = self.transport.outbound_peers().await;
-        let peer = match peers.first() {
-            Some(&p) => p,
-            None => return,
-        };
+        if peers.is_empty() {
+            return;
+        }
 
         // Drain from the front, group by type. Queue is in height order so
         // front-drain preserves the natural request ordering.
@@ -548,17 +565,20 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
             self.section_queue.pop_front();
         }
 
+        // Send to all outbound peers — we don't know which has full blocks
         let mut sent = 0usize;
         for (type_id, ids) in &by_type {
             if ids.is_empty() {
                 continue;
             }
-            self.request_announced(peer, *type_id, ids.clone()).await;
+            for &peer in &peers {
+                self.request_announced(peer, *type_id, ids.clone()).await;
+            }
             sent += ids.len();
         }
 
         if sent > 0 {
-            tracing::info!(sent, remaining = self.section_queue.len(), "requested block sections");
+            tracing::info!(sent, peer_count = peers.len(), remaining = self.section_queue.len(), "requested block sections");
         }
     }
 
@@ -569,7 +589,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
         peer: PeerId,
     ) -> Result<(), Box<dyn std::error::Error + Send>> {
         // Rate-limit: JVM drops SyncInfo received within 100ms of previous
-        if self.last_sync_sent.elapsed() < MIN_SYNC_SEND_INTERVAL {
+        if self.last_sync_sent.elapsed() < self.config.min_sync_send_interval {
             return Ok(());
         }
 
@@ -615,7 +635,7 @@ enum EventResult {
 enum SyncOutcome {
     /// Caught up with the peer's chain tip.
     Synced,
-    /// No progress for STALL_TIMEOUT — rotate peer.
+    /// No progress for stall_timeout — rotate peer.
     Stalled,
     /// A different peer has more headers — switch to it.
     SwitchPeer,

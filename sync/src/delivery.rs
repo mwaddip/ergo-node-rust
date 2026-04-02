@@ -77,6 +77,15 @@ impl DeliveryTracker {
         }
     }
 
+    pub fn with_config(timeout: Duration, max_checks: u32) -> Self {
+        Self {
+            pending: HashMap::new(),
+            evicted: Vec::new(),
+            timeout,
+            max_checks,
+        }
+    }
+
     /// Mark modifier IDs as requested from a peer.
     pub fn mark_requested(&mut self, ids: &[[u8; 32]], peer: PeerId) {
         let now = Instant::now();

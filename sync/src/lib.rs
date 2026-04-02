@@ -7,5 +7,5 @@ pub mod delivery;
 mod state;
 mod traits;
 
-pub use state::HeaderSync;
+pub use state::{HeaderSync, SyncConfig};
 pub use traits::{SyncChain, SyncStore, SyncTransport};
