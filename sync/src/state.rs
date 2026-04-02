@@ -365,6 +365,16 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
                     EventResult::Continue
                 }
 
+                ProtocolMessage::Inv { modifier_type, ref ids } => {
+                    tracing::info!(
+                        peer = %peer_id,
+                        modifier_type,
+                        count = ids.len(),
+                        "unhandled Inv type"
+                    );
+                    EventResult::Continue
+                }
+
                 other => {
                     tracing::info!(
                         peer = %peer_id,
