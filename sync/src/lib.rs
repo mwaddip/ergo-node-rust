@@ -8,4 +8,4 @@ mod state;
 mod traits;
 
 pub use state::HeaderSync;
-pub use traits::{SyncChain, SyncTransport};
+pub use traits::{SyncChain, SyncStore, SyncTransport};

@@ -2,12 +2,13 @@
 
 use std::sync::Arc;
 
-use enr_chain::{ChainError, HeaderChain, SyncInfo};
+use enr_chain::{ChainError, Header, HeaderChain, SyncInfo};
 use enr_p2p::node::P2pNode;
 use enr_p2p::protocol::messages::ProtocolMessage;
 use enr_p2p::protocol::peer::ProtocolEvent;
 use enr_p2p::types::PeerId;
-use ergo_sync::{SyncChain, SyncTransport};
+use enr_store::{ModifierStore, RedbModifierStore};
+use ergo_sync::{SyncChain, SyncStore, SyncTransport};
 use tokio::sync::{mpsc, Mutex};
 
 /// Wraps `P2pNode` + event receiver to implement `SyncTransport`.
@@ -66,5 +67,26 @@ impl SyncChain for SharedChain {
 
     fn parse_sync_info(&self, body: &[u8]) -> Result<SyncInfo, ChainError> {
         enr_chain::parse_sync_info(body)
+    }
+
+    async fn header_at(&self, height: u32) -> Option<Header> {
+        self.chain.lock().await.header_at(height).cloned()
+    }
+}
+
+/// Wraps `Arc<RedbModifierStore>` to implement `SyncStore`.
+pub struct SharedStore {
+    store: Arc<RedbModifierStore>,
+}
+
+impl SharedStore {
+    pub fn new(store: Arc<RedbModifierStore>) -> Self {
+        Self { store }
+    }
+}
+
+impl SyncStore for SharedStore {
+    async fn has_modifier(&self, type_id: u8, id: &[u8; 32]) -> bool {
+        self.store.contains(type_id, id).unwrap_or(false)
     }
 }

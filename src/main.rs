@@ -1,9 +1,29 @@
 use std::sync::Arc;
 
 use enr_chain::{ChainConfig, HeaderChain};
-use ergo_node_rust::{P2pTransport, SharedChain, ValidationPipeline};
+use enr_store::{ModifierStore, RedbModifierStore};
+use ergo_node_rust::{P2pTransport, SharedChain, SharedStore, ValidationPipeline};
 use ergo_sync::HeaderSync;
+use serde::Deserialize;
 use tokio::sync::Mutex;
+
+/// Node-level config parsed from the `[node]` section of ergo.toml.
+#[derive(Debug, Deserialize)]
+struct NodeConfig {
+    #[serde(default = "default_data_dir")]
+    data_dir: String,
+}
+
+fn default_data_dir() -> String {
+    "/var/lib/ergo-node/data".to_string()
+}
+
+/// Top-level config wrapper — just the [node] section, P2P is parsed separately.
+#[derive(Debug, Deserialize)]
+struct RootConfig {
+    #[serde(default)]
+    node: Option<NodeConfig>,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,8 +46,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         enr_p2p::types::Network::Mainnet => ChainConfig::mainnet(),
     };
 
+    // Parse node config from the same TOML file
+    let config_content = std::fs::read_to_string(&config_path)?;
+    let root_config: RootConfig = toml::from_str(&config_content)?;
+    let data_dir = std::path::PathBuf::from(
+        root_config.node.map(|n| n.data_dir).unwrap_or_else(default_data_dir),
+    );
+    std::fs::create_dir_all(&data_dir)?;
+    let store = Arc::new(RedbModifierStore::new(&data_dir.join("modifiers.redb"))?);
+
     // Shared header chain: pipeline writes, sync reads
-    let chain = Arc::new(Mutex::new(HeaderChain::new(chain_config)));
+    let mut chain = HeaderChain::new(chain_config);
+
+    // Restore chain from stored headers
+    const HEADER_TYPE_ID: u8 = 101;
+    if let Some((tip_height, _)) = store.tip(HEADER_TYPE_ID)? {
+        let mut loaded = 0u32;
+        for height in 1..=tip_height {
+            let id = match store.get_id_at(HEADER_TYPE_ID, height)? {
+                Some(id) => id,
+                None => {
+                    tracing::warn!(height, "gap in stored headers, stopping load");
+                    break;
+                }
+            };
+            let data = match store.get(HEADER_TYPE_ID, &id)? {
+                Some(d) => d,
+                None => {
+                    tracing::warn!(height, "stored header ID but no data, stopping load");
+                    break;
+                }
+            };
+            let header = match enr_chain::parse_header(&data) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!(height, "stored header parse failed: {e}, stopping load");
+                    break;
+                }
+            };
+            if let Err(e) = chain.try_append(header) {
+                tracing::error!(height, "stored header chain failed: {e}, stopping load");
+                break;
+            }
+            loaded += 1;
+        }
+        tracing::info!(loaded, tip = chain.height(), "restored header chain from store");
+    }
+
+    let chain = Arc::new(Mutex::new(chain));
 
     // Modifier channel — P2P produces, pipeline consumes
     let (modifier_tx, modifier_rx) = tokio::sync::mpsc::channel(4096);
@@ -37,11 +103,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Validation pipeline — progress channel feeds sync, delivery channel feeds tracker
     let pipeline_chain = chain.clone();
+    let sync_store = SharedStore::new(store.clone());
     let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(4);
     let (delivery_tx, delivery_rx) = tokio::sync::mpsc::channel(64);
     tokio::spawn(async move {
         let mut pipeline =
-            ValidationPipeline::new(modifier_rx, pipeline_chain, progress_tx, delivery_tx);
+            ValidationPipeline::new(modifier_rx, pipeline_chain, store, progress_tx, delivery_tx);
         pipeline.run().await;
     });
 
@@ -54,7 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start sync in a background task (with delivery tracker channel)
     tokio::spawn(async move {
-        let mut sync = HeaderSync::new(transport, sync_chain, progress_rx, delivery_rx);
+        let mut sync = HeaderSync::new(transport, sync_chain, sync_store, progress_rx, delivery_rx);
         sync.run().await;
     });
 

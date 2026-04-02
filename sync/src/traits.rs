@@ -1,7 +1,19 @@
-use enr_chain::SyncInfo;
+use enr_chain::{Header, SyncInfo};
 use enr_p2p::protocol::messages::ProtocolMessage;
 use enr_p2p::protocol::peer::ProtocolEvent;
 use enr_p2p::types::PeerId;
+
+/// How the sync machine queries persistent storage.
+///
+/// Implemented by the main crate wrapping `RedbModifierStore`.
+pub trait SyncStore {
+    /// Check whether a modifier exists in the store.
+    fn has_modifier(
+        &self,
+        type_id: u8,
+        id: &[u8; 32],
+    ) -> impl std::future::Future<Output = bool> + Send;
+}
 
 /// How the sync machine sends messages and observes the network.
 ///
@@ -32,6 +44,9 @@ pub trait SyncChain {
 
     /// Build a V2 SyncInfo body from current chain state.
     fn build_sync_info(&self) -> impl std::future::Future<Output = Vec<u8>> + Send;
+
+    /// Return the header at a given height, if it exists in the chain.
+    fn header_at(&self, height: u32) -> impl std::future::Future<Output = Option<Header>> + Send;
 
     /// Parse an incoming SyncInfo message body.
     fn parse_sync_info(&self, body: &[u8]) -> Result<SyncInfo, enr_chain::ChainError>;

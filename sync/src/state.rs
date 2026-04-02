@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use enr_p2p::protocol::messages::ProtocolMessage;
 use enr_p2p::protocol::peer::ProtocolEvent;
@@ -7,10 +7,22 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
 use crate::delivery::{DeliveryEvent, DeliveryTracker};
-use crate::traits::{SyncChain, SyncTransport};
+use crate::traits::{SyncChain, SyncStore, SyncTransport};
 
 /// Header modifier type ID (NetworkObjectTypeId).
 const HEADER_TYPE_ID: u8 = 101;
+
+/// Block section modifier type IDs.
+const BLOCK_TRANSACTIONS_TYPE_ID: u8 = 102;
+const AD_PROOFS_TYPE_ID: u8 = 104;
+const EXTENSION_TYPE_ID: u8 = 108;
+
+/// Number of block section requests to send per batch.
+const SECTION_REQUEST_BATCH_SIZE: usize = 64;
+
+fn is_block_section_type(type_id: u8) -> bool {
+    matches!(type_id, BLOCK_TRANSACTIONS_TYPE_ID | AD_PROOFS_TYPE_ID | EXTENSION_TYPE_ID)
+}
 
 /// Minimum time between scheduled SyncInfo sends to the same peer.
 /// The JVM enforces a hard 20-second minimum per peer in
@@ -38,9 +50,10 @@ const MIN_SYNC_SEND_INTERVAL: Duration = Duration::from_millis(200);
 /// - On pipeline progress: sends SyncInfo again (two-batch cycle)
 /// - On peer SyncInfo: responds with our SyncInfo (bidirectional exchange)
 /// - On stall: rotates to a different peer
-pub struct HeaderSync<T: SyncTransport, C: SyncChain> {
+pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore> {
     transport: T,
     chain: C,
+    store: S,
     progress: mpsc::Receiver<u32>,
     delivery_rx: mpsc::Receiver<DeliveryEvent>,
     tracker: DeliveryTracker,
@@ -56,18 +69,24 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain> {
     last_sync_sent: Instant,
     /// Total SyncInfo messages sent this session (diagnostics).
     sync_sent_count: u32,
+    /// Block section modifier IDs queued for download.
+    section_queue: VecDeque<(u8, [u8; 32])>,
+    /// Highest header height for which sections have been queued.
+    sections_queued_to: u32,
 }
 
-impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
+impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
     pub fn new(
         transport: T,
         chain: C,
+        store: S,
         progress: mpsc::Receiver<u32>,
         delivery_rx: mpsc::Receiver<DeliveryEvent>,
     ) -> Self {
         Self {
             transport,
             chain,
+            store,
             progress,
             delivery_rx,
             tracker: DeliveryTracker::new(),
@@ -77,12 +96,45 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
             last_scheduled_sync: Instant::now(),
             last_sync_sent: Instant::now(),
             sync_sent_count: 0,
+            section_queue: VecDeque::new(),
+            sections_queued_to: 0,
+        }
+    }
+
+    /// Queue missing block sections for headers from `from` to `to` (inclusive).
+    async fn queue_sections_for_range(&mut self, from: u32, to: u32) {
+        let mut queued = 0u32;
+        for height in from..=to {
+            let header = match self.chain.header_at(height).await {
+                Some(h) => h,
+                None => continue,
+            };
+            let sections = enr_chain::section_ids(&header);
+            for (type_id, id) in &sections {
+                if !self.store.has_modifier(*type_id, id).await {
+                    self.section_queue.push_back((*type_id, *id));
+                    queued += 1;
+                }
+            }
+        }
+        if queued > 0 {
+            tracing::info!(queued, from, to, queue_len = self.section_queue.len(), "queued block sections");
+        }
+        if to > self.sections_queued_to {
+            self.sections_queued_to = to;
         }
     }
 
     /// Run the sync loop. Returns only if all event sources close.
     pub async fn run(&mut self) {
         tracing::info!("header sync started");
+
+        // Startup catch-up: queue sections for stored headers
+        let tip = self.chain.chain_height().await;
+        if tip > 0 {
+            self.queue_sections_for_range(1, tip).await;
+        }
+
         loop {
             // Phase 1: wait for outbound peers
             if !self.pick_sync_peer().await {
@@ -180,7 +232,7 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                                     // Re-request any modifiers that were pending from this peer
                                     let orphaned = self.tracker.purge_peer(peer);
                                     if !orphaned.is_empty() {
-                                        self.rerequest_from_any(&orphaned).await;
+                                        self.rerequest_from_any(HEADER_TYPE_ID, &orphaned).await;
                                     }
                                     return SyncOutcome::PeerDisconnected;
                                 }
@@ -208,6 +260,12 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                 Some(height) = self.progress.recv() => {
                     self.last_progress = Instant::now();
                     self.stalled_peers.clear();
+
+                    // Queue block sections for newly chained headers
+                    if height > self.sections_queued_to {
+                        let from = self.sections_queued_to + 1;
+                        self.queue_sections_for_range(from, height).await;
+                    }
 
                     if !progress_send_used {
                         progress_send_used = true;
@@ -271,6 +329,29 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                     let height = self.chain.chain_height().await;
                     tracing::info!(height, "peer reports no more headers");
                     EventResult::Synced
+                }
+
+                // Inv with block section IDs: request them
+                ProtocolMessage::Inv { modifier_type, ids }
+                    if is_block_section_type(modifier_type) && !ids.is_empty() =>
+                {
+                    tracing::debug!(
+                        type_id = modifier_type,
+                        count = ids.len(),
+                        "block section Inv → requesting"
+                    );
+                    self.tracker.mark_requested(&ids, peer_id);
+                    let _ = self
+                        .transport
+                        .send_to(
+                            peer_id,
+                            ProtocolMessage::ModifierRequest {
+                                modifier_type,
+                                ids,
+                            },
+                        )
+                        .await;
+                    EventResult::Continue
                 }
 
                 // Peer's SyncInfo: respond with ours to keep the bidirectional
@@ -343,7 +424,7 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
 
         // Request evicted modifiers from any available peer
         if !result.fresh.is_empty() {
-            self.rerequest_from_any(&result.fresh).await;
+            self.rerequest_from_any(HEADER_TYPE_ID, &result.fresh).await;
         }
 
         if !result.abandoned.is_empty() {
@@ -360,14 +441,14 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
     }
 
     /// Re-request modifier IDs from any available outbound peer.
-    async fn rerequest_from_any(&mut self, ids: &[[u8; 32]]) {
+    async fn rerequest_from_any(&mut self, modifier_type: u8, ids: &[[u8; 32]]) {
         let peers = self.transport.outbound_peers().await;
         if let Some(&target) = peers.first() {
             self.tracker.mark_requested(ids, target);
             let _ = self.transport.send_to(
                 target,
                 ProtocolMessage::ModifierRequest {
-                    modifier_type: HEADER_TYPE_ID,
+                    modifier_type,
                     ids: ids.to_vec(),
                 },
             ).await;
@@ -375,9 +456,12 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
         }
     }
 
-    /// Synced: periodically check for new blocks.
+    /// Synced: periodically check for new blocks, download block sections.
     async fn synced(&mut self) {
         let mut ticker = tokio::time::interval(SYNCED_POLL_INTERVAL);
+
+        // Drain section queue on entry
+        self.drain_section_queue().await;
 
         loop {
             tokio::select! {
@@ -390,6 +474,9 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                         self.sync_peer = None;
                         return;
                     }
+
+                    // Periodically drain any newly queued sections
+                    self.drain_section_queue().await;
                 }
 
                 event = self.transport.next_event() => {
@@ -400,6 +487,13 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
                             }} = event {
                                 if modifier_type == HEADER_TYPE_ID && !ids.is_empty() {
                                     tracing::debug!(new_headers = ids.len(), "new headers while synced");
+                                    self.tracker.mark_requested(&ids, peer_id);
+                                    let _ = self.transport.send_to(
+                                        peer_id,
+                                        ProtocolMessage::ModifierRequest { modifier_type, ids },
+                                    ).await;
+                                } else if is_block_section_type(modifier_type) && !ids.is_empty() {
+                                    tracing::debug!(type_id = modifier_type, count = ids.len(), "block section Inv while synced");
                                     self.tracker.mark_requested(&ids, peer_id);
                                     let _ = self.transport.send_to(
                                         peer_id,
@@ -417,10 +511,59 @@ impl<T: SyncTransport, C: SyncChain> HeaderSync<T, C> {
 
                 Some(height) = self.progress.recv() => {
                     tracing::debug!(height, "pipeline progress while synced");
-                    // New headers validated — if we're still behind, go back to syncing
-                    // (will be detected on next SyncInfo exchange)
+
+                    // Queue sections for newly chained headers
+                    if height > self.sections_queued_to {
+                        let from = self.sections_queued_to + 1;
+                        self.queue_sections_for_range(from, height).await;
+                    }
                 }
             }
+        }
+    }
+
+    /// Send batched ModifierRequests for queued block sections.
+    async fn drain_section_queue(&mut self) {
+        if self.section_queue.is_empty() {
+            return;
+        }
+
+        let peers = self.transport.outbound_peers().await;
+        let peer = match peers.first() {
+            Some(&p) => p,
+            None => return,
+        };
+
+        let mut sent = 0usize;
+        // Group by type for efficient requests
+        for &type_id in &[BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID, EXTENSION_TYPE_ID] {
+            let ids: Vec<[u8; 32]> = self.section_queue.iter()
+                .filter(|(t, _)| *t == type_id)
+                .take(SECTION_REQUEST_BATCH_SIZE)
+                .map(|(_, id)| *id)
+                .collect();
+
+            if ids.is_empty() {
+                continue;
+            }
+
+            self.tracker.mark_requested(&ids, peer);
+            let _ = self.transport.send_to(
+                peer,
+                ProtocolMessage::ModifierRequest {
+                    modifier_type: type_id,
+                    ids: ids.clone(),
+                },
+            ).await;
+            sent += ids.len();
+
+            // Remove sent items from queue
+            let id_set: HashSet<[u8; 32]> = ids.into_iter().collect();
+            self.section_queue.retain(|(t, id)| !(*t == type_id && id_set.contains(id)));
+        }
+
+        if sent > 0 {
+            tracing::info!(sent, remaining = self.section_queue.len(), "requested block sections");
         }
     }
 
