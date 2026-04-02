@@ -14,15 +14,6 @@ pub trait SyncStore {
         id: &[u8; 32],
     ) -> impl std::future::Future<Output = bool> + Send;
 
-    /// Register the height for a modifier ID before its data arrives.
-    /// The pipeline stores section bytes without knowing the height;
-    /// the sync machine knows the height at queue time.
-    fn put_height(
-        &self,
-        type_id: u8,
-        id: &[u8; 32],
-        height: u32,
-    ) -> impl std::future::Future<Output = ()> + Send;
 }
 
 /// How the sync machine sends messages and observes the network.

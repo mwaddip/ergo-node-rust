@@ -108,7 +108,6 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
             let sections = enr_chain::section_ids(&header);
             for (type_id, id) in &sections {
                 if !self.store.has_modifier(*type_id, id).await {
-                    self.store.put_height(*type_id, id, height).await;
                     self.section_queue.push_back((*type_id, *id));
                     queued += 1;
                 }

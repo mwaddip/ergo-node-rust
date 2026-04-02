@@ -103,18 +103,4 @@ impl SyncStore for SharedStore {
         .unwrap_or(false)
     }
 
-    async fn put_height(&self, type_id: u8, id: &[u8; 32], height: u32) {
-        let store = self.store.clone();
-        let type_id = type_id;
-        let id = *id;
-        let height = height;
-        let _ = tokio::task::spawn_blocking(move || {
-            // Write empty data with the correct height — registers the height
-            // index entry. The pipeline will later overwrite with real data.
-            if let Err(e) = store.put(type_id, &id, height, &[]) {
-                tracing::warn!("store.put_height failed: {e}");
-            }
-        })
-        .await;
-    }
 }
