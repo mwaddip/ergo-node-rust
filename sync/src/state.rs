@@ -132,14 +132,15 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
         }
 
         loop {
-            // Phase 1: wait for outbound peers
-            if !self.pick_sync_peer().await {
+            // Phase 1: wait for outbound peers (skip if already targeting one)
+            if self.sync_peer.is_none() && !self.pick_sync_peer().await {
                 return; // event stream ended
             }
 
             // Phase 2: sync from the selected peer
             match self.sync_from_peer().await {
                 SyncOutcome::Synced => self.synced().await,
+                SyncOutcome::SwitchPeer => continue,
                 SyncOutcome::Stalled => {
                     if let Some(peer) = self.sync_peer.take() {
                         let height = self.chain.chain_height().await;
@@ -224,6 +225,11 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
                             match self.handle_event(peer, event).await {
                                 EventResult::Continue => {}
                                 EventResult::Synced => return SyncOutcome::Synced,
+                                EventResult::BehindPeer(ahead_peer) => {
+                                    self.sync_peer = Some(ahead_peer);
+                                    self.stalled_peers.clear();
+                                    return SyncOutcome::SwitchPeer;
+                                }
                                 EventResult::PeerGone => {
                                     // Re-request any modifiers that were pending from this peer
                                     let orphaned = self.tracker.purge_peer(peer);
@@ -353,9 +359,15 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
                         let our_height = self.chain.chain_height().await;
 
                         if let Some(&peer_tip) = peer_heights.first() {
-                            if peer_tip <= our_height {
+                            // "Caught up" only counts from the peer we're syncing from
+                            if peer_id == peer && peer_tip <= our_height {
                                 tracing::info!(our_height, peer_tip, "caught up with peer");
                                 return EventResult::Synced;
+                            }
+                            // Any peer ahead of us triggers a switch
+                            if peer_tip > our_height + 1 {
+                                tracing::info!(our_height, peer_tip, peer = %peer_id, "peer is ahead, resuming sync");
+                                return EventResult::BehindPeer(peer_id);
                             }
                         }
                     }
@@ -478,6 +490,11 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
                             let peer = self.sync_peer.unwrap_or(PeerId(0));
                             match self.handle_event(peer, event).await {
                                 EventResult::Continue | EventResult::Synced => {}
+                                EventResult::BehindPeer(ahead_peer) => {
+                                    self.sync_peer = Some(ahead_peer);
+                                    self.stalled_peers.clear();
+                                    return;
+                                }
                                 EventResult::PeerGone => {
                                     self.sync_peer = None;
                                     return;
@@ -588,6 +605,8 @@ enum EventResult {
     Continue,
     /// Caught up with the peer.
     Synced,
+    /// A peer has a significantly higher chain — resume header sync.
+    BehindPeer(PeerId),
     /// Sync peer disconnected.
     PeerGone,
 }
@@ -598,6 +617,8 @@ enum SyncOutcome {
     Synced,
     /// No progress for STALL_TIMEOUT — rotate peer.
     Stalled,
+    /// A different peer has more headers — switch to it.
+    SwitchPeer,
     /// Sync peer disconnected.
     PeerDisconnected,
     /// Event stream closed (shutdown).
