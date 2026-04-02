@@ -273,6 +273,10 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
                         DeliveryEvent::Evicted(ids) => {
                             self.tracker.schedule_rerequest(&ids);
                         }
+                        DeliveryEvent::NeedModifier { type_id, id } => {
+                            tracing::info!(type_id, "pipeline needs modifier for reorg");
+                            self.request_announced(peer, type_id, vec![id]).await;
+                        }
                     }
                 }
 

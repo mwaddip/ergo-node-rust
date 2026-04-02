@@ -23,6 +23,9 @@ pub enum DeliveryEvent {
     Received(Vec<[u8; 32]>),
     /// Modifier IDs evicted from the LRU buffer before chaining.
     Evicted(Vec<[u8; 32]>),
+    /// Pipeline needs a specific modifier to complete a reorg.
+    /// The sync machine should request it from any available peer.
+    NeedModifier { type_id: u8, id: [u8; 32] },
 }
 
 /// A pending modifier request.

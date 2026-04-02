@@ -27,6 +27,8 @@ pub struct ValidationPipeline {
     delivery_tx: mpsc::Sender<DeliveryEvent>,
     tracker: HeaderTracker,
     buffer: LruCache<BlockId, (Header, Vec<u8>)>,
+    /// Modifier ID we've already requested for reorg (avoid flooding).
+    reorg_requested: Option<[u8; 32]>,
 }
 
 impl ValidationPipeline {
@@ -45,6 +47,7 @@ impl ValidationPipeline {
             delivery_tx,
             tracker: HeaderTracker::new(),
             buffer: LruCache::new(NonZeroUsize::new(BUFFER_CAPACITY).unwrap()),
+            reorg_requested: None,
         }
     }
 
@@ -220,13 +223,6 @@ impl ValidationPipeline {
                         // The alternative block shares our tip's parent. It would be
                         // buffered under key = tip.parent_id (its own parent_id).
                         let tip_parent = chain.tip().parent_id;
-                        tracing::info!(
-                            header_height,
-                            parent = %parent_id,
-                            tip_parent = %tip_parent,
-                            buffer_len = self.buffer.len(),
-                            "reorg check: looking for alternative at tip_parent"
-                        );
                         if let Some((alt, alt_raw)) = self.buffer.pop(&tip_parent) {
                             match chain.try_reorg(alt.clone(), header.clone()) {
                                 Ok(old_tip_id) => {
@@ -237,6 +233,7 @@ impl ValidationPipeline {
                                         "1-deep reorg: replaced tip"
                                     );
                                     chained += 2; // alternative + continuation
+                                    self.reorg_requested = None;
                                     store_entries.push((HEADER_TYPE_ID, alt.id.0.0, alt.height, alt_raw));
                                     store_entries.push((HEADER_TYPE_ID, header_id.0.0, header_height, raw));
                                     // Drain buffer from the new tip
@@ -261,6 +258,18 @@ impl ValidationPipeline {
                                     // Put the alternative back in the buffer
                                     self.buffer.push(parent_id, (alt, alt_raw));
                                 }
+                            }
+                        } else if self.reorg_requested != Some(parent_id.0.0) {
+                            // Alternative not in buffer — ask the sync machine to
+                            // fetch it. parent_id is the alternative's modifier ID.
+                            self.reorg_requested = Some(parent_id.0.0);
+                            if self.delivery_tx.try_send(
+                                DeliveryEvent::NeedModifier {
+                                    type_id: HEADER_TYPE_ID,
+                                    id: parent_id.0.0,
+                                },
+                            ).is_err() {
+                                tracing::warn!("delivery channel full, couldn't request reorg modifier");
                             }
                         }
                     }
