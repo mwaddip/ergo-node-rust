@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use enr_chain::{ChainConfig, HeaderChain};
+use enr_chain::{ChainConfig, HeaderChain, HEADER_TYPE_ID};
 use enr_store::{ModifierStore, RedbModifierStore};
 use ergo_node_rust::{P2pTransport, SharedChain, SharedStore, ValidationPipeline};
 use ergo_sync::HeaderSync;
@@ -59,7 +59,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut chain = HeaderChain::new(chain_config);
 
     // Restore chain from stored headers
-    const HEADER_TYPE_ID: u8 = 101;
     if let Some((tip_height, _)) = store.tip(HEADER_TYPE_ID)? {
         let mut loaded = 0u32;
         for height in 1..=tip_height {
@@ -133,6 +132,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let height = chain.lock().await.height();
     let peers = p2p.peer_count().await;
     tracing::info!(chain_height = height, peers, "Shutting down");
+
+    // Drop P2P node to close event streams, triggering task shutdown.
+    // The pipeline exits when its modifier channel closes (sender dropped
+    // with the P2P node). The sync task exits when its event stream ends.
+    drop(p2p);
+    // Brief grace period for tasks to finish in-flight work
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     Ok(())
 }

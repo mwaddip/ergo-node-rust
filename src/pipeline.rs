@@ -1,15 +1,12 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use enr_chain::{BlockId, ChainError, Header, HeaderChain, HeaderTracker};
+use enr_chain::{BlockId, ChainError, Header, HeaderChain, HeaderTracker, HEADER_TYPE_ID};
 use enr_store::{ModifierStore, RedbModifierStore};
 use ergo_sync::delivery::DeliveryEvent;
 use lru::LruCache;
 use sigma_ser::ScorexSerializable;
 use tokio::sync::{mpsc, Mutex};
-
-/// Modifier type ID for headers (NetworkObjectTypeId in JVM source).
-const HEADER_TYPE_ID: u8 = 101;
 
 /// LRU buffer capacity for out-of-order headers (JVM: `headersCache` = 8192).
 const BUFFER_CAPACITY: usize = 8_192;
@@ -74,35 +71,39 @@ impl ValidationPipeline {
 
     /// Process a batch of raw modifiers.
     pub(crate) async fn process_batch(&mut self, batch: Vec<(u8, [u8; 32], Vec<u8>)>) {
-        // Notify delivery tracker that all modifiers arrived
-        let received_ids: Vec<[u8; 32]> = batch.iter().map(|(_, id, _)| *id).collect();
-        if !received_ids.is_empty() {
-            let _ = self.delivery_tx.try_send(DeliveryEvent::Received(received_ids));
-        }
+        // Single pass: collect IDs for delivery tracker, partition headers from sections
+        let mut received_ids = Vec::with_capacity(batch.len());
+        let mut raw_headers: Vec<&[u8]> = Vec::new();
+        let mut section_entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = Vec::new();
 
-        // Store non-header block sections directly (no validation, just bytes)
-        let non_headers: Vec<&(u8, [u8; 32], Vec<u8>)> = batch
-            .iter()
-            .filter(|(t, _, d)| *t != HEADER_TYPE_ID && !d.is_empty())
-            .collect();
-        if !non_headers.is_empty() {
-            let entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = non_headers
-                .iter()
-                .map(|(t, id, data)| (*t, *id, 0, data.clone()))  // height=0: section heights are not known here
-                .collect();
-            if let Err(e) = self.store.put_batch(&entries) {
-                tracing::error!(count = entries.len(), "store write failed for block sections: {e}");
-            } else {
-                tracing::debug!(count = non_headers.len(), "stored block sections");
+        for (type_id, id, data) in &batch {
+            received_ids.push(*id);
+            if *type_id == HEADER_TYPE_ID {
+                raw_headers.push(data.as_slice());
+            } else if !data.is_empty() {
+                // Height 0 signals "height unknown" — the store skips the height
+                // index write for height=0. The sync machine pre-registers the
+                // correct height via SyncStore::put_height before data arrives.
+                section_entries.push((*type_id, *id, 0, data.clone()));
             }
         }
 
-        // Filter to headers only
-        let raw_headers: Vec<&[u8]> = batch
-            .iter()
-            .filter(|(t, _, _)| *t == HEADER_TYPE_ID)
-            .map(|(_, _, data)| data.as_slice())
-            .collect();
+        // Notify delivery tracker
+        if !received_ids.is_empty() {
+            if self.delivery_tx.try_send(DeliveryEvent::Received(received_ids)).is_err() {
+                tracing::warn!("delivery channel full, dropped Received notification");
+            }
+        }
+
+        // Store non-header block sections directly (no validation)
+        if !section_entries.is_empty() {
+            let count = section_entries.len();
+            if let Err(e) = self.store.put_batch(&section_entries) {
+                tracing::error!(count, "store write failed for block sections: {e}");
+            } else {
+                tracing::debug!(count, "stored block sections");
+            }
+        }
 
         if raw_headers.is_empty() {
             return;
@@ -153,6 +154,7 @@ impl ValidationPipeline {
 
         // Sort by height — within a batch this eliminates most buffering
         valid_headers.sort_by_key(|(h, _)| h.height);
+        let batch_size = valid_headers.len();
 
         // Lock chain once for the whole batch
         let mut chain = self.chain.lock().await;
@@ -164,31 +166,33 @@ impl ValidationPipeline {
         let mut evicted_ids: Vec<[u8; 32]> = Vec::new();
         let mut store_entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = Vec::new();
 
-        for (header, raw) in &valid_headers {
+        for (header, raw) in valid_headers {
             // Skip headers already at or below the chain tip (duplicates
             // from overlapping SyncInfo responses)
             if header.height <= chain.height() {
                 rejected += 1;
                 continue;
             }
-            self.tracker.observe(header);
+            self.tracker.observe(&header);
+            let header_id = header.id;
+            let header_height = header.height;
+            let parent_id = header.parent_id;
             match chain.try_append(header.clone()) {
                 Ok(()) => {
                     chained += 1;
-                    store_entries.push((HEADER_TYPE_ID, header.id.0.0, header.height, raw.clone()));
-                    // Log IDs at SyncInfo offset heights for diagnostic comparison
-                    let h = header.height;
-                    if h % 400 < 2 || h == 4789 || h == 4773 || h == 4661 || h == 4277 {
-                        tracing::info!(height = h, id = %header.id, "chained header ID");
+                    store_entries.push((HEADER_TYPE_ID, header_id.0.0, header_height, raw));
+                    if header_height % 400 < 2 {
+                        tracing::info!(height = header_height, id = %header_id, "chained header ID");
                     }
                     // Drain buffer: follow the chain of buffered children
-                    let mut next_parent = header.id;
+                    let mut next_parent = header_id;
                     while let Some((buf, buf_raw)) = self.buffer.pop(&next_parent) {
                         let bid = buf.id;
+                        let buf_height = buf.height;
                         match chain.try_append(buf.clone()) {
                             Ok(()) => {
                                 chained += 1;
-                                store_entries.push((HEADER_TYPE_ID, buf.id.0.0, buf.height, buf_raw));
+                                store_entries.push((HEADER_TYPE_ID, bid.0.0, buf_height, buf_raw));
                                 self.tracker.observe(&buf);
                                 next_parent = bid;
                             }
@@ -200,8 +204,7 @@ impl ValidationPipeline {
                 | Err(ChainError::InvalidGenesisParent { .. })
                 | Err(ChainError::InvalidGenesisHeight { .. }) => {
                     buffered += 1;
-                    if let Some((_, (evicted, _))) = self.buffer.push(header.parent_id, (header.clone(), raw.clone())) {
-                        // LRU eviction — track for re-request
+                    if let Some((_, (evicted, _))) = self.buffer.push(parent_id, (header, raw)) {
                         evicted_ids.push(evicted.id.0.0);
                     }
                 }
@@ -235,7 +238,9 @@ impl ValidationPipeline {
         // Notify delivery tracker of evicted modifier IDs for re-request
         if !evicted_ids.is_empty() {
             tracing::debug!(count = evicted_ids.len(), "buffer evictions → re-request");
-            let _ = self.delivery_tx.try_send(DeliveryEvent::Evicted(evicted_ids));
+            if self.delivery_tx.try_send(DeliveryEvent::Evicted(evicted_ids)).is_err() {
+                tracing::warn!("delivery channel full, dropped Evicted notification");
+            }
         }
 
         if height_after > height_before {
@@ -245,12 +250,14 @@ impl ValidationPipeline {
                 buffer = self.buffer.len(),
                 "pipeline: chained headers from height {height_before}"
             );
-            let _ = self.progress_tx.try_send(height_after);
+            if self.progress_tx.try_send(height_after).is_err() {
+                tracing::warn!("progress channel full, dropped height {height_after}");
+            }
         }
 
         if buffered > 0 || rejected > 0 || purged > 0 {
             tracing::info!(
-                batch_size = valid_headers.len(),
+                batch_size,
                 chained, buffered, rejected, purged,
                 chain_tip = height_after,
                 "pipeline: batch breakdown"

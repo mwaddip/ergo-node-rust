@@ -87,6 +87,34 @@ impl SharedStore {
 
 impl SyncStore for SharedStore {
     async fn has_modifier(&self, type_id: u8, id: &[u8; 32]) -> bool {
-        self.store.contains(type_id, id).unwrap_or(false)
+        let store = self.store.clone();
+        let type_id = type_id;
+        let id = *id;
+        tokio::task::spawn_blocking(move || {
+            match store.contains(type_id, &id) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("store.contains failed: {e}");
+                    false
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    async fn put_height(&self, type_id: u8, id: &[u8; 32], height: u32) {
+        let store = self.store.clone();
+        let type_id = type_id;
+        let id = *id;
+        let height = height;
+        let _ = tokio::task::spawn_blocking(move || {
+            // Write empty data with the correct height — registers the height
+            // index entry. The pipeline will later overwrite with real data.
+            if let Err(e) = store.put(type_id, &id, height, &[]) {
+                tracing::warn!("store.put_height failed: {e}");
+            }
+        })
+        .await;
     }
 }
