@@ -1,6 +1,6 @@
 //! Convert transactions to AVL+ tree operations.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;

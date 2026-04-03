@@ -411,14 +411,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     /// required block sections (per `config.state_type`) are in the store.
     /// Advances as far as possible in one call — stops at the first gap.
     async fn advance_downloaded_height(&mut self) {
-        eprintln!(">>> advance_downloaded_height called: downloaded={} validated={}", self.downloaded_height, self.validated_height);
         let chain_height = self.chain.chain_height().await;
         if self.downloaded_height >= chain_height {
-            tracing::warn!(
-                downloaded_height = self.downloaded_height,
-                chain_height,
-                "download height scan: already at or above chain height"
-            );
             return;
         }
 
@@ -434,12 +428,6 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             let mut complete = true;
             for (type_id, id) in &sections {
                 if !self.store.has_modifier(*type_id, id).await {
-                    tracing::warn!(
-                        height,
-                        type_id,
-                        id = hex::encode(id),
-                        "section missing — stopping download height scan"
-                    );
                     complete = false;
                     break;
                 }

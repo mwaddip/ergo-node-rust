@@ -16,9 +16,11 @@ use crate::{BlockValidator, ValidationError};
 const KEY_LENGTH: usize = 32;
 
 /// Resolver for the AVL verifier — returns a LabelOnly node preserving the digest.
+///
 /// The verifier's partial tree has LabelOnly sibling stubs with labels from the proof.
-/// When resolve() is called on them, we must preserve the label so subsequent
-/// accesses don't panic on unwrap().
+/// `AVLTree::left()/right()` calls `resolve()` on every child access, including
+/// LabelOnly stubs. The resolver must preserve the label so the stub remains valid
+/// for subsequent accesses (label computation, rebalancing checks).
 fn label_preserving_resolver(digest: &[u8; 32]) -> Node {
     Node::LabelOnly(NodeHeader::new(Some(*digest), None))
 }
@@ -83,13 +85,6 @@ impl BlockValidator for DigestValidator {
         let _parsed_ext = parse_extension(extension)?;
 
         // 2. Verify AD proofs digest matches header
-        tracing::info!(
-            height = header.height,
-            section_header_id = hex::encode(&parsed_proofs.header_id),
-            expected_header_id = hex::encode(&<[u8; 32]>::from(header.id.0)),
-            proof_first_8 = hex::encode(&parsed_proofs.proof_bytes[..parsed_proofs.proof_bytes.len().min(8)]),
-            "AD proof section details"
-        );
         let proof_digest: [u8; 32] = blake2::Blake2b::<blake2::digest::typenum::U32>::digest(
             &parsed_proofs.proof_bytes,
         )
@@ -107,6 +102,7 @@ impl BlockValidator for DigestValidator {
         let changes = compute_state_changes(summaries)?;
 
         // 4. Build AVL operations in JVM order: Lookups, Removes, Inserts
+        //    (Removes and Inserts are sorted by box ID — see state_changes.rs)
         let mut operations: Vec<Operation> = Vec::new();
 
         for lookup_id in &changes.lookups {
@@ -127,23 +123,6 @@ impl BlockValidator for DigestValidator {
         let starting_digest = Bytes::copy_from_slice(&starting_digest_bytes);
         let proof_bytes = Bytes::copy_from_slice(&parsed_proofs.proof_bytes);
 
-        for (i, op) in operations.iter().enumerate() {
-            match op {
-                Operation::Lookup(k) => tracing::info!(i, key = hex::encode(k.as_ref()), "op: Lookup"),
-                Operation::Remove(k) => tracing::info!(i, key = hex::encode(k.as_ref()), "op: Remove"),
-                Operation::Insert(kv) => tracing::info!(i, key = hex::encode(kv.key.as_ref()), val_len = kv.value.len(), "op: Insert"),
-                _ => tracing::info!(i, "op: other"),
-            }
-        }
-
-        tracing::info!(
-            height = header.height,
-            starting_digest = hex::encode(&starting_digest_bytes),
-            proof_len = parsed_proofs.proof_bytes.len(),
-            ops = operations.len(),
-            "verifying AD proof"
-        );
-
         let tree = AVLTree::new(label_preserving_resolver, KEY_LENGTH, None);
         let mut verifier = BatchAVLVerifier::new(
             &starting_digest,
@@ -155,23 +134,11 @@ impl BlockValidator for DigestValidator {
         .map_err(|e| ValidationError::ProofVerificationFailed(format!("{e}")))?;
 
         for (i, op) in operations.iter().enumerate() {
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                verifier.perform_one_operation(op)
-            })) {
-                Ok(Ok(result)) => {
-                    tracing::info!(i, has_old_value = result.is_some(), "operation succeeded");
-                }
-                Ok(Err(e)) => {
-                    return Err(ValidationError::ProofVerificationFailed(
-                        format!("operation {i} failed: {e}"),
-                    ));
-                }
-                Err(_) => {
-                    return Err(ValidationError::ProofVerificationFailed(
-                        format!("operation {i} panicked (resolve on missing node)"),
-                    ));
-                }
-            }
+            verifier
+                .perform_one_operation(op)
+                .map_err(|e| ValidationError::ProofVerificationFailed(
+                    format!("operation {i} failed: {e}"),
+                ))?;
         }
 
         // 6. Check resulting digest matches header.state_root
