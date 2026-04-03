@@ -111,6 +111,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         delivery_rx: mpsc::Receiver<DeliveryEvent>,
     ) -> Self {
         let tracker = DeliveryTracker::with_config(config.delivery_timeout, config.max_delivery_checks);
+        let initial_validated = validator.validated_height();
         Self {
             config,
             transport,
@@ -128,8 +129,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             sync_sent_count: 0,
             section_queue: VecDeque::new(),
             sections_queued_to: 0,
-            downloaded_height: 0,
-            validated_height: 0,
+            downloaded_height: initial_validated,
+            validated_height: initial_validated,
         }
     }
 
