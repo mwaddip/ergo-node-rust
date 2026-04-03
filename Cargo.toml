@@ -12,7 +12,9 @@ enr-chain = { path = "chain" }
 enr-p2p = { path = "p2p" }
 enr-store = { path = "store" }
 ergo-sync = { path = "sync" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "6e76e82" }
 ergo-validation = { path = "validation" }
+hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "6e76e82" }
 toml = "0.8"
