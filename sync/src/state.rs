@@ -337,20 +337,27 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
     }
 
     /// Request announced modifiers from a peer and track delivery.
+    ///
+    /// Chunks into messages of at most 400 IDs to stay within the JVM's
+    /// `desiredInvObjects` limit. Larger requests are silently rejected.
     async fn request_announced(&mut self, peer: PeerId, modifier_type: u8, ids: Vec<[u8; 32]>) {
         self.tracker.mark_requested(&ids, peer);
-        if let Err(e) = self
-            .transport
-            .send_to(
-                peer,
-                ProtocolMessage::ModifierRequest {
-                    modifier_type,
-                    ids,
-                },
-            )
-            .await
-        {
-            tracing::warn!(peer = %peer, "modifier request send failed: {e}");
+        // JVM rejects ModifierRequest with >400 elements
+        for chunk in ids.chunks(400) {
+            if let Err(e) = self
+                .transport
+                .send_to(
+                    peer,
+                    ProtocolMessage::ModifierRequest {
+                        modifier_type,
+                        ids: chunk.to_vec(),
+                    },
+                )
+                .await
+            {
+                tracing::warn!(peer = %peer, "modifier request send failed: {e}");
+                break;
+            }
         }
     }
 
