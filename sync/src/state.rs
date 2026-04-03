@@ -12,6 +12,7 @@ use enr_chain::{
 };
 
 use crate::traits::{SyncChain, SyncStore, SyncTransport};
+use ergo_validation::BlockValidator;
 
 /// Number of block section requests to send per batch (per type).
 /// The JVM's Akka layer can silently drop large ModifierResponse bodies via
@@ -67,11 +68,12 @@ impl Default for SyncConfig {
 /// - On pipeline progress: sends SyncInfo again (two-batch cycle)
 /// - On peer SyncInfo: responds with our SyncInfo (bidirectional exchange)
 /// - On stall: rotates to a different peer
-pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore> {
+pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> {
     config: SyncConfig,
     transport: T,
     chain: C,
     store: S,
+    validator: V,
     progress: mpsc::Receiver<u32>,
     delivery_rx: mpsc::Receiver<DeliveryEvent>,
     tracker: DeliveryTracker,
@@ -94,14 +96,17 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore> {
     /// Highest height where ALL required block sections are in the store.
     /// Blocks at or below this height are ready for validation.
     downloaded_height: u32,
+    /// Highest height where block sections have been validated.
+    validated_height: u32,
 }
 
-impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
+impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync<T, C, S, V> {
     pub fn new(
         config: SyncConfig,
         transport: T,
         chain: C,
         store: S,
+        validator: V,
         progress: mpsc::Receiver<u32>,
         delivery_rx: mpsc::Receiver<DeliveryEvent>,
     ) -> Self {
@@ -111,6 +116,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
             transport,
             chain,
             store,
+            validator,
             progress,
             delivery_rx,
             tracker,
@@ -123,6 +129,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
             section_queue: VecDeque::new(),
             sections_queued_to: 0,
             downloaded_height: 0,
+            validated_height: 0,
         }
     }
 
@@ -303,7 +310,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
                             self.section_queue.clear();
                             self.sections_queued_to = fork_point;
 
-                            // Reset watermark if it was above the fork point
+                            // Reset watermarks if they were above the fork point
                             if self.downloaded_height > fork_point {
                                 tracing::info!(
                                     old = self.downloaded_height,
@@ -311,6 +318,12 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
                                     "resetting downloaded_height to fork point"
                                 );
                                 self.downloaded_height = fork_point;
+                            }
+                            if self.validated_height > fork_point {
+                                if let Some(fork_header) = self.chain.header_at(fork_point).await {
+                                    self.validator.reset_to(fork_point, fork_header.state_root);
+                                }
+                                self.validated_height = fork_point;
                             }
 
                             // Re-queue sections for the new best chain
@@ -431,7 +444,101 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
                 downloaded_height = new_height,
                 advanced,
                 chain_height,
-                "full block height advanced"
+                "downloaded height advanced"
+            );
+            self.advance_validated_height().await;
+        }
+    }
+
+    /// Advance the validated height by running the block validator on
+    /// downloaded-but-not-yet-validated blocks.
+    async fn advance_validated_height(&mut self) {
+        if self.validated_height >= self.downloaded_height {
+            return;
+        }
+
+        let start = self.validated_height + 1;
+        let mut validated_to = self.validated_height;
+
+        for height in start..=self.downloaded_height {
+            let header = match self.chain.header_at(height).await {
+                Some(h) => h,
+                None => break,
+            };
+
+            let sections = enr_chain::required_section_ids(&header, self.config.state_type);
+
+            let mut block_txs = None;
+            let mut ad_proofs = None;
+            let mut extension = None;
+
+            for (type_id, id) in &sections {
+                let data = match self.store.get_modifier(*type_id, id).await {
+                    Some(d) => d,
+                    None => {
+                        tracing::warn!(height, type_id, "section bytes missing during validation");
+                        return;
+                    }
+                };
+                match *type_id {
+                    BLOCK_TRANSACTIONS_TYPE_ID => block_txs = Some(data),
+                    AD_PROOFS_TYPE_ID => ad_proofs = Some(data),
+                    EXTENSION_TYPE_ID => extension = Some(data),
+                    _ => {}
+                }
+            }
+
+            let block_txs = match block_txs {
+                Some(d) => d,
+                None => {
+                    tracing::warn!(height, "BlockTransactions missing");
+                    return;
+                }
+            };
+            let extension = match extension {
+                Some(d) => d,
+                None => {
+                    tracing::warn!(height, "Extension missing");
+                    return;
+                }
+            };
+
+            // Get preceding headers (up to 10) for future ErgoStateContext
+            let preceding_start = height.saturating_sub(10).max(1);
+            let mut preceding = Vec::new();
+            for h in (preceding_start..height).rev() {
+                if let Some(hdr) = self.chain.header_at(h).await {
+                    preceding.push(hdr);
+                }
+            }
+
+            let result = self.validator.validate_block(
+                &header,
+                &block_txs,
+                ad_proofs.as_deref(),
+                &extension,
+                &preceding,
+            );
+
+            match result {
+                Ok(()) => {
+                    validated_to = height;
+                }
+                Err(e) => {
+                    tracing::error!(height, error = %e, "block validation failed");
+                    break;
+                }
+            }
+        }
+
+        if validated_to > self.validated_height {
+            let advanced = validated_to - self.validated_height;
+            self.validated_height = validated_to;
+            tracing::info!(
+                validated_height = validated_to,
+                advanced,
+                downloaded_height = self.downloaded_height,
+                "validated height advanced"
             );
         }
     }

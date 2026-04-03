@@ -14,6 +14,12 @@ pub trait SyncStore {
         id: &[u8; 32],
     ) -> impl std::future::Future<Output = bool> + Send;
 
+    /// Retrieve raw modifier bytes from the store.
+    fn get_modifier(
+        &self,
+        type_id: u8,
+        id: &[u8; 32],
+    ) -> impl std::future::Future<Output = Option<Vec<u8>>> + Send;
 }
 
 /// How the sync machine sends messages and observes the network.
