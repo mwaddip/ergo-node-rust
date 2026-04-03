@@ -1,0 +1,24 @@
+# Local dev config — Rust node chained through local JVM
+
+[proxy]
+network = "testnet"
+
+[node]
+data_dir = ".local-data"
+state_type = "utxo"
+blocks_to_keep = 0
+
+[listen.ipv6]
+address = "[::]:9030"
+mode = "full"
+max_inbound = 20
+
+[outbound]
+min_peers = 1
+max_peers = 1
+seed_peers = ["127.0.0.1:9023"]
+
+[identity]
+agent_name = "ergo-node-rust"
+peer_name = "ergo-node-rust"
+protocol_version = "6.0.3"

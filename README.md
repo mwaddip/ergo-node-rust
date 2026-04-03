@@ -4,7 +4,7 @@ A ground-up Ergo blockchain full node in Rust. Not a port of the JVM reference n
 
 ## Status
 
-**Highly experimental.** Syncing the header chain and downloading block sections on testnet. Headers are validated (PoW, difficulty, parent linkage) and persisted to disk via redb. Block body download (transactions, AD proofs, extensions) is in progress — the sync machine queues missing sections and requests them after header sync reaches the network tip. Survives restarts without re-syncing.
+**Highly experimental.** Syncing the header chain and downloading block sections on testnet. Headers are validated (PoW, difficulty, parent linkage) and persisted to disk via redb. Block section download is mode-aware (UTXO mode downloads BlockTransactions + Extension; digest mode scaffolding is in place for ADProofs). The sync machine tracks `full_block_height` — the highest height with all required sections present. Survives restarts without re-syncing.
 
 ## Roadmap
 
@@ -15,7 +15,9 @@ A ground-up Ergo blockchain full node in Rust. Not a port of the JVM reference n
 | 3 | **Header chain validation** — parent hashes, timestamps, difficulty adjustment | Done |
 | 3b | **Header chain sync** — SyncInfo exchange, async validation pipeline, peer rotation | Done |
 | 3c | **Persistent storage** — headers and block sections survive restarts (redb) | Done |
-| 3d | **Block section download** — request BlockTransactions, ADProofs, Extensions | Done |
+| 3d | **Block section download** — request BlockTransactions + Extensions (UTXO mode) | Done |
+| 3e | **Block assembly** — track `full_block_height` watermark for complete blocks | Done |
+| 3f | **Honest Mode advertisement** — handshake advertises actual capabilities (`blocks_to_keep`) | Done |
 | 4 | Transaction validation — validate against input boxes via `ergo-lib` | Next |
 | 5 | UTXO state management — AVL+ tree backed, apply/rollback blocks | Planned |
 | 6 | Full node — chain sync state machine, mempool, REST API | Planned |
@@ -31,7 +33,9 @@ A ground-up Ergo blockchain full node in Rust. Not a port of the JVM reference n
 - **Full chain validation**: parent linkage, timestamp bounds, difficulty adjustment, PoW
 - **Event-driven sync**: progress-triggered and timer-based SyncInfo cycles, peer rotation on stall
 - **Persistent storage**: headers written to redb after validation, restored on startup — no re-sync after restart
-- **Block section download**: sync machine computes section modifier IDs from headers, queues missing sections, downloads after reaching header tip
+- **Block section download**: mode-aware — UTXO mode downloads BlockTransactions + Extension, digest mode scaffolding downloads ADProofs too
+- **Block assembly tracking**: `full_block_height` watermark advances as sections arrive, identifies blocks ready for validation
+- **Honest Mode feature**: handshake advertises `state_type`, `verifying`, and `blocks_to_keep` from node config — peers don't request blocks we can't serve
 - Continuous header sync from genesis on testnet — no connection stalls
 - Wire format fully compatible: verified byte-identical serialization against JVM test vectors
 - Tested: a JVM reference node syncs its full header chain exclusively through this relay

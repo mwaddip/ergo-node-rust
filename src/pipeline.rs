@@ -104,7 +104,7 @@ impl ValidationPipeline {
             if let Err(e) = self.store.put_batch(&section_entries) {
                 tracing::error!(count, "store write failed for block sections: {e}");
             } else {
-                tracing::debug!(count, "stored block sections");
+                tracing::info!(count, "stored block sections");
             }
         }
 

@@ -8,15 +8,16 @@ use tokio::time::{Duration, Instant};
 
 use crate::delivery::{DeliveryEvent, DeliveryTracker};
 use enr_chain::{
-    HEADER_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID, EXTENSION_TYPE_ID,
+    StateType, HEADER_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID, EXTENSION_TYPE_ID,
 };
 
 use crate::traits::{SyncChain, SyncStore, SyncTransport};
 
-/// Number of block section requests to send per batch.
-/// Keep small — large ModifierResponse bodies can exceed JVM's TCP write buffer
-/// and get silently dropped by Akka's backpressure handler.
-const SECTION_REQUEST_BATCH_SIZE: usize = 8;
+/// Number of block section requests to send per batch (per type).
+/// The JVM's Akka layer can silently drop large ModifierResponse bodies via
+/// backpressure, so this is capped below the JVM's `desiredInvObjects` (400).
+/// 64 per type × 2 types = 128 sections per cycle = 64 blocks/cycle.
+const SECTION_REQUEST_BATCH_SIZE: usize = 64;
 
 fn is_block_section_type(type_id: u8) -> bool {
     matches!(type_id, BLOCK_TRANSACTIONS_TYPE_ID | AD_PROOFS_TYPE_ID | EXTENSION_TYPE_ID)
@@ -39,6 +40,9 @@ pub struct SyncConfig {
     pub delivery_timeout: Duration,
     /// Max delivery re-attempts (JVM: maxDeliveryChecks).
     pub max_delivery_checks: u32,
+    /// Node state type — determines which block sections to download.
+    /// UTXO mode skips AD proofs; digest mode downloads all sections.
+    pub state_type: StateType,
 }
 
 impl Default for SyncConfig {
@@ -51,6 +55,7 @@ impl Default for SyncConfig {
             min_sync_send_interval: Duration::from_millis(200),
             delivery_timeout: Duration::from_secs(10),
             max_delivery_checks: 100,
+            state_type: StateType::Utxo,
         }
     }
 }
@@ -86,6 +91,10 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore> {
     section_queue: VecDeque<(u8, [u8; 32])>,
     /// Highest header height for which sections have been queued.
     sections_queued_to: u32,
+    /// Highest height where ALL required block sections are in the store.
+    /// Mirrors JVM's `fullHeight`. Blocks at or below this height are
+    /// ready for validation (once tx validation is wired).
+    full_block_height: u32,
 }
 
 impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
@@ -114,10 +123,17 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
             sync_sent_count: 0,
             section_queue: VecDeque::new(),
             sections_queued_to: 0,
+            full_block_height: 0,
         }
     }
 
     /// Queue missing block sections for headers from `from` to `to` (inclusive).
+    ///
+    /// Which sections are queued depends on `config.state_type`:
+    /// - UTXO mode: BlockTransactions + Extension (no AD proofs)
+    /// - Digest mode: all three including AD proofs
+    ///
+    /// Mirrors JVM's `ToDownloadProcessor.requiredModifiersForHeader`.
     async fn queue_sections_for_range(&mut self, from: u32, to: u32) {
         let mut queued = 0u32;
         for height in from..=to {
@@ -125,7 +141,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
                 Some(h) => h,
                 None => continue,
             };
-            let sections = enr_chain::section_ids(&header);
+            let sections = enr_chain::required_section_ids(&header, self.config.state_type);
             for (type_id, id) in &sections {
                 if !self.store.has_modifier(*type_id, id).await {
                     self.section_queue.push_back((*type_id, *id));
@@ -149,6 +165,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
         let tip = self.chain.chain_height().await;
         if tip > 0 {
             self.queue_sections_for_range(1, tip).await;
+            self.advance_full_block_height().await;
         }
 
         loop {
@@ -271,6 +288,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
                             for id in &ids {
                                 self.tracker.mark_received(id);
                             }
+                            self.advance_full_block_height().await;
                         }
                         DeliveryEvent::Evicted(ids) => {
                             self.tracker.schedule_rerequest(&ids);
@@ -296,11 +314,12 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
                     }
                 }
 
-                // Delivery check: re-request timed-out modifiers
+                // Delivery check: re-request timed-out modifiers + advance watermark
                 _ = tokio::time::sleep(until_delivery) => {
                     last_delivery_check = Instant::now();
                     let result = self.tracker.check_timeouts();
                     self.handle_delivery_check(result, peer).await;
+                    self.advance_full_block_height().await;
                 }
 
                 // Scheduled SyncInfo: 20-second cycle start
@@ -340,6 +359,51 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
         if height > self.sections_queued_to {
             let from = self.sections_queued_to + 1;
             self.queue_sections_for_range(from, height).await;
+        }
+    }
+
+    /// Advance the full block height watermark by scanning forward.
+    ///
+    /// For each height above the current watermark, checks whether all
+    /// required block sections (per `config.state_type`) are in the store.
+    /// Advances as far as possible in one call — stops at the first gap.
+    async fn advance_full_block_height(&mut self) {
+        let chain_height = self.chain.chain_height().await;
+        if self.full_block_height >= chain_height {
+            return;
+        }
+
+        let start = self.full_block_height + 1;
+        let mut new_height = self.full_block_height;
+
+        for height in start..=chain_height {
+            let header = match self.chain.header_at(height).await {
+                Some(h) => h,
+                None => break,
+            };
+            let sections = enr_chain::required_section_ids(&header, self.config.state_type);
+            let mut complete = true;
+            for (type_id, id) in &sections {
+                if !self.store.has_modifier(*type_id, id).await {
+                    complete = false;
+                    break;
+                }
+            }
+            if !complete {
+                break;
+            }
+            new_height = height;
+        }
+
+        if new_height > self.full_block_height {
+            let advanced = new_height - self.full_block_height;
+            self.full_block_height = new_height;
+            tracing::info!(
+                full_block_height = new_height,
+                advanced,
+                chain_height,
+                "full block height advanced"
+            );
         }
     }
 
@@ -506,6 +570,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
 
                     // Periodically drain any newly queued sections
                     self.drain_section_queue().await;
+                    self.advance_full_block_height().await;
                 }
 
                 event = self.transport.next_event() => {

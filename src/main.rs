@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use enr_chain::{ChainConfig, HeaderChain, HEADER_TYPE_ID};
+use enr_chain::{ChainConfig, HeaderChain, StateType, HEADER_TYPE_ID};
 use enr_store::{ModifierStore, RedbModifierStore};
 use ergo_node_rust::{P2pTransport, SharedChain, SharedStore, ValidationPipeline};
 use ergo_sync::{HeaderSync, SyncConfig};
@@ -18,6 +18,17 @@ struct NodeConfig {
     verify_transactions: bool,
     #[serde(default = "default_blocks_to_keep")]
     blocks_to_keep: i64,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            data_dir: default_data_dir(),
+            state_type: default_state_type(),
+            verify_transactions: default_verify_transactions(),
+            blocks_to_keep: default_blocks_to_keep(),
+        }
+    }
 }
 
 fn default_data_dir() -> String {
@@ -64,9 +75,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse node config from the same TOML file
     let config_content = std::fs::read_to_string(&config_path)?;
     let root_config: RootConfig = toml::from_str(&config_content)?;
-    let data_dir = std::path::PathBuf::from(
-        root_config.node.map(|n| n.data_dir).unwrap_or_else(default_data_dir),
-    );
+    let node_config = root_config.node.unwrap_or_default();
+    let state_type = match node_config.state_type.as_str() {
+        "utxo" => StateType::Utxo,
+        "digest" => StateType::Digest,
+        other => {
+            return Err(format!("unknown state_type '{}' (expected 'utxo' or 'digest')", other).into());
+        }
+    };
+    let verify_transactions = node_config.verify_transactions;
+    let blocks_to_keep = node_config.blocks_to_keep;
+    tracing::info!(state_type = ?state_type, verify_transactions, blocks_to_keep, "node config");
+    let data_dir = std::path::PathBuf::from(node_config.data_dir);
     std::fs::create_dir_all(&data_dir)?;
     let store = Arc::new(RedbModifierStore::new(&data_dir.join("modifiers.redb"))?);
 
@@ -115,8 +135,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Grab network settings before P2P takes ownership of config
     let net_settings = config.network_settings();
 
+    // Build Mode feature from node config — tells peers what we can serve
+    let mode_config = enr_p2p::transport::handshake::ModeConfig {
+        state_type_id: match state_type {
+            StateType::Utxo => 0,
+            StateType::Digest => 1,
+        },
+        verifying: verify_transactions,
+        blocks_to_keep: blocks_to_keep as i32,
+    };
+
     // Start P2P with modifier sink (no validator)
-    let p2p = Arc::new(enr_p2p::node::P2pNode::start(config, Some(modifier_tx)).await?);
+    let p2p = Arc::new(enr_p2p::node::P2pNode::start(config, Some(modifier_tx), mode_config).await?);
 
     // Validation pipeline — progress channel feeds sync, delivery channel feeds tracker
     let pipeline_chain = chain.clone();
@@ -141,6 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sync_config = SyncConfig {
         delivery_timeout: std::time::Duration::from_secs(net.delivery_timeout_secs),
         max_delivery_checks: net.max_delivery_checks,
+        state_type,
         ..SyncConfig::default()
     };
 
