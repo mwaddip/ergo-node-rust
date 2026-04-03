@@ -4,7 +4,9 @@ mod state_changes;
 
 use ergo_chain_types::{ADDigest, Header};
 
+pub use digest::DigestValidator;
 pub use sections::{ParsedAdProofs, ParsedBlockTransactions, ParsedExtension};
+pub use state_changes::StateChanges;
 
 /// Validates block sections against the current UTXO state.
 ///
