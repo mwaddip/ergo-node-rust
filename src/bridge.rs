@@ -103,4 +103,18 @@ impl SyncStore for SharedStore {
         .unwrap_or(false)
     }
 
+    async fn get_modifier(&self, type_id: u8, id: &[u8; 32]) -> Option<Vec<u8>> {
+        let store = self.store.clone();
+        let type_id = type_id;
+        let id = *id;
+        tokio::task::spawn_blocking(move || match store.get(type_id, &id) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("store.get failed: {e}");
+                None
+            }
+        })
+        .await
+        .unwrap_or(None)
+    }
 }

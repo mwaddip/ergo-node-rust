@@ -7,5 +7,7 @@ description = "Chain sync state machine for the Ergo Rust node"
 [dependencies]
 enr-p2p = { path = "../p2p" }
 enr-chain = { path = "../chain" }
+ergo-validation = { path = "../validation" }
+hex = "0.4"
 tokio = { version = "1", features = ["time", "sync"] }
 tracing = "0.1"

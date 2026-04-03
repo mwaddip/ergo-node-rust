@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
 use enr_chain::{ChainConfig, HeaderChain, StateType, HEADER_TYPE_ID};
+use ergo_chain_types::ADDigest;
 use enr_store::{ModifierStore, RedbModifierStore};
 use ergo_node_rust::{P2pTransport, SharedChain, SharedStore, ValidationPipeline};
 use ergo_sync::{HeaderSync, SyncConfig};
+use ergo_validation::DigestValidator;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
@@ -67,7 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = enr_p2p::config::Config::load(&config_path)?;
 
     // Derive chain config from P2P network setting
-    let chain_config = match config.proxy.network {
+    let network = config.proxy.network;
+    let chain_config = match network {
         enr_p2p::types::Network::Testnet => ChainConfig::testnet(),
         enr_p2p::types::Network::Mainnet => ChainConfig::mainnet(),
     };
@@ -173,6 +176,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transport = P2pTransport::new(p2p.clone(), events);
     let sync_chain = SharedChain::new(chain.clone());
 
+    // Create block validator (digest mode)
+    // If we restored a chain from store, start validation from the tip's state root.
+    // Otherwise start from the genesis digest.
+    let chain_guard = chain.lock().await;
+    let validator = if chain_guard.height() > 0 {
+        let tip = chain_guard.tip();
+        let height = chain_guard.height();
+        let digest = tip.state_root;
+        tracing::info!(
+            height,
+            digest = ?digest,
+            "block validator resuming from stored chain tip (digest mode)"
+        );
+        DigestValidator::from_state(digest, height, 0)
+    } else {
+        let genesis_digest_hex = match network {
+            enr_p2p::types::Network::Testnet =>
+                "cb63aa99a3060f341781d8662b58bf18b9ad258db4fe88d09f8f71cb668cad4502",
+            enr_p2p::types::Network::Mainnet =>
+                "a5df145d41ab15a01e0cd3ffbab046f0d029e5412293072ad0f5827428589b9302",
+        };
+        let genesis_bytes = hex::decode(genesis_digest_hex).expect("invalid genesis digest hex");
+        let genesis_digest = ADDigest::try_from(genesis_bytes.as_slice())
+            .expect("invalid genesis digest length");
+        tracing::info!(genesis_digest = genesis_digest_hex, "block validator starting from genesis (digest mode)");
+        DigestValidator::new(genesis_digest, 0)
+    };
+    drop(chain_guard);
+
     // Build sync config from P2P network settings
     let net = net_settings;
     let sync_config = SyncConfig {
@@ -184,7 +216,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start sync in a background task (with delivery tracker channel)
     tokio::spawn(async move {
-        let mut sync = HeaderSync::new(sync_config, transport, sync_chain, sync_store, progress_rx, delivery_rx);
+        let mut sync = HeaderSync::new(sync_config, transport, sync_chain, sync_store, validator, progress_rx, delivery_rx);
         sync.run().await;
     });
 
