@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "sync", "validation"]
+
 [package]
 name = "ergo-node-rust"
 version = "0.1.0"
