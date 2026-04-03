@@ -35,10 +35,15 @@ pub struct StateChanges {
 pub fn compute_state_changes(
     tx_summaries: Vec<TxSummary>,
 ) -> Result<StateChanges, ValidationError> {
-    let mut pending_inserts: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+    // Track which output box IDs were created (for intra-block netting)
+    let mut created: HashSet<[u8; 32]> = HashSet::new();
+    // Track which box IDs were netted out (created + spent within the block)
+    let mut netted: HashSet<[u8; 32]> = HashSet::new();
     let mut spent: HashSet<[u8; 32]> = HashSet::new();
     let mut removals: Vec<[u8; 32]> = Vec::new();
     let mut lookups: Vec<[u8; 32]> = Vec::new();
+    // Preserve transaction output order for insertions
+    let mut all_inserts: Vec<([u8; 32], Vec<u8>)> = Vec::new();
 
     for summary in &tx_summaries {
         for &input_id in &summary.input_ids {
@@ -47,15 +52,17 @@ pub fn compute_state_changes(
                     hex::encode(input_id),
                 ));
             }
-            if pending_inserts.remove(&input_id).is_none() {
-                // Not an intra-block output — must be removed from tree
+            if created.contains(&input_id) {
+                // Intra-block: output created by earlier tx, now spent — net-zero
+                netted.insert(input_id);
+            } else {
                 removals.push(input_id);
             }
-            // else: netted out (created and spent within this block)
         }
 
         for entry in &summary.output_entries {
-            pending_inserts.insert(entry.0, entry.1.clone());
+            created.insert(entry.0);
+            all_inserts.push((entry.0, entry.1.clone()));
         }
 
         for &data_input_id in &summary.data_input_ids {
@@ -63,9 +70,15 @@ pub fn compute_state_changes(
         }
     }
 
-    // Remaining pending_inserts are outputs that weren't spent intra-block.
-    // Collect in deterministic order (sorted by box_id) to match JVM behavior.
-    let mut insertions: Vec<([u8; 32], Vec<u8>)> = pending_inserts.into_iter().collect();
+    // Filter out netted inserts, then sort both removals and inserts by box ID.
+    // The JVM uses TreeMap (sorted by hex-encoded ModifierId = lexicographic byte order).
+    // Lookups preserve transaction order (data inputs don't modify the tree).
+    removals.sort();
+
+    let mut insertions: Vec<([u8; 32], Vec<u8>)> = all_inserts
+        .into_iter()
+        .filter(|(id, _)| !netted.contains(id))
+        .collect();
     insertions.sort_by_key(|(id, _)| *id);
 
     Ok(StateChanges {
