@@ -92,9 +92,8 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore> {
     /// Highest header height for which sections have been queued.
     sections_queued_to: u32,
     /// Highest height where ALL required block sections are in the store.
-    /// Mirrors JVM's `fullHeight`. Blocks at or below this height are
-    /// ready for validation (once tx validation is wired).
-    full_block_height: u32,
+    /// Blocks at or below this height are ready for validation.
+    downloaded_height: u32,
 }
 
 impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
@@ -123,7 +122,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
             sync_sent_count: 0,
             section_queue: VecDeque::new(),
             sections_queued_to: 0,
-            full_block_height: 0,
+            downloaded_height: 0,
         }
     }
 
@@ -165,7 +164,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
         let tip = self.chain.chain_height().await;
         if tip > 0 {
             self.queue_sections_for_range(1, tip).await;
-            self.advance_full_block_height().await;
+            self.advance_downloaded_height().await;
         }
 
         loop {
@@ -288,7 +287,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
                             for id in &ids {
                                 self.tracker.mark_received(id);
                             }
-                            self.advance_full_block_height().await;
+                            self.advance_downloaded_height().await;
                         }
                         DeliveryEvent::Evicted(ids) => {
                             self.tracker.schedule_rerequest(&ids);
@@ -305,20 +304,20 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
                             self.sections_queued_to = fork_point;
 
                             // Reset watermark if it was above the fork point
-                            if self.full_block_height > fork_point {
+                            if self.downloaded_height > fork_point {
                                 tracing::info!(
-                                    old = self.full_block_height,
+                                    old = self.downloaded_height,
                                     new = fork_point,
-                                    "resetting full_block_height to fork point"
+                                    "resetting downloaded_height to fork point"
                                 );
-                                self.full_block_height = fork_point;
+                                self.downloaded_height = fork_point;
                             }
 
                             // Re-queue sections for the new best chain
                             self.queue_sections_for_range(fork_point + 1, new_tip).await;
 
                             // Re-scan watermark — some sections may already be in store
-                            self.advance_full_block_height().await;
+                            self.advance_downloaded_height().await;
                         }
                     }
                 }
@@ -342,7 +341,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
                     last_delivery_check = Instant::now();
                     let result = self.tracker.check_timeouts();
                     self.handle_delivery_check(result, peer).await;
-                    self.advance_full_block_height().await;
+                    self.advance_downloaded_height().await;
                 }
 
                 // Scheduled SyncInfo: 20-second cycle start
@@ -397,14 +396,14 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
     /// For each height above the current watermark, checks whether all
     /// required block sections (per `config.state_type`) are in the store.
     /// Advances as far as possible in one call — stops at the first gap.
-    async fn advance_full_block_height(&mut self) {
+    async fn advance_downloaded_height(&mut self) {
         let chain_height = self.chain.chain_height().await;
-        if self.full_block_height >= chain_height {
+        if self.downloaded_height >= chain_height {
             return;
         }
 
-        let start = self.full_block_height + 1;
-        let mut new_height = self.full_block_height;
+        let start = self.downloaded_height + 1;
+        let mut new_height = self.downloaded_height;
 
         for height in start..=chain_height {
             let header = match self.chain.header_at(height).await {
@@ -425,11 +424,11 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
             new_height = height;
         }
 
-        if new_height > self.full_block_height {
-            let advanced = new_height - self.full_block_height;
-            self.full_block_height = new_height;
+        if new_height > self.downloaded_height {
+            let advanced = new_height - self.downloaded_height;
+            self.downloaded_height = new_height;
             tracing::info!(
-                full_block_height = new_height,
+                downloaded_height = new_height,
                 advanced,
                 chain_height,
                 "full block height advanced"
@@ -600,7 +599,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
 
                     // Periodically drain any newly queued sections
                     self.drain_section_queue().await;
-                    self.advance_full_block_height().await;
+                    self.advance_downloaded_height().await;
                 }
 
                 event = self.transport.next_event() => {
