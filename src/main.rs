@@ -93,14 +93,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Shared header chain: pipeline writes, sync reads
     let mut chain = HeaderChain::new(chain_config);
 
-    // Restore chain from stored headers
-    if let Some((tip_height, _)) = store.tip(HEADER_TYPE_ID)? {
+    // Restore chain from stored headers (using best chain index)
+    if let Some((tip_height, _)) = store.best_header_tip()? {
         let mut loaded = 0u32;
         for height in 1..=tip_height {
-            let id = match store.get_id_at(HEADER_TYPE_ID, height)? {
+            let id = match store.best_header_at(height)? {
                 Some(id) => id,
                 None => {
-                    tracing::warn!(height, "gap in stored headers, stopping load");
+                    tracing::warn!(height, "gap in best chain, stopping load");
                     break;
                 }
             };
@@ -118,9 +118,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
             };
-            if let Err(e) = chain.try_append(header) {
-                tracing::error!(height, "stored header chain failed: {e}, stopping load");
-                break;
+            match chain.try_append(header) {
+                Ok(enr_chain::AppendResult::Extended) => {}
+                Ok(enr_chain::AppendResult::Forked { .. }) => {
+                    tracing::error!(height, "stored best-chain header detected as fork — store corrupted?");
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!(height, "stored header chain failed: {e}, stopping load");
+                    break;
+                }
             }
             loaded += 1;
         }

@@ -297,6 +297,29 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore> HeaderSync<T, C, S> {
                             tracing::info!(type_id, "pipeline needs modifier for reorg");
                             self.request_announced(peer, type_id, vec![id]).await;
                         }
+                        DeliveryEvent::Reorg { fork_point, old_tip, new_tip } => {
+                            tracing::info!(fork_point, old_tip, new_tip, "reorg: adjusting section queue and watermark");
+
+                            // Clear section queue — entries are for the old branch
+                            self.section_queue.clear();
+                            self.sections_queued_to = fork_point;
+
+                            // Reset watermark if it was above the fork point
+                            if self.full_block_height > fork_point {
+                                tracing::info!(
+                                    old = self.full_block_height,
+                                    new = fork_point,
+                                    "resetting full_block_height to fork point"
+                                );
+                                self.full_block_height = fork_point;
+                            }
+
+                            // Re-queue sections for the new best chain
+                            self.queue_sections_for_range(fork_point + 1, new_tip).await;
+
+                            // Re-scan watermark — some sections may already be in store
+                            self.advance_full_block_height().await;
+                        }
                     }
                 }
 

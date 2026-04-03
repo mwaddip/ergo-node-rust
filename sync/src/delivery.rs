@@ -26,6 +26,13 @@ pub enum DeliveryEvent {
     /// Pipeline needs a specific modifier to complete a reorg.
     /// The sync machine should request it from any available peer.
     NeedModifier { type_id: u8, id: [u8; 32] },
+    /// A chain reorg occurred. The sync machine should adjust its section
+    /// queue and full_block_height watermark.
+    Reorg {
+        fork_point: u32,
+        old_tip: u32,
+        new_tip: u32,
+    },
 }
 
 /// A pending modifier request.

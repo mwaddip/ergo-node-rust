@@ -1,7 +1,10 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use enr_chain::{BlockId, ChainError, Header, HeaderChain, HeaderTracker, HEADER_TYPE_ID};
+use enr_chain::{
+    AppendResult, BlockId, ChainError, Header, HeaderChain, HeaderTracker,
+    decode_compact_bits, HEADER_TYPE_ID,
+};
 use enr_store::{ModifierStore, RedbModifierStore};
 use ergo_sync::delivery::DeliveryEvent;
 use lru::LruCache;
@@ -27,8 +30,8 @@ pub struct ValidationPipeline {
     delivery_tx: mpsc::Sender<DeliveryEvent>,
     tracker: HeaderTracker,
     buffer: LruCache<BlockId, (Header, Vec<u8>)>,
-    /// Modifier ID we've already requested for reorg (avoid flooding).
-    reorg_requested: Option<[u8; 32]>,
+    /// Parent IDs we've already requested for fork resolution (avoid flooding).
+    reorg_requested: std::collections::HashSet<[u8; 32]>,
 }
 
 impl ValidationPipeline {
@@ -47,8 +50,68 @@ impl ValidationPipeline {
             delivery_tx,
             tracker: HeaderTracker::new(),
             buffer: LruCache::new(NonZeroUsize::new(BUFFER_CAPACITY).unwrap()),
-            reorg_requested: None,
+            reorg_requested: std::collections::HashSet::new(),
         }
+    }
+
+    /// Walk backward from a fork tip through the store to find the fork point
+    /// (first ancestor that's in the best chain). Returns (fork_point_height, branch)
+    /// where branch is the fork headers in ascending order.
+    fn assemble_fork_branch(
+        &self,
+        chain: &HeaderChain,
+        _tip_id: BlockId,
+        tip_header: &Header,
+    ) -> Option<(u32, Vec<Header>)> {
+        let mut branch = vec![tip_header.clone()];
+        let mut current_parent = tip_header.parent_id;
+
+        // Walk backward, max 1000 steps to prevent runaway
+        for _ in 0..1000 {
+            // Is this parent in the best chain?
+            if chain.contains(&current_parent) {
+                // Found the fork point
+                // The branch is in reverse order (tip first). The last entry is
+                // closest to the fork point — its height - 1 is the fork point.
+                let first_fork_header = branch.last().unwrap();
+                let fork_point_height = first_fork_header.height - 1;
+
+                // Verify the fork point is actually in the chain at that height
+                if chain.header_at(fork_point_height).map(|h| h.id) == Some(current_parent) {
+                    branch.reverse(); // ascending order
+                    return Some((fork_point_height, branch));
+                } else {
+                    tracing::warn!(
+                        fork_point_height,
+                        parent = %current_parent,
+                        "fork point parent ID doesn't match chain at expected height"
+                    );
+                    return None;
+                }
+            }
+
+            // Parent is another fork header — read it from the store
+            let parent_data = match self.store.get(HEADER_TYPE_ID, &current_parent.0.0) {
+                Ok(Some(data)) => data,
+                _ => {
+                    tracing::debug!(parent = %current_parent, "fork chain broken — parent not in store");
+                    return None;
+                }
+            };
+            let parent_header = match enr_chain::parse_header(&parent_data) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(parent = %current_parent, "fork parent parse failed: {e}");
+                    return None;
+                }
+            };
+
+            current_parent = parent_header.parent_id;
+            branch.push(parent_header);
+        }
+
+        tracing::warn!("fork chain walk exceeded 1000 steps");
+        None
     }
 
     /// Run the pipeline loop. Returns when the channel closes.
@@ -168,16 +231,12 @@ impl ValidationPipeline {
         let mut rejected = 0u32;
         let mut evicted_ids: Vec<[u8; 32]> = Vec::new();
         let mut store_entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = Vec::new();
+        // Pending deep reorg: (fork_point_height, new_branch_headers, new_branch_raw)
+        let mut pending_reorg: Option<(u32, Vec<Header>, Vec<Vec<u8>>)> = None;
 
         for (header, raw) in valid_headers {
-            // Skip headers strictly below the chain tip (duplicates).
-            // Headers AT tip height with a different ID are competing blocks —
-            // buffer them for potential 1-deep reorg.
-            if header.height < chain.height() {
-                rejected += 1;
-                continue;
-            }
-            if header.height == chain.height() && header.id == chain.tip().id {
+            // Skip exact duplicate of current tip
+            if !chain.is_empty() && header.height == chain.height() && header.id == chain.tip().id {
                 rejected += 1;
                 continue;
             }
@@ -186,7 +245,7 @@ impl ValidationPipeline {
             let header_height = header.height;
             let parent_id = header.parent_id;
             match chain.try_append(header.clone()) {
-                Ok(()) => {
+                Ok(AppendResult::Extended) => {
                     chained += 1;
                     store_entries.push((HEADER_TYPE_ID, header_id.0.0, header_height, raw));
                     if header_height % 400 < 2 {
@@ -198,84 +257,138 @@ impl ValidationPipeline {
                         let bid = buf.id;
                         let buf_height = buf.height;
                         match chain.try_append(buf.clone()) {
-                            Ok(()) => {
+                            Ok(AppendResult::Extended) => {
                                 chained += 1;
                                 store_entries.push((HEADER_TYPE_ID, bid.0.0, buf_height, buf_raw));
                                 self.tracker.observe(&buf);
                                 next_parent = bid;
                             }
-                            Err(_) => break,
+                            _ => break,
                         }
                     }
                 }
-                Err(ChainError::ParentNotFound { .. }) => {
-                    tracing::debug!(
-                        header_height,
-                        chain_height = chain.height(),
-                        id = %header_id,
-                        parent = %parent_id,
-                        "ParentNotFound"
+                Ok(AppendResult::Forked { fork_height }) => {
+                    // Header is valid but forks from the best chain.
+                    // Compute its cumulative score and store immediately
+                    // (later headers in this batch may extend this fork).
+                    let parent_score = chain.score_at(fork_height)
+                        .cloned()
+                        .unwrap_or_default();
+                    let difficulty = decode_compact_bits(header.n_bits)
+                        .to_biguint()
+                        .unwrap_or_default();
+                    let fork_score = &parent_score + &difficulty;
+
+                    // Determine fork number at this height
+                    let fork_num = self.store.header_ids_at_height(header_height)
+                        .map(|forks| forks.last().map(|(_, f)| f + 1).unwrap_or(1))
+                        .unwrap_or(1);
+
+                    let score_bytes = fork_score.to_bytes_be();
+                    if let Err(e) = self.store.put_header(
+                        &header_id.0.0, header_height, fork_num,
+                        &score_bytes, &raw,
+                    ) {
+                        tracing::error!(height = header_height, "store fork header failed: {e}");
+                    }
+
+                    let best_score = chain.cumulative_score();
+                    tracing::info!(
+                        height = header_height,
+                        fork_height,
+                        fork_better = fork_score > best_score,
+                        "fork detected (parent in best chain)"
                     );
-                    // Check for 1-deep reorg: the header's parent might be in the
-                    // buffer (a competing block at tip height). If so, try to replace
-                    // our tip with the alternative chain.
-                    if header_height == chain.height() + 1 {
-                        // The alternative block shares our tip's parent. It would be
-                        // buffered under key = tip.parent_id (its own parent_id).
-                        let tip_parent = chain.tip().parent_id;
-                        if let Some((alt, alt_raw)) = self.buffer.pop(&tip_parent) {
-                            match chain.try_reorg(alt.clone(), header.clone()) {
-                                Ok(old_tip_id) => {
-                                    tracing::info!(
-                                        height = header_height,
-                                        old_tip = %old_tip_id,
-                                        new_tip = %header_id,
-                                        "1-deep reorg: replaced tip"
-                                    );
-                                    chained += 2; // alternative + continuation
-                                    self.reorg_requested = None;
-                                    store_entries.push((HEADER_TYPE_ID, alt.id.0.0, alt.height, alt_raw));
-                                    store_entries.push((HEADER_TYPE_ID, header_id.0.0, header_height, raw));
-                                    // Drain buffer from the new tip
-                                    let mut next_parent = header_id;
-                                    while let Some((buf, buf_raw)) = self.buffer.pop(&next_parent) {
-                                        let bid = buf.id;
-                                        let buf_height = buf.height;
-                                        match chain.try_append(buf.clone()) {
-                                            Ok(()) => {
-                                                chained += 1;
-                                                store_entries.push((HEADER_TYPE_ID, bid.0.0, buf_height, buf_raw));
-                                                self.tracker.observe(&buf);
-                                                next_parent = bid;
-                                            }
-                                            Err(_) => break,
-                                        }
-                                    }
-                                    continue;
+
+                    if fork_score > best_score && pending_reorg.is_none() {
+                        pending_reorg = Some((fork_height, vec![header], vec![raw]));
+                    }
+                }
+                Err(ChainError::ParentNotFound { .. }) => {
+                    // Parent not in best chain. Check if it's a known fork header
+                    // in the store — if so, this extends that fork chain.
+                    let parent_score_opt = self.store.header_score(&parent_id.0.0)
+                        .ok()
+                        .flatten()
+                        .filter(|s| !s.is_empty());
+
+                    if let Some(parent_score_bytes) = parent_score_opt {
+                        // Parent is a stored fork header. Extend the fork chain.
+                        use enr_chain::BigUint;
+                        let parent_score = BigUint::from_bytes_be(&parent_score_bytes);
+                        let difficulty = decode_compact_bits(header.n_bits)
+                            .to_biguint()
+                            .unwrap_or_default();
+                        let fork_score = &parent_score + &difficulty;
+
+                        let fork_num = self.store.header_ids_at_height(header_height)
+                            .map(|forks| forks.last().map(|(_, f)| f + 1).unwrap_or(1))
+                            .unwrap_or(1);
+
+                        let score_bytes = fork_score.to_bytes_be();
+                        if let Err(e) = self.store.put_header(
+                            &header_id.0.0, header_height, fork_num,
+                            &score_bytes, &raw,
+                        ) {
+                            tracing::error!(height = header_height, "store fork chain header failed: {e}");
+                        }
+
+                        let best_score = chain.cumulative_score();
+                        if fork_score > best_score && pending_reorg.is_none() {
+                            // Fork chain is better. Assemble the branch by walking
+                            // parent_id backward through the store to the fork point.
+                            tracing::info!(
+                                height = header_height,
+                                "fork chain surpasses best chain — assembling reorg branch"
+                            );
+
+                            match self.assemble_fork_branch(&chain, header_id, &header) {
+                                Some((fork_point, branch)) => {
+                                    pending_reorg = Some((fork_point, branch, vec![]));
                                 }
-                                Err(e) => {
-                                    tracing::debug!(height = header_height, "reorg failed: {e}");
-                                    // Put the alternative back in the buffer
-                                    self.buffer.push(parent_id, (alt, alt_raw));
+                                None => {
+                                    tracing::warn!(
+                                        height = header_height,
+                                        "fork chain better but couldn't assemble branch"
+                                    );
                                 }
                             }
-                        } else if self.reorg_requested != Some(parent_id.0.0) {
-                            // Alternative not in buffer — ask the sync machine to
-                            // fetch it. parent_id is the alternative's modifier ID.
-                            self.reorg_requested = Some(parent_id.0.0);
-                            if self.delivery_tx.try_send(
-                                DeliveryEvent::NeedModifier {
-                                    type_id: HEADER_TYPE_ID,
-                                    id: parent_id.0.0,
-                                },
-                            ).is_err() {
-                                tracing::warn!("delivery channel full, couldn't request reorg modifier");
+                        } else {
+                            tracing::debug!(
+                                height = header_height,
+                                "fork chain extended but not yet better"
+                            );
+                        }
+                    } else {
+                        // Truly unknown parent — buffer it and request the parent
+                        // so we can build the fork chain back to a known block.
+                        tracing::debug!(
+                            header_height,
+                            chain_height = chain.height(),
+                            id = %header_id,
+                            parent = %parent_id,
+                            "ParentNotFound"
+                        );
+
+                        // Request the missing parent — but only the FIRST one per
+                        // batch to avoid flooding. The fork chain links backward,
+                        // so fetching the lowest missing parent is sufficient: once
+                        // it arrives and chains, the rest drain from the buffer.
+                        if self.reorg_requested.is_empty() || self.reorg_requested.len() < 3 {
+                            if self.reorg_requested.insert(parent_id.0.0) {
+                                let _ = self.delivery_tx.try_send(
+                                    DeliveryEvent::NeedModifier {
+                                        type_id: HEADER_TYPE_ID,
+                                        id: parent_id.0.0,
+                                    },
+                                );
                             }
                         }
-                    }
-                    buffered += 1;
-                    if let Some((_, (evicted, _))) = self.buffer.push(parent_id, (header, raw)) {
-                        evicted_ids.push(evicted.id.0.0);
+
+                        buffered += 1;
+                        if let Some((_, (evicted, _))) = self.buffer.push(parent_id, (header, raw)) {
+                            evicted_ids.push(evicted.id.0.0);
+                        }
                     }
                 }
                 Err(ChainError::InvalidGenesisParent { .. })
@@ -287,6 +400,36 @@ impl ValidationPipeline {
                 }
                 Err(_) => {
                     rejected += 1;
+                }
+            }
+        }
+
+        // Execute pending deep reorg while still holding the chain lock
+        if let Some((fork_point, new_branch, _new_branch_raw)) = pending_reorg {
+            let old_tip = chain.height();
+            match chain.try_reorg_deep(fork_point, new_branch.clone()) {
+                Ok(demoted_ids) => {
+                    let new_tip = chain.height();
+                    tracing::info!(
+                        fork_point,
+                        demoted = demoted_ids.len(),
+                        old_tip,
+                        new_tip,
+                        "deep reorg succeeded"
+                    );
+                    chained += new_branch.len() as u32;
+
+                    // Notify sync machine
+                    if self.delivery_tx.try_send(DeliveryEvent::Reorg {
+                        fork_point,
+                        old_tip,
+                        new_tip,
+                    }).is_err() {
+                        tracing::warn!("delivery channel full, dropped Reorg notification");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(fork_point, "deep reorg failed: {e}");
                 }
             }
         }
