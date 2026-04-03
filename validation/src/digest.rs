@@ -118,6 +118,14 @@ impl BlockValidator for DigestValidator {
         let starting_digest = Bytes::copy_from_slice(&starting_digest_bytes);
         let proof_bytes = Bytes::copy_from_slice(&parsed_proofs.proof_bytes);
 
+        tracing::info!(
+            height = header.height,
+            starting_digest = hex::encode(&starting_digest_bytes),
+            proof_len = parsed_proofs.proof_bytes.len(),
+            ops = operations.len(),
+            "verifying AD proof"
+        );
+
         let tree = AVLTree::new(dummy_resolver, KEY_LENGTH, None);
         let mut verifier = BatchAVLVerifier::new(
             &starting_digest,
