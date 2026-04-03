@@ -4,9 +4,9 @@ A ground-up Ergo blockchain full node in Rust. Not a port of the JVM reference n
 
 ## Status
 
-**Highly experimental.** Syncing the header chain and downloading block sections on testnet. Headers are validated (PoW, difficulty, parent linkage) and persisted to disk via redb. Block section download is mode-aware (UTXO mode downloads BlockTransactions + Extension; digest mode scaffolding is in place for ADProofs). The sync machine tracks `full_block_height` — the highest height with all required sections present. Survives restarts without re-syncing.
+**Highly experimental.** Syncing headers, downloading block sections, and validating state transitions on testnet. Headers are validated (PoW, difficulty, parent linkage) and persisted via redb. Block sections are validated in digest mode — AD proofs verify that each block's transactions correctly transform the UTXO state root without maintaining the full UTXO set. Survives restarts without re-syncing or re-validating.
 
-**Running continuously on testnet** since April 2026 — stays synced with the network, handles chain reorganizations, and maintains persistent connections without getting banned by peers.
+**Running continuously on testnet** since April 2026 — stays synced with the network, validates every block via AD proofs, handles chain reorganizations, and maintains persistent connections without getting banned by peers.
 
 ## Roadmap
 
@@ -21,7 +21,8 @@ A ground-up Ergo blockchain full node in Rust. Not a port of the JVM reference n
 | 3e | **Block assembly** — track `full_block_height` watermark for complete blocks | Done |
 | 3f | **Honest Mode advertisement** — handshake advertises actual capabilities (`blocks_to_keep`) | Done |
 | 3g | **Deep chain reorg** — fork-aware header storage, cumulative difficulty scoring, multi-block reorg | Done |
-| 4 | Transaction validation — validate against input boxes via `ergo-lib` | Next |
+| 4a | **Digest-mode validation** — verify state transitions via AD proofs (BatchAVLVerifier) | Done |
+| 4b | Transaction validation — ErgoScript evaluation via `ergo-lib` | Next |
 | 5 | UTXO state management — AVL+ tree backed, apply/rollback blocks | Planned |
 | 6 | Full node — chain sync state machine, mempool, REST API | Planned |
 
@@ -37,7 +38,8 @@ A ground-up Ergo blockchain full node in Rust. Not a port of the JVM reference n
 - **Event-driven sync**: progress-triggered and timer-based SyncInfo cycles, peer rotation on stall
 - **Persistent storage**: headers written to redb after validation, restored on startup — no re-sync after restart
 - **Block section download**: mode-aware — UTXO mode downloads BlockTransactions + Extension, digest mode scaffolding downloads ADProofs too
-- **Block assembly tracking**: `full_block_height` watermark advances as sections arrive, identifies blocks ready for validation
+- **Block assembly tracking**: `downloaded_height` watermark advances as sections arrive, identifies blocks ready for validation
+- **Digest-mode block validation**: verifies state transitions using AD proofs — each block's transactions are converted to AVL+ tree operations, and `BatchAVLVerifier` confirms the state root transition matches the header. No UTXO set needed. Validated 1000+ consecutive testnet blocks.
 - **Honest Mode feature**: handshake advertises `state_type`, `verifying`, and `blocks_to_keep` from node config — peers don't request blocks we can't serve
 - **Deep chain reorg**: fork-aware header storage keeps all validated headers across forks. Cumulative difficulty scoring selects the best chain. Multi-block reorganization is a local operation — zero network traffic, reads fork headers from the store and swaps the in-memory chain atomically. Handles testnet forks automatically.
 - Continuous header sync from genesis on testnet — no connection stalls
@@ -52,7 +54,8 @@ The node is composed of independent submodules, each owning a well-defined bound
 |---|---|---|
 | `p2p/` | [enr-p2p](https://github.com/mwaddip/enr-p2p) | P2P networking: handshake, message framing, routing, peer management |
 | `chain/` | [enr-chain](https://github.com/mwaddip/enr-chain) | Header parsing, PoW verification, difficulty adjustment, chain validation |
-| `sync/` | — | Header chain sync state machine |
+| `sync/` | — | Chain sync state machine, section download, validation coordination |
+| `validation/` | — | Block validation: section parsing, state changes, AD proof verification |
 | `state/` | [enr-state](https://github.com/mwaddip/enr-state) | UTXO state management via AVL+ authenticated tree |
 | `store/` | [enr-store](https://github.com/mwaddip/enr-store) | Persistent storage for headers, blocks, and modifiers |
 | `facts/` | [ergo-node-facts](https://github.com/mwaddip/ergo-node-facts) | Interface contracts between components |
