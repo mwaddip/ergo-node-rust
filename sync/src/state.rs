@@ -416,6 +416,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     /// required block sections (per `config.state_type`) are in the store.
     /// Advances as far as possible in one call — stops at the first gap.
     async fn advance_downloaded_height(&mut self) {
+        if self.validator.is_none() && self.config.utxo_bootstrap {
+            return; // Snapshot bootstrap pending — don't download sections from height 0
+        }
         let chain_height = self.chain.chain_height().await;
         if self.downloaded_height >= chain_height {
             return;
