@@ -6,7 +6,7 @@ use enr_p2p::types::PeerId;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
-use crate::delivery::{DeliveryEvent, DeliveryTracker};
+use crate::delivery::{DeliveryControl, DeliveryData, DeliveryTracker};
 use enr_chain::{
     StateType, HEADER_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID, EXTENSION_TYPE_ID,
 };
@@ -75,7 +75,8 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     store: S,
     validator: V,
     progress: mpsc::Receiver<u32>,
-    delivery_rx: mpsc::Receiver<DeliveryEvent>,
+    delivery_control_rx: mpsc::UnboundedReceiver<DeliveryControl>,
+    delivery_data_rx: mpsc::Receiver<DeliveryData>,
     tracker: DeliveryTracker,
     /// Peer we're currently syncing from.
     sync_peer: Option<PeerId>,
@@ -108,7 +109,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         store: S,
         validator: V,
         progress: mpsc::Receiver<u32>,
-        delivery_rx: mpsc::Receiver<DeliveryEvent>,
+        delivery_control_rx: mpsc::UnboundedReceiver<DeliveryControl>,
+        delivery_data_rx: mpsc::Receiver<DeliveryData>,
     ) -> Self {
         let tracker = DeliveryTracker::with_config(config.delivery_timeout, config.max_delivery_checks);
         let initial_validated = validator.validated_height();
@@ -119,7 +121,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             store,
             validator,
             progress,
-            delivery_rx,
+            delivery_control_rx,
+            delivery_data_rx,
             tracker,
             sync_peer: None,
             stalled_peers: HashSet::new(),
@@ -262,6 +265,13 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 .saturating_sub(last_delivery_check.elapsed());
 
             tokio::select! {
+                biased;
+
+                // Control-plane events — checked first, never dropped
+                Some(ctrl) = self.delivery_control_rx.recv() => {
+                    self.handle_control_event(ctrl, peer).await;
+                }
+
                 // P2P events: Inv, peer SyncInfo, disconnect
                 event = self.transport.next_event() => {
                     match event {
@@ -288,50 +298,17 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     }
                 }
 
-                // Pipeline delivery notifications: received / evicted modifiers
-                Some(event) = self.delivery_rx.recv() => {
-                    match event {
-                        DeliveryEvent::Received(ids) => {
+                // Data-plane delivery notifications: received / evicted modifiers
+                Some(data) = self.delivery_data_rx.recv() => {
+                    match data {
+                        DeliveryData::Received(ids) => {
                             for id in &ids {
                                 self.tracker.mark_received(id);
                             }
                             self.advance_downloaded_height().await;
                         }
-                        DeliveryEvent::Evicted(ids) => {
+                        DeliveryData::Evicted(ids) => {
                             self.tracker.schedule_rerequest(&ids);
-                        }
-                        DeliveryEvent::NeedModifier { type_id, id } => {
-                            tracing::info!(type_id, "pipeline needs modifier for reorg");
-                            self.request_announced(peer, type_id, vec![id]).await;
-                        }
-                        DeliveryEvent::Reorg { fork_point, old_tip, new_tip } => {
-                            tracing::info!(fork_point, old_tip, new_tip, "reorg: adjusting section queue and watermark");
-
-                            // Clear section queue — entries are for the old branch
-                            self.section_queue.clear();
-                            self.sections_queued_to = fork_point;
-
-                            // Reset watermarks if they were above the fork point
-                            if self.downloaded_height > fork_point {
-                                tracing::info!(
-                                    old = self.downloaded_height,
-                                    new = fork_point,
-                                    "resetting downloaded_height to fork point"
-                                );
-                                self.downloaded_height = fork_point;
-                            }
-                            if self.validated_height > fork_point {
-                                if let Some(fork_header) = self.chain.header_at(fork_point).await {
-                                    self.validator.reset_to(fork_point, fork_header.state_root);
-                                }
-                                self.validated_height = fork_point;
-                            }
-
-                            // Re-queue sections for the new best chain
-                            self.queue_sections_for_range(fork_point + 1, new_tip).await;
-
-                            // Re-scan watermark — some sections may already be in store
-                            self.advance_downloaded_height().await;
                         }
                     }
                 }
@@ -544,6 +521,45 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         }
     }
 
+    /// Handle a control-plane event (Reorg or NeedModifier).
+    async fn handle_control_event(&mut self, ctrl: DeliveryControl, peer: PeerId) {
+        match ctrl {
+            DeliveryControl::NeedModifier { type_id, id } => {
+                tracing::info!(type_id, "pipeline needs modifier for reorg");
+                self.request_announced(peer, type_id, vec![id]).await;
+            }
+            DeliveryControl::Reorg { fork_point, old_tip, new_tip } => {
+                tracing::info!(fork_point, old_tip, new_tip, "reorg: adjusting section queue and watermark");
+
+                // Clear section queue — entries are for the old branch
+                self.section_queue.clear();
+                self.sections_queued_to = fork_point;
+
+                // Reset watermarks if they were above the fork point
+                if self.downloaded_height > fork_point {
+                    tracing::info!(
+                        old = self.downloaded_height,
+                        new = fork_point,
+                        "resetting downloaded_height to fork point"
+                    );
+                    self.downloaded_height = fork_point;
+                }
+                if self.validated_height > fork_point {
+                    if let Some(fork_header) = self.chain.header_at(fork_point).await {
+                        self.validator.reset_to(fork_point, fork_header.state_root);
+                    }
+                    self.validated_height = fork_point;
+                }
+
+                // Re-queue sections for the new best chain
+                self.queue_sections_for_range(fork_point + 1, new_tip).await;
+
+                // Re-scan watermark — some sections may already be in store
+                self.advance_downloaded_height().await;
+            }
+        }
+    }
+
     /// Handle a single P2P event during sync.
     async fn handle_event(&mut self, peer: PeerId, event: ProtocolEvent) -> EventResult {
         match event {
@@ -695,6 +711,14 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
 
         loop {
             tokio::select! {
+                biased;
+
+                // Control-plane events — checked first, even while synced
+                Some(ctrl) = self.delivery_control_rx.recv() => {
+                    let peer = self.sync_peer.unwrap_or(PeerId(0));
+                    self.handle_control_event(ctrl, peer).await;
+                }
+
                 _ = ticker.tick() => {
                     let peers = self.transport.outbound_peers().await;
                     if let Some(&peer) = peers.first() {

@@ -16,23 +16,30 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default max re-request attempts before abandoning (JVM: `maxDeliveryChecks`).
 const DEFAULT_MAX_CHECKS: u32 = 100;
 
-/// Notification from the pipeline to the delivery tracker.
-/// Sent via channel — the sync machine receives and dispatches to the tracker.
-pub enum DeliveryEvent {
-    /// Modifier IDs successfully received by the pipeline.
-    Received(Vec<[u8; 32]>),
-    /// Modifier IDs evicted from the LRU buffer before chaining.
-    Evicted(Vec<[u8; 32]>),
+/// Control-plane events from the pipeline.
+/// Rare and critical — losing one is unrecoverable.
+/// Sent via unbounded channel, checked with priority in every select branch.
+pub enum DeliveryControl {
     /// Pipeline needs a specific modifier to complete a reorg.
     /// The sync machine should request it from any available peer.
     NeedModifier { type_id: u8, id: [u8; 32] },
     /// A chain reorg occurred. The sync machine should adjust its section
-    /// queue and full_block_height watermark.
+    /// queue and downloaded_height watermark.
     Reorg {
         fork_point: u32,
         old_tip: u32,
         new_tip: u32,
     },
+}
+
+/// Data-plane events from the pipeline.
+/// High-volume, lossy — missing one just delays the watermark scan by one timer tick.
+/// Sent via bounded channel with try_send.
+pub enum DeliveryData {
+    /// Modifier IDs successfully received by the pipeline.
+    Received(Vec<[u8; 32]>),
+    /// Modifier IDs evicted from the LRU buffer before chaining.
+    Evicted(Vec<[u8; 32]>),
 }
 
 /// A pending modifier request.

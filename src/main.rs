@@ -162,10 +162,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pipeline_chain = chain.clone();
     let sync_store = SharedStore::new(store.clone());
     let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(4);
-    let (delivery_tx, delivery_rx) = tokio::sync::mpsc::channel(64);
+    // Control channel: unbounded — Reorg/NeedModifier must never be dropped
+    let (delivery_control_tx, delivery_control_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Data channel: bounded — Received/Evicted are lossy, ok to drop
+    let (delivery_data_tx, delivery_data_rx) = tokio::sync::mpsc::channel(64);
     tokio::spawn(async move {
         let mut pipeline =
-            ValidationPipeline::new(modifier_rx, pipeline_chain, store, progress_tx, delivery_tx);
+            ValidationPipeline::new(modifier_rx, pipeline_chain, store, progress_tx, delivery_control_tx, delivery_data_tx);
         pipeline.run().await;
     });
 
@@ -216,7 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start sync in a background task (with delivery tracker channel)
     tokio::spawn(async move {
-        let mut sync = HeaderSync::new(sync_config, transport, sync_chain, sync_store, validator, progress_rx, delivery_rx);
+        let mut sync = HeaderSync::new(sync_config, transport, sync_chain, sync_store, validator, progress_rx, delivery_control_rx, delivery_data_rx);
         sync.run().await;
     });
 

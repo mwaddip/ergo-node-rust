@@ -6,7 +6,7 @@ use enr_chain::{
     decode_compact_bits, HEADER_TYPE_ID,
 };
 use enr_store::{ModifierStore, RedbModifierStore};
-use ergo_sync::delivery::DeliveryEvent;
+use ergo_sync::delivery::{DeliveryControl, DeliveryData};
 use lru::LruCache;
 use sigma_ser::ScorexSerializable;
 use tokio::sync::{mpsc, Mutex};
@@ -27,7 +27,8 @@ pub struct ValidationPipeline {
     chain: Arc<Mutex<HeaderChain>>,
     store: Arc<RedbModifierStore>,
     progress_tx: mpsc::Sender<u32>,
-    delivery_tx: mpsc::Sender<DeliveryEvent>,
+    delivery_control_tx: mpsc::UnboundedSender<DeliveryControl>,
+    delivery_data_tx: mpsc::Sender<DeliveryData>,
     tracker: HeaderTracker,
     buffer: LruCache<BlockId, (Header, Vec<u8>)>,
     /// Parent IDs we've already requested for fork resolution (avoid flooding).
@@ -40,14 +41,16 @@ impl ValidationPipeline {
         chain: Arc<Mutex<HeaderChain>>,
         store: Arc<RedbModifierStore>,
         progress_tx: mpsc::Sender<u32>,
-        delivery_tx: mpsc::Sender<DeliveryEvent>,
+        delivery_control_tx: mpsc::UnboundedSender<DeliveryControl>,
+        delivery_data_tx: mpsc::Sender<DeliveryData>,
     ) -> Self {
         Self {
             rx,
             chain,
             store,
             progress_tx,
-            delivery_tx,
+            delivery_control_tx,
+            delivery_data_tx,
             tracker: HeaderTracker::new(),
             buffer: LruCache::new(NonZeroUsize::new(BUFFER_CAPACITY).unwrap()),
             reorg_requested: std::collections::HashSet::new(),
@@ -154,10 +157,10 @@ impl ValidationPipeline {
             }
         }
 
-        // Notify delivery tracker
+        // Notify delivery tracker (data plane — ok to drop)
         if !received_ids.is_empty() {
-            if self.delivery_tx.try_send(DeliveryEvent::Received(received_ids)).is_err() {
-                tracing::warn!("delivery channel full, dropped Received notification");
+            if self.delivery_data_tx.try_send(DeliveryData::Received(received_ids)).is_err() {
+                tracing::warn!("delivery data channel full, dropped Received notification");
             }
         }
 
@@ -376,8 +379,8 @@ impl ValidationPipeline {
                         // it arrives and chains, the rest drain from the buffer.
                         if self.reorg_requested.is_empty() || self.reorg_requested.len() < 3 {
                             if self.reorg_requested.insert(parent_id.0.0) {
-                                let _ = self.delivery_tx.try_send(
-                                    DeliveryEvent::NeedModifier {
+                                let _ = self.delivery_control_tx.send(
+                                    DeliveryControl::NeedModifier {
                                         type_id: HEADER_TYPE_ID,
                                         id: parent_id.0.0,
                                     },
@@ -421,12 +424,12 @@ impl ValidationPipeline {
 
                     // Notify sync machine — Reorg MUST NOT be dropped.
                     // A missed reorg leaves the validator with a stale state root,
-                    // permanently stalling validation.
-                    let _ = self.delivery_tx.send(DeliveryEvent::Reorg {
+                    // permanently stalling validation. Unbounded channel = infallible.
+                    let _ = self.delivery_control_tx.send(DeliveryControl::Reorg {
                         fork_point,
                         old_tip,
                         new_tip,
-                    }).await;
+                    });
                 }
                 Err(e) => {
                     tracing::warn!(fork_point, "deep reorg failed: {e}");
@@ -455,11 +458,11 @@ impl ValidationPipeline {
             }
         }
 
-        // Notify delivery tracker of evicted modifier IDs for re-request
+        // Notify delivery tracker of evicted modifier IDs for re-request (data plane — ok to drop)
         if !evicted_ids.is_empty() {
             tracing::debug!(count = evicted_ids.len(), "buffer evictions → re-request");
-            if self.delivery_tx.try_send(DeliveryEvent::Evicted(evicted_ids)).is_err() {
-                tracing::warn!("delivery channel full, dropped Evicted notification");
+            if self.delivery_data_tx.try_send(DeliveryData::Evicted(evicted_ids)).is_err() {
+                tracing::warn!("delivery data channel full, dropped Evicted notification");
             }
         }
 
@@ -496,17 +499,19 @@ mod tests {
         ValidationPipeline,
         mpsc::Sender<(u8, [u8; 32], Vec<u8>)>,
         mpsc::Receiver<u32>,
-        mpsc::Receiver<DeliveryEvent>,
+        mpsc::UnboundedReceiver<DeliveryControl>,
+        mpsc::Receiver<DeliveryData>,
         tempfile::TempDir,
     ) {
         let (tx, rx) = mpsc::channel(256);
         let (progress_tx, progress_rx) = mpsc::channel(4);
-        let (delivery_tx, delivery_rx) = mpsc::channel(64);
+        let (delivery_control_tx, delivery_control_rx) = mpsc::unbounded_channel();
+        let (delivery_data_tx, delivery_data_rx) = mpsc::channel(64);
         let chain = Arc::new(Mutex::new(HeaderChain::new(ChainConfig::testnet())));
         let dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(RedbModifierStore::new(&dir.path().join("test.redb")).unwrap());
-        let pipeline = ValidationPipeline::new(rx, chain, store, progress_tx, delivery_tx);
-        (pipeline, tx, progress_rx, delivery_rx, dir)
+        let pipeline = ValidationPipeline::new(rx, chain, store, progress_tx, delivery_control_tx, delivery_data_tx);
+        (pipeline, tx, progress_rx, delivery_control_rx, delivery_data_rx, dir)
     }
 
     #[test]
@@ -542,7 +547,7 @@ mod tests {
 
     #[test]
     fn rejects_unparseable_header() {
-        let (mut pipeline, _tx, _progress_rx, _delivery_rx, _dir) = test_pipeline();
+        let (mut pipeline, _tx, _progress_rx, _ctrl_rx, _data_rx, _dir) = test_pipeline();
         let batch = vec![(HEADER_TYPE_ID, [0xaa; 32], vec![0xff, 0x00, 0x01])];
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(pipeline.process_batch(batch));
@@ -552,7 +557,7 @@ mod tests {
 
     #[test]
     fn ignores_non_header_modifier_types() {
-        let (mut pipeline, _tx, _progress_rx, _delivery_rx, _dir) = test_pipeline();
+        let (mut pipeline, _tx, _progress_rx, _ctrl_rx, _data_rx, _dir) = test_pipeline();
         let batch = vec![(102, [0xaa; 32], vec![0xff; 100])];
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(pipeline.process_batch(batch));
@@ -587,7 +592,7 @@ mod tests {
         let header: Header = serde_json::from_str(json).unwrap();
         let bytes = header.scorex_serialize_bytes().unwrap();
 
-        let (mut pipeline, _tx, _progress_rx, _delivery_rx, _dir) = test_pipeline();
+        let (mut pipeline, _tx, _progress_rx, _ctrl_rx, _data_rx, _dir) = test_pipeline();
         let batch = vec![(HEADER_TYPE_ID, [0xaa; 32], bytes)];
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(pipeline.process_batch(batch));
