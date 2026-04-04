@@ -435,10 +435,23 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             return;
         }
 
-        let start = self.validated_height + 1;
+        let sweep_from = self.validated_height + 1;
+        let sweep_to = self.downloaded_height;
+        let sweep_size = sweep_to - self.validated_height;
+        let sweep_start = Instant::now();
+
+        if sweep_size > 100 {
+            tracing::info!(
+                from = sweep_from,
+                to = sweep_to,
+                blocks = sweep_size,
+                "=== VALIDATION SWEEP STARTED ==="
+            );
+        }
+
         let mut validated_to = self.validated_height;
 
-        for height in start..=self.downloaded_height {
+        for height in sweep_from..=sweep_to {
             let header = match self.chain.header_at(height).await {
                 Some(h) => h,
                 None => break,
@@ -481,7 +494,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 }
             };
 
-            // Get preceding headers (up to 10) for future ErgoStateContext
+            // Get preceding headers (up to 10) for ErgoStateContext
             let preceding_start = height.saturating_sub(10).max(1);
             let mut preceding = Vec::new();
             for h in (preceding_start..height).rev() {
@@ -501,6 +514,23 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             match result {
                 Ok(()) => {
                     validated_to = height;
+                    // Progress report every 1000 blocks during large sweeps
+                    let done = height - self.validated_height;
+                    if done % 1000 == 0 && sweep_size > 100 {
+                        let elapsed = sweep_start.elapsed().as_secs().max(1);
+                        let rate = done as f64 / elapsed as f64;
+                        let remaining = sweep_to - height;
+                        let eta_secs = if rate > 0.0 { remaining as f64 / rate } else { 0.0 };
+                        tracing::info!(
+                            height,
+                            done,
+                            remaining,
+                            elapsed_secs = elapsed,
+                            rate = format!("{rate:.0}/s"),
+                            eta = format!("{:.0}m", eta_secs / 60.0),
+                            "validation progress"
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::error!(height, error = %e, "block validation failed");
@@ -512,12 +542,27 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         if validated_to > self.validated_height {
             let advanced = validated_to - self.validated_height;
             self.validated_height = validated_to;
-            tracing::info!(
-                validated_height = validated_to,
-                advanced,
-                downloaded_height = self.downloaded_height,
-                "validated height advanced"
-            );
+
+            if sweep_size > 100 {
+                let elapsed = sweep_start.elapsed();
+                let secs = elapsed.as_secs().max(1);
+                let rate = advanced as f64 / secs as f64;
+                tracing::info!(
+                    from = sweep_from,
+                    to = validated_to,
+                    blocks = advanced,
+                    elapsed = format!("{}m{}s", secs / 60, secs % 60),
+                    rate = format!("{rate:.0}/s"),
+                    "=== VALIDATION SWEEP COMPLETE ==="
+                );
+            } else {
+                tracing::info!(
+                    validated_height = validated_to,
+                    advanced,
+                    downloaded_height = self.downloaded_height,
+                    "validated height advanced"
+                );
+            }
         }
     }
 
@@ -530,10 +575,6 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             }
             DeliveryControl::Reorg { fork_point, old_tip, new_tip } => {
                 tracing::info!(fork_point, old_tip, new_tip, "reorg: adjusting section queue and watermark");
-
-                // Clear section queue — entries are for the old branch
-                self.section_queue.clear();
-                self.sections_queued_to = fork_point;
 
                 // Reset watermarks if they were above the fork point
                 if self.downloaded_height > fork_point {
@@ -551,8 +592,15 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     self.validated_height = fork_point;
                 }
 
-                // Re-queue sections for the new best chain
-                self.queue_sections_for_range(fork_point + 1, new_tip).await;
+                // Clear section queue and reset queued-to watermark to downloaded_height.
+                // Entries above fork point are for the wrong branch. Entries below might
+                // still be valid but were cleared — re-queuing from downloaded_height
+                // ensures nothing is lost (has_modifier check skips what's already stored).
+                self.section_queue.clear();
+                self.sections_queued_to = self.downloaded_height;
+
+                // Re-queue from downloaded_height+1 through the new tip
+                self.queue_sections_for_range(self.sections_queued_to + 1, new_tip).await;
 
                 // Re-scan watermark — some sections may already be in store
                 self.advance_downloaded_height().await;
@@ -705,6 +753,10 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     /// Synced: periodically check for new blocks, download block sections.
     async fn synced(&mut self) {
         let mut ticker = tokio::time::interval(self.config.synced_poll_interval);
+        // Fast section download timer — keeps the pipe full without waiting
+        // for the 30s SyncInfo ticker. Gated on pending count to avoid
+        // overwhelming the peer.
+        let mut section_ticker = tokio::time::interval(Duration::from_secs(2));
 
         // Drain section queue on entry
         self.drain_section_queue().await;
@@ -729,9 +781,15 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         return;
                     }
 
-                    // Periodically drain any newly queued sections
-                    self.drain_section_queue().await;
                     self.advance_downloaded_height().await;
+                }
+
+                // Fast section download — drain queue every 2s if not too many in flight
+                _ = section_ticker.tick() => {
+                    if !self.section_queue.is_empty() && self.tracker.pending_count() < 500 {
+                        self.drain_section_queue().await;
+                        self.advance_downloaded_height().await;
+                    }
                 }
 
                 event = self.transport.next_event() => {
@@ -777,24 +835,19 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             return;
         }
 
-        // Drain from the front, group by type. Queue is in height order so
-        // front-drain preserves the natural request ordering.
+        // Pop up to 192 entries from the front, group by type.
+        // Each type is capped at 400 per ModifierRequest (JVM limit).
+        let max_drain = SECTION_REQUEST_BATCH_SIZE * 3;
         let mut by_type: HashMap<u8, Vec<[u8; 32]>> = HashMap::new();
-        let mut to_drain = 0usize;
-        for (type_id, id) in self.section_queue.iter() {
-            let batch = by_type.entry(*type_id).or_default();
-            if batch.len() < SECTION_REQUEST_BATCH_SIZE {
-                batch.push(*id);
-                to_drain += 1;
+        let mut drained = 0usize;
+        while drained < max_drain {
+            match self.section_queue.pop_front() {
+                Some((type_id, id)) => {
+                    by_type.entry(type_id).or_default().push(id);
+                    drained += 1;
+                }
+                None => break,
             }
-            if by_type.values().all(|v| v.len() >= SECTION_REQUEST_BATCH_SIZE) {
-                break;
-            }
-        }
-
-        // Remove drained entries from front
-        for _ in 0..to_drain {
-            self.section_queue.pop_front();
         }
 
         // Send to all outbound peers — we don't know which has full blocks

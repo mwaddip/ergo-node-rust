@@ -1,5 +1,7 @@
 //! DigestValidator: AD proof verification via BatchAVLVerifier.
 
+use std::collections::HashMap;
+
 use blake2::Digest;
 use bytes::Bytes;
 use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
@@ -7,9 +9,11 @@ use ergo_avltree_rust::batch_avl_verifier::BatchAVLVerifier;
 use ergo_avltree_rust::batch_node::{AVLTree, Node, NodeHeader};
 use ergo_avltree_rust::operation::{KeyValue, Operation};
 use ergo_chain_types::{ADDigest, Header};
+use ergo_lib::chain::parameters::Parameters;
 
 use crate::sections::{parse_ad_proofs, parse_block_transactions, parse_extension};
 use crate::state_changes::{compute_state_changes, transactions_to_summaries};
+use crate::tx_validation;
 use crate::{BlockValidator, ValidationError};
 
 /// Key length for Ergo's UTXO AVL+ tree (BoxId = 32 bytes).
@@ -32,8 +36,10 @@ fn label_preserving_resolver(digest: &[u8; 32]) -> Node {
 pub struct DigestValidator {
     current_digest: ADDigest,
     validated_height: u32,
-    #[allow(dead_code)]
     checkpoint_height: u32,
+    /// Current blockchain parameters. Updated from Extension at voting epoch
+    /// boundaries, carried forward between epochs.
+    parameters: Parameters,
 }
 
 impl DigestValidator {
@@ -46,15 +52,20 @@ impl DigestValidator {
             current_digest: genesis_digest,
             validated_height: 0,
             checkpoint_height,
+            parameters: Parameters::default(),
         }
     }
 
     /// Create a DigestValidator resuming from a known state.
+    ///
+    /// Uses default parameters — they'll be updated from the next epoch
+    /// boundary Extension encountered during validation.
     pub fn from_state(digest: ADDigest, height: u32, checkpoint_height: u32) -> Self {
         Self {
             current_digest: digest,
             validated_height: height,
             checkpoint_height,
+            parameters: Parameters::default(),
         }
     }
 }
@@ -66,7 +77,7 @@ impl BlockValidator for DigestValidator {
         block_txs: &[u8],
         ad_proofs: Option<&[u8]>,
         extension: &[u8],
-        _preceding_headers: &[Header],
+        preceding_headers: &[Header],
     ) -> Result<(), ValidationError> {
         let expected_height = self.validated_height + 1;
         if header.height != expected_height {
@@ -82,7 +93,7 @@ impl BlockValidator for DigestValidator {
         // 1. Parse sections
         let parsed_proofs = parse_ad_proofs(proof_data)?;
         let parsed_txs = parse_block_transactions(block_txs)?;
-        let _parsed_ext = parse_extension(extension)?;
+        let parsed_ext = parse_extension(extension)?;
 
         // 2. Verify AD proofs digest matches header
         let proof_digest: [u8; 32] = blake2::Blake2b::<blake2::digest::typenum::U32>::digest(
@@ -118,7 +129,9 @@ impl BlockValidator for DigestValidator {
             }));
         }
 
-        // 5. Verify AD proof via BatchAVLVerifier
+        // 5. Verify AD proof via BatchAVLVerifier, capturing old values
+        //    for transaction validation (Lookup/Remove return the serialized box)
+        let validate_txs = header.height > self.checkpoint_height;
         let starting_digest_bytes: [u8; 33] = self.current_digest.into();
         let starting_digest = Bytes::copy_from_slice(&starting_digest_bytes);
         let proof_bytes = Bytes::copy_from_slice(&parsed_proofs.proof_bytes);
@@ -133,12 +146,27 @@ impl BlockValidator for DigestValidator {
         )
         .map_err(|e| ValidationError::ProofVerificationFailed(format!("{e}")))?;
 
+        let mut proof_box_bytes: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+
         for (i, op) in operations.iter().enumerate() {
-            verifier
+            let result = verifier
                 .perform_one_operation(op)
                 .map_err(|e| ValidationError::ProofVerificationFailed(
                     format!("operation {i} failed: {e}"),
                 ))?;
+
+            if validate_txs {
+                if let Some(value) = result {
+                    match op {
+                        Operation::Lookup(key) | Operation::Remove(key) => {
+                            let mut id = [0u8; 32];
+                            id.copy_from_slice(key);
+                            proof_box_bytes.insert(id, value.to_vec());
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
 
         // 6. Check resulting digest matches header.state_root
@@ -159,7 +187,27 @@ impl BlockValidator for DigestValidator {
             }
         }
 
-        // 7. Advance state
+        // 7. Transaction validation (above checkpoint — ErgoScript evaluation)
+        if validate_txs {
+            let mut proof_boxes = HashMap::with_capacity(proof_box_bytes.len());
+            for (id, bytes) in &proof_box_bytes {
+                proof_boxes.insert(*id, tx_validation::deserialize_box(bytes)?);
+            }
+
+            tx_validation::validate_transactions(
+                &parsed_txs.transactions,
+                &proof_boxes,
+                header,
+                preceding_headers,
+                &self.parameters,
+            )?;
+        }
+
+        // 8. Update parameters from extension (always — tracks voting epochs)
+        self.parameters =
+            tx_validation::update_parameters_from_extension(&self.parameters, &parsed_ext);
+
+        // 9. Advance state
         self.current_digest = header.state_root;
         self.validated_height = header.height;
 

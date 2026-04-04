@@ -1,6 +1,7 @@
 mod digest;
 mod sections;
 mod state_changes;
+mod tx_validation;
 
 use ergo_chain_types::{ADDigest, Header};
 

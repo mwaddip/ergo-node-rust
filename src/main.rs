@@ -20,6 +20,16 @@ struct NodeConfig {
     verify_transactions: bool,
     #[serde(default = "default_blocks_to_keep")]
     blocks_to_keep: i64,
+    /// Re-validate all stored blocks from genesis on startup.
+    /// Keeps headers and sections — no re-download. Useful for testing
+    /// validation logic changes against the full chain history.
+    #[serde(default)]
+    revalidate: bool,
+    /// ErgoScript validation checkpoint. Blocks at or below this height
+    /// skip script evaluation (AD proof verification alone is sufficient).
+    /// 0 = validate everything. Overrides the default (tip - 100).
+    #[serde(default)]
+    checkpoint_height: Option<u32>,
 }
 
 impl Default for NodeConfig {
@@ -29,6 +39,8 @@ impl Default for NodeConfig {
             state_type: default_state_type(),
             verify_transactions: default_verify_transactions(),
             blocks_to_keep: default_blocks_to_keep(),
+            revalidate: false,
+            checkpoint_height: None,
         }
     }
 }
@@ -88,7 +100,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let verify_transactions = node_config.verify_transactions;
     let blocks_to_keep = node_config.blocks_to_keep;
-    tracing::info!(state_type = ?state_type, verify_transactions, blocks_to_keep, "node config");
+    let revalidate = node_config.revalidate;
+    let configured_checkpoint = node_config.checkpoint_height;
+    tracing::info!(state_type = ?state_type, verify_transactions, blocks_to_keep, revalidate, checkpoint_height = ?configured_checkpoint, "node config");
     let data_dir = std::path::PathBuf::from(node_config.data_dir);
     std::fs::create_dir_all(&data_dir)?;
     let store = Arc::new(RedbModifierStore::new(&data_dir.join("modifiers.redb"))?);
@@ -182,29 +196,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create block validator (digest mode)
     // If we restored a chain from store, start validation from the tip's state root.
     // Otherwise start from the genesis digest.
+    // Genesis state root — needed for fresh start or revalidation
+    let genesis_digest_hex = match network {
+        enr_p2p::types::Network::Testnet =>
+            "cb63aa99a3060f341781d8662b58bf18b9ad258db4fe88d09f8f71cb668cad4502",
+        enr_p2p::types::Network::Mainnet =>
+            "a5df145d41ab15a01e0cd3ffbab046f0d029e5412293072ad0f5827428589b9302",
+    };
+    let genesis_bytes = hex::decode(genesis_digest_hex).expect("invalid genesis digest hex");
+    let genesis_digest = ADDigest::try_from(genesis_bytes.as_slice())
+        .expect("invalid genesis digest length");
+
     let chain_guard = chain.lock().await;
-    let validator = if chain_guard.height() > 0 {
+    let validator = if chain_guard.height() > 0 && !revalidate {
         let tip = chain_guard.tip();
         let height = chain_guard.height();
         let digest = tip.state_root;
+        let checkpoint = configured_checkpoint.unwrap_or_else(|| height.saturating_sub(100));
         tracing::info!(
             height,
+            checkpoint,
             digest = ?digest,
             "block validator resuming from stored chain tip (digest mode)"
         );
-        DigestValidator::from_state(digest, height, 0)
+        DigestValidator::from_state(digest, height, checkpoint)
     } else {
-        let genesis_digest_hex = match network {
-            enr_p2p::types::Network::Testnet =>
-                "cb63aa99a3060f341781d8662b58bf18b9ad258db4fe88d09f8f71cb668cad4502",
-            enr_p2p::types::Network::Mainnet =>
-                "a5df145d41ab15a01e0cd3ffbab046f0d029e5412293072ad0f5827428589b9302",
-        };
-        let genesis_bytes = hex::decode(genesis_digest_hex).expect("invalid genesis digest hex");
-        let genesis_digest = ADDigest::try_from(genesis_bytes.as_slice())
-            .expect("invalid genesis digest length");
-        tracing::info!(genesis_digest = genesis_digest_hex, "block validator starting from genesis (digest mode)");
-        DigestValidator::new(genesis_digest, 0)
+        let checkpoint = configured_checkpoint.unwrap_or(0);
+        if revalidate && chain_guard.height() > 0 {
+            tracing::info!(
+                chain_height = chain_guard.height(),
+                checkpoint,
+                "revalidating all stored blocks from genesis"
+            );
+        } else {
+            tracing::info!(checkpoint, "block validator starting from genesis (digest mode)");
+        }
+        DigestValidator::new(genesis_digest, checkpoint)
     };
     drop(chain_guard);
 
