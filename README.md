@@ -4,9 +4,9 @@ A ground-up Ergo blockchain full node in Rust. Not a port of the JVM reference n
 
 ## Status
 
-**Highly experimental.** Syncing headers, downloading block sections, and validating state transitions on testnet. Headers are validated (PoW, difficulty, parent linkage) and persisted via redb. Block sections are validated in digest mode — AD proofs verify that each block's transactions correctly transform the UTXO state root without maintaining the full UTXO set. Survives restarts without re-syncing or re-validating.
+**Highly experimental.** Syncing headers, downloading block sections, and validating state transitions on testnet. Supports two validation modes: **digest mode** (AD proof verification, no UTXO set) and **UTXO mode** (persistent AVL+ tree, full state management). Headers are validated (PoW, difficulty, parent linkage) and persisted via redb. Survives restarts without re-syncing or re-validating.
 
-**Running continuously on testnet** since April 2026 — stays synced with the network, validates every block via AD proofs, handles chain reorganizations, and maintains persistent connections without getting banned by peers.
+**Running continuously on testnet** since April 2026. Currently syncing the full chain from genesis in UTXO mode — building the UTXO set block by block with state roots verified against every header. Also validated 267k+ blocks in digest mode via AD proofs. Handles chain reorganizations, maintains persistent connections, and survives restarts.
 
 ## Roadmap
 
@@ -23,8 +23,8 @@ A ground-up Ergo blockchain full node in Rust. Not a port of the JVM reference n
 | 3g | **Deep chain reorg** — fork-aware header storage, cumulative difficulty scoring, multi-block reorg | Done |
 | 4a | **Digest-mode validation** — verify state transitions via AD proofs (BatchAVLVerifier) | Done |
 | 4b | **Transaction validation** — ErgoScript evaluation via `ergo-lib` | Done |
-| 5 | UTXO state management — AVL+ tree backed, apply/rollback blocks | Next |
-| 6 | Full node — chain sync state machine, mempool, REST API | Planned |
+| 5 | **UTXO state management** — persistent AVL+ tree, apply/rollback blocks, genesis bootstrap | Done |
+| 6 | Full node — mempool, REST API | Planned |
 
 ## What works today
 
@@ -40,7 +40,9 @@ A ground-up Ergo blockchain full node in Rust. Not a port of the JVM reference n
 - **Block section download**: mode-aware — UTXO mode downloads BlockTransactions + Extension, digest mode scaffolding downloads ADProofs too
 - **Block assembly tracking**: `downloaded_height` watermark advances as sections arrive, identifies blocks ready for validation
 - **Digest-mode block validation**: verifies state transitions using AD proofs — each block's transactions are converted to AVL+ tree operations, and `BatchAVLVerifier` confirms the state root transition matches the header. No UTXO set needed.
-- **Transaction validation**: above a configurable checkpoint height, every transaction's spending proofs (sigma protocols) are verified via ergo-lib's `TransactionContext::validate()`. Input boxes extracted from AD proof output, parameters tracked from Extension sections at voting epoch boundaries. Validated 300+ consecutive testnet blocks with full ErgoScript evaluation — zero failures.
+- **Transaction validation**: above a configurable checkpoint height, every transaction's spending proofs (sigma protocols) are verified via ergo-lib's `TransactionContext::validate()`. Input boxes extracted from AD proof output (digest mode) or AVL+ tree lookups (UTXO mode), parameters tracked from Extension sections at voting epoch boundaries.
+- **UTXO state management**: persistent AVL+ tree over redb via `PersistentBatchAVLProver`. Genesis state bootstrapped from chain parameters using ported `ErgoTreePredef` (emission contract, foundation script built from IR — no hardcoded hex). Block state changes applied to the tree, state root verified against headers, with configurable rollback depth (200 blocks). Crash-safe — atomic redb transactions for all state updates.
+- **Sliding window sync**: sequential 192-block download window (matching JVM's `FullBlocksToDownloadAhead`), recomputed each cycle from current state. Delivery tracker with type-aware timeout retries.
 - **Honest Mode feature**: handshake advertises `state_type`, `verifying`, and `blocks_to_keep` from node config — peers don't request blocks we can't serve
 - **Deep chain reorg**: fork-aware header storage keeps all validated headers across forks. Cumulative difficulty scoring selects the best chain. Multi-block reorganization is a local operation — zero network traffic, reads fork headers from the store and swaps the in-memory chain atomically. Handles testnet forks automatically.
 - Continuous header sync from genesis on testnet — no connection stalls
@@ -56,14 +58,14 @@ The node is composed of independent submodules, each owning a well-defined bound
 | `p2p/` | [enr-p2p](https://github.com/mwaddip/enr-p2p) | P2P networking: handshake, message framing, routing, peer management |
 | `chain/` | [enr-chain](https://github.com/mwaddip/enr-chain) | Header parsing, PoW verification, difficulty adjustment, chain validation |
 | `sync/` | — | Chain sync state machine, section download, validation coordination |
-| `validation/` | — | Block validation: section parsing, state changes, AD proof verification |
+| `validation/` | — | Block validation: digest mode (AD proofs) and UTXO mode (persistent tree) |
 | `state/` | [enr-state](https://github.com/mwaddip/enr-state) | UTXO state management via AVL+ authenticated tree |
 | `store/` | [enr-store](https://github.com/mwaddip/enr-store) | Persistent storage for headers, blocks, and modifiers |
 | `facts/` | [ergo-node-facts](https://github.com/mwaddip/ergo-node-facts) | Interface contracts between components |
 
 The main crate wires components together via traits — the P2P layer doesn't know what validation means, and the validation layer doesn't know about networking. Integration happens at the top.
 
-Transaction validation and ErgoScript evaluation are handled by the existing [sigma-rust](https://github.com/ergoplatform/sigma-rust) ecosystem (`ergo-lib`, `ergotree-interpreter`).
+Transaction validation and ErgoScript evaluation are handled by the existing [sigma-rust](https://github.com/ergoplatform/sigma-rust) ecosystem (`ergo-lib`, `ergotree-interpreter`). Genesis box construction uses `ErgoTreePredef` — emission and foundation scripts ported from the JVM's `sigmastate-interpreter` to sigma-rust ([PR #848](https://github.com/ergoplatform/sigma-rust/pull/848)).
 
 ## Building
 

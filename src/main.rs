@@ -1,13 +1,132 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
 use enr_chain::{ChainConfig, HeaderChain, StateType, HEADER_TYPE_ID};
+use enr_state::{AVLTreeParams, RedbAVLStorage};
+use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
+use ergo_avltree_rust::batch_node::AVLTree;
+use ergo_avltree_rust::operation::{KeyValue, Operation};
+use ergo_avltree_rust::persistent_batch_avl_prover::PersistentBatchAVLProver;
+use ergo_avltree_rust::versioned_avl_storage::VersionedAVLStorage;
 use ergo_chain_types::ADDigest;
+use ergo_lib::chain::emission::MonetarySettings;
+use ergo_lib::chain::genesis;
+use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
+use ergo_chain_types::EcPoint;
 use enr_store::{ModifierStore, RedbModifierStore};
 use ergo_node_rust::{P2pTransport, SharedChain, SharedStore, ValidationPipeline};
 use ergo_sync::{HeaderSync, SyncConfig};
-use ergo_validation::DigestValidator;
+use ergo_validation::{BlockValidator, DigestValidator, UtxoValidator, ValidationError};
 use serde::Deserialize;
 use tokio::sync::Mutex;
+
+/// Testnet no-premine proof strings (UTF-8, stored in R4-R8).
+const TESTNET_NO_PREMINE_PROOFS: &[&str] = &[
+    "'Chaos reigns': what the papers say about the no-deal Brexit vote",
+    "\u{4e60}\u{8fd1}\u{5e73}\u{7684}\u{4e24}\u{4f1a}\u{65f6}\u{95f4}|\u{8fd9}\u{91cc}\u{6709}\u{4efd}\u{4e60}\u{8fd1}\u{5e73}\u{4e24}\u{4f1a}\u{65e5}\u{5386}\u{ff0c}\u{8bf7}\u{67e5}\u{6536}\u{ff01}",
+    "\u{0422}\u{0410}\u{0421}\u{0421} \u{0441}\u{043e}\u{043e}\u{0431}\u{0449}\u{0438}\u{043b} \u{043e}\u{0431} \u{043e}\u{0431}\u{043d}\u{0430}\u{0440}\u{0443}\u{0436}\u{0435}\u{043d}\u{0438}\u{0438} \u{043d}\u{0435}\u{0441}\u{043a}\u{043e}\u{043b}\u{044c}\u{043a}\u{0438}\u{0445} \u{043c}\u{0430}\u{0439}\u{043d}\u{0438}\u{043d}\u{0433}\u{043e}\u{0432}\u{044b}\u{0445} \u{0444}\u{0435}\u{0440}\u{043c} \u{043d}\u{0430} \u{0441}\u{0442}\u{043e}\u{043b}\u{0438}\u{0447}\u{043d}\u{044b}\u{0445} \u{0440}\u{044b}\u{043d}\u{043a}\u{0430}\u{0445}",
+    "000000000000000000139a3e61bd5721827b51a5309a8bfeca0b8c4b5c060931",
+    "0xef1d584d77e74e3c509de625dc17893b22b73d040b5d5302bbf832065f928d03",
+];
+
+/// Testnet founders' public keys (hex-encoded compressed EC points).
+const TESTNET_FOUNDERS_PKS: &[&str] = &[
+    "039bb5fe52359a64c99a60fd944fc5e388cbdc4d37ff091cc841c3ee79060b8647",
+    "031fb52cf6e805f80d97cde289f4f757d49accf0c83fb864b27d2cf982c37f9a8b",
+    "0352ac2a471339b0d23b3d2c5ce0db0e81c969f77891b9edf0bda7fd39a78184e7",
+];
+
+/// Construct the 3 genesis UTXO boxes from chain parameters.
+///
+/// Returns (box_id, sigma_serialized_bytes) for each box.
+/// Uses ergo-lib's genesis module — ErgoTree scripts are built from IR,
+/// not hardcoded hex.
+fn build_genesis_boxes(network: enr_p2p::types::Network) -> Vec<([u8; 32], Vec<u8>)> {
+    let settings = MonetarySettings::default();
+
+    let (proof_strings, founder_pk_hexes) = match network {
+        enr_p2p::types::Network::Testnet => (TESTNET_NO_PREMINE_PROOFS, TESTNET_FOUNDERS_PKS),
+        enr_p2p::types::Network::Mainnet => {
+            unimplemented!("mainnet genesis not yet implemented")
+        }
+    };
+
+    let founder_pks: Vec<ProveDlog> = founder_pk_hexes
+        .iter()
+        .map(|hex_str| {
+            let bytes = hex::decode(hex_str).expect("invalid founder pk hex");
+            let point = EcPoint::sigma_parse_bytes(&bytes).expect("invalid EC point");
+            ProveDlog::new(point)
+        })
+        .collect();
+
+    let (emission, no_premine, founders) = genesis::genesis_boxes(
+        &settings,
+        &founder_pks,
+        2, // 2-of-3 threshold
+        proof_strings,
+    ).expect("genesis box construction failed");
+
+    [emission, no_premine, founders]
+        .into_iter()
+        .map(|b| {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(b.box_id().as_ref());
+            let bytes = b.sigma_serialize_bytes().expect("genesis box serialization failed");
+            (id, bytes)
+        })
+        .collect()
+}
+
+/// Dispatches to either DigestValidator or UtxoValidator based on config.
+enum Validator {
+    Digest(DigestValidator),
+    Utxo(UtxoValidator),
+}
+
+impl BlockValidator for Validator {
+    fn validate_block(
+        &mut self,
+        header: &ergo_chain_types::Header,
+        block_txs: &[u8],
+        ad_proofs: Option<&[u8]>,
+        extension: &[u8],
+        preceding_headers: &[ergo_chain_types::Header],
+    ) -> Result<(), ValidationError> {
+        match self {
+            Validator::Digest(v) => v.validate_block(header, block_txs, ad_proofs, extension, preceding_headers),
+            Validator::Utxo(v) => v.validate_block(header, block_txs, ad_proofs, extension, preceding_headers),
+        }
+    }
+
+    fn validated_height(&self) -> u32 {
+        match self {
+            Validator::Digest(v) => v.validated_height(),
+            Validator::Utxo(v) => v.validated_height(),
+        }
+    }
+
+    fn current_digest(&self) -> &ADDigest {
+        match self {
+            Validator::Digest(v) => v.current_digest(),
+            Validator::Utxo(v) => v.current_digest(),
+        }
+    }
+
+    fn reset_to(&mut self, height: u32, digest: ADDigest) {
+        match self {
+            Validator::Digest(v) => v.reset_to(height, digest),
+            Validator::Utxo(v) => v.reset_to(height, digest),
+        }
+    }
+}
+
+// SAFETY: UtxoValidator contains PersistentBatchAVLProver which uses Rc<RefCell<Node>>
+// (not Send). The Validator enum is only used from the sync task — a single logical
+// owner with no cross-thread sharing. The Send bound is required by tokio::spawn but
+// the actual access pattern is single-threaded.
+unsafe impl Send for Validator {}
 
 /// Node-level config parsed from the `[node]` section of ergo.toml.
 #[derive(Debug, Deserialize)]
@@ -194,9 +313,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transport = P2pTransport::new(p2p.clone(), events);
     let sync_chain = SharedChain::new(chain.clone());
 
-    // Create block validator (digest mode)
-    // If we restored a chain from store, start validation from the tip's state root.
-    // Otherwise start from the genesis digest.
     // Genesis state root — needed for fresh start or revalidation
     let genesis_digest_hex = match network {
         enr_p2p::types::Network::Testnet =>
@@ -209,63 +325,127 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("invalid genesis digest length");
 
     let chain_guard = chain.lock().await;
-    let validator = if chain_guard.height() > 0 && !revalidate {
-        let tip = chain_guard.tip();
-        let height = chain_guard.height();
-        let digest = tip.state_root;
-        let checkpoint = configured_checkpoint.unwrap_or_else(|| height.saturating_sub(100));
-        tracing::info!(
-            height,
-            checkpoint,
-            digest = ?digest,
-            "block validator resuming from stored chain tip (digest mode)"
-        );
-        DigestValidator::from_state(digest, height, checkpoint)
-    } else if revalidate && chain_guard.height() > 0 {
-        let checkpoint = configured_checkpoint.unwrap_or(0);
-        let chain_height = chain_guard.height();
 
-        // Scan forward to find the first height with all required sections.
-        // Early blocks often lack AD proofs (UTXO-mode peers don't serve them).
-        let mut start_from = 0u32;
-        for height in 1..=chain_height {
-            let header = match chain_guard.header_at(height) {
-                Some(h) => h,
-                None => continue,
-            };
-            let sections = enr_chain::required_section_ids(&header, state_type);
-            let complete = sections.iter().all(|(type_id, id)| {
-                revalidate_store.get(*type_id, id).ok().flatten().is_some()
-            });
-            if complete {
-                start_from = height;
-                break;
-            }
-        }
+    let validator: Validator = match state_type {
+        StateType::Utxo => {
+            let state_path = data_dir.join("state.redb");
+            let params = AVLTreeParams { key_length: 32, value_length: None };
+            let keep_versions = 200u32;
+            let storage = RedbAVLStorage::open(&state_path, params, keep_versions)
+                .expect("failed to open UTXO state storage");
 
-        if start_from == 0 {
-            tracing::warn!("revalidate: no complete blocks found in store, starting from genesis");
-            DigestValidator::new(genesis_digest, checkpoint)
-        } else {
-            // Start validator from the block before the first complete one
-            let prev_height = start_from - 1;
-            let digest = if prev_height == 0 {
-                genesis_digest
+            let checkpoint = configured_checkpoint.unwrap_or(0);
+
+            let persistent_prover = if storage.version().is_some() {
+                // Resume from stored UTXO state
+                let resolver = storage.resolver();
+                let tree = AVLTree::new(resolver, 32, None);
+                let prover = BatchAVLProver::new(tree, true);
+                PersistentBatchAVLProver::new(prover, Box::new(storage), vec![])
+                    .expect("failed to create persistent prover from stored state")
             } else {
-                chain_guard.header_at(prev_height).unwrap().state_root
+                // Bootstrap from genesis — insert the 3 genesis boxes
+                let resolver = storage.resolver();
+                let tree = AVLTree::new(resolver, 32, None);
+                let mut prover = BatchAVLProver::new(tree, true);
+
+                for (box_id, box_bytes) in build_genesis_boxes(network) {
+                    prover.perform_one_operation(&Operation::Insert(KeyValue {
+                        key: Bytes::copy_from_slice(&box_id),
+                        value: Bytes::copy_from_slice(&box_bytes),
+                    })).expect("genesis box insert failed");
+                }
+
+                let p = PersistentBatchAVLProver::new(prover, Box::new(storage), vec![])
+                    .expect("failed to create persistent prover from genesis");
+
+                // Verify genesis digest matches expected
+                let actual = p.digest();
+                let expected: [u8; 33] = genesis_digest.into();
+                assert_eq!(
+                    actual.as_ref(), &expected[..],
+                    "genesis UTXO state digest mismatch"
+                );
+                p
             };
-            tracing::info!(
-                first_complete = start_from,
-                chain_height,
-                checkpoint,
-                "revalidating stored blocks from first complete section"
+
+            let height = chain_guard.height().min(
+                // UtxoValidator tracks its own height via the prover's state
+                // For now, start from 0 if fresh, or chain tip if resuming
+                if persistent_prover.digest().as_ref() == <[u8; 33]>::from(genesis_digest).as_slice() {
+                    0
+                } else {
+                    chain_guard.height()
+                }
             );
-            DigestValidator::from_state(digest, prev_height, checkpoint)
+
+            tracing::info!(
+                height,
+                checkpoint,
+                "block validator starting (UTXO mode)"
+            );
+            Validator::Utxo(UtxoValidator::new(persistent_prover, height, checkpoint))
         }
-    } else {
-        let checkpoint = configured_checkpoint.unwrap_or(0);
-        tracing::info!(checkpoint, "block validator starting from genesis (digest mode)");
-        DigestValidator::new(genesis_digest, checkpoint)
+
+        StateType::Digest => {
+            let validator = if chain_guard.height() > 0 && !revalidate {
+                let tip = chain_guard.tip();
+                let height = chain_guard.height();
+                let digest = tip.state_root;
+                let checkpoint = configured_checkpoint.unwrap_or_else(|| height.saturating_sub(100));
+                tracing::info!(
+                    height,
+                    checkpoint,
+                    digest = ?digest,
+                    "block validator resuming from stored chain tip (digest mode)"
+                );
+                DigestValidator::from_state(digest, height, checkpoint)
+            } else if revalidate && chain_guard.height() > 0 {
+                let checkpoint = configured_checkpoint.unwrap_or(0);
+                let chain_height = chain_guard.height();
+
+                // Scan forward to find the first height with all required sections.
+                let mut start_from = 0u32;
+                for height in 1..=chain_height {
+                    let header = match chain_guard.header_at(height) {
+                        Some(h) => h,
+                        None => continue,
+                    };
+                    let sections = enr_chain::required_section_ids(&header, state_type);
+                    let complete = sections.iter().all(|(type_id, id)| {
+                        revalidate_store.get(*type_id, id).ok().flatten().is_some()
+                    });
+                    if complete {
+                        start_from = height;
+                        break;
+                    }
+                }
+
+                if start_from == 0 {
+                    tracing::warn!("revalidate: no complete blocks found in store, starting from genesis");
+                    DigestValidator::new(genesis_digest, checkpoint)
+                } else {
+                    let prev_height = start_from - 1;
+                    let digest = if prev_height == 0 {
+                        genesis_digest
+                    } else {
+                        chain_guard.header_at(prev_height).unwrap().state_root
+                    };
+                    tracing::info!(
+                        first_complete = start_from,
+                        chain_height,
+                        checkpoint,
+                        "revalidating stored blocks from first complete section"
+                    );
+                    DigestValidator::from_state(digest, prev_height, checkpoint)
+                }
+            } else {
+                let checkpoint = configured_checkpoint.unwrap_or(0);
+                tracing::info!(checkpoint, "block validator starting from genesis (digest mode)");
+                DigestValidator::new(genesis_digest, checkpoint)
+            };
+            Validator::Digest(validator)
+        }
     };
     drop(chain_guard);
 
@@ -301,4 +481,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
+    use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
+    use ergo_avltree_rust::batch_node::{AVLTree, Node, NodeHeader};
+    use ergo_avltree_rust::operation::{KeyValue, Operation};
+    use std::sync::Arc;
+
+    #[test]
+    fn testnet_genesis_boxes_produce_correct_digest() {
+        let boxes = build_genesis_boxes(enr_p2p::types::Network::Testnet);
+        assert_eq!(boxes.len(), 3, "expected 3 genesis boxes");
+
+        // Verify box IDs match the JVM's
+        let expected_ids = [
+            "b69575e11c5c43400bfead5976ee0d6245a1168396b2e2a4f384691f275d501c",
+            "3bfaf76c824df668822dfce71abaf688d0281f91c3ac2a271f92fa28c3efaac7",
+            "5527430474b673e4aafb08e0079c639de23e6a17e87edd00f78662b43c88aeda",
+        ];
+        for (i, (id, _)) in boxes.iter().enumerate() {
+            assert_eq!(
+                hex::encode(id),
+                expected_ids[i],
+                "box {} ID mismatch",
+                i
+            );
+        }
+
+        // Insert into AVL+ tree and verify genesis state digest
+        let resolver: ergo_avltree_rust::batch_node::Resolver =
+            Arc::new(|digest: &[u8; 32]| Node::LabelOnly(NodeHeader::new(Some(*digest), None)));
+        let tree = AVLTree::new(resolver, 32, None);
+        let mut prover = BatchAVLProver::new(tree, false);
+
+        for (id, value) in &boxes {
+            prover
+                .perform_one_operation(&Operation::Insert(KeyValue {
+                    key: Bytes::copy_from_slice(id),
+                    value: Bytes::copy_from_slice(value),
+                }))
+                .expect("genesis box insert failed");
+        }
+
+        let digest = prover.digest().expect("prover has no digest");
+        let expected_hex = "cb63aa99a3060f341781d8662b58bf18b9ad258db4fe88d09f8f71cb668cad4502";
+        assert_eq!(
+            hex::encode(&digest),
+            expected_hex,
+            "genesis state digest mismatch"
+        );
+    }
 }

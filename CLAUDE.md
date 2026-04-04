@@ -44,18 +44,18 @@ Multi-session development following the BlockHost pattern:
 
 | Component | Status | Session |
 |---|---|---|
-| P2P networking | **Done** | `ergo-proxy-node` (separate repo) |
-| Header chain validation | To build | Submodule |
-| Block validation | To build | Submodule |
-| UTXO state management | To build | Submodule |
+| P2P networking | **Done** | `enr-p2p` submodule |
+| Header chain validation | **Done** | `enr-chain` submodule |
+| Block validation (digest + UTXO) | **Done** | `validation/` in-repo |
+| UTXO state management | **Done** | `enr-state` submodule |
+| Chain sync state machine | **Done** | `sync/` in-repo |
+| Block/modifier storage | **Done** | `enr-store` submodule |
 | Mempool | To build | Submodule |
-| Chain sync state machine | To build | Submodule |
-| Block/modifier storage | To build | Submodule |
 | REST API | To build | Submodule |
 
 ## Design Principles
 
-- **Design by Contract**: every component boundary has explicit preconditions, postconditions, and invariants. Contracts are documented in `contracts/` and enforced via `debug_assert!`.
+- **Design by Contract**: every component boundary has explicit preconditions, postconditions, and invariants. Contracts are documented in `facts/` and enforced via `debug_assert!`.
 - **The wire is the spec**: the Ergo P2P protocol has no formal specification. Protocol behavior was reverse-engineered from the JVM reference node and verified against pcap captures. See `docs/protocol/` for the wire format spec.
 - **Reuse before building**: the Rust Ergo ecosystem has substantial existing components. Use them. See the ecosystem inventory below.
 - **Incremental validation**: each phase adds one capability without breaking what came before. The node starts as a proxy and gains validation layers progressively.
@@ -73,26 +73,35 @@ Multi-session development following the BlockHost pattern:
 | Block header types | `ergo-chain-types` | 0.15.0 | Feb 2026 | Full Header struct with Autolykos solution |
 | Autolykos v2 PoW | `ergo-chain-types` | 0.15.0 | Feb 2026 | `pow_hit()`, compact bits, table size growth |
 | NiPoPoW verification | `ergo-nipopow` | 0.15.0 | Dec 2021 | Full KMZ17 algorithm, proof comparison, best chain |
-| AVL+ authenticated tree | `ergo_avltree_rust` | 0.1.1 | Dec 2024 | Prover + verifier, batch operations, versioned storage trait |
+| AVL+ authenticated tree | `ergo_avltree_rust` | fork | Apr 2026 | Prover + verifier, batch operations — forked to fix `Resolver` type for persistence ([PR #10](https://github.com/ergoplatform/ergo_avltree_rust/pull/10)) |
 | Merkle proofs | `ergo-merkle-tree` | 0.15.0 | Feb 2026 | Tree, proof, batch multiproof |
 | ErgoScript compiler | `ergoscript-compiler` | 0.24.0 | Feb 2026 | Source to ErgoTree |
 | Scorex serialization | `sigma-ser` | — | Feb 2026 | VLQ, ZigZag, binary encoding |
 | P2P networking | `ergo-proxy-node` | 0.1.0 | Mar 2026 | Handshake, framing, message routing, IPv6 |
 
+### Built (this project)
+
+| Component | Status | Notes |
+|---|---|---|
+| Header chain validation | **Done** | Parent linkage, timestamps, difficulty adjustment |
+| Difficulty adjustment | **Done** | Epoch recalculation, ported from JVM |
+| UTXO set management | **Done** | Persistent AVL+ tree over redb, rollback, genesis bootstrap |
+| AD proofs verification | **Done** | `BatchAVLVerifier` orchestration in digest mode |
+| Block validation (digest) | **Done** | AD proof verification + ErgoScript evaluation |
+| Block validation (UTXO) | **Done** | `PersistentBatchAVLProver` + ErgoScript evaluation |
+| Extension section handling | **Done** | Parameter extraction at voting epoch boundaries |
+| Block/modifier storage | **Done** | redb backend, height-indexed |
+| Chain sync state machine | **Done** | Digest + UTXO modes, sliding window download |
+| Emission schedule | **Done** | Ported to sigma-rust as `EmissionRules` |
+| ErgoTree predefs | **Done** | Ported to sigma-rust as `ErgoTreePredef` (PR #848) |
+
 ### Must Build
 
 | Component | Difficulty | Reference |
 |---|---|---|
-| Header chain validation | Medium | `ergo-core` sub-module in JVM repo |
-| Difficulty adjustment (Autolykos2) | Medium | Epoch recalculation, documented algorithm |
-| UTXO set management | Hard | Apply block → update AVL tree, rollback |
-| AD proofs verification | Medium | `ergo_avltree_rust` exists, orchestration needed |
-| Block validation (full) | Hard | Combine header + tx + AD proof + UTXO checks |
-| Extension section handling | Easy | Parameters, interlinks, voting |
 | Mempool | Medium | Tx ordering, eviction, double-spend detection |
-| Block/modifier storage | Medium | Persistent backend (LevelDB, RocksDB, or similar) |
-| Chain sync state machine | Hard | Full/digest/UTXO-snapshot modes |
-| Emission schedule | Easy | Fixed rate period, epoch reduction, documented formula |
+| REST API | Medium | Query interface for wallets and dApps |
+| UTXO snapshot sync | Medium | Bootstrap from peer snapshot instead of genesis |
 | Soft-fork voting | Easy | Parameter voting, rule activation |
 
 ### Dead / Superseded
@@ -114,14 +123,14 @@ Verify proof of work before forwarding headers. `ergo-chain-types::AutolykosPowS
 ### Phase 3: Header Chain Validation
 Validate headers form a valid chain: parent hash, timestamps, difficulty adjustment. Porting difficulty algorithm from `ergo-core`. Combined with NiPoPoW for light client bootstrap.
 
-### Phase 4: Transaction Validation
-Validate transactions given input boxes. `ergo-lib::TransactionContext::validate()` already exists. Need input box lookup.
+### Phase 4: Block Validation
+Validate blocks in digest mode (AD proofs, `BatchAVLVerifier`) and UTXO mode (`PersistentBatchAVLProver`). ErgoScript evaluation via `ergo-lib::TransactionContext::validate()`. Both modes share section parsing, state change computation, and transaction validation — only the state root verification mechanism differs. **Done.**
 
 ### Phase 5: UTXO State Management
-AVL+ tree backed UTXO set. Apply blocks, rollback support. `ergo_avltree_rust` exists, needs persistence backend and orchestration layer.
+Persistent AVL+ tree over redb (`enr-state` crate). Implements `VersionedAVLStorage` from forked `ergo_avltree_rust`. Undo-log rollback, configurable version retention, crash-safe atomic writes. Genesis bootstrap from chain parameters via ported `ErgoTreePredef`. Sliding 192-block download window for sequential sync. **Done.**
 
 ### Phase 6: Full Node
-Block storage, chain sync state machine, mempool, REST API.
+Mempool, REST API, UTXO snapshot sync.
 
 ## Protocol Reference
 
