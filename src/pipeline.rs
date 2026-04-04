@@ -238,8 +238,8 @@ impl ValidationPipeline {
         let mut pending_reorg: Option<(u32, Vec<Header>, Vec<Vec<u8>>)> = None;
 
         for (header, raw) in valid_headers {
-            // Skip exact duplicate of current tip
-            if !chain.is_empty() && header.height == chain.height() && header.id == chain.tip().id {
+            // Skip headers already in the chain (duplicates from overlapping peer responses)
+            if chain.contains(&header.id) {
                 rejected += 1;
                 continue;
             }
