@@ -175,6 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Validation pipeline — progress channel feeds sync, delivery channel feeds tracker
     let pipeline_chain = chain.clone();
     let sync_store = SharedStore::new(store.clone());
+    let revalidate_store = store.clone(); // for section scan during revalidation
     let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(4);
     // Control channel: unbounded — Reorg/NeedModifier must never be dropped
     let (delivery_control_tx, delivery_control_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -220,17 +221,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "block validator resuming from stored chain tip (digest mode)"
         );
         DigestValidator::from_state(digest, height, checkpoint)
+    } else if revalidate && chain_guard.height() > 0 {
+        let checkpoint = configured_checkpoint.unwrap_or(0);
+        let chain_height = chain_guard.height();
+
+        // Scan forward to find the first height with all required sections.
+        // Early blocks often lack AD proofs (UTXO-mode peers don't serve them).
+        let mut start_from = 0u32;
+        for height in 1..=chain_height {
+            let header = match chain_guard.header_at(height) {
+                Some(h) => h,
+                None => continue,
+            };
+            let sections = enr_chain::required_section_ids(&header, state_type);
+            let complete = sections.iter().all(|(type_id, id)| {
+                revalidate_store.get(*type_id, id).ok().flatten().is_some()
+            });
+            if complete {
+                start_from = height;
+                break;
+            }
+        }
+
+        if start_from == 0 {
+            tracing::warn!("revalidate: no complete blocks found in store, starting from genesis");
+            DigestValidator::new(genesis_digest, checkpoint)
+        } else {
+            // Start validator from the block before the first complete one
+            let prev_height = start_from - 1;
+            let digest = if prev_height == 0 {
+                genesis_digest
+            } else {
+                chain_guard.header_at(prev_height).unwrap().state_root
+            };
+            tracing::info!(
+                first_complete = start_from,
+                chain_height,
+                checkpoint,
+                "revalidating stored blocks from first complete section"
+            );
+            DigestValidator::from_state(digest, prev_height, checkpoint)
+        }
     } else {
         let checkpoint = configured_checkpoint.unwrap_or(0);
-        if revalidate && chain_guard.height() > 0 {
-            tracing::info!(
-                chain_height = chain_guard.height(),
-                checkpoint,
-                "revalidating all stored blocks from genesis"
-            );
-        } else {
-            tracing::info!(checkpoint, "block validator starting from genesis (digest mode)");
-        }
+        tracing::info!(checkpoint, "block validator starting from genesis (digest mode)");
         DigestValidator::new(genesis_digest, checkpoint)
     };
     drop(chain_guard);

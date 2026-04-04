@@ -22,8 +22,8 @@ A ground-up Ergo blockchain full node in Rust. Not a port of the JVM reference n
 | 3f | **Honest Mode advertisement** — handshake advertises actual capabilities (`blocks_to_keep`) | Done |
 | 3g | **Deep chain reorg** — fork-aware header storage, cumulative difficulty scoring, multi-block reorg | Done |
 | 4a | **Digest-mode validation** — verify state transitions via AD proofs (BatchAVLVerifier) | Done |
-| 4b | Transaction validation — ErgoScript evaluation via `ergo-lib` | Next |
-| 5 | UTXO state management — AVL+ tree backed, apply/rollback blocks | Planned |
+| 4b | **Transaction validation** — ErgoScript evaluation via `ergo-lib` | Done |
+| 5 | UTXO state management — AVL+ tree backed, apply/rollback blocks | Next |
 | 6 | Full node — chain sync state machine, mempool, REST API | Planned |
 
 ## What works today
@@ -39,7 +39,8 @@ A ground-up Ergo blockchain full node in Rust. Not a port of the JVM reference n
 - **Persistent storage**: headers written to redb after validation, restored on startup — no re-sync after restart
 - **Block section download**: mode-aware — UTXO mode downloads BlockTransactions + Extension, digest mode scaffolding downloads ADProofs too
 - **Block assembly tracking**: `downloaded_height` watermark advances as sections arrive, identifies blocks ready for validation
-- **Digest-mode block validation**: verifies state transitions using AD proofs — each block's transactions are converted to AVL+ tree operations, and `BatchAVLVerifier` confirms the state root transition matches the header. No UTXO set needed. Validated 1000+ consecutive testnet blocks.
+- **Digest-mode block validation**: verifies state transitions using AD proofs — each block's transactions are converted to AVL+ tree operations, and `BatchAVLVerifier` confirms the state root transition matches the header. No UTXO set needed.
+- **Transaction validation**: above a configurable checkpoint height, every transaction's spending proofs (sigma protocols) are verified via ergo-lib's `TransactionContext::validate()`. Input boxes extracted from AD proof output, parameters tracked from Extension sections at voting epoch boundaries. Validated 300+ consecutive testnet blocks with full ErgoScript evaluation — zero failures.
 - **Honest Mode feature**: handshake advertises `state_type`, `verifying`, and `blocks_to_keep` from node config — peers don't request blocks we can't serve
 - **Deep chain reorg**: fork-aware header storage keeps all validated headers across forks. Cumulative difficulty scoring selects the best chain. Multi-block reorganization is a local operation — zero network traffic, reads fork headers from the store and swaps the in-memory chain atomically. Handles testnet forks automatically.
 - Continuous header sync from genesis on testnet — no connection stalls
