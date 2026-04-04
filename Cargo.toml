@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "sync", "validation"]
+members = [".", "sync", "validation", "state"]
 
 [package]
 name = "ergo-node-rust"
