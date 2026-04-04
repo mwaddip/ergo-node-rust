@@ -72,6 +72,12 @@ impl SyncChain for SharedChain {
     async fn header_at(&self, height: u32) -> Option<Header> {
         self.chain.lock().await.header_at(height).cloned()
     }
+
+    async fn header_state_root(&self, height: u32) -> Option<[u8; 33]> {
+        let chain = self.chain.lock().await;
+        let header = chain.header_at(height)?;
+        Some(header.state_root.0)
+    }
 }
 
 /// Wraps `Arc<RedbModifierStore>` to implement `SyncStore`.

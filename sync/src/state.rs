@@ -42,6 +42,12 @@ pub struct SyncConfig {
     /// Node state type — determines which block sections to download.
     /// UTXO mode skips AD proofs; digest mode downloads all sections.
     pub state_type: StateType,
+    /// Enable UTXO snapshot bootstrapping.
+    pub utxo_bootstrap: bool,
+    /// Minimum peers announcing the same manifest before downloading.
+    pub min_snapshot_peers: u32,
+    /// Data directory for temporary snapshot download storage.
+    pub data_dir: std::path::PathBuf,
 }
 
 impl Default for SyncConfig {
@@ -55,6 +61,9 @@ impl Default for SyncConfig {
             delivery_timeout: Duration::from_secs(10),
             max_delivery_checks: 100,
             state_type: StateType::Utxo,
+            utxo_bootstrap: false,
+            min_snapshot_peers: 2,
+            data_dir: std::path::PathBuf::from("."),
         }
     }
 }
