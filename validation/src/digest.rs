@@ -1,12 +1,13 @@
 //! DigestValidator: AD proof verification via BatchAVLVerifier.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use blake2::Digest;
 use bytes::Bytes;
 use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
 use ergo_avltree_rust::batch_avl_verifier::BatchAVLVerifier;
-use ergo_avltree_rust::batch_node::{AVLTree, Node, NodeHeader};
+use ergo_avltree_rust::batch_node::{AVLTree, Node, NodeHeader, Resolver};
 use ergo_avltree_rust::operation::{KeyValue, Operation};
 use ergo_chain_types::{ADDigest, Header};
 use ergo_lib::chain::parameters::Parameters;
@@ -17,7 +18,7 @@ use crate::tx_validation;
 use crate::{BlockValidator, ValidationError};
 
 /// Key length for Ergo's UTXO AVL+ tree (BoxId = 32 bytes).
-const KEY_LENGTH: usize = 32;
+pub(crate) const KEY_LENGTH: usize = 32;
 
 /// Resolver for the AVL verifier — returns a LabelOnly node preserving the digest.
 ///
@@ -25,8 +26,8 @@ const KEY_LENGTH: usize = 32;
 /// `AVLTree::left()/right()` calls `resolve()` on every child access, including
 /// LabelOnly stubs. The resolver must preserve the label so the stub remains valid
 /// for subsequent accesses (label computation, rebalancing checks).
-fn label_preserving_resolver(digest: &[u8; 32]) -> Node {
-    Node::LabelOnly(NodeHeader::new(Some(*digest), None))
+pub(crate) fn label_preserving_resolver() -> Resolver {
+    Arc::new(|digest: &[u8; 32]| Node::LabelOnly(NodeHeader::new(Some(*digest), None)))
 }
 
 /// Digest-mode block validator.
@@ -136,7 +137,7 @@ impl BlockValidator for DigestValidator {
         let starting_digest = Bytes::copy_from_slice(&starting_digest_bytes);
         let proof_bytes = Bytes::copy_from_slice(&parsed_proofs.proof_bytes);
 
-        let tree = AVLTree::new(label_preserving_resolver, KEY_LENGTH, None);
+        let tree = AVLTree::new(label_preserving_resolver(), KEY_LENGTH, None);
         let mut verifier = BatchAVLVerifier::new(
             &starting_digest,
             &proof_bytes,

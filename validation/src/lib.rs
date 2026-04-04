@@ -2,12 +2,14 @@ mod digest;
 mod sections;
 mod state_changes;
 mod tx_validation;
+mod utxo;
 
 use ergo_chain_types::{ADDigest, Header};
 
 pub use digest::DigestValidator;
 pub use sections::{ParsedAdProofs, ParsedBlockTransactions, ParsedExtension};
 pub use state_changes::StateChanges;
+pub use utxo::UtxoValidator;
 
 /// Validates block sections against the current UTXO state.
 ///
@@ -70,4 +72,7 @@ pub enum ValidationError {
 
     #[error("unexpected block height: expected {expected}, got {got}")]
     HeightMismatch { expected: u32, got: u32 },
+
+    #[error("UTXO state operation failed: {0}")]
+    StateOperationFailed(String),
 }
