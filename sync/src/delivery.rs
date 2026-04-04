@@ -45,6 +45,7 @@ pub enum DeliveryData {
 /// A pending modifier request.
 struct PendingRequest {
     peer: PeerId,
+    type_id: u8,
     requested_at: Instant,
     checks: u32,
 }
@@ -52,6 +53,7 @@ struct PendingRequest {
 /// A modifier that needs (re-)requesting.
 pub struct RetryAction {
     pub id: [u8; 32],
+    pub type_id: u8,
     /// The peer that failed to deliver. Caller should pick a different one.
     pub failed_peer: PeerId,
 }
@@ -104,11 +106,12 @@ impl DeliveryTracker {
     }
 
     /// Mark modifier IDs as requested from a peer.
-    pub fn mark_requested(&mut self, ids: &[[u8; 32]], peer: PeerId) {
+    pub fn mark_requested(&mut self, ids: &[[u8; 32]], peer: PeerId, type_id: u8) {
         let now = Instant::now();
         for id in ids {
             self.pending.insert(*id, PendingRequest {
                 peer,
+                type_id,
                 requested_at: now,
                 checks: 0,
             });
@@ -148,6 +151,7 @@ impl DeliveryTracker {
                 } else {
                     retries.push(RetryAction {
                         id: *id,
+                        type_id: req.type_id,
                         failed_peer: req.peer,
                     });
                     req.requested_at = now;
@@ -178,6 +182,16 @@ impl DeliveryTracker {
         orphaned
     }
 
+    /// Check whether a modifier ID is currently pending.
+    pub fn is_pending(&self, id: &[u8; 32]) -> bool {
+        self.pending.contains_key(id)
+    }
+
+    /// Remove all pending requests. Used on reorg.
+    pub fn purge_all(&mut self) {
+        self.pending.clear();
+    }
+
     /// Number of in-flight requests.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
@@ -204,7 +218,7 @@ mod tests {
     #[test]
     fn mark_requested_and_received() {
         let mut tracker = DeliveryTracker::new();
-        tracker.mark_requested(&[id(1), id(2), id(3)], peer(1));
+        tracker.mark_requested(&[id(1), id(2), id(3)], peer(1), 101);
         assert_eq!(tracker.pending_count(), 3);
 
         assert!(tracker.mark_received(&id(2)));
@@ -217,7 +231,7 @@ mod tests {
     #[test]
     fn check_timeouts_before_expiry() {
         let mut tracker = DeliveryTracker::new();
-        tracker.mark_requested(&[id(1)], peer(1));
+        tracker.mark_requested(&[id(1)], peer(1), 101);
 
         let result = tracker.check_timeouts();
         assert!(result.retries.is_empty());
@@ -230,7 +244,7 @@ mod tests {
     async fn check_timeouts_after_expiry() {
         let mut tracker = DeliveryTracker::new();
         tracker.timeout = Duration::from_millis(10);
-        tracker.mark_requested(&[id(1), id(2)], peer(1));
+        tracker.mark_requested(&[id(1), id(2)], peer(1), 101);
 
         tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -251,7 +265,7 @@ mod tests {
         let mut tracker = DeliveryTracker::new();
         tracker.timeout = Duration::from_millis(1);
         tracker.max_checks = 2;
-        tracker.mark_requested(&[id(1)], peer(1));
+        tracker.mark_requested(&[id(1)], peer(1), 101);
 
         tokio::time::sleep(Duration::from_millis(5)).await;
         let r1 = tracker.check_timeouts();
@@ -267,8 +281,8 @@ mod tests {
     #[test]
     fn purge_peer_returns_orphaned() {
         let mut tracker = DeliveryTracker::new();
-        tracker.mark_requested(&[id(1), id(2)], peer(1));
-        tracker.mark_requested(&[id(3)], peer(2));
+        tracker.mark_requested(&[id(1), id(2)], peer(1), 101);
+        tracker.mark_requested(&[id(3)], peer(2), 101);
 
         let orphaned = tracker.purge_peer(peer(1));
         assert_eq!(orphaned.len(), 2);
@@ -280,7 +294,7 @@ mod tests {
         let mut tracker = DeliveryTracker::new();
 
         // Simulate: modifier was received, then evicted from buffer
-        tracker.mark_requested(&[id(1)], peer(1));
+        tracker.mark_requested(&[id(1)], peer(1), 101);
         tracker.mark_received(&id(1));
         tracker.schedule_rerequest(&[id(1)]);
 
@@ -299,7 +313,7 @@ mod tests {
 
         // Modifier is still in pending (not yet received) but buffer evicts it
         // This shouldn't happen normally, but defensive: clear from pending
-        tracker.mark_requested(&[id(1)], peer(1));
+        tracker.mark_requested(&[id(1)], peer(1), 101);
         tracker.schedule_rerequest(&[id(1)]);
 
         assert_eq!(tracker.pending_count(), 0);

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use enr_p2p::protocol::messages::ProtocolMessage;
 use enr_p2p::protocol::peer::ProtocolEvent;
@@ -18,8 +18,6 @@ use ergo_validation::BlockValidator;
 /// The JVM's Akka layer can silently drop large ModifierResponse bodies via
 /// backpressure, so this is capped below the JVM's `desiredInvObjects` (400).
 /// 64 per type × 2 types = 128 sections per cycle = 64 blocks/cycle.
-const SECTION_REQUEST_BATCH_SIZE: usize = 64;
-
 fn is_block_section_type(type_id: u8) -> bool {
     matches!(type_id, BLOCK_TRANSACTIONS_TYPE_ID | AD_PROOFS_TYPE_ID | EXTENSION_TYPE_ID)
 }
@@ -90,10 +88,6 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     last_sync_sent: Instant,
     /// Total SyncInfo messages sent this session (diagnostics).
     sync_sent_count: u32,
-    /// Block section modifier IDs queued for download.
-    section_queue: VecDeque<(u8, [u8; 32])>,
-    /// Highest header height for which sections have been queued.
-    sections_queued_to: u32,
     /// Highest height where ALL required block sections are in the store.
     /// Blocks at or below this height are ready for validation.
     downloaded_height: u32,
@@ -130,51 +124,22 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             last_scheduled_sync: Instant::now(),
             last_sync_sent: Instant::now(),
             sync_sent_count: 0,
-            section_queue: VecDeque::new(),
-            sections_queued_to: 0,
             downloaded_height: initial_validated,
             validated_height: initial_validated,
         }
     }
 
-    /// Queue missing block sections for headers from `from` to `to` (inclusive).
-    ///
-    /// Which sections are queued depends on `config.state_type`:
-    /// - UTXO mode: BlockTransactions + Extension (no AD proofs)
-    /// - Digest mode: all three including AD proofs
-    ///
-    /// Mirrors JVM's `ToDownloadProcessor.requiredModifiersForHeader`.
-    async fn queue_sections_for_range(&mut self, from: u32, to: u32) {
-        let mut queued = 0u32;
-        for height in from..=to {
-            let header = match self.chain.header_at(height).await {
-                Some(h) => h,
-                None => continue,
-            };
-            let sections = enr_chain::required_section_ids(&header, self.config.state_type);
-            for (type_id, id) in &sections {
-                if !self.store.has_modifier(*type_id, id).await {
-                    self.section_queue.push_back((*type_id, *id));
-                    queued += 1;
-                }
-            }
-        }
-        if queued > 0 {
-            tracing::info!(queued, from, to, queue_len = self.section_queue.len(), "queued block sections");
-        }
-        if to > self.sections_queued_to {
-            self.sections_queued_to = to;
-        }
-    }
+    /// How many blocks ahead of `downloaded_height` to request sections for.
+    /// Matches JVM's `FullBlocksToDownloadAhead = 192`.
+    const DOWNLOAD_WINDOW: u32 = 192;
 
     /// Run the sync loop. Returns only if all event sources close.
     pub async fn run(&mut self) {
         tracing::info!("header sync started");
 
-        // Startup catch-up: queue sections for stored headers
+        // Startup: scan for already-downloaded sections in the store
         let tip = self.chain.chain_height().await;
         if tip > 0 {
-            self.queue_sections_for_range(1, tip).await;
             self.advance_downloaded_height().await;
         }
 
@@ -318,7 +283,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     self.last_progress = Instant::now();
                     self.stalled_peers.clear();
 
-                    self.queue_new_sections(height).await;
+                    self.request_next_sections().await;
 
                     if !progress_send_used {
                         progress_send_used = true;
@@ -354,7 +319,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     /// Chunks into messages of at most 400 IDs to stay within the JVM's
     /// `desiredInvObjects` limit. Larger requests are silently rejected.
     async fn request_announced(&mut self, peer: PeerId, modifier_type: u8, ids: Vec<[u8; 32]>) {
-        self.tracker.mark_requested(&ids, peer);
+        self.tracker.mark_requested(&ids, peer, modifier_type);
         // JVM rejects ModifierRequest with >400 elements
         for chunk in ids.chunks(400) {
             if let Err(e) = self
@@ -371,14 +336,6 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 tracing::warn!(peer = %peer, "modifier request send failed: {e}");
                 break;
             }
-        }
-    }
-
-    /// Queue block sections for newly chained headers if above the watermark.
-    async fn queue_new_sections(&mut self, height: u32) {
-        if height > self.sections_queued_to {
-            let from = self.sections_queued_to + 1;
-            self.queue_sections_for_range(from, height).await;
         }
     }
 
@@ -592,18 +549,12 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     self.validated_height = fork_point;
                 }
 
-                // Clear section queue and reset queued-to watermark to downloaded_height.
-                // Entries above fork point are for the wrong branch. Entries below might
-                // still be valid but were cleared — re-queuing from downloaded_height
-                // ensures nothing is lost (has_modifier check skips what's already stored).
-                self.section_queue.clear();
-                self.sections_queued_to = self.downloaded_height;
+                // Purge pending requests — they're for the wrong branch
+                self.tracker.purge_all();
 
-                // Re-queue from downloaded_height+1 through the new tip
-                self.queue_sections_for_range(self.sections_queued_to + 1, new_tip).await;
-
-                // Re-scan watermark — some sections may already be in store
+                // Re-scan watermark and request sections for the new branch
                 self.advance_downloaded_height().await;
+                self.request_next_sections().await;
             }
         }
     }
@@ -699,23 +650,22 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     async fn handle_delivery_check(
         &mut self,
         result: crate::delivery::CheckResult,
-        current_peer: PeerId,
+        _current_peer: PeerId,
     ) {
         // Re-request timed-out modifiers from a different peer
         if !result.retries.is_empty() {
             let peers = self.transport.outbound_peers().await;
             for retry in &result.retries {
-                // Pick a peer different from the one that failed
                 let target = peers.iter()
                     .find(|&&p| p != retry.failed_peer)
                     .copied()
-                    .unwrap_or(current_peer);
+                    .unwrap_or(retry.failed_peer);
 
-                self.tracker.mark_requested(&[retry.id], target);
+                self.tracker.mark_requested(&[retry.id], target, retry.type_id);
                 let _ = self.transport.send_to(
                     target,
                     ProtocolMessage::ModifierRequest {
-                        modifier_type: HEADER_TYPE_ID,
+                        modifier_type: retry.type_id,
                         ids: vec![retry.id],
                     },
                 ).await;
@@ -723,7 +673,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             tracing::debug!(count = result.retries.len(), "re-requested timed-out modifiers");
         }
 
-        // Request evicted modifiers from any available peer
+        // Re-request evicted modifiers (LRU buffer evictions — headers only)
         if !result.fresh.is_empty() {
             self.rerequest_from_any(HEADER_TYPE_ID, &result.fresh).await;
         }
@@ -753,13 +703,13 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     /// Synced: periodically check for new blocks, download block sections.
     async fn synced(&mut self) {
         let mut ticker = tokio::time::interval(self.config.synced_poll_interval);
-        // Fast section download timer — keeps the pipe full without waiting
-        // for the 30s SyncInfo ticker. Gated on pending count to avoid
-        // overwhelming the peer.
+        // Section download timer — recomputes the sliding window every 2s
         let mut section_ticker = tokio::time::interval(Duration::from_secs(2));
+        // Delivery timeout check — cleans up stale pending requests
+        let mut delivery_ticker = tokio::time::interval(self.config.delivery_check_interval);
 
-        // Drain section queue on entry
-        self.drain_section_queue().await;
+        // Request first batch on entry
+        self.request_next_sections().await;
 
         loop {
             tokio::select! {
@@ -784,12 +734,17 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     self.advance_downloaded_height().await;
                 }
 
-                // Fast section download — drain queue every 2s if not too many in flight
+                // Delivery timeout: expire stale requests, free pending slots
+                _ = delivery_ticker.tick() => {
+                    let peer = self.sync_peer.unwrap_or(PeerId(0));
+                    let result = self.tracker.check_timeouts();
+                    self.handle_delivery_check(result, peer).await;
+                }
+
+                // Sliding window section download — recompute and request every 2s
                 _ = section_ticker.tick() => {
-                    if !self.section_queue.is_empty() && self.tracker.pending_count() < 500 {
-                        self.drain_section_queue().await;
-                        self.advance_downloaded_height().await;
-                    }
+                    self.advance_downloaded_height().await;
+                    self.request_next_sections().await;
                 }
 
                 event = self.transport.next_event() => {
@@ -818,15 +773,23 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
 
                 Some(height) = self.progress.recv() => {
                     tracing::debug!(height, "pipeline progress while synced");
-                    self.queue_new_sections(height).await;
+                    self.request_next_sections().await;
                 }
             }
         }
     }
 
-    /// Send batched ModifierRequests for queued block sections.
-    async fn drain_section_queue(&mut self) {
-        if self.section_queue.is_empty() {
+    /// Compute and request the next batch of block sections using a sliding window.
+    ///
+    /// Scans from `downloaded_height + 1` up to `downloaded_height + DOWNLOAD_WINDOW`,
+    /// finds sections not yet in the store and not already pending in the tracker,
+    /// and requests them. Recomputed each cycle — no persistent queue.
+    ///
+    /// Mirrors JVM's `ToDownloadProcessor.nextModifiersToDownload` with a 192-block
+    /// forward window.
+    async fn request_next_sections(&mut self) {
+        let chain_height = self.chain.chain_height().await;
+        if self.downloaded_height >= chain_height {
             return;
         }
 
@@ -835,22 +798,38 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             return;
         }
 
-        // Pop up to 192 entries from the front, group by type.
-        // Each type is capped at 400 per ModifierRequest (JVM limit).
-        let max_drain = SECTION_REQUEST_BATCH_SIZE * 3;
+        let window_end = std::cmp::min(
+            self.downloaded_height + Self::DOWNLOAD_WINDOW,
+            chain_height,
+        );
+
         let mut by_type: HashMap<u8, Vec<[u8; 32]>> = HashMap::new();
-        let mut drained = 0usize;
-        while drained < max_drain {
-            match self.section_queue.pop_front() {
-                Some((type_id, id)) => {
-                    by_type.entry(type_id).or_default().push(id);
-                    drained += 1;
+        let mut total = 0usize;
+
+        for height in (self.downloaded_height + 1)..=window_end {
+            let header = match self.chain.header_at(height).await {
+                Some(h) => h,
+                None => break, // gap in header chain — stop
+            };
+            let sections = enr_chain::required_section_ids(&header, self.config.state_type);
+            for (type_id, id) in &sections {
+                // Skip if already in store or already pending
+                if self.store.has_modifier(*type_id, id).await {
+                    continue;
                 }
-                None => break,
+                if self.tracker.is_pending(id) {
+                    continue;
+                }
+                by_type.entry(*type_id).or_default().push(*id);
+                total += 1;
             }
         }
 
-        // Send to all outbound peers — we don't know which has full blocks
+        if total == 0 {
+            return;
+        }
+
+        // Send to all outbound peers — distribute the load
         let mut sent = 0usize;
         for (type_id, ids) in &by_type {
             if ids.is_empty() {
@@ -863,7 +842,12 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         }
 
         if sent > 0 {
-            tracing::info!(sent, peer_count = peers.len(), remaining = self.section_queue.len(), "requested block sections");
+            tracing::info!(
+                sent,
+                peer_count = peers.len(),
+                window = format!("{}..{}", self.downloaded_height + 1, window_end),
+                "requested block sections"
+            );
         }
     }
 
