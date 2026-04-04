@@ -419,14 +419,14 @@ impl ValidationPipeline {
                     );
                     chained += new_branch.len() as u32;
 
-                    // Notify sync machine
-                    if self.delivery_tx.try_send(DeliveryEvent::Reorg {
+                    // Notify sync machine — Reorg MUST NOT be dropped.
+                    // A missed reorg leaves the validator with a stale state root,
+                    // permanently stalling validation.
+                    let _ = self.delivery_tx.send(DeliveryEvent::Reorg {
                         fork_point,
                         old_tip,
                         new_tip,
-                    }).is_err() {
-                        tracing::warn!("delivery channel full, dropped Reorg notification");
-                    }
+                    }).await;
                 }
                 Err(e) => {
                     tracing::warn!(fork_point, "deep reorg failed: {e}");
