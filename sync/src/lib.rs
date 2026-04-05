@@ -4,6 +4,7 @@
 //! header chain from genesis to the network tip.
 
 pub mod delivery;
+pub mod snapshot;
 mod state;
 mod traits;
 

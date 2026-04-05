@@ -55,6 +55,13 @@ pub trait SyncChain {
     /// Return the header at a given height, if it exists in the chain.
     fn header_at(&self, height: u32) -> impl std::future::Future<Output = Option<Header>> + Send;
 
+    /// Return the state_root (33 bytes: root_hash[32] + tree_height[1]) at a given height.
+    /// Returns None if the header doesn't exist.
+    fn header_state_root(
+        &self,
+        height: u32,
+    ) -> impl std::future::Future<Output = Option<[u8; 33]>> + Send;
+
     /// Parse an incoming SyncInfo message body.
     fn parse_sync_info(&self, body: &[u8]) -> Result<SyncInfo, enr_chain::ChainError>;
 

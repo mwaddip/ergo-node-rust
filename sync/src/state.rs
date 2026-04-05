@@ -42,6 +42,12 @@ pub struct SyncConfig {
     /// Node state type — determines which block sections to download.
     /// UTXO mode skips AD proofs; digest mode downloads all sections.
     pub state_type: StateType,
+    /// Enable UTXO snapshot bootstrapping.
+    pub utxo_bootstrap: bool,
+    /// Minimum peers announcing the same manifest before downloading.
+    pub min_snapshot_peers: u32,
+    /// Data directory for temporary snapshot download storage.
+    pub data_dir: std::path::PathBuf,
 }
 
 impl Default for SyncConfig {
@@ -55,6 +61,9 @@ impl Default for SyncConfig {
             delivery_timeout: Duration::from_secs(10),
             max_delivery_checks: 100,
             state_type: StateType::Utxo,
+            utxo_bootstrap: false,
+            min_snapshot_peers: 2,
+            data_dir: std::path::PathBuf::from("."),
         }
     }
 }
@@ -71,10 +80,14 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     transport: T,
     chain: C,
     store: S,
-    validator: V,
+    validator: Option<V>,
     progress: mpsc::Receiver<u32>,
     delivery_control_rx: mpsc::UnboundedReceiver<DeliveryControl>,
     delivery_data_rx: mpsc::Receiver<DeliveryData>,
+    /// Oneshot channel to send snapshot data to the main crate for state loading.
+    snapshot_tx: Option<tokio::sync::oneshot::Sender<crate::snapshot::SnapshotData>>,
+    /// Oneshot channel to receive the validator back after snapshot loading.
+    validator_rx: Option<tokio::sync::oneshot::Receiver<V>>,
     tracker: DeliveryTracker,
     /// Peer we're currently syncing from.
     sync_peer: Option<PeerId>,
@@ -101,13 +114,15 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         transport: T,
         chain: C,
         store: S,
-        validator: V,
+        validator: Option<V>,
         progress: mpsc::Receiver<u32>,
         delivery_control_rx: mpsc::UnboundedReceiver<DeliveryControl>,
         delivery_data_rx: mpsc::Receiver<DeliveryData>,
+        snapshot_tx: Option<tokio::sync::oneshot::Sender<crate::snapshot::SnapshotData>>,
+        validator_rx: Option<tokio::sync::oneshot::Receiver<V>>,
     ) -> Self {
         let tracker = DeliveryTracker::with_config(config.delivery_timeout, config.max_delivery_checks);
-        let initial_validated = validator.validated_height();
+        let initial_validated = validator.as_ref().map_or(0, |v| v.validated_height());
         Self {
             config,
             transport,
@@ -117,6 +132,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             progress,
             delivery_control_rx,
             delivery_data_rx,
+            snapshot_tx,
+            validator_rx,
             tracker,
             sync_peer: None,
             stalled_peers: HashSet::new(),
@@ -151,7 +168,61 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
 
             // Phase 2: sync from the selected peer
             match self.sync_from_peer().await {
-                SyncOutcome::Synced => self.synced().await,
+                SyncOutcome::Synced => {
+                    // Snapshot bootstrap: if enabled, no validator, and channels ready
+                    if self.config.utxo_bootstrap
+                        && self.validator.is_none()
+                        && self.snapshot_tx.is_some()
+                    {
+                        tracing::info!("headers synced, starting UTXO snapshot sync");
+                        let snapshot_config = crate::snapshot::SnapshotConfig {
+                            min_snapshot_peers: self.config.min_snapshot_peers,
+                            chunk_timeout_multiplier: 4,
+                            data_dir: self.config.data_dir.clone(),
+                        };
+
+                        match crate::snapshot::run_snapshot_sync(
+                            &mut self.transport,
+                            &self.chain,
+                            &snapshot_config,
+                        )
+                        .await
+                        {
+                            Ok(snapshot_data) => {
+                                let height = snapshot_data.snapshot_height;
+                                // Send snapshot to main for state loading + validator creation
+                                if let Some(tx) = self.snapshot_tx.take() {
+                                    let _ = tx.send(snapshot_data);
+                                }
+                                // Wait for the validator to come back
+                                if let Some(rx) = self.validator_rx.take() {
+                                    match rx.await {
+                                        Ok(validator) => {
+                                            self.validator = Some(validator);
+                                            self.downloaded_height = height;
+                                            self.validated_height = height;
+                                            tracing::info!(
+                                                height,
+                                                "snapshot loaded, resuming block sync"
+                                            );
+                                        }
+                                        Err(_) => {
+                                            tracing::error!(
+                                                "validator channel closed during snapshot bootstrap"
+                                            );
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("snapshot sync failed: {e}, retrying next cycle");
+                                continue;
+                            }
+                        }
+                    }
+                    self.synced().await;
+                }
                 SyncOutcome::SwitchPeer => continue,
                 SyncOutcome::Stalled => {
                     if let Some(peer) = self.sync_peer.take() {
@@ -345,6 +416,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     /// required block sections (per `config.state_type`) are in the store.
     /// Advances as far as possible in one call — stops at the first gap.
     async fn advance_downloaded_height(&mut self) {
+        if self.validator.is_none() && self.config.utxo_bootstrap {
+            return; // Snapshot bootstrap pending — don't download sections from height 0
+        }
         let chain_height = self.chain.chain_height().await;
         if self.downloaded_height >= chain_height {
             return;
@@ -388,6 +462,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     /// Advance the validated height by running the block validator on
     /// downloaded-but-not-yet-validated blocks.
     async fn advance_validated_height(&mut self) {
+        if self.validator.is_none() {
+            return; // No validator yet (snapshot bootstrap pending)
+        }
         if self.validated_height >= self.downloaded_height {
             return;
         }
@@ -460,7 +537,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 }
             }
 
-            let result = self.validator.validate_block(
+            let result = self.validator.as_mut().unwrap().validate_block(
                 &header,
                 &block_txs,
                 ad_proofs.as_deref(),
@@ -544,7 +621,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 }
                 if self.validated_height > fork_point {
                     if let Some(fork_header) = self.chain.header_at(fork_point).await {
-                        self.validator.reset_to(fork_point, fork_header.state_root);
+                        if let Some(v) = self.validator.as_mut() {
+                            v.reset_to(fork_point, fork_header.state_root);
+                        }
                     }
                     self.validated_height = fork_point;
                 }

@@ -149,6 +149,13 @@ struct NodeConfig {
     /// 0 = validate everything. Overrides the default (tip - 100).
     #[serde(default)]
     checkpoint_height: Option<u32>,
+    /// Enable UTXO snapshot bootstrapping — download state from peers
+    /// instead of replaying blocks from genesis.
+    #[serde(default)]
+    utxo_bootstrap: bool,
+    /// Minimum peers announcing the same snapshot before downloading.
+    #[serde(default = "default_min_snapshot_peers")]
+    min_snapshot_peers: u32,
 }
 
 impl Default for NodeConfig {
@@ -160,6 +167,8 @@ impl Default for NodeConfig {
             blocks_to_keep: default_blocks_to_keep(),
             revalidate: false,
             checkpoint_height: None,
+            utxo_bootstrap: false,
+            min_snapshot_peers: default_min_snapshot_peers(),
         }
     }
 }
@@ -175,6 +184,9 @@ fn default_verify_transactions() -> bool {
 }
 fn default_blocks_to_keep() -> i64 {
     -1
+}
+fn default_min_snapshot_peers() -> u32 {
+    2
 }
 
 /// Top-level config wrapper — just the [node] section, P2P is parsed separately.
@@ -324,9 +336,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let genesis_digest = ADDigest::try_from(genesis_bytes.as_slice())
         .expect("invalid genesis digest length");
 
+    let utxo_bootstrap = node_config.utxo_bootstrap;
+    let min_snapshot_peers = node_config.min_snapshot_peers;
     let chain_guard = chain.lock().await;
 
-    let validator: Validator = match state_type {
+    let validator: Option<Validator> = match state_type {
         StateType::Utxo => {
             let state_path = data_dir.join("state.redb");
             let params = AVLTreeParams { key_length: 32, value_length: None };
@@ -336,13 +350,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let checkpoint = configured_checkpoint.unwrap_or(0);
 
-            let persistent_prover = if storage.version().is_some() {
+            if storage.version().is_some() {
                 // Resume from stored UTXO state
                 let resolver = storage.resolver();
                 let tree = AVLTree::new(resolver, 32, None);
                 let prover = BatchAVLProver::new(tree, true);
-                PersistentBatchAVLProver::new(prover, Box::new(storage), vec![])
-                    .expect("failed to create persistent prover from stored state")
+                let persistent_prover = PersistentBatchAVLProver::new(prover, Box::new(storage), vec![])
+                    .expect("failed to create persistent prover from stored state");
+
+                let height = chain_guard.height();
+                tracing::info!(height, checkpoint, "block validator resuming (UTXO mode)");
+                Some(Validator::Utxo(UtxoValidator::new(persistent_prover, height, checkpoint)))
+            } else if utxo_bootstrap {
+                // Snapshot bootstrap — validator will be created after snapshot download
+                tracing::info!("UTXO state empty, will bootstrap from peer snapshot");
+                None
             } else {
                 // Bootstrap from genesis — insert the 3 genesis boxes
                 let resolver = storage.resolver();
@@ -356,35 +378,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })).expect("genesis box insert failed");
                 }
 
-                let p = PersistentBatchAVLProver::new(prover, Box::new(storage), vec![])
+                let persistent_prover = PersistentBatchAVLProver::new(prover, Box::new(storage), vec![])
                     .expect("failed to create persistent prover from genesis");
 
                 // Verify genesis digest matches expected
-                let actual = p.digest();
+                let actual = persistent_prover.digest();
                 let expected: [u8; 33] = genesis_digest.into();
                 assert_eq!(
                     actual.as_ref(), &expected[..],
                     "genesis UTXO state digest mismatch"
                 );
-                p
-            };
 
-            let height = chain_guard.height().min(
-                // UtxoValidator tracks its own height via the prover's state
-                // For now, start from 0 if fresh, or chain tip if resuming
-                if persistent_prover.digest().as_ref() == <[u8; 33]>::from(genesis_digest).as_slice() {
-                    0
-                } else {
-                    chain_guard.height()
-                }
-            );
-
-            tracing::info!(
-                height,
-                checkpoint,
-                "block validator starting (UTXO mode)"
-            );
-            Validator::Utxo(UtxoValidator::new(persistent_prover, height, checkpoint))
+                tracing::info!(checkpoint, "block validator starting from genesis (UTXO mode)");
+                Some(Validator::Utxo(UtxoValidator::new(persistent_prover, 0, checkpoint)))
+            }
         }
 
         StateType::Digest => {
@@ -444,7 +451,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!(checkpoint, "block validator starting from genesis (digest mode)");
                 DigestValidator::new(genesis_digest, checkpoint)
             };
-            Validator::Digest(validator)
+            Some(Validator::Digest(validator))
         }
     };
     drop(chain_guard);
@@ -455,14 +462,88 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         delivery_timeout: std::time::Duration::from_secs(net.delivery_timeout_secs),
         max_delivery_checks: net.max_delivery_checks,
         state_type,
+        utxo_bootstrap,
+        min_snapshot_peers,
+        data_dir: data_dir.clone(),
         ..SyncConfig::default()
     };
 
-    // Start sync in a background task (with delivery tracker channel)
+    // Snapshot bootstrap channels — only created when needed
+    let (snapshot_tx, snapshot_rx, validator_tx_send, validator_rx) = if validator.is_none() && utxo_bootstrap {
+        let (stx, srx) = tokio::sync::oneshot::channel::<ergo_sync::snapshot::SnapshotData>();
+        let (vtx, vrx) = tokio::sync::oneshot::channel::<Validator>();
+        (Some(stx), Some(srx), Some(vtx), Some(vrx))
+    } else {
+        (None, None, None, None)
+    };
+
+    // Start sync in a background task
     tokio::spawn(async move {
-        let mut sync = HeaderSync::new(sync_config, transport, sync_chain, sync_store, validator, progress_rx, delivery_control_rx, delivery_data_rx);
+        let mut sync = HeaderSync::new(
+            sync_config, transport, sync_chain, sync_store, validator,
+            progress_rx, delivery_control_rx, delivery_data_rx,
+            snapshot_tx, validator_rx,
+        );
         sync.run().await;
     });
+
+    // Snapshot handler — receives snapshot data from sync, loads state, sends validator back
+    if let Some(snapshot_rx) = snapshot_rx {
+        let state_path = data_dir.join("state.redb");
+        let validator_tx = validator_tx_send.unwrap();
+        let checkpoint = configured_checkpoint.unwrap_or(0);
+        tokio::spawn(async move {
+            match snapshot_rx.await {
+                Ok(snapshot_data) => {
+                    tracing::info!(
+                        nodes = snapshot_data.nodes.len(),
+                        height = snapshot_data.snapshot_height,
+                        "loading snapshot into state"
+                    );
+
+                    let params = AVLTreeParams { key_length: 32, value_length: None };
+                    let mut storage = RedbAVLStorage::open(&state_path, params, 200)
+                        .expect("failed to open state storage for snapshot");
+
+                    let root_hash = snapshot_data.root_hash;
+                    let tree_height = snapshot_data.tree_height as usize;
+                    let height = snapshot_data.snapshot_height;
+
+                    // Build ADDigest (33 bytes: root_hash[32] + tree_height[1])
+                    let mut version_bytes = Vec::with_capacity(33);
+                    version_bytes.extend_from_slice(&root_hash);
+                    version_bytes.push(snapshot_data.tree_height);
+                    let version = Bytes::from(version_bytes);
+
+                    let nodes_iter = snapshot_data.nodes.into_iter().map(|(label, packed)| {
+                        (label, Bytes::from(packed))
+                    });
+
+                    storage.load_snapshot(nodes_iter, root_hash, tree_height, version)
+                        .expect("failed to load snapshot into state");
+
+                    tracing::info!("snapshot loaded, creating validator");
+
+                    // Create validator from loaded state
+                    let resolver = storage.resolver();
+                    let tree = AVLTree::new(resolver, 32, None);
+                    let prover = BatchAVLProver::new(tree, true);
+                    let persistent = PersistentBatchAVLProver::new(
+                        prover, Box::new(storage), vec![],
+                    ).expect("failed to create prover from snapshot state");
+
+                    let validator = Validator::Utxo(
+                        UtxoValidator::new(persistent, height, checkpoint),
+                    );
+                    let _ = validator_tx.send(validator);
+                    tracing::info!(height, "validator sent to sync machine");
+                }
+                Err(_) => {
+                    tracing::warn!("snapshot channel closed without data");
+                }
+            }
+        });
+    }
 
     tracing::info!("Ergo node running");
 
