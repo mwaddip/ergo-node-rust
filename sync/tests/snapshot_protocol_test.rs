@@ -77,7 +77,8 @@ fn parse_manifest_response() {
     let msg = SnapshotMessage::Manifest(manifest_bytes.clone());
     let (code, body) = msg.encode();
     assert_eq!(code, MANIFEST);
-    assert_eq!(body.len(), 4 + 1024);
+    // VLQ(1024) = 2 bytes, + 1024 data bytes
+    assert_eq!(body.len(), 2 + 1024);
 
     let parsed = SnapshotMessage::parse(code, &body).unwrap();
     assert_eq!(parsed, SnapshotMessage::Manifest(manifest_bytes));
@@ -90,7 +91,8 @@ fn parse_utxo_snapshot_chunk_response() {
     let msg = SnapshotMessage::UtxoSnapshotChunk(chunk_bytes.clone());
     let (code, body) = msg.encode();
     assert_eq!(code, UTXO_SNAPSHOT_CHUNK);
-    assert_eq!(body.len(), 4 + 2048);
+    // VLQ(2048) = 2 bytes, + 2048 data bytes
+    assert_eq!(body.len(), 2 + 2048);
 
     let parsed = SnapshotMessage::parse(code, &body).unwrap();
     assert_eq!(parsed, SnapshotMessage::UtxoSnapshotChunk(chunk_bytes));

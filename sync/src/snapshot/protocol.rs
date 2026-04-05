@@ -158,15 +158,13 @@ impl SnapshotMessage {
                 if body.len() > MAX_MANIFEST_SIZE {
                     return Err(ProtocolError::TooLarge(body.len()));
                 }
-                if body.len() < 4 {
+                // Length prefix is VLQ (Scorex putUInt)
+                let (len, offset) = vlq_decode(body)?;
+                let len = len as usize;
+                if body.len() < offset + len {
                     return Err(ProtocolError::TooShort);
                 }
-                let len =
-                    u32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
-                if body.len() < 4 + len {
-                    return Err(ProtocolError::TooShort);
-                }
-                Ok(SnapshotMessage::Manifest(body[4..4 + len].to_vec()))
+                Ok(SnapshotMessage::Manifest(body[offset..offset + len].to_vec()))
             }
 
             GET_UTXO_SNAPSHOT_CHUNK => {
@@ -182,15 +180,13 @@ impl SnapshotMessage {
                 if body.len() > MAX_CHUNK_SIZE {
                     return Err(ProtocolError::TooLarge(body.len()));
                 }
-                if body.len() < 4 {
+                // Length prefix is VLQ (Scorex putUInt)
+                let (len, offset) = vlq_decode(body)?;
+                let len = len as usize;
+                if body.len() < offset + len {
                     return Err(ProtocolError::TooShort);
                 }
-                let len =
-                    u32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
-                if body.len() < 4 + len {
-                    return Err(ProtocolError::TooShort);
-                }
-                Ok(SnapshotMessage::UtxoSnapshotChunk(body[4..4 + len].to_vec()))
+                Ok(SnapshotMessage::UtxoSnapshotChunk(body[offset..offset + len].to_vec()))
             }
 
             _ => Err(ProtocolError::UnknownCode(code)),
@@ -215,8 +211,8 @@ impl SnapshotMessage {
             SnapshotMessage::GetManifest(id) => (GET_MANIFEST, id.to_vec()),
 
             SnapshotMessage::Manifest(data) => {
-                let mut body = Vec::with_capacity(4 + data.len());
-                body.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                let mut body = Vec::with_capacity(5 + data.len());
+                body.extend_from_slice(&vlq_encode(data.len() as u64));
                 body.extend_from_slice(data);
                 (MANIFEST, body)
             }
@@ -226,8 +222,8 @@ impl SnapshotMessage {
             }
 
             SnapshotMessage::UtxoSnapshotChunk(data) => {
-                let mut body = Vec::with_capacity(4 + data.len());
-                body.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                let mut body = Vec::with_capacity(5 + data.len());
+                body.extend_from_slice(&vlq_encode(data.len() as u64));
                 body.extend_from_slice(data);
                 (UTXO_SNAPSHOT_CHUNK, body)
             }
