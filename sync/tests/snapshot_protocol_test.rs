@@ -121,6 +121,49 @@ fn reject_oversized_messages() {
     );
 }
 
+/// Parse real JVM wire bytes captured from testnet.
+/// JVM sent: count=2, heights 268799 and 268927, VLQ+ZigZag encoded.
+#[test]
+fn parse_real_jvm_snapshots_info() {
+    let body: Vec<u8> = vec![
+        2, 254, 231, 32, 58, 66, 224, 79, 217, 75, 51, 233, 158, 23, 236, 50,
+        7, 157, 130, 232, 149, 102, 39, 253, 72, 215, 26, 124, 86, 25, 119, 45,
+        215, 94, 159, 154, 254, 233, 32, 207, 233, 138, 191, 11, 147, 60, 90, 220,
+        89, 176, 29, 171, 60, 132, 45, 179, 136, 137, 176, 241, 183, 140, 231, 224,
+        63, 174, 232, 234, 185, 200, 41,
+    ];
+
+    let parsed = SnapshotMessage::parse(SNAPSHOTS_INFO, &body).unwrap();
+    match parsed {
+        SnapshotMessage::SnapshotsInfo(entries) => {
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].height, 268799);
+            assert_eq!(entries[1].height, 268927);
+            // Manifest IDs from JVM REST API
+            assert_eq!(
+                hex::encode(&entries[0].manifest_id),
+                "3a42e04fd94b33e99e17ec32079d82e8956627fd48d71a7c5619772dd75e9f9a"
+            );
+            assert_eq!(
+                hex::encode(&entries[1].manifest_id),
+                "cfe98abf0b933c5adc59b01dab3c842db38889b0f1b78ce7e03faee8eab9c829"
+            );
+        }
+        other => panic!("expected SnapshotsInfo, got {:?}", other),
+    }
+}
+
+/// Parse empty SnapshotsInfo (count=0, single byte).
+#[test]
+fn parse_empty_snapshots_info() {
+    let body = vec![0u8]; // VLQ 0
+    let parsed = SnapshotMessage::parse(SNAPSHOTS_INFO, &body).unwrap();
+    match parsed {
+        SnapshotMessage::SnapshotsInfo(entries) => assert!(entries.is_empty()),
+        other => panic!("expected empty SnapshotsInfo, got {:?}", other),
+    }
+}
+
 /// Verify is_snapshot_code for codes 75-82.
 #[test]
 fn is_snapshot_code_range() {
