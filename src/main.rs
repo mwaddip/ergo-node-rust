@@ -80,9 +80,28 @@ fn build_genesis_boxes(network: enr_p2p::types::Network) -> Vec<([u8; 32], Vec<u
 }
 
 /// Dispatches to either DigestValidator or UtxoValidator based on config.
-enum Validator {
+/// Tracks validated_height in a shared atomic for the snapshot trigger.
+struct Validator {
+    inner: ValidatorInner,
+    /// Updated after every successful validate_block(). Read by the snapshot
+    /// creation trigger to know the actual UTXO state height.
+    shared_height: Arc<std::sync::atomic::AtomicU32>,
+}
+
+enum ValidatorInner {
     Digest(DigestValidator),
     Utxo(UtxoValidator),
+}
+
+impl Validator {
+    fn new(inner: ValidatorInner, shared_height: Arc<std::sync::atomic::AtomicU32>) -> Self {
+        let h = match &inner {
+            ValidatorInner::Digest(v) => v.validated_height(),
+            ValidatorInner::Utxo(v) => v.validated_height(),
+        };
+        shared_height.store(h, std::sync::atomic::Ordering::Relaxed);
+        Self { inner, shared_height }
+    }
 }
 
 impl BlockValidator for Validator {
@@ -94,31 +113,36 @@ impl BlockValidator for Validator {
         extension: &[u8],
         preceding_headers: &[ergo_chain_types::Header],
     ) -> Result<(), ValidationError> {
-        match self {
-            Validator::Digest(v) => v.validate_block(header, block_txs, ad_proofs, extension, preceding_headers),
-            Validator::Utxo(v) => v.validate_block(header, block_txs, ad_proofs, extension, preceding_headers),
+        let result = match &mut self.inner {
+            ValidatorInner::Digest(v) => v.validate_block(header, block_txs, ad_proofs, extension, preceding_headers),
+            ValidatorInner::Utxo(v) => v.validate_block(header, block_txs, ad_proofs, extension, preceding_headers),
+        };
+        if result.is_ok() {
+            self.shared_height.store(self.validated_height(), std::sync::atomic::Ordering::Relaxed);
         }
+        result
     }
 
     fn validated_height(&self) -> u32 {
-        match self {
-            Validator::Digest(v) => v.validated_height(),
-            Validator::Utxo(v) => v.validated_height(),
+        match &self.inner {
+            ValidatorInner::Digest(v) => v.validated_height(),
+            ValidatorInner::Utxo(v) => v.validated_height(),
         }
     }
 
     fn current_digest(&self) -> &ADDigest {
-        match self {
-            Validator::Digest(v) => v.current_digest(),
-            Validator::Utxo(v) => v.current_digest(),
+        match &self.inner {
+            ValidatorInner::Digest(v) => v.current_digest(),
+            ValidatorInner::Utxo(v) => v.current_digest(),
         }
     }
 
     fn reset_to(&mut self, height: u32, digest: ADDigest) {
-        match self {
-            Validator::Digest(v) => v.reset_to(height, digest),
-            Validator::Utxo(v) => v.reset_to(height, digest),
-        }
+        match &mut self.inner {
+            ValidatorInner::Digest(v) => v.reset_to(height, digest),
+            ValidatorInner::Utxo(v) => v.reset_to(height, digest),
+        };
+        self.shared_height.store(self.validated_height(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -411,6 +435,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let utxo_bootstrap = node_config.utxo_bootstrap;
     let min_snapshot_peers = node_config.min_snapshot_peers;
+    let shared_validated_height = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let chain_guard = chain.lock().await;
 
     let mut snapshot_reader: Option<SnapshotReader> = None;
@@ -436,7 +461,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let height = chain_guard.height();
                 tracing::info!(height, checkpoint, "block validator resuming (UTXO mode)");
-                Some(Validator::Utxo(UtxoValidator::new(persistent_prover, height, checkpoint)))
+                Some(Validator::new(
+                    ValidatorInner::Utxo(UtxoValidator::new(persistent_prover, height, checkpoint)),
+                    shared_validated_height.clone(),
+                ))
             } else if utxo_bootstrap {
                 // Snapshot bootstrap — validator will be created after snapshot download
                 tracing::info!("UTXO state empty, will bootstrap from peer snapshot");
@@ -467,7 +495,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
 
                 tracing::info!(checkpoint, "block validator starting from genesis (UTXO mode)");
-                Some(Validator::Utxo(UtxoValidator::new(persistent_prover, 0, checkpoint)))
+                Some(Validator::new(
+                    ValidatorInner::Utxo(UtxoValidator::new(persistent_prover, 0, checkpoint)),
+                    shared_validated_height.clone(),
+                ))
             }
         }
 
@@ -528,7 +559,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!(checkpoint, "block validator starting from genesis (digest mode)");
                 DigestValidator::new(genesis_digest, checkpoint)
             };
-            Some(Validator::Digest(validator))
+            Some(Validator::new(
+                ValidatorInner::Digest(validator),
+                shared_validated_height.clone(),
+            ))
         }
     };
     drop(chain_guard);
@@ -569,6 +603,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state_path = data_dir.join("state.redb");
         let validator_tx = validator_tx_send.unwrap();
         let checkpoint = configured_checkpoint.unwrap_or(0);
+        let shared_validated_height = shared_validated_height.clone();
         tokio::spawn(async move {
             match snapshot_rx.await {
                 Ok(snapshot_data) => {
@@ -609,8 +644,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         prover, Box::new(storage), vec![],
                     ).expect("failed to create prover from snapshot state");
 
-                    let validator = Validator::Utxo(
-                        UtxoValidator::new(persistent, height, checkpoint),
+                    let validator = Validator::new(
+                        ValidatorInner::Utxo(UtxoValidator::new(persistent, height, checkpoint)),
+                        shared_validated_height.clone(),
                     );
                     let _ = validator_tx.send(validator);
                     tracing::info!(height, "validator sent to sync machine");
@@ -630,30 +666,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .expect("snapshot_store must exist when storing_snapshots > 0");
             let snapshot_interval = node_config.snapshot_interval;
             let storing_snapshots = node_config.storing_snapshots;
-            let chain_for_snapshot = chain.clone();
             let reader = std::sync::Arc::new(reader);
+            let shared_height = shared_validated_height.clone();
 
             tokio::spawn(async move {
-                let mut last_checked_height = 0u32;
+                let mut last_snapshot_boundary = 0u32;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
-                    let height = chain_for_snapshot.lock().await.height();
-                    if height == 0 {
+                    // Use the actual validated height, not the chain (header) height.
+                    // The validator updates this atomic after each successful block.
+                    let validated = shared_height.load(std::sync::atomic::Ordering::Relaxed);
+                    if validated == 0 {
                         continue;
                     }
 
-                    // Find the latest snapshot boundary we've crossed since last check.
-                    // Boundary = height where height % interval == interval - 1.
-                    let boundary = height - (height % snapshot_interval) + snapshot_interval - 1;
-                    let snapshot_height = if boundary <= height { boundary } else {
-                        boundary.saturating_sub(snapshot_interval)
-                    };
-                    if snapshot_height == 0 || snapshot_height <= last_checked_height {
-                        last_checked_height = height;
+                    // Find the latest snapshot boundary at or below validated height.
+                    // Boundary = largest h where h % interval == interval - 1 and h <= validated.
+                    let snapshot_height = validated - ((validated + 1) % snapshot_interval);
+                    if snapshot_height == 0 || snapshot_height <= last_snapshot_boundary {
                         continue;
                     }
-                    last_checked_height = height;
+                    last_snapshot_boundary = snapshot_height;
 
                     // Skip if we already have a snapshot at this height
                     if let Ok(info) = snapshot_store_for_trigger.snapshots_info() {
