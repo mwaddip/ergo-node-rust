@@ -28,9 +28,10 @@ pub fn extract_subtree_ids(
 
     let mut subtree_ids = Vec::new();
     let mut offset = HEADER_SIZE;
-    // Stack of pending right-child visits: each entry is the depth of the right child.
+    // Stack of pending right-child visits: each entry is the level of the right child.
     let mut depth_stack: Vec<u8> = Vec::new();
-    let mut current_depth: u8 = 0;
+    // JVM starts the DFS at level = 1 (not 0). Root is level 1, boundary at manifest_depth.
+    let mut current_depth: u8 = 1;
 
     while offset < manifest_bytes.len() {
         let (node, consumed) = parse_node(&manifest_bytes[offset..], key_length)?;
