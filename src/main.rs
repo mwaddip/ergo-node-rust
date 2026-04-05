@@ -335,11 +335,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pipeline.run().await;
     });
 
-    // Subscribe to events for the sync machine
-    let events = p2p.subscribe().await;
+    // Subscribe to events for the sync machine — with snapshot serving demux
+    let raw_events = p2p.subscribe().await;
+
+    // Snapshot store: open if serving is enabled
+    let snapshot_store = if node_config.storing_snapshots > 0 {
+        let store = ergo_node_rust::snapshot_store::SnapshotStore::open(
+            &data_dir.join("snapshots.redb"),
+        )?;
+        Some(std::sync::Arc::new(store))
+    } else {
+        None
+    };
+
+    // Event demux: intercept snapshot serving requests (76/78/80), forward rest to sync
+    let (sync_events_tx, sync_events_rx) = tokio::sync::mpsc::channel(256);
+    {
+        let snapshot_store = snapshot_store.clone();
+        let p2p_serve = p2p.clone();
+        tokio::spawn(async move {
+            let mut events = raw_events;
+            while let Some(event) = events.recv().await {
+                let handled = if let enr_p2p::protocol::peer::ProtocolEvent::Message {
+                    peer_id,
+                    message: enr_p2p::protocol::messages::ProtocolMessage::Unknown { code, ref body },
+                } = event
+                {
+                    if let Some(ref store) = snapshot_store {
+                        if ergo_node_rust::snapshot_serve::is_snapshot_request(code) {
+                            if let Some((resp_code, resp_body)) =
+                                ergo_node_rust::snapshot_serve::handle_snapshot_request(
+                                    code, body, store,
+                                )
+                            {
+                                let msg = enr_p2p::protocol::messages::ProtocolMessage::Unknown {
+                                    code: resp_code,
+                                    body: resp_body,
+                                };
+                                let _ = p2p_serve.send_to(peer_id, msg).await;
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if !handled {
+                    if sync_events_tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     // Bridge implementations
-    let transport = P2pTransport::new(p2p.clone(), events);
+    let transport = P2pTransport::new(p2p.clone(), sync_events_rx);
     let sync_chain = SharedChain::new(chain.clone());
 
     // Genesis state root — needed for fresh start or revalidation
