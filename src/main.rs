@@ -156,6 +156,12 @@ struct NodeConfig {
     /// Minimum peers announcing the same snapshot before downloading.
     #[serde(default = "default_min_snapshot_peers")]
     min_snapshot_peers: u32,
+    /// How many UTXO snapshots to keep for serving (0 = disabled).
+    #[serde(default)]
+    storing_snapshots: u32,
+    /// Blocks between snapshot creation points.
+    #[serde(default = "default_snapshot_interval")]
+    snapshot_interval: u32,
 }
 
 impl Default for NodeConfig {
@@ -169,6 +175,8 @@ impl Default for NodeConfig {
             checkpoint_height: None,
             utxo_bootstrap: false,
             min_snapshot_peers: default_min_snapshot_peers(),
+            storing_snapshots: 0,
+            snapshot_interval: default_snapshot_interval(),
         }
     }
 }
@@ -187,6 +195,9 @@ fn default_blocks_to_keep() -> i64 {
 }
 fn default_min_snapshot_peers() -> u32 {
     2
+}
+fn default_snapshot_interval() -> u32 {
+    52224
 }
 
 /// Top-level config wrapper — just the [node] section, P2P is parsed separately.
@@ -233,7 +244,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let blocks_to_keep = node_config.blocks_to_keep;
     let revalidate = node_config.revalidate;
     let configured_checkpoint = node_config.checkpoint_height;
-    tracing::info!(state_type = ?state_type, verify_transactions, blocks_to_keep, revalidate, checkpoint_height = ?configured_checkpoint, "node config");
+    tracing::info!(
+        state_type = ?state_type, verify_transactions, blocks_to_keep, revalidate,
+        checkpoint_height = ?configured_checkpoint,
+        storing_snapshots = node_config.storing_snapshots,
+        snapshot_interval = node_config.snapshot_interval,
+        "node config"
+    );
     let data_dir = std::path::PathBuf::from(node_config.data_dir);
     std::fs::create_dir_all(&data_dir)?;
     let store = Arc::new(RedbModifierStore::new(&data_dir.join("modifiers.redb"))?);
