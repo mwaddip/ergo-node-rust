@@ -634,21 +634,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let reader = std::sync::Arc::new(reader);
 
             tokio::spawn(async move {
+                let mut last_checked_height = 0u32;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
                     let height = chain_for_snapshot.lock().await.height();
-                    if height == 0 || height % snapshot_interval != snapshot_interval - 1 {
+                    if height == 0 {
                         continue;
                     }
 
+                    // Find the latest snapshot boundary we've crossed since last check.
+                    // Boundary = height where height % interval == interval - 1.
+                    let boundary = height - (height % snapshot_interval) + snapshot_interval - 1;
+                    let snapshot_height = if boundary <= height { boundary } else {
+                        boundary.saturating_sub(snapshot_interval)
+                    };
+                    if snapshot_height == 0 || snapshot_height <= last_checked_height {
+                        last_checked_height = height;
+                        continue;
+                    }
+                    last_checked_height = height;
+
                     // Skip if we already have a snapshot at this height
                     if let Ok(info) = snapshot_store_for_trigger.snapshots_info() {
-                        if info.iter().any(|(h, _)| *h == height) {
+                        if info.iter().any(|(h, _)| *h == snapshot_height) {
                             continue;
                         }
                     }
 
+                    let height = snapshot_height;
                     tracing::info!(height, "creating UTXO snapshot");
 
                     let reader = reader.clone();
