@@ -25,7 +25,7 @@ toml = "0.8"
 tracing = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-lru = "0.12"
+lru = "0.16"
 
 [dev-dependencies]
 sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f139eb74" }
