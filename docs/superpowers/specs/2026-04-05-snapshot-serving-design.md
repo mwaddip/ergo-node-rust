@@ -130,12 +130,14 @@ snapshot_interval: u32,                          // 52224 mainnet default
 
 ### Creation trigger
 
-Located in `ValidationPipeline`. After applying a block in UTXO mode, check:
-- `storing_snapshots > 0`
-- `height % snapshot_interval == snapshot_interval - 1`
-- `tip_height - height <= snapshot_interval` (near tip)
+Separate polling task in `main.rs` (not in ValidationPipeline). Polls every 30 seconds,
+reads `validated_height` from a shared `Arc<AtomicU32>` (updated by the `Validator`
+wrapper after each successful `validate_block()`). Computes the latest snapshot
+boundary crossed since last check. Spawns a blocking task that calls
+`SnapshotReader::dump_snapshot(14)` then `SnapshotStore::write_snapshot()`.
 
-When triggered: spawn a blocking task that calls `RedbAVLStorage::dump_snapshot(14)` then `SnapshotStore::write_snapshot()`. The read transaction doesn't block ongoing block application.
+The `SnapshotReader` shares `Arc<Database>` with the prover — read transactions
+don't block ongoing block application.
 
 ### Request handlers
 
@@ -187,7 +189,8 @@ Internal state is trusted. Performance matters for the tree walk. Low risk overa
 | File | Change |
 |------|--------|
 | `state/src/storage.rs` | Add `SnapshotReader` + `SnapshotDump` + `dump_snapshot()` (submodule prompt) |
-| `src/snapshot_store.rs` | New — `SnapshotStore` module |
-| `src/main.rs` | Config fields, `SnapshotStore` init, request handlers, creation trigger wiring |
-| `src/lib.rs` | Export `snapshot_store` module |
+| `src/snapshot_store.rs` | New — `SnapshotStore` module (redb 4) |
+| `src/snapshot_serve.rs` | New — request handlers + `is_snapshot_request()` |
+| `src/main.rs` | Config fields, `SnapshotStore` init, event demux, creation trigger, `Validator`/`ValidatorInner` refactor for shared height |
+| `src/lib.rs` | Export `snapshot_store` and `snapshot_serve` modules |
 | `facts/snapshot.md` | Update serving section status |
