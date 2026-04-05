@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use enr_chain::{ChainConfig, HeaderChain, StateType, HEADER_TYPE_ID};
-use enr_state::{AVLTreeParams, RedbAVLStorage};
+use enr_state::{AVLTreeParams, RedbAVLStorage, SnapshotReader};
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
 use ergo_avltree_rust::batch_node::AVLTree;
 use ergo_avltree_rust::operation::{KeyValue, Operation};
@@ -413,6 +413,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let min_snapshot_peers = node_config.min_snapshot_peers;
     let chain_guard = chain.lock().await;
 
+    let mut snapshot_reader: Option<SnapshotReader> = None;
+
     let validator: Option<Validator> = match state_type {
         StateType::Utxo => {
             let state_path = data_dir.join("state.redb");
@@ -424,7 +426,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let checkpoint = configured_checkpoint.unwrap_or(0);
 
             if storage.version().is_some() {
-                // Resume from stored UTXO state
+                // Create snapshot reader BEFORE prover consumes storage
+                snapshot_reader = Some(storage.snapshot_reader());
                 let resolver = storage.resolver();
                 let tree = AVLTree::new(resolver, 32, None);
                 let prover = BatchAVLProver::new(tree, true);
@@ -439,7 +442,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!("UTXO state empty, will bootstrap from peer snapshot");
                 None
             } else {
-                // Bootstrap from genesis — insert the 3 genesis boxes
+                // Create snapshot reader BEFORE prover consumes storage
+                snapshot_reader = Some(storage.snapshot_reader());
                 let resolver = storage.resolver();
                 let tree = AVLTree::new(resolver, 32, None);
                 let mut prover = BatchAVLProver::new(tree, true);
@@ -619,43 +623,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Snapshot creation trigger — periodically dump UTXO state for serving.
-    // Requires SnapshotReader from enr-state (pending submodule update).
-    // Once available: create reader before prover construction, pass to this task.
-    if node_config.storing_snapshots > 0 && state_type == StateType::Utxo {
-        let snapshot_store_for_trigger = snapshot_store.clone();
-        let snapshot_interval = node_config.snapshot_interval;
-        let storing_snapshots = node_config.storing_snapshots;
-        let chain_for_snapshot = chain.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    if let Some(reader) = snapshot_reader {
+        if node_config.storing_snapshots > 0 {
+            let snapshot_store_for_trigger = snapshot_store
+                .clone()
+                .expect("snapshot_store must exist when storing_snapshots > 0");
+            let snapshot_interval = node_config.snapshot_interval;
+            let storing_snapshots = node_config.storing_snapshots;
+            let chain_for_snapshot = chain.clone();
+            let reader = std::sync::Arc::new(reader);
 
-                let height = chain_for_snapshot.lock().await.height();
-                if height == 0 || height % snapshot_interval != snapshot_interval - 1 {
-                    continue;
-                }
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
-                if let Some(ref store) = snapshot_store_for_trigger {
-                    if let Ok(info) = store.snapshots_info() {
+                    let height = chain_for_snapshot.lock().await.height();
+                    if height == 0 || height % snapshot_interval != snapshot_interval - 1 {
+                        continue;
+                    }
+
+                    // Skip if we already have a snapshot at this height
+                    if let Ok(info) = snapshot_store_for_trigger.snapshots_info() {
                         if info.iter().any(|(h, _)| *h == height) {
                             continue;
                         }
                     }
-                }
 
-                // TODO: call snapshot_reader.dump_snapshot(14) here once enr-state
-                // delivers SnapshotReader (see prompts/state-dump-snapshot.md)
-                tracing::debug!(
-                    height,
-                    "snapshot creation trigger fired (dump_snapshot not yet available)"
-                );
-            }
-        });
-        tracing::info!(
-            snapshot_interval,
-            storing_snapshots,
-            "snapshot creation trigger active (pending state submodule)"
-        );
+                    tracing::info!(height, "creating UTXO snapshot");
+
+                    let reader = reader.clone();
+                    let store = snapshot_store_for_trigger.clone();
+                    let storing = storing_snapshots;
+
+                    let result = tokio::task::spawn_blocking(move || {
+                        let dump = reader.dump_snapshot(14)?;
+                        match dump {
+                            Some(d) => {
+                                store.write_snapshot(
+                                    height,
+                                    d.root_hash,
+                                    &d.manifest,
+                                    &d.chunks,
+                                    storing,
+                                )?;
+                                Ok::<_, anyhow::Error>(Some(height))
+                            }
+                            None => Ok(None),
+                        }
+                    })
+                    .await;
+
+                    match result {
+                        Ok(Ok(Some(h))) => {
+                            tracing::info!(height = h, "UTXO snapshot created and stored");
+                        }
+                        Ok(Ok(None)) => {
+                            tracing::debug!("snapshot skipped — state is empty");
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!("snapshot creation failed: {e}");
+                        }
+                        Err(e) => {
+                            tracing::error!("snapshot task panicked: {e}");
+                        }
+                    }
+                }
+            });
+            tracing::info!(snapshot_interval, storing_snapshots, "snapshot creation trigger active");
+        }
     }
 
     tracing::info!("Ergo node running");
