@@ -11,12 +11,21 @@ Serve UTXO snapshots to peers — the mirror of the receiving side built in sess
 | Code location | Main crate module (`src/snapshot_store.rs`) | Too small for its own crate |
 | Pruning strategy | Simple delete — no shared subtree analysis | At most 1-2 snapshots stored, complexity not justified |
 
-## Component 1: `enr-state` — `dump_snapshot()`
+## Component 1: `enr-state` — `SnapshotReader` + `dump_snapshot()`
 
-New public method on `RedbAVLStorage`:
+New `SnapshotReader` type — lightweight read-only handle sharing the `Arc<Database>`
+with `RedbAVLStorage`. Created before the storage is consumed by the prover.
 
 ```rust
-pub fn dump_snapshot(&self, manifest_depth: u8) -> Result<SnapshotDump>
+pub struct SnapshotReader { /* db: Arc<Database>, key_length: usize */ }
+
+impl RedbAVLStorage {
+    pub fn snapshot_reader(&self) -> SnapshotReader
+}
+
+impl SnapshotReader {
+    pub fn dump_snapshot(&self, manifest_depth: u8) -> Result<Option<SnapshotDump>>
+}
 
 pub struct SnapshotDump {
     pub root_hash: [u8; 32],
@@ -25,6 +34,10 @@ pub struct SnapshotDump {
     pub chunks: Vec<([u8; 32], Vec<u8>)>,     // (subtree_id, DFS node bytes)
 }
 ```
+
+**Why a separate reader?** `RedbAVLStorage` is consumed by `PersistentBatchAVLProver`.
+redb takes an exclusive file lock, so we can't open a second `Database`. The reader
+clones the `Arc<Database>` before handoff and uses read transactions for the dump.
 
 ### Procedure
 
@@ -173,7 +186,7 @@ Internal state is trusted. Performance matters for the tree walk. Low risk overa
 
 | File | Change |
 |------|--------|
-| `state/src/storage.rs` | Add `dump_snapshot()` + `SnapshotDump` (submodule prompt) |
+| `state/src/storage.rs` | Add `SnapshotReader` + `SnapshotDump` + `dump_snapshot()` (submodule prompt) |
 | `src/snapshot_store.rs` | New — `SnapshotStore` module |
 | `src/main.rs` | Config fields, `SnapshotStore` init, request handlers, creation trigger wiring |
 | `src/lib.rs` | Export `snapshot_store` module |
