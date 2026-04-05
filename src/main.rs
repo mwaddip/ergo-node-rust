@@ -618,6 +618,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Snapshot creation trigger — periodically dump UTXO state for serving.
+    // Requires SnapshotReader from enr-state (pending submodule update).
+    // Once available: create reader before prover construction, pass to this task.
+    if node_config.storing_snapshots > 0 && state_type == StateType::Utxo {
+        let snapshot_store_for_trigger = snapshot_store.clone();
+        let snapshot_interval = node_config.snapshot_interval;
+        let storing_snapshots = node_config.storing_snapshots;
+        let chain_for_snapshot = chain.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+                let height = chain_for_snapshot.lock().await.height();
+                if height == 0 || height % snapshot_interval != snapshot_interval - 1 {
+                    continue;
+                }
+
+                if let Some(ref store) = snapshot_store_for_trigger {
+                    if let Ok(info) = store.snapshots_info() {
+                        if info.iter().any(|(h, _)| *h == height) {
+                            continue;
+                        }
+                    }
+                }
+
+                // TODO: call snapshot_reader.dump_snapshot(14) here once enr-state
+                // delivers SnapshotReader (see prompts/state-dump-snapshot.md)
+                tracing::debug!(
+                    height,
+                    "snapshot creation trigger fired (dump_snapshot not yet available)"
+                );
+            }
+        });
+        tracing::info!(
+            snapshot_interval,
+            storing_snapshots,
+            "snapshot creation trigger active (pending state submodule)"
+        );
+    }
+
     tracing::info!("Ergo node running");
 
     // Run until interrupted
