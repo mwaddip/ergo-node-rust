@@ -160,7 +160,7 @@ impl ValidationPipeline {
         // Notify delivery tracker (data plane — ok to drop)
         if !received_ids.is_empty() {
             if self.delivery_data_tx.try_send(DeliveryData::Received(received_ids)).is_err() {
-                tracing::warn!("delivery data channel full, dropped Received notification");
+                tracing::debug!("delivery data channel full, dropped Received notification");
             }
         }
 
@@ -462,7 +462,7 @@ impl ValidationPipeline {
         if !evicted_ids.is_empty() {
             tracing::debug!(count = evicted_ids.len(), "buffer evictions → re-request");
             if self.delivery_data_tx.try_send(DeliveryData::Evicted(evicted_ids)).is_err() {
-                tracing::warn!("delivery data channel full, dropped Evicted notification");
+                tracing::debug!("delivery data channel full, dropped Evicted notification");
             }
         }
 
