@@ -168,6 +168,89 @@ pub fn parse_extension(data: &[u8]) -> Result<ParsedExtension, ValidationError> 
     })
 }
 
+// ---------------------------------------------------------------------------
+// Serializers (inverses of the parsers above) — used by the mining crate to
+// convert structured block sections back to wire format for storage and
+// pipeline injection.
+// ---------------------------------------------------------------------------
+
+use sigma_ser::vlq_encode::WriteSigmaVlqExt;
+
+/// Serialize an ADProofs section to wire format.
+///
+/// Wire format: `[header_id: 32B] [proof_size: VLQ u32] [proof_bytes]`
+pub fn serialize_ad_proofs(header_id: &[u8; 32], proof_bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32 + 5 + proof_bytes.len());
+    out.extend_from_slice(header_id);
+    let mut size_buf = Vec::new();
+    WriteSigmaVlqExt::put_u32(&mut size_buf, proof_bytes.len() as u32).unwrap();
+    out.extend_from_slice(&size_buf);
+    out.extend_from_slice(proof_bytes);
+    out
+}
+
+/// Serialize a BlockTransactions section to wire format.
+///
+/// Wire format: `[header_id: 32B] [version_sentinel: VLQ] [tx_count: VLQ] [txs...]`
+/// where `version_sentinel = BLOCK_VERSION_SENTINEL + block_version` for v2+.
+pub fn serialize_block_transactions(
+    header_id: &[u8; 32],
+    block_version: u32,
+    transactions: &[Transaction],
+) -> Result<Vec<u8>, ValidationError> {
+    let mut out = Vec::new();
+    out.extend_from_slice(header_id);
+
+    // Version sentinel for v2+
+    let mut sentinel_buf = Vec::new();
+    WriteSigmaVlqExt::put_u32(&mut sentinel_buf, BLOCK_VERSION_SENTINEL + block_version).unwrap();
+    out.extend_from_slice(&sentinel_buf);
+
+    // Transaction count
+    let mut count_buf = Vec::new();
+    WriteSigmaVlqExt::put_u32(&mut count_buf, transactions.len() as u32).unwrap();
+    out.extend_from_slice(&count_buf);
+
+    // Transactions
+    for (i, tx) in transactions.iter().enumerate() {
+        let tx_bytes = tx.sigma_serialize_bytes().map_err(|e| {
+            section_parse_err(102, format!("transaction {i} serialize: {e}"))
+        })?;
+        out.extend_from_slice(&tx_bytes);
+    }
+
+    Ok(out)
+}
+
+/// Serialize an Extension section to wire format.
+///
+/// Wire format: `[header_id: 32B] [field_count: VLQ] [fields: {key: 2B, val_len: 1B, val}]`
+pub fn serialize_extension(
+    header_id: &[u8; 32],
+    fields: &[([u8; 2], Vec<u8>)],
+) -> Result<Vec<u8>, ValidationError> {
+    let mut out = Vec::new();
+    out.extend_from_slice(header_id);
+
+    let mut count_buf = Vec::new();
+    WriteSigmaVlqExt::put_u32(&mut count_buf, fields.len() as u32).unwrap();
+    out.extend_from_slice(&count_buf);
+
+    for (i, (key, value)) in fields.iter().enumerate() {
+        if value.len() > 255 {
+            return Err(section_parse_err(
+                108,
+                format!("field {i}: value length {} exceeds 255", value.len()),
+            ));
+        }
+        out.extend_from_slice(key);
+        out.push(value.len() as u8);
+        out.extend_from_slice(value);
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

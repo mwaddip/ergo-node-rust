@@ -2,6 +2,7 @@
 
 use blake2::Digest as Blake2Digest;
 use ergo_chain_types::{AutolykosSolution, BlockId, Digest, Digest32, Header, Votes};
+use sigma_ser::ScorexSerializable;
 
 use crate::candidate::transactions_root;
 use crate::types::CandidateBlock;
@@ -31,10 +32,11 @@ pub fn validate_solution(
     let tx_root = transactions_root(&candidate.transactions)?;
     let ext_root_bytes = crate::extension::extension_digest(&candidate.extension)?;
 
-    // Build the full header with the submitted solution
-    let header = Header {
+    // Build the full header with the submitted solution.
+    // The id field is initially zero — we compute the proper hash after assembly.
+    let mut header = Header {
         version: candidate.version,
-        id: BlockId(Digest::from([0u8; 32])), // TODO: compute from full serialization
+        id: BlockId(Digest::from([0u8; 32])),
         parent_id: candidate.parent.id,
         ad_proofs_root,
         state_root: candidate.state_root,
@@ -47,6 +49,20 @@ pub fn validate_solution(
         votes: Votes(candidate.votes),
         unparsed_bytes: Box::new([]),
     };
+
+    // Compute the header ID = Blake2b256(scorex_serialize_bytes(header))
+    // This must happen BEFORE check_pow because pow_hit uses serialize_without_pow
+    // which doesn't include the id, so the order doesn't actually matter — but
+    // setting id correctly is needed for downstream consumers.
+    let header_bytes = header
+        .scorex_serialize_bytes()
+        .map_err(|e| MiningError::AssemblyFailed(format!("header serialize: {e}")))?;
+    let id_hash: [u8; 32] = {
+        let mut hasher = Blake2b256::new();
+        hasher.update(&header_bytes);
+        hasher.finalize().into()
+    };
+    header.id = BlockId(Digest32::from(id_hash));
 
     // Verify PoW using Header::check_pow() which computes:
     //   target = order / decode_compact_bits(n_bits)

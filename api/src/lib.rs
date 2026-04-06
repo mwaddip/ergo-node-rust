@@ -32,6 +32,8 @@ pub struct ApiState {
     pub node_info: NodeMeta,
     /// Mining state — None if mining is not configured or node is in digest mode.
     pub mining: Option<Arc<CandidateGenerator>>,
+    /// Block submitter — handles mined block application + broadcast.
+    pub block_submitter: Option<Arc<dyn BlockSubmitter>>,
 }
 
 /// Static node metadata.
@@ -67,6 +69,23 @@ pub trait StoreAccess: Send + Sync {
 pub trait UtxoAccess: Send + Sync {
     /// Look up a box by its ID in the confirmed UTXO set.
     fn box_by_id(&self, box_id: &[u8; 32]) -> Option<ergo_validation::ErgoBox>;
+}
+
+/// Trait for submitting locally-mined blocks to the node's processing pipeline.
+///
+/// Implementations are responsible for storing the block sections, advancing
+/// the chain, and broadcasting to peers. Called by the mining solution handler
+/// after a valid PoW solution is received.
+pub trait BlockSubmitter: Send + Sync {
+    /// Submit a freshly mined block. The header is the assembled Header (with
+    /// PoW solution). The byte slices are the raw wire-format sections.
+    fn submit(
+        &self,
+        header: ergo_chain_types::Header,
+        block_txs_bytes: Vec<u8>,
+        ad_proofs_bytes: Vec<u8>,
+        extension_bytes: Vec<u8>,
+    ) -> Result<(), String>;
 }
 
 /// Build the axum Router with all API routes.

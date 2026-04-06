@@ -541,7 +541,7 @@ pub async fn post_mining_solution(
     };
 
     // Validate PoW
-    let _header = ergo_mining::solution::validate_solution(&candidate, solution).map_err(|e| {
+    let header = ergo_mining::solution::validate_solution(&candidate, solution).map_err(|e| {
         match e {
             ergo_mining::MiningError::InvalidSolution(msg) => {
                 (StatusCode::BAD_REQUEST, Json(ApiError {
@@ -561,9 +561,52 @@ pub async fn post_mining_solution(
         }
     })?;
 
-    // TODO: apply block to validator + broadcast to peers
-    // For now, just acknowledge the valid solution
-    tracing::info!("valid mining solution received");
+    // Serialize block sections to wire format for submission
+    let mut header_id = [0u8; 32];
+    header_id.copy_from_slice(header.id.0.as_ref());
 
+    let block_txs_bytes = ergo_validation::serialize_block_transactions(
+        &header_id,
+        candidate.version as u32,
+        &candidate.transactions,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
+        error: 500,
+        reason: format!("block transactions serialize: {e}"),
+        detail: None,
+    })))?;
+
+    let ad_proofs_bytes = ergo_validation::serialize_ad_proofs(
+        &header_id,
+        &candidate.ad_proof_bytes,
+    );
+
+    let extension_bytes = ergo_validation::serialize_extension(
+        &header_id,
+        &candidate.extension.fields,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
+        error: 500,
+        reason: format!("extension serialize: {e}"),
+        detail: None,
+    })))?;
+
+    // Submit to the local pipeline + P2P broadcast (if submitter configured)
+    if let Some(ref submitter) = state.block_submitter {
+        submitter
+            .submit(header, block_txs_bytes, ad_proofs_bytes, extension_bytes)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
+                error: 500,
+                reason: format!("block submission failed: {e}"),
+                detail: None,
+            })))?;
+    } else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "block submitter not configured");
+    }
+
+    // Invalidate the cached candidate so the next poll generates a fresh one
+    mining.invalidate();
+
+    tracing::info!("valid mining solution accepted, block submitted");
     Ok(Json(serde_json::json!({ "status": "accepted" })))
 }

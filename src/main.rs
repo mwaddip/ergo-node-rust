@@ -384,6 +384,71 @@ impl ergo_api::UtxoAccess for ApiUtxoReader {
     }
 }
 
+/// BlockSubmitter implementation for the mining solution endpoint.
+///
+/// Stores the mined block sections directly in the modifier store, then
+/// injects the header into the validation pipeline so the chain advances.
+/// The sync task picks up the new tip, validates the block (sections are
+/// already in the store), and the validator's mining callback fires for
+/// the next candidate.
+struct MinedBlockSubmitter {
+    store: Arc<RedbModifierStore>,
+    modifier_tx: tokio::sync::mpsc::Sender<(u8, [u8; 32], Vec<u8>)>,
+}
+
+impl ergo_api::BlockSubmitter for MinedBlockSubmitter {
+    fn submit(
+        &self,
+        header: ergo_chain_types::Header,
+        block_txs_bytes: Vec<u8>,
+        ad_proofs_bytes: Vec<u8>,
+        extension_bytes: Vec<u8>,
+    ) -> Result<(), String> {
+        use sigma_ser::ScorexSerializable;
+
+        // Serialize the full header (with PoW solution)
+        let header_bytes = header
+            .scorex_serialize_bytes()
+            .map_err(|e| format!("header serialize: {e}"))?;
+
+        // Get section IDs computed from the header
+        let mut header_id = [0u8; 32];
+        header_id.copy_from_slice(header.id.0.as_ref());
+
+        let section_ids = enr_chain::section_ids(&header);
+        let block_txs_id = section_ids[0].1;
+        let ad_proofs_id = section_ids[1].1;
+        let extension_id = section_ids[2].1;
+
+        // Pre-store all sections in the modifier store so the sync task can
+        // find them when the chain advances.
+        let entries = vec![
+            (enr_chain::BLOCK_TRANSACTIONS_TYPE_ID, block_txs_id, header.height, block_txs_bytes),
+            (enr_chain::AD_PROOFS_TYPE_ID, ad_proofs_id, header.height, ad_proofs_bytes),
+            (enr_chain::EXTENSION_TYPE_ID, extension_id, header.height, extension_bytes),
+        ];
+        self.store
+            .put_batch(&entries)
+            .map_err(|e| format!("section store: {e}"))?;
+
+        tracing::info!(
+            height = header.height,
+            header_id = %hex::encode(&header_id),
+            "mined block sections stored, injecting header into pipeline"
+        );
+
+        // Inject the header into the validation pipeline. The pipeline
+        // validates PoW (passes — we just verified), stores the header,
+        // and appends to the chain. The sync task then validates the block
+        // by reading the sections we pre-stored.
+        self.modifier_tx
+            .try_send((HEADER_TYPE_ID, header_id, header_bytes))
+            .map_err(|e| format!("pipeline injection: {e}"))?;
+
+        Ok(())
+    }
+}
+
 /// Mining config parsed from `[node.mining]` in ergo.toml.
 #[derive(Debug, Deserialize, Default)]
 struct MiningConfig {
@@ -630,6 +695,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Modifier channel — P2P produces, pipeline consumes
     let (modifier_tx, modifier_rx) = tokio::sync::mpsc::channel(4096);
 
+    // Clone modifier_tx for the mining block submitter (used after P2P takes ownership)
+    let modifier_tx_for_mining = modifier_tx.clone();
+
     // Grab network settings before P2P takes ownership of config
     let net_settings = config.network_settings();
 
@@ -659,9 +727,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Transaction channel — pipeline forwards unconfirmed txs to mempool task
     let (tx_tx, tx_rx) = tokio::sync::mpsc::channel::<([u8; 32], Vec<u8>)>(256);
 
+    let pipeline_store = store.clone();
     tokio::spawn(async move {
         let mut pipeline =
-            ValidationPipeline::new(modifier_rx, pipeline_chain, store, progress_tx, delivery_control_tx, delivery_data_tx);
+            ValidationPipeline::new(modifier_rx, pipeline_chain, pipeline_store, progress_tx, delivery_control_tx, delivery_data_tx);
         pipeline.set_tx_sender(tx_tx);
         pipeline.run().await;
     });
@@ -1422,7 +1491,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 ergo_api::PeerCounts { connected: count }
             }),
-            mining: mining_generator,
+            mining: mining_generator.clone(),
+            block_submitter: mining_generator.as_ref().map(|_| {
+                Arc::new(MinedBlockSubmitter {
+                    store: store.clone(),
+                    modifier_tx: modifier_tx_for_mining.clone(),
+                }) as Arc<dyn ergo_api::BlockSubmitter>
+            }),
             node_info: ergo_api::NodeMeta {
                 name: "ergo-node-rust".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),

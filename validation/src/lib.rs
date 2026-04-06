@@ -7,7 +7,10 @@ mod utxo;
 use ergo_chain_types::{ADDigest, Header};
 
 pub use digest::DigestValidator;
-pub use sections::{ParsedAdProofs, ParsedBlockTransactions, ParsedExtension, parse_block_transactions};
+pub use sections::{
+    ParsedAdProofs, ParsedBlockTransactions, ParsedExtension, parse_block_transactions,
+    serialize_ad_proofs, serialize_block_transactions, serialize_extension,
+};
 pub use state_changes::{StateChanges, compute_state_changes, transactions_to_summaries};
 pub use tx_validation::{
     build_state_context, deserialize_box, validate_single_transaction,
