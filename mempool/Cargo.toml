@@ -1,0 +1,15 @@
+[package]
+name = "ergo-mempool"
+version = "0.1.0"
+edition = "2021"
+description = "In-memory transaction pool for the Ergo Rust node"
+
+[dependencies]
+ergo-validation = { path = "../validation" }
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f139eb74" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f139eb74" }
+tracing = "0.1"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

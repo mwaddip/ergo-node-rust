@@ -186,6 +186,12 @@ struct NodeConfig {
     /// Blocks between snapshot creation points.
     #[serde(default = "default_snapshot_interval")]
     snapshot_interval: u32,
+    /// Maximum transactions in the mempool (default: 1000).
+    #[serde(default = "default_mempool_capacity")]
+    mempool_capacity: usize,
+    /// Minimum fee in nanoERG to enter the mempool (default: 1,000,000 = 0.001 ERG).
+    #[serde(default = "default_min_fee")]
+    min_fee: u64,
 }
 
 impl Default for NodeConfig {
@@ -201,6 +207,8 @@ impl Default for NodeConfig {
             min_snapshot_peers: default_min_snapshot_peers(),
             storing_snapshots: 0,
             snapshot_interval: default_snapshot_interval(),
+            mempool_capacity: default_mempool_capacity(),
+            min_fee: default_min_fee(),
         }
     }
 }
@@ -222,6 +230,12 @@ fn default_min_snapshot_peers() -> u32 {
 }
 fn default_snapshot_interval() -> u32 {
     52224
+}
+fn default_mempool_capacity() -> usize {
+    1000
+}
+fn default_min_fee() -> u64 {
+    1_000_000
 }
 
 /// Top-level config wrapper — just the [node] section, P2P is parsed separately.
@@ -740,6 +754,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(snapshot_interval, storing_snapshots, "snapshot creation trigger active");
         }
     }
+
+    // Mempool — in-memory transaction pool
+    let _mempool = Arc::new(Mutex::new(ergo_mempool::Mempool::new(
+        ergo_mempool::types::MempoolConfig {
+            capacity: node_config.mempool_capacity,
+            min_fee: node_config.min_fee,
+            ..Default::default()
+        },
+    )));
 
     tracing::info!("Ergo node running");
 

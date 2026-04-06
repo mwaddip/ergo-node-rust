@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "sync", "validation", "state"]
+members = [".", "sync", "validation", "state", "mempool"]
 
 [package]
 name = "ergo-node-rust"
@@ -16,6 +16,7 @@ ergo-sync = { path = "sync" }
 ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "28862a1" }
 ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f139eb74" }
 ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f139eb74" }
+ergo-mempool = { path = "mempool" }
 ergo-validation = { path = "validation" }
 bytes = "1"
 hex = "0.4"
