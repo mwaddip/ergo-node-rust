@@ -14,6 +14,9 @@ use tokio::sync::{mpsc, Mutex};
 /// LRU buffer capacity for out-of-order headers (JVM: `headersCache` = 8192).
 const BUFFER_CAPACITY: usize = 8_192;
 
+/// Ergo unconfirmed transaction modifier type.
+const TRANSACTION_TYPE_ID: u8 = 2;
+
 /// Async validation pipeline for modifiers.
 ///
 /// Receives raw modifier data from the P2P layer via a channel, validates
@@ -33,6 +36,8 @@ pub struct ValidationPipeline {
     buffer: LruCache<BlockId, (Header, Vec<u8>)>,
     /// Parent IDs we've already requested for fork resolution (avoid flooding).
     reorg_requested: std::collections::HashSet<[u8; 32]>,
+    /// Channel for forwarding unconfirmed transactions to the mempool task.
+    tx_sender: Option<mpsc::Sender<([u8; 32], Vec<u8>)>>,
 }
 
 impl ValidationPipeline {
@@ -54,7 +59,13 @@ impl ValidationPipeline {
             tracker: HeaderTracker::new(),
             buffer: LruCache::new(NonZeroUsize::new(BUFFER_CAPACITY).unwrap()),
             reorg_requested: std::collections::HashSet::new(),
+            tx_sender: None,
         }
+    }
+
+    /// Set the channel for forwarding unconfirmed transactions to the mempool.
+    pub fn set_tx_sender(&mut self, sender: mpsc::Sender<([u8; 32], Vec<u8>)>) {
+        self.tx_sender = Some(sender);
     }
 
     /// Walk backward from a fork tip through the store to find the fork point
@@ -149,6 +160,11 @@ impl ValidationPipeline {
             received_ids.push(*id);
             if *type_id == HEADER_TYPE_ID {
                 raw_headers.push(data.as_slice());
+            } else if *type_id == TRANSACTION_TYPE_ID && !data.is_empty() {
+                // Unconfirmed transaction — forward to mempool
+                if let Some(ref tx_sender) = self.tx_sender {
+                    let _ = tx_sender.try_send((*id, data.clone()));
+                }
             } else if !data.is_empty() {
                 // Height 0 signals "height unknown" — the store skips the height
                 // index write for height=0. The sync machine pre-registers the

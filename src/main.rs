@@ -152,6 +152,22 @@ impl BlockValidator for Validator {
 // the actual access pattern is single-threaded.
 unsafe impl Send for Validator {}
 
+/// UtxoReader for the mempool — looks up boxes from the persistent AVL+ tree.
+///
+/// Uses SnapshotReader's read-only database handle to traverse the tree
+/// without interfering with the validator's prover.
+struct MempoolUtxoReader<'a> {
+    snapshot_reader: Option<&'a SnapshotReader>,
+}
+
+impl<'a> ergo_mempool::types::UtxoReader for MempoolUtxoReader<'a> {
+    fn box_by_id(&self, box_id: &[u8; 32]) -> Option<ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox> {
+        let reader = self.snapshot_reader?;
+        let value_bytes = reader.lookup_key(box_id)?;
+        ergo_validation::deserialize_box(&value_bytes).ok()
+    }
+}
+
 /// Node-level config parsed from the `[node]` section of ergo.toml.
 #[derive(Debug, Deserialize)]
 struct NodeConfig {
@@ -367,9 +383,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (delivery_control_tx, delivery_control_rx) = tokio::sync::mpsc::unbounded_channel();
     // Data channel: bounded — Received/Evicted are lossy, ok to drop
     let (delivery_data_tx, delivery_data_rx) = tokio::sync::mpsc::channel(64);
+    // Transaction channel — pipeline forwards unconfirmed txs to mempool task
+    let (tx_tx, tx_rx) = tokio::sync::mpsc::channel::<([u8; 32], Vec<u8>)>(256);
+
     tokio::spawn(async move {
         let mut pipeline =
             ValidationPipeline::new(modifier_rx, pipeline_chain, store, progress_tx, delivery_control_tx, delivery_data_tx);
+        pipeline.set_tx_sender(tx_tx);
         pipeline.run().await;
     });
 
@@ -695,6 +715,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Clone snapshot reader for mempool UTXO lookups before snapshot trigger consumes it
+    let mempool_snapshot_reader = snapshot_reader.clone();
+
     // Snapshot creation trigger — periodically dump UTXO state for serving.
     if let Some(reader) = snapshot_reader {
         if node_config.storing_snapshots > 0 {
@@ -778,14 +801,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Mempool — in-memory transaction pool
-    let _mempool = Arc::new(Mutex::new(ergo_mempool::Mempool::new(
+    // Mempool — in-memory transaction pool with P2P transaction receiver
+    let mempool = Arc::new(Mutex::new(ergo_mempool::Mempool::new(
         ergo_mempool::types::MempoolConfig {
             capacity: node_config.mempool_capacity,
             min_fee: node_config.min_fee,
             ..Default::default()
         },
     )));
+
+    // Mempool task: receive transactions from pipeline, deserialize, log receipt.
+    // Full validation (ErgoScript) requires a state context built from the tip
+    // header + preceding headers + parameters. For now we receive and log;
+    // process() integration comes with the REST API when we have state context plumbing.
+    {
+        let _mempool = mempool.clone();
+        let _snapshot_reader_for_mempool = mempool_snapshot_reader;
+        tokio::spawn(async move {
+            let mut tx_rx = tx_rx;
+            while let Some((tx_id, tx_bytes)) = tx_rx.recv().await {
+                use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+                use std::io::Cursor;
+                use ergo_lib::ergotree_ir::serialization::constant_store::ConstantStore;
+                use ergo_lib::ergotree_ir::serialization::sigma_byte_reader::SigmaByteReader;
+
+                let cursor = Cursor::new(&tx_bytes);
+                let mut reader = SigmaByteReader::new(cursor, ConstantStore::empty());
+                match ergo_validation::Transaction::sigma_parse(&mut reader) {
+                    Ok(tx) => {
+                        tracing::info!(
+                            tx_id = hex::encode(tx_id),
+                            inputs = tx.inputs.len(),
+                            outputs = tx.outputs.len(),
+                            tx_size = tx_bytes.len(),
+                            "mempool: received unconfirmed tx"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            tx_id = hex::encode(tx_id),
+                            tx_size = tx_bytes.len(),
+                            "mempool: tx deserialization failed: {e}"
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     tracing::info!("Ergo node running");
 

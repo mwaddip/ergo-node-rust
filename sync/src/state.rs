@@ -14,6 +14,9 @@ use enr_chain::{
 use crate::traits::{SyncChain, SyncStore, SyncTransport};
 use ergo_validation::BlockValidator;
 
+/// Ergo unconfirmed transaction modifier type.
+const TRANSACTION_TYPE_ID: u8 = 2;
+
 /// Number of block section requests to send per batch (per type).
 /// The JVM's Akka layer can silently drop large ModifierResponse bodies via
 /// backpressure, so this is capped below the JVM's `desiredInvObjects` (400).
@@ -699,6 +702,15 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
 
                     // Respond with our SyncInfo — mirrors JVM's syncSendNeeded behavior
                     let _ = self.send_sync_info(peer).await;
+                    EventResult::Continue
+                }
+
+                // Transaction Inv: request unconfirmed txs from peers
+                ProtocolMessage::Inv { modifier_type, ids }
+                    if modifier_type == TRANSACTION_TYPE_ID && !ids.is_empty() =>
+                {
+                    tracing::debug!(count = ids.len(), "tx Inv → requesting transactions");
+                    self.request_announced(peer_id, modifier_type, ids).await;
                     EventResult::Continue
                 }
 
