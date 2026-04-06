@@ -9,7 +9,16 @@ use ergo_chain_types::{ADDigest, Header};
 pub use digest::DigestValidator;
 pub use sections::{ParsedAdProofs, ParsedBlockTransactions, ParsedExtension};
 pub use state_changes::StateChanges;
+pub use tx_validation::{
+    build_state_context, deserialize_box, validate_single_transaction,
+};
 pub use utxo::UtxoValidator;
+
+// Re-export types needed by mempool callers
+pub use ergo_lib::chain::ergo_state_context::ErgoStateContext;
+pub use ergo_lib::chain::parameters::Parameters;
+pub use ergo_lib::chain::transaction::Transaction;
+pub use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
 
 /// Validates block sections against the current UTXO state.
 ///

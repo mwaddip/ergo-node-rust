@@ -90,6 +90,45 @@ fn build_headers_array(preceding: &[Header]) -> [Header; 10] {
     headers.try_into().unwrap()
 }
 
+/// Build an ErgoStateContext from a header and preceding headers.
+///
+/// Requires at least one preceding header. Pads to 10 headers by
+/// repeating the oldest if fewer are provided.
+pub fn build_state_context(
+    header: &Header,
+    preceding_headers: &[Header],
+    parameters: &Parameters,
+) -> ErgoStateContext {
+    let pre_header = PreHeader::from(header.clone());
+    let headers_array = build_headers_array(preceding_headers);
+    ErgoStateContext::new(pre_header, headers_array, parameters.clone())
+}
+
+/// Validate a single transaction against provided input and data-input boxes.
+///
+/// Runs full ErgoScript evaluation via ergo-lib's TransactionContext.
+pub fn validate_single_transaction(
+    tx: &Transaction,
+    input_boxes: Vec<ErgoBox>,
+    data_boxes: Vec<ErgoBox>,
+    state_context: &ErgoStateContext,
+) -> Result<(), ValidationError> {
+    let tx_context = TransactionContext::new(tx.clone(), input_boxes, data_boxes)
+        .map_err(|e| ValidationError::TransactionInvalid {
+            index: 0,
+            reason: format!("context: {e}"),
+        })?;
+
+    tx_context.validate(state_context).map_err(|e| {
+        ValidationError::TransactionInvalid {
+            index: 0,
+            reason: format!("{e}"),
+        }
+    })?;
+
+    Ok(())
+}
+
 /// Validate all transactions in a block using ErgoScript evaluation.
 ///
 /// `proof_boxes`: input/data-input boxes extracted from the AD proof, keyed by box ID.
@@ -113,13 +152,7 @@ pub fn validate_transactions(
         return Ok(());
     }
 
-    let pre_header = PreHeader::from(header.clone());
-    let headers_array = build_headers_array(preceding_headers);
-    let state_context = ErgoStateContext::new(
-        pre_header,
-        headers_array,
-        parameters.clone(),
-    );
+    let state_context = build_state_context(header, preceding_headers, parameters);
 
     // Box lookup: proof boxes (from UTXO set) + intra-block outputs
     let mut box_map: HashMap<[u8; 32], ErgoBox> = proof_boxes.clone();
@@ -164,19 +197,13 @@ pub fn validate_transactions(
             .transpose()?
             .unwrap_or_default();
 
-        let tx_context = TransactionContext::new(tx.clone(), input_boxes, data_boxes).map_err(
-            |e| ValidationError::TransactionInvalid {
-                index: tx_idx,
-                reason: format!("context: {e}"),
-            },
-        )?;
-
-        tx_context.validate(&state_context).map_err(|e| {
-            ValidationError::TransactionInvalid {
-                index: tx_idx,
-                reason: format!("{e}"),
-            }
-        })?;
+        validate_single_transaction(tx, input_boxes, data_boxes, &state_context)
+            .map_err(|e| match e {
+                ValidationError::TransactionInvalid { reason, .. } => {
+                    ValidationError::TransactionInvalid { index: tx_idx, reason }
+                }
+                other => other,
+            })?;
     }
 
     Ok(())
