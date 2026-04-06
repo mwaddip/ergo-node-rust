@@ -51,7 +51,7 @@ Multi-session development following the BlockHost pattern:
 | Chain sync state machine | **Done** | `sync/` in-repo |
 | Block/modifier storage | **Done** | `enr-store` submodule |
 | UTXO snapshot sync | **Done** | `sync/src/snapshot/` in-repo |
-| Mempool | To build | `mempool/` in-repo |
+| Mempool | **Done** | `mempool/` in-repo |
 | REST API | To build | Separate crate |
 
 ## Design Principles
@@ -96,13 +96,14 @@ Multi-session development following the BlockHost pattern:
 | Emission schedule | **Done** | Ported to sigma-rust as `EmissionRules` |
 | ErgoTree predefs | **Done** | Ported to sigma-rust as `ErgoTreePredef` (PR #848) |
 | UTXO snapshot sync | **Done** | Bootstrap from peer snapshot, 6 P2P messages (76-81), crash-safe download |
+| Mempool | **Done** | Validate-on-entry, replace-by-fee, family weighting, fee stats, rate limiting |
 
 ### Must Build
 
 | Component | Difficulty | Reference |
 |---|---|---|
-| Mempool | Medium | Tx ordering, eviction, double-spend detection |
 | REST API | Medium | Query interface for wallets and dApps |
+| Mining API | Medium | `getWork`/`submitSolution` for external GPU miners |
 | Soft-fork voting | Easy | Parameter voting, rule activation |
 
 ### Dead / Superseded
@@ -131,7 +132,7 @@ Validate blocks in digest mode (AD proofs, `BatchAVLVerifier`) and UTXO mode (`P
 Persistent AVL+ tree over redb (`enr-state` crate). Implements `VersionedAVLStorage` from forked `ergo_avltree_rust`. Undo-log rollback, configurable version retention, crash-safe atomic writes. Genesis bootstrap from chain parameters via ported `ErgoTreePredef`. Sliding 192-block download window for sequential sync. **Done.**
 
 ### Phase 6: Full Node
-Mempool, REST API. UTXO snapshot sync is done (Phase 5b).
+Mempool is done. REST API and mining API remain. UTXO snapshot sync is done (Phase 5b).
 
 ## Protocol Reference
 
