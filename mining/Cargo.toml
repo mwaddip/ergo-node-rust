@@ -1,0 +1,21 @@
+[package]
+name = "ergo-mining"
+version = "0.1.0"
+edition = "2021"
+description = "Block candidate assembly and PoW solution validation for external miners"
+
+[dependencies]
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "38d38ece" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "38d38ece" }
+ergo-nipopow = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "38d38ece" }
+ergo-merkle-tree = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "38d38ece" }
+ergo-validation = { path = "../validation" }
+blake2 = "0.10"
+hex = "0.4"
+num-bigint = "0.4"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

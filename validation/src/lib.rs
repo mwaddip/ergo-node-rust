@@ -7,8 +7,8 @@ mod utxo;
 use ergo_chain_types::{ADDigest, Header};
 
 pub use digest::DigestValidator;
-pub use sections::{ParsedAdProofs, ParsedBlockTransactions, ParsedExtension};
-pub use state_changes::StateChanges;
+pub use sections::{ParsedAdProofs, ParsedBlockTransactions, ParsedExtension, parse_block_transactions};
+pub use state_changes::{StateChanges, compute_state_changes, transactions_to_summaries};
 pub use tx_validation::{
     build_state_context, deserialize_box, validate_single_transaction,
 };
@@ -47,6 +47,26 @@ pub trait BlockValidator {
 
     /// Reset to a previous state after reorg.
     fn reset_to(&mut self, height: u32, digest: ADDigest);
+
+    /// Current blockchain parameters (updated from Extension at epoch boundaries).
+    fn parameters(&self) -> &Parameters;
+
+    /// Compute AD proofs and new state root for a set of transactions
+    /// without modifying persistent state. Returns None for digest-mode
+    /// validators (mining requires UTXO mode).
+    fn proofs_for_transactions(
+        &self,
+        txs: &[Transaction],
+    ) -> Option<Result<(Vec<u8>, ADDigest), ValidationError>> {
+        let _ = txs;
+        None
+    }
+
+    /// Current emission box ID in the UTXO set. None if digest mode or
+    /// all ERG emitted. Updated after each block validation.
+    fn emission_box_id(&self) -> Option<[u8; 32]> {
+        None
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
