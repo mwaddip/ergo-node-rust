@@ -18,12 +18,14 @@ pub struct MinerConfig {
 }
 
 /// Extension section key-value pairs for a new block.
+#[derive(Clone)]
 pub struct ExtensionCandidate {
     /// Fields as (2-byte key, variable-length value).
     pub fields: Vec<([u8; 2], Vec<u8>)>,
 }
 
 /// All components needed to assemble a full block once a PoW solution arrives.
+#[derive(Clone)]
 pub struct CandidateBlock {
     /// Parent block header.
     pub parent: Header,
