@@ -1,7 +1,6 @@
 //! PoW solution validation and block assembly.
 
 use blake2::Digest as Blake2Digest;
-use ergo_chain_types::autolykos_pow_scheme::{decode_compact_bits, AutolykosPowScheme};
 use ergo_chain_types::{AutolykosSolution, BlockId, Digest, Digest32, Header, Votes};
 
 use crate::candidate::transactions_root;
@@ -49,21 +48,15 @@ pub fn validate_solution(
         unparsed_bytes: Box::new([]),
     };
 
-    // Verify PoW: hit < target
-    let pow = AutolykosPowScheme::default();
-    let hit = pow
-        .pow_hit(&header)
-        .map_err(|e| MiningError::InvalidSolution(format!("pow_hit: {e}")))?;
+    // Verify PoW using Header::check_pow() which computes:
+    //   target = order / decode_compact_bits(n_bits)
+    //   valid = pow_hit(header) < target
+    let valid = header
+        .check_pow()
+        .map_err(|e| MiningError::InvalidSolution(format!("check_pow: {e}")))?;
 
-    let target = decode_compact_bits(candidate.n_bits);
-    let target_uint = target
-        .to_biguint()
-        .ok_or(MiningError::InvalidSolution("negative target".into()))?;
-
-    if hit >= target_uint {
-        return Err(MiningError::InvalidSolution(format!(
-            "hit {hit} >= target {target_uint}"
-        )));
+    if !valid {
+        return Err(MiningError::InvalidSolution("pow_hit >= target".into()));
     }
 
     Ok(header)
