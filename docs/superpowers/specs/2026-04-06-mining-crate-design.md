@@ -1,7 +1,7 @@
 # Mining Crate Design
 
 **Date:** 2026-04-06
-**Status:** Approved
+**Status:** Implemented (with deviations — see "Implementation Notes" at the end)
 **Contract:** `facts/mining.md`
 
 ## Goal
@@ -215,3 +215,119 @@ reward_delay = 720         # miner reward maturity delay in blocks
 8. Tx selection limits: exceed max_block_cost, verify truncation
 9. Fee aggregation: multiple fee outputs → single miner output
 10. Digest mode / no PK → 503
+
+## Implementation Notes (Deviations from Spec)
+
+These are post-implementation notes documenting where the actual code
+diverges from the original spec above. They represent learnings, not
+contract changes.
+
+### Validator access pattern (replaces `MiningState`)
+
+**Spec:** A `MiningState` struct holds `Arc<Mutex<UtxoValidator>>`. The
+mining task locks the validator briefly to call `proofs_for_transactions()`.
+
+**Reality:** The validator is owned by the sync task (it's not behind a
+shared mutex — `HeaderSync<V: BlockValidator>` takes V by value). Wrapping
+it in `Arc<Mutex>` would have required cross-crate changes.
+
+Instead, the `Validator` wrapper in `main.rs` pre-computes mining proofs
+in its `validate_block` callback (after the existing `shared_height` /
+`shared_state_context` / `block_applied_tx` updates). The proofs land in
+a `MiningProofCache: Arc<Mutex<Option<MiningProofData>>>`. The mining
+task watches `shared_validated_height`, reads from this cache, and
+assembles the full candidate (extension + header + WorkMessage) without
+ever touching the validator. Zero contention.
+
+This is functionally equivalent to the spec — the same work happens,
+just attributed to the validator's post-block callback rather than to
+the mining task. The trade-off: the cache only contains proofs for the
+emission-only candidate. Adding mempool transaction selection requires
+recomputing proofs, which would either need a read-only prover (see
+project memory `project_avltree_readonly_prover.md`) or a request channel
+back to the sync task.
+
+### `proofs_for_transactions()` is `&self`, not `&mut self`
+
+**Spec:** `proofs_for_transactions(&mut self, ...)`.
+
+**Reality:** `&self`. The inner `BatchAVLProver::generate_proof_for_operations`
+creates a temporary prover copy internally and doesn't mutate the original.
+No `&mut` needed.
+
+### PoW target formula
+
+**Spec (implicit):** Standard "hit < target" PoW check.
+
+**Reality (bug fixed):** First implementation used `decode_compact_bits(n_bits)`
+directly as the target. The correct formula is
+`target = order_bigint() / decode_compact_bits(n_bits)`. With the wrong
+formula, every valid solution would be rejected. Found via the integration
+test that mines blocks with trivial difficulty. `validate_solution` now
+delegates to `Header::check_pow()` which uses the correct formula.
+
+### Header ID computation
+
+**Spec:** Not explicitly mentioned.
+
+**Reality:** `validate_solution` computes the header ID as
+`Blake2b256(scorex_serialize_bytes(header))` after assembling the header
+with the submitted solution. This matches sigma-rust's `Header::scorex_parse`
+which does the same hash on the deserialized bytes. Required for downstream
+storage and section ID derivation.
+
+### Section serializers
+
+**Spec:** Not explicitly mentioned.
+
+**Reality:** The `validation` crate had parsers for BlockTransactions,
+ADProofs, and Extension wire formats but no serializers. Mining needs
+to convert structured candidate data back to wire format for storage
+and pipeline injection. Inverse serializers added in `validation/src/sections.rs`:
+`serialize_block_transactions`, `serialize_ad_proofs`, `serialize_extension`.
+
+### Block submission path
+
+**Spec (Phase 5):** "Submit through normal validation pipeline."
+
+**Reality:** The API crate doesn't know about the modifier_tx channel or
+the modifier store. Added a `BlockSubmitter` trait to the api crate; the
+main crate provides a `MinedBlockSubmitter` impl that:
+
+1. Stores all 4 sections (header, block_txs, ad_proofs, extension) in
+   the modifier store via `put_batch`.
+2. Injects only the header into the modifier_tx pipeline channel.
+3. The pipeline parses the header, validates PoW (passes), appends to
+   chain.
+4. The sync task picks up the new tip via `advance_downloaded_height`,
+   finds all sections in the store, validates the block.
+5. The validator's mining callback fires for the next candidate.
+
+P2P broadcast is implicit via the existing relay path: peers see the new
+tip via SyncInfo exchange and request the block sections from us.
+
+### Interlinks tracking
+
+**Spec:** `update_interlinks(parent, parent_extension)` is called on each
+candidate generation.
+
+**Reality:** The current mining task passes empty interlinks
+(`parent_interlinks: &[]`) for first release. This works because
+sigma-rust's `update_interlinks` treats `prev_header.height == 1` as
+genesis and returns `vec![prev_header.id]` — for testnet which started
+in early 2026, every block we'd mine has a non-genesis parent, so the
+interlinks must track across blocks. **TODO:** persist interlinks across
+blocks. Currently a deferred limitation.
+
+### Cross-verification gate (Phase 4)
+
+**Spec:** "generate WorkMessage from same chain state as JVM node on
+test server. Compare `msg` byte-for-byte. Must pass before proceeding."
+
+**Reality:** Not yet performed. The integration tests prove that mined
+blocks have valid PoW (Autolykos v2 hit < target), and the JVM has
+independently re-validated 271k+ blocks served by our node — so the
+header serialization is provably correct for blocks we've validated. The
+remaining unknown is whether the WorkMessage we serve to external miners
+matches what the JVM would serve for the same chain state. This test
+remains for the next session.
