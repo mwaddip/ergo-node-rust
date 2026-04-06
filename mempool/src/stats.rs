@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
 
 /// Fee bucket for histogram display.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FeeBucket {
     /// Number of transactions in this fee range.
     pub count: usize,

@@ -230,4 +230,8 @@ impl BlockValidator for DigestValidator {
         self.current_digest = digest;
         tracing::info!(height, "validator reset to fork point");
     }
+
+    fn parameters(&self) -> &Parameters {
+        &self.parameters
+    }
 }

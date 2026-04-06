@@ -1,0 +1,569 @@
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::Json;
+use serde::Deserialize;
+
+use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+
+use crate::types::*;
+use crate::ApiState;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
+
+fn err<T>(status: StatusCode, reason: impl Into<String>) -> ApiResult<T> {
+    Err((status, Json(ApiError { error: status.as_u16(), reason: reason.into(), detail: None })))
+}
+
+fn hex_to_id(hex_str: &str) -> Result<[u8; 32], (StatusCode, Json<ApiError>)> {
+    let bytes = hex::decode(hex_str).map_err(|_| {
+        (StatusCode::BAD_REQUEST, Json(ApiError { error: 400, reason: "invalid hex ID".into(), detail: None }))
+    })?;
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+        (StatusCode::BAD_REQUEST, Json(ApiError { error: 400, reason: "ID must be 32 bytes".into(), detail: None }))
+    })?;
+    Ok(arr)
+}
+
+// ---------------------------------------------------------------------------
+// GET /info
+// ---------------------------------------------------------------------------
+
+pub async fn get_info(State(state): State<ApiState>) -> Json<NodeInfo> {
+    let height = state.chain.height();
+    let tip = state.chain.tip();
+    let tip_id = hex::encode(tip.id.0.as_ref());
+    let state_root = hex::encode(<[u8; 33]>::from(tip.state_root));
+
+    let pool_size = state.mempool.lock().await.len();
+    let peers = (state.peer_count)();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    Json(NodeInfo {
+        name: state.node_info.name.clone(),
+        app_version: state.node_info.version.clone(),
+        network: state.node_info.network.clone(),
+        full_height: height,
+        headers_height: height,
+        best_full_header_id: tip_id.clone(),
+        best_header_id: tip_id,
+        state_root,
+        state_type: state.node_info.state_type.clone(),
+        peers_count: peers.connected,
+        unconfirmed_count: pool_size,
+        is_mining: false,
+        current_time: now,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// GET /blocks/at/{height}
+// ---------------------------------------------------------------------------
+
+pub async fn get_block_ids_at_height(
+    State(state): State<ApiState>,
+    Path(height): Path<u32>,
+) -> ApiResult<Vec<String>> {
+    match state.chain.header_at(height) {
+        Some(header) => Ok(Json(vec![hex::encode(header.id.0.as_ref())])),
+        None => err(StatusCode::NOT_FOUND, "no block at this height"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /blocks/{header_id}/header
+// ---------------------------------------------------------------------------
+
+pub async fn get_block_header(
+    State(state): State<ApiState>,
+    Path(header_id): Path<String>,
+) -> ApiResult<ergo_chain_types::Header> {
+    let id = hex_to_id(&header_id)?;
+    match state.chain.header_by_id(&id) {
+        Some(header) => Ok(Json(header)),
+        None => err(StatusCode::NOT_FOUND, "header not found"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /blocks/{header_id}/transactions
+// ---------------------------------------------------------------------------
+
+/// Block transactions section type ID (Ergo modifier type 104).
+const BLOCK_TRANSACTIONS_TYPE: u8 = 104;
+
+pub async fn get_block_transactions(
+    State(state): State<ApiState>,
+    Path(header_id): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let id = hex_to_id(&header_id)?;
+    match state.store.get(BLOCK_TRANSACTIONS_TYPE, &id) {
+        Some(data) => {
+            match ergo_validation::parse_block_transactions(&data) {
+                Ok(parsed) => Ok(Json(serde_json::json!({
+                    "headerId": header_id,
+                    "transactions": parsed.transactions,
+                }))),
+                Err(e) => err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to parse stored transactions: {e}"),
+                ),
+            }
+        }
+        None => err(StatusCode::NOT_FOUND, "transactions not found"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /blocks/lastHeaders/{count}
+// ---------------------------------------------------------------------------
+
+pub async fn get_last_headers(
+    State(state): State<ApiState>,
+    Path(count): Path<u32>,
+) -> Json<Vec<ergo_chain_types::Header>> {
+    let count = count.min(100);
+    let height = state.chain.height();
+    let mut headers = Vec::with_capacity(count as usize);
+    for h in (1..=height).rev().take(count as usize) {
+        if let Some(header) = state.chain.header_at(h) {
+            headers.push(header);
+        }
+    }
+    Json(headers)
+}
+
+// ---------------------------------------------------------------------------
+// POST /transactions
+// ---------------------------------------------------------------------------
+
+pub async fn post_transaction(
+    State(state): State<ApiState>,
+    Json(tx): Json<ergo_validation::Transaction>,
+) -> ApiResult<String> {
+    process_transaction(state, tx, true).await
+}
+
+// ---------------------------------------------------------------------------
+// POST /transactions/check
+// ---------------------------------------------------------------------------
+
+pub async fn check_transaction(
+    State(state): State<ApiState>,
+    Json(tx): Json<ergo_validation::Transaction>,
+) -> ApiResult<String> {
+    process_transaction(state, tx, false).await
+}
+
+async fn process_transaction(
+    state: ApiState,
+    tx: ergo_validation::Transaction,
+    add_to_pool: bool,
+) -> ApiResult<String> {
+    let ctx_guard = state.state_context.read().await;
+    let ctx = match ctx_guard.as_ref() {
+        Some(c) => c,
+        None => return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node is syncing, cannot validate transactions yet",
+        ),
+    };
+
+    // Compute tx_id hex string
+    let tx_id_hex = String::from(tx.id());
+
+    // Sigma-serialize for mempool storage (P2P wire format)
+    let tx_bytes = match tx.sigma_serialize_bytes() {
+        Ok(b) => b,
+        Err(e) => return err(
+            StatusCode::BAD_REQUEST,
+            format!("transaction serialization failed: {e}"),
+        ),
+    };
+
+    if !add_to_pool {
+        // Check-only: validate inputs exist and scripts pass, but don't add to pool.
+        let mut input_boxes = Vec::with_capacity(tx.inputs.len());
+        for input in tx.inputs.iter() {
+            let box_id_bytes: [u8; 32] = input.box_id.as_ref().try_into().unwrap();
+            match state.utxo_reader.box_by_id(&box_id_bytes) {
+                Some(b) => input_boxes.push(b),
+                None => return err(
+                    StatusCode::BAD_REQUEST,
+                    format!("input box not found: {}", hex::encode(box_id_bytes)),
+                ),
+            }
+        }
+        let mut data_boxes = Vec::new();
+        if let Some(ref data_inputs) = tx.data_inputs {
+            for di in data_inputs.iter() {
+                let box_id_bytes: [u8; 32] = di.box_id.as_ref().try_into().unwrap();
+                match state.utxo_reader.box_by_id(&box_id_bytes) {
+                    Some(b) => data_boxes.push(b),
+                    None => return err(
+                        StatusCode::BAD_REQUEST,
+                        format!("data-input box not found: {}", hex::encode(box_id_bytes)),
+                    ),
+                }
+            }
+        }
+
+        if let Err(e) = ergo_validation::validate_single_transaction(&tx, input_boxes, data_boxes, ctx) {
+            return err(StatusCode::BAD_REQUEST, format!("{e}"));
+        }
+        drop(ctx_guard);
+        return Ok(Json(tx_id_hex));
+    }
+
+    // Full submission: validate + add to mempool
+    let mut pool = state.mempool.lock().await;
+    let outcome = pool.process(
+        tx,
+        tx_bytes,
+        &UtxoReaderAdapter { utxo_reader: &*state.utxo_reader },
+        ctx,
+        None, // local submission — bypass rate limiting
+    );
+    drop(ctx_guard);
+
+    match outcome {
+        ergo_mempool::types::ProcessingOutcome::Accepted { .. }
+        | ergo_mempool::types::ProcessingOutcome::Replaced { .. }
+        | ergo_mempool::types::ProcessingOutcome::AlreadyInPool => {
+            Ok(Json(tx_id_hex))
+        }
+        ergo_mempool::types::ProcessingOutcome::Invalidated { reason } => {
+            err(StatusCode::BAD_REQUEST, reason)
+        }
+        ergo_mempool::types::ProcessingOutcome::Declined { reason } => {
+            err(StatusCode::BAD_REQUEST, reason)
+        }
+        ergo_mempool::types::ProcessingOutcome::DoubleSpendLoser { .. } => {
+            err(StatusCode::BAD_REQUEST, "double-spend conflict with higher-fee transaction")
+        }
+    }
+}
+
+/// UtxoReader adapter for mempool validation from API context.
+struct UtxoReaderAdapter<'a> {
+    utxo_reader: &'a dyn crate::UtxoAccess,
+}
+
+impl ergo_mempool::types::UtxoReader for UtxoReaderAdapter<'_> {
+    fn box_by_id(&self, box_id: &[u8; 32]) -> Option<ergo_validation::ErgoBox> {
+        self.utxo_reader.box_by_id(box_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /transactions/unconfirmed
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct PaginationParams {
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+
+fn default_limit() -> usize { 50 }
+
+pub async fn get_unconfirmed(
+    State(state): State<ApiState>,
+    Query(params): Query<PaginationParams>,
+) -> Json<Vec<serde_json::Value>> {
+    let limit = params.limit.min(100);
+    let pool = state.mempool.lock().await;
+    let txs: Vec<_> = pool
+        .all_prioritized()
+        .into_iter()
+        .skip(params.offset)
+        .take(limit)
+        .filter_map(|utx| serde_json::to_value(&utx.tx).ok())
+        .collect();
+    Json(txs)
+}
+
+// ---------------------------------------------------------------------------
+// GET /transactions/unconfirmed/transactionIds
+// ---------------------------------------------------------------------------
+
+pub async fn get_unconfirmed_ids(State(state): State<ApiState>) -> Json<Vec<String>> {
+    let pool = state.mempool.lock().await;
+    let ids: Vec<String> = pool.tx_ids().into_iter().map(hex::encode).collect();
+    Json(ids)
+}
+
+// ---------------------------------------------------------------------------
+// GET /transactions/unconfirmed/byTransactionId/{tx_id}
+// ---------------------------------------------------------------------------
+
+pub async fn get_unconfirmed_by_id(
+    State(state): State<ApiState>,
+    Path(tx_id): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let id = hex_to_id(&tx_id)?;
+    let pool = state.mempool.lock().await;
+    match pool.get(&id) {
+        Some(utx) => Ok(Json(serde_json::to_value(&utx.tx).unwrap())),
+        None => err(StatusCode::NOT_FOUND, "transaction not in mempool"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /transactions/getFee
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct FeeParams {
+    #[serde(default = "default_wait_time")]
+    #[serde(rename = "waitTime")]
+    wait_time: u64,
+    #[serde(default = "default_tx_size")]
+    #[serde(rename = "txSize")]
+    tx_size: usize,
+}
+
+fn default_wait_time() -> u64 { 1 }
+fn default_tx_size() -> usize { 100 }
+
+pub async fn get_recommended_fee(
+    State(state): State<ApiState>,
+    Query(params): Query<FeeParams>,
+) -> ApiResult<FeeResponse> {
+    let pool = state.mempool.lock().await;
+    // Convert wait_time from blocks to approximate milliseconds
+    // (Ergo target block time ~2 minutes = 120_000ms)
+    let wait_ms = params.wait_time * 120_000;
+    match pool.recommended_fee(wait_ms, params.tx_size) {
+        Some(fee) => Ok(Json(FeeResponse { fee })),
+        None => err(StatusCode::BAD_REQUEST, "insufficient fee history"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /transactions/poolHistogram
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct HistogramParams {
+    #[serde(default = "default_bins")]
+    bins: usize,
+}
+
+fn default_bins() -> usize { 10 }
+
+pub async fn get_pool_histogram(
+    State(state): State<ApiState>,
+    Query(params): Query<HistogramParams>,
+) -> Json<serde_json::Value> {
+    let bins = params.bins.min(50);
+    let pool = state.mempool.lock().await;
+    let histogram = pool.fee_histogram(bins);
+    Json(serde_json::to_value(histogram).unwrap_or(serde_json::Value::Array(vec![])))
+}
+
+// ---------------------------------------------------------------------------
+// GET /utxo/byId/{box_id}
+// ---------------------------------------------------------------------------
+
+pub async fn get_utxo_by_id(
+    State(state): State<ApiState>,
+    Path(box_id): Path<String>,
+) -> ApiResult<ergo_validation::ErgoBox> {
+    let id = hex_to_id(&box_id)?;
+    match state.utxo_reader.box_by_id(&id) {
+        Some(ergo_box) => Ok(Json(ergo_box)),
+        None => err(StatusCode::NOT_FOUND, "box not found in UTXO set"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /utxo/withPool/byId/{box_id}
+// ---------------------------------------------------------------------------
+
+pub async fn get_utxo_with_pool(
+    State(state): State<ApiState>,
+    Path(box_id): Path<String>,
+) -> ApiResult<ergo_validation::ErgoBox> {
+    let id = hex_to_id(&box_id)?;
+    // Check confirmed UTXO set first
+    if let Some(ergo_box) = state.utxo_reader.box_by_id(&id) {
+        return Ok(Json(ergo_box));
+    }
+    // Check mempool outputs
+    let pool = state.mempool.lock().await;
+    match pool.unconfirmed_box(&id) {
+        Some(ergo_box) => Ok(Json(ergo_box.clone())),
+        None => err(StatusCode::NOT_FOUND, "box not found"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /peers/connected
+// ---------------------------------------------------------------------------
+
+pub async fn get_connected_peers(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    let counts = (state.peer_count)();
+    Json(serde_json::json!({
+        "connectedPeers": counts.connected,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// GET /emission/at/{height}
+// ---------------------------------------------------------------------------
+
+pub async fn get_emission_at(Path(height): Path<u32>) -> Json<EmissionInfo> {
+    use ergo_lib::chain::emission::{EmissionRules, MonetarySettings};
+
+    let settings = MonetarySettings::default();
+    let rules = EmissionRules::new(settings);
+
+    let h = height as i64;
+    let reward = rules.emission_at_height(h);
+    let mut total_issued: i64 = 0;
+    for i in 0..=h {
+        total_issued += rules.emission_at_height(i);
+    }
+    let total_supply = rules.coins_total();
+
+    Json(EmissionInfo {
+        miner_reward: reward.max(0) as u64,
+        total_coins_issued: total_issued.max(0) as u64,
+        total_remain_coins: (total_supply - total_issued).max(0) as u64,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// GET /mining/candidate
+// ---------------------------------------------------------------------------
+
+pub async fn get_mining_candidate(
+    State(state): State<ApiState>,
+) -> ApiResult<ergo_mining::WorkMessage> {
+    let mining = state.mining.as_ref().ok_or_else(|| {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(ApiError {
+            error: 503,
+            reason: "mining not configured".into(),
+            detail: None,
+        }))
+    })?;
+
+    let tip_height = state.chain.height();
+    match mining.cached_work(tip_height) {
+        Some(work) => Ok(Json(work)),
+        None => err(StatusCode::SERVICE_UNAVAILABLE, "no candidate available — node may still be syncing"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /mining/rewardAddress
+// ---------------------------------------------------------------------------
+
+pub async fn get_mining_reward_address(
+    State(state): State<ApiState>,
+) -> ApiResult<serde_json::Value> {
+    let mining = state.mining.as_ref().ok_or_else(|| {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(ApiError {
+            error: 503,
+            reason: "mining not configured".into(),
+            detail: None,
+        }))
+    })?;
+
+    // Derive P2S address from miner PK
+    let pk_hex: String = (*mining.config.miner_pk.h).clone().into();
+    Ok(Json(serde_json::json!({
+        "rewardAddress": pk_hex,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// POST /mining/solution
+// ---------------------------------------------------------------------------
+
+/// Solution submission from miners. For Autolykos v2, only the 8-byte nonce
+/// is required. The miner_pk and other fields are optional (defaults apply).
+#[derive(Deserialize)]
+pub struct SolutionSubmission {
+    /// 8-byte nonce as hex string.
+    pub n: String,
+}
+
+pub async fn post_mining_solution(
+    State(state): State<ApiState>,
+    Json(submission): Json<SolutionSubmission>,
+) -> ApiResult<serde_json::Value> {
+    let mining = state.mining.as_ref().ok_or_else(|| {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(ApiError {
+            error: 503,
+            reason: "mining not configured".into(),
+            detail: None,
+        }))
+    })?;
+
+    // Parse nonce
+    let nonce = hex::decode(&submission.n).map_err(|_| {
+        (StatusCode::BAD_REQUEST, Json(ApiError {
+            error: 400,
+            reason: "invalid nonce hex".into(),
+            detail: None,
+        }))
+    })?;
+    if nonce.len() != 8 {
+        return err(StatusCode::BAD_REQUEST, "nonce must be exactly 8 bytes");
+    }
+
+    // Get cached candidate
+    let candidate = mining.cached_block().ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, Json(ApiError {
+            error: 400,
+            reason: "no current candidate — fetch /mining/candidate first".into(),
+            detail: None,
+        }))
+    })?;
+
+    // Build Autolykos v2 solution (miner_pk not used in PoW calc, use configured pk)
+    let solution = ergo_chain_types::AutolykosSolution {
+        miner_pk: Box::new((*mining.config.miner_pk.h).clone()),
+        pow_onetime_pk: None,
+        nonce,
+        pow_distance: None,
+    };
+
+    // Validate PoW
+    let _header = ergo_mining::solution::validate_solution(&candidate, solution).map_err(|e| {
+        match e {
+            ergo_mining::MiningError::InvalidSolution(msg) => {
+                (StatusCode::BAD_REQUEST, Json(ApiError {
+                    error: 400,
+                    reason: format!("invalid solution: {msg}"),
+                    detail: None,
+                }))
+            }
+            other => {
+                tracing::error!("solution validation error: {other}");
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
+                    error: 500,
+                    reason: "solution validation failed".into(),
+                    detail: Some(other.to_string()),
+                }))
+            }
+        }
+    })?;
+
+    // TODO: apply block to validator + broadcast to peers
+    // For now, just acknowledge the valid solution
+    tracing::info!("valid mining solution received");
+
+    Ok(Json(serde_json::json!({ "status": "accepted" })))
+}

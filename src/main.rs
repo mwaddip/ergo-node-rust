@@ -79,13 +79,42 @@ fn build_genesis_boxes(network: enr_p2p::types::Network) -> Vec<([u8; 32], Vec<u
         .collect()
 }
 
+/// Pre-computed state proofs for mining candidate generation.
+/// Written by the validator after each block, read by the mining task.
+#[derive(Clone)]
+struct MiningProofData {
+    parent: ergo_chain_types::Header,
+    emission_box: ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox,
+    ad_proof_bytes: Vec<u8>,
+    state_root: ADDigest,
+    emission_tx: ergo_validation::Transaction,
+    tip_height: u32,
+}
+
+type MiningProofCache = Arc<std::sync::Mutex<Option<MiningProofData>>>;
+
+/// Context for mining proof pre-computation inside the validator callback.
+struct MiningCtx {
+    config: ergo_mining::MinerConfig,
+    proof_cache: MiningProofCache,
+    snapshot_reader: Arc<SnapshotReader>,
+}
+
 /// Dispatches to either DigestValidator or UtxoValidator based on config.
 /// Tracks validated_height in a shared atomic for the snapshot trigger.
+/// Publishes ErgoStateContext and confirmed transactions after each block.
 struct Validator {
     inner: ValidatorInner,
     /// Updated after every successful validate_block(). Read by the snapshot
     /// creation trigger to know the actual UTXO state height.
     shared_height: Arc<std::sync::atomic::AtomicU32>,
+    /// Published after every successful validate_block(). Read by the mempool
+    /// task and REST API for transaction validation.
+    shared_state_context: Arc<tokio::sync::RwLock<Option<ergo_validation::ErgoStateContext>>>,
+    /// Sends confirmed transactions to the mempool task after each block.
+    block_applied_tx: tokio::sync::mpsc::Sender<Vec<ergo_validation::Transaction>>,
+    /// Mining proof pre-computation (None if mining not configured or digest mode).
+    mining: Option<MiningCtx>,
 }
 
 enum ValidatorInner {
@@ -94,13 +123,83 @@ enum ValidatorInner {
 }
 
 impl Validator {
-    fn new(inner: ValidatorInner, shared_height: Arc<std::sync::atomic::AtomicU32>) -> Self {
+    fn new(
+        inner: ValidatorInner,
+        shared_height: Arc<std::sync::atomic::AtomicU32>,
+        shared_state_context: Arc<tokio::sync::RwLock<Option<ergo_validation::ErgoStateContext>>>,
+        block_applied_tx: tokio::sync::mpsc::Sender<Vec<ergo_validation::Transaction>>,
+        mining: Option<MiningCtx>,
+    ) -> Self {
         let h = match &inner {
             ValidatorInner::Digest(v) => v.validated_height(),
             ValidatorInner::Utxo(v) => v.validated_height(),
         };
         shared_height.store(h, std::sync::atomic::Ordering::Relaxed);
-        Self { inner, shared_height }
+        Self { inner, shared_height, shared_state_context, block_applied_tx, mining }
+    }
+
+    /// Pre-compute mining proofs after a successful block validation.
+    fn update_mining_proofs(&self, header: &ergo_chain_types::Header) {
+        let mining = match &self.mining {
+            Some(m) => m,
+            None => return,
+        };
+
+        let next_height = header.height + 1;
+        let emission_id = match self.emission_box_id() {
+            Some(id) => id,
+            None => return,
+        };
+
+        let box_bytes = match mining.snapshot_reader.lookup_key(&emission_id) {
+            Some(b) => b,
+            None => {
+                tracing::debug!("mining: emission box not found in snapshot reader");
+                return;
+            }
+        };
+
+        let emission_box = match ergo_validation::deserialize_box(&box_bytes) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("mining: failed to deserialize emission box: {e}");
+                return;
+            }
+        };
+
+        let reemission = ergo_mining::emission::ReemissionRules::mainnet();
+        let emission_tx = match ergo_mining::emission::build_emission_tx(
+            &emission_box,
+            next_height,
+            &mining.config.miner_pk,
+            mining.config.reward_delay,
+            &reemission,
+        ) {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::warn!("mining: failed to build emission tx: {e}");
+                return;
+            }
+        };
+
+        let (ad_proof_bytes, state_root) = match self.proofs_for_transactions(&[emission_tx.clone()]) {
+            Some(Ok(result)) => result,
+            Some(Err(e)) => {
+                tracing::warn!("mining: proof computation failed: {e}");
+                return;
+            }
+            None => return, // digest mode
+        };
+
+        let mut guard = mining.proof_cache.lock().unwrap();
+        *guard = Some(MiningProofData {
+            parent: header.clone(),
+            emission_box,
+            ad_proof_bytes,
+            state_root,
+            emission_tx,
+            tip_height: header.height,
+        });
     }
 }
 
@@ -119,6 +218,27 @@ impl BlockValidator for Validator {
         };
         if result.is_ok() {
             self.shared_height.store(self.validated_height(), std::sync::atomic::Ordering::Relaxed);
+
+            // Publish state context for mempool/API transaction validation.
+            // Only when we have preceding headers (height > 0).
+            if !preceding_headers.is_empty() {
+                let ctx = ergo_validation::build_state_context(
+                    header,
+                    preceding_headers,
+                    self.parameters(),
+                );
+                // Block on the write lock — we're in the sync task's single thread,
+                // and this is a fast in-memory swap.
+                *self.shared_state_context.blocking_write() = Some(ctx);
+            }
+
+            // Send confirmed transactions to the mempool task for apply_block().
+            if let Ok(parsed) = ergo_validation::parse_block_transactions(block_txs) {
+                let _ = self.block_applied_tx.try_send(parsed.transactions);
+            }
+
+            // Pre-compute mining proofs for the next block.
+            self.update_mining_proofs(header);
         }
         result
     }
@@ -144,6 +264,30 @@ impl BlockValidator for Validator {
         };
         self.shared_height.store(self.validated_height(), std::sync::atomic::Ordering::Relaxed);
     }
+
+    fn parameters(&self) -> &ergo_validation::Parameters {
+        match &self.inner {
+            ValidatorInner::Digest(v) => v.parameters(),
+            ValidatorInner::Utxo(v) => v.parameters(),
+        }
+    }
+
+    fn proofs_for_transactions(
+        &self,
+        txs: &[ergo_validation::Transaction],
+    ) -> Option<Result<(Vec<u8>, ADDigest), ValidationError>> {
+        match &self.inner {
+            ValidatorInner::Utxo(v) => v.proofs_for_transactions(txs),
+            ValidatorInner::Digest(_) => None,
+        }
+    }
+
+    fn emission_box_id(&self) -> Option<[u8; 32]> {
+        match &self.inner {
+            ValidatorInner::Utxo(v) => v.emission_box_id(),
+            ValidatorInner::Digest(_) => None,
+        }
+    }
 }
 
 // SAFETY: UtxoValidator contains PersistentBatchAVLProver which uses Rc<RefCell<Node>>
@@ -167,6 +311,100 @@ impl<'a> ergo_mempool::types::UtxoReader for MempoolUtxoReader<'a> {
         ergo_validation::deserialize_box(&value_bytes).ok()
     }
 }
+
+/// Adapter: HeaderChain → ChainAccess for the API crate.
+///
+/// Uses block_in_place + block_on to acquire the async chain Mutex from sync trait methods.
+/// This is safe on tokio's multi-threaded runtime (axum) — block_in_place moves the current
+/// task off the worker thread so the lock acquisition doesn't deadlock with other tasks.
+struct HeaderChainAdapter {
+    chain: Arc<Mutex<HeaderChain>>,
+}
+
+impl HeaderChainAdapter {
+    fn with_chain<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&HeaderChain) -> R,
+    {
+        tokio::task::block_in_place(|| {
+            let chain = tokio::runtime::Handle::current().block_on(self.chain.lock());
+            f(&chain)
+        })
+    }
+}
+
+impl ergo_api::ChainAccess for HeaderChainAdapter {
+    fn height(&self) -> u32 {
+        self.with_chain(|c| c.height())
+    }
+    fn header_at(&self, height: u32) -> Option<ergo_chain_types::Header> {
+        self.with_chain(|c| c.header_at(height).cloned())
+    }
+    fn header_by_id(&self, id: &[u8; 32]) -> Option<ergo_chain_types::Header> {
+        self.with_chain(|c| {
+            // Linear scan — headers are indexed by height, not by ID.
+            // For the API this is acceptable; optimize later if needed.
+            for h in (0..=c.height()).rev() {
+                if let Some(header) = c.header_at(h) {
+                    let header_id: &[u8] = header.id.0.as_ref();
+                    if header_id == id {
+                        return Some(header.clone());
+                    }
+                }
+            }
+            None
+        })
+    }
+    fn tip(&self) -> ergo_chain_types::Header {
+        self.with_chain(|c| c.tip().clone())
+    }
+}
+
+/// Adapter: RedbModifierStore → StoreAccess for the API crate.
+struct StoreAdapter {
+    store: Arc<RedbModifierStore>,
+}
+
+impl ergo_api::StoreAccess for StoreAdapter {
+    fn get(&self, type_id: u8, id: &[u8; 32]) -> Option<Vec<u8>> {
+        self.store.get(type_id, id).ok().flatten()
+    }
+}
+
+/// Adapter: SnapshotReader → UtxoAccess for the API crate.
+struct ApiUtxoReader {
+    snapshot_reader: Option<SnapshotReader>,
+}
+
+impl ergo_api::UtxoAccess for ApiUtxoReader {
+    fn box_by_id(&self, box_id: &[u8; 32]) -> Option<ergo_validation::ErgoBox> {
+        let reader = self.snapshot_reader.as_ref()?;
+        let value_bytes = reader.lookup_key(box_id)?;
+        ergo_validation::deserialize_box(&value_bytes).ok()
+    }
+}
+
+/// Mining config parsed from `[node.mining]` in ergo.toml.
+#[derive(Debug, Deserialize, Default)]
+struct MiningConfig {
+    /// Miner public key (hex-encoded compressed EC point, 33 bytes).
+    /// Empty = mining disabled.
+    #[serde(default)]
+    miner_pk: String,
+    /// Voting preferences: 3 bytes as hex string. "000000" = no votes.
+    #[serde(default = "default_votes")]
+    votes: String,
+    /// Miner reward maturity delay in blocks (default: 720).
+    #[serde(default = "default_reward_delay")]
+    reward_delay: i32,
+    /// Maximum candidate lifetime before forced regeneration (seconds).
+    #[serde(default = "default_candidate_ttl")]
+    candidate_ttl_secs: u64,
+}
+
+fn default_votes() -> String { "000000".to_string() }
+fn default_reward_delay() -> i32 { 720 }
+fn default_candidate_ttl() -> u64 { 15 }
 
 /// Node-level config parsed from the `[node]` section of ergo.toml.
 #[derive(Debug, Deserialize)]
@@ -208,6 +446,12 @@ struct NodeConfig {
     /// Minimum fee in nanoERG to enter the mempool (default: 1,000,000 = 0.001 ERG).
     #[serde(default = "default_min_fee")]
     min_fee: u64,
+    /// REST API bind address (default: 0.0.0.0:9053 testnet, 0.0.0.0:9052 mainnet).
+    #[serde(default)]
+    api_address: Option<String>,
+    /// Mining configuration.
+    #[serde(default)]
+    mining: MiningConfig,
 }
 
 impl Default for NodeConfig {
@@ -225,6 +469,8 @@ impl Default for NodeConfig {
             snapshot_interval: default_snapshot_interval(),
             mempool_capacity: default_mempool_capacity(),
             min_fee: default_min_fee(),
+            api_address: None,
+            mining: MiningConfig::default(),
         }
     }
 }
@@ -305,6 +551,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         snapshot_interval = node_config.snapshot_interval,
         "node config"
     );
+
+    // Parse mining config
+    let miner_pk_opt: Option<ProveDlog> = if !node_config.mining.miner_pk.is_empty() {
+        let pk_bytes = hex::decode(&node_config.mining.miner_pk)
+            .map_err(|e| format!("invalid miner_pk hex: {e}"))?;
+        let point = EcPoint::sigma_parse_bytes(&pk_bytes)
+            .map_err(|e| format!("invalid miner_pk EC point: {e}"))?;
+        Some(ProveDlog::new(point))
+    } else {
+        None
+    };
+
+    let miner_votes: [u8; 3] = {
+        let v = hex::decode(&node_config.mining.votes)
+            .unwrap_or_else(|_| vec![0, 0, 0]);
+        [v.get(0).copied().unwrap_or(0), v.get(1).copied().unwrap_or(0), v.get(2).copied().unwrap_or(0)]
+    };
+
+    // Mining proof cache — shared between the validator callback and the mining task
+    let mining_proof_cache: MiningProofCache = Arc::new(std::sync::Mutex::new(None));
+
+    if let Some(ref pk) = miner_pk_opt {
+        let pk_hex: String = (*pk.h).clone().into();
+        tracing::info!(miner_pk = %pk_hex, votes = %node_config.mining.votes, "mining configured");
+    }
+
     let data_dir = std::path::PathBuf::from(node_config.data_dir);
     std::fs::create_dir_all(&data_dir)?;
     let store = Arc::new(RedbModifierStore::new(&data_dir.join("modifiers.redb"))?);
@@ -376,6 +648,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Validation pipeline — progress channel feeds sync, delivery channel feeds tracker
     let pipeline_chain = chain.clone();
+    let api_store = store.clone(); // for REST API block queries
     let sync_store = SharedStore::new(store.clone());
     let revalidate_store = store.clone(); // for section scan during revalidation
     let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(4);
@@ -470,6 +743,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let utxo_bootstrap = node_config.utxo_bootstrap;
     let min_snapshot_peers = node_config.min_snapshot_peers;
     let shared_validated_height = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let shared_state_context: Arc<tokio::sync::RwLock<Option<ergo_validation::ErgoStateContext>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
+    let (block_applied_tx, block_applied_rx) =
+        tokio::sync::mpsc::channel::<Vec<ergo_validation::Transaction>>(64);
     let chain_guard = chain.lock().await;
 
     let mut snapshot_reader: Option<SnapshotReader> = None;
@@ -518,9 +795,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 tracing::info!(height, chain_height, checkpoint, "block validator resuming (UTXO mode)");
+                let mining_ctx = miner_pk_opt.as_ref().and_then(|pk| {
+                    snapshot_reader.as_ref().map(|sr| MiningCtx {
+                        config: ergo_mining::MinerConfig {
+                            miner_pk: pk.clone(),
+                            reward_delay: node_config.mining.reward_delay,
+                            votes: miner_votes,
+                            candidate_ttl: std::time::Duration::from_secs(node_config.mining.candidate_ttl_secs),
+                        },
+                        proof_cache: mining_proof_cache.clone(),
+                        snapshot_reader: Arc::new(sr.clone()),
+                    })
+                });
                 Some(Validator::new(
                     ValidatorInner::Utxo(UtxoValidator::new(persistent_prover, height, checkpoint)),
                     shared_validated_height.clone(),
+                    shared_state_context.clone(),
+                    block_applied_tx.clone(),
+                    mining_ctx,
                 ))
             } else if utxo_bootstrap {
                 // Snapshot bootstrap — validator will be created after snapshot download
@@ -552,9 +844,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
 
                 tracing::info!(checkpoint, "block validator starting from genesis (UTXO mode)");
+                let mining_ctx = miner_pk_opt.as_ref().and_then(|pk| {
+                    snapshot_reader.as_ref().map(|sr| MiningCtx {
+                        config: ergo_mining::MinerConfig {
+                            miner_pk: pk.clone(),
+                            reward_delay: node_config.mining.reward_delay,
+                            votes: miner_votes,
+                            candidate_ttl: std::time::Duration::from_secs(node_config.mining.candidate_ttl_secs),
+                        },
+                        proof_cache: mining_proof_cache.clone(),
+                        snapshot_reader: Arc::new(sr.clone()),
+                    })
+                });
                 Some(Validator::new(
                     ValidatorInner::Utxo(UtxoValidator::new(persistent_prover, 0, checkpoint)),
                     shared_validated_height.clone(),
+                    shared_state_context.clone(),
+                    block_applied_tx.clone(),
+                    mining_ctx,
                 ))
             }
         }
@@ -619,6 +926,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(Validator::new(
                 ValidatorInner::Digest(validator),
                 shared_validated_height.clone(),
+                shared_state_context.clone(),
+                block_applied_tx.clone(),
+                None, // mining requires UTXO mode
             ))
         }
     };
@@ -661,6 +971,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let validator_tx = validator_tx_send.unwrap();
         let checkpoint = configured_checkpoint.unwrap_or(0);
         let shared_validated_height = shared_validated_height.clone();
+        let shared_state_context = shared_state_context.clone();
+        let block_applied_tx = block_applied_tx.clone();
         tokio::spawn(async move {
             match snapshot_rx.await {
                 Ok(snapshot_data) => {
@@ -704,6 +1016,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let validator = Validator::new(
                         ValidatorInner::Utxo(UtxoValidator::new(persistent, height, checkpoint)),
                         shared_validated_height.clone(),
+                        shared_state_context.clone(),
+                        block_applied_tx.clone(),
+                        None, // TODO: mining ctx for snapshot bootstrap
                     );
                     let _ = validator_tx.send(validator);
                     tracing::info!(height, "validator sent to sync machine");
@@ -810,41 +1125,321 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )));
 
-    // Mempool task: receive transactions from pipeline, deserialize, log receipt.
-    // Full validation (ErgoScript) requires a state context built from the tip
-    // header + preceding headers + parameters. For now we receive and log;
-    // process() integration comes with the REST API when we have state context plumbing.
+    // Mempool task: validates incoming transactions, applies confirmed blocks,
+    // and runs periodic cleanup/revalidation.
     {
-        let _mempool = mempool.clone();
-        let _snapshot_reader_for_mempool = mempool_snapshot_reader;
+        let mempool = mempool.clone();
+        let snapshot_reader_for_mempool = mempool_snapshot_reader.clone();
+        let state_context = shared_state_context.clone();
+        let p2p_for_mempool = p2p.clone();
+        let mut block_applied_rx = block_applied_rx;
+        let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         tokio::spawn(async move {
             let mut tx_rx = tx_rx;
-            while let Some((tx_id, tx_bytes)) = tx_rx.recv().await {
-                use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
-                use std::io::Cursor;
-                use ergo_lib::ergotree_ir::serialization::constant_store::ConstantStore;
-                use ergo_lib::ergotree_ir::serialization::sigma_byte_reader::SigmaByteReader;
+            loop {
+                tokio::select! {
+                    // Block confirmed — purge confirmed txs + double-spends from pool
+                    Some(confirmed_txs) = block_applied_rx.recv() => {
+                        let mut pool = mempool.lock().await;
+                        let removed = pool.apply_block(&confirmed_txs);
+                        if !removed.is_empty() {
+                            tracing::debug!(
+                                confirmed = confirmed_txs.len(),
+                                removed = removed.len(),
+                                pool_size = pool.len(),
+                                "mempool: applied block"
+                            );
+                        }
+                    }
 
-                let cursor = Cursor::new(&tx_bytes);
-                let mut reader = SigmaByteReader::new(cursor, ConstantStore::empty());
-                match ergo_validation::Transaction::sigma_parse(&mut reader) {
-                    Ok(tx) => {
-                        tracing::info!(
-                            tx_id = hex::encode(tx_id),
-                            inputs = tx.inputs.len(),
-                            outputs = tx.outputs.len(),
-                            tx_size = tx_bytes.len(),
-                            "mempool: received unconfirmed tx"
+                    // P2P transaction — deserialize, validate, add to pool
+                    Some((tx_id, tx_bytes)) = tx_rx.recv() => {
+                        use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+                        use std::io::Cursor;
+                        use ergo_lib::ergotree_ir::serialization::constant_store::ConstantStore;
+                        use ergo_lib::ergotree_ir::serialization::sigma_byte_reader::SigmaByteReader;
+
+                        // Need state context to validate — skip if not yet available
+                        // (still syncing, no blocks validated yet)
+                        let ctx_guard = state_context.read().await;
+                        let Some(ref ctx) = *ctx_guard else {
+                            tracing::trace!(
+                                tx_id = hex::encode(tx_id),
+                                "mempool: skipping tx, no state context yet"
+                            );
+                            continue;
+                        };
+
+                        let cursor = Cursor::new(&tx_bytes);
+                        let mut reader = SigmaByteReader::new(cursor, ConstantStore::empty());
+                        let tx = match ergo_validation::Transaction::sigma_parse(&mut reader) {
+                            Ok(tx) => tx,
+                            Err(e) => {
+                                tracing::debug!(
+                                    tx_id = hex::encode(tx_id),
+                                    "mempool: tx deserialization failed: {e}"
+                                );
+                                continue;
+                            }
+                        };
+
+                        let utxo_reader = MempoolUtxoReader {
+                            snapshot_reader: snapshot_reader_for_mempool.as_ref(),
+                        };
+
+                        let mut pool = mempool.lock().await;
+                        let outcome = pool.process(
+                            tx,
+                            tx_bytes,
+                            &utxo_reader,
+                            ctx,
+                            Some(0), // all P2P txs share one rate-limit budget for now
                         );
+                        drop(ctx_guard);
+
+                        match &outcome {
+                            ergo_mempool::types::ProcessingOutcome::Accepted { tx_id } => {
+                                tracing::info!(
+                                    tx_id = hex::encode(tx_id),
+                                    pool_size = pool.len(),
+                                    "mempool: tx accepted"
+                                );
+                                let inv = enr_p2p::protocol::messages::ProtocolMessage::Inv {
+                                    modifier_type: 2,
+                                    ids: vec![*tx_id],
+                                };
+                                p2p_for_mempool.broadcast_outbound(inv).await;
+                            }
+                            ergo_mempool::types::ProcessingOutcome::Replaced { tx_id, removed } => {
+                                tracing::info!(
+                                    tx_id = hex::encode(tx_id),
+                                    replaced = removed.len(),
+                                    "mempool: tx replaced double-spend"
+                                );
+                                let inv = enr_p2p::protocol::messages::ProtocolMessage::Inv {
+                                    modifier_type: 2,
+                                    ids: vec![*tx_id],
+                                };
+                                p2p_for_mempool.broadcast_outbound(inv).await;
+                            }
+                            ergo_mempool::types::ProcessingOutcome::Invalidated { reason } => {
+                                tracing::debug!(
+                                    tx_id = hex::encode(tx_id),
+                                    reason,
+                                    "mempool: tx invalidated"
+                                );
+                            }
+                            ergo_mempool::types::ProcessingOutcome::Declined { reason } => {
+                                tracing::trace!(
+                                    tx_id = hex::encode(tx_id),
+                                    reason,
+                                    "mempool: tx declined"
+                                );
+                            }
+                            ergo_mempool::types::ProcessingOutcome::AlreadyInPool => {}
+                            ergo_mempool::types::ProcessingOutcome::DoubleSpendLoser { .. } => {
+                                tracing::trace!(
+                                    tx_id = hex::encode(tx_id),
+                                    "mempool: tx lost double-spend contest"
+                                );
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::debug!(
-                            tx_id = hex::encode(tx_id),
-                            tx_size = tx_bytes.len(),
-                            "mempool: tx deserialization failed: {e}"
-                        );
+
+                    // Periodic cleanup — revalidate pool + rebroadcast
+                    _ = cleanup_interval.tick() => {
+                        let ctx_guard = state_context.read().await;
+                        if let Some(ref ctx) = *ctx_guard {
+                            let utxo_reader = MempoolUtxoReader {
+                                snapshot_reader: snapshot_reader_for_mempool.as_ref(),
+                            };
+                            let mut pool = mempool.lock().await;
+                            let removed = pool.revalidate(&utxo_reader, ctx);
+                            if !removed.is_empty() {
+                                tracing::info!(
+                                    removed = removed.len(),
+                                    pool_size = pool.len(),
+                                    "mempool: cleanup removed invalid txs"
+                                );
+                            }
+
+                            // Rebroadcast selected txs to peers
+                            let rebroadcast = pool.select_for_rebroadcast(&utxo_reader);
+                            if !rebroadcast.is_empty() {
+                                let ids: Vec<[u8; 32]> = rebroadcast.iter()
+                                    .map(|utx| {
+                                        let id: [u8; 32] = utx.tx.id().as_ref().try_into().unwrap();
+                                        id
+                                    })
+                                    .collect();
+                                tracing::debug!(count = ids.len(), "mempool: rebroadcasting txs");
+                                let inv = enr_p2p::protocol::messages::ProtocolMessage::Inv {
+                                    modifier_type: 2,
+                                    ids,
+                                };
+                                p2p_for_mempool.broadcast_outbound(inv).await;
+                            }
+                        }
                     }
+
+                    else => break,
                 }
+            }
+        });
+    }
+
+    // REST API server
+    {
+        let api_bind_addr: std::net::SocketAddr = node_config.api_address
+            .as_deref()
+            .unwrap_or(match network {
+                enr_p2p::types::Network::Testnet => "0.0.0.0:9053",
+                enr_p2p::types::Network::Mainnet => "0.0.0.0:9052",
+            })
+            .parse()
+            .expect("invalid api_address");
+
+        let api_chain = chain.clone();
+        let api_mempool = mempool.clone();
+        let api_state_ctx = shared_state_context.clone();
+        let p2p_for_api = p2p.clone();
+
+        // Mining: construct CandidateGenerator + mining task if configured
+        let mining_generator: Option<Arc<ergo_mining::CandidateGenerator>> =
+            if let Some(ref pk) = miner_pk_opt {
+                if state_type == StateType::Utxo {
+                    let generator = Arc::new(ergo_mining::CandidateGenerator::new(
+                        ergo_mining::MinerConfig {
+                            miner_pk: pk.clone(),
+                            reward_delay: node_config.mining.reward_delay,
+                            votes: miner_votes,
+                            candidate_ttl: std::time::Duration::from_secs(node_config.mining.candidate_ttl_secs),
+                        },
+                    ));
+
+                    // Mining task: watches shared_height for tip changes, builds candidates
+                    let gen = generator.clone();
+                    let proof_cache = mining_proof_cache.clone();
+                    let mining_height = shared_validated_height.clone();
+                    let mining_chain = chain.clone();
+                    tokio::spawn(async move {
+                        let mut last_height = 0u32;
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            let current = mining_height.load(std::sync::atomic::Ordering::Relaxed);
+                            if current == last_height || current == 0 {
+                                continue;
+                            }
+                            last_height = current;
+
+                            // Read pre-computed proofs from the validator callback
+                            let proof_data = {
+                                let guard = proof_cache.lock().unwrap();
+                                guard.clone()
+                            };
+
+                            let proof_data = match proof_data {
+                                Some(d) if d.tip_height == current => d,
+                                _ => continue, // proofs not ready yet
+                            };
+
+                            // Get n_bits for next block from chain
+                            let chain_guard = mining_chain.lock().await;
+                            let n_bits = chain_guard.tip().n_bits; // same as current for first release
+                            drop(chain_guard);
+
+                            // Build extension + header + WorkMessage
+                            let extension = match ergo_mining::extension::build_extension(
+                                &proof_data.parent,
+                                &[], // interlinks tracking deferred
+                            ) {
+                                Ok(ext) => ext,
+                                Err(e) => {
+                                    tracing::warn!("mining: extension build failed: {e}");
+                                    continue;
+                                }
+                            };
+
+                            let candidate = ergo_mining::CandidateBlock {
+                                parent: proof_data.parent.clone(),
+                                version: proof_data.parent.version,
+                                n_bits,
+                                state_root: proof_data.state_root,
+                                ad_proof_bytes: proof_data.ad_proof_bytes.clone(),
+                                transactions: vec![proof_data.emission_tx.clone()],
+                                timestamp: {
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_millis() as u64;
+                                    std::cmp::max(now, proof_data.parent.timestamp + 1)
+                                },
+                                extension,
+                                votes: gen.config.votes,
+                                header_bytes: vec![],
+                            };
+
+                            match ergo_mining::candidate::build_work_message(
+                                &candidate,
+                                &gen.config.miner_pk.h,
+                            ) {
+                                Ok((header_bytes, work)) => {
+                                    let mut candidate = candidate;
+                                    candidate.header_bytes = header_bytes;
+                                    gen.cache_candidate(candidate, work, current);
+                                    tracing::debug!(height = current + 1, "mining candidate cached");
+                                }
+                                Err(e) => {
+                                    tracing::warn!("mining: work message build failed: {e}");
+                                }
+                            }
+                        }
+                    });
+                    tracing::info!("mining task started");
+                    Some(generator)
+                } else {
+                    tracing::warn!("mining configured but node is in digest mode — mining disabled");
+                    None
+                }
+            } else {
+                None
+            };
+
+        let api_state = ergo_api::ApiState {
+            chain: Arc::new(HeaderChainAdapter { chain: api_chain }),
+            store: Arc::new(StoreAdapter { store: api_store }),
+            mempool: api_mempool,
+            utxo_reader: Arc::new(ApiUtxoReader {
+                snapshot_reader: mempool_snapshot_reader.clone(),
+            }),
+            state_context: api_state_ctx,
+            peer_count: Arc::new(move || {
+                let count = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(p2p_for_api.peer_count())
+                });
+                ergo_api::PeerCounts { connected: count }
+            }),
+            mining: mining_generator,
+            node_info: ergo_api::NodeMeta {
+                name: "ergo-node-rust".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                network: match network {
+                    enr_p2p::types::Network::Testnet => "testnet".to_string(),
+                    enr_p2p::types::Network::Mainnet => "mainnet".to_string(),
+                },
+                state_type: match state_type {
+                    StateType::Utxo => "utxo".to_string(),
+                    StateType::Digest => "digest".to_string(),
+                },
+            },
+        };
+
+        tokio::spawn(async move {
+            if let Err(e) = ergo_api::serve(api_state, api_bind_addr).await {
+                tracing::error!("REST API server failed: {e}");
             }
         });
     }
