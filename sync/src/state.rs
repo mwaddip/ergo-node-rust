@@ -170,6 +170,12 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             match self.sync_from_peer().await {
                 SyncOutcome::Synced => {
                     // Snapshot bootstrap: if enabled, no validator, and channels ready
+                    tracing::info!(
+                        utxo_bootstrap = self.config.utxo_bootstrap,
+                        has_validator = self.validator.is_some(),
+                        has_snapshot_tx = self.snapshot_tx.is_some(),
+                        "SyncOutcome::Synced reached"
+                    );
                     if self.config.utxo_bootstrap
                         && self.validator.is_none()
                         && self.snapshot_tx.is_some()
