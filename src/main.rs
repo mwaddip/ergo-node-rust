@@ -473,8 +473,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let persistent_prover = PersistentBatchAVLProver::new(prover, Box::new(storage), vec![])
                     .expect("failed to create persistent prover from stored state");
 
-                let height = chain_guard.height();
-                tracing::info!(height, checkpoint, "block validator resuming (UTXO mode)");
+                // Find the actual validated height by matching the prover's
+                // current digest against header state roots. The chain height
+                // may be far ahead of the validated height during sync.
+                let prover_digest = persistent_prover.digest();
+                let prover_digest_arr: [u8; 33] = prover_digest.as_ref().try_into()
+                    .expect("prover digest should be 33 bytes");
+                let chain_height = chain_guard.height();
+                let mut height = 0u32;
+                for h in (0..=chain_height).rev() {
+                    if h == 0 {
+                        // Genesis state root
+                        let genesis_root: [u8; 33] = genesis_digest.into();
+                        if prover_digest_arr == genesis_root {
+                            height = 0;
+                            break;
+                        }
+                    } else if let Some(header) = chain_guard.header_at(h) {
+                        let header_root: [u8; 33] = header.state_root.into();
+                        if prover_digest_arr == header_root {
+                            height = h;
+                            break;
+                        }
+                    }
+                }
+                tracing::info!(height, chain_height, checkpoint, "block validator resuming (UTXO mode)");
                 Some(Validator::new(
                     ValidatorInner::Utxo(UtxoValidator::new(persistent_prover, height, checkpoint)),
                     shared_validated_height.clone(),
