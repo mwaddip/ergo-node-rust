@@ -30,7 +30,9 @@ REST API and mining API are live. The mining endpoints generate Autolykos v2 can
 | 6a | **Mempool** — validate-on-entry, replace-by-fee, family weighting, rate limiting | Done |
 | 6b | **REST API** — 19 endpoints (info, blocks, transactions, UTXO, peers, emission, mining) | Done |
 | 6c | **Mining API** — Autolykos v2 candidate assembly, EIP-27 re-emission, solution validation | Done |
-| 7 | NiPoPoW light sync, soft-fork voting | Planned |
+| 7a | **Soft-fork voting** — parameter tracking across epoch boundaries, JVM `matchParameters60` semantics | Done |
+| 7b | **NiPoPoW serve + verify** — codes 90/91, build proofs from local chain, verify incoming proofs | Done |
+| 7c | NiPoPoW light-client sync (consume proof to skip block download) | Planned |
 
 ## What works today
 
@@ -52,6 +54,8 @@ REST API and mining API are live. The mining endpoints generate Autolykos v2 can
 - **Mempool**: in-memory transaction pool with full JVM parity — validate-on-entry, replace-by-fee, family weighting, fee statistics, rate limiting, periodic revalidation. Confirmed transactions purged after each validated block. P2P transaction relay (receive → validate → broadcast → rebroadcast).
 - **REST API**: 19 endpoints in `api/` crate (axum), JVM path-compatible. Covers `/info`, `/blocks/*`, `/transactions/*`, `/utxo/*`, `/peers/*`, `/emission/*`, `/mining/*`.
 - **Mining API**: full Autolykos v2 candidate assembly. Pre-computes emission tx + state proofs after each validated block (no validator lock contention with sync). EIP-27 re-emission token handling. CPU-mined integration tests prove the loop end-to-end. Solution endpoint validates PoW, computes header ID, and submits the assembled block to the local pipeline.
+- **Soft-fork voting**: epoch-boundary parameter tracking with JVM v6 `matchParameters60` semantics. Network-aware default parameters (testnet starts at `BlockVersion=4`, mainnet has multi-epoch voting lifecycle). Validated against testnet past 100+ epoch boundaries with zero parameter mismatches.
+- **NiPoPoW serve + verify**: P2P codes 90 (`GetNipopowProof`) and 91 (`NipopowProof`). Builds proofs from local chain on demand and verifies proofs received from peers. Genesis (height 1) interlinks synthesized in-process; for h ≥ 2, the integrator clamps the build anchor to the current validated tip so the proof walk never runs off the validated edge. End-to-end verified via `tests/nipopow_serve_integration.rs` against the live testnet deployment.
 - **Honest Mode feature**: handshake advertises `state_type`, `verifying`, and `blocks_to_keep` from node config — peers don't request blocks we can't serve
 - **Deep chain reorg**: fork-aware header storage keeps all validated headers across forks. Cumulative difficulty scoring selects the best chain. Multi-block reorganization is a local operation — zero network traffic, reads fork headers from the store and swaps the in-memory chain atomically. Handles testnet forks automatically.
 - Continuous header sync from genesis on testnet — no connection stalls

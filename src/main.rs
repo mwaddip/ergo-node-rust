@@ -319,6 +319,7 @@ async fn handle_nipopow_event(
     peer_id: enr_p2p::types::PeerId,
     chain: &Arc<Mutex<HeaderChain>>,
     p2p: &Arc<enr_p2p::node::P2pNode>,
+    shared_validated_height: &Arc<std::sync::atomic::AtomicU32>,
 ) {
     use ergo_node_rust::nipopow_serve;
 
@@ -337,11 +338,45 @@ async fn handle_nipopow_event(
             // for a single P2P request.
             let proof_bytes = {
                 let chain_guard = chain.lock().await;
+
+                // Anchor: explicit header_id from peer, or derive from validated tip.
+                // `build_nipopow_proof` walks 1..=anchor_height pulling extensions
+                // from the loader. Extensions are only present in the modifier store
+                // for blocks the validator has actually processed — heights beyond
+                // `validated_height` have headers but no extension bytes. If we let
+                // `build_nipopow_proof` default to `chain.height()` (the header tip)
+                // it will run off the validated edge and fail mid-walk.
+                let anchor = match req.header_id {
+                    Some(id) => Some(id),
+                    None => {
+                        let validated_h = shared_validated_height
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        if validated_h == 0 {
+                            tracing::warn!(
+                                peer = %peer_id,
+                                "GetNipopowProof: validator has not advanced yet, cannot serve"
+                            );
+                            return;
+                        }
+                        match chain_guard.header_at(validated_h) {
+                            Some(h) => Some(h.id),
+                            None => {
+                                tracing::warn!(
+                                    peer = %peer_id,
+                                    validated_h,
+                                    "GetNipopowProof: header at validated height missing from chain"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                };
+
                 match enr_chain::build_nipopow_proof(
                     &chain_guard,
                     req.m as u32,
                     req.k as u32,
-                    req.header_id,
+                    anchor,
                 ) {
                     Ok(b) => b,
                     Err(e) => {
@@ -872,6 +907,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pipeline.run().await;
     });
 
+    // Shared validated-height atomic — populated by the validator (see Validator::sync_shared)
+    // and read by the snapshot trigger, mining task, and NiPoPoW serve handler.
+    // Defined here (above the event demux) because the NiPoPoW closure needs to clone it.
+    let shared_validated_height = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
     // Subscribe to events for the sync machine — with snapshot serving demux
     let raw_events = p2p.subscribe().await;
 
@@ -892,6 +932,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let snapshot_store = snapshot_store.clone();
         let nipopow_chain = chain.clone();
         let p2p_serve = p2p.clone();
+        let nipopow_validated_height = shared_validated_height.clone();
         tokio::spawn(async move {
             let mut events = raw_events;
             while let Some(event) = events.recv().await {
@@ -932,6 +973,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             peer_id,
                             &nipopow_chain,
                             &p2p_serve,
+                            &nipopow_validated_height,
                         )
                         .await;
                         true
@@ -970,7 +1012,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let utxo_bootstrap = node_config.utxo_bootstrap;
     let min_snapshot_peers = node_config.min_snapshot_peers;
-    let shared_validated_height = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let shared_state_context: Arc<tokio::sync::RwLock<Option<ergo_validation::ErgoStateContext>>> =
         Arc::new(tokio::sync::RwLock::new(None));
     let (block_applied_tx, block_applied_rx) =
