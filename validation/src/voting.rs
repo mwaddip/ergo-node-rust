@@ -80,6 +80,76 @@ pub fn parse_parameters_from_extension(
     Ok(params)
 }
 
+/// Verify that an `expected` parameter table from chain matches a `parsed`
+/// table from a block's extension, using JVM v6 `matchParameters60` semantics:
+///
+/// - `expected.size <= parsed.size` — the local table may be smaller because
+///   newer protocol versions can introduce parameters that older clients
+///   don't yet know about.
+/// - For every entry `(param, value)` in `expected`, `parsed` must contain
+///   the same value at the same key.
+/// - Entries that exist only in `parsed` (newer params) are ignored.
+///
+/// **Does NOT check `proposedUpdate` (param ID 124)**. JVM v6 still requires
+/// it to match, but this validator doesn't track it — the chain submodule
+/// holds the active disabling rules separately. ID 124 enforcement is a
+/// follow-up once the chain submodule exposes it.
+///
+/// Mirrors JVM `Parameters.matchParameters60`.
+pub fn check_parameters_v6(
+    expected: &Parameters,
+    parsed: &Parameters,
+    height: u32,
+) -> Result<(), ValidationError> {
+    if expected.parameters_table.len() > parsed.parameters_table.len() {
+        tracing::warn!(
+            height,
+            expected_size = expected.parameters_table.len(),
+            parsed_size = parsed.parameters_table.len(),
+            "epoch-boundary parameter check: local table larger than received"
+        );
+        return Err(ValidationError::ParameterMismatch {
+            height,
+            expected: Box::new(expected.clone()),
+            actual: Box::new(parsed.clone()),
+        });
+    }
+
+    for (param, expected_value) in expected.parameters_table.iter() {
+        match parsed.parameters_table.get(param) {
+            Some(actual_value) if actual_value == expected_value => {}
+            Some(actual_value) => {
+                tracing::warn!(
+                    height,
+                    ?param,
+                    expected_value,
+                    actual_value,
+                    "epoch-boundary parameter check: value mismatch"
+                );
+                return Err(ValidationError::ParameterMismatch {
+                    height,
+                    expected: Box::new(expected.clone()),
+                    actual: Box::new(parsed.clone()),
+                });
+            }
+            None => {
+                tracing::warn!(
+                    height,
+                    ?param,
+                    "epoch-boundary parameter check: param missing from received"
+                );
+                return Err(ValidationError::ParameterMismatch {
+                    height,
+                    expected: Box::new(expected.clone()),
+                    actual: Box::new(parsed.clone()),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Pack a [`Parameters`] table into extension key-value fields for
 /// embedding in an epoch-boundary block's extension section.
 ///
@@ -250,6 +320,81 @@ mod tests {
         assert_eq!(fields[0].0, [0x00, 1]);
         assert_eq!(fields[1].0, [0x00, 3]);
         assert_eq!(fields[2].0, [0x00, 123]);
+    }
+
+    #[test]
+    fn check_v6_exact_match() {
+        let mut expected = Parameters::default();
+        expected.parameters_table.clear();
+        expected.parameters_table.insert(Parameter::StorageFeeFactor, 1_250_000);
+        expected.parameters_table.insert(Parameter::BlockVersion, 4);
+
+        let parsed = expected.clone();
+        assert!(check_parameters_v6(&expected, &parsed, 128).is_ok());
+    }
+
+    #[test]
+    fn check_v6_parsed_has_more_entries_ok() {
+        // expected: 2 entries; parsed: 3 entries (one new param we don't know about).
+        // v6 allows local to be smaller — newer protocol can introduce params.
+        let mut expected = Parameters::default();
+        expected.parameters_table.clear();
+        expected.parameters_table.insert(Parameter::StorageFeeFactor, 1_250_000);
+        expected.parameters_table.insert(Parameter::BlockVersion, 4);
+
+        let mut parsed = expected.clone();
+        parsed.parameters_table.insert(Parameter::MaxBlockSize, 524_288);
+
+        assert!(check_parameters_v6(&expected, &parsed, 128).is_ok());
+    }
+
+    #[test]
+    fn check_v6_expected_has_more_entries_fails() {
+        // The reverse: expected has more than parsed. Block is missing a
+        // parameter we expected — consensus failure.
+        let mut expected = Parameters::default();
+        expected.parameters_table.clear();
+        expected.parameters_table.insert(Parameter::StorageFeeFactor, 1_250_000);
+        expected.parameters_table.insert(Parameter::BlockVersion, 4);
+        expected.parameters_table.insert(Parameter::MaxBlockSize, 524_288);
+
+        let mut parsed = Parameters::default();
+        parsed.parameters_table.clear();
+        parsed.parameters_table.insert(Parameter::StorageFeeFactor, 1_250_000);
+        parsed.parameters_table.insert(Parameter::BlockVersion, 4);
+
+        let err = check_parameters_v6(&expected, &parsed, 128).unwrap_err();
+        assert!(matches!(err, ValidationError::ParameterMismatch { .. }));
+    }
+
+    #[test]
+    fn check_v6_value_mismatch_fails() {
+        let mut expected = Parameters::default();
+        expected.parameters_table.clear();
+        expected.parameters_table.insert(Parameter::BlockVersion, 1);
+
+        let mut parsed = Parameters::default();
+        parsed.parameters_table.clear();
+        parsed.parameters_table.insert(Parameter::BlockVersion, 4);
+
+        let err = check_parameters_v6(&expected, &parsed, 128).unwrap_err();
+        assert!(matches!(err, ValidationError::ParameterMismatch { .. }));
+    }
+
+    #[test]
+    fn check_v6_missing_key_fails() {
+        // expected has BlockVersion but parsed doesn't (and parsed is somehow
+        // not smaller — has different keys filling the slot).
+        let mut expected = Parameters::default();
+        expected.parameters_table.clear();
+        expected.parameters_table.insert(Parameter::BlockVersion, 4);
+
+        let mut parsed = Parameters::default();
+        parsed.parameters_table.clear();
+        parsed.parameters_table.insert(Parameter::StorageFeeFactor, 1_250_000);
+
+        let err = check_parameters_v6(&expected, &parsed, 128).unwrap_err();
+        assert!(matches!(err, ValidationError::ParameterMismatch { .. }));
     }
 
     #[test]

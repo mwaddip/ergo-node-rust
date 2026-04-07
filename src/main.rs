@@ -235,9 +235,17 @@ impl BlockValidator for Validator {
                     preceding_headers,
                     active_params,
                 );
-                // Block on the write lock — we're in the sync task's single thread,
-                // and this is a fast in-memory swap.
-                *self.shared_state_context.blocking_write() = Some(ctx);
+                // We're inside a sync function called from a tokio worker thread.
+                // tokio::sync::RwLock::blocking_write panics here. Use the
+                // documented "block on async from sync from runtime" pattern:
+                // block_in_place tells the runtime this thread will block, then
+                // block_on the async write completes the swap.
+                let ctx_lock = self.shared_state_context.clone();
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        *ctx_lock.write().await = Some(ctx);
+                    });
+                });
             }
 
             // Send confirmed transactions to the mempool task for apply_block().
@@ -1272,7 +1280,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Use the actual validated height, not the chain (header) height.
                     // The validator updates this atomic after each successful block.
                     let validated = shared_height.load(std::sync::atomic::Ordering::Relaxed);
-                    if validated == 0 {
+                    // Skip if below the first snapshot boundary. The boundary
+                    // formula `validated - ((validated + 1) % interval)` underflows
+                    // when validated < interval - 1; the early-return on validated == 0
+                    // alone wasn't enough.
+                    if validated < snapshot_interval.saturating_sub(1) {
                         continue;
                     }
 

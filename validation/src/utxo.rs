@@ -98,17 +98,13 @@ impl BlockValidator for UtxoValidator {
         let parsed_txs = parse_block_transactions(block_txs)?;
         let parsed_ext = parse_extension(extension)?;
 
-        // 1a. Epoch-boundary parameter check (consensus-critical)
+        // 1a. Epoch-boundary parameter check (consensus-critical).
+        // Uses JVM v6 matchParameters60 semantics: local can have fewer
+        // entries than received, every entry in local must match received.
         let epoch_boundary_params = match expected_boundary_params {
             Some(expected) => {
                 let parsed = voting::parse_parameters_from_extension(&parsed_ext)?;
-                if parsed != *expected {
-                    return Err(ValidationError::ParameterMismatch {
-                        height: header.height,
-                        expected: Box::new(expected.clone()),
-                        actual: Box::new(parsed),
-                    });
-                }
+                voting::check_parameters_v6(expected, &parsed, header.height)?;
                 Some(parsed)
             }
             None => None,
