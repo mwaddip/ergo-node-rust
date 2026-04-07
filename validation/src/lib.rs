@@ -3,19 +3,21 @@ mod sections;
 mod state_changes;
 mod tx_validation;
 mod utxo;
+mod voting;
 
 use ergo_chain_types::{ADDigest, Header};
 
 pub use digest::DigestValidator;
 pub use sections::{
-    ParsedAdProofs, ParsedBlockTransactions, ParsedExtension, parse_block_transactions,
-    serialize_ad_proofs, serialize_block_transactions, serialize_extension,
+    ExtensionField, ParsedAdProofs, ParsedBlockTransactions, ParsedExtension, parse_block_transactions,
+    parse_extension, serialize_ad_proofs, serialize_block_transactions, serialize_extension,
 };
 pub use state_changes::{StateChanges, compute_state_changes, transactions_to_summaries};
 pub use tx_validation::{
     build_state_context, deserialize_box, validate_single_transaction,
 };
 pub use utxo::UtxoValidator;
+pub use voting::{pack_parameters, parse_parameters_from_extension};
 
 // Re-export types needed by mempool callers
 pub use ergo_lib::chain::ergo_state_context::ErgoStateContext;
@@ -23,16 +25,44 @@ pub use ergo_lib::chain::parameters::Parameters;
 pub use ergo_lib::chain::transaction::Transaction;
 pub use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
 
+/// Outcome of a successful block validation.
+///
+/// Carries information the caller needs to advance chain state after the
+/// validator returns Ok. Currently only used for epoch-boundary parameter
+/// propagation; future fields can extend this struct without breaking the
+/// trait signature.
+#[derive(Debug, Clone, Default)]
+pub struct ValidationOutcome {
+    /// `Some(parsed)` if this was an epoch-boundary block AND the parsed
+    /// parameters from its extension matched `expected_boundary_params`.
+    /// The caller MUST pass these to `chain.apply_epoch_boundary_parameters()`
+    /// after persisting the block, before validating the next block.
+    pub epoch_boundary_params: Option<Parameters>,
+}
+
 /// Validates block sections against the current UTXO state.
 ///
 /// Two implementations: DigestValidator (AD proof based, no persistent UTXO set)
-/// and UtxoValidator (persistent AVL+ tree, future Phase 4b).
+/// and UtxoValidator (persistent AVL+ tree, current Phase 4b).
+///
+/// Validators are stateless w.r.t. blockchain parameters — the caller passes
+/// `active_params` (from `chain.active_parameters()`) on every call. At epoch
+/// boundaries, the caller also passes `expected_boundary_params` (from
+/// `chain.compute_expected_parameters(height)`) which the validator compares
+/// against the parameters parsed from the block's extension. On match, the
+/// returned `ValidationOutcome::epoch_boundary_params` carries the parsed
+/// parameters for the caller to apply via `chain.apply_epoch_boundary_parameters`.
 pub trait BlockValidator {
     /// Validate a block's sections against the current state.
     ///
     /// `header.height` must equal `self.validated_height() + 1`.
     /// `ad_proofs` is required for digest mode, None for UTXO mode.
     /// `preceding_headers` contains up to 10 headers before this block (newest first).
+    /// `active_params` is the current chain parameters used for transaction cost bounds.
+    /// `expected_boundary_params` is `Some` iff `header.height` is an epoch boundary;
+    /// when present, the validator parses the extension's parameters and verifies
+    /// they match. On mismatch, returns `Err(ValidationError::ParameterMismatch)`.
+    #[allow(clippy::too_many_arguments)]
     fn validate_block(
         &mut self,
         header: &Header,
@@ -40,7 +70,9 @@ pub trait BlockValidator {
         ad_proofs: Option<&[u8]>,
         extension: &[u8],
         preceding_headers: &[Header],
-    ) -> Result<(), ValidationError>;
+        active_params: &Parameters,
+        expected_boundary_params: Option<&Parameters>,
+    ) -> Result<ValidationOutcome, ValidationError>;
 
     /// Height of the last validated block. 0 = genesis state set but no blocks applied.
     fn validated_height(&self) -> u32;
@@ -50,9 +82,6 @@ pub trait BlockValidator {
 
     /// Reset to a previous state after reorg.
     fn reset_to(&mut self, height: u32, digest: ADDigest);
-
-    /// Current blockchain parameters (updated from Extension at epoch boundaries).
-    fn parameters(&self) -> &Parameters;
 
     /// Compute AD proofs and new state root for a set of transactions
     /// without modifying persistent state. Returns None for digest-mode
@@ -107,4 +136,11 @@ pub enum ValidationError {
 
     #[error("UTXO state operation failed: {0}")]
     StateOperationFailed(String),
+
+    #[error("epoch-boundary parameter mismatch at height {height}")]
+    ParameterMismatch {
+        height: u32,
+        expected: Box<Parameters>,
+        actual: Box<Parameters>,
+    },
 }

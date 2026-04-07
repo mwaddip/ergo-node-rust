@@ -78,6 +78,31 @@ impl SyncChain for SharedChain {
         let header = chain.header_at(height)?;
         Some(header.state_root.0)
     }
+
+    async fn active_parameters(&self) -> ergo_validation::Parameters {
+        self.chain.lock().await.active_parameters().clone()
+    }
+
+    async fn is_epoch_boundary(&self, height: u32) -> bool {
+        self.chain.lock().await.is_epoch_boundary(height)
+    }
+
+    async fn compute_expected_parameters(
+        &self,
+        epoch_boundary_height: u32,
+    ) -> Result<ergo_validation::Parameters, ChainError> {
+        self.chain
+            .lock()
+            .await
+            .compute_expected_parameters(epoch_boundary_height)
+    }
+
+    async fn apply_epoch_boundary_parameters(&self, params: ergo_validation::Parameters) {
+        self.chain
+            .lock()
+            .await
+            .apply_epoch_boundary_parameters(params);
+    }
 }
 
 /// Wraps `Arc<RedbModifierStore>` to implement `SyncStore`.

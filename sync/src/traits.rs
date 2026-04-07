@@ -65,6 +65,36 @@ pub trait SyncChain {
     /// Parse an incoming SyncInfo message body.
     fn parse_sync_info(&self, body: &[u8]) -> Result<SyncInfo, enr_chain::ChainError>;
 
+    /// Current blockchain parameters at the chain tip.
+    /// Used by the validator to bound transaction costs on every block.
+    fn active_parameters(
+        &self,
+    ) -> impl std::future::Future<Output = ergo_validation::Parameters> + Send;
+
+    /// `true` iff `height` is the start of a new voting epoch.
+    fn is_epoch_boundary(
+        &self,
+        height: u32,
+    ) -> impl std::future::Future<Output = bool> + Send;
+
+    /// Compute the parameters that the block at `epoch_boundary_height` MUST emit
+    /// in its extension. Used by the validator at epoch-boundary blocks to verify
+    /// the block's parameters match expected. Errors if the height is not a valid
+    /// epoch boundary or required headers are missing.
+    fn compute_expected_parameters(
+        &self,
+        epoch_boundary_height: u32,
+    ) -> impl std::future::Future<Output = Result<ergo_validation::Parameters, enr_chain::ChainError>>
+    + Send;
+
+    /// Apply parameters from a successfully validated epoch-boundary block.
+    /// Called by the validator's caller AFTER `validate_block` returns Ok with
+    /// `epoch_boundary_params: Some(params)`. Mutates the chain's active parameters.
+    fn apply_epoch_boundary_parameters(
+        &self,
+        params: ergo_validation::Parameters,
+    ) -> impl std::future::Future<Output = ()> + Send;
+
     /// Peek at the tip headers to determine peer's chain status.
     /// Returns the heights of headers in the sync info, if V2.
     fn sync_info_heights(info: &SyncInfo) -> Vec<u32> {

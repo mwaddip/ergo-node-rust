@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 
 use ergo_lib::chain::ergo_state_context::ErgoStateContext;
-use ergo_lib::chain::parameters::{Parameter, Parameters};
+use ergo_lib::chain::parameters::Parameters;
 use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
 use ergo_lib::ergotree_ir::serialization::constant_store::ConstantStore;
@@ -18,7 +18,6 @@ use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_lib::wallet::tx_context::TransactionContext;
 use ergo_chain_types::{Header, PreHeader};
 
-use crate::sections::ParsedExtension;
 use crate::ValidationError;
 
 /// Deserialize an ErgoBox from raw bytes (as returned by the AVL proof verifier).
@@ -29,52 +28,6 @@ pub fn deserialize_box(bytes: &[u8]) -> Result<ErgoBox, ValidationError> {
         index: 0,
         reason: format!("box deserialization: {e}"),
     })
-}
-
-/// Extract blockchain parameters from an Extension section.
-///
-/// Parameters are stored as key `[0x00, param_id]` with 4-byte big-endian i32 values.
-/// Only present at voting epoch boundaries — between epochs the caller carries
-/// forward the previous parameters unchanged.
-pub fn update_parameters_from_extension(
-    current: &Parameters,
-    extension: &ParsedExtension,
-) -> Parameters {
-    let mut table = current.parameters_table.clone();
-    let mut updated = false;
-
-    for field in &extension.fields {
-        // System parameters: key prefix 0x00, 4-byte big-endian i32 value.
-        // Skip SoftForkDisablingRules (ID 124) — variable-length encoding.
-        if field.key[0] == 0x00 && field.key[1] != 124 && field.value.len() == 4 {
-            let value = i32::from_be_bytes(field.value[..4].try_into().unwrap());
-            if let Some(param) = byte_to_parameter(field.key[1]) {
-                table.insert(param, value);
-                updated = true;
-            }
-        }
-    }
-
-    if updated {
-        tracing::info!("updated blockchain parameters from extension");
-    }
-
-    Parameters { parameters_table: table }
-}
-
-fn byte_to_parameter(id: u8) -> Option<Parameter> {
-    match id {
-        1 => Some(Parameter::StorageFeeFactor),
-        2 => Some(Parameter::MinValuePerByte),
-        3 => Some(Parameter::MaxBlockSize),
-        4 => Some(Parameter::MaxBlockCost),
-        5 => Some(Parameter::TokenAccessCost),
-        6 => Some(Parameter::InputCost),
-        7 => Some(Parameter::DataInputCost),
-        8 => Some(Parameter::OutputCost),
-        123 => Some(Parameter::BlockVersion),
-        _ => None,
-    }
 }
 
 /// Build the `[Header; 10]` array required by ErgoStateContext.

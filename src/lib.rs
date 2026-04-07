@@ -1,4 +1,5 @@
 mod bridge;
+pub mod nipopow_serve;
 mod pipeline;
 pub mod snapshot_serve;
 pub mod snapshot_store;

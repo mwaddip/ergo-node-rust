@@ -15,7 +15,8 @@ use ergo_lib::chain::parameters::Parameters;
 use crate::sections::{parse_ad_proofs, parse_block_transactions, parse_extension};
 use crate::state_changes::{compute_state_changes, transactions_to_summaries};
 use crate::tx_validation;
-use crate::{BlockValidator, ValidationError};
+use crate::voting;
+use crate::{BlockValidator, ValidationError, ValidationOutcome};
 
 /// Key length for Ergo's UTXO AVL+ tree (BoxId = 32 bytes).
 pub(crate) const KEY_LENGTH: usize = 32;
@@ -34,13 +35,14 @@ pub(crate) fn label_preserving_resolver() -> Resolver {
 ///
 /// Verifies state transitions using AD proofs and BatchAVLVerifier.
 /// No persistent UTXO set — just tracks the current state root.
+///
+/// Stateless w.r.t. blockchain parameters: the caller passes `active_params`
+/// on every `validate_block` call. The validator does not own a `Parameters`
+/// field — chain submodule is the single source of truth.
 pub struct DigestValidator {
     current_digest: ADDigest,
     validated_height: u32,
     checkpoint_height: u32,
-    /// Current blockchain parameters. Updated from Extension at voting epoch
-    /// boundaries, carried forward between epochs.
-    parameters: Parameters,
 }
 
 impl DigestValidator {
@@ -53,20 +55,15 @@ impl DigestValidator {
             current_digest: genesis_digest,
             validated_height: 0,
             checkpoint_height,
-            parameters: Parameters::default(),
         }
     }
 
     /// Create a DigestValidator resuming from a known state.
-    ///
-    /// Uses default parameters — they'll be updated from the next epoch
-    /// boundary Extension encountered during validation.
     pub fn from_state(digest: ADDigest, height: u32, checkpoint_height: u32) -> Self {
         Self {
             current_digest: digest,
             validated_height: height,
             checkpoint_height,
-            parameters: Parameters::default(),
         }
     }
 }
@@ -79,7 +76,9 @@ impl BlockValidator for DigestValidator {
         ad_proofs: Option<&[u8]>,
         extension: &[u8],
         preceding_headers: &[Header],
-    ) -> Result<(), ValidationError> {
+        active_params: &Parameters,
+        expected_boundary_params: Option<&Parameters>,
+    ) -> Result<ValidationOutcome, ValidationError> {
         let expected_height = self.validated_height + 1;
         if header.height != expected_height {
             return Err(ValidationError::HeightMismatch {
@@ -95,6 +94,22 @@ impl BlockValidator for DigestValidator {
         let parsed_proofs = parse_ad_proofs(proof_data)?;
         let parsed_txs = parse_block_transactions(block_txs)?;
         let parsed_ext = parse_extension(extension)?;
+
+        // 1a. Epoch-boundary parameter check (consensus-critical)
+        let epoch_boundary_params = match expected_boundary_params {
+            Some(expected) => {
+                let parsed = voting::parse_parameters_from_extension(&parsed_ext)?;
+                if parsed != *expected {
+                    return Err(ValidationError::ParameterMismatch {
+                        height: header.height,
+                        expected: Box::new(expected.clone()),
+                        actual: Box::new(parsed),
+                    });
+                }
+                Some(parsed)
+            }
+            None => None,
+        };
 
         // 2. Verify AD proofs digest matches header
         let proof_digest: [u8; 32] = blake2::Blake2b::<blake2::digest::typenum::U32>::digest(
@@ -200,21 +215,17 @@ impl BlockValidator for DigestValidator {
                 &proof_boxes,
                 header,
                 preceding_headers,
-                &self.parameters,
+                active_params,
             )?;
         }
 
-        // 8. Update parameters from extension (always — tracks voting epochs)
-        self.parameters =
-            tx_validation::update_parameters_from_extension(&self.parameters, &parsed_ext);
-
-        // 9. Advance state
+        // 8. Advance state
         self.current_digest = header.state_root;
         self.validated_height = header.height;
 
         tracing::debug!(height = header.height, "block validated (digest mode)");
 
-        Ok(())
+        Ok(ValidationOutcome { epoch_boundary_params })
     }
 
     fn validated_height(&self) -> u32 {
@@ -229,9 +240,5 @@ impl BlockValidator for DigestValidator {
         self.validated_height = height;
         self.current_digest = digest;
         tracing::info!(height, "validator reset to fork point");
-    }
-
-    fn parameters(&self) -> &Parameters {
-        &self.parameters
     }
 }

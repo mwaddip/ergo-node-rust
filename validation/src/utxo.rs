@@ -11,13 +11,18 @@ use ergo_lib::chain::parameters::Parameters;
 use crate::sections::{parse_block_transactions, parse_extension};
 use crate::state_changes::{compute_state_changes, transactions_to_summaries};
 use crate::tx_validation;
-use crate::{BlockValidator, ValidationError};
+use crate::voting;
+use crate::{BlockValidator, ValidationError, ValidationOutcome};
 
 /// UTXO-mode block validator.
 ///
 /// Verifies state transitions by applying operations to a persistent AVL+ tree
 /// (PersistentBatchAVLProver backed by VersionedAVLStorage). Boxes come from
 /// the tree's Lookup/Remove results, not from AD proofs.
+///
+/// Stateless w.r.t. blockchain parameters: the caller passes `active_params`
+/// on every `validate_block` call. The validator does not own a `Parameters`
+/// field — chain submodule is the single source of truth.
 ///
 /// Shares section parsing, state change computation, and transaction validation
 /// with DigestValidator — only the state root verification mechanism differs.
@@ -26,7 +31,6 @@ pub struct UtxoValidator {
     validated_height: u32,
     checkpoint_height: u32,
     current_digest: ADDigest,
-    parameters: Parameters,
     /// Current emission box ID (changes every block). None if all ERG emitted.
     emission_box_id: Option<[u8; 32]>,
     /// Emission contract ErgoTree bytes for matching outputs.
@@ -65,7 +69,6 @@ impl UtxoValidator {
             validated_height: height,
             checkpoint_height,
             current_digest: digest,
-            parameters: Parameters::default(),
             emission_box_id: None,
             emission_tree_bytes,
         }
@@ -80,7 +83,9 @@ impl BlockValidator for UtxoValidator {
         _ad_proofs: Option<&[u8]>,
         extension: &[u8],
         preceding_headers: &[Header],
-    ) -> Result<(), ValidationError> {
+        active_params: &Parameters,
+        expected_boundary_params: Option<&Parameters>,
+    ) -> Result<ValidationOutcome, ValidationError> {
         let expected_height = self.validated_height + 1;
         if header.height != expected_height {
             return Err(ValidationError::HeightMismatch {
@@ -92,6 +97,22 @@ impl BlockValidator for UtxoValidator {
         // 1. Parse sections (AD proofs not needed in UTXO mode)
         let parsed_txs = parse_block_transactions(block_txs)?;
         let parsed_ext = parse_extension(extension)?;
+
+        // 1a. Epoch-boundary parameter check (consensus-critical)
+        let epoch_boundary_params = match expected_boundary_params {
+            Some(expected) => {
+                let parsed = voting::parse_parameters_from_extension(&parsed_ext)?;
+                if parsed != *expected {
+                    return Err(ValidationError::ParameterMismatch {
+                        height: header.height,
+                        expected: Box::new(expected.clone()),
+                        actual: Box::new(parsed),
+                    });
+                }
+                Some(parsed)
+            }
+            None => None,
+        };
 
         // 2. Compute state changes from transactions
         let summaries = transactions_to_summaries(&parsed_txs.transactions)?;
@@ -160,7 +181,7 @@ impl BlockValidator for UtxoValidator {
                 &proof_boxes,
                 header,
                 preceding_headers,
-                &self.parameters,
+                active_params,
             )?;
         }
 
@@ -171,11 +192,7 @@ impl BlockValidator for UtxoValidator {
                 format!("persist failed: {e}"),
             ))?;
 
-        // 8. Update parameters from extension
-        self.parameters =
-            tx_validation::update_parameters_from_extension(&self.parameters, &parsed_ext);
-
-        // 9. Track emission box: scan new outputs for emission contract
+        // 8. Track emission box: scan new outputs for emission contract
         if !self.emission_tree_bytes.is_empty() {
             self.emission_box_id = None;
             for (box_id, box_bytes) in &changes.insertions {
@@ -191,13 +208,13 @@ impl BlockValidator for UtxoValidator {
             }
         }
 
-        // 10. Advance state
+        // 9. Advance state
         self.current_digest = header.state_root;
         self.validated_height = header.height;
 
         tracing::debug!(height = header.height, "block validated (UTXO mode)");
 
-        Ok(())
+        Ok(ValidationOutcome { epoch_boundary_params })
     }
 
     fn validated_height(&self) -> u32 {
@@ -220,10 +237,6 @@ impl BlockValidator for UtxoValidator {
         self.validated_height = height;
         self.current_digest = digest;
         tracing::info!(height, "UTXO validator reset to fork point");
-    }
-
-    fn parameters(&self) -> &Parameters {
-        &self.parameters
     }
 
     fn proofs_for_transactions(

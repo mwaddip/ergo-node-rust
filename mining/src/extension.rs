@@ -1,20 +1,72 @@
 //! Extension section building — NiPoPoW interlinks and voting parameters.
 
-use ergo_chain_types::{BlockId, Header};
+use ergo_chain_types::{BlockId, ExtensionCandidate as ErgoExtensionCandidate, Header};
+use ergo_lib::chain::parameters::Parameters;
 use ergo_merkle_tree::{MerkleNode, MerkleTree};
 use ergo_nipopow::NipopowAlgos;
 
 use crate::types::ExtensionCandidate;
 use crate::MiningError;
 
+/// Unpack a parent block's interlinks from its raw extension bytes.
+///
+/// Bridges the in-repo modifier store (which stores raw extension bytes)
+/// to sigma-rust's `NipopowAlgos::unpack_interlinks` (which takes a parsed
+/// `ExtensionCandidate`). Used by the mining task to obtain interlinks for
+/// the next candidate's `build_extension` call.
+///
+/// Returns an empty Vec if the extension contains no interlink fields,
+/// or if parsing fails. Errors are logged inside, never propagated —
+/// genesis (no parent extension) is a normal case.
+pub fn unpack_parent_interlinks(parent_extension_bytes: &[u8]) -> Vec<BlockId> {
+    let parsed = match ergo_validation::parse_extension(parent_extension_bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("mining: parent extension parse failed: {e}; using empty interlinks");
+            return vec![];
+        }
+    };
+
+    let fields: Vec<([u8; 2], Vec<u8>)> = parsed
+        .fields
+        .into_iter()
+        .map(|f| (f.key, f.value))
+        .collect();
+
+    let ec = match ErgoExtensionCandidate::new(fields) {
+        Ok(ec) => ec,
+        Err(e) => {
+            tracing::warn!(
+                "mining: ExtensionCandidate::new failed: {e}; using empty interlinks"
+            );
+            return vec![];
+        }
+    };
+
+    match NipopowAlgos::unpack_interlinks(&ec) {
+        Ok(links) => links,
+        Err(e) => {
+            tracing::warn!("mining: unpack_interlinks failed: {e}; using empty interlinks");
+            vec![]
+        }
+    }
+}
+
 /// Build the extension section for a new block.
 ///
-/// Contains NiPoPoW interlinks updated from the parent header.
-/// Voting parameters are encoded in the header's votes field, not in
-/// the extension (except at epoch boundaries — deferred for first release).
+/// Contains NiPoPoW interlinks updated from the parent header. When
+/// `boundary_params` is `Some`, also includes the packed parameter fields
+/// (`[0x00, param_id]` keys with 4-byte BE i32 values) — required at every
+/// epoch-boundary block per the consensus rules. When `None`, only
+/// interlinks are emitted (within-epoch blocks).
+///
+/// Voting decisions (which parameters to vote for) are encoded in the
+/// header's `votes` field, NOT in the extension. The extension at an
+/// epoch-boundary block carries the RESULT of the just-ended voting epoch.
 pub fn build_extension(
     parent: &Header,
     parent_interlinks: &[BlockId],
+    boundary_params: Option<&Parameters>,
 ) -> Result<ExtensionCandidate, MiningError> {
     // Update interlinks from parent
     let updated_interlinks =
@@ -22,7 +74,12 @@ pub fn build_extension(
             .map_err(|e| MiningError::AssemblyFailed(format!("interlinks: {e}")))?;
 
     // Pack interlinks into extension key-value format
-    let fields = NipopowAlgos::pack_interlinks(updated_interlinks);
+    let mut fields = NipopowAlgos::pack_interlinks(updated_interlinks);
+
+    // At epoch boundary, append packed parameters
+    if let Some(params) = boundary_params {
+        fields.extend(ergo_validation::pack_parameters(params));
+    }
 
     Ok(ExtensionCandidate { fields })
 }

@@ -54,12 +54,14 @@ pub enum MiningError {
 /// `validator_proofs` is a closure that calls
 /// `validator.proofs_for_transactions()`. This avoids the mining crate
 /// needing to know the validator's concrete type.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_candidate(
     config: &MinerConfig,
     parent: &Header,
     n_bits: u32,
     parent_interlinks: &[BlockId],
     emission_box: &ErgoBox,
+    boundary_params: Option<&ergo_lib::chain::parameters::Parameters>,
     validator_proofs: &dyn Fn(&[Transaction]) -> Option<Result<(Vec<u8>, ADDigest), ValidationError>>,
 ) -> Result<(CandidateBlock, WorkMessage), MiningError> {
     let height = parent.height + 1;
@@ -90,7 +92,7 @@ pub fn generate_candidate(
         .map_err(MiningError::Validation)?;
 
     // 4. Build extension
-    let extension = extension::build_extension(parent, parent_interlinks)?;
+    let extension = extension::build_extension(parent, parent_interlinks, boundary_params)?;
 
     // 5. Assemble candidate
     let mut block = CandidateBlock {

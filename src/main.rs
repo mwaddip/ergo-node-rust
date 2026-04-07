@@ -211,10 +211,18 @@ impl BlockValidator for Validator {
         ad_proofs: Option<&[u8]>,
         extension: &[u8],
         preceding_headers: &[ergo_chain_types::Header],
-    ) -> Result<(), ValidationError> {
+        active_params: &ergo_validation::Parameters,
+        expected_boundary_params: Option<&ergo_validation::Parameters>,
+    ) -> Result<ergo_validation::ValidationOutcome, ValidationError> {
         let result = match &mut self.inner {
-            ValidatorInner::Digest(v) => v.validate_block(header, block_txs, ad_proofs, extension, preceding_headers),
-            ValidatorInner::Utxo(v) => v.validate_block(header, block_txs, ad_proofs, extension, preceding_headers),
+            ValidatorInner::Digest(v) => v.validate_block(
+                header, block_txs, ad_proofs, extension, preceding_headers,
+                active_params, expected_boundary_params,
+            ),
+            ValidatorInner::Utxo(v) => v.validate_block(
+                header, block_txs, ad_proofs, extension, preceding_headers,
+                active_params, expected_boundary_params,
+            ),
         };
         if result.is_ok() {
             self.shared_height.store(self.validated_height(), std::sync::atomic::Ordering::Relaxed);
@@ -225,7 +233,7 @@ impl BlockValidator for Validator {
                 let ctx = ergo_validation::build_state_context(
                     header,
                     preceding_headers,
-                    self.parameters(),
+                    active_params,
                 );
                 // Block on the write lock — we're in the sync task's single thread,
                 // and this is a fast in-memory swap.
@@ -265,13 +273,6 @@ impl BlockValidator for Validator {
         self.shared_height.store(self.validated_height(), std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn parameters(&self) -> &ergo_validation::Parameters {
-        match &self.inner {
-            ValidatorInner::Digest(v) => v.parameters(),
-            ValidatorInner::Utxo(v) => v.parameters(),
-        }
-    }
-
     fn proofs_for_transactions(
         &self,
         txs: &[ergo_validation::Transaction],
@@ -295,6 +296,103 @@ impl BlockValidator for Validator {
 // owner with no cross-thread sharing. The Send bound is required by tokio::spawn but
 // the actual access pattern is single-threaded.
 unsafe impl Send for Validator {}
+
+/// Handle an incoming NiPoPoW message (code 90 GetNipopowProof or 91 NipopowProof).
+///
+/// For code 90: parse the request, lock the chain, build the proof, and send the
+/// response via the P2P node. For code 91: parse the inner proof bytes and verify
+/// against the chain (logged but not applied — light-client mode is a future session).
+///
+/// Errors during parsing/building/verification are logged at warn level and dropped.
+/// We never send error responses — JVM doesn't expect them.
+async fn handle_nipopow_event(
+    code: u8,
+    body: &[u8],
+    peer_id: enr_p2p::types::PeerId,
+    chain: &Arc<Mutex<HeaderChain>>,
+    p2p: &Arc<enr_p2p::node::P2pNode>,
+) {
+    use ergo_node_rust::nipopow_serve;
+
+    match code {
+        nipopow_serve::GET_NIPOPOW_PROOF => {
+            let req = match nipopow_serve::parse_get_nipopow_proof(body) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(peer = %peer_id, "GetNipopowProof parse failed: {e}");
+                    return;
+                }
+            };
+
+            // Build the proof under chain lock. Build is bounded by chain length;
+            // for a 270k-block chain this can be a few hundred ms — acceptable
+            // for a single P2P request.
+            let proof_bytes = {
+                let chain_guard = chain.lock().await;
+                match enr_chain::build_nipopow_proof(
+                    &chain_guard,
+                    req.m as u32,
+                    req.k as u32,
+                    req.header_id,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(peer = %peer_id, m = req.m, k = req.k, "build_nipopow_proof failed: {e}");
+                        return;
+                    }
+                }
+            };
+
+            tracing::debug!(
+                peer = %peer_id,
+                m = req.m,
+                k = req.k,
+                proof_size = proof_bytes.len(),
+                "serving NiPoPoW proof"
+            );
+
+            let resp_body = nipopow_serve::serialize_nipopow_proof(&proof_bytes);
+            let msg = enr_p2p::protocol::messages::ProtocolMessage::Unknown {
+                code: nipopow_serve::NIPOPOW_PROOF,
+                body: resp_body,
+            };
+            if let Err(e) = p2p.send_to(peer_id, msg).await {
+                tracing::warn!(peer = %peer_id, "send NipopowProof response failed: {e}");
+            }
+        }
+
+        nipopow_serve::NIPOPOW_PROOF => {
+            let proof_bytes = match nipopow_serve::parse_nipopow_proof(body) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(peer = %peer_id, "NipopowProof parse failed: {e}");
+                    return;
+                }
+            };
+
+            // Verify is a pure function over the proof bytes — no chain access needed.
+            match enr_chain::verify_nipopow_proof_bytes(&proof_bytes) {
+                Ok(meta) => {
+                    tracing::info!(
+                        peer = %peer_id,
+                        suffix_tip_height = meta.suffix_tip_height,
+                        total_headers = meta.total_headers,
+                        continuous = meta.continuous,
+                        "received and verified NiPoPoW proof (logged only — light-client mode pending)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(peer = %peer_id, "NiPoPoW proof verification failed: {e}");
+                }
+            }
+        }
+
+        _ => {
+            // is_nipopow_message guarantees code is 90 or 91; this branch is unreachable.
+            debug_assert!(false, "handle_nipopow_event called with non-nipopow code {code}");
+        }
+    }
+}
 
 /// UtxoReader for the mempool — looks up boxes from the persistent AVL+ tree.
 ///
@@ -690,6 +788,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(loaded, tip = chain.height(), "restored header chain from store");
     }
 
+    // Wire the extension loader so chain can read epoch-boundary extensions
+    // for parameter recomputation and nipopow proof construction. Bridges
+    // chain (which knows nothing about storage) to enr-store via header lookup.
+    {
+        let store_for_loader = store.clone();
+        chain.set_extension_loader(move |height: u32| -> Option<Vec<u8>> {
+            let header_id = store_for_loader.best_header_at(height).ok().flatten()?;
+            let header_bytes = store_for_loader
+                .get(enr_chain::HEADER_TYPE_ID, &header_id)
+                .ok()
+                .flatten()?;
+            let header = enr_chain::parse_header(&header_bytes).ok()?;
+            let extension_id = enr_chain::section_ids(&header)[2].1;
+            store_for_loader
+                .get(enr_chain::EXTENSION_TYPE_ID, &extension_id)
+                .ok()
+                .flatten()
+        });
+
+        // Recompute active parameters from the most recent epoch-boundary
+        // block's extension. Bounded walk: at most one extension read.
+        if let Err(e) = chain.recompute_active_parameters_from_storage() {
+            tracing::warn!(
+                error = %e,
+                "failed to recompute active parameters from storage; using defaults"
+            );
+        } else {
+            tracing::info!("recomputed active blockchain parameters from storage");
+        }
+    }
+
     let chain = Arc::new(Mutex::new(chain));
 
     // Modifier channel — P2P produces, pipeline consumes
@@ -748,10 +877,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Event demux: intercept snapshot serving requests (76/78/80), forward rest to sync
+    // Event demux: intercept snapshot serving requests (76/78/80) and NiPoPoW
+    // serving/verification (90/91), forward rest to sync.
     let (sync_events_tx, sync_events_rx) = tokio::sync::mpsc::channel(256);
     {
         let snapshot_store = snapshot_store.clone();
+        let nipopow_chain = chain.clone();
         let p2p_serve = p2p.clone();
         tokio::spawn(async move {
             let mut events = raw_events;
@@ -761,7 +892,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     message: enr_p2p::protocol::messages::ProtocolMessage::Unknown { code, ref body },
                 } = event
                 {
-                    if let Some(ref store) = snapshot_store {
+                    // Snapshot serving (codes 76, 78, 80)
+                    let snapshot_handled = if let Some(ref store) = snapshot_store {
                         if ergo_node_rust::snapshot_serve::is_snapshot_request(code) {
                             if let Some((resp_code, resp_body)) =
                                 ergo_node_rust::snapshot_serve::handle_snapshot_request(
@@ -780,7 +912,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     } else {
                         false
-                    }
+                    };
+
+                    // NiPoPoW serving (code 90) and verification (code 91)
+                    let nipopow_handled = if !snapshot_handled
+                        && ergo_node_rust::nipopow_serve::is_nipopow_message(code)
+                    {
+                        handle_nipopow_event(
+                            code,
+                            body,
+                            peer_id,
+                            &nipopow_chain,
+                            &p2p_serve,
+                        )
+                        .await;
+                        true
+                    } else {
+                        false
+                    };
+
+                    snapshot_handled || nipopow_handled
                 } else {
                     false
                 };
@@ -1393,6 +1544,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let proof_cache = mining_proof_cache.clone();
                     let mining_height = shared_validated_height.clone();
                     let mining_chain = chain.clone();
+                    let mining_store = store.clone();
                     tokio::spawn(async move {
                         let mut last_height = 0u32;
                         loop {
@@ -1414,15 +1566,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 _ => continue, // proofs not ready yet
                             };
 
-                            // Get n_bits for next block from chain
-                            let chain_guard = mining_chain.lock().await;
-                            let n_bits = chain_guard.tip().n_bits; // same as current for first release
-                            drop(chain_guard);
+                            let candidate_height = proof_data.parent.height + 1;
+
+                            // Single chain lock: read n_bits, check epoch boundary,
+                            // compute expected params if needed.
+                            let (n_bits, boundary_params) = {
+                                let chain_guard = mining_chain.lock().await;
+                                let n_bits = chain_guard.tip().n_bits;
+                                let bp = if chain_guard.is_epoch_boundary(candidate_height) {
+                                    match chain_guard.compute_expected_parameters(candidate_height) {
+                                        Ok(p) => Some(p),
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                candidate_height,
+                                                "mining: compute_expected_parameters failed: {e}"
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
+                                (n_bits, bp)
+                            };
+
+                            // Read parent extension to unpack interlinks for the new block.
+                            // The parent extension lookup mirrors the chain extension loader:
+                            // header → section_ids[2] → extension bytes → mining helper.
+                            let parent_interlinks = {
+                                let parent_extension_id =
+                                    enr_chain::section_ids(&proof_data.parent)[2].1;
+                                match mining_store
+                                    .get(enr_chain::EXTENSION_TYPE_ID, &parent_extension_id)
+                                {
+                                    Ok(Some(ext_bytes)) => {
+                                        ergo_mining::extension::unpack_parent_interlinks(&ext_bytes)
+                                    }
+                                    Ok(None) => {
+                                        // Parent extension not yet stored (genesis or fresh chain)
+                                        vec![]
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "mining: parent extension store read failed: {e}; using empty interlinks"
+                                        );
+                                        vec![]
+                                    }
+                                }
+                            };
 
                             // Build extension + header + WorkMessage
                             let extension = match ergo_mining::extension::build_extension(
                                 &proof_data.parent,
-                                &[], // interlinks tracking deferred
+                                &parent_interlinks,
+                                boundary_params.as_ref(),
                             ) {
                                 Ok(ext) => ext,
                                 Err(e) => {

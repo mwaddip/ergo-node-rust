@@ -546,16 +546,40 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 }
             }
 
+            // Read active parameters and (if at epoch boundary) expected boundary
+            // parameters from chain BEFORE calling validate_block. The validator
+            // is sync and stateless w.r.t. chain state, so all chain queries
+            // happen out-of-band before/after the call.
+            let active_params = self.chain.active_parameters().await;
+            let expected_boundary_params = if self.chain.is_epoch_boundary(height).await {
+                match self.chain.compute_expected_parameters(height).await {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        tracing::error!(height, error = %e, "compute_expected_parameters failed");
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
+
             let result = self.validator.as_mut().unwrap().validate_block(
                 &header,
                 &block_txs,
                 ad_proofs.as_deref(),
                 &extension,
                 &preceding,
+                &active_params,
+                expected_boundary_params.as_ref(),
             );
 
             match result {
-                Ok(()) => {
+                Ok(outcome) => {
+                    // If this was an epoch-boundary block, apply the new parameters
+                    // to chain state. The validator already verified they match expected.
+                    if let Some(new_params) = outcome.epoch_boundary_params {
+                        self.chain.apply_epoch_boundary_parameters(new_params).await;
+                    }
                     validated_to = height;
                     // Progress report every 1000 blocks during large sweeps
                     let done = height - self.validated_height;
