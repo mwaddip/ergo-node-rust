@@ -186,6 +186,33 @@ pub fn serialize_nipopow_proof(proof_bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Serialize a `GetNipopowProofRequest` into a code 90 message body.
+///
+/// Inverse of [`parse_get_nipopow_proof`]. Wire format:
+/// ```text
+/// m: i32 (ZigZag VLQ — putInt)
+/// k: i32 (ZigZag VLQ — putInt)
+/// header_id_present: u8 (raw byte: 0 or 1)
+/// [if present] header_id: 32 raw bytes
+/// future_pad_length: u16 (VLQ — putUShort) — always 0 from us
+/// ```
+pub fn serialize_get_nipopow_proof(req: &GetNipopowProofRequest) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    out.put_i32(req.m).expect("Vec write cannot fail");
+    out.put_i32(req.k).expect("Vec write cannot fail");
+    match &req.header_id {
+        Some(id) => {
+            out.push(1);
+            out.extend_from_slice(&id.0 .0);
+        }
+        None => {
+            out.push(0);
+        }
+    }
+    out.put_u16(0).expect("Vec write cannot fail");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +279,35 @@ mod tests {
         let serialized = serialize_nipopow_proof(&original);
         let parsed = parse_nipopow_proof(&serialized).unwrap();
         assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn serialize_get_nipopow_proof_no_anchor_round_trip() {
+        let req = GetNipopowProofRequest {
+            m: 6,
+            k: 10,
+            header_id: None,
+        };
+        let bytes = serialize_get_nipopow_proof(&req);
+        let parsed = parse_get_nipopow_proof(&bytes).unwrap();
+        assert_eq!(parsed.m, 6);
+        assert_eq!(parsed.k, 10);
+        assert!(parsed.header_id.is_none());
+    }
+
+    #[test]
+    fn serialize_get_nipopow_proof_with_anchor_round_trip() {
+        let id_bytes = [0x42; 32];
+        let req = GetNipopowProofRequest {
+            m: 12,
+            k: 24,
+            header_id: Some(BlockId(Digest32::from(id_bytes))),
+        };
+        let bytes = serialize_get_nipopow_proof(&req);
+        let parsed = parse_get_nipopow_proof(&bytes).unwrap();
+        assert_eq!(parsed.m, 12);
+        assert_eq!(parsed.k, 24);
+        assert_eq!(parsed.header_id.unwrap().0 .0, id_bytes);
     }
 
     #[test]

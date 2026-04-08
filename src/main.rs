@@ -754,8 +754,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state_type = match node_config.state_type.as_str() {
         "utxo" => StateType::Utxo,
         "digest" => StateType::Digest,
+        "light" => StateType::Light,
         other => {
-            return Err(format!("unknown state_type '{}' (expected 'utxo' or 'digest')", other).into());
+            return Err(format!("unknown state_type '{}' (expected 'utxo', 'digest', or 'light')", other).into());
         }
     };
     let verify_transactions = node_config.verify_transactions;
@@ -918,14 +919,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Grab network settings before P2P takes ownership of config
     let net_settings = config.network_settings();
 
-    // Build Mode feature from node config — tells peers what we can serve
+    // Build Mode feature from node config — tells peers what we can serve.
+    // Light mode advertises as Digest on the wire (the closest JVM-recognized
+    // shape: state-via-authenticated-proofs, no UTXO set) with verifying=false
+    // and blocks_to_keep=0. JVM peers will treat us as a header-only SPV node.
+    // The dedicated NiPoPoW bootstrap flag in the wire's mode body lives in
+    // p2p's ProxyMode (currently hardcoded to Full); plumbing that through
+    // is a separate p2p change, out of scope here.
     let mode_config = enr_p2p::transport::handshake::ModeConfig {
         state_type_id: match state_type {
             StateType::Utxo => 0,
-            StateType::Digest => 1,
+            StateType::Digest | StateType::Light => 1,
         },
-        verifying: verify_transactions,
-        blocks_to_keep: blocks_to_keep as i32,
+        verifying: verify_transactions && state_type != StateType::Light,
+        blocks_to_keep: if state_type == StateType::Light { 0 } else { blocks_to_keep as i32 },
     };
 
     // Start P2P with modifier sink (no validator)
@@ -1263,6 +1270,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 block_applied_tx.clone(),
                 None, // mining requires UTXO mode
             ))
+        }
+
+        StateType::Light => {
+            // Light mode runs no validator. The chain is bootstrapped from a
+            // verified NiPoPoW proof (see sync's light bootstrap state) and
+            // tip-following uses HeaderChain::try_append, which the chain
+            // crate's light_client_mode flag teaches to skip the
+            // expected_difficulty recalc. Mining and transaction validation
+            // are not available.
+            tracing::info!("light-client mode: no block validator constructed");
+            None
         }
     };
     drop(chain_guard);
@@ -1831,6 +1849,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 state_type: match state_type {
                     StateType::Utxo => "utxo".to_string(),
                     StateType::Digest => "digest".to_string(),
+                    StateType::Light => "light".to_string(),
                 },
             },
         };
