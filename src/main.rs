@@ -1064,6 +1064,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 tracing::info!(height, chain_height, checkpoint, "block validator resuming (UTXO mode)");
+                // Publish the resume height to the shared atomic so
+                // consumers that read it at startup (snapshot trigger,
+                // NiPoPoW serve handler, mining task) see the real
+                // persistent state instead of the 0 the atomic was
+                // initialized with. Without this, the no-anchor
+                // GetNipopowProof path refuses to serve for the window
+                // between binary restart and the first new block being
+                // processed.
+                shared_validated_height.store(height, std::sync::atomic::Ordering::Relaxed);
                 let mining_ctx = miner_pk_opt.as_ref().and_then(|pk| {
                     snapshot_reader.as_ref().map(|sr| MiningCtx {
                         config: ergo_mining::MinerConfig {
@@ -1147,6 +1156,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     digest = ?digest,
                     "block validator resuming from stored chain tip (digest mode)"
                 );
+                // See UTXO resume branch above for the rationale —
+                // publish the resume height so startup-time readers
+                // don't see 0.
+                shared_validated_height.store(height, std::sync::atomic::Ordering::Relaxed);
                 DigestValidator::from_state(digest, height, checkpoint)
             } else if revalidate && chain_guard.height() > 0 {
                 let checkpoint = configured_checkpoint.unwrap_or(0);
@@ -1185,6 +1198,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         checkpoint,
                         "revalidating stored blocks from first complete section"
                     );
+                    // Revalidation resets the effective validated
+                    // height to prev_height — publish it so the
+                    // atomic doesn't lie about the node's state.
+                    shared_validated_height.store(prev_height, std::sync::atomic::Ordering::Relaxed);
                     DigestValidator::from_state(digest, prev_height, checkpoint)
                 }
             } else {
@@ -1289,6 +1306,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         block_applied_tx.clone(),
                         None, // TODO: mining ctx for snapshot bootstrap
                     );
+                    // Publish the bootstrap snapshot height to the
+                    // shared atomic — see the UTXO resume branch in
+                    // main() for the rationale. Snapshot bootstrap
+                    // differs from normal resume because the atomic
+                    // has been 0 the entire time sync was downloading
+                    // the snapshot; this is the first opportunity to
+                    // update it.
+                    shared_validated_height.store(height, std::sync::atomic::Ordering::Relaxed);
                     let _ = validator_tx.send(validator);
                     tracing::info!(height, "validator sent to sync machine");
                 }
