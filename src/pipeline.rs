@@ -70,14 +70,17 @@ impl ValidationPipeline {
 
     /// Walk backward from a fork tip through the store to find the fork point
     /// (first ancestor that's in the best chain). Returns (fork_point_height, branch)
-    /// where branch is the fork headers in ascending order.
+    /// where branch is `(header, raw_bytes)` pairs in ascending order. The raw bytes
+    /// are needed so the caller can re-emit the new branch via `put_batch` after a
+    /// successful reorg, updating BEST_CHAIN to reflect the new chain.
     fn assemble_fork_branch(
         &self,
         chain: &HeaderChain,
         _tip_id: BlockId,
         tip_header: &Header,
-    ) -> Option<(u32, Vec<Header>)> {
-        let mut branch = vec![tip_header.clone()];
+        tip_raw: Vec<u8>,
+    ) -> Option<(u32, Vec<(Header, Vec<u8>)>)> {
+        let mut branch: Vec<(Header, Vec<u8>)> = vec![(tip_header.clone(), tip_raw)];
         let mut current_parent = tip_header.parent_id;
 
         // Walk backward, max 1000 steps to prevent runaway
@@ -87,7 +90,7 @@ impl ValidationPipeline {
                 // Found the fork point
                 // The branch is in reverse order (tip first). The last entry is
                 // closest to the fork point — its height - 1 is the fork point.
-                let first_fork_header = branch.last().unwrap();
+                let (first_fork_header, _) = branch.last().unwrap();
                 let fork_point_height = first_fork_header.height - 1;
 
                 // Verify the fork point is actually in the chain at that height
@@ -121,7 +124,7 @@ impl ValidationPipeline {
             };
 
             current_parent = parent_header.parent_id;
-            branch.push(parent_header);
+            branch.push((parent_header, parent_data));
         }
 
         tracing::warn!("fork chain walk exceeded 1000 steps");
@@ -250,8 +253,8 @@ impl ValidationPipeline {
         let mut rejected = 0u32;
         let mut evicted_ids: Vec<[u8; 32]> = Vec::new();
         let mut store_entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = Vec::new();
-        // Pending deep reorg: (fork_point_height, new_branch_headers, new_branch_raw)
-        let mut pending_reorg: Option<(u32, Vec<Header>, Vec<Vec<u8>>)> = None;
+        // Pending deep reorg: (fork_point_height, [(header, raw_bytes)] in ascending order)
+        let mut pending_reorg: Option<(u32, Vec<(Header, Vec<u8>)>)> = None;
 
         for (header, raw) in valid_headers {
             // Skip headers already in the chain (duplicates from overlapping peer responses)
@@ -320,7 +323,7 @@ impl ValidationPipeline {
                     );
 
                     if fork_score > best_score && pending_reorg.is_none() {
-                        pending_reorg = Some((fork_height, vec![header], vec![raw]));
+                        pending_reorg = Some((fork_height, vec![(header, raw)]));
                     }
                 }
                 Err(ChainError::ParentNotFound { .. }) => {
@@ -361,9 +364,9 @@ impl ValidationPipeline {
                                 "fork chain surpasses best chain — assembling reorg branch"
                             );
 
-                            match self.assemble_fork_branch(&chain, header_id, &header) {
+                            match self.assemble_fork_branch(&chain, header_id, &header, raw) {
                                 Some((fork_point, branch)) => {
-                                    pending_reorg = Some((fork_point, branch, vec![]));
+                                    pending_reorg = Some((fork_point, branch));
                                 }
                                 None => {
                                     tracing::warn!(
@@ -424,9 +427,13 @@ impl ValidationPipeline {
         }
 
         // Execute pending deep reorg while still holding the chain lock
-        if let Some((fork_point, new_branch, _new_branch_raw)) = pending_reorg {
+        if let Some((fork_point, new_branch_with_raw)) = pending_reorg {
             let old_tip = chain.height();
-            match chain.try_reorg_deep(fork_point, new_branch.clone()) {
+            let headers_only: Vec<Header> = new_branch_with_raw
+                .iter()
+                .map(|(h, _)| h.clone())
+                .collect();
+            match chain.try_reorg_deep(fork_point, headers_only) {
                 Ok(demoted_ids) => {
                     let new_tip = chain.height();
                     tracing::info!(
@@ -436,7 +443,31 @@ impl ValidationPipeline {
                         new_tip,
                         "deep reorg succeeded"
                     );
-                    chained += new_branch.len() as u32;
+                    chained += new_branch_with_raw.len() as u32;
+
+                    // Re-emit the new branch headers via put_batch so BEST_CHAIN
+                    // reflects the new chain at fork_point+1..new_tip. The new
+                    // branch headers are already in PRIMARY + HEADER_FORKS from
+                    // their earlier put_header (fork > 0) writes during fork
+                    // detection, but put_header with fork > 0 only inserts into
+                    // BEST_CHAIN if the slot is empty — so BEST_CHAIN still
+                    // points at the OLD chain in that height range. Without this
+                    // step, any consumer reading best_header_at(h) after a
+                    // reorg (notably the extension_loader used by voting-epoch
+                    // parameter recomputation) would see the demoted chain.
+                    // put_batch's unconditional BEST_CHAIN insert for type 101
+                    // makes the new branch authoritative.
+                    let reorg_entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = new_branch_with_raw
+                        .into_iter()
+                        .map(|(h, raw)| (HEADER_TYPE_ID, h.id.0.0, h.height, raw))
+                        .collect();
+                    let reorg_entry_count = reorg_entries.len();
+                    if let Err(e) = self.store.put_batch(&reorg_entries) {
+                        tracing::error!(
+                            count = reorg_entry_count,
+                            "reorg: put_batch failed to update BEST_CHAIN: {e}"
+                        );
+                    }
 
                     // Notify sync machine — Reorg MUST NOT be dropped.
                     // A missed reorg leaves the validator with a stale state root,
