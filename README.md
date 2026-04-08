@@ -81,7 +81,31 @@ The node is composed of independent submodules, each owning a well-defined bound
 
 The main crate wires components together via traits — the P2P layer doesn't know what validation means, and the validation layer doesn't know about networking. Integration happens at the top.
 
-Transaction validation and ErgoScript evaluation are handled by the existing [sigma-rust](https://github.com/ergoplatform/sigma-rust) ecosystem (`ergo-lib`, `ergotree-interpreter`). Genesis box construction uses `ErgoTreePredef` — emission and foundation scripts ported from the JVM's `sigmastate-interpreter` to sigma-rust ([PR #848](https://github.com/ergoplatform/sigma-rust/pull/848)).
+Transaction validation and ErgoScript evaluation are handled by the existing [sigma-rust](https://github.com/ergoplatform/sigma-rust) ecosystem (`ergo-lib`, `ergotree-interpreter`). UTXO state is backed by [ergo_avltree_rust](https://github.com/ergoplatform/ergo_avltree_rust)'s authenticated AVL+ tree. Both are consumed via forks that carry upstream PRs not yet merged — see **Upstream dependencies and forks** below.
+
+## Upstream dependencies and forks
+
+The node leans on two upstream Rust crates for consensus-critical primitives. Both are consumed via forks ([`mwaddip/sigma-rust`](https://github.com/mwaddip/sigma-rust), [`mwaddip/ergo_avltree_rust`](https://github.com/mwaddip/ergo_avltree_rust)) that carry changes we've contributed back upstream as open PRs. Once those PRs merge and are released, the workspace switches back to crates.io.
+
+### sigma-rust
+
+The workspace `Cargo.toml` pins `ergo-chain-types`, `ergo-lib`, `ergo-nipopow`, and `sigma-ser` to a local `ergo-node-integration` branch that merges the following independent feature branches. Each PR is a standalone branch off `upstream/develop` — the integration branch exists only so the ergo-node-rust workspace can consume all of them at once while review is in flight.
+
+- **[ergoplatform/sigma-rust#848](https://github.com/ergoplatform/sigma-rust/pull/848) — `ErgoTreePredef` port + genesis construction.** Ports the JVM's `ErgoTreePredef` helper and `EmissionRules` to sigma-rust so the Rust node can build genesis boxes from chain parameters (emission contract, foundation script) without hardcoding hex. Also folds in two smaller fixes along the way: `n_bits` type should be `u32`, not `u64` (JVM writes 4 BE bytes), and `pow_distance` should parse as an unsigned `BigUint::from_bytes_be` to match the JVM's `BigIntegers.fromUnsignedByteArray`.
+- **[ergoplatform/sigma-rust#850](https://github.com/ergoplatform/sigma-rust/pull/850) — Soft-fork parameter variants.** Adds three missing `Parameter` enum variants (`SubblocksPerBlock = 9`, `SoftForkVotesCollected = 121`, `SoftForkStartingHeight = 122`) so the Rust node can track the full post-6.0 soft-fork voting state. The original enum carried a `// TODO: soft-fork parameter` comment acknowledging the gap; this PR closes it for the three `i32`-valued slots. `SoftForkDisablingRules = 124` is deliberately out of scope — its variable-length encoded value is incompatible with the existing `HashMap<Parameter, i32>` storage and is tracked separately on the chain crate's `active_disabling_rules: Vec<u8>` field.
+- **[ergoplatform/sigma-rust#851](https://github.com/ergoplatform/sigma-rust/pull/851) — `NipopowAlgos::prove_with_reader`.** Ports JVM `NipopowProverWithDbAlgs.prove` to sigma-rust as a production primitive for NiPoPoW proof serving. The existing `NipopowAlgos::prove(&[PoPowHeader])` is a Rust port of the JVM's **in-memory test helper** (`NipopowAlgos.prove(Seq[PoPowHeader])`) and requires the caller to materialize the full chain as `PoPowHeader`s up front — `O(N)` cost per request, prohibitive for P2P serving on chains of any meaningful length (roughly five minutes of single-threaded work on a 100k-block testnet chain, hours on mainnet). `prove_with_reader` takes a new `PopowHeaderReader` trait as a callback and walks only the interlink hierarchy it actually needs — `O(m + k + m · log₂ N)` fetches, roughly three orders of magnitude fewer on a 270k-block chain. Additive, no breaking changes to the existing `prove`. This is the structural fix for the NiPoPoW build perf issue that was blocking first release.
+
+### ergo_avltree_rust
+
+The `enr-state` crate consumes `ergo_avltree_rust` via the fork pinned to rev `28862a1`.
+
+- **[ergoplatform/ergo_avltree_rust#10](https://github.com/ergoplatform/ergo_avltree_rust/pull/10) — `Resolver` type.** Changes `Resolver` from a bare `fn(&Digest32) -> Node` function pointer to `Arc<dyn Fn(&Digest32) -> Node + Send + Sync>`. The original type makes real disk-backed storage impossible — a bare function pointer cannot capture a database handle, which is why the upstream crate's own test suite only ever exercises an in-memory mock. This PR is a prerequisite for the `enr-state` crate's `RedbAVLStorage` implementation, which provides a closure-based resolver that reads AVL+ nodes from redb on demand.
+
+## Other Rust Ergo implementations
+
+Independent Rust Ergo node efforts we're aware of:
+
+- [arkadianet/ergo](https://github.com/arkadianet/ergo)
 
 ## Building
 
