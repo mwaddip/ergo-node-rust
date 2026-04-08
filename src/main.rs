@@ -790,45 +790,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Shared header chain: pipeline writes, sync reads
     let mut chain = HeaderChain::new(chain_config);
 
-    // Restore chain from stored headers (using best chain index)
-    if let Some((tip_height, _)) = store.best_header_tip()? {
-        let mut loaded = 0u32;
-        for height in 1..=tip_height {
-            let id = match store.best_header_at(height)? {
-                Some(id) => id,
-                None => {
-                    tracing::warn!(height, "gap in best chain, stopping load");
-                    break;
-                }
-            };
-            let data = match store.get(HEADER_TYPE_ID, &id)? {
+    // Restore chain from stored headers by walking backward from the
+    // best-chain tip via parent_id. This is authoritative and resilient
+    // to holes in the best-chain height index: the headers-by-id
+    // (PRIMARY) table is dense, so following parent links from the
+    // recorded tip always reconstructs a contiguous chain if the header
+    // data itself is intact. The height-index approach was observed to
+    // fail on the Apr 7 test server, where a single-height hole at
+    // 219851 truncated the restored chain at 219850, which in turn
+    // made the resume-height scan fail and drop the validator back to
+    // sweep-from-1 against a persistent AVL at height 228737. Root
+    // cause in enr-store's write path is tracked separately; this
+    // loader tolerates the divergence regardless.
+    if let Some((tip_height, tip_id)) = store.best_header_tip()? {
+        let mut stack: Vec<enr_chain::Header> = Vec::with_capacity(tip_height as usize);
+        let mut current_id: [u8; 32] = tip_id;
+        let walk_ok = loop {
+            let data = match store.get(HEADER_TYPE_ID, &current_id)? {
                 Some(d) => d,
                 None => {
-                    tracing::warn!(height, "stored header ID but no data, stopping load");
-                    break;
+                    tracing::error!(
+                        walked = stack.len(),
+                        missing_id = ?current_id,
+                        "backward chain walk: header data not found in store"
+                    );
+                    break false;
                 }
             };
             let header = match enr_chain::parse_header(&data) {
                 Ok(h) => h,
                 Err(e) => {
-                    tracing::error!(height, "stored header parse failed: {e}, stopping load");
-                    break;
+                    tracing::error!(
+                        walked = stack.len(),
+                        "backward chain walk: header parse failed: {e}"
+                    );
+                    break false;
                 }
             };
+            let parent_id: [u8; 32] = header.parent_id.0.0;
+            let is_genesis = header.height == 1;
+            stack.push(header);
+            if is_genesis {
+                break true;
+            }
+            current_id = parent_id;
+        };
+
+        // Even on walk failure, replay whatever prefix we successfully
+        // collected — the tail is authoritative from the tip so a
+        // partial walk always yields a valid prefix.
+        stack.reverse();
+        let mut loaded = 0u32;
+        for header in stack {
+            let h = header.height;
             match chain.try_append(header) {
-                Ok(enr_chain::AppendResult::Extended) => {}
+                Ok(enr_chain::AppendResult::Extended) => loaded += 1,
                 Ok(enr_chain::AppendResult::Forked { .. }) => {
-                    tracing::error!(height, "stored best-chain header detected as fork — store corrupted?");
+                    tracing::error!(height = h, "restored header detected as fork — store corrupted?");
                     break;
                 }
                 Err(e) => {
-                    tracing::error!(height, "stored header chain failed: {e}, stopping load");
+                    tracing::error!(height = h, "restored header append failed: {e}");
                     break;
                 }
             }
-            loaded += 1;
         }
-        tracing::info!(loaded, tip = chain.height(), "restored header chain from store");
+        tracing::info!(
+            loaded,
+            tip = chain.height(),
+            declared_tip = tip_height,
+            walk_ok,
+            "restored header chain from store"
+        );
     }
 
     // Wire the extension loader so chain can read epoch-boundary extensions
