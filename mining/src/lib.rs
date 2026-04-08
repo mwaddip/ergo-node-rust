@@ -74,13 +74,12 @@ pub fn generate_candidate(
     };
 
     // 1. Build emission transaction
-    let reemission_rules = emission::ReemissionRules::mainnet();
     let emission_tx = emission::build_emission_tx(
         emission_box,
         height,
         &config.miner_pk,
         config.reward_delay,
-        &reemission_rules,
+        &config.reemission_rules,
     )?;
 
     // 2. Transaction list: [emission_tx] (no mempool txs yet, no fee tx)

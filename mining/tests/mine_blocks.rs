@@ -166,6 +166,7 @@ fn generate_candidate_and_mine_block() {
         reward_delay: 720,
         votes: [0, 0, 0],
         candidate_ttl: Duration::from_secs(15),
+        reemission_rules: ReemissionRules::mainnet(),
     };
 
     let parent = genesis_header();
@@ -229,6 +230,7 @@ fn mine_three_consecutive_blocks() {
         reward_delay: 720,
         votes: [0, 0, 0],
         candidate_ttl: Duration::from_secs(15),
+        reemission_rules: ReemissionRules::mainnet(),
     };
 
     let mock_proofs =

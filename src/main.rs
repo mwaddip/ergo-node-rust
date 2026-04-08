@@ -79,6 +79,19 @@ fn build_genesis_boxes(network: enr_p2p::types::Network) -> Vec<([u8; 32], Vec<u
         .collect()
 }
 
+/// Pick the EIP-27 `ReemissionRules` for the active network. Mainnet uses
+/// activation height 777,217 (live since April 2023). Testnet uses
+/// 100,000,001 — effectively never, since testnet EIP-27 is deferred
+/// indefinitely. Sourced from JVM `mainnet.conf` / `testnet.conf`.
+fn reemission_rules_for(
+    network: enr_p2p::types::Network,
+) -> ergo_mining::emission::ReemissionRules {
+    match network {
+        enr_p2p::types::Network::Mainnet => ergo_mining::emission::ReemissionRules::mainnet(),
+        enr_p2p::types::Network::Testnet => ergo_mining::emission::ReemissionRules::testnet(),
+    }
+}
+
 /// Pre-computed state proofs for mining candidate generation.
 /// Written by the validator after each block, read by the mining task.
 #[derive(Clone)]
@@ -167,13 +180,12 @@ impl Validator {
             }
         };
 
-        let reemission = ergo_mining::emission::ReemissionRules::mainnet();
         let emission_tx = match ergo_mining::emission::build_emission_tx(
             &emission_box,
             next_height,
             &mining.config.miner_pk,
             mining.config.reward_delay,
-            &reemission,
+            &mining.config.reemission_rules,
         ) {
             Ok(tx) => tx,
             Err(e) => {
@@ -1113,6 +1125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             reward_delay: node_config.mining.reward_delay,
                             votes: miner_votes,
                             candidate_ttl: std::time::Duration::from_secs(node_config.mining.candidate_ttl_secs),
+                            reemission_rules: reemission_rules_for(network),
                         },
                         proof_cache: mining_proof_cache.clone(),
                         snapshot_reader: Arc::new(sr.clone()),
@@ -1162,6 +1175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             reward_delay: node_config.mining.reward_delay,
                             votes: miner_votes,
                             candidate_ttl: std::time::Duration::from_secs(node_config.mining.candidate_ttl_secs),
+                            reemission_rules: reemission_rules_for(network),
                         },
                         proof_cache: mining_proof_cache.clone(),
                         snapshot_reader: Arc::new(sr.clone()),
@@ -1647,6 +1661,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             reward_delay: node_config.mining.reward_delay,
                             votes: miner_votes,
                             candidate_ttl: std::time::Duration::from_secs(node_config.mining.candidate_ttl_secs),
+                            reemission_rules: reemission_rules_for(network),
                         },
                     ));
 

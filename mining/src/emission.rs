@@ -23,6 +23,7 @@ const COINS_IN_ONE_ERG: i64 = 1_000_000_000;
 /// the current height (NOT the miner reward — the total including foundation).
 ///
 /// Reference: JVM `ReemissionRules.reemissionForHeight()`.
+#[derive(Clone, Copy)]
 pub struct ReemissionRules {
     /// Height at which re-emission activates (mainnet: 777_217).
     pub activation_height: u32,
@@ -31,10 +32,23 @@ pub struct ReemissionRules {
 }
 
 impl ReemissionRules {
-    /// Mainnet EIP-27 parameters.
+    /// Mainnet EIP-27 parameters. Sourced from JVM `mainnet.conf` — activation
+    /// height 777,217 (EIP-27 went live on mainnet around April 2023).
     pub fn mainnet() -> Self {
         Self {
             activation_height: 777_217,
+            basic_charge_amount: 12,
+        }
+    }
+
+    /// Testnet EIP-27 parameters. Sourced from JVM `testnet.conf` — activation
+    /// height 100,000,001, which is effectively "never" — testnet EIP-27 is
+    /// deferred indefinitely. This means `reemission_for_height` returns 0 for
+    /// every realistic testnet height. The constructor exists so the mining
+    /// path can be network-aware without `main.rs` lying about the rules.
+    pub fn testnet() -> Self {
+        Self {
+            activation_height: 100_000_001,
             basic_charge_amount: 12,
         }
     }
@@ -192,6 +206,29 @@ pub fn build_emission_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn testnet_activation_height_matches_jvm() {
+        // JVM testnet.conf line 65: activationHeight = 100000001.
+        // Effectively "never" on testnet.
+        let rules = ReemissionRules::testnet();
+        assert_eq!(rules.activation_height, 100_000_001);
+        assert_eq!(rules.basic_charge_amount, 12);
+    }
+
+    #[test]
+    fn testnet_returns_zero_for_realistic_heights() {
+        let rules = ReemissionRules::testnet();
+        // Any testnet height we'll see in practice is below 100M.
+        assert_eq!(rules.reemission_for_height(1, 67_500_000_000), 0);
+        assert_eq!(rules.reemission_for_height(1_000_000, 67_500_000_000), 0);
+        assert_eq!(rules.reemission_for_height(99_999_999, 67_500_000_000), 0);
+        // And one past activation, just to confirm the constructor wires up.
+        assert_eq!(
+            rules.reemission_for_height(100_000_001, 67_500_000_000),
+            12_000_000_000
+        );
+    }
 
     #[test]
     fn no_reemission_before_activation() {

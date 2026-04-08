@@ -5,6 +5,8 @@ use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
 use serde::Serialize;
 
+use crate::emission::ReemissionRules;
+
 /// Miner configuration loaded from node config.
 pub struct MinerConfig {
     /// Miner's public key (required for mining).
@@ -15,6 +17,11 @@ pub struct MinerConfig {
     pub votes: [u8; 3],
     /// Maximum candidate lifetime before forced regeneration.
     pub candidate_ttl: Duration,
+    /// EIP-27 re-emission rules. Carried in config rather than derived
+    /// inside `generate_candidate` so the network-policy decision lives
+    /// at the configuration boundary, not inside the assembly path.
+    /// Construct from the chain's network type at config-load time.
+    pub reemission_rules: ReemissionRules,
 }
 
 /// Extension section key-value pairs for a new block.
