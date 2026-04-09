@@ -332,4 +332,112 @@ mod tests {
             _ => panic!("expected InvalidProofLength"),
         }
     }
+
+    // --- Adversarial wire-data tests ---
+
+    #[test]
+    fn parse_nipopow_proof_truncated_body() {
+        // VLQ claims 100 bytes of proof, but body only has 5 bytes total.
+        let mut body = Vec::new();
+        body.put_u32(100).unwrap(); // proof_len = 100
+        body.push(0xde); // 1 byte of "proof" — far short of 100
+        let err = parse_nipopow_proof(&body).unwrap_err();
+        assert!(matches!(err, NipopowError::Truncated));
+    }
+
+    #[test]
+    fn parse_nipopow_proof_missing_pad_length() {
+        // Valid proof bytes, but no pad_length footer.
+        let proof = vec![0xde, 0xad];
+        let mut body = Vec::new();
+        body.put_u32(proof.len() as u32).unwrap();
+        body.extend_from_slice(&proof);
+        // No pad_length — cursor exhausted.
+        let err = parse_nipopow_proof(&body).unwrap_err();
+        assert!(matches!(err, NipopowError::Vlq(_)));
+    }
+
+    #[test]
+    fn parse_nipopow_proof_empty_body() {
+        let err = parse_nipopow_proof(&[]).unwrap_err();
+        // Empty body can't even read the VLQ proof_len.
+        assert!(matches!(err, NipopowError::Vlq(_)));
+    }
+
+    #[test]
+    fn parse_nipopow_proof_random_garbage_no_panic() {
+        // 50 random-looking bytes — must not panic. May parse "successfully"
+        // if the bytes happen to form valid VLQ — that's fine, the verifier
+        // will reject the inner bytes later.
+        let garbage: Vec<u8> = (0..50).map(|i| (i * 37 + 13) as u8).collect();
+        let _ = parse_nipopow_proof(&garbage);
+    }
+
+    #[test]
+    fn verify_nipopow_garbage_inner_bytes_returns_error() {
+        // Wrap garbage bytes in a valid envelope, pass through the full
+        // parse_nipopow_proof + verify pipeline.
+        let garbage_inner = vec![0xff; 100];
+        let envelope = serialize_nipopow_proof(&garbage_inner);
+        let inner = parse_nipopow_proof(&envelope).unwrap();
+        assert_eq!(inner, garbage_inner);
+        // Now verify — scorex_parse_bytes should fail, not panic.
+        let result = enr_chain::verify_nipopow_proof_bytes(&inner);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_nipopow_empty_inner_bytes_returns_error() {
+        let result = enr_chain::verify_nipopow_proof_bytes(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[ignore] // SIGABRT — sigma-rust allocates Vec::with_capacity(huge) before reading.
+              // Tracked: fix in sigma-rust scorex_parse to cap counts against cursor length.
+    fn verify_nipopow_crafted_huge_prefix_count() {
+        // Craft inner bytes that claim num_prefixes = 0x7FFFFFFF.
+        // sigma-rust's NipopowProof::scorex_parse does Vec::with_capacity(num)
+        // before any reads — a 20-byte payload triggers a 790GB allocation.
+        let mut inner = Vec::new();
+        inner.put_u32(6).unwrap(); // m
+        inner.put_u32(10).unwrap(); // k
+        inner.put_u32(0x7FFF_FFFF).unwrap(); // num_prefixes = 2 billion
+        // No actual prefix data follows.
+
+        let result = enr_chain::verify_nipopow_proof_bytes(&inner);
+        // After sigma-rust fix: should fail parsing, not OOM.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_nipopow_crafted_huge_suffix_tail_count() {
+        // Valid m, k, zero prefixes, then suffix_head placeholder, then
+        // huge suffix_tail count. This doesn't actually reach the suffix
+        // count because suffix_head parsing fails first.
+        let mut inner = Vec::new();
+        inner.put_u32(6).unwrap(); // m
+        inner.put_u32(10).unwrap(); // k
+        inner.put_u32(0).unwrap(); // num_prefixes = 0
+        // suffix_head_size + minimal header placeholder
+        inner.put_u32(1).unwrap(); // suffix_head_size
+        inner.push(0x00); // bogus header byte (will fail parse)
+
+        let result = enr_chain::verify_nipopow_proof_bytes(&inner);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_get_nipopow_proof_garbage_returns_error() {
+        let garbage: Vec<u8> = (0..20).map(|i| (i * 53 + 7) as u8).collect();
+        // Should either parse (if the bytes happen to decode as valid VLQ)
+        // or return an error. Must not panic.
+        let _ = parse_get_nipopow_proof(&garbage);
+    }
+
+    #[test]
+    fn parse_get_nipopow_proof_empty_returns_error() {
+        let err = parse_get_nipopow_proof(&[]).unwrap_err();
+        assert!(matches!(err, NipopowError::Vlq(_)));
+    }
 }
