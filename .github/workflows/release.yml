@@ -1,0 +1,55 @@
+name: release
+
+# Build a release on every pushed tag matching `v*`. Produces a stripped
+# release binary, packages it as a Debian package and a portable tar.gz,
+# and attaches both to a GitHub Release for the tag.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # required for creating the release + uploading assets
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build .deb package
+        run: ./build-deb
+
+      - name: Build .tar.gz bundle
+        run: ./build-tar
+
+      - name: Collect artifact paths
+        id: artifacts
+        run: |
+          set -euo pipefail
+          deb=$(ls target/ergo-node-rust_*.deb | head -1)
+          tar=$(ls target/ergo-node-rust-*.tar.gz | head -1)
+          echo "deb=${deb}" >> "$GITHUB_OUTPUT"
+          echo "tar=${tar}" >> "$GITHUB_OUTPUT"
+          ls -lh "${deb}" "${tar}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.artifacts.outputs.deb }}
+            ${{ steps.artifacts.outputs.tar }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

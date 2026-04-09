@@ -1,0 +1,81 @@
+#!/bin/bash
+set -euo pipefail
+
+VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
+case "${ARCH}" in
+    amd64|x86_64)  TARGET_ARCH="amd64"  ;;
+    arm64|aarch64) TARGET_ARCH="arm64"  ;;
+    *)             TARGET_ARCH="${ARCH}" ;;
+esac
+PKG="ergo-node-rust-${VERSION}-linux-${TARGET_ARCH}"
+
+echo "Building ${PKG}.tar.gz..."
+
+cargo build --release
+
+rm -rf "target/${PKG}"
+mkdir -p "target/${PKG}"
+
+cp target/release/ergo-node-rust "target/${PKG}/ergo-node-rust"
+strip "target/${PKG}/ergo-node-rust"
+
+cp ergo.toml "target/${PKG}/ergo.toml"
+cp deploy/ergo-node-rust.service "target/${PKG}/ergo-node-rust.service"
+cp README.md "target/${PKG}/README.md"
+
+cat > "target/${PKG}/INSTALL.md" <<'EOF'
+# ergo-node-rust — manual install
+
+This bundle is a portable build of `ergo-node-rust` for Linux. It is
+suitable for running directly from any directory or for installing
+system-wide via the bundled systemd unit.
+
+## Run in place
+
+```sh
+./ergo-node-rust ergo.toml
+```
+
+The binary takes a config file path as its only argument. Edit
+`ergo.toml` to change network, listen address, peers, data
+directory, etc. Defaults target Ergo testnet.
+
+## System install (systemd)
+
+```sh
+sudo install -m 755 ergo-node-rust /usr/bin/ergo-node-rust
+sudo install -d /etc/ergo-node /var/lib/ergo-node /var/log/ergo-node
+sudo install -m 644 ergo.toml /etc/ergo-node/ergo.toml
+sudo install -m 644 ergo-node-rust.service /usr/lib/systemd/system/ergo-node-rust.service
+
+# Create the runtime user (skip if it already exists)
+sudo adduser --system --group --no-create-home --home /var/lib/ergo-node ergo-node || true
+sudo chown -R ergo-node:ergo-node /var/lib/ergo-node /var/log/ergo-node
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now ergo-node-rust
+sudo journalctl -u ergo-node-rust -f
+```
+
+The bundled systemd unit logs stdout/stderr to
+`/var/log/ergo-node/ergo-node.log` and runs as user `ergo-node`. See
+the unit file for the full sandboxing settings.
+
+## See also
+
+The `.deb` package built from the same source automates this install
+flow. If you prefer a packaged install, grab the matching
+`ergo-node-rust_<version>_<arch>.deb` from the same release.
+
+For project documentation, see `README.md` in this bundle or the
+repository at <https://github.com/mwaddip/ergo-node-rust>.
+EOF
+
+tar -czf "target/${PKG}.tar.gz" -C target "${PKG}"
+
+rm -rf "target/${PKG}"
+
+echo ""
+echo "Built: target/${PKG}.tar.gz"
+ls -lh "target/${PKG}.tar.gz"
