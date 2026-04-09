@@ -37,6 +37,21 @@ const TESTNET_FOUNDERS_PKS: &[&str] = &[
     "0352ac2a471339b0d23b3d2c5ce0db0e81c969f77891b9edf0bda7fd39a78184e7",
 ];
 
+/// Interval between snapshot creation checks.
+const SNAPSHOT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Interval between mempool cleanup passes.
+const MEMPOOL_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Mining task poll interval for new tip heights.
+const MINING_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// Grace period before shutdown to let in-flight work finish.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Genesis UTXO state root digest (hex, 33 bytes with tree height suffix).
+const TESTNET_GENESIS_DIGEST: &str =
+    "cb63aa99a3060f341781d8662b58bf18b9ad258db4fe88d09f8f71cb668cad4502";
+const MAINNET_GENESIS_DIGEST: &str =
+    "a5df145d41ab15a01e0cd3ffbab046f0d029e5412293072ad0f5827428589b9302";
+
 /// Construct the 3 genesis UTXO boxes from chain parameters.
 ///
 /// Returns (box_id, sigma_serialized_bytes) for each box.
@@ -111,6 +126,21 @@ struct MiningCtx {
     config: ergo_mining::MinerConfig,
     proof_cache: MiningProofCache,
     snapshot_reader: Arc<SnapshotReader>,
+}
+
+fn build_miner_config(
+    pk: &ProveDlog,
+    mining_cfg: &MiningConfig,
+    votes: [u8; 3],
+    network: enr_p2p::types::Network,
+) -> ergo_mining::MinerConfig {
+    ergo_mining::MinerConfig {
+        miner_pk: pk.clone(),
+        reward_delay: mining_cfg.reward_delay,
+        votes,
+        candidate_ttl: std::time::Duration::from_secs(mining_cfg.candidate_ttl_secs),
+        reemission_rules: reemission_rules_for(network),
+    }
 }
 
 /// Dispatches to either DigestValidator or UtxoValidator based on config.
@@ -203,7 +233,7 @@ impl Validator {
             None => return, // digest mode
         };
 
-        let mut guard = mining.proof_cache.lock().unwrap();
+        let mut guard = mining.proof_cache.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(MiningProofData {
             parent: header.clone(),
             emission_box,
@@ -494,18 +524,10 @@ impl ergo_api::ChainAccess for HeaderChainAdapter {
         self.with_chain(|c| c.header_at(height).cloned())
     }
     fn header_by_id(&self, id: &[u8; 32]) -> Option<ergo_chain_types::Header> {
+        let block_id = ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(*id));
         self.with_chain(|c| {
-            // Linear scan — headers are indexed by height, not by ID.
-            // For the API this is acceptable; optimize later if needed.
-            for h in (0..=c.height()).rev() {
-                if let Some(header) = c.header_at(h) {
-                    let header_id: &[u8] = header.id.0.as_ref();
-                    if header_id == id {
-                        return Some(header.clone());
-                    }
-                }
-            }
-            None
+            let height = c.height_of(&block_id)?;
+            c.header_at(height).cloned()
         })
     }
     fn tip(&self) -> ergo_chain_types::Header {
@@ -783,9 +805,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let miner_votes: [u8; 3] = {
-        let v = hex::decode(&node_config.mining.votes)
-            .unwrap_or_else(|_| vec![0, 0, 0]);
-        [v.get(0).copied().unwrap_or(0), v.get(1).copied().unwrap_or(0), v.get(2).copied().unwrap_or(0)]
+        if node_config.mining.votes.is_empty() || node_config.mining.votes == "000000" {
+            [0, 0, 0]
+        } else {
+            let v = hex::decode(&node_config.mining.votes)
+                .map_err(|e| format!("invalid mining votes hex '{}': {e}", node_config.mining.votes))?;
+            if v.len() != 3 {
+                return Err(format!("mining votes must be exactly 3 bytes, got {}", v.len()).into());
+            }
+            [v[0], v[1], v[2]]
+        }
     };
 
     // Mining proof cache — shared between the validator callback and the mining task
@@ -1061,10 +1090,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Genesis state root — needed for fresh start or revalidation
     let genesis_digest_hex = match network {
-        enr_p2p::types::Network::Testnet =>
-            "cb63aa99a3060f341781d8662b58bf18b9ad258db4fe88d09f8f71cb668cad4502",
-        enr_p2p::types::Network::Mainnet =>
-            "a5df145d41ab15a01e0cd3ffbab046f0d029e5412293072ad0f5827428589b9302",
+        enr_p2p::types::Network::Testnet => TESTNET_GENESIS_DIGEST,
+        enr_p2p::types::Network::Mainnet => MAINNET_GENESIS_DIGEST,
     };
     let genesis_bytes = hex::decode(genesis_digest_hex).expect("invalid genesis digest hex");
     let genesis_digest = ADDigest::try_from(genesis_bytes.as_slice())
@@ -1135,13 +1162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 shared_validated_height.store(height, std::sync::atomic::Ordering::Relaxed);
                 let mining_ctx = miner_pk_opt.as_ref().and_then(|pk| {
                     snapshot_reader.as_ref().map(|sr| MiningCtx {
-                        config: ergo_mining::MinerConfig {
-                            miner_pk: pk.clone(),
-                            reward_delay: node_config.mining.reward_delay,
-                            votes: miner_votes,
-                            candidate_ttl: std::time::Duration::from_secs(node_config.mining.candidate_ttl_secs),
-                            reemission_rules: reemission_rules_for(network),
-                        },
+                        config: build_miner_config(pk, &node_config.mining, miner_votes, network),
                         proof_cache: mining_proof_cache.clone(),
                         snapshot_reader: Arc::new(sr.clone()),
                     })
@@ -1185,13 +1206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!(checkpoint, "block validator starting from genesis (UTXO mode)");
                 let mining_ctx = miner_pk_opt.as_ref().and_then(|pk| {
                     snapshot_reader.as_ref().map(|sr| MiningCtx {
-                        config: ergo_mining::MinerConfig {
-                            miner_pk: pk.clone(),
-                            reward_delay: node_config.mining.reward_delay,
-                            votes: miner_votes,
-                            candidate_ttl: std::time::Duration::from_secs(node_config.mining.candidate_ttl_secs),
-                            reemission_rules: reemission_rules_for(network),
-                        },
+                        config: build_miner_config(pk, &node_config.mining, miner_votes, network),
                         proof_cache: mining_proof_cache.clone(),
                         snapshot_reader: Arc::new(sr.clone()),
                     })
@@ -1414,7 +1429,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::spawn(async move {
                 let mut last_snapshot_boundary = 0u32;
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    tokio::time::sleep(SNAPSHOT_CHECK_INTERVAL).await;
 
                     // Use the actual validated height, not the chain (header) height.
                     // The validator updates this atomic after each successful block.
@@ -1504,7 +1519,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state_context = shared_state_context.clone();
         let p2p_for_mempool = p2p.clone();
         let mut block_applied_rx = block_applied_rx;
-        let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut cleanup_interval = tokio::time::interval(MEMPOOL_CLEANUP_INTERVAL);
         cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         tokio::spawn(async move {
@@ -1682,13 +1697,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(ref pk) = miner_pk_opt {
                 if state_type == StateType::Utxo {
                     let generator = Arc::new(ergo_mining::CandidateGenerator::new(
-                        ergo_mining::MinerConfig {
-                            miner_pk: pk.clone(),
-                            reward_delay: node_config.mining.reward_delay,
-                            votes: miner_votes,
-                            candidate_ttl: std::time::Duration::from_secs(node_config.mining.candidate_ttl_secs),
-                            reemission_rules: reemission_rules_for(network),
-                        },
+                        build_miner_config(pk, &node_config.mining, miner_votes, network),
                     ));
 
                     // Mining task: watches shared_height for tip changes, builds candidates
@@ -1700,7 +1709,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tokio::spawn(async move {
                         let mut last_height = 0u32;
                         loop {
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            tokio::time::sleep(MINING_POLL_INTERVAL).await;
                             let current = mining_height.load(std::sync::atomic::Ordering::Relaxed);
                             if current == last_height || current == 0 {
                                 continue;
@@ -1709,7 +1718,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             // Read pre-computed proofs from the validator callback
                             let proof_data = {
-                                let guard = proof_cache.lock().unwrap();
+                                let guard = proof_cache.lock().unwrap_or_else(|e| e.into_inner());
                                 guard.clone()
                             };
 
@@ -1883,7 +1892,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // with the P2P node). The sync task exits when its event stream ends.
     drop(p2p);
     // Brief grace period for tasks to finish in-flight work
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(SHUTDOWN_GRACE).await;
 
     Ok(())
 }
@@ -1933,7 +1942,7 @@ mod tests {
         }
 
         let digest = prover.digest().expect("prover has no digest");
-        let expected_hex = "cb63aa99a3060f341781d8662b58bf18b9ad258db4fe88d09f8f71cb668cad4502";
+        let expected_hex = TESTNET_GENESIS_DIGEST;
         assert_eq!(
             hex::encode(&digest),
             expected_hex,

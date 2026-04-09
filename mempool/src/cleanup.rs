@@ -73,7 +73,12 @@ impl super::Mempool {
                     // which isn't worth the complexity for the BTreeMap key dance.
                     // The cleanup_interval check prevents re-checking too often.
                 }
-                Err(_) => {
+                Err(e) => {
+                    tracing::info!(
+                        tx_id = %hex::encode(tx_id),
+                        reason = %e,
+                        "revalidation: evicting invalid tx"
+                    );
                     self.invalidated.insert(tx_id);
                     self.pool.remove(&tx_id);
                     removed.push(tx_id);

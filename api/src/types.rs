@@ -43,19 +43,3 @@ pub struct FeeResponse {
     pub fee: u64,
 }
 
-/// Wait time estimation response.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WaitTimeResponse {
-    pub wait_time: u64,
-}
-
-/// Peer info response.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PeerInfo {
-    pub address: String,
-    pub name: Option<String>,
-    pub last_seen: Option<u64>,
-    pub connection_type: Option<String>,
-}

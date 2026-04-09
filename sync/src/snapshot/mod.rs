@@ -91,9 +91,12 @@ async fn discover_snapshot<T: SyncTransport, C: SyncChain>(
 
     let (code, body) = SnapshotMessage::GetSnapshotsInfo.encode();
     for &peer in &peers {
-        let _ = transport
+        if let Err(e) = transport
             .send_to(peer, ProtocolMessage::Unknown { code, body: body.clone() })
-            .await;
+            .await
+        {
+            tracing::warn!(%peer, "failed to send GetSnapshotsInfo: {e}");
+        }
     }
 
     // manifest_id → (height, announcing_peers)
@@ -163,9 +166,12 @@ async fn download_manifest<T: SyncTransport>(
     let (code, body) = SnapshotMessage::GetManifest(snapshot.manifest_id).encode();
 
     for &peer in &snapshot.peers {
-        let _ = transport
+        if let Err(e) = transport
             .send_to(peer, ProtocolMessage::Unknown { code, body: body.clone() })
-            .await;
+            .await
+        {
+            tracing::warn!(%peer, "failed to send GetManifest: {e}");
+        }
 
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -232,11 +238,19 @@ async fn download_chunks<T: SyncTransport>(
 
             let batch_size = CHUNKS_PER_PEER.min(pending.len());
             for _ in 0..batch_size {
-                let id = pending.pop().unwrap();
+                let id = match pending.pop() {
+                    Some(id) => id,
+                    None => break,
+                };
                 let (code, body) = SnapshotMessage::GetUtxoSnapshotChunk(id).encode();
-                let _ = transport
+                if let Err(e) = transport
                     .send_to(peer, ProtocolMessage::Unknown { code, body })
-                    .await;
+                    .await
+                {
+                    tracing::warn!(%peer, "failed to send GetUtxoSnapshotChunk: {e}");
+                    pending.push(id); // put it back
+                    break;
+                }
                 in_flight.insert(id, Instant::now());
             }
         }

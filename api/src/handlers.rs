@@ -18,6 +18,12 @@ fn err<T>(status: StatusCode, reason: impl Into<String>) -> ApiResult<T> {
     Err((status, Json(ApiError { error: status.as_u16(), reason: reason.into(), detail: None })))
 }
 
+fn mining_err() -> (StatusCode, Json<ApiError>) {
+    (StatusCode::SERVICE_UNAVAILABLE, Json(ApiError {
+        error: 503, reason: "mining not configured".into(), detail: None,
+    }))
+}
+
 fn hex_to_id(hex_str: &str) -> Result<[u8; 32], (StatusCode, Json<ApiError>)> {
     let bytes = hex::decode(hex_str).map_err(|_| {
         (StatusCode::BAD_REQUEST, Json(ApiError { error: 400, reason: "invalid hex ID".into(), detail: None }))
@@ -192,7 +198,11 @@ async fn process_transaction(
         // Check-only: validate inputs exist and scripts pass, but don't add to pool.
         let mut input_boxes = Vec::with_capacity(tx.inputs.len());
         for input in tx.inputs.iter() {
-            let box_id_bytes: [u8; 32] = input.box_id.as_ref().try_into().unwrap();
+            let box_id_bytes: [u8; 32] = input.box_id.as_ref().try_into().map_err(|_| {
+                (StatusCode::BAD_REQUEST, Json(ApiError {
+                    error: 400, reason: "input box_id must be 32 bytes".into(), detail: None,
+                }))
+            })?;
             match state.utxo_reader.box_by_id(&box_id_bytes) {
                 Some(b) => input_boxes.push(b),
                 None => return err(
@@ -204,7 +214,11 @@ async fn process_transaction(
         let mut data_boxes = Vec::new();
         if let Some(ref data_inputs) = tx.data_inputs {
             for di in data_inputs.iter() {
-                let box_id_bytes: [u8; 32] = di.box_id.as_ref().try_into().unwrap();
+                let box_id_bytes: [u8; 32] = di.box_id.as_ref().try_into().map_err(|_| {
+                    (StatusCode::BAD_REQUEST, Json(ApiError {
+                        error: 400, reason: "data-input box_id must be 32 bytes".into(), detail: None,
+                    }))
+                })?;
                 match state.utxo_reader.box_by_id(&box_id_bytes) {
                     Some(b) => data_boxes.push(b),
                     None => return err(
@@ -281,11 +295,12 @@ pub async fn get_unconfirmed(
     Query(params): Query<PaginationParams>,
 ) -> Json<Vec<serde_json::Value>> {
     let limit = params.limit.min(100);
+    let offset = params.offset.min(100_000);
     let pool = state.mempool.lock().await;
     let txs: Vec<_> = pool
         .all_prioritized()
         .into_iter()
-        .skip(params.offset)
+        .skip(offset)
         .take(limit)
         .filter_map(|utx| serde_json::to_value(&utx.tx).ok())
         .collect();
@@ -313,7 +328,10 @@ pub async fn get_unconfirmed_by_id(
     let id = hex_to_id(&tx_id)?;
     let pool = state.mempool.lock().await;
     match pool.get(&id) {
-        Some(utx) => Ok(Json(serde_json::to_value(&utx.tx).unwrap())),
+        Some(utx) => match serde_json::to_value(&utx.tx) {
+            Ok(v) => Ok(Json(v)),
+            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("serialization failed: {e}")),
+        },
         None => err(StatusCode::NOT_FOUND, "transaction not in mempool"),
     }
 }
@@ -342,8 +360,10 @@ pub async fn get_recommended_fee(
     let pool = state.mempool.lock().await;
     // Convert wait_time from blocks to approximate milliseconds
     // (Ergo target block time ~2 minutes = 120_000ms)
-    let wait_ms = params.wait_time * 120_000;
-    match pool.recommended_fee(wait_ms, params.tx_size) {
+    let wait_time = params.wait_time.min(100);
+    let tx_size = params.tx_size.min(1_000_000);
+    let wait_ms = wait_time.saturating_mul(120_000);
+    match pool.recommended_fee(wait_ms, tx_size) {
         Some(fee) => Ok(Json(FeeResponse { fee })),
         None => err(StatusCode::BAD_REQUEST, "insufficient fee history"),
     }
@@ -422,8 +442,16 @@ pub async fn get_connected_peers(State(state): State<ApiState>) -> Json<serde_js
 // GET /emission/at/{height}
 // ---------------------------------------------------------------------------
 
-pub async fn get_emission_at(Path(height): Path<u32>) -> Json<EmissionInfo> {
+/// Ergo emission ends around height 2,080,800. Cap to prevent DoS via
+/// unbounded iteration (the loop is O(height)).
+const MAX_EMISSION_HEIGHT: u32 = 2_100_000;
+
+pub async fn get_emission_at(Path(height): Path<u32>) -> ApiResult<EmissionInfo> {
     use ergo_lib::chain::emission::{EmissionRules, MonetarySettings};
+
+    if height > MAX_EMISSION_HEIGHT {
+        return err(StatusCode::BAD_REQUEST, format!("height exceeds max ({MAX_EMISSION_HEIGHT})"));
+    }
 
     let settings = MonetarySettings::default();
     let rules = EmissionRules::new(settings);
@@ -436,11 +464,11 @@ pub async fn get_emission_at(Path(height): Path<u32>) -> Json<EmissionInfo> {
     }
     let total_supply = rules.coins_total();
 
-    Json(EmissionInfo {
+    Ok(Json(EmissionInfo {
         miner_reward: reward.max(0) as u64,
         total_coins_issued: total_issued.max(0) as u64,
         total_remain_coins: (total_supply - total_issued).max(0) as u64,
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -450,13 +478,7 @@ pub async fn get_emission_at(Path(height): Path<u32>) -> Json<EmissionInfo> {
 pub async fn get_mining_candidate(
     State(state): State<ApiState>,
 ) -> ApiResult<ergo_mining::WorkMessage> {
-    let mining = state.mining.as_ref().ok_or_else(|| {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(ApiError {
-            error: 503,
-            reason: "mining not configured".into(),
-            detail: None,
-        }))
-    })?;
+    let mining = state.mining.as_ref().ok_or_else(mining_err)?;
 
     let tip_height = state.chain.height();
     match mining.cached_work(tip_height) {
@@ -472,13 +494,7 @@ pub async fn get_mining_candidate(
 pub async fn get_mining_reward_address(
     State(state): State<ApiState>,
 ) -> ApiResult<serde_json::Value> {
-    let mining = state.mining.as_ref().ok_or_else(|| {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(ApiError {
-            error: 503,
-            reason: "mining not configured".into(),
-            detail: None,
-        }))
-    })?;
+    let mining = state.mining.as_ref().ok_or_else(mining_err)?;
 
     // Derive P2S address from miner PK
     let pk_hex: String = (*mining.config.miner_pk.h).clone().into();
@@ -503,13 +519,7 @@ pub async fn post_mining_solution(
     State(state): State<ApiState>,
     Json(submission): Json<SolutionSubmission>,
 ) -> ApiResult<serde_json::Value> {
-    let mining = state.mining.as_ref().ok_or_else(|| {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(ApiError {
-            error: 503,
-            reason: "mining not configured".into(),
-            detail: None,
-        }))
-    })?;
+    let mining = state.mining.as_ref().ok_or_else(mining_err)?;
 
     // Parse nonce
     let nonce = hex::decode(&submission.n).map_err(|_| {

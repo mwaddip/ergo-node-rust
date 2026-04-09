@@ -87,7 +87,15 @@ impl super::Mempool {
             }
         }
 
-        // 4. Resolve input boxes
+        // 4. Bound input count to prevent expensive lookups
+        const MAX_TX_INPUTS: usize = 5_000;
+        if tx.inputs.len() > MAX_TX_INPUTS {
+            return ProcessingOutcome::Declined {
+                reason: format!("too many inputs: {} (max {MAX_TX_INPUTS})", tx.inputs.len()),
+            };
+        }
+
+        // 5. Resolve input boxes
         let input_ids = input_box_ids(&tx);
         let mut input_boxes = Vec::with_capacity(input_ids.len());
         for id in &input_ids {

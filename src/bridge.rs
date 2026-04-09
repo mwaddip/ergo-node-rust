@@ -143,7 +143,6 @@ impl SharedStore {
 impl SyncStore for SharedStore {
     async fn has_modifier(&self, type_id: u8, id: &[u8; 32]) -> bool {
         let store = self.store.clone();
-        let type_id = type_id;
         let id = *id;
         tokio::task::spawn_blocking(move || {
             match store.contains(type_id, &id) {
@@ -160,7 +159,6 @@ impl SyncStore for SharedStore {
 
     async fn get_modifier(&self, type_id: u8, id: &[u8; 32]) -> Option<Vec<u8>> {
         let store = self.store.clone();
-        let type_id = type_id;
         let id = *id;
         tokio::task::spawn_blocking(move || match store.get(type_id, &id) {
             Ok(v) => v,
