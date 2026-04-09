@@ -11,5 +11,17 @@ case "$1" in
         systemctl daemon-reload
         systemctl enable ergo-node-rust 2>/dev/null || true
         systemctl start ergo-node-rust 2>/dev/null || true
+
+        # fail2ban integration
+        if command -v fail2ban-client >/dev/null 2>&1; then
+            echo "fail2ban detected — enabling ergo-node jails"
+            fail2ban-client reload 2>/dev/null || true
+        else
+            echo "NOTE: fail2ban is not installed."
+            echo "  ergo-node-rust ships with fail2ban rules for automatic"
+            echo "  peer banning. Install fail2ban and run:"
+            echo "    sudo dpkg-reconfigure ergo-node-rust"
+            echo "  to enable them."
+        fi
         ;;
 esac

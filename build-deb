@@ -22,6 +22,11 @@ cp ergo.toml "target/${PKG}/etc/ergo-node/ergo.toml"
 
 cp deploy/ergo-node-rust.service "target/${PKG}/usr/lib/systemd/system/"
 
+mkdir -p "target/${PKG}/etc/fail2ban/filter.d"
+mkdir -p "target/${PKG}/etc/fail2ban/jail.d"
+cp deploy/fail2ban/ergo-node.conf "target/${PKG}/etc/fail2ban/filter.d/"
+cp deploy/fail2ban/ergo-node.jail "target/${PKG}/etc/fail2ban/jail.d/"
+
 sed "s/^Architecture:.*/Architecture: ${ARCH}/" debian/control > "target/${PKG}/DEBIAN/control"
 sed -i "s/^Version:.*/Version: ${VERSION}/" "target/${PKG}/DEBIAN/control"
 SIZE=$(du -sk "target/${PKG}" | cut -f1)

@@ -1,1 +1,3 @@
 /etc/ergo-node/ergo.toml
+/etc/fail2ban/filter.d/ergo-node.conf
+/etc/fail2ban/jail.d/ergo-node.jail

@@ -356,6 +356,29 @@ impl BlockValidator for Validator {
 // the actual access pattern is single-threaded.
 unsafe impl Send for Validator {}
 
+/// Emit a structured penalty log line for fail2ban and optionally disconnect the peer.
+///
+/// Format: `PENALTY peer_ip={ip} type={type} reason="{reason}"`
+/// Types: permanent (instant ban), misbehavior (accumulates), spam, nondelivery
+async fn penalize(
+    p2p: &enr_p2p::node::P2pNode,
+    peer_id: enr_p2p::types::PeerId,
+    penalty_type: &str,
+    reason: &str,
+    disconnect: bool,
+) {
+    let ip = match p2p.peer_addr(peer_id).await {
+        Some(addr) => addr.ip().to_string(),
+        None => "unknown".to_string(),
+    };
+    tracing::warn!(
+        "PENALTY peer_ip={ip} type={penalty_type} reason=\"{reason}\""
+    );
+    if disconnect {
+        p2p.disconnect_peer(peer_id).await;
+    }
+}
+
 /// Handle an incoming NiPoPoW message (code 90 GetNipopowProof or 91 NipopowProof).
 ///
 /// For code 90: parse the request, lock the chain, build the proof, and send the
@@ -379,7 +402,7 @@ async fn handle_nipopow_event(
             let req = match nipopow_serve::parse_get_nipopow_proof(body) {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!(peer = %peer_id, "GetNipopowProof parse failed: {e}");
+                    penalize(p2p, peer_id, "misbehavior", &format!("GetNipopowProof parse failed: {e}"), false).await;
                     return;
                 }
             };
@@ -459,7 +482,7 @@ async fn handle_nipopow_event(
             let proof_bytes = match nipopow_serve::parse_nipopow_proof(body) {
                 Ok(b) => b,
                 Err(e) => {
-                    tracing::warn!(peer = %peer_id, "NipopowProof parse failed: {e}");
+                    penalize(p2p, peer_id, "misbehavior", &format!("NipopowProof parse failed: {e}"), false).await;
                     return;
                 }
             };
@@ -476,7 +499,7 @@ async fn handle_nipopow_event(
                     );
                 }
                 Err(e) => {
-                    tracing::warn!(peer = %peer_id, "NiPoPoW proof verification failed: {e}");
+                    penalize(p2p, peer_id, "permanent", &format!("NiPoPoW proof verification failed: {e}"), true).await;
                 }
             }
         }

@@ -4,6 +4,7 @@ Section: net
 Priority: optional
 Architecture: amd64
 Depends: libc6
+Suggests: fail2ban
 Conflicts: ergo-proxy-node
 Replaces: ergo-proxy-node
 Maintainer: Muad'Dib <dev@blockhost.io>

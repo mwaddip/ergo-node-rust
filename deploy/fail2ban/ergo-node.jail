@@ -1,0 +1,34 @@
+# fail2ban jail for ergo-node-rust
+#
+# Penalty thresholds mirror the JVM Ergo node's scoring:
+#   permanent  = 1 hit  → 24h ban (wire-level attacks)
+#   misbehavior = 10 pts each, ban at 500 → ~50 offenses in 10 min
+#   spam       = 25 pts each, ban at 500 → ~20 offenses in 10 min
+#   nondelivery = 2 pts each, ban at 500 → ~250 offenses in 10 min
+#
+# The single jail catches all types. The JVM's 500-point threshold
+# maps to maxretry=50 for the general case (misbehavior at 10 pts
+# each). Permanent penalties are instant — one hit bans.
+#
+# Tuning: adjust maxretry and findtime for your network conditions.
+# Testnet operators may want to raise maxretry significantly.
+
+[ergo-node-permanent]
+enabled  = true
+filter   = ergo-node
+port     = 9030,9130
+logpath  = /var/log/ergo-node/ergo-node.log
+maxretry = 1
+findtime = 1
+bantime  = 86400
+failregex = PENALTY peer_ip=<HOST> type=permanent reason="[^"]*"
+
+[ergo-node-misbehavior]
+enabled  = true
+filter   = ergo-node
+port     = 9030,9130
+logpath  = /var/log/ergo-node/ergo-node.log
+maxretry = 50
+findtime = 600
+bantime  = 3600
+failregex = PENALTY peer_ip=<HOST> type=(?:misbehavior|spam|nondelivery) reason="[^"]*"
