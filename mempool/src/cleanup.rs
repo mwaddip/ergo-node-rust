@@ -68,7 +68,7 @@ impl super::Mempool {
             let tx_clone = utx.tx.clone();
 
             match validate_single_transaction(&tx_clone, input_boxes, data_boxes, state_context) {
-                Ok(()) => {
+                Ok(_) => {
                     // Would update last_checked here, but we'd need get_mut
                     // which isn't worth the complexity for the BTreeMap key dance.
                     // The cleanup_interval check prevents re-checking too often.

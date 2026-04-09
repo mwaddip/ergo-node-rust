@@ -5,12 +5,12 @@ edition = "2021"
 description = "Block candidate assembly and PoW solution validation for external miners"
 
 [dependencies]
-ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "1e3fe28" }
-ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "1e3fe28" }
-ergo-nipopow = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "1e3fe28" }
-ergo-merkle-tree = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "1e3fe28" }
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "66e94f3" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "66e94f3" }
+ergo-nipopow = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "66e94f3" }
+ergo-merkle-tree = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "66e94f3" }
 ergo-validation = { path = "../validation" }
-sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "1e3fe28" }
+sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "66e94f3" }
 blake2 = "0.10"
 hex = "0.4"
 num-bigint = "0.4"

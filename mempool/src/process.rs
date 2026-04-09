@@ -120,17 +120,16 @@ impl super::Mempool {
             })
             .unwrap_or_default();
 
-        // 6. Validate
-        let cost = tx_bytes.len() as u32;
-        match validate_single_transaction(&tx, input_boxes.clone(), data_boxes, state_context) {
-            Ok(()) => {}
+        // 6. Validate (returns script evaluation cost in block cost units)
+        let cost = match validate_single_transaction(&tx, input_boxes.clone(), data_boxes, state_context) {
+            Ok(script_cost) => script_cost.max(tx_bytes.len() as u64) as u32,
             Err(e) => {
                 self.invalidated.insert(tx_id);
                 return ProcessingOutcome::Invalidated {
                     reason: format!("{e}"),
                 };
             }
-        }
+        };
 
         // Track validation cost for rate limiting
         if let Some(peer) = source {

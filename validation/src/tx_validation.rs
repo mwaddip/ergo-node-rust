@@ -60,26 +60,27 @@ pub fn build_state_context(
 /// Validate a single transaction against provided input and data-input boxes.
 ///
 /// Runs full ErgoScript evaluation via ergo-lib's TransactionContext.
+/// Returns the total script evaluation cost (block cost units) on success.
 pub fn validate_single_transaction(
     tx: &Transaction,
     input_boxes: Vec<ErgoBox>,
     data_boxes: Vec<ErgoBox>,
     state_context: &ErgoStateContext,
-) -> Result<(), ValidationError> {
+) -> Result<u64, ValidationError> {
     let tx_context = TransactionContext::new(tx.clone(), input_boxes, data_boxes)
         .map_err(|e| ValidationError::TransactionInvalid {
             index: 0,
             reason: format!("context: {e}"),
         })?;
 
-    tx_context.validate(state_context).map_err(|e| {
+    let cost = tx_context.validate(state_context).map_err(|e| {
         ValidationError::TransactionInvalid {
             index: 0,
             reason: format!("{e}"),
         }
     })?;
 
-    Ok(())
+    Ok(cost)
 }
 
 /// Validate all transactions in a block using ErgoScript evaluation.

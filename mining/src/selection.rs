@@ -73,7 +73,7 @@ pub fn select_transactions(
 
         // Validate against upcoming state
         match validate_single_transaction(tx, input_boxes, data_boxes, state_context) {
-            Ok(()) => {
+            Ok(_) => {
                 accumulated_size += tx_size;
 
                 // Track outputs for later txs (intra-block spending)
