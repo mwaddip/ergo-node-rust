@@ -3,7 +3,7 @@ members = [".", "sync", "validation", "state", "mempool", "api", "mining"]
 
 [package]
 name = "ergo-node-rust"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2021"
 description = "Full Ergo blockchain node in Rust"
 
