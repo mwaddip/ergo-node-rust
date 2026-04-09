@@ -108,6 +108,18 @@ pub trait SyncChain {
         envelope_body: &[u8],
     ) -> impl std::future::Future<Output = Result<Vec<Header>, enr_chain::ChainError>> + Send;
 
+    /// Compare two NiPoPoW proofs (raw P2P code-91 envelope bodies) and
+    /// return `true` if `this` is better than `that` per KMZ17 §4.3.
+    ///
+    /// Used by the light-client bootstrap to pick the best proof from
+    /// multiple peers. Both envelopes must be parseable (they should have
+    /// already passed [`Self::verify_nipopow_envelope`]).
+    fn is_better_nipopow(
+        &self,
+        this_envelope: &[u8],
+        than_envelope: &[u8],
+    ) -> impl std::future::Future<Output = Result<bool, enr_chain::ChainError>> + Send;
+
     /// Install a verified NiPoPoW proof's suffix as the chain's starting
     /// point for light-client mode. Wraps
     /// [`enr_chain::HeaderChain::install_from_nipopow_proof`].

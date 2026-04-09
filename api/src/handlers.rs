@@ -39,7 +39,8 @@ fn hex_to_id(hex_str: &str) -> Result<[u8; 32], (StatusCode, Json<ApiError>)> {
 // ---------------------------------------------------------------------------
 
 pub async fn get_info(State(state): State<ApiState>) -> Json<NodeInfo> {
-    let height = state.chain.height();
+    let headers_height = state.chain.height();
+    let full_height = state.validated_height.load(std::sync::atomic::Ordering::Relaxed);
     let tip = state.chain.tip();
     let tip_id = hex::encode(tip.id.0.as_ref());
     let state_root = hex::encode(<[u8; 33]>::from(tip.state_root));
@@ -56,8 +57,8 @@ pub async fn get_info(State(state): State<ApiState>) -> Json<NodeInfo> {
         name: state.node_info.name.clone(),
         app_version: state.node_info.version.clone(),
         network: state.node_info.network.clone(),
-        full_height: height,
-        headers_height: height,
+        full_height,
+        headers_height,
         best_full_header_id: tip_id.clone(),
         best_header_id: tip_id,
         state_root,

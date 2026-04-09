@@ -1,6 +1,7 @@
 mod handlers;
 pub mod types;
 
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
 use axum::Router;
@@ -34,6 +35,8 @@ pub struct ApiState {
     pub mining: Option<Arc<CandidateGenerator>>,
     /// Block submitter — handles mined block application + broadcast.
     pub block_submitter: Option<Arc<dyn BlockSubmitter>>,
+    /// Last fully validated block height (updated by the validator).
+    pub validated_height: Arc<AtomicU32>,
 }
 
 /// Static node metadata.

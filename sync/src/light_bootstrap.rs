@@ -1,13 +1,10 @@
 //! NiPoPoW light-client bootstrap state machine.
 //!
 //! Runs once at startup when `state_type == StateType::Light` and the chain
-//! is empty. Asks one peer for a NiPoPoW proof, verifies it, and installs
-//! the suffix as the chain's starting point. Subsequent tip-following uses
-//! the existing header sync loop.
-//!
-//! Single peer per attempt — multi-peer best-arg comparison (KMZ17 §4.3) is
-//! tracked as a hardening follow-up. The trust model is standard SPV: a
-//! hostile peer causes a recoverable DoS, not loss of funds.
+//! is empty. Broadcasts `GetNipopowProof` to all outbound peers, collects
+//! valid proofs within a timeout window, compares them via KMZ17 §4.3
+//! (`is_better_than`), and installs the best as the chain's starting point.
+//! Subsequent tip-following uses the existing header sync loop.
 //!
 //! JVM reference: `ErgoNodeViewSynchronizer.scala:1032` (outbound request),
 //! `PopowProcessor.applyPopowProof` (install side).
@@ -32,16 +29,14 @@ pub const GET_NIPOPOW_PROOF: u8 = 90;
 /// P2P message code for `NipopowProof`.
 pub const NIPOPOW_PROOF: u8 = 91;
 
-/// How long to wait for a peer to respond with a NiPoPoW proof before
-/// rotating to the next peer.
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long to wait for proof responses after broadcasting to all peers.
+/// Peers that haven't responded within this window are counted as stalled.
+const COLLECTION_WINDOW: Duration = Duration::from_secs(30);
 /// How long to wait for an outbound peer to become available at startup
 /// before giving up.
 const PEER_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Polling interval while waiting for outbound peers.
 const PEER_WAIT_POLL: Duration = Duration::from_secs(1);
-/// Maximum number of peers to attempt before declaring bootstrap failed.
-const MAX_PEER_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Error)]
 pub enum LightBootstrapError {
@@ -90,17 +85,15 @@ fn build_get_nipopow_proof_body(m: i32, k: i32, header_id: Option<&BlockId>) -> 
 ///
 /// Idempotent: returns immediately if `chain.chain_height() > 0`.
 ///
-/// Top-level state machine:
+/// Top-level state machine (KMZ17 §4.3 multi-peer comparison):
 /// 1. Wait for at least one outbound peer (60s deadline).
-/// 2. For each peer (up to 3 attempts):
-///    a. Send `GetNipopowProof(m=6, k=10, header_id=None)`.
-///    b. Wait for a code-91 response from THAT peer (30s timeout).
-///    c. Verify the proof. On verify failure → mark peer hostile, rotate.
-///    d. Split the verified headers into (suffix_head, suffix_tail) using
-///       the `k` we requested.
-///    e. Install via `chain.install_nipopow_suffix`.
-///    f. Return Ok.
-/// 3. All peers exhausted → return error.
+/// 2. Broadcast `GetNipopowProof(m=6, k=10)` to ALL outbound peers.
+/// 3. Collect valid proofs within a 30s window. Verify each on arrival.
+/// 4. If multiple valid proofs, compare pairwise via `is_better_than`
+///    and pick the best. If one valid proof, use it.
+/// 5. Split the best proof's headers into (suffix_head, suffix_tail)
+///    and install.
+/// 6. No valid proofs → return error.
 pub async fn run_light_bootstrap<T: SyncTransport, C: SyncChain>(
     transport: &mut T,
     chain: &C,
@@ -118,189 +111,194 @@ pub async fn run_light_bootstrap<T: SyncTransport, C: SyncChain>(
 
     // Step 1: wait for outbound peers.
     let peer_wait_deadline = Instant::now() + PEER_WAIT_TIMEOUT;
-    let mut initial_peers = Vec::new();
+    let mut peers = Vec::new();
     while Instant::now() < peer_wait_deadline {
-        let peers = transport.outbound_peers().await;
+        peers = transport.outbound_peers().await;
         if !peers.is_empty() {
-            initial_peers = peers;
             break;
         }
         tokio::time::sleep(PEER_WAIT_POLL).await;
     }
-    if initial_peers.is_empty() {
+    if peers.is_empty() {
         return Err(LightBootstrapError::NoPeers(PEER_WAIT_TIMEOUT));
     }
     tracing::info!(
-        peer_count = initial_peers.len(),
-        "light bootstrap: outbound peers available"
+        peer_count = peers.len(),
+        "light bootstrap: broadcasting GetNipopowProof to all outbound peers"
     );
 
-    // Step 2: try peers one at a time.
-    let mut tried = Vec::new();
-    let mut hostile = 0usize;
-
-    for &target_peer in initial_peers.iter().take(MAX_PEER_ATTEMPTS) {
-        tried.push(target_peer);
-        tracing::info!(peer = ?target_peer, "light bootstrap: requesting proof");
-
-        // Send GetNipopowProof to this peer.
-        let body = build_get_nipopow_proof_body(P2P_NIPOPOW_M, P2P_NIPOPOW_K, None);
+    // Step 2: broadcast to all outbound peers.
+    let body = build_get_nipopow_proof_body(P2P_NIPOPOW_M, P2P_NIPOPOW_K, None);
+    let mut sent_to = Vec::new();
+    for &peer in &peers {
         let msg = ProtocolMessage::Unknown {
             code: GET_NIPOPOW_PROOF,
-            body,
+            body: body.clone(),
         };
-        if let Err(e) = transport.send_to(target_peer, msg).await {
-            tracing::warn!(peer = ?target_peer, "light bootstrap: send failed: {e}");
-            // Counted as stall for the final error decision.
-            continue;
-        }
-
-        // Wait for the response from this specific peer.
-        let outcome = wait_for_proof(transport, chain, target_peer, RESPONSE_TIMEOUT).await;
-        match outcome {
-            ProofOutcome::Verified(headers) => {
-                tracing::info!(
-                    peer = ?target_peer,
-                    header_count = headers.len(),
-                    "light bootstrap: proof verified"
-                );
-
-                // Step 2d: split into (suffix_head, suffix_tail).
-                // The last k headers are the suffix; the rest is the prefix
-                // and gets discarded. suffix_head is the first of the last k.
-                let k = P2P_NIPOPOW_K as usize;
-                if headers.len() < k {
-                    tracing::warn!(
-                        peer = ?target_peer,
-                        header_count = headers.len(),
-                        k,
-                        "light bootstrap: proof has fewer headers than k — treating as hostile"
-                    );
-                    hostile += 1;
-                    continue;
-                }
-                let split_idx = headers.len() - k;
-                let mut suffix: Vec<Header> = headers.into_iter().skip(split_idx).collect();
-                let suffix_head = suffix.remove(0);
-                let suffix_tail = suffix;
-
-                tracing::info!(
-                    peer = ?target_peer,
-                    suffix_head_height = suffix_head.height,
-                    suffix_tail_len = suffix_tail.len(),
-                    "light bootstrap: installing suffix"
-                );
-
-                // Step 2e: install.
-                match chain.install_nipopow_suffix(suffix_head, suffix_tail).await {
-                    Ok(()) => {
-                        let final_height = chain.chain_height().await;
-                        tracing::info!(
-                            chain_height = final_height,
-                            "light bootstrap: complete, transitioning to tip-following sync"
-                        );
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        // Install errors are NOT peer-attributable —
-                        // verify already passed. This is a chain-state
-                        // failure (e.g., chain not actually empty due to a
-                        // race). Surface immediately.
-                        tracing::error!(
-                            peer = ?target_peer,
-                            "light bootstrap: install failed: {e}"
-                        );
-                        return Err(LightBootstrapError::InstallFailed(e));
-                    }
-                }
-            }
-            ProofOutcome::VerifyFailed(reason) => {
-                tracing::warn!(
-                    peer = ?target_peer,
-                    "light bootstrap: proof verify failed ({reason}) — peer hostile, rotating"
-                );
-                hostile += 1;
-            }
-            ProofOutcome::Timeout => {
-                tracing::warn!(
-                    peer = ?target_peer,
-                    timeout_secs = RESPONSE_TIMEOUT.as_secs(),
-                    "light bootstrap: timed out waiting for response — peer stalled, rotating"
-                );
-                // Counted as stall for the final error decision.
-            }
-            ProofOutcome::StreamClosed => {
-                return Err(LightBootstrapError::StreamClosed);
-            }
+        if let Err(e) = transport.send_to(peer, msg).await {
+            tracing::warn!(peer = ?peer, "light bootstrap: send failed: {e}");
+        } else {
+            sent_to.push(peer);
         }
     }
-
-    // Step 3: all peers exhausted.
-    if hostile >= tried.len() {
-        Err(LightBootstrapError::AllPeersHostile(tried.len()))
-    } else {
-        Err(LightBootstrapError::AllPeersStalled(tried.len()))
+    if sent_to.is_empty() {
+        return Err(LightBootstrapError::AllPeersStalled(peers.len()));
     }
-}
 
-/// Outcome of waiting for a NiPoPoW proof from a specific peer.
-enum ProofOutcome {
-    Verified(Vec<Header>),
-    VerifyFailed(String),
-    Timeout,
-    StreamClosed,
-}
-
-/// Drain the transport event stream until either a code-91 message arrives
-/// from `target_peer` or the timeout expires.
-///
-/// Events from other peers and other message codes are silently dropped —
-/// the bootstrap is the only consumer that cares about them at this point
-/// in the lifecycle (the main sync loop hasn't started yet, so there's
-/// nothing else to route them to).
-async fn wait_for_proof<T: SyncTransport, C: SyncChain>(
-    transport: &mut T,
-    chain: &C,
-    target_peer: PeerId,
-    timeout: Duration,
-) -> ProofOutcome {
-    let deadline = Instant::now() + timeout;
+    // Step 3: collect valid proofs within the window.
+    let mut valid_proofs: Vec<ValidProof> = Vec::new();
+    let mut hostile = 0usize;
+    let mut responded = 0usize;
+    let deadline = Instant::now() + COLLECTION_WINDOW;
 
     loop {
+        // All peers responded or window expired — stop collecting.
+        if responded >= sent_to.len() {
+            break;
+        }
         let remaining = match deadline.checked_duration_since(Instant::now()) {
             Some(d) if !d.is_zero() => d,
-            _ => return ProofOutcome::Timeout,
+            _ => break,
         };
 
         let event = tokio::time::timeout(remaining, transport.next_event()).await;
         let event = match event {
             Ok(Some(e)) => e,
-            Ok(None) => return ProofOutcome::StreamClosed,
-            Err(_) => return ProofOutcome::Timeout,
+            Ok(None) => return Err(LightBootstrapError::StreamClosed),
+            Err(_) => break, // timeout
         };
 
         let ProtocolEvent::Message { peer_id, message } = event else {
             continue;
         };
-
-        if peer_id != target_peer {
-            // Ignore proofs from other peers in single-peer mode.
+        if !sent_to.contains(&peer_id) {
             continue;
         }
-
         let ProtocolMessage::Unknown { code, body } = message else {
             continue;
         };
-
         if code != NIPOPOW_PROOF {
             continue;
         }
 
+        responded += 1;
+
         match chain.verify_nipopow_envelope(&body).await {
-            Ok(headers) => return ProofOutcome::Verified(headers),
-            Err(e) => return ProofOutcome::VerifyFailed(e.to_string()),
+            Ok(headers) => {
+                tracing::info!(
+                    peer = ?peer_id,
+                    header_count = headers.len(),
+                    "light bootstrap: valid proof received"
+                );
+                valid_proofs.push(ValidProof {
+                    peer: peer_id,
+                    headers,
+                    envelope: body,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    peer = ?peer_id,
+                    "light bootstrap: proof verify failed ({e}) — hostile"
+                );
+                hostile += 1;
+            }
         }
     }
+
+    if valid_proofs.is_empty() {
+        if hostile > 0 {
+            return Err(LightBootstrapError::AllPeersHostile(sent_to.len()));
+        }
+        return Err(LightBootstrapError::AllPeersStalled(sent_to.len()));
+    }
+
+    // Step 4: pick the best proof via KMZ17 comparison.
+    let best = if valid_proofs.len() == 1 {
+        valid_proofs.into_iter().next().unwrap()
+    } else {
+        pick_best_proof(chain, valid_proofs).await?
+    };
+
+    tracing::info!(
+        peer = ?best.peer,
+        header_count = best.headers.len(),
+        "light bootstrap: selected best proof"
+    );
+
+    // Step 5: split into (suffix_head, suffix_tail) and install.
+    let k = P2P_NIPOPOW_K as usize;
+    if best.headers.len() < k {
+        return Err(LightBootstrapError::AllPeersHostile(1));
+    }
+    let split_idx = best.headers.len() - k;
+    let mut suffix: Vec<Header> = best.headers.into_iter().skip(split_idx).collect();
+    let suffix_head = suffix.remove(0);
+    let suffix_tail = suffix;
+
+    tracing::info!(
+        suffix_head_height = suffix_head.height,
+        suffix_tail_len = suffix_tail.len(),
+        "light bootstrap: installing suffix"
+    );
+
+    chain
+        .install_nipopow_suffix(suffix_head, suffix_tail)
+        .await
+        .map_err(LightBootstrapError::InstallFailed)?;
+
+    let final_height = chain.chain_height().await;
+    tracing::info!(
+        chain_height = final_height,
+        "light bootstrap: complete, transitioning to tip-following sync"
+    );
+    Ok(())
+}
+
+/// A verified proof from a peer, kept alive for comparison.
+struct ValidProof {
+    peer: PeerId,
+    headers: Vec<Header>,
+    /// Raw P2P code-91 envelope body — retained for KMZ17 comparison.
+    envelope: Vec<u8>,
+}
+
+/// Compare all valid proofs pairwise and return the best one.
+///
+/// Uses `SyncChain::is_better_nipopow` which delegates to
+/// `NipopowProof::is_better_than` (KMZ17 §4.3).
+async fn pick_best_proof<C: SyncChain>(
+    chain: &C,
+    mut proofs: Vec<ValidProof>,
+) -> Result<ValidProof, LightBootstrapError> {
+    debug_assert!(proofs.len() >= 2);
+
+    let mut best_idx = 0;
+    for i in 1..proofs.len() {
+        match chain
+            .is_better_nipopow(&proofs[i].envelope, &proofs[best_idx].envelope)
+            .await
+        {
+            Ok(true) => {
+                tracing::info!(
+                    challenger = ?proofs[i].peer,
+                    incumbent = ?proofs[best_idx].peer,
+                    "light bootstrap: challenger proof is better"
+                );
+                best_idx = i;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                // Comparison failure — skip this challenger, keep incumbent.
+                tracing::warn!(
+                    challenger = ?proofs[i].peer,
+                    "light bootstrap: proof comparison failed ({e}), skipping"
+                );
+            }
+        }
+    }
+
+    Ok(proofs.swap_remove(best_idx))
 }
 
 #[cfg(test)]

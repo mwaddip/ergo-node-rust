@@ -117,6 +117,18 @@ impl SyncChain for SharedChain {
         Ok(result.headers)
     }
 
+    async fn is_better_nipopow(
+        &self,
+        this_envelope: &[u8],
+        than_envelope: &[u8],
+    ) -> Result<bool, ChainError> {
+        let inner_a = crate::nipopow_serve::parse_nipopow_proof(this_envelope)
+            .map_err(|e| ChainError::Nipopow(format!("envelope parse (a): {e}")))?;
+        let inner_b = crate::nipopow_serve::parse_nipopow_proof(than_envelope)
+            .map_err(|e| ChainError::Nipopow(format!("envelope parse (b): {e}")))?;
+        enr_chain::compare_nipopow_proof_bytes(&inner_a, &inner_b)
+    }
+
     async fn install_nipopow_suffix(
         &self,
         suffix_head: Header,

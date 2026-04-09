@@ -973,6 +973,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start P2P with modifier sink (no validator)
     let p2p = Arc::new(enr_p2p::node::P2pNode::start(config, Some(modifier_tx), mode_config).await?);
 
+    // Register message codes consumed by the main crate's event stream so
+    // the router doesn't blindly forward them to all peers.
+    for code in [76u8, 78, 80, 90, 91] {
+        p2p.register_consumed_code(code).await;
+    }
+
     // Validation pipeline — progress channel feeds sync, delivery channel feeds tracker
     let pipeline_chain = chain.clone();
     let api_store = store.clone(); // for REST API block queries
@@ -1862,6 +1868,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     modifier_tx: modifier_tx_for_mining.clone(),
                 }) as Arc<dyn ergo_api::BlockSubmitter>
             }),
+            validated_height: shared_validated_height.clone(),
             node_info: ergo_api::NodeMeta {
                 name: "ergo-node-rust".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
