@@ -286,3 +286,94 @@ async fn nipopow_serve_full_chain_round_trip() {
         meta.suffix_tip_height
     );
 }
+
+/// Regression test for the `has_valid_connections` JVM-tolerance bug.
+///
+/// Sends `GetNipopowProof(m=6, k=10, header_id=None)` to a running node,
+/// which on our test server is forwarded by the router to JVM peers (per
+/// `project_unknown_message_forwarding`). The JVM peers reply with proofs
+/// whose prefix has skipped intermediate entries — adjacent sorted-by-
+/// height pairs that don't directly reference each other via interlinks
+/// because they come from different superlevel walks.
+///
+/// Pre-fix sigma-rust `NipopowProof::has_valid_connections` was strict —
+/// it required immediate-predecessor connectivity and rejected these
+/// proofs with `Nipopow("invalid connections")`. The fix
+/// (`mwaddip/sigma-rust:fix/nipopow-prefix-connection-lookback`,
+/// integrated as `1e3fe28` on `ergo-node-integration`) ports JVM's
+/// `useLastEpochs + 2` lookback window so the verifier accepts proofs
+/// where each entry connects to ANY of the up-to-10 immediately preceding
+/// entries.
+///
+/// This test passes against any peer (JVM or Rust) that produces valid
+/// JVM-shape proofs. Pre-fix it failed; post-fix it passes. Keeping it
+/// as a permanent regression check for the connection-tolerance fix.
+#[tokio::test]
+#[ignore = "requires a running ergo-node-rust on NIPOPOW_TARGET (default 127.0.0.1:9030)"]
+async fn nipopow_serve_no_anchor_repro() {
+    let target = env::var("NIPOPOW_TARGET").unwrap_or_else(|_| DEFAULT_TARGET.to_string());
+    let addr: SocketAddr = target.parse().expect("NIPOPOW_TARGET must be a valid SocketAddr");
+
+    eprintln!("[no-anchor] connecting to {addr}");
+    let stream = timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS), TcpStream::connect(addr))
+        .await
+        .expect("connect timed out")
+        .expect("tcp connect failed");
+
+    let hs_config = HandshakeConfig {
+        agent_name: "ergo-rust-test-client".into(),
+        peer_name: "nipopow-no-anchor-client".into(),
+        version: Version::new(5, 0, 22),
+        network: Network::Testnet,
+        mode: ProxyMode::Light,
+        declared_address: None,
+        mode_config: ModeConfig::default(),
+    };
+
+    let mut conn = Connection::outbound(stream, &hs_config)
+        .await
+        .expect("handshake failed");
+
+    // m=6, k=10, header_id=None — exact light-client bootstrap params.
+    let mut body = Vec::new();
+    body.put_i32(6).expect("vec write");
+    body.put_i32(10).expect("vec write");
+    body.push(0); // header_id_present = 0
+    body.put_u16(0).expect("vec write"); // pad_len = 0
+
+    conn.write_frame(&Frame { code: GET_NIPOPOW_PROOF, body })
+        .await
+        .expect("write frame failed");
+
+    let proof_bytes = timeout(Duration::from_secs(FULL_CHAIN_BUILD_TIMEOUT_SECS), async {
+        loop {
+            let frame = conn.read_frame().await.expect("read frame failed");
+            if frame.code == NIPOPOW_PROOF {
+                return parse_nipopow_proof(&frame.body).expect("parse_nipopow_proof failed");
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for NipopowProof response");
+
+    let meta = enr_chain::verify_nipopow_proof_bytes(&proof_bytes)
+        .expect("verify_nipopow_proof_bytes failed (regression: tolerant lookback?)");
+
+    eprintln!(
+        "[no-anchor] verified OK: proof_bytes={} suffix_tip_height={} total_headers={}",
+        proof_bytes.len(),
+        meta.suffix_tip_height,
+        meta.total_headers,
+    );
+
+    assert!(
+        meta.total_headers >= 10,
+        "expected at least k=10 headers in the proof, got {}",
+        meta.total_headers
+    );
+    assert!(
+        meta.suffix_tip_height > 200,
+        "no-anchor request should resolve to a deep tip, got {}",
+        meta.suffix_tip_height
+    );
+}

@@ -1,0 +1,28 @@
+# Light-client smoke test config.
+# Bootstraps from the test server's Rust node (216.128.144.28:9030),
+# verifies a NiPoPoW proof, installs the suffix, and follows the tip.
+#
+# Local-only — no inbound peers, custom port to avoid conflicts with
+# any other local nodes.
+
+[proxy]
+network = "testnet"
+
+[listen.ipv4]
+address = "0.0.0.0:19034"
+mode = "full"
+max_inbound = 0
+
+[outbound]
+min_peers = 1
+max_peers = 1
+seed_peers = ["216.128.144.28:9030"]
+
+[identity]
+agent_name = "ergo-node-rust"
+peer_name = "ergo-light-test"
+protocol_version = "6.0.3"
+
+[node]
+state_type = "light"
+data_dir = ".local-data/light-test"
