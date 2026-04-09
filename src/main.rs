@@ -30,8 +30,19 @@ const TESTNET_NO_PREMINE_PROOFS: &[&str] = &[
     "0xef1d584d77e74e3c509de625dc17893b22b73d040b5d5302bbf832065f928d03",
 ];
 
-/// Testnet founders' public keys (hex-encoded compressed EC points).
-const TESTNET_FOUNDERS_PKS: &[&str] = &[
+/// Mainnet no-premine proof strings (UTF-8, stored in R4-R8).
+/// Source: JVM mainnet.conf:24-30 (July 2019 headlines + block hashes).
+const MAINNET_NO_PREMINE_PROOFS: &[&str] = &[
+    "00000000000000000014c2e2e7e33d51ae7e66f6ccb6942c3437127b36c33747",
+    "0xd07a97293468d9132c5a2adab2e52a23009e6798608e47b0d2623c7e3e923463",
+    "Brexit: both Tory sides play down risk of no-deal after business alarm",
+    "\u{8ff0}\u{8bc4}\u{ff1a}\u{5e73}\u{8861}\u{3001}\u{6301}\u{7eed}\u{3001}\u{5305}\u{5bb9}\u{2014}\u{2014}\u{65b0}\u{65f6}\u{4ee3}\u{5e94}\u{5bf9}\u{5168}\u{7403}\u{5316}\u{6311}\u{6218}\u{7684}\u{4e2d}\u{56fd}\u{4e4b}\u{9053}",
+    "\u{0414}\u{0438}\u{0432}\u{0438}\u{0434}\u{0435}\u{043d}\u{0434}\u{044b} \u{0427}\u{0422}\u{041f}\u{0417} \u{0432}\u{044b}\u{0440}\u{0430}\u{0441}\u{0442}\u{0443}\u{0442} \u{043d}\u{0430} 33% \u{043d}\u{0430} \u{0430}\u{043a}\u{0446}\u{0438}\u{044e}",
+];
+
+/// Founders' public keys (hex-encoded compressed EC points).
+/// Shared between mainnet and testnet. Source: JVM application.conf:209-213.
+const FOUNDERS_PKS: &[&str] = &[
     "039bb5fe52359a64c99a60fd944fc5e388cbdc4d37ff091cc841c3ee79060b8647",
     "031fb52cf6e805f80d97cde289f4f757d49accf0c83fb864b27d2cf982c37f9a8b",
     "0352ac2a471339b0d23b3d2c5ce0db0e81c969f77891b9edf0bda7fd39a78184e7",
@@ -60,14 +71,12 @@ const MAINNET_GENESIS_DIGEST: &str =
 fn build_genesis_boxes(network: enr_p2p::types::Network) -> Vec<([u8; 32], Vec<u8>)> {
     let settings = MonetarySettings::default();
 
-    let (proof_strings, founder_pk_hexes) = match network {
-        enr_p2p::types::Network::Testnet => (TESTNET_NO_PREMINE_PROOFS, TESTNET_FOUNDERS_PKS),
-        enr_p2p::types::Network::Mainnet => {
-            unimplemented!("mainnet genesis not yet implemented")
-        }
+    let proof_strings = match network {
+        enr_p2p::types::Network::Testnet => TESTNET_NO_PREMINE_PROOFS,
+        enr_p2p::types::Network::Mainnet => MAINNET_NO_PREMINE_PROOFS,
     };
 
-    let founder_pks: Vec<ProveDlog> = founder_pk_hexes
+    let founder_pks: Vec<ProveDlog> = FOUNDERS_PKS
         .iter()
         .map(|hex_str| {
             let bytes = hex::decode(hex_str).expect("invalid founder pk hex");
@@ -1963,6 +1972,51 @@ mod tests {
             hex::encode(&digest),
             expected_hex,
             "genesis state digest mismatch"
+        );
+    }
+
+    #[test]
+    fn mainnet_genesis_boxes_produce_correct_digest() {
+        let boxes = build_genesis_boxes(enr_p2p::types::Network::Mainnet);
+        assert_eq!(boxes.len(), 3, "expected 3 genesis boxes");
+
+        // Emission and founders boxes are identical to testnet (same monetary
+        // settings, same founder PKs). Only the no-premine box differs
+        // (different proof strings in registers R4-R8).
+        let expected_ids = [
+            "b69575e11c5c43400bfead5976ee0d6245a1168396b2e2a4f384691f275d501c",
+            "b8ce8cfe331e5eadfb0783bdc375c94413433f65e1e45857d71550d42e4d83bd",
+            "5527430474b673e4aafb08e0079c639de23e6a17e87edd00f78662b43c88aeda",
+        ];
+        for (i, (id, _)) in boxes.iter().enumerate() {
+            assert_eq!(
+                hex::encode(id),
+                expected_ids[i],
+                "box {} ID mismatch",
+                i
+            );
+        }
+
+        // Insert into AVL+ tree and verify genesis state digest
+        let resolver: ergo_avltree_rust::batch_node::Resolver =
+            Arc::new(|digest: &[u8; 32]| Node::LabelOnly(NodeHeader::new(Some(*digest), None)));
+        let tree = AVLTree::new(resolver, 32, None);
+        let mut prover = BatchAVLProver::new(tree, false);
+
+        for (id, value) in &boxes {
+            prover
+                .perform_one_operation(&Operation::Insert(KeyValue {
+                    key: Bytes::copy_from_slice(id),
+                    value: Bytes::copy_from_slice(value),
+                }))
+                .expect("genesis box insert failed");
+        }
+
+        let digest = prover.digest().expect("prover has no digest");
+        assert_eq!(
+            hex::encode(&digest),
+            MAINNET_GENESIS_DIGEST,
+            "mainnet genesis state digest mismatch"
         );
     }
 }

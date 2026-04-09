@@ -1,0 +1,38 @@
+# Mainnet config — connects to public mainnet peers
+
+[proxy]
+network = "mainnet"
+
+[node]
+data_dir = ".local-data/mainnet"
+state_type = "utxo"
+blocks_to_keep = 0
+
+[listen.ipv6]
+address = "[::]:9030"
+mode = "full"
+max_inbound = 20
+
+[outbound]
+min_peers = 3
+max_peers = 10
+seed_peers = [
+    "213.239.193.208:9030",
+    "159.65.11.55:9030",
+    "165.227.26.175:9030",
+    "159.89.116.15:9030",
+    "136.244.110.145:9030",
+    "94.130.108.35:9030",
+    "51.75.147.1:9020",
+    "221.165.214.185:9030",
+    "217.182.197.196:9030",
+    "173.212.220.9:9030",
+    "176.9.65.58:9130",
+    "213.152.106.56:9030",
+    "[2001:41d0:700:6662::]:29031",
+]
+
+[identity]
+agent_name = "ergo-node-rust"
+peer_name = "ergo-node-rust-mainnet"
+protocol_version = "6.0.3"
