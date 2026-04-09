@@ -11,7 +11,7 @@ use thiserror::Error;
 
 /// Decode a VLQ (Variable-Length Quantity) unsigned integer from bytes.
 /// Returns (value, bytes_consumed).
-fn vlq_decode(data: &[u8]) -> Result<(u64, usize), ProtocolError> {
+pub(crate) fn vlq_decode(data: &[u8]) -> Result<(u64, usize), ProtocolError> {
     let mut result: u64 = 0;
     let mut shift = 0;
     for (i, &b) in data.iter().enumerate() {
@@ -28,7 +28,7 @@ fn vlq_decode(data: &[u8]) -> Result<(u64, usize), ProtocolError> {
 }
 
 /// Encode a u64 as VLQ bytes.
-fn vlq_encode(mut value: u64) -> Vec<u8> {
+pub(crate) fn vlq_encode(mut value: u64) -> Vec<u8> {
     let mut out = Vec::new();
     loop {
         let mut byte = (value & 0x7F) as u8;
@@ -45,12 +45,12 @@ fn vlq_encode(mut value: u64) -> Vec<u8> {
 }
 
 /// ZigZag decode: unsigned → signed mapping.
-fn zigzag_decode(n: u64) -> i64 {
+pub(crate) fn zigzag_decode(n: u64) -> i64 {
     ((n >> 1) as i64) ^ -((n & 1) as i64)
 }
 
 /// ZigZag encode: signed → unsigned mapping.
-fn zigzag_encode(n: i64) -> u64 {
+pub(crate) fn zigzag_encode(n: i64) -> u64 {
     ((n << 1) ^ (n >> 63)) as u64
 }
 

@@ -157,6 +157,35 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     pub async fn run(&mut self) {
         tracing::info!("header sync started");
 
+        // Light-client bootstrap: if state_type is Light AND chain is empty,
+        // run a one-shot NiPoPoW bootstrap before entering the normal sync
+        // cycle. The bootstrap installs the proof's suffix as the chain
+        // origin; subsequent tip-following uses the existing loop unchanged.
+        // Idempotent: skipped on restart when the chain is non-empty.
+        if self.config.state_type == StateType::Light && self.chain.chain_height().await == 0 {
+            tracing::info!("light-client mode: running NiPoPoW bootstrap");
+            match crate::light_bootstrap::run_light_bootstrap(
+                &mut self.transport,
+                &self.chain,
+            )
+            .await
+            {
+                Ok(()) => {
+                    let height = self.chain.chain_height().await;
+                    // Light mode treats all installed headers as "validated"
+                    // — the proof's PoW checks ARE the validation. There's
+                    // no validator running and no block sections to download.
+                    self.downloaded_height = height;
+                    self.validated_height = height;
+                    tracing::info!(height, "light bootstrap installed, entering tip-following sync");
+                }
+                Err(e) => {
+                    tracing::error!("light bootstrap failed: {e}");
+                    return;
+                }
+            }
+        }
+
         // Startup: scan for already-downloaded sections in the store
         let tip = self.chain.chain_height().await;
         if tip > 0 {

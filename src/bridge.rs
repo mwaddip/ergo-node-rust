@@ -103,6 +103,30 @@ impl SyncChain for SharedChain {
             .await
             .apply_epoch_boundary_parameters(params);
     }
+
+    async fn verify_nipopow_envelope(
+        &self,
+        envelope_body: &[u8],
+    ) -> Result<Vec<Header>, ChainError> {
+        // Strip the P2P code-91 envelope (length-prefixed inner bytes + future
+        // pad). The wire codec lives in the main crate's `nipopow_serve` so
+        // sync stays codec-free.
+        let inner = crate::nipopow_serve::parse_nipopow_proof(envelope_body)
+            .map_err(|e| ChainError::Nipopow(format!("envelope parse: {e}")))?;
+        let result = enr_chain::verify_nipopow_proof_bytes(&inner)?;
+        Ok(result.headers)
+    }
+
+    async fn install_nipopow_suffix(
+        &self,
+        suffix_head: Header,
+        suffix_tail: Vec<Header>,
+    ) -> Result<(), ChainError> {
+        self.chain
+            .lock()
+            .await
+            .install_from_nipopow_proof(suffix_head, suffix_tail)
+    }
 }
 
 /// Wraps `Arc<RedbModifierStore>` to implement `SyncStore`.

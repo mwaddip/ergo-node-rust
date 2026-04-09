@@ -1015,7 +1015,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         false
                     };
 
-                    // NiPoPoW serving (code 90) and verification (code 91)
+                    // NiPoPoW serving (code 90) and verification (code 91).
+                    // Code 90 (GetNipopowProof) is fully consumed here — the
+                    // serve handler builds and sends the response. Code 91
+                    // (NipopowProof) is processed for logging but ALSO
+                    // forwarded to sync so the light-client bootstrap state
+                    // machine can consume it via transport.next_event(). In
+                    // non-light modes the forwarded code 91 event sits in
+                    // sync's stream and is silently dropped at the next loop
+                    // iteration as an unhandled Unknown — negligible cost.
                     let nipopow_handled = if !snapshot_handled
                         && ergo_node_rust::nipopow_serve::is_nipopow_message(code)
                     {
@@ -1028,7 +1036,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &nipopow_validated_height,
                         )
                         .await;
-                        true
+                        code == ergo_node_rust::nipopow_serve::GET_NIPOPOW_PROOF
                     } else {
                         false
                     };

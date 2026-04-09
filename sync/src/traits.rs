@@ -95,6 +95,32 @@ pub trait SyncChain {
         params: ergo_validation::Parameters,
     ) -> impl std::future::Future<Output = ()> + Send;
 
+    /// Strip a `NipopowProof` (P2P code 91) message envelope and verify the
+    /// inner proof bytes via [`enr_chain::verify_nipopow_proof_bytes`].
+    /// Returns the extracted header chain in strictly-increasing height order
+    /// on success.
+    ///
+    /// Used by the light-client bootstrap state machine. The bridge wraps
+    /// `nipopow_serve::parse_nipopow_proof` (envelope strip) +
+    /// `enr_chain::verify_nipopow_proof_bytes` (verify).
+    fn verify_nipopow_envelope(
+        &self,
+        envelope_body: &[u8],
+    ) -> impl std::future::Future<Output = Result<Vec<Header>, enr_chain::ChainError>> + Send;
+
+    /// Install a verified NiPoPoW proof's suffix as the chain's starting
+    /// point for light-client mode. Wraps
+    /// [`enr_chain::HeaderChain::install_from_nipopow_proof`].
+    ///
+    /// Precondition: chain must be empty. The headers MUST already be
+    /// verified via [`Self::verify_nipopow_envelope`] — this function does
+    /// NOT re-verify.
+    fn install_nipopow_suffix(
+        &self,
+        suffix_head: Header,
+        suffix_tail: Vec<Header>,
+    ) -> impl std::future::Future<Output = Result<(), enr_chain::ChainError>> + Send;
+
     /// Peek at the tip headers to determine peer's chain status.
     /// Returns the heights of headers in the sync info, if V2.
     fn sync_info_heights(info: &SyncInfo) -> Vec<u32> {
