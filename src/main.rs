@@ -530,8 +530,11 @@ impl ergo_api::ChainAccess for HeaderChainAdapter {
             c.header_at(height).cloned()
         })
     }
-    fn tip(&self) -> ergo_chain_types::Header {
-        self.with_chain(|c| c.tip().clone())
+    fn tip(&self) -> Option<ergo_chain_types::Header> {
+        self.with_chain(|c| {
+            let h = c.height();
+            if h == 0 { None } else { c.header_at(h).cloned() }
+        })
     }
 }
 

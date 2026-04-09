@@ -41,9 +41,13 @@ fn hex_to_id(hex_str: &str) -> Result<[u8; 32], (StatusCode, Json<ApiError>)> {
 pub async fn get_info(State(state): State<ApiState>) -> Json<NodeInfo> {
     let headers_height = state.chain.height();
     let full_height = state.validated_height.load(std::sync::atomic::Ordering::Relaxed);
-    let tip = state.chain.tip();
-    let tip_id = hex::encode(tip.id.0.as_ref());
-    let state_root = hex::encode(<[u8; 33]>::from(tip.state_root));
+    let (tip_id, state_root) = match state.chain.tip() {
+        Some(tip) => (
+            hex::encode(tip.id.0.as_ref()),
+            hex::encode(<[u8; 33]>::from(tip.state_root)),
+        ),
+        None => (String::new(), String::new()),
+    };
 
     let pool_size = state.mempool.lock().await.len();
     let peers = (state.peer_count)();

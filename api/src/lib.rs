@@ -59,7 +59,7 @@ pub trait ChainAccess: Send + Sync {
     fn height(&self) -> u32;
     fn header_at(&self, height: u32) -> Option<ergo_chain_types::Header>;
     fn header_by_id(&self, id: &[u8; 32]) -> Option<ergo_chain_types::Header>;
-    fn tip(&self) -> ergo_chain_types::Header;
+    fn tip(&self) -> Option<ergo_chain_types::Header>;
 }
 
 /// Trait for block store access.
