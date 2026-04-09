@@ -749,6 +749,12 @@ struct RootConfig {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("ergo-node-rust {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -756,8 +762,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let config_path = std::env::args()
-        .nth(1)
+    let config_path = args.get(1)
+        .cloned()
         .unwrap_or_else(|| "ergo.toml".to_string());
 
     let config = enr_p2p::config::Config::load(&config_path)?;
