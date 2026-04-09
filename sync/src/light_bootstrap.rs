@@ -304,21 +304,494 @@ async fn pick_best_proof<C: SyncChain>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use enr_chain::ChainError;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     #[test]
     fn build_get_nipopow_proof_body_no_anchor_jvm_defaults() {
-        // m=6, k=10, no anchor — the wire bytes the JVM peer expects.
-        // Hand-computed:
-        //   m=6 → zigzag(6)=12 → vlq=[0x0c]
-        //   k=10 → zigzag(10)=20 → vlq=[0x14]
-        //   present=0
-        //   pad_len=0 → vlq=[0x00]
         let body = build_get_nipopow_proof_body(6, 10, None);
         assert_eq!(body, vec![0x0c, 0x14, 0x00, 0x00]);
     }
 
-    // The bootstrap only ever sends header_id=None for first release.
-    // The with-anchor wire encoding is exercised by the
-    // src/nipopow_serve.rs round-trip tests in the main crate, which have
-    // direct access to BlockId/Digest32 construction.
+    // --- Mock infrastructure ---
+
+    fn fake_header(height: u32) -> Header {
+        use ergo_chain_types::*;
+        Header {
+            version: 2,
+            id: BlockId(Digest32::from([height as u8; 32])),
+            parent_id: BlockId(Digest32::zero()),
+            ad_proofs_root: Digest32::zero(),
+            state_root: ADDigest::zero(),
+            transaction_root: Digest32::zero(),
+            timestamp: 1_000_000 + height as u64,
+            n_bits: 100_000,
+            height,
+            extension_root: Digest32::zero(),
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce: vec![0; 8],
+                pow_distance: None,
+            },
+            votes: Votes([0, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        }
+    }
+
+    fn fake_headers(count: usize) -> Vec<Header> {
+        (1..=count as u32).map(fake_header).collect()
+    }
+
+    /// Mock transport that delivers scripted events.
+    struct MockTransport {
+        outbound: Vec<PeerId>,
+        events: VecDeque<ProtocolEvent>,
+        sent: Mutex<Vec<(PeerId, ProtocolMessage)>>,
+    }
+
+    impl MockTransport {
+        fn new(peers: Vec<PeerId>, events: Vec<ProtocolEvent>) -> Self {
+            Self {
+                outbound: peers,
+                events: events.into(),
+                sent: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl crate::traits::SyncTransport for MockTransport {
+        async fn send_to(
+            &self,
+            peer: PeerId,
+            message: ProtocolMessage,
+        ) -> Result<(), Box<dyn std::error::Error + Send>> {
+            self.sent.lock().unwrap().push((peer, message));
+            Ok(())
+        }
+
+        async fn outbound_peers(&self) -> Vec<PeerId> {
+            self.outbound.clone()
+        }
+
+        async fn next_event(&mut self) -> Option<ProtocolEvent> {
+            self.events.pop_front()
+        }
+    }
+
+    /// Verify outcome: Ok(headers) or Err(reason).
+    #[derive(Clone)]
+    enum VerifyResult {
+        Ok(Vec<Header>),
+        Err(String),
+    }
+
+    /// Compare outcome for is_better_nipopow.
+    #[derive(Clone)]
+    enum CompareResult {
+        Better,
+        Worse,
+        Err(String),
+    }
+
+    /// Mock chain that returns scripted verification and comparison results.
+    struct MockChain {
+        /// Map envelope body → verification result.
+        verify_results: Mutex<Vec<(Vec<u8>, VerifyResult)>>,
+        /// Pairwise comparison results: (this, that) → result.
+        compare_results: Mutex<Vec<(Vec<u8>, Vec<u8>, CompareResult)>>,
+        installed: Mutex<Option<(Header, Vec<Header>)>>,
+    }
+
+    impl MockChain {
+        fn new() -> Self {
+            Self {
+                verify_results: Mutex::new(Vec::new()),
+                compare_results: Mutex::new(Vec::new()),
+                installed: Mutex::new(None),
+            }
+        }
+
+        fn add_verify(&self, body: Vec<u8>, result: VerifyResult) {
+            self.verify_results.lock().unwrap().push((body, result));
+        }
+
+        fn add_compare(&self, this: Vec<u8>, than: Vec<u8>, result: CompareResult) {
+            self.compare_results.lock().unwrap().push((this, than, result));
+        }
+
+        fn installed(&self) -> Option<(Header, Vec<Header>)> {
+            self.installed.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::traits::SyncChain for MockChain {
+        async fn chain_height(&self) -> u32 { 0 }
+        async fn build_sync_info(&self) -> Vec<u8> { vec![] }
+        async fn header_at(&self, _h: u32) -> Option<Header> { None }
+        async fn header_state_root(&self, _h: u32) -> Option<[u8; 33]> { None }
+        fn parse_sync_info(&self, _b: &[u8]) -> Result<enr_chain::SyncInfo, ChainError> {
+            unimplemented!()
+        }
+        async fn active_parameters(&self) -> ergo_validation::Parameters {
+            unimplemented!()
+        }
+        async fn is_epoch_boundary(&self, _h: u32) -> bool { false }
+        async fn compute_expected_parameters(
+            &self, _h: u32,
+        ) -> Result<ergo_validation::Parameters, ChainError> {
+            unimplemented!()
+        }
+        async fn apply_epoch_boundary_parameters(&self, _p: ergo_validation::Parameters) {}
+
+        async fn verify_nipopow_envelope(
+            &self,
+            envelope_body: &[u8],
+        ) -> Result<Vec<Header>, ChainError> {
+            let results = self.verify_results.lock().unwrap();
+            for (body, result) in results.iter() {
+                if body == envelope_body {
+                    return match result {
+                        VerifyResult::Ok(h) => Ok(h.clone()),
+                        VerifyResult::Err(e) => Err(ChainError::Nipopow(e.clone())),
+                    };
+                }
+            }
+            Err(ChainError::Nipopow("unexpected envelope body in mock".into()))
+        }
+
+        async fn is_better_nipopow(
+            &self,
+            this_envelope: &[u8],
+            than_envelope: &[u8],
+        ) -> Result<bool, ChainError> {
+            let results = self.compare_results.lock().unwrap();
+            for (this, than, result) in results.iter() {
+                if this == this_envelope && than == than_envelope {
+                    return match result {
+                        CompareResult::Better => Ok(true),
+                        CompareResult::Worse => Ok(false),
+                        CompareResult::Err(e) => Err(ChainError::Nipopow(e.clone())),
+                    };
+                }
+            }
+            Err(ChainError::Nipopow("unexpected comparison in mock".into()))
+        }
+
+        async fn install_nipopow_suffix(
+            &self,
+            suffix_head: Header,
+            suffix_tail: Vec<Header>,
+        ) -> Result<(), ChainError> {
+            *self.installed.lock().unwrap() = Some((suffix_head, suffix_tail));
+            Ok(())
+        }
+    }
+
+    fn proof_event(peer: PeerId, body: Vec<u8>) -> ProtocolEvent {
+        ProtocolEvent::Message {
+            peer_id: peer,
+            message: ProtocolMessage::Unknown {
+                code: NIPOPOW_PROOF,
+                body,
+            },
+        }
+    }
+
+    // --- Bootstrap adversarial tests ---
+
+    #[tokio::test]
+    async fn bootstrap_no_responses_stream_exhausted() {
+        let peer_a = PeerId(1);
+        let peer_b = PeerId(2);
+        // No events in queue — mock returns None (stream closed).
+        let mut transport = MockTransport::new(vec![peer_a, peer_b], vec![]);
+        let chain = MockChain::new();
+
+        let result = run_light_bootstrap(&mut transport, &chain).await;
+        assert!(matches!(result, Err(LightBootstrapError::StreamClosed)));
+        assert!(chain.installed().is_none());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_all_peers_hostile() {
+        let peer_a = PeerId(1);
+        let body_a = vec![0xaa];
+        let chain = MockChain::new();
+        chain.add_verify(body_a.clone(), VerifyResult::Err("bad proof".into()));
+
+        let mut transport = MockTransport::new(
+            vec![peer_a],
+            vec![proof_event(peer_a, body_a)],
+        );
+
+        let result = run_light_bootstrap(&mut transport, &chain).await;
+        assert!(matches!(result, Err(LightBootstrapError::AllPeersHostile(_))));
+        assert!(chain.installed().is_none());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_single_valid_proof_installs() {
+        let peer_a = PeerId(1);
+        let body_a = vec![0xaa];
+        let headers = fake_headers(15); // 15 > k=10
+        let chain = MockChain::new();
+        chain.add_verify(body_a.clone(), VerifyResult::Ok(headers.clone()));
+
+        let mut transport = MockTransport::new(
+            vec![peer_a],
+            vec![proof_event(peer_a, body_a)],
+        );
+
+        let result = run_light_bootstrap(&mut transport, &chain).await;
+        assert!(result.is_ok());
+        let (head, tail) = chain.installed().expect("should have installed");
+        // suffix_head is the (len-k)th header, tail is the remaining k-1
+        assert_eq!(head.height, 6); // headers[5] (0-indexed), height 6
+        assert_eq!(tail.len(), P2P_NIPOPOW_K as usize - 1);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_mix_hostile_and_valid() {
+        let peer_a = PeerId(1);
+        let peer_b = PeerId(2);
+        let body_a = vec![0xaa];
+        let body_b = vec![0xbb];
+        let headers = fake_headers(15);
+        let chain = MockChain::new();
+        chain.add_verify(body_a.clone(), VerifyResult::Err("invalid".into()));
+        chain.add_verify(body_b.clone(), VerifyResult::Ok(headers));
+
+        let mut transport = MockTransport::new(
+            vec![peer_a, peer_b],
+            vec![
+                proof_event(peer_a, body_a),
+                proof_event(peer_b, body_b),
+            ],
+        );
+
+        let result = run_light_bootstrap(&mut transport, &chain).await;
+        assert!(result.is_ok());
+        assert!(chain.installed().is_some());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_two_valid_proofs_picks_better() {
+        let peer_a = PeerId(1);
+        let peer_b = PeerId(2);
+        let body_a = vec![0xaa];
+        let body_b = vec![0xbb];
+        let headers_a = fake_headers(15);
+        let headers_b = fake_headers(15);
+        let chain = MockChain::new();
+        chain.add_verify(body_a.clone(), VerifyResult::Ok(headers_a));
+        chain.add_verify(body_b.clone(), VerifyResult::Ok(headers_b));
+        // Peer B's proof is better than A's.
+        chain.add_compare(body_b.clone(), body_a.clone(), CompareResult::Better);
+
+        let mut transport = MockTransport::new(
+            vec![peer_a, peer_b],
+            vec![
+                proof_event(peer_a, body_a),
+                proof_event(peer_b, body_b),
+            ],
+        );
+
+        let result = run_light_bootstrap(&mut transport, &chain).await;
+        assert!(result.is_ok());
+        // Should have installed (peer B was better).
+        assert!(chain.installed().is_some());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_comparison_failure_falls_back_to_incumbent() {
+        let peer_a = PeerId(1);
+        let peer_b = PeerId(2);
+        let body_a = vec![0xaa];
+        let body_b = vec![0xbb];
+        let headers_a = fake_headers(15);
+        let headers_b = fake_headers(15);
+        let chain = MockChain::new();
+        chain.add_verify(body_a.clone(), VerifyResult::Ok(headers_a));
+        chain.add_verify(body_b.clone(), VerifyResult::Ok(headers_b));
+        // Comparison fails — should fall back to incumbent (peer A, first valid).
+        chain.add_compare(body_b.clone(), body_a.clone(), CompareResult::Err("parse failed".into()));
+
+        let mut transport = MockTransport::new(
+            vec![peer_a, peer_b],
+            vec![
+                proof_event(peer_a, body_a),
+                proof_event(peer_b, body_b),
+            ],
+        );
+
+        let result = run_light_bootstrap(&mut transport, &chain).await;
+        assert!(result.is_ok());
+        assert!(chain.installed().is_some());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_stream_closes_after_partial_collection() {
+        let peer_a = PeerId(1);
+        let peer_b = PeerId(2);
+        let body_a = vec![0xaa];
+        let chain = MockChain::new();
+        // Peer A sends an invalid proof, then stream closes before B responds.
+        chain.add_verify(body_a.clone(), VerifyResult::Err("bad".into()));
+
+        let mut transport = MockTransport::new(
+            vec![peer_a, peer_b],
+            vec![proof_event(peer_a, body_a)],
+            // After this event, next_event returns None (stream closed).
+        );
+
+        let result = run_light_bootstrap(&mut transport, &chain).await;
+        // Stream closed after collecting one hostile proof, so StreamClosed.
+        assert!(matches!(result, Err(LightBootstrapError::StreamClosed)));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_ignores_unsolicited_peer() {
+        let peer_a = PeerId(1);
+        let peer_rogue = PeerId(99);
+        let body_a = vec![0xaa];
+        let body_rogue = vec![0xff];
+        let headers = fake_headers(15);
+        let chain = MockChain::new();
+        chain.add_verify(body_a.clone(), VerifyResult::Ok(headers));
+        // Don't add verify for rogue — it should never be called.
+
+        let mut transport = MockTransport::new(
+            vec![peer_a],
+            vec![
+                // Rogue peer sends a proof — should be ignored.
+                proof_event(peer_rogue, body_rogue),
+                // Real peer sends valid proof.
+                proof_event(peer_a, body_a),
+            ],
+        );
+
+        let result = run_light_bootstrap(&mut transport, &chain).await;
+        assert!(result.is_ok());
+        assert!(chain.installed().is_some());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_ignores_non_proof_messages() {
+        let peer_a = PeerId(1);
+        let body_a = vec![0xaa];
+        let headers = fake_headers(15);
+        let chain = MockChain::new();
+        chain.add_verify(body_a.clone(), VerifyResult::Ok(headers));
+
+        let mut transport = MockTransport::new(
+            vec![peer_a],
+            vec![
+                // Non-code-91 Unknown message — should be ignored.
+                ProtocolEvent::Message {
+                    peer_id: peer_a,
+                    message: ProtocolMessage::Unknown {
+                        code: 42,
+                        body: vec![0xde, 0xad],
+                    },
+                },
+                // Non-Unknown message — should be ignored.
+                ProtocolEvent::Message {
+                    peer_id: peer_a,
+                    message: ProtocolMessage::Peers { body: vec![] },
+                },
+                // Valid proof.
+                proof_event(peer_a, body_a),
+            ],
+        );
+
+        let result = run_light_bootstrap(&mut transport, &chain).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_proof_too_few_headers_for_k() {
+        let peer_a = PeerId(1);
+        let body_a = vec![0xaa];
+        // Only 5 headers — less than k=10.
+        let headers = fake_headers(5);
+        let chain = MockChain::new();
+        chain.add_verify(body_a.clone(), VerifyResult::Ok(headers));
+
+        let mut transport = MockTransport::new(
+            vec![peer_a],
+            vec![proof_event(peer_a, body_a)],
+        );
+
+        let result = run_light_bootstrap(&mut transport, &chain).await;
+        // Proof with fewer headers than k is treated as hostile.
+        assert!(matches!(result, Err(LightBootstrapError::AllPeersHostile(_))));
+        assert!(chain.installed().is_none());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_skips_already_populated_chain() {
+        let peer_a = PeerId(1);
+        let mut transport = MockTransport::new(vec![peer_a], vec![]);
+
+        // Chain already has headers — MockChain returns 0, we need a non-zero one.
+        struct PopulatedChain;
+        impl crate::traits::SyncChain for PopulatedChain {
+            async fn chain_height(&self) -> u32 { 100 }
+            async fn build_sync_info(&self) -> Vec<u8> { vec![] }
+            async fn header_at(&self, _h: u32) -> Option<Header> { None }
+            async fn header_state_root(&self, _h: u32) -> Option<[u8; 33]> { None }
+            fn parse_sync_info(&self, _b: &[u8]) -> Result<enr_chain::SyncInfo, ChainError> {
+                unimplemented!()
+            }
+            async fn active_parameters(&self) -> ergo_validation::Parameters { unimplemented!() }
+            async fn is_epoch_boundary(&self, _h: u32) -> bool { false }
+            async fn compute_expected_parameters(
+                &self, _h: u32,
+            ) -> Result<ergo_validation::Parameters, ChainError> { unimplemented!() }
+            async fn apply_epoch_boundary_parameters(&self, _p: ergo_validation::Parameters) {}
+            async fn verify_nipopow_envelope(&self, _b: &[u8]) -> Result<Vec<Header>, ChainError> {
+                unimplemented!()
+            }
+            async fn is_better_nipopow(&self, _a: &[u8], _b: &[u8]) -> Result<bool, ChainError> {
+                unimplemented!()
+            }
+            async fn install_nipopow_suffix(
+                &self, _h: Header, _t: Vec<Header>,
+            ) -> Result<(), ChainError> { unimplemented!() }
+        }
+
+        let result = run_light_bootstrap(&mut transport, &PopulatedChain).await;
+        assert!(result.is_ok()); // Should return immediately.
+    }
+
+    #[tokio::test]
+    async fn bootstrap_broadcasts_to_all_peers() {
+        let peers = vec![PeerId(1), PeerId(2), PeerId(3)];
+        let body = vec![0xaa];
+        let headers = fake_headers(15);
+        let chain = MockChain::new();
+        chain.add_verify(body.clone(), VerifyResult::Ok(headers));
+
+        let mut transport = MockTransport::new(
+            peers.clone(),
+            vec![proof_event(PeerId(1), body)],
+        );
+
+        let _ = run_light_bootstrap(&mut transport, &chain).await;
+
+        // Should have sent GetNipopowProof to all 3 peers.
+        let sent = transport.sent.lock().unwrap();
+        assert_eq!(sent.len(), 3);
+        for (i, (peer, msg)) in sent.iter().enumerate() {
+            assert_eq!(*peer, peers[i]);
+            match msg {
+                ProtocolMessage::Unknown { code, .. } => {
+                    assert_eq!(*code, GET_NIPOPOW_PROOF);
+                }
+                _ => panic!("expected Unknown message"),
+            }
+        }
+    }
 }
