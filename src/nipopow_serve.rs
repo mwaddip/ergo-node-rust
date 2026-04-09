@@ -393,20 +393,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // SIGABRT — sigma-rust allocates Vec::with_capacity(huge) before reading.
-              // Tracked: fix in sigma-rust scorex_parse to cap counts against cursor length.
     fn verify_nipopow_crafted_huge_prefix_count() {
         // Craft inner bytes that claim num_prefixes = 0x7FFFFFFF.
-        // sigma-rust's NipopowProof::scorex_parse does Vec::with_capacity(num)
-        // before any reads — a 20-byte payload triggers a 790GB allocation.
+        // Before sigma-rust fix (3ca4af0b): Vec::with_capacity(2B) → 790GB
+        // alloc → SIGABRT. After fix: capped at 20,000, returns parse error.
         let mut inner = Vec::new();
         inner.put_u32(6).unwrap(); // m
         inner.put_u32(10).unwrap(); // k
         inner.put_u32(0x7FFF_FFFF).unwrap(); // num_prefixes = 2 billion
-        // No actual prefix data follows.
 
         let result = enr_chain::verify_nipopow_proof_bytes(&inner);
-        // After sigma-rust fix: should fail parsing, not OOM.
         assert!(result.is_err());
     }
 

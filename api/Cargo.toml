@@ -5,8 +5,8 @@ edition = "2021"
 description = "REST API for ergo-node-rust"
 
 [dependencies]
-ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "66e94f3" }
-ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "66e94f3" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "3ca4af0b" }
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "3ca4af0b" }
 ergo-mempool = { path = "../mempool" }
 ergo-mining = { path = "../mining" }
 ergo-validation = { path = "../validation" }
