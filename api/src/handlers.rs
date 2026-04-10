@@ -444,6 +444,108 @@ pub async fn get_connected_peers(State(state): State<ApiState>) -> Json<serde_js
 }
 
 // ---------------------------------------------------------------------------
+// GET /peers/api-urls
+// ---------------------------------------------------------------------------
+
+pub async fn get_peer_api_urls(State(state): State<ApiState>) -> Json<Vec<PeerApiUrl>> {
+    let peers = (state.peer_api_urls)();
+    let mut urls = Vec::new();
+    for info in peers {
+        if let Some(ref url_str) = info.rest_url {
+            // Security: only expose URLs whose hostname matches the peer's socket IP.
+            if url_host_matches_addr(url_str, &info.addr) {
+                urls.push(PeerApiUrl {
+                    peer_id: info.peer_id,
+                    url: url_str.clone(),
+                });
+            }
+        }
+    }
+    Json(urls)
+}
+
+/// Check that a URL's host component matches a socket address IP.
+/// Rejects peers that advertise URLs pointing to a different host.
+fn url_host_matches_addr(url: &str, addr: &std::net::SocketAddr) -> bool {
+    // Parse "http://1.2.3.4:9053" or "http://[::1]:9053" — extract host between :// and next : or /
+    let Some(after_scheme) = url.split("://").nth(1) else { return false };
+    let host_part = after_scheme.split('/').next().unwrap_or(after_scheme);
+
+    // Handle IPv6 bracket notation: [::1]:9053
+    let host = if host_part.starts_with('[') {
+        host_part.split(']').next().unwrap_or("").trim_start_matches('[')
+    } else {
+        // IPv4: strip port
+        host_part.split(':').next().unwrap_or(host_part)
+    };
+
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip == addr.ip(),
+        Err(_) => false, // DNS names rejected — IP only
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /ingest/modifiers
+// ---------------------------------------------------------------------------
+
+pub async fn post_ingest_modifiers(
+    axum::extract::ConnectInfo(remote): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(state): State<ApiState>,
+    body: axum::body::Bytes,
+) -> ApiResult<serde_json::Value> {
+    // Localhost-only: reject requests from non-loopback addresses
+    if !remote.ip().is_loopback() {
+        return err(StatusCode::FORBIDDEN, "ingest endpoint is localhost-only");
+    }
+
+    let Some(ref tx) = state.modifier_tx else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "modifier pipeline not available");
+    };
+
+    // Parse body: sequence of (type_id: u8, modifier_id: [u8; 32], data_len: u32 BE, data: [u8])
+    let mut cursor = 0;
+    let mut count = 0u32;
+    while cursor < body.len() {
+        // type_id (1) + modifier_id (32) + data_len (4) = 37 bytes minimum
+        if cursor + 37 > body.len() {
+            return err(StatusCode::BAD_REQUEST, format!(
+                "truncated modifier header at offset {cursor}"
+            ));
+        }
+
+        let type_id = body[cursor];
+        cursor += 1;
+
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&body[cursor..cursor + 32]);
+        cursor += 32;
+
+        let data_len = u32::from_be_bytes(
+            body[cursor..cursor + 4].try_into().unwrap()
+        ) as usize;
+        cursor += 4;
+
+        if cursor + data_len > body.len() {
+            return err(StatusCode::BAD_REQUEST, format!(
+                "truncated modifier data at offset {cursor}: need {data_len} bytes"
+            ));
+        }
+
+        let data = body[cursor..cursor + data_len].to_vec();
+        cursor += data_len;
+
+        if tx.try_send((type_id, id, data)).is_err() {
+            return err(StatusCode::SERVICE_UNAVAILABLE, "pipeline channel full");
+        }
+        count += 1;
+    }
+
+    tracing::info!(count, bytes = body.len(), "ingested modifiers via REST");
+    Ok(Json(serde_json::json!({ "accepted": count })))
+}
+
+// ---------------------------------------------------------------------------
 // GET /emission/at/{height}
 // ---------------------------------------------------------------------------
 
@@ -624,4 +726,37 @@ pub async fn post_mining_solution(
 
     tracing::info!("valid mining solution accepted, block submitted");
     Ok(Json(serde_json::json!({ "status": "accepted" })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn url_host_matches_ipv4() {
+        let addr: SocketAddr = "213.239.193.208:9030".parse().unwrap();
+        assert!(url_host_matches_addr("http://213.239.193.208:9053", &addr));
+        assert!(!url_host_matches_addr("http://1.2.3.4:9053", &addr));
+    }
+
+    #[test]
+    fn url_host_matches_ipv6() {
+        let addr: SocketAddr = "[::1]:9030".parse().unwrap();
+        assert!(url_host_matches_addr("http://[::1]:9053", &addr));
+        assert!(!url_host_matches_addr("http://[::2]:9053", &addr));
+    }
+
+    #[test]
+    fn url_host_rejects_dns() {
+        let addr: SocketAddr = "213.239.193.208:9030".parse().unwrap();
+        assert!(!url_host_matches_addr("http://example.com:9053", &addr));
+    }
+
+    #[test]
+    fn url_host_rejects_garbage() {
+        let addr: SocketAddr = "127.0.0.1:9030".parse().unwrap();
+        assert!(!url_host_matches_addr("not-a-url", &addr));
+        assert!(!url_host_matches_addr("", &addr));
+    }
 }

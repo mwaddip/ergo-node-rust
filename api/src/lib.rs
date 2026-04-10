@@ -37,6 +37,10 @@ pub struct ApiState {
     pub block_submitter: Option<Arc<dyn BlockSubmitter>>,
     /// Last fully validated block height (updated by the validator).
     pub validated_height: Arc<AtomicU32>,
+    /// Peer REST URL callback — returns connected peers with their socket addr and REST URL.
+    pub peer_api_urls: Arc<dyn Fn() -> Vec<PeerRestInfo> + Send + Sync>,
+    /// Modifier pipeline sender — for the /ingest/modifiers endpoint.
+    pub modifier_tx: Option<tokio::sync::mpsc::Sender<(u8, [u8; 32], Vec<u8>)>>,
 }
 
 /// Static node metadata.
@@ -51,6 +55,13 @@ pub struct NodeMeta {
 /// Peer count summary.
 pub struct PeerCounts {
     pub connected: usize,
+}
+
+/// Per-peer REST info returned by the peer_api_urls callback.
+pub struct PeerRestInfo {
+    pub peer_id: u64,
+    pub addr: std::net::SocketAddr,
+    pub rest_url: Option<String>,
 }
 
 /// Trait for chain access — avoids API depending on enr-chain internals.
@@ -116,6 +127,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/utxo/withPool/byId/{box_id}", get(handlers::get_utxo_with_pool))
         // Peers
         .route("/peers/connected", get(handlers::get_connected_peers))
+        .route("/peers/api-urls", get(handlers::get_peer_api_urls))
+        // Ingest (localhost only)
+        .route("/ingest/modifiers", axum::routing::post(handlers::post_ingest_modifiers))
         // Emission
         .route("/emission/at/{height}", get(handlers::get_emission_at))
         // Mining
@@ -132,7 +146,7 @@ pub async fn serve(
     state: ApiState,
     bind_addr: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let app = router(state);
+    let app = router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(%bind_addr, "REST API listening");
     axum::serve(listener, app).await?;

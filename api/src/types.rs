@@ -43,3 +43,11 @@ pub struct FeeResponse {
     pub fee: u64,
 }
 
+/// GET /peers/api-urls response entry.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerApiUrl {
+    pub peer_id: u64,
+    pub url: String,
+}
+

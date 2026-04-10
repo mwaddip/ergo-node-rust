@@ -1738,6 +1738,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let api_mempool = mempool.clone();
         let api_state_ctx = shared_state_context.clone();
         let p2p_for_api = p2p.clone();
+        let p2p_for_api_urls = p2p.clone();
 
         // Mining: construct CandidateGenerator + mining task if configured
         let mining_generator: Option<Arc<ergo_mining::CandidateGenerator>> =
@@ -1904,6 +1905,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }) as Arc<dyn ergo_api::BlockSubmitter>
             }),
             validated_height: shared_validated_height.clone(),
+            peer_api_urls: Arc::new(move || {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(p2p_for_api_urls.peer_rest_urls())
+                })
+                .into_iter()
+                .map(|(peer_id, addr, rest_url)| ergo_api::PeerRestInfo {
+                    peer_id: peer_id.0,
+                    addr,
+                    rest_url,
+                })
+                .collect()
+            }),
+            modifier_tx: Some(modifier_tx_for_mining.clone()),
             node_info: ergo_api::NodeMeta {
                 name: "ergo-node-rust".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
