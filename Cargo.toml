@@ -1,5 +1,6 @@
 [workspace]
 members = [".", "sync", "validation", "state", "mempool", "api", "mining"]
+exclude = ["addons/fastsync", "addons/indexer"]
 
 [package]
 name = "ergo-node-rust"

@@ -41,6 +41,8 @@ pub struct ApiState {
     pub peer_api_urls: Arc<dyn Fn() -> Vec<PeerRestInfo> + Send + Sync>,
     /// Modifier pipeline sender — for the /ingest/modifiers endpoint.
     pub modifier_tx: Option<tokio::sync::mpsc::Sender<(u8, [u8; 32], Vec<u8>, Option<u64>)>>,
+    /// Watch channel for validated block height — used by /info/wait long-poll.
+    pub height_watch: tokio::sync::watch::Receiver<u32>,
 }
 
 /// Static node metadata.
@@ -77,6 +79,9 @@ pub trait ChainAccess: Send + Sync {
 pub trait StoreAccess: Send + Sync {
     /// Get raw modifier bytes by type ID and modifier ID.
     fn get(&self, type_id: u8, id: &[u8; 32]) -> Option<Vec<u8>>;
+    /// Get raw modifier bytes by type ID and block height.
+    /// Looks up the modifier ID at that height first, then fetches the data.
+    fn get_at_height(&self, type_id: u8, height: u32) -> Option<Vec<u8>>;
 }
 
 /// Trait for UTXO lookups.
@@ -109,6 +114,7 @@ pub fn router(state: ApiState) -> Router {
     Router::new()
         // Node info
         .route("/info", get(handlers::get_info))
+        .route("/info/wait", get(handlers::info_wait))
         // Blocks
         .route("/blocks/at/{height}", get(handlers::get_block_ids_at_height))
         .route("/blocks/{header_id}/header", get(handlers::get_block_header))

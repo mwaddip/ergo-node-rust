@@ -165,6 +165,8 @@ struct Validator {
     shared_state_context: Arc<tokio::sync::RwLock<Option<ergo_validation::ErgoStateContext>>>,
     /// Sends confirmed transactions to the mempool task after each block.
     block_applied_tx: tokio::sync::mpsc::Sender<Vec<ergo_validation::Transaction>>,
+    /// Notifies the /info/wait long-poll endpoint when a new block is validated.
+    height_watch_tx: tokio::sync::watch::Sender<u32>,
     /// Mining proof pre-computation (None if mining not configured or digest mode).
     mining: Option<MiningCtx>,
 }
@@ -180,6 +182,7 @@ impl Validator {
         shared_height: Arc<std::sync::atomic::AtomicU32>,
         shared_state_context: Arc<tokio::sync::RwLock<Option<ergo_validation::ErgoStateContext>>>,
         block_applied_tx: tokio::sync::mpsc::Sender<Vec<ergo_validation::Transaction>>,
+        height_watch_tx: tokio::sync::watch::Sender<u32>,
         mining: Option<MiningCtx>,
     ) -> Self {
         let h = match &inner {
@@ -187,7 +190,8 @@ impl Validator {
             ValidatorInner::Utxo(v) => v.validated_height(),
         };
         shared_height.store(h, std::sync::atomic::Ordering::Relaxed);
-        Self { inner, shared_height, shared_state_context, block_applied_tx, mining }
+        let _ = height_watch_tx.send(h);
+        Self { inner, shared_height, shared_state_context, block_applied_tx, height_watch_tx, mining }
     }
 
     /// Pre-compute mining proofs after a successful block validation.
@@ -276,7 +280,9 @@ impl BlockValidator for Validator {
             ),
         };
         if result.is_ok() {
-            self.shared_height.store(self.validated_height(), std::sync::atomic::Ordering::Relaxed);
+            let h = self.validated_height();
+            self.shared_height.store(h, std::sync::atomic::Ordering::Relaxed);
+            let _ = self.height_watch_tx.send(h);
 
             // Publish state context for mempool/API transaction validation.
             // Only when we have preceding headers (height > 0).
@@ -329,7 +335,9 @@ impl BlockValidator for Validator {
             ValidatorInner::Digest(v) => v.reset_to(height, digest),
             ValidatorInner::Utxo(v) => v.reset_to(height, digest),
         };
-        self.shared_height.store(self.validated_height(), std::sync::atomic::Ordering::Relaxed);
+        let h = self.validated_height();
+        self.shared_height.store(h, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.height_watch_tx.send(h);
     }
 
     fn proofs_for_transactions(
@@ -579,6 +587,11 @@ impl ergo_api::StoreAccess for StoreAdapter {
     fn get(&self, type_id: u8, id: &[u8; 32]) -> Option<Vec<u8>> {
         self.store.get(type_id, id).ok().flatten()
     }
+
+    fn get_at_height(&self, type_id: u8, height: u32) -> Option<Vec<u8>> {
+        let modifier_id = self.store.get_id_at(type_id, height).ok().flatten()?;
+        self.store.get(type_id, &modifier_id).ok().flatten()
+    }
 }
 
 /// Adapter: SnapshotReader → UtxoAccess for the API crate.
@@ -724,6 +737,15 @@ struct NodeConfig {
     /// REST API bind address (default: 0.0.0.0:9053 testnet, 0.0.0.0:9052 mainnet).
     #[serde(default)]
     api_address: Option<String>,
+    /// Auto-spawn `ergo-fastsync` on startup if the binary is in PATH.
+    /// Fastsync fetches headers/blocks from JVM peers over HTTP and pushes
+    /// them via the ingest endpoint — much faster than P2P for cold starts.
+    #[serde(default = "default_fastsync")]
+    fastsync: bool,
+    /// Override peer URL for fastsync instead of auto-discovering via
+    /// /peers/api-urls. Example: "http://213.239.193.208:9053"
+    #[serde(default)]
+    fastsync_peer: Option<String>,
     /// Mining configuration.
     #[serde(default)]
     mining: MiningConfig,
@@ -745,6 +767,8 @@ impl Default for NodeConfig {
             mempool_capacity: default_mempool_capacity(),
             min_fee: default_min_fee(),
             api_address: None,
+            fastsync: default_fastsync(),
+            fastsync_peer: None,
             mining: MiningConfig::default(),
         }
     }
@@ -773,6 +797,9 @@ fn default_mempool_capacity() -> usize {
 }
 fn default_min_fee() -> u64 {
     1_000_000
+}
+fn default_fastsync() -> bool {
+    true
 }
 
 /// Top-level config wrapper — just the [node] section, P2P is parsed separately.
@@ -1150,6 +1177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(tokio::sync::RwLock::new(None));
     let (block_applied_tx, block_applied_rx) =
         tokio::sync::mpsc::channel::<Vec<ergo_validation::Transaction>>(64);
+    let (height_watch_tx, height_watch_rx) = tokio::sync::watch::channel(0u32);
     let chain_guard = chain.lock().await;
 
     let mut snapshot_reader: Option<SnapshotReader> = None;
@@ -1219,6 +1247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     shared_validated_height.clone(),
                     shared_state_context.clone(),
                     block_applied_tx.clone(),
+                    height_watch_tx.clone(),
                     mining_ctx,
                 ))
             } else if utxo_bootstrap {
@@ -1263,6 +1292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     shared_validated_height.clone(),
                     shared_state_context.clone(),
                     block_applied_tx.clone(),
+                    height_watch_tx.clone(),
                     mining_ctx,
                 ))
             }
@@ -1338,6 +1368,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 shared_validated_height.clone(),
                 shared_state_context.clone(),
                 block_applied_tx.clone(),
+                height_watch_tx.clone(),
                 None, // mining requires UTXO mode
             ))
         }
@@ -1439,6 +1470,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         shared_validated_height.clone(),
                         shared_state_context.clone(),
                         block_applied_tx.clone(),
+                        height_watch_tx.clone(),
                         None, // TODO: mining ctx for snapshot bootstrap
                     );
                     // Publish the bootstrap snapshot height to the
@@ -1919,6 +1951,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect()
             }),
             modifier_tx: Some(modifier_tx_for_mining.clone()),
+            height_watch: height_watch_rx,
             node_info: ergo_api::NodeMeta {
                 name: "ergo-node-rust".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1939,6 +1972,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::error!("REST API server failed: {e}");
             }
         });
+
+        // Auto-spawn fastsync if enabled and the binary is in PATH.
+        // Runs after a delay to let peers connect so /peers/api-urls has URLs.
+        if node_config.fastsync {
+            let fastsync_peer = node_config.fastsync_peer.clone();
+            let api_port = api_bind_addr.port();
+            tokio::spawn(async move {
+                // Wait for peers to connect before starting fastsync
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+                // Check if the binary exists
+                let probe = tokio::process::Command::new("ergo-fastsync")
+                    .arg("--version")
+                    .output()
+                    .await;
+                if probe.is_err() || !probe.unwrap().status.success() {
+                    tracing::debug!("ergo-fastsync not found in PATH, skipping fast sync");
+                    return;
+                }
+
+                let node_url = format!("http://127.0.0.1:{api_port}");
+                let mut cmd = tokio::process::Command::new("ergo-fastsync");
+                cmd.arg("--node-url").arg(&node_url);
+                if let Some(ref peer) = fastsync_peer {
+                    cmd.arg("--peer-url").arg(peer);
+                }
+                tracing::info!("starting fastsync");
+                match cmd.status().await {
+                    Ok(s) if s.success() => tracing::info!("fastsync completed"),
+                    Ok(s) => tracing::warn!(code = ?s.code(), "fastsync exited with error"),
+                    Err(e) => tracing::warn!(error = %e, "fastsync spawn failed"),
+                }
+            });
+        }
     }
 
     tracing::info!("Ergo node running");

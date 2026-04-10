@@ -1,0 +1,47 @@
+[workspace]
+
+[package]
+name = "ergo-indexer"
+version = "0.1.0"
+edition = "2021"
+description = "Blockchain indexer for ergo-node-rust — rich query API over SQLite or PostgreSQL"
+
+[features]
+default = ["sqlite"]
+sqlite = ["dep:rusqlite"]
+postgres = ["dep:sqlx"]
+
+[dependencies]
+# Ergo types — address derivation, register decoding
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "3ca4af0b" }
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "3ca4af0b" }
+
+# HTTP client — rustls for static binary
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+
+# Query API
+axum = "0.8"
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+
+# Database backends
+rusqlite = { version = "0.33", features = ["bundled"], optional = true }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"], optional = true }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+hex = "0.4"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Crypto (blake2b256 for ergo_tree_hash)
+blake2 = "0.10"
+
+# Misc
+anyhow = "1"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

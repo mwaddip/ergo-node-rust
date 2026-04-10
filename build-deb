@@ -46,3 +46,41 @@ rm -rf "target/${PKG}"
 echo ""
 echo "Built: target/${PKG}.deb"
 ls -lh "target/${PKG}.deb"
+
+# --- Optional: indexer addon ---
+if [[ "${1:-}" == "--with-indexer" ]]; then
+    echo ""
+    echo "Building ergo-indexer..."
+    (cd addons/indexer && cargo build --release)
+
+    IDX_PKG="ergo-node-rust-indexer_${VERSION}_${ARCH}"
+    rm -rf "target/${IDX_PKG}"
+    mkdir -p "target/${IDX_PKG}/DEBIAN"
+    mkdir -p "target/${IDX_PKG}/usr/bin"
+    mkdir -p "target/${IDX_PKG}/usr/lib/systemd/system"
+    mkdir -p "target/${IDX_PKG}/var/lib/ergo-indexer"
+
+    cp addons/indexer/target/release/ergo-indexer "target/${IDX_PKG}/usr/bin/"
+    strip "target/${IDX_PKG}/usr/bin/ergo-indexer"
+    cp deploy/ergo-indexer.service "target/${IDX_PKG}/usr/lib/systemd/system/"
+
+    cat > "target/${IDX_PKG}/DEBIAN/control" <<CTRL
+Package: ergo-node-rust-indexer
+Version: ${VERSION}
+Architecture: ${ARCH}
+Depends: ergo-node-rust (>= ${VERSION})
+Maintainer: mwaddip
+Description: Blockchain indexer for ergo-node-rust
+ Rich query API over SQLite — box lookup by address, transaction history,
+ token metadata, and network statistics.
+CTRL
+    SIZE=$(du -sk "target/${IDX_PKG}" | cut -f1)
+    echo "Installed-Size: ${SIZE}" >> "target/${IDX_PKG}/DEBIAN/control"
+
+    dpkg-deb --build "target/${IDX_PKG}"
+    rm -rf "target/${IDX_PKG}"
+
+    echo ""
+    echo "Built: target/${IDX_PKG}.deb"
+    ls -lh "target/${IDX_PKG}.deb"
+fi

@@ -159,6 +159,8 @@ impl ValidationPipeline {
         let mut raw_headers: Vec<(&[u8], Option<u64>)> = Vec::new();
         let mut section_entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = Vec::new();
 
+        {
+        let chain_guard = self.chain.lock().await;
         for (type_id, id, data, peer_id) in &batch {
             received_ids.push(*id);
             if *type_id == HEADER_TYPE_ID {
@@ -169,12 +171,20 @@ impl ValidationPipeline {
                     let _ = tx_sender.try_send((*id, data.clone()));
                 }
             } else if !data.is_empty() {
-                // Height 0 signals "height unknown" — the store skips the height
-                // index write for height=0. The sync machine pre-registers the
-                // correct height via SyncStore::put_height before data arrives.
-                section_entries.push((*type_id, *id, 0, data.clone()));
+                // Block sections (102=BlockTransactions, 104=ADProofs, 108=Extension)
+                // have the header ID in the first 32 bytes. Look up the header to
+                // derive the height so the store can index by (type_id, height).
+                let height = if data.len() >= 32 {
+                    let header_id: [u8; 32] = data[..32].try_into().unwrap();
+                    let block_id = ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(header_id));
+                    chain_guard.height_of(&block_id).unwrap_or(0)
+                } else {
+                    0
+                };
+                section_entries.push((*type_id, *id, height, data.clone()));
             }
         }
+        } // drop chain_guard
 
         // Notify delivery tracker (data plane — ok to drop)
         if !received_ids.is_empty() {

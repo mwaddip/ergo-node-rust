@@ -24,6 +24,19 @@ fn mining_err() -> (StatusCode, Json<ApiError>) {
     }))
 }
 
+/// Compute modifier ID = blake2b256(type_id || header_id || section_root).
+/// Matches JVM's `Algos.hash.prefixedHash`.
+fn section_modifier_id(type_id: u8, header_id: &[u8; 32], root: &[u8]) -> [u8; 32] {
+    use blake2::digest::consts::U32;
+    use blake2::{Blake2b, Digest};
+    type Blake2b256 = Blake2b<U32>;
+    let mut hasher = Blake2b256::new();
+    hasher.update([type_id]);
+    hasher.update(header_id);
+    hasher.update(root);
+    hasher.finalize().into()
+}
+
 fn hex_to_id(hex_str: &str) -> Result<[u8; 32], (StatusCode, Json<ApiError>)> {
     let bytes = hex::decode(hex_str).map_err(|_| {
         (StatusCode::BAD_REQUEST, Json(ApiError { error: 400, reason: "invalid hex ID".into(), detail: None }))
@@ -107,15 +120,20 @@ pub async fn get_block_header(
 // GET /blocks/{header_id}/transactions
 // ---------------------------------------------------------------------------
 
-/// Block transactions section type ID (Ergo modifier type 104).
-const BLOCK_TRANSACTIONS_TYPE: u8 = 104;
+/// Block transactions section type ID (Ergo modifier type 102).
+const BLOCK_TRANSACTIONS_TYPE: u8 = 102;
 
 pub async fn get_block_transactions(
     State(state): State<ApiState>,
     Path(header_id): Path<String>,
 ) -> ApiResult<serde_json::Value> {
     let id = hex_to_id(&header_id)?;
-    match state.store.get(BLOCK_TRANSACTIONS_TYPE, &id) {
+    // Block transactions are keyed by modifier ID = blake2b256(type_id || header_id || tx_root),
+    // not by header ID. Compute the modifier ID from the header.
+    let header = state.chain.header_by_id(&id)
+        .ok_or_else(|| err::<()>(StatusCode::NOT_FOUND, "header not found").unwrap_err())?;
+    let modifier_id = section_modifier_id(BLOCK_TRANSACTIONS_TYPE, &id, header.transaction_root.0.as_ref());
+    match state.store.get(BLOCK_TRANSACTIONS_TYPE, &modifier_id) {
         Some(data) => {
             match ergo_validation::parse_block_transactions(&data) {
                 Ok(parsed) => Ok(Json(serde_json::json!({
@@ -640,14 +658,18 @@ pub async fn post_mining_solution(
         return err(StatusCode::BAD_REQUEST, "nonce must be exactly 8 bytes");
     }
 
-    // Get cached candidate
-    let candidate = mining.cached_block().ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, Json(ApiError {
-            error: 400,
-            reason: "no current candidate — fetch /mining/candidate first".into(),
-            detail: None,
-        }))
-    })?;
+    // Collect candidates to try: current first, then previous (so a GPU
+    // miner solving the old candidate while a regen occurred still works).
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(c) = mining.cached_block() {
+        candidates.push(c);
+    }
+    if let Some(p) = mining.previous_block() {
+        candidates.push(p);
+    }
+    if candidates.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "no current candidate — fetch /mining/candidate first");
+    }
 
     // Build Autolykos v2 solution (miner_pk not used in PoW calc, use configured pk)
     let solution = ergo_chain_types::AutolykosSolution {
@@ -657,8 +679,17 @@ pub async fn post_mining_solution(
         pow_distance: None,
     };
 
-    // Validate PoW
-    let header = ergo_mining::solution::validate_solution(&candidate, solution).map_err(|e| {
+    // Try each candidate — the solution may match the current or previous one.
+    let mut last_err = None;
+    let mut matched = None;
+    for candidate in candidates {
+        match ergo_mining::solution::validate_solution(&candidate, solution.clone()) {
+            Ok(h) => { matched = Some((h, candidate)); break; }
+            Err(e) => { last_err = Some(e); }
+        }
+    }
+    let (header, candidate) = matched.ok_or_else(|| {
+        let e = last_err.unwrap();
         match e {
             ergo_mining::MiningError::InvalidSolution(msg) => {
                 (StatusCode::BAD_REQUEST, Json(ApiError {
@@ -726,6 +757,33 @@ pub async fn post_mining_solution(
 
     tracing::info!("valid mining solution accepted, block submitted");
     Ok(Json(serde_json::json!({ "status": "accepted" })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /info/wait?after={height}
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct WaitQuery {
+    after: u32,
+}
+
+pub async fn info_wait(
+    State(state): State<ApiState>,
+    Query(params): Query<WaitQuery>,
+) -> Result<Json<crate::types::NodeInfo>, StatusCode> {
+    let current = state.validated_height.load(std::sync::atomic::Ordering::Relaxed);
+    if current > params.after {
+        return Ok(get_info(State(state)).await);
+    }
+
+    let mut rx = state.height_watch.clone();
+    tokio::select! {
+        _ = rx.changed() => Ok(get_info(State(state)).await),
+        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            Err(StatusCode::NO_CONTENT)
+        }
+    }
 }
 
 #[cfg(test)]

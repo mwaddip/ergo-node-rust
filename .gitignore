@@ -4,3 +4,4 @@ Cargo.lock
 .ergo/
 .worktrees/
 prompts/
+addons/indexer/target/
