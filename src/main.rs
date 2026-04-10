@@ -603,7 +603,7 @@ impl ergo_api::UtxoAccess for ApiUtxoReader {
 /// the next candidate.
 struct MinedBlockSubmitter {
     store: Arc<RedbModifierStore>,
-    modifier_tx: tokio::sync::mpsc::Sender<(u8, [u8; 32], Vec<u8>)>,
+    modifier_tx: tokio::sync::mpsc::Sender<(u8, [u8; 32], Vec<u8>, Option<u64>)>,
 }
 
 impl ergo_api::BlockSubmitter for MinedBlockSubmitter {
@@ -652,7 +652,7 @@ impl ergo_api::BlockSubmitter for MinedBlockSubmitter {
         // and appends to the chain. The sync task then validates the block
         // by reading the sections we pre-stored.
         self.modifier_tx
-            .try_send((HEADER_TYPE_ID, header_id, header_bytes))
+            .try_send((HEADER_TYPE_ID, header_id, header_bytes, None))
             .map_err(|e| format!("pipeline injection: {e}"))?;
 
         Ok(())

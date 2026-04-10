@@ -40,7 +40,7 @@ pub struct ApiState {
     /// Peer REST URL callback — returns connected peers with their socket addr and REST URL.
     pub peer_api_urls: Arc<dyn Fn() -> Vec<PeerRestInfo> + Send + Sync>,
     /// Modifier pipeline sender — for the /ingest/modifiers endpoint.
-    pub modifier_tx: Option<tokio::sync::mpsc::Sender<(u8, [u8; 32], Vec<u8>)>>,
+    pub modifier_tx: Option<tokio::sync::mpsc::Sender<(u8, [u8; 32], Vec<u8>, Option<u64>)>>,
 }
 
 /// Static node metadata.

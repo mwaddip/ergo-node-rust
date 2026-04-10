@@ -26,7 +26,7 @@ const TRANSACTION_TYPE_ID: u8 = 2;
 /// Out-of-order headers are buffered in an LRU cache. Evicted headers are
 /// reported to the delivery tracker for re-request.
 pub struct ValidationPipeline {
-    rx: mpsc::Receiver<(u8, [u8; 32], Vec<u8>)>,
+    rx: mpsc::Receiver<(u8, [u8; 32], Vec<u8>, Option<u64>)>,
     chain: Arc<Mutex<HeaderChain>>,
     store: Arc<RedbModifierStore>,
     progress_tx: mpsc::Sender<u32>,
@@ -42,7 +42,7 @@ pub struct ValidationPipeline {
 
 impl ValidationPipeline {
     pub fn new(
-        rx: mpsc::Receiver<(u8, [u8; 32], Vec<u8>)>,
+        rx: mpsc::Receiver<(u8, [u8; 32], Vec<u8>, Option<u64>)>,
         chain: Arc<Mutex<HeaderChain>>,
         store: Arc<RedbModifierStore>,
         progress_tx: mpsc::Sender<u32>,
@@ -153,16 +153,16 @@ impl ValidationPipeline {
     }
 
     /// Process a batch of raw modifiers.
-    pub(crate) async fn process_batch(&mut self, batch: Vec<(u8, [u8; 32], Vec<u8>)>) {
+    pub(crate) async fn process_batch(&mut self, batch: Vec<(u8, [u8; 32], Vec<u8>, Option<u64>)>) {
         // Single pass: collect IDs for delivery tracker, partition headers from sections
         let mut received_ids = Vec::with_capacity(batch.len());
-        let mut raw_headers: Vec<&[u8]> = Vec::new();
+        let mut raw_headers: Vec<(&[u8], Option<u64>)> = Vec::new();
         let mut section_entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = Vec::new();
 
-        for (type_id, id, data) in &batch {
+        for (type_id, id, data, peer_id) in &batch {
             received_ids.push(*id);
             if *type_id == HEADER_TYPE_ID {
-                raw_headers.push(data.as_slice());
+                raw_headers.push((data.as_slice(), *peer_id));
             } else if *type_id == TRANSACTION_TYPE_ID && !data.is_empty() {
                 // Unconfirmed transaction — forward to mempool
                 if let Some(ref tx_sender) = self.tx_sender {
@@ -199,11 +199,15 @@ impl ValidationPipeline {
 
         // Parse, round-trip check, and PoW-verify
         let mut valid_headers: Vec<(Header, Vec<u8>)> = Vec::with_capacity(raw_headers.len());
-        for data in raw_headers {
+        for (data, peer_id) in raw_headers {
             let header = match enr_chain::parse_header(data) {
                 Ok(h) => h,
                 Err(e) => {
-                    tracing::debug!("pipeline: rejecting header: parse failed: {e}");
+                    if let Some(pid) = peer_id {
+                        tracing::warn!(peer_id = pid, "PENALTY header parse failed: {e}");
+                    } else {
+                        tracing::debug!("pipeline: rejecting header: parse failed: {e}");
+                    }
                     continue;
                 }
             };
@@ -227,10 +231,14 @@ impl ValidationPipeline {
             }
 
             if let Err(e) = enr_chain::verify_pow(&header) {
-                tracing::debug!(
-                    "pipeline: rejecting header at height {}: {e}",
-                    header.height
-                );
+                if let Some(pid) = peer_id {
+                    tracing::warn!(peer_id = pid, height = header.height, "PENALTY invalid PoW: {e}");
+                } else {
+                    tracing::debug!(
+                        "pipeline: rejecting header at height {}: {e}",
+                        header.height
+                    );
+                }
                 continue;
             }
             valid_headers.push((header, data.to_vec()));
@@ -544,7 +552,7 @@ mod tests {
     /// Build a pipeline with a testnet chain, channels, and a temp store.
     fn test_pipeline() -> (
         ValidationPipeline,
-        mpsc::Sender<(u8, [u8; 32], Vec<u8>)>,
+        mpsc::Sender<(u8, [u8; 32], Vec<u8>, Option<u64>)>,
         mpsc::Receiver<u32>,
         mpsc::UnboundedReceiver<DeliveryControl>,
         mpsc::Receiver<DeliveryData>,
@@ -595,7 +603,7 @@ mod tests {
     #[test]
     fn rejects_unparseable_header() {
         let (mut pipeline, _tx, _progress_rx, _ctrl_rx, _data_rx, _dir) = test_pipeline();
-        let batch = vec![(HEADER_TYPE_ID, [0xaa; 32], vec![0xff, 0x00, 0x01])];
+        let batch = vec![(HEADER_TYPE_ID, [0xaa; 32], vec![0xff, 0x00, 0x01], None)];
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(pipeline.process_batch(batch));
         let chain = rt.block_on(pipeline.chain.lock());
@@ -605,7 +613,7 @@ mod tests {
     #[test]
     fn ignores_non_header_modifier_types() {
         let (mut pipeline, _tx, _progress_rx, _ctrl_rx, _data_rx, _dir) = test_pipeline();
-        let batch = vec![(102, [0xaa; 32], vec![0xff; 100])];
+        let batch = vec![(102, [0xaa; 32], vec![0xff; 100], None)];
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(pipeline.process_batch(batch));
         let chain = rt.block_on(pipeline.chain.lock());
@@ -640,7 +648,7 @@ mod tests {
         let bytes = header.scorex_serialize_bytes().unwrap();
 
         let (mut pipeline, _tx, _progress_rx, _ctrl_rx, _data_rx, _dir) = test_pipeline();
-        let batch = vec![(HEADER_TYPE_ID, [0xaa; 32], bytes)];
+        let batch = vec![(HEADER_TYPE_ID, [0xaa; 32], bytes, None)];
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(pipeline.process_batch(batch));
 

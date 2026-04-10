@@ -535,7 +535,7 @@ pub async fn post_ingest_modifiers(
         let data = body[cursor..cursor + data_len].to_vec();
         cursor += data_len;
 
-        if tx.try_send((type_id, id, data)).is_err() {
+        if tx.try_send((type_id, id, data, None)).is_err() {
             return err(StatusCode::SERVICE_UNAVAILABLE, "pipeline channel full");
         }
         count += 1;
