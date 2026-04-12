@@ -8,6 +8,8 @@ description = "Chain sync state machine for the Ergo Rust node"
 enr-p2p = { path = "../p2p" }
 enr-chain = { path = "../chain" }
 ergo-validation = { path = "../validation" }
+crossbeam-channel = "0.5"
+rayon = "1"
 blake2 = "0.10"
 bytes = "1"
 hex = "0.4"
@@ -19,5 +21,5 @@ tracing = "0.1"
 
 [dev-dependencies]
 ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "28862a1" }
-ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "3ca4af0b" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "c328e3a4" }
 tempfile = "3"

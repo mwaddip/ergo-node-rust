@@ -1,4 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 
 use enr_p2p::protocol::messages::ProtocolMessage;
 use enr_p2p::protocol::peer::ProtocolEvent;
@@ -105,10 +107,18 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     /// Total SyncInfo messages sent this session (diagnostics).
     sync_sent_count: u32,
     /// Highest height where ALL required block sections are in the store.
-    /// Blocks at or below this height are ready for validation.
     downloaded_height: u32,
-    /// Highest height where block sections have been validated.
-    validated_height: u32,
+    /// Highest height where apply_state() returned Ok (state advanced).
+    state_applied_height: u32,
+    /// Highest height where evaluate_scripts() completed successfully.
+    /// Advances in-order as results arrive. Persisted for startup re-eval.
+    script_verified_height: u32,
+    /// Number of eval tasks dispatched but not yet drained from the channel.
+    evals_in_flight: u32,
+    /// Channel for sending eval results from rayon pool.
+    eval_tx: CrossbeamSender<(u32, Result<(), ergo_validation::ValidationError>)>,
+    /// Channel for receiving eval results.
+    eval_rx: CrossbeamReceiver<(u32, Result<(), ergo_validation::ValidationError>)>,
 }
 
 impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync<T, C, S, V> {
@@ -126,6 +136,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     ) -> Self {
         let tracker = DeliveryTracker::with_config(config.delivery_timeout, config.max_delivery_checks);
         let initial_validated = validator.as_ref().map_or(0, |v| v.validated_height());
+        let (eval_tx, eval_rx) = crossbeam_channel::unbounded();
         Self {
             config,
             transport,
@@ -145,7 +156,11 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             last_sync_sent: Instant::now(),
             sync_sent_count: 0,
             downloaded_height: initial_validated,
-            validated_height: initial_validated,
+            state_applied_height: initial_validated,
+            script_verified_height: initial_validated,
+            evals_in_flight: 0,
+            eval_tx,
+            eval_rx,
         }
     }
 
@@ -176,7 +191,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     // — the proof's PoW checks ARE the validation. There's
                     // no validator running and no block sections to download.
                     self.downloaded_height = height;
-                    self.validated_height = height;
+                    self.state_applied_height = height;
                     tracing::info!(height, "light bootstrap installed, entering tip-following sync");
                 }
                 Err(e) => {
@@ -238,7 +253,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                                         Ok(validator) => {
                                             self.validator = Some(validator);
                                             self.downloaded_height = height;
-                                            self.validated_height = height;
+                                            self.state_applied_height = height;
                                             tracing::info!(
                                                 height,
                                                 "snapshot loaded, resuming block sync"
@@ -493,23 +508,23 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 chain_height,
                 "downloaded height advanced"
             );
-            self.advance_validated_height().await;
+            self.advance_state_applied_height().await;
         }
     }
 
     /// Advance the validated height by running the block validator on
     /// downloaded-but-not-yet-validated blocks.
-    async fn advance_validated_height(&mut self) {
+    async fn advance_state_applied_height(&mut self) {
         if self.validator.is_none() {
             return; // No validator yet (snapshot bootstrap pending)
         }
-        if self.validated_height >= self.downloaded_height {
+        if self.state_applied_height >= self.downloaded_height {
             return;
         }
 
-        let sweep_from = self.validated_height + 1;
+        let sweep_from = self.state_applied_height + 1;
         let sweep_to = self.downloaded_height;
-        let sweep_size = sweep_to - self.validated_height;
+        let sweep_size = sweep_to - self.state_applied_height;
         let sweep_start = Instant::now();
 
         if sweep_size > 100 {
@@ -521,7 +536,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             );
         }
 
-        let mut validated_to = self.validated_height;
+        let mut validated_to = self.state_applied_height;
 
         for height in sweep_from..=sweep_to {
             let header = match self.chain.header_at(height).await {
@@ -592,7 +607,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 None
             };
 
-            let result = self.validator.as_mut().unwrap().validate_block(
+            let result = self.validator.as_mut().unwrap().apply_state(
                 &header,
                 &block_txs,
                 ad_proofs.as_deref(),
@@ -610,8 +625,23 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         self.chain.apply_epoch_boundary_parameters(new_params).await;
                     }
                     validated_to = height;
+
+                    // Spawn deferred script evaluation on rayon pool
+                    if let Some(eval) = outcome.deferred_eval {
+                        let tx = self.eval_tx.clone();
+                        self.evals_in_flight += 1;
+                        rayon::spawn(move || {
+                            let h = eval.height;
+                            let result = ergo_validation::evaluate_scripts(&eval);
+                            let _ = tx.send((h, result));
+                        });
+                    }
+
+                    // Non-blocking drain of completed eval results
+                    self.drain_eval_results(false).await;
+
                     // Progress report every 1000 blocks during large sweeps
-                    let done = height - self.validated_height;
+                    let done = height - self.state_applied_height;
                     if done % 1000 == 0 && sweep_size > 100 {
                         let elapsed = sweep_start.elapsed().as_secs().max(1);
                         let rate = done as f64 / elapsed as f64;
@@ -629,15 +659,15 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     }
                 }
                 Err(e) => {
-                    tracing::error!(height, error = %e, "block validation failed");
+                    tracing::error!(height, error = %e, "apply_state failed");
                     break;
                 }
             }
         }
 
-        if validated_to > self.validated_height {
-            let advanced = validated_to - self.validated_height;
-            self.validated_height = validated_to;
+        if validated_to > self.state_applied_height {
+            let advanced = validated_to - self.state_applied_height;
+            self.state_applied_height = validated_to;
 
             if sweep_size > 100 {
                 let elapsed = sweep_start.elapsed();
@@ -653,13 +683,92 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 );
             } else {
                 tracing::info!(
-                    validated_height = validated_to,
+                    state_applied_height = validated_to,
                     advanced,
                     downloaded_height = self.downloaded_height,
-                    "validated height advanced"
+                    "state applied height advanced"
                 );
             }
         }
+
+        // After sweep: drain remaining eval results.
+        // At chain tip (single block), drain synchronously to ensure
+        // scripts are verified before accepting the next peer block.
+        let blocking = sweep_size <= 1;
+        self.drain_eval_results(blocking).await;
+    }
+
+    /// Drain completed script evaluation results from the channel.
+    ///
+    /// `blocking`: if true, block until all in-flight evals complete.
+    /// If false, drain only what's immediately available (non-blocking).
+    async fn drain_eval_results(&mut self, blocking: bool) {
+        let mut verified: BTreeSet<u32> = BTreeSet::new();
+
+        while self.evals_in_flight > 0 {
+            let msg = if blocking {
+                match self.eval_rx.recv() {
+                    Ok(msg) => msg,
+                    Err(_) => break,
+                }
+            } else {
+                match self.eval_rx.try_recv() {
+                    Ok(msg) => msg,
+                    Err(_) => break,
+                }
+            };
+
+            self.evals_in_flight -= 1;
+            let (height, result) = msg;
+            match result {
+                Ok(()) => {
+                    verified.insert(height);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        height, error = %e,
+                        "script evaluation failed — rolling back"
+                    );
+                    self.handle_eval_failure(height).await;
+                    return;
+                }
+            }
+        }
+
+        // Advance script_verified_height sequentially
+        while verified.contains(&(self.script_verified_height + 1)) {
+            self.script_verified_height += 1;
+            verified.remove(&self.script_verified_height);
+        }
+    }
+
+    /// Handle a deferred script evaluation failure by rolling back state.
+    async fn handle_eval_failure(&mut self, failed_height: u32) {
+        // Drain and discard remaining results
+        while self.eval_rx.try_recv().is_ok() {}
+        self.evals_in_flight = 0;
+
+        let rollback_to = failed_height - 1;
+
+        if let Some(v) = self.validator.as_mut() {
+            if let Some(header) = self.chain.header_at(rollback_to).await {
+                v.reset_to(rollback_to, header.state_root);
+            } else {
+                tracing::error!(rollback_to, "cannot find header for rollback");
+                return;
+            }
+        }
+
+        self.state_applied_height = rollback_to;
+        self.script_verified_height = rollback_to;
+        if self.downloaded_height > rollback_to {
+            self.downloaded_height = rollback_to;
+        }
+
+        tracing::warn!(
+            rollback_to,
+            "state rolled back due to script eval failure"
+        );
     }
 
     /// Handle a control-plane event (Reorg or NeedModifier).
@@ -672,6 +781,10 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             DeliveryControl::Reorg { fork_point, old_tip, new_tip } => {
                 tracing::info!(fork_point, old_tip, new_tip, "reorg: adjusting section queue and watermark");
 
+                // Drain and discard in-flight eval results
+                while self.eval_rx.try_recv().is_ok() {}
+                self.evals_in_flight = 0;
+
                 // Reset watermarks if they were above the fork point
                 if self.downloaded_height > fork_point {
                     tracing::info!(
@@ -681,13 +794,14 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     );
                     self.downloaded_height = fork_point;
                 }
-                if self.validated_height > fork_point {
+                if self.state_applied_height > fork_point {
                     if let Some(fork_header) = self.chain.header_at(fork_point).await {
                         if let Some(v) = self.validator.as_mut() {
                             v.reset_to(fork_point, fork_header.state_root);
                         }
                     }
-                    self.validated_height = fork_point;
+                    self.state_applied_height = fork_point;
+                    self.script_verified_height = fork_point;
                 }
 
                 // Purge pending requests — they're for the wrong branch
