@@ -17,7 +17,7 @@ use ergo_chain_types::EcPoint;
 use enr_store::{ModifierStore, RedbModifierStore};
 use ergo_node_rust::{P2pTransport, SharedChain, SharedStore, ValidationPipeline};
 use ergo_sync::{HeaderSync, SyncConfig};
-use ergo_validation::{BlockValidator, DigestValidator, UtxoValidator, ValidationError};
+use ergo_validation::{ApplyStateOutcome, BlockValidator, DigestValidator, UtxoValidator, ValidationError};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
@@ -259,7 +259,7 @@ impl Validator {
 }
 
 impl BlockValidator for Validator {
-    fn validate_block(
+    fn apply_state(
         &mut self,
         header: &ergo_chain_types::Header,
         block_txs: &[u8],
@@ -268,13 +268,13 @@ impl BlockValidator for Validator {
         preceding_headers: &[ergo_chain_types::Header],
         active_params: &ergo_validation::Parameters,
         expected_boundary_params: Option<&ergo_validation::Parameters>,
-    ) -> Result<ergo_validation::ValidationOutcome, ValidationError> {
+    ) -> Result<ApplyStateOutcome, ValidationError> {
         let result = match &mut self.inner {
-            ValidatorInner::Digest(v) => v.validate_block(
+            ValidatorInner::Digest(v) => v.apply_state(
                 header, block_txs, ad_proofs, extension, preceding_headers,
                 active_params, expected_boundary_params,
             ),
-            ValidatorInner::Utxo(v) => v.validate_block(
+            ValidatorInner::Utxo(v) => v.apply_state(
                 header, block_txs, ad_proofs, extension, preceding_headers,
                 active_params, expected_boundary_params,
             ),
@@ -292,11 +292,6 @@ impl BlockValidator for Validator {
                     preceding_headers,
                     active_params,
                 );
-                // We're inside a sync function called from a tokio worker thread.
-                // tokio::sync::RwLock::blocking_write panics here. Use the
-                // documented "block on async from sync from runtime" pattern:
-                // block_in_place tells the runtime this thread will block, then
-                // block_on the async write completes the swap.
                 let ctx_lock = self.shared_state_context.clone();
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
@@ -993,16 +988,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .flatten()
         });
 
-        // Recompute active parameters from the most recent epoch-boundary
-        // block's extension. Bounded walk: at most one extension read.
-        if let Err(e) = chain.recompute_active_parameters_from_storage() {
-            tracing::warn!(
-                error = %e,
-                "failed to recompute active parameters from storage; using defaults"
-            );
-        } else {
-            tracing::info!("recomputed active blockchain parameters from storage");
-        }
+        // Note: active_parameters is recomputed from storage AFTER the
+        // validator's resume height is known (inside the validator init
+        // block below). The chain tip's parameters often diverge from the
+        // validator's resume point (e.g. fresh resync, partial state), so
+        // recomputing against the chain tip here would load the wrong
+        // parameter table for early epoch boundaries.
     }
 
     let chain = Arc::new(Mutex::new(chain));
@@ -1178,7 +1169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (block_applied_tx, block_applied_rx) =
         tokio::sync::mpsc::channel::<Vec<ergo_validation::Transaction>>(64);
     let (height_watch_tx, height_watch_rx) = tokio::sync::watch::channel(0u32);
-    let chain_guard = chain.lock().await;
+    let mut chain_guard = chain.lock().await;
 
     let mut snapshot_reader: Option<SnapshotReader> = None;
 
@@ -1226,6 +1217,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 tracing::info!(height, chain_height, checkpoint, "block validator resuming (UTXO mode)");
+
+                // Now that we know the validator's resume height, load the
+                // chain's active parameters from the most recent epoch
+                // boundary at or before that height. For a fresh resync
+                // (height=0) this is a no-op and the chain stays at
+                // construction defaults — see chain submodule docs.
+                if let Err(e) = chain_guard.recompute_active_parameters_from_storage(height) {
+                    tracing::warn!(
+                        error = %e,
+                        resume_height = height,
+                        "failed to recompute active parameters; using current defaults"
+                    );
+                } else {
+                    tracing::info!(
+                        resume_height = height,
+                        "recomputed active blockchain parameters for validator resume"
+                    );
+                }
+
                 // Publish the resume height to the shared atomic so
                 // consumers that read it at startup (snapshot trigger,
                 // NiPoPoW serve handler, mining task) see the real
@@ -1280,6 +1290,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
 
                 tracing::info!(checkpoint, "block validator starting from genesis (UTXO mode)");
+
+                // Genesis resync — recompute(0) is a no-op per the chain
+                // contract; active_parameters stays at construction defaults
+                // (v1-era for mainnet, matching what block 1024's extension
+                // will carry).
+                let _ = chain_guard.recompute_active_parameters_from_storage(0);
                 let mining_ctx = miner_pk_opt.as_ref().and_then(|pk| {
                     snapshot_reader.as_ref().map(|sr| MiningCtx {
                         config: build_miner_config(pk, &node_config.mining, miner_votes, network),
