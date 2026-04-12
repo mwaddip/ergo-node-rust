@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use enr_chain::{ChainConfig, HeaderChain, StateType, HEADER_TYPE_ID};
-use enr_state::{AVLTreeParams, RedbAVLStorage, SnapshotReader};
+use enr_state::{AVLTreeParams, CacheSize, RedbAVLStorage, SnapshotReader};
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
 use ergo_avltree_rust::batch_node::AVLTree;
 use ergo_avltree_rust::operation::{KeyValue, Operation};
@@ -121,7 +121,6 @@ fn reemission_rules_for(
 #[derive(Clone)]
 struct MiningProofData {
     parent: ergo_chain_types::Header,
-    emission_box: ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox,
     ad_proof_bytes: Vec<u8>,
     state_root: ADDigest,
     emission_tx: ergo_validation::Transaction,
@@ -249,7 +248,6 @@ impl Validator {
         let mut guard = mining.proof_cache.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(MiningProofData {
             parent: header.clone(),
-            emission_box,
             ad_proof_bytes,
             state_root,
             emission_tx,
@@ -1178,7 +1176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let state_path = data_dir.join("state.redb");
             let params = AVLTreeParams { key_length: 32, value_length: None };
             let keep_versions = 200u32;
-            let storage = RedbAVLStorage::open(&state_path, params, keep_versions)
+            let storage = RedbAVLStorage::open(&state_path, params, keep_versions, CacheSize::default())
                 .expect("failed to open UTXO state storage");
 
             let checkpoint = configured_checkpoint.unwrap_or(0);
@@ -1451,7 +1449,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
 
                     let params = AVLTreeParams { key_length: 32, value_length: None };
-                    let mut storage = RedbAVLStorage::open(&state_path, params, 200)
+                    let mut storage = RedbAVLStorage::open(&state_path, params, 200, CacheSize::default())
                         .expect("failed to open state storage for snapshot");
 
                     let root_hash = snapshot_data.root_hash;
