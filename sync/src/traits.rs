@@ -20,6 +20,15 @@ pub trait SyncStore {
         type_id: u8,
         id: &[u8; 32],
     ) -> impl std::future::Future<Output = Option<Vec<u8>>> + Send;
+
+    /// Read the persisted script_verified_height. Returns None if not set.
+    fn script_verified_height(&self) -> impl std::future::Future<Output = Option<u32>> + Send;
+
+    /// Persist the script_verified_height.
+    fn set_script_verified_height(
+        &self,
+        height: u32,
+    ) -> impl std::future::Future<Output = ()> + Send;
 }
 
 /// How the sync machine sends messages and observes the network.

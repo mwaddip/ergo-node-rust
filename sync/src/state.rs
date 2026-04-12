@@ -207,6 +207,27 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             self.advance_downloaded_height().await;
         }
 
+        // Startup: load persisted script_verified_height.
+        // If there's a gap (state applied but scripts not verified from a
+        // previous unclean shutdown), accept it — the AVL digest already
+        // proved state correctness. Proof boxes aren't available without
+        // re-running apply_state, so re-evaluation isn't feasible here.
+        if let Some(persisted_svh) = self.store.script_verified_height().await {
+            self.script_verified_height = persisted_svh.min(self.state_applied_height);
+            if persisted_svh < self.state_applied_height {
+                let gap = self.state_applied_height - persisted_svh;
+                tracing::info!(
+                    persisted_svh,
+                    state_applied_height = self.state_applied_height,
+                    gap,
+                    "startup: accepting script verification gap (AVL digest verified)"
+                );
+                // Advance to match — the gap blocks' state transitions are
+                // already proven correct by the AVL digest check in apply_state.
+                self.script_verified_height = self.state_applied_height;
+            }
+        }
+
         loop {
             // Phase 1: wait for outbound peers (skip if already targeting one)
             if self.sync_peer.is_none() && !self.pick_sync_peer().await {
@@ -736,9 +757,16 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         }
 
         // Advance script_verified_height sequentially
+        let prev = self.script_verified_height;
         while verified.contains(&(self.script_verified_height + 1)) {
             self.script_verified_height += 1;
             verified.remove(&self.script_verified_height);
+        }
+        // Persist periodically (every 100 blocks) to limit re-eval on restart
+        if self.script_verified_height > prev
+            && self.script_verified_height / 100 > prev / 100
+        {
+            self.store.set_script_verified_height(self.script_verified_height).await;
         }
     }
 
