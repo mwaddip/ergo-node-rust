@@ -12,7 +12,7 @@ use crate::sections::{parse_block_transactions, parse_extension};
 use crate::state_changes::{compute_state_changes, transactions_to_summaries};
 use crate::tx_validation;
 use crate::voting;
-use crate::{BlockValidator, ValidationError, ValidationOutcome};
+use crate::{ApplyStateOutcome, BlockValidator, ValidationError};
 
 /// UTXO-mode block validator.
 ///
@@ -76,7 +76,7 @@ impl UtxoValidator {
 }
 
 impl BlockValidator for UtxoValidator {
-    fn validate_block(
+    fn apply_state(
         &mut self,
         header: &Header,
         block_txs: &[u8],
@@ -85,7 +85,7 @@ impl BlockValidator for UtxoValidator {
         preceding_headers: &[Header],
         active_params: &Parameters,
         expected_boundary_params: Option<&Parameters>,
-    ) -> Result<ValidationOutcome, ValidationError> {
+    ) -> Result<ApplyStateOutcome, ValidationError> {
         let expected_height = self.validated_height + 1;
         if header.height != expected_height {
             return Err(ValidationError::HeightMismatch {
@@ -165,21 +165,24 @@ impl BlockValidator for UtxoValidator {
             });
         }
 
-        // 6. Transaction validation (above checkpoint — ErgoScript evaluation)
-        if validate_txs {
+        // 6. Build DeferredEval for deferred script verification
+        let deferred_eval = if validate_txs {
             let mut proof_boxes = HashMap::with_capacity(proof_box_bytes.len());
             for (id, bytes) in &proof_box_bytes {
                 proof_boxes.insert(*id, tx_validation::deserialize_box(bytes)?);
             }
 
-            tx_validation::validate_transactions(
-                &parsed_txs.transactions,
-                &proof_boxes,
-                header,
-                preceding_headers,
-                active_params,
-            )?;
-        }
+            Some(crate::DeferredEval {
+                height: header.height,
+                transactions: parsed_txs.transactions,
+                proof_boxes,
+                header: header.clone(),
+                preceding_headers: preceding_headers.to_vec(),
+                parameters: active_params.clone(),
+            })
+        } else {
+            None
+        };
 
         // 7. Persist state changes + generate AD proof as side effect
         self.prover
@@ -208,9 +211,9 @@ impl BlockValidator for UtxoValidator {
         self.current_digest = header.state_root;
         self.validated_height = header.height;
 
-        tracing::debug!(height = header.height, "block validated (UTXO mode)");
+        tracing::debug!(height = header.height, "state applied (UTXO mode)");
 
-        Ok(ValidationOutcome { epoch_boundary_params })
+        Ok(ApplyStateOutcome { epoch_boundary_params, deferred_eval })
     }
 
     fn validated_height(&self) -> u32 {

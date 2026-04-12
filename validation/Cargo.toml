@@ -5,12 +5,17 @@ edition = "2021"
 description = "Block validation for the Ergo Rust node"
 
 [dependencies]
-ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "3ca4af0b" }
-ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "3ca4af0b" }
-sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "3ca4af0b" }
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "c328e3a4" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "c328e3a4" }
+sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "c328e3a4" }
 ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "28862a1" }
+rayon = "1"
 blake2 = "0.10"
 bytes = "1"
 hex = "0.4"
 tracing = "0.1"
 thiserror = "2"
+
+[dev-dependencies]
+ergotree-interpreter = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "c328e3a4" }
+ergotree-ir = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "c328e3a4" }
