@@ -76,6 +76,7 @@ pub async fn get_info(State(state): State<ApiState>) -> Json<NodeInfo> {
         network: state.node_info.network.clone(),
         full_height,
         headers_height,
+        downloaded_height: state.downloaded_height.load(std::sync::atomic::Ordering::Relaxed),
         best_full_header_id: tip_id.clone(),
         best_header_id: tip_id,
         state_root,

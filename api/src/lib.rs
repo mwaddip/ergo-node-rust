@@ -37,6 +37,8 @@ pub struct ApiState {
     pub block_submitter: Option<Arc<dyn BlockSubmitter>>,
     /// Last fully validated block height (updated by the validator).
     pub validated_height: Arc<AtomicU32>,
+    /// Highest height with all block sections downloaded (updated by sync layer).
+    pub downloaded_height: Arc<AtomicU32>,
     /// Peer REST URL callback — returns connected peers with their socket addr and REST URL.
     pub peer_api_urls: Arc<dyn Fn() -> Vec<PeerRestInfo> + Send + Sync>,
     /// Modifier pipeline sender — for the /ingest/modifiers endpoint.

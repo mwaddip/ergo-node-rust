@@ -21,5 +21,5 @@ tracing = "0.1"
 
 [dev-dependencies]
 ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "28862a1" }
-ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "6c765c41" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "2de209be" }
 tempfile = "3"

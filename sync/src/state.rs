@@ -119,6 +119,8 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     eval_tx: CrossbeamSender<(u32, Result<(), ergo_validation::ValidationError>)>,
     /// Channel for receiving eval results.
     eval_rx: CrossbeamReceiver<(u32, Result<(), ergo_validation::ValidationError>)>,
+    /// Shared downloaded_height for the API (read by fastsync to avoid redundant work).
+    shared_downloaded_height: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync<T, C, S, V> {
@@ -133,6 +135,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         delivery_data_rx: mpsc::Receiver<DeliveryData>,
         snapshot_tx: Option<tokio::sync::oneshot::Sender<crate::snapshot::SnapshotData>>,
         validator_rx: Option<tokio::sync::oneshot::Receiver<V>>,
+        shared_downloaded_height: std::sync::Arc<std::sync::atomic::AtomicU32>,
     ) -> Self {
         let tracker = DeliveryTracker::with_config(config.delivery_timeout, config.max_delivery_checks);
         let initial_validated = validator.as_ref().map_or(0, |v| v.validated_height());
@@ -161,6 +164,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             evals_in_flight: 0,
             eval_tx,
             eval_rx,
+            shared_downloaded_height,
         }
     }
 
@@ -523,6 +527,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         if new_height > self.downloaded_height {
             let advanced = new_height - self.downloaded_height;
             self.downloaded_height = new_height;
+            self.shared_downloaded_height.store(new_height, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
                 downloaded_height = new_height,
                 advanced,
@@ -658,8 +663,23 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         });
                     }
 
-                    // Non-blocking drain of completed eval results
+                    // Non-blocking drain of completed eval results.
+                    // Save state_applied_height before drain — handle_eval_failure
+                    // may lower it if a deferred eval failed. Note: state_applied_height
+                    // is NOT updated during the sweep loop (only in the post-loop code),
+                    // so any decrease means a rollback happened inside drain.
+                    let pre_drain_height = self.state_applied_height;
                     self.drain_eval_results(false).await;
+
+                    if self.state_applied_height < pre_drain_height {
+                        tracing::warn!(
+                            validated_to,
+                            rolled_back_to = self.state_applied_height,
+                            "eval failure rolled back state during sweep — aborting"
+                        );
+                        validated_to = self.state_applied_height;
+                        break;
+                    }
 
                     // Progress report every 1000 blocks during large sweeps
                     let done = height - self.state_applied_height;
@@ -689,6 +709,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         if validated_to > self.state_applied_height {
             let advanced = validated_to - self.state_applied_height;
             self.state_applied_height = validated_to;
+            self.store.set_validator_height(validated_to).await;
 
             if sweep_size > 100 {
                 let elapsed = sweep_start.elapsed();

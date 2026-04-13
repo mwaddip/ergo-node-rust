@@ -29,6 +29,12 @@ pub trait SyncStore {
         &self,
         height: u32,
     ) -> impl std::future::Future<Output = ()> + Send;
+
+    /// Persist the validator (state_applied) height for fast startup.
+    fn set_validator_height(
+        &self,
+        height: u32,
+    ) -> impl std::future::Future<Output = ()> + Send;
 }
 
 /// How the sync machine sends messages and observes the network.

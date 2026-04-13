@@ -18,6 +18,7 @@ pub struct NodeInfo {
     pub network: String,
     pub full_height: u32,
     pub headers_height: u32,
+    pub downloaded_height: u32,
     pub best_full_header_id: String,
     pub best_header_id: String,
     pub state_root: String,

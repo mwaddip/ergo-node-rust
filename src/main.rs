@@ -1071,6 +1071,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // and read by the snapshot trigger, mining task, and NiPoPoW serve handler.
     // Defined here (above the event demux) because the NiPoPoW closure needs to clone it.
     let shared_validated_height = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let shared_downloaded_height = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     // Subscribe to events for the sync machine — with snapshot serving demux
     let raw_events = p2p.subscribe().await;
@@ -1207,30 +1208,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .expect("failed to create persistent prover from stored state");
 
                 // Find the actual validated height by matching the prover's
-                // current digest against header state roots. The chain height
-                // may be far ahead of the validated height during sync.
+                // current digest against header state roots. Try the persisted
+                // hint first (O(1)), then scan downward from the hint on miss.
                 let prover_digest = persistent_prover.digest();
                 let prover_digest_arr: [u8; 33] = prover_digest.as_ref().try_into()
                     .expect("prover digest should be 33 bytes");
                 let chain_height = chain_guard.height();
+
+                let hint = ergo_node_rust::read_validator_height(&store);
                 let mut height = 0u32;
-                for h in (0..=chain_height).rev() {
-                    if h == 0 {
-                        // Genesis state root
-                        let genesis_root: [u8; 33] = genesis_digest.into();
-                        if prover_digest_arr == genesis_root {
-                            height = 0;
-                            break;
-                        }
-                    } else if let Some(header) = chain_guard.header_at(h) {
-                        let header_root: [u8; 33] = header.state_root.into();
-                        if prover_digest_arr == header_root {
-                            height = h;
-                            break;
+                let mut scanned = false;
+
+                // Fast path: check the persisted height hint
+                if let Some(h) = hint {
+                    if h > 0 && h <= chain_height {
+                        if let Some(header) = chain_guard.header_at(h) {
+                            let header_root: [u8; 33] = header.state_root.into();
+                            if prover_digest_arr == header_root {
+                                height = h;
+                            }
                         }
                     }
                 }
-                tracing::info!(height, chain_height, checkpoint, "block validator resuming (UTXO mode)");
+
+                // Slow path: hint missed (Durability::None rollback, first run, etc.)
+                // Scan downward from the hint (or chain_height if no hint).
+                if height == 0 && hint != Some(0) {
+                    scanned = true;
+                    let scan_from = hint.unwrap_or(chain_height).min(chain_height);
+                    for h in (0..=scan_from).rev() {
+                        if h == 0 {
+                            let genesis_root: [u8; 33] = genesis_digest.into();
+                            if prover_digest_arr == genesis_root {
+                                height = 0;
+                                break;
+                            }
+                        } else if let Some(header) = chain_guard.header_at(h) {
+                            let header_root: [u8; 33] = header.state_root.into();
+                            if prover_digest_arr == header_root {
+                                height = h;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Persist the resolved height for next startup
+                ergo_node_rust::write_validator_height(&store, height);
+
+                tracing::info!(height, chain_height, checkpoint, ?hint, scanned, "block validator resuming (UTXO mode)");
 
                 // Now that we know the validator's resume height, load the
                 // chain's active parameters from the most recent epoch
@@ -1438,11 +1464,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Start sync in a background task
+    let api_downloaded_height = shared_downloaded_height.clone();
     tokio::spawn(async move {
         let mut sync = HeaderSync::new(
             sync_config, transport, sync_chain, sync_store, validator,
             progress_rx, delivery_control_rx, delivery_data_rx,
-            snapshot_tx, validator_rx,
+            snapshot_tx, validator_rx, shared_downloaded_height,
         );
         sync.run().await;
     });
@@ -1967,6 +1994,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }) as Arc<dyn ergo_api::BlockSubmitter>
             }),
             validated_height: shared_validated_height.clone(),
+            downloaded_height: api_downloaded_height.clone(),
             peer_api_urls: Arc::new(move || {
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current()
