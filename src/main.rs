@@ -1,3 +1,11 @@
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -739,6 +747,9 @@ struct NodeConfig {
     /// /peers/api-urls. Example: "http://213.239.193.208:9053"
     #[serde(default)]
     fastsync_peer: Option<String>,
+    /// redb cache size in megabytes (default: 256).
+    #[serde(default = "default_cache_mb")]
+    cache_mb: u64,
     /// Mining configuration.
     #[serde(default)]
     mining: MiningConfig,
@@ -762,6 +773,7 @@ impl Default for NodeConfig {
             api_address: None,
             fastsync: default_fastsync(),
             fastsync_peer: None,
+            cache_mb: default_cache_mb(),
             mining: MiningConfig::default(),
         }
     }
@@ -793,6 +805,9 @@ fn default_min_fee() -> u64 {
 }
 fn default_fastsync() -> bool {
     true
+}
+fn default_cache_mb() -> u64 {
+    256
 }
 
 /// Top-level config wrapper — just the [node] section, P2P is parsed separately.
@@ -851,6 +866,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         checkpoint_height = ?configured_checkpoint,
         storing_snapshots = node_config.storing_snapshots,
         snapshot_interval = node_config.snapshot_interval,
+        cache_mb = node_config.cache_mb,
         "node config"
     );
 
@@ -1176,7 +1192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let state_path = data_dir.join("state.redb");
             let params = AVLTreeParams { key_length: 32, value_length: None };
             let keep_versions = 200u32;
-            let storage = RedbAVLStorage::open(&state_path, params, keep_versions, CacheSize::default())
+            let storage = RedbAVLStorage::open(&state_path, params, keep_versions, CacheSize::Bytes(node_config.cache_mb as usize * 1024 * 1024))
                 .expect("failed to open UTXO state storage");
 
             let checkpoint = configured_checkpoint.unwrap_or(0);
@@ -1449,7 +1465,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
 
                     let params = AVLTreeParams { key_length: 32, value_length: None };
-                    let mut storage = RedbAVLStorage::open(&state_path, params, 200, CacheSize::default())
+                    let mut storage = RedbAVLStorage::open(&state_path, params, 200, CacheSize::Bytes(node_config.cache_mb as usize * 1024 * 1024))
                         .expect("failed to open state storage for snapshot");
 
                     let root_hash = snapshot_data.root_hash;
@@ -1966,7 +1982,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
             modifier_tx: Some(modifier_tx_for_mining.clone()),
             height_watch: height_watch_rx,
-            node_info: ergo_api::NodeMeta {
+            node_info: std::sync::Arc::new(ergo_api::NodeMeta {
                 name: "ergo-node-rust".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 network: match network {
@@ -1978,7 +1994,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     StateType::Digest => "digest".to_string(),
                     StateType::Light => "light".to_string(),
                 },
-            },
+            }),
         };
 
         tokio::spawn(async move {

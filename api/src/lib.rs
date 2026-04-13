@@ -29,8 +29,8 @@ pub struct ApiState {
     pub state_context: Arc<RwLock<Option<ErgoStateContext>>>,
     /// Peer count callback — returns (connected, known) counts.
     pub peer_count: Arc<dyn Fn() -> PeerCounts + Send + Sync>,
-    /// Node metadata.
-    pub node_info: NodeMeta,
+    /// Node metadata (immutable after construction — Arc avoids cloning 4 Strings per request).
+    pub node_info: Arc<NodeMeta>,
     /// Mining state — None if mining is not configured or node is in digest mode.
     pub mining: Option<Arc<CandidateGenerator>>,
     /// Block submitter — handles mined block application + broadcast.

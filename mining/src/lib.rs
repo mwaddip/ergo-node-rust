@@ -117,9 +117,14 @@ pub fn generate_candidate(
 /// Stateful candidate manager — caches the current candidate and serves
 /// it to multiple miner polls. Invalidated when the chain tip changes
 /// or the candidate TTL expires.
+///
+/// Keeps one previous candidate so that a GPU miner solving the old
+/// candidate while a regeneration occurred can still submit its solution.
+/// Mirrors the JVM's `previousCandidate` semantics.
 pub struct CandidateGenerator {
     pub config: MinerConfig,
     cached: RwLock<Option<CachedCandidate>>,
+    previous: RwLock<Option<CachedCandidate>>,
 }
 
 impl CandidateGenerator {
@@ -127,6 +132,7 @@ impl CandidateGenerator {
         Self {
             config,
             cached: RwLock::new(None),
+            previous: RwLock::new(None),
         }
     }
 
@@ -143,7 +149,8 @@ impl CandidateGenerator {
         }
     }
 
-    /// Store a freshly generated candidate.
+    /// Store a freshly generated candidate. The old candidate (if any)
+    /// is preserved as `previous` so stale solutions can still be accepted.
     pub fn cache_candidate(
         &self,
         block: CandidateBlock,
@@ -151,6 +158,12 @@ impl CandidateGenerator {
         tip_height: u32,
     ) {
         let mut guard = self.cached.write().unwrap();
+        // Move current → previous before overwriting
+        if let Some(old) = guard.take() {
+            if let Ok(mut prev) = self.previous.write() {
+                *prev = Some(old);
+            }
+        }
         *guard = Some(CachedCandidate {
             block,
             work,
@@ -159,16 +172,28 @@ impl CandidateGenerator {
         });
     }
 
-    /// Get the cached CandidateBlock for solution validation.
+    /// Get the current cached CandidateBlock for solution validation.
     pub fn cached_block(&self) -> Option<CandidateBlock> {
         let guard = self.cached.read().ok()?;
         guard.as_ref().map(|c| c.block.clone())
     }
 
-    /// Invalidate the cached candidate (called when chain tip changes).
+    /// Get the previous CandidateBlock (if any).
+    pub fn previous_block(&self) -> Option<CandidateBlock> {
+        let guard = self.previous.read().ok()?;
+        guard.as_ref().map(|c| c.block.clone())
+    }
+
+    /// Invalidate the cached candidate (called when chain tip changes
+    /// or mempool content changes). The current candidate moves to
+    /// `previous` so in-flight solutions remain valid.
     pub fn invalidate(&self) {
         if let Ok(mut guard) = self.cached.write() {
-            *guard = None;
+            if let Some(old) = guard.take() {
+                if let Ok(mut prev) = self.previous.write() {
+                    *prev = Some(old);
+                }
+            }
         }
     }
 }

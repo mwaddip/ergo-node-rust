@@ -8,6 +8,7 @@ use serde::Serialize;
 use crate::emission::ReemissionRules;
 
 /// Miner configuration loaded from node config.
+#[derive(Clone)]
 pub struct MinerConfig {
     /// Miner's public key (required for mining).
     pub miner_pk: ProveDlog,

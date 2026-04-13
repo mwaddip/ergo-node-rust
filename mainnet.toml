@@ -7,6 +7,7 @@ network = "mainnet"
 data_dir = ".local-data/mainnet"
 state_type = "utxo"
 blocks_to_keep = 0
+cache_mb = 4096
 
 [listen.ipv6]
 address = "[::]:9030"

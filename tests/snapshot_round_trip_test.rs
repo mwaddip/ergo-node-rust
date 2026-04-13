@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use enr_state::{AVLTreeParams, RedbAVLStorage};
+use enr_state::{AVLTreeParams, CacheSize, RedbAVLStorage};
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
 use ergo_avltree_rust::batch_node::{AVLTree, Node, NodeHeader, Resolver};
 use ergo_avltree_rust::operation::{KeyValue, Operation};
@@ -24,7 +24,7 @@ fn dump_serve_receive_round_trip() {
         key_length: 32,
         value_length: None,
     };
-    let storage = RedbAVLStorage::open(&state_path, params, 0).unwrap();
+    let storage = RedbAVLStorage::open(&state_path, params, 0, CacheSize::default()).unwrap();
 
     // Create snapshot reader BEFORE prover takes ownership of storage
     let snapshot_reader = storage.snapshot_reader();
@@ -113,7 +113,7 @@ fn dump_serve_receive_round_trip() {
         key_length: 32,
         value_length: None,
     };
-    let mut storage2 = RedbAVLStorage::open(&state2_path, params2, 0).unwrap();
+    let mut storage2 = RedbAVLStorage::open(&state2_path, params2, 0, CacheSize::default()).unwrap();
 
     let mut version_bytes = Vec::with_capacity(33);
     version_bytes.extend_from_slice(&dump.root_hash);
