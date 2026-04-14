@@ -238,6 +238,12 @@ impl BlockValidator for UtxoValidator {
         tracing::info!(height, "UTXO validator reset to fork point");
     }
 
+    fn flush(&self) -> Result<(), ValidationError> {
+        self.prover.storage.flush().map_err(|e| {
+            ValidationError::StateOperationFailed(format!("flush: {e}"))
+        })
+    }
+
     fn proofs_for_transactions(
         &self,
         txs: &[ergo_lib::chain::transaction::Transaction],

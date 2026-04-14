@@ -712,6 +712,16 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                             "validation progress"
                         );
                     }
+
+                    // Durable flush every 100 blocks. Bounds crash data
+                    // loss to < 100 blocks (~3s of validation at tip).
+                    if height % 100 == 0 {
+                        if let Some(v) = self.validator.as_ref() {
+                            if let Err(e) = v.flush() {
+                                tracing::warn!(height, error = %e, "validator flush failed");
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::error!(height, error = %e, "apply_state failed");
@@ -752,6 +762,15 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         // scripts are verified before accepting the next peer block.
         let blocking = sweep_size <= 1;
         self.drain_eval_results(blocking).await;
+
+        // Durable flush at sweep end — catches the tail of blocks that
+        // didn't hit a 100-boundary. Also the tip-following path (single
+        // block per sweep) always flushes here.
+        if let Some(v) = self.validator.as_ref() {
+            if let Err(e) = v.flush() {
+                tracing::warn!(error = %e, "validator flush after sweep failed");
+            }
+        }
     }
 
     /// Drain completed script evaluation results from the channel.

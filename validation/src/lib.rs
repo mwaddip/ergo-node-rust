@@ -102,6 +102,13 @@ pub trait BlockValidator {
     /// Reset to a previous state after reorg.
     fn reset_to(&mut self, height: u32, digest: ADDigest);
 
+    /// Force a durable commit (fsync) of all outstanding storage writes.
+    /// Call periodically during long sweeps (bounds crash data loss) and
+    /// on graceful shutdown. Digest-mode validators may make this a no-op.
+    fn flush(&self) -> Result<(), ValidationError> {
+        Ok(())
+    }
+
     /// Compute AD proofs and new state root for a set of transactions
     /// without modifying persistent state. Returns None for digest-mode
     /// validators (mining requires UTXO mode).

@@ -22,7 +22,7 @@ enr-state = { path = "state" }
 enr-store = { path = "store" }
 ergo-api = { path = "api" }
 ergo-sync = { path = "sync" }
-ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "28862a1" }
+ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "de1a79a" }
 ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "2de209be" }
 ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "2de209be" }
 ergo-mempool = { path = "mempool" }

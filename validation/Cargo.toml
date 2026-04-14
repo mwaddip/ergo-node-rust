@@ -8,7 +8,7 @@ description = "Block validation for the Ergo Rust node"
 ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "2de209be" }
 ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "2de209be" }
 sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "2de209be" }
-ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "28862a1" }
+ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "de1a79a" }
 rayon = "1"
 blake2 = "0.10"
 bytes = "1"

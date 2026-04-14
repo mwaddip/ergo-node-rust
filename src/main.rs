@@ -341,6 +341,13 @@ impl BlockValidator for Validator {
         let _ = self.height_watch_tx.send(h);
     }
 
+    fn flush(&self) -> Result<(), ValidationError> {
+        match &self.inner {
+            ValidatorInner::Digest(v) => v.flush(),
+            ValidatorInner::Utxo(v) => v.flush(),
+        }
+    }
+
     fn proofs_for_transactions(
         &self,
         txs: &[ergo_validation::Transaction],
@@ -939,14 +946,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // cause in enr-store's write path is tracked separately; this
     // loader tolerates the divergence regardless.
     if let Some((tip_height, tip_id)) = store.best_header_tip()? {
-        let mut stack: Vec<enr_chain::Header> = Vec::with_capacity(tip_height as usize);
+        // Walk backward collecting IDs only. Parsing each header just to
+        // extract parent_id and dropping it avoids keeping 1.76M fully
+        // deserialized Header structs resident alongside chain's own
+        // by_height storage — the previous Vec<Header> intermediate was
+        // the dominant startup RSS peak.
+        let mut ids: Vec<[u8; 32]> = Vec::with_capacity(tip_height as usize);
         let mut current_id: [u8; 32] = tip_id;
         let walk_ok = loop {
             let data = match store.get(HEADER_TYPE_ID, &current_id)? {
                 Some(d) => d,
                 None => {
                     tracing::error!(
-                        walked = stack.len(),
+                        walked = ids.len(),
                         missing_id = ?current_id,
                         "backward chain walk: header data not found in store"
                     );
@@ -957,7 +969,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(h) => h,
                 Err(e) => {
                     tracing::error!(
-                        walked = stack.len(),
+                        walked = ids.len(),
                         "backward chain walk: header parse failed: {e}"
                     );
                     break false;
@@ -965,19 +977,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let parent_id: [u8; 32] = header.parent_id.0.0;
             let is_genesis = header.height == 1;
-            stack.push(header);
+            ids.push(current_id);
             if is_genesis {
                 break true;
             }
             current_id = parent_id;
         };
 
-        // Even on walk failure, replay whatever prefix we successfully
-        // collected — the tail is authoritative from the tip so a
-        // partial walk always yields a valid prefix.
-        stack.reverse();
+        // Replay forward, re-fetching and re-parsing one header at a time.
+        // redb's cache makes the second fetch cheap. If the walk failed
+        // before reaching genesis, the first try_append will fail parent
+        // linkage and we bail — matching the previous partial-replay behavior.
         let mut loaded = 0u32;
-        for header in stack {
+        for id in ids.into_iter().rev() {
+            let data = match store.get(HEADER_TYPE_ID, &id)? {
+                Some(d) => d,
+                None => {
+                    tracing::error!(
+                        loaded,
+                        "replay: header data vanished between walk and replay"
+                    );
+                    break;
+                }
+            };
+            let header = match enr_chain::parse_header(&data) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!(loaded, "replay: header parse failed: {e}");
+                    break;
+                }
+            };
             let h = header.height;
             match chain.try_append(header) {
                 Ok(enr_chain::AppendResult::Extended) => loaded += 1,
@@ -2160,8 +2189,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Ergo node running");
 
-    // Run until interrupted
-    tokio::signal::ctrl_c().await?;
+    // Run until interrupted — handle both SIGINT (ctrl-c) and SIGTERM
+    // (systemd stop). Without SIGTERM handling, the process exits via
+    // default handler and in-progress state writes are lost.
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("SIGINT received");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM received");
+            }
+        }
+    }
 
     let height = chain.lock().await.height();
     let peers = p2p.peer_count().await;
@@ -2169,9 +2211,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Drop P2P node to close event streams, triggering task shutdown.
     // The pipeline exits when its modifier channel closes (sender dropped
-    // with the P2P node). The sync task exits when its event stream ends.
+    // with the P2P node). The sync task exits when its event stream ends
+    // and runs its end-of-sweep flush in the process.
     drop(p2p);
-    // Brief grace period for tasks to finish in-flight work
+    // Brief grace period for tasks to finish in-flight work and flush state
     tokio::time::sleep(SHUTDOWN_GRACE).await;
 
     Ok(())
