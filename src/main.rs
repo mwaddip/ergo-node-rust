@@ -747,6 +747,15 @@ struct NodeConfig {
     /// /peers/api-urls. Example: "http://213.239.193.208:9053"
     #[serde(default)]
     fastsync_peer: Option<String>,
+    /// Minimum gap (peer_chain_tip - downloaded_height) that triggers fastsync.
+    /// Below this, boot proceeds directly to P2P sync. Also passed to fastsync
+    /// as --handoff-distance so both sides agree on when to hand off.
+    #[serde(default = "default_fastsync_threshold_blocks")]
+    fastsync_threshold_blocks: u32,
+    /// How long to wait at boot for the first peer SyncInfo before deciding.
+    /// If no peer reports a tip within this window, fastsync is skipped.
+    #[serde(default = "default_fastsync_peer_wait_timeout_sec")]
+    fastsync_peer_wait_timeout_sec: u64,
     /// redb cache size in megabytes (default: 256).
     #[serde(default = "default_cache_mb")]
     cache_mb: u64,
@@ -773,6 +782,8 @@ impl Default for NodeConfig {
             api_address: None,
             fastsync: default_fastsync(),
             fastsync_peer: None,
+            fastsync_threshold_blocks: default_fastsync_threshold_blocks(),
+            fastsync_peer_wait_timeout_sec: default_fastsync_peer_wait_timeout_sec(),
             cache_mb: default_cache_mb(),
             mining: MiningConfig::default(),
         }
@@ -805,6 +816,12 @@ fn default_min_fee() -> u64 {
 }
 fn default_fastsync() -> bool {
     true
+}
+fn default_fastsync_threshold_blocks() -> u32 {
+    25_000
+}
+fn default_fastsync_peer_wait_timeout_sec() -> u64 {
+    30
 }
 fn default_cache_mb() -> u64 {
     256
@@ -1072,6 +1089,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Defined here (above the event demux) because the NiPoPoW closure needs to clone it.
     let shared_validated_height = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let shared_downloaded_height = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    // Block-request gate: closed at construction, opened after the boot-time
+    // fastsync bootstrap decision resolves. While closed, the sync machine
+    // processes incoming events but does not send ModifierRequest.
+    let block_request_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Peer chain tip: published by the sync machine on every incoming SyncInfo.
+    // Read by the bootstrap task to decide whether to spawn fastsync.
+    let peer_chain_tip = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     // Subscribe to events for the sync machine — with snapshot serving demux
     let raw_events = p2p.subscribe().await;
@@ -1465,11 +1489,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start sync in a background task
     let api_downloaded_height = shared_downloaded_height.clone();
+    let sync_shared_downloaded_height = shared_downloaded_height.clone();
+    let sync_block_request_gate = block_request_gate.clone();
+    let sync_peer_chain_tip = peer_chain_tip.clone();
     tokio::spawn(async move {
         let mut sync = HeaderSync::new(
             sync_config, transport, sync_chain, sync_store, validator,
             progress_rx, delivery_control_rx, delivery_data_rx,
-            snapshot_tx, validator_rx, shared_downloaded_height,
+            snapshot_tx, validator_rx, sync_shared_downloaded_height,
+            sync_block_request_gate, sync_peer_chain_tip,
         );
         sync.run().await;
     });
@@ -2031,39 +2059,103 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-        // Auto-spawn fastsync if enabled and the binary is in PATH.
-        // Runs after a delay to let peers connect so /peers/api-urls has URLs.
-        if node_config.fastsync {
-            let fastsync_peer = node_config.fastsync_peer.clone();
-            let api_port = api_bind_addr.port();
-            tokio::spawn(async move {
-                // Wait for peers to connect before starting fastsync
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        // Boot-time bootstrap decision: optionally spawn fastsync and wait
+        // for it to exit, then open the P2P block-request gate. The gate is
+        // opened in every path so P2P sync always resumes. See facts/sync.md
+        // "Bootstrap Mode (Optional Fastsync)".
+        let fastsync_enabled = node_config.fastsync;
+        let fastsync_peer = node_config.fastsync_peer.clone();
+        let fastsync_threshold = node_config.fastsync_threshold_blocks;
+        let fastsync_peer_wait = std::time::Duration::from_secs(
+            node_config.fastsync_peer_wait_timeout_sec,
+        );
+        let api_port = api_bind_addr.port();
+        let bootstrap_gate = block_request_gate.clone();
+        let bootstrap_peer_tip = peer_chain_tip.clone();
+        let bootstrap_downloaded = shared_downloaded_height.clone();
 
-                // Check if the binary exists
-                let probe = tokio::process::Command::new("ergo-fastsync")
-                    .arg("--version")
-                    .output()
-                    .await;
-                if probe.is_err() || !probe.unwrap().status.success() {
-                    tracing::debug!("ergo-fastsync not found in PATH, skipping fast sync");
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering;
+
+            if !fastsync_enabled {
+                tracing::info!("fastsync disabled in config — skipping bootstrap");
+                bootstrap_gate.store(true, Ordering::Relaxed);
+                return;
+            }
+
+            // Probe the binary — absent binary means skip fastsync entirely.
+            let probe = tokio::process::Command::new("ergo-fastsync")
+                .arg("--version")
+                .output()
+                .await;
+            if probe.is_err() || !probe.unwrap().status.success() {
+                tracing::info!("ergo-fastsync not found in PATH — skipping fastsync");
+                bootstrap_gate.store(true, Ordering::Relaxed);
+                return;
+            }
+
+            // Wait for at least one peer SyncInfo, bounded by timeout.
+            let wait_started = std::time::Instant::now();
+            let poll_interval = std::time::Duration::from_millis(500);
+            let peer_tip = loop {
+                let tip = bootstrap_peer_tip.load(Ordering::Relaxed);
+                if tip > 0 {
+                    break tip;
+                }
+                if wait_started.elapsed() >= fastsync_peer_wait {
+                    tracing::warn!(
+                        wait_secs = fastsync_peer_wait.as_secs(),
+                        "no peer SyncInfo within fastsync_peer_wait_timeout_sec — skipping fastsync"
+                    );
+                    bootstrap_gate.store(true, Ordering::Relaxed);
                     return;
                 }
+                tokio::time::sleep(poll_interval).await;
+            };
 
-                let node_url = format!("http://127.0.0.1:{api_port}");
-                let mut cmd = tokio::process::Command::new("ergo-fastsync");
-                cmd.arg("--node-url").arg(&node_url);
-                if let Some(ref peer) = fastsync_peer {
-                    cmd.arg("--peer-url").arg(peer);
-                }
-                tracing::info!("starting fastsync");
-                match cmd.status().await {
-                    Ok(s) if s.success() => tracing::info!("fastsync completed"),
-                    Ok(s) => tracing::warn!(code = ?s.code(), "fastsync exited with error"),
-                    Err(e) => tracing::warn!(error = %e, "fastsync spawn failed"),
-                }
-            });
-        }
+            let downloaded = bootstrap_downloaded.load(Ordering::Relaxed);
+            let gap = peer_tip.saturating_sub(downloaded);
+
+            if gap <= fastsync_threshold {
+                tracing::info!(
+                    peer_tip, downloaded, gap, threshold = fastsync_threshold,
+                    "gap at/below fastsync threshold — going straight to P2P"
+                );
+                bootstrap_gate.store(true, Ordering::Relaxed);
+                return;
+            }
+
+            tracing::info!(
+                peer_tip, downloaded, gap, threshold = fastsync_threshold,
+                "gap exceeds fastsync threshold — spawning fastsync"
+            );
+            let node_url = format!("http://127.0.0.1:{api_port}");
+            let mut cmd = tokio::process::Command::new("ergo-fastsync");
+            cmd.arg("--node-url").arg(&node_url);
+            cmd.arg("--handoff-distance").arg(fastsync_threshold.to_string());
+            if let Some(ref peer) = fastsync_peer {
+                cmd.arg("--peer-url").arg(peer);
+            }
+            let spawn_started = std::time::Instant::now();
+            match cmd.status().await {
+                Ok(s) if s.success() => tracing::info!(
+                    elapsed_secs = spawn_started.elapsed().as_secs(),
+                    "fastsync completed"
+                ),
+                Ok(s) => tracing::warn!(
+                    code = ?s.code(),
+                    elapsed_secs = spawn_started.elapsed().as_secs(),
+                    "fastsync exited with error"
+                ),
+                Err(e) => tracing::warn!(error = %e, "fastsync spawn failed"),
+            }
+
+            // Open the gate regardless of exit status. Validation catches
+            // anything fastsync delivered in bad faith; P2P picks up the
+            // remainder for any blocks fastsync didn't close the gap on.
+            bootstrap_gate.store(true, Ordering::Relaxed);
+            tracing::info!("block-request gate opened — P2P block sync active");
+        });
     }
 
     tracing::info!("Ergo node running");

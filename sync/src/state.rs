@@ -121,6 +121,13 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     eval_rx: CrossbeamReceiver<(u32, Result<(), ergo_validation::ValidationError>)>,
     /// Shared downloaded_height for the API (read by fastsync to avoid redundant work).
     shared_downloaded_height: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Gate controlling whether block/header/tx ModifierRequest sends actually fire.
+    /// Closed (false) at construction, opened (true) by the main crate after the
+    /// boot-time fastsync bootstrap decision resolves. See facts/sync.md "Bootstrap Mode".
+    block_request_gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Peer's chain tip, updated on every incoming SyncInfo to the max observed.
+    /// Read by the main crate to compute the bootstrap gap.
+    peer_chain_tip: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync<T, C, S, V> {
@@ -136,6 +143,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         snapshot_tx: Option<tokio::sync::oneshot::Sender<crate::snapshot::SnapshotData>>,
         validator_rx: Option<tokio::sync::oneshot::Receiver<V>>,
         shared_downloaded_height: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        block_request_gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        peer_chain_tip: std::sync::Arc<std::sync::atomic::AtomicU32>,
     ) -> Self {
         let tracker = DeliveryTracker::with_config(config.delivery_timeout, config.max_delivery_checks);
         let initial_validated = validator.as_ref().map_or(0, |v| v.validated_height());
@@ -165,6 +174,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             eval_tx,
             eval_rx,
             shared_downloaded_height,
+            block_request_gate,
+            peer_chain_tip,
         }
     }
 
@@ -468,6 +479,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     /// Chunks into messages of at most 400 IDs to stay within the JVM's
     /// `desiredInvObjects` limit. Larger requests are silently rejected.
     async fn request_announced(&mut self, peer: PeerId, modifier_type: u8, ids: Vec<[u8; 32]>) {
+        if !self.block_request_gate.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         self.tracker.mark_requested(&ids, peer, modifier_type);
         // JVM rejects ModifierRequest with >400 elements
         for chunk in ids.chunks(400) {
@@ -903,6 +917,15 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         let our_height = self.chain.chain_height().await;
 
                         if let Some(&peer_tip) = peer_heights.first() {
+                            // Publish the max peer tip we've seen — main crate
+                            // reads this for the bootstrap gap decision.
+                            let prev = self.peer_chain_tip
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            if peer_tip > prev {
+                                self.peer_chain_tip
+                                    .store(peer_tip, std::sync::atomic::Ordering::Relaxed);
+                            }
+
                             // "Caught up" only counts from the peer we're syncing from
                             if peer_id == peer && peer_tip <= our_height {
                                 tracing::info!(our_height, peer_tip, "caught up with peer");
@@ -966,7 +989,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         _current_peer: PeerId,
     ) {
         // Re-request timed-out modifiers from a different peer
-        if !result.retries.is_empty() {
+        if !result.retries.is_empty()
+            && self.block_request_gate.load(std::sync::atomic::Ordering::Relaxed)
+        {
             let peers = self.transport.outbound_peers().await;
             for retry in &result.retries {
                 let target = peers.iter()
