@@ -2155,6 +2155,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
             modifier_tx: Some(modifier_tx_for_mining.clone()),
             height_watch: height_watch_rx,
+            jemalloc_probe: {
+                #[cfg(feature = "jemalloc")]
+                {
+                    Some(Arc::new(|| {
+                        let _ = tikv_jemalloc_ctl::epoch::advance();
+                        ergo_api::JemallocSnapshot {
+                            allocated: tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0) as u64,
+                            active: tikv_jemalloc_ctl::stats::active::read().unwrap_or(0) as u64,
+                            resident: tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0) as u64,
+                            retained: tikv_jemalloc_ctl::stats::retained::read().unwrap_or(0) as u64,
+                            metadata: tikv_jemalloc_ctl::stats::metadata::read().unwrap_or(0) as u64,
+                        }
+                    }))
+                }
+                #[cfg(not(feature = "jemalloc"))]
+                {
+                    None
+                }
+            },
             node_info: std::sync::Arc::new(ergo_api::NodeMeta {
                 name: "ergo-node-rust".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),

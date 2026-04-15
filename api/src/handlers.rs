@@ -787,6 +787,96 @@ pub async fn info_wait(
     }
 }
 
+// ---------------------------------------------------------------------------
+// GET /debug/memory
+// ---------------------------------------------------------------------------
+
+/// Average bytes per header in the in-memory chain. Real headers vary with
+/// interlink vector size; 800 is a coarse working estimate. Good enough to
+/// know whether chain is 0.5 GB or 2 GB of the total — don't use for anything
+/// that requires precision.
+const AVG_HEADER_BYTES: u64 = 800;
+
+pub async fn get_debug_memory(State(state): State<ApiState>) -> Json<DebugMemory> {
+    // Process memory from /proc/self/status. Fall back to zeros if any field
+    // is missing — the endpoint is diagnostic, not mission-critical.
+    let process = read_proc_memory();
+
+    // Jemalloc stats: only when the main crate wired a probe.
+    let jemalloc = state.jemalloc_probe.as_ref().map(|p| {
+        let s = p();
+        JemallocMemory {
+            allocated_bytes: s.allocated,
+            active_bytes: s.active,
+            resident_bytes: s.resident,
+            retained_bytes: s.retained,
+            metadata_bytes: s.metadata,
+        }
+    });
+
+    let chain_header_count = state.chain.height();
+    let mempool_tx_count = state.mempool.lock().await.len() as u32;
+
+    let components = ComponentMemory {
+        chain_header_estimate_bytes: chain_header_count as u64 * AVG_HEADER_BYTES,
+        chain_header_count,
+        mempool_tx_count,
+    };
+
+    Json(DebugMemory { process, jemalloc, components })
+}
+
+/// Read anon/file/peak RSS and VmSize from `/proc/self/status`, PSS from
+/// `/proc/self/smaps_rollup`. All fields return 0 on parse failure.
+fn read_proc_memory() -> ProcessMemory {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let mut rss_anon = 0u64;
+    let mut rss_file = 0u64;
+    let mut rss_shmem = 0u64;
+    let mut rss_peak = 0u64;
+    let mut vm_size = 0u64;
+    for line in status.lines() {
+        let (key, rest) = match line.split_once(':') {
+            Some(p) => p,
+            None => continue,
+        };
+        let kb = rest.trim().split_whitespace().next()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let bytes = kb * 1024;
+        match key {
+            "RssAnon" => rss_anon = bytes,
+            "RssFile" => rss_file = bytes,
+            "RssShmem" => rss_shmem = bytes,
+            "VmHWM" => rss_peak = bytes,
+            "VmSize" => vm_size = bytes,
+            _ => {}
+        }
+    }
+    let rss_total = rss_anon + rss_file + rss_shmem;
+
+    // smaps_rollup is one line of aggregate PSS — not always readable (requires
+    // CAP_SYS_PTRACE or ownership). Best-effort.
+    let pss_bytes = std::fs::read_to_string("/proc/self/smaps_rollup")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Pss:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|kb| kb * 1024)
+        });
+
+    ProcessMemory {
+        rss_anon_bytes: rss_anon,
+        rss_file_bytes: rss_file,
+        rss_total_bytes: rss_total,
+        rss_peak_bytes: rss_peak,
+        vm_size_bytes: vm_size,
+        pss_bytes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

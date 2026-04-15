@@ -45,6 +45,21 @@ pub struct ApiState {
     pub modifier_tx: Option<tokio::sync::mpsc::Sender<(u8, [u8; 32], Vec<u8>, Option<u64>)>>,
     /// Watch channel for validated block height — used by /info/wait long-poll.
     pub height_watch: tokio::sync::watch::Receiver<u32>,
+    /// Jemalloc stats probe. Populated by the main crate when built with
+    /// jemalloc; None with mimalloc or system allocator. The `/debug/memory`
+    /// handler calls this to read live allocator counters.
+    pub jemalloc_probe: Option<Arc<dyn Fn() -> JemallocSnapshot + Send + Sync>>,
+}
+
+/// Snapshot of jemalloc stats at a moment in time. The probe calls
+/// `epoch::advance()` then reads each stat. Byte-valued fields are u64.
+#[derive(Clone, Copy, Default)]
+pub struct JemallocSnapshot {
+    pub allocated: u64,
+    pub active: u64,
+    pub resident: u64,
+    pub retained: u64,
+    pub metadata: u64,
 }
 
 /// Static node metadata.
@@ -144,6 +159,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/mining/candidate", get(handlers::get_mining_candidate))
         .route("/mining/solution", axum::routing::post(handlers::post_mining_solution))
         .route("/mining/rewardAddress", get(handlers::get_mining_reward_address))
+        // Debug
+        .route("/debug/memory", get(handlers::get_debug_memory))
         .with_state(state)
 }
 
