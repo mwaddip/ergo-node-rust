@@ -4,7 +4,7 @@ exclude = ["addons/fastsync", "addons/indexer"]
 
 [package]
 name = "ergo-node-rust"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Full Ergo blockchain node in Rust"
 
@@ -12,6 +12,11 @@ description = "Full Ergo blockchain node in Rust"
 default = ["jemalloc"]
 mimalloc = ["dep:mimalloc"]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+# Enables jemalloc's built-in heap profiler. Opt-in build
+# (`--no-default-features --features jemalloc-prof`) for field
+# profiling with jeprof. Activate at runtime via
+# `_RJEM_MALLOC_CONF=prof:true,prof_prefix:/var/log/.../jeprof,...`.
+jemalloc-prof = ["jemalloc", "tikv-jemallocator/profiling"]
 
 [dependencies]
 mimalloc = { version = "0.1", optional = true }
