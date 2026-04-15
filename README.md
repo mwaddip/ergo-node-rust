@@ -115,11 +115,15 @@ The node depends on two upstream Rust crates for consensus-critical primitives, 
 
 Open PRs against [ergoplatform/sigma-rust](https://github.com/ergoplatform/sigma-rust):
 
+- [#847](https://github.com/ergoplatform/sigma-rust/pull/847) — Fix panic in `gen_indexes` when index modulo N equals zero
 - [#848](https://github.com/ergoplatform/sigma-rust/pull/848) — `ErgoTreePredef` port + genesis construction
 - [#850](https://github.com/ergoplatform/sigma-rust/pull/850) — Soft-fork parameter variants
 - [#851](https://github.com/ergoplatform/sigma-rust/pull/851) — `NipopowAlgos::prove_with_reader` for efficient proof serving
+- [#852](https://github.com/ergoplatform/sigma-rust/pull/852) — NiPoPoW `has_valid_connections` tolerates skipped prefix entries
+- [#854](https://github.com/ergoplatform/sigma-rust/pull/854) — Port JIT costing from sigmastate-interpreter
 - [#855](https://github.com/ergoplatform/sigma-rust/pull/855) — Allocation bomb guard for VLQ-decoded message sizes
 - [#857](https://github.com/ergoplatform/sigma-rust/pull/857) — BigInt modulo semantics (`mod` vs `rem`)
+- [#858](https://github.com/ergoplatform/sigma-rust/pull/858) — Lazy constant resolution in ErgoTree evaluation
 - [#859](https://github.com/ergoplatform/sigma-rust/pull/859) — Pre-JIT ErgoScript leniency for v0/v1 scripts
 
 ### ergo_avltree_rust
@@ -127,6 +131,7 @@ Open PRs against [ergoplatform/sigma-rust](https://github.com/ergoplatform/sigma
 [`mwaddip/ergo_avltree_rust`](https://github.com/mwaddip/ergo_avltree_rust)
 
 - [#10](https://github.com/ergoplatform/ergo_avltree_rust/pull/10) — `Resolver` type change to support disk-backed storage
+- [#11](https://github.com/ergoplatform/ergo_avltree_rust/pull/11) — `VersionedAVLStorage::flush()` for durable commits on demand
 
 ## Credits
 
