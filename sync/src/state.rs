@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 
@@ -53,6 +54,23 @@ pub struct SyncConfig {
     pub min_snapshot_peers: u32,
     /// Data directory for temporary snapshot download storage.
     pub data_dir: std::path::PathBuf,
+    /// Heap-allocated-bytes threshold above which `validator.flush()` is called
+    /// mid-sweep. When the probe (see `flush_probe`) reports live heap above
+    /// this, and at least `flush_min_blocks` have elapsed since the last flush,
+    /// the sweep commits the redb write transaction. Setting to 0 disables
+    /// memory-based triggering.
+    pub flush_heap_threshold_mb: u64,
+    /// Upper guardrail: flush at least every N validated blocks regardless of
+    /// memory. Bounds crash recovery work. Always applied.
+    pub flush_max_blocks: u32,
+    /// Lower guardrail: never flush more often than every N validated blocks,
+    /// even if heap is over threshold. Prevents flush storms when heap growth
+    /// comes from sources other than the redb write transaction.
+    pub flush_min_blocks: u32,
+    /// Probe returning the current live heap in bytes. Main crate wires this
+    /// to `tikv_jemalloc_ctl::stats::allocated` when built with jemalloc.
+    /// When `None`, flushing is purely count-based (every `flush_max_blocks`).
+    pub flush_probe: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
 }
 
 impl Default for SyncConfig {
@@ -69,6 +87,14 @@ impl Default for SyncConfig {
             utxo_bootstrap: false,
             min_snapshot_peers: 2,
             data_dir: std::path::PathBuf::from("."),
+            // 0 disables the memory trigger. Effective policy then degenerates
+            // to "flush every flush_max_blocks". Main crate overrides with a
+            // real threshold when a probe is wired.
+            flush_heap_threshold_mb: 0,
+            // 100 preserves the prior hardcoded cadence as the upper bound.
+            flush_max_blocks: 100,
+            flush_min_blocks: 5,
+            flush_probe: None,
         }
     }
 }
@@ -128,6 +154,10 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     /// Peer's chain tip, updated on every incoming SyncInfo to the max observed.
     /// Read by the main crate to compute the bootstrap gap.
     peer_chain_tip: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Height of the most recent `validator.flush()` call. Used by the
+    /// memory-aware flush policy to enforce `flush_min_blocks` spacing and
+    /// `flush_max_blocks` upper bound.
+    last_flush_height: u32,
 }
 
 impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync<T, C, S, V> {
@@ -149,6 +179,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         let tracker = DeliveryTracker::with_config(config.delivery_timeout, config.max_delivery_checks);
         let initial_validated = validator.as_ref().map_or(0, |v| v.validated_height());
         let (eval_tx, eval_rx) = crossbeam_channel::unbounded();
+        let last_flush_height = initial_validated;
         Self {
             config,
             transport,
@@ -176,6 +207,40 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             shared_downloaded_height,
             block_request_gate,
             peer_chain_tip,
+            last_flush_height,
+        }
+    }
+
+    /// Decide whether to `validator.flush()` after validating `height`.
+    ///
+    /// Policy (dial between memory usage and I/O, see docs/profiling-results.md):
+    ///
+    /// 1. Forced flush if at least `flush_max_blocks` have passed since the
+    ///    last flush. Bounds crash-recovery work.
+    /// 2. Suppressed flush if fewer than `flush_min_blocks` have passed.
+    ///    Prevents flush storms when heap growth is driven by something other
+    ///    than the redb write transaction.
+    /// 3. Between those bounds, flush when the heap probe reports live heap
+    ///    above `flush_heap_threshold_mb`. The probe is configured by the
+    ///    main crate — typically `tikv_jemalloc_ctl::stats::allocated` when
+    ///    the binary is built with jemalloc.
+    /// 4. If no probe is configured OR threshold is 0, the policy degenerates
+    ///    to "flush every `flush_max_blocks`" via rule (1).
+    fn should_flush(&self, height: u32) -> bool {
+        let since_last = height.saturating_sub(self.last_flush_height);
+        if since_last >= self.config.flush_max_blocks {
+            return true;
+        }
+        if since_last < self.config.flush_min_blocks {
+            return false;
+        }
+        if self.config.flush_heap_threshold_mb == 0 {
+            return false;
+        }
+        let threshold_bytes = self.config.flush_heap_threshold_mb * 1024 * 1024;
+        match self.config.flush_probe.as_ref() {
+            Some(probe) => probe() >= threshold_bytes,
+            None => false,
         }
     }
 
@@ -713,13 +778,23 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         );
                     }
 
-                    // Durable flush every 100 blocks. Bounds crash data
-                    // loss to < 100 blocks (~3s of validation at tip).
-                    if height % 100 == 0 {
+                    // Memory-aware flush. `should_flush` applies the configured
+                    // heap threshold + min/max block guardrails. See the method
+                    // doc for the full policy. Keeps crash-recovery work bounded
+                    // by `flush_max_blocks` and peak heap bounded by
+                    // `flush_heap_threshold_mb` (when a probe is wired).
+                    if self.should_flush(height) {
                         if let Some(v) = self.validator.as_ref() {
-                            if let Err(e) = v.flush() {
-                                tracing::warn!(height, error = %e, "validator flush failed");
+                            match v.flush() {
+                                Ok(()) => {
+                                    self.last_flush_height = height;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(height, error = %e, "validator flush failed");
+                                }
                             }
+                        } else {
+                            self.last_flush_height = height;
                         }
                     }
                 }
@@ -766,11 +841,16 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         self.drain_eval_results(blocking).await;
 
         // Durable flush at sweep end — catches the tail of blocks that
-        // didn't hit a 100-boundary. Also the tip-following path (single
-        // block per sweep) always flushes here.
+        // didn't hit a heap-threshold or max-blocks trigger mid-sweep. The
+        // tip-following path (single block per sweep) always reaches this.
         if let Some(v) = self.validator.as_ref() {
-            if let Err(e) = v.flush() {
-                tracing::warn!(error = %e, "validator flush after sweep failed");
+            match v.flush() {
+                Ok(()) => {
+                    self.last_flush_height = self.state_applied_height;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "validator flush after sweep failed");
+                }
             }
         }
     }

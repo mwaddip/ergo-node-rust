@@ -766,6 +766,20 @@ struct NodeConfig {
     /// redb cache size in megabytes (default: 256).
     #[serde(default = "default_cache_mb")]
     cache_mb: u64,
+    /// Live-heap threshold (MB) above which the validation sweep commits
+    /// the redb write transaction mid-sweep. 0 disables the memory trigger
+    /// and flushes degenerate to every `flush_max_blocks`. Default tuned to
+    /// 4 GB, empirically the point where the redb write-tx dirty-page
+    /// cache starts dominating live heap during initial sync.
+    #[serde(default = "default_flush_heap_threshold_mb")]
+    flush_heap_threshold_mb: u64,
+    /// Upper bound on blocks between flushes. Bounds crash-recovery work.
+    #[serde(default = "default_flush_max_blocks")]
+    flush_max_blocks: u32,
+    /// Lower bound on blocks between flushes. Prevents storm-flushing when
+    /// heap growth is driven by something other than the redb write tx.
+    #[serde(default = "default_flush_min_blocks")]
+    flush_min_blocks: u32,
     /// Mining configuration.
     #[serde(default)]
     mining: MiningConfig,
@@ -792,6 +806,9 @@ impl Default for NodeConfig {
             fastsync_threshold_blocks: default_fastsync_threshold_blocks(),
             fastsync_peer_wait_timeout_sec: default_fastsync_peer_wait_timeout_sec(),
             cache_mb: default_cache_mb(),
+            flush_heap_threshold_mb: default_flush_heap_threshold_mb(),
+            flush_max_blocks: default_flush_max_blocks(),
+            flush_min_blocks: default_flush_min_blocks(),
             mining: MiningConfig::default(),
         }
     }
@@ -832,6 +849,15 @@ fn default_fastsync_peer_wait_timeout_sec() -> u64 {
 }
 fn default_cache_mb() -> u64 {
     256
+}
+fn default_flush_heap_threshold_mb() -> u64 {
+    4096
+}
+fn default_flush_max_blocks() -> u32 {
+    100
+}
+fn default_flush_min_blocks() -> u32 {
+    5
 }
 
 /// Top-level config wrapper — just the [node] section, P2P is parsed separately.
@@ -1530,6 +1556,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     drop(chain_guard);
 
+    // Live-heap probe for the memory-aware flush trigger. Returns 0 when not
+    // built with jemalloc; sync then falls back to the max-block guardrail.
+    let flush_probe: Option<std::sync::Arc<dyn Fn() -> u64 + Send + Sync>> = {
+        #[cfg(feature = "jemalloc")]
+        {
+            Some(std::sync::Arc::new(|| {
+                // Advance the epoch so stats reflect the current allocator
+                // state, then read the live allocated-bytes counter. Both
+                // calls are documented as cheap (microseconds).
+                let _ = tikv_jemalloc_ctl::epoch::advance();
+                tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0) as u64
+            }))
+        }
+        #[cfg(not(feature = "jemalloc"))]
+        {
+            None
+        }
+    };
+
     // Build sync config from P2P network settings
     let net = net_settings;
     let sync_config = SyncConfig {
@@ -1539,6 +1584,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         utxo_bootstrap,
         min_snapshot_peers,
         data_dir: data_dir.clone(),
+        flush_heap_threshold_mb: node_config.flush_heap_threshold_mb,
+        flush_max_blocks: node_config.flush_max_blocks,
+        flush_min_blocks: node_config.flush_min_blocks,
+        flush_probe,
         ..SyncConfig::default()
     };
 
