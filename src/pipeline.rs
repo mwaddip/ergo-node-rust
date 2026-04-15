@@ -312,7 +312,6 @@ impl ValidationPipeline {
                     // Compute its cumulative score and store immediately
                     // (later headers in this batch may extend this fork).
                     let parent_score = chain.score_at(fork_height)
-                        .cloned()
                         .unwrap_or_default();
                     let difficulty = decode_compact_bits(header.n_bits)
                         .to_biguint()

@@ -569,19 +569,19 @@ impl ergo_api::ChainAccess for HeaderChainAdapter {
         self.with_chain(|c| c.height())
     }
     fn header_at(&self, height: u32) -> Option<ergo_chain_types::Header> {
-        self.with_chain(|c| c.header_at(height).cloned())
+        self.with_chain(|c| c.header_at(height))
     }
     fn header_by_id(&self, id: &[u8; 32]) -> Option<ergo_chain_types::Header> {
         let block_id = ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(*id));
         self.with_chain(|c| {
             let height = c.height_of(&block_id)?;
-            c.header_at(height).cloned()
+            c.header_at(height)
         })
     }
     fn tip(&self) -> Option<ergo_chain_types::Header> {
         self.with_chain(|c| {
             let h = c.height();
-            if h == 0 { None } else { c.header_at(h).cloned() }
+            if h == 0 { None } else { c.header_at(h) }
         })
     }
 }

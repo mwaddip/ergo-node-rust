@@ -70,7 +70,7 @@ impl SyncChain for SharedChain {
     }
 
     async fn header_at(&self, height: u32) -> Option<Header> {
-        self.chain.lock().await.header_at(height).cloned()
+        self.chain.lock().await.header_at(height)
     }
 
     async fn header_state_root(&self, height: u32) -> Option<[u8; 33]> {
