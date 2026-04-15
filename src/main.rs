@@ -1048,6 +1048,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .flatten()
         });
 
+        // Wire the header loader so chain's LRU cache can fall through to
+        // storage on miss. Replaces the materialize-all-headers-in-memory
+        // behavior — at 1.76M mainnet headers that was 1.4 GB of live heap.
+        // Score loader stays unwired: scores for main-chain headers are
+        // empty placeholders in the store (only fork headers carry real
+        // scores), so chain's Vec<BigUint> safety net is still authoritative.
+        let store_for_header_loader = store.clone();
+        chain.set_header_loader(move |height: u32| -> Option<ergo_chain_types::Header> {
+            let header_bytes = store_for_header_loader
+                .read_header_at(height)
+                .ok()
+                .flatten()?;
+            enr_chain::parse_header(&header_bytes).ok()
+        });
+
         // Note: active_parameters is recomputed from storage AFTER the
         // validator's resume height is known (inside the validator init
         // block below). The chain tip's parameters often diverge from the
