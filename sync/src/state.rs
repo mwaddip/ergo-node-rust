@@ -733,7 +733,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         if validated_to > self.state_applied_height {
             let advanced = validated_to - self.state_applied_height;
             self.state_applied_height = validated_to;
-            self.store.set_validator_height(validated_to).await;
+            // validator height is now persisted atomically inside state.redb
+            // by UtxoValidator::apply_state via storage.update_with_height —
+            // no separate hint write needed.
 
             if sweep_size > 100 {
                 let elapsed = sweep_start.elapsed();

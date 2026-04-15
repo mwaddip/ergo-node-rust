@@ -3,8 +3,11 @@
 use std::collections::HashMap;
 
 use bytes::Bytes;
+use enr_state::RedbAVLStorage;
+use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
+use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
 use ergo_avltree_rust::operation::{KeyValue, Operation};
-use ergo_avltree_rust::persistent_batch_avl_prover::PersistentBatchAVLProver;
+use ergo_avltree_rust::versioned_avl_storage::VersionedAVLStorage;
 use ergo_chain_types::{ADDigest, Header};
 use ergo_lib::chain::parameters::Parameters;
 
@@ -17,8 +20,11 @@ use crate::{ApplyStateOutcome, BlockValidator, ValidationError};
 /// UTXO-mode block validator.
 ///
 /// Verifies state transitions by applying operations to a persistent AVL+ tree
-/// (PersistentBatchAVLProver backed by VersionedAVLStorage). Boxes come from
-/// the tree's Lookup/Remove results, not from AD proofs.
+/// (BatchAVLProver over RedbAVLStorage). Boxes come from the tree's
+/// Lookup/Remove results, not from AD proofs. Storage and prover are held as
+/// separate fields so the validator can call the storage's inherent
+/// `update_with_height` to commit block_height atomically with state — the
+/// `VersionedAVLStorage` trait only exposes the block-height-unaware `update`.
 ///
 /// Stateless w.r.t. blockchain parameters: the caller passes `active_params`
 /// on every `validate_block` call. The validator does not own a `Parameters`
@@ -27,7 +33,8 @@ use crate::{ApplyStateOutcome, BlockValidator, ValidationError};
 /// Shares section parsing, state change computation, and transaction validation
 /// with DigestValidator — only the state root verification mechanism differs.
 pub struct UtxoValidator {
-    prover: PersistentBatchAVLProver,
+    storage: RedbAVLStorage,
+    prover: BatchAVLProver,
     validated_height: u32,
     checkpoint_height: u32,
     current_digest: ADDigest,
@@ -38,16 +45,19 @@ pub struct UtxoValidator {
 }
 
 impl UtxoValidator {
-    /// Create a UtxoValidator from a fully constructed PersistentBatchAVLProver.
+    /// Create a UtxoValidator from initialized storage and prover.
     ///
-    /// The caller builds the prover (RedbAVLStorage + BatchAVLProver) and passes
-    /// it in. The validator doesn't know about the storage backend.
+    /// The caller is responsible for arranging the prover's in-memory tree to
+    /// match `storage.version()`: either by calling `storage.rollback(&version)`
+    /// and installing the returned root, or by performing the genesis-bootstrap
+    /// insertions plus a first `storage.update_with_height(&mut prover, vec![], 0)`.
     pub fn new(
-        prover: PersistentBatchAVLProver,
+        storage: RedbAVLStorage,
+        prover: BatchAVLProver,
         height: u32,
         checkpoint_height: u32,
     ) -> Self {
-        let digest_bytes = prover.digest();
+        let digest_bytes = prover.digest().expect("prover has no root");
         let digest = bytes_to_ad_digest(&digest_bytes);
 
         // Compute emission contract ErgoTree bytes for box matching.
@@ -65,6 +75,7 @@ impl UtxoValidator {
             };
 
         Self {
+            storage,
             prover,
             validated_height: height,
             checkpoint_height,
@@ -129,7 +140,7 @@ impl BlockValidator for UtxoValidator {
             }));
         }
 
-        // 4. Apply operations to the persistent prover, capturing old values
+        // 4. Apply operations to the prover, capturing old values
         let validate_txs = header.height > self.checkpoint_height;
         let mut proof_box_bytes: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
 
@@ -157,7 +168,12 @@ impl BlockValidator for UtxoValidator {
 
         // 5. Verify resulting digest matches header.state_root
         let expected_state_root: [u8; 33] = header.state_root.into();
-        let prover_digest = self.prover.digest();
+        let prover_digest = self
+            .prover
+            .digest()
+            .ok_or_else(|| ValidationError::StateOperationFailed(
+                "prover has no root after operations".to_string(),
+            ))?;
         if prover_digest.as_ref() != expected_state_root.as_slice() {
             return Err(ValidationError::StateRootMismatch {
                 expected: expected_state_root.to_vec(),
@@ -184,12 +200,17 @@ impl BlockValidator for UtxoValidator {
             None
         };
 
-        // 7. Persist state changes + generate AD proof as side effect
-        self.prover
-            .generate_proof_and_update_storage(vec![])
+        // 7. Persist state changes atomically with block_height, then flush
+        //    the prover's tree-local state (resets visited/new flags) by
+        //    consuming the AD proof. Proof bytes are not served to peers
+        //    from validation today; digest-mode peers would need them but
+        //    that wiring is Phase 6.
+        self.storage
+            .update_with_height(&mut self.prover, vec![], header.height)
             .map_err(|e| ValidationError::StateOperationFailed(
                 format!("persist failed: {e}"),
             ))?;
+        let _ = self.prover.generate_proof();
 
         // 8. Track emission box: scan new outputs for emission contract
         if !self.emission_tree_bytes.is_empty() {
@@ -228,10 +249,15 @@ impl BlockValidator for UtxoValidator {
         let digest_bytes: [u8; 33] = digest.into();
         let avl_digest = Bytes::copy_from_slice(&digest_bytes);
 
-        if let Err(e) = self.prover.rollback(&avl_digest) {
-            tracing::error!(height, error = %e, "UTXO state rollback failed");
-            return;
-        }
+        let (root, tree_height) = match self.storage.rollback(&avl_digest) {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::error!(height, error = %e, "UTXO state rollback failed");
+                return;
+            }
+        };
+        self.prover.base.tree.root = Some(root);
+        self.prover.base.tree.height = tree_height;
 
         self.validated_height = height;
         self.current_digest = digest;
@@ -239,7 +265,7 @@ impl BlockValidator for UtxoValidator {
     }
 
     fn flush(&self) -> Result<(), ValidationError> {
-        self.prover.storage.flush().map_err(|e| {
+        self.storage.flush().map_err(|e| {
             ValidationError::StateOperationFailed(format!("flush: {e}"))
         })
     }
@@ -290,7 +316,6 @@ impl UtxoValidator {
         // 3. Generate proof WITHOUT modifying state.
         //    generate_proof_for_operations creates a temp prover internally.
         let (proof_bytes, new_digest) = self
-            .prover
             .prover
             .generate_proof_for_operations(&operations)
             .map_err(|e| {

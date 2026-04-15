@@ -154,41 +154,12 @@ impl SharedStore {
 
 /// Reserved type_id for sync metadata (not a real modifier type).
 const SYNC_META_TYPE_ID: u8 = 255;
-/// Fixed key for validator_height metadata (persisted for fast startup).
-const VALIDATOR_HEIGHT_KEY: [u8; 32] = {
-    let mut k = [0u8; 32];
-    k[0] = b'v'; k[1] = b'a'; k[2] = b'l'; // "val" prefix
-    k
-};
 /// Fixed key for script_verified_height metadata.
 const SCRIPT_VERIFIED_HEIGHT_KEY: [u8; 32] = {
     let mut k = [0u8; 32];
     k[0] = b's'; k[1] = b'v'; k[2] = b'h'; // "svh" prefix
     k
 };
-
-/// Read the persisted validator height from the block store (startup optimization).
-/// Returns None if not set.
-pub fn read_validator_height(store: &RedbModifierStore) -> Option<u32> {
-    match store.get(SYNC_META_TYPE_ID, &VALIDATOR_HEIGHT_KEY) {
-        Ok(Some(bytes)) if bytes.len() == 4 => {
-            Some(u32::from_le_bytes(bytes[..4].try_into().unwrap()))
-        }
-        _ => None,
-    }
-}
-
-/// Persist the validator height to the block store (called after validator creation).
-pub fn write_validator_height(store: &RedbModifierStore, height: u32) {
-    if let Err(e) = store.put(
-        SYNC_META_TYPE_ID,
-        &VALIDATOR_HEIGHT_KEY,
-        0,
-        &height.to_le_bytes(),
-    ) {
-        tracing::warn!(height, "failed to persist validator_height: {e}");
-    }
-}
 
 impl SyncStore for SharedStore {
     async fn has_modifier(&self, type_id: u8, id: &[u8; 32]) -> bool {
@@ -246,15 +217,6 @@ impl SyncStore for SharedStore {
             ) {
                 tracing::warn!(height, "failed to persist script_verified_height: {e}");
             }
-        })
-        .await
-        .ok();
-    }
-
-    async fn set_validator_height(&self, height: u32) {
-        let store = self.store.clone();
-        tokio::task::spawn_blocking(move || {
-            write_validator_height(&store, height);
         })
         .await
         .ok();

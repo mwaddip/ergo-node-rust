@@ -11,10 +11,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use enr_chain::{ChainConfig, HeaderChain, StateType, HEADER_TYPE_ID};
 use enr_state::{AVLTreeParams, CacheSize, RedbAVLStorage, SnapshotReader};
+use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
 use ergo_avltree_rust::batch_node::AVLTree;
 use ergo_avltree_rust::operation::{KeyValue, Operation};
-use ergo_avltree_rust::persistent_batch_avl_prover::PersistentBatchAVLProver;
 use ergo_avltree_rust::versioned_avl_storage::VersionedAVLStorage;
 use ergo_chain_types::ADDigest;
 use ergo_lib::chain::emission::MonetarySettings;
@@ -1246,70 +1246,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let state_path = data_dir.join("state.redb");
             let params = AVLTreeParams { key_length: 32, value_length: None };
             let keep_versions = 200u32;
-            let storage = RedbAVLStorage::open(&state_path, params, keep_versions, CacheSize::Bytes(node_config.cache_mb as usize * 1024 * 1024))
+            let mut storage = RedbAVLStorage::open(&state_path, params, keep_versions, CacheSize::Bytes(node_config.cache_mb as usize * 1024 * 1024))
                 .expect("failed to open UTXO state storage");
 
             let checkpoint = configured_checkpoint.unwrap_or(0);
 
-            if storage.version().is_some() {
-                // Create snapshot reader BEFORE prover consumes storage
+            if let Some(current_version) = storage.version() {
+                // Resume branch: storage has data, load its root into a fresh
+                // prover and resolve the block height from state's own metadata.
                 snapshot_reader = Some(storage.snapshot_reader());
                 let resolver = storage.resolver();
                 let tree = AVLTree::new(resolver, 32, None);
-                let prover = BatchAVLProver::new(tree, true);
-                let persistent_prover = PersistentBatchAVLProver::new(prover, Box::new(storage), vec![])
-                    .expect("failed to create persistent prover from stored state");
+                let mut prover = BatchAVLProver::new(tree, true);
 
-                // Find the actual validated height by matching the prover's
-                // current digest against header state roots. Try the persisted
-                // hint first (O(1)), then scan downward from the hint on miss.
-                let prover_digest = persistent_prover.digest();
+                // Install the current version's root into the prover's
+                // in-memory tree. `rollback` to the CURRENT version is a
+                // cheap short-circuit in RedbAVLStorage — same pattern as
+                // PersistentBatchAVLProver::new used before.
+                let (root, tree_height) = storage
+                    .rollback(&current_version)
+                    .expect("failed to load current version root from storage");
+                prover.base.tree.root = Some(root);
+                prover.base.tree.height = tree_height;
+
+                let prover_digest = prover.digest().expect("prover has no root");
                 let prover_digest_arr: [u8; 33] = prover_digest.as_ref().try_into()
                     .expect("prover digest should be 33 bytes");
                 let chain_height = chain_guard.height();
+                let stored_height = storage.block_height();
 
-                let hint = ergo_node_rust::read_validator_height(&store);
-                let mut height = 0u32;
-                let mut scanned = false;
-
-                // Fast path: check the persisted height hint
-                if let Some(h) = hint {
-                    if h > 0 && h <= chain_height {
-                        if let Some(header) = chain_guard.header_at(h) {
-                            let header_root: [u8; 33] = header.state_root.into();
-                            if prover_digest_arr == header_root {
-                                height = h;
+                // Resolve the validator's resume height from state.redb
+                // metadata. `block_height().is_some() == version().is_some()`
+                // per the state contract, so the None arm is unreachable here.
+                //
+                // The Some(0) + non-genesis-digest case is the one-shot legacy
+                // migration path: state.redb was written before META_BLOCK_HEIGHT
+                // existed; `RedbAVLStorage::open` stamped 0 to preserve the
+                // invariant. We resolve via a chain scan; the first subsequent
+                // apply_state writes the real height and makes this permanent.
+                let height = match stored_height {
+                    Some(h) if h > 0 => h,
+                    Some(0) => {
+                        let genesis_root: [u8; 33] = genesis_digest.into();
+                        if prover_digest_arr == genesis_root {
+                            0
+                        } else {
+                            let mut resolved = 0u32;
+                            for h in (1..=chain_height).rev() {
+                                if let Some(header) = chain_guard.header_at(h) {
+                                    let header_root: [u8; 33] = header.state_root.into();
+                                    if prover_digest_arr == header_root {
+                                        resolved = h;
+                                        break;
+                                    }
+                                }
                             }
+                            if resolved == 0 {
+                                panic!(
+                                    "legacy state.redb digest={} matches no header in [1..{}] and is not genesis — state is corrupt",
+                                    hex::encode(prover_digest.as_ref()),
+                                    chain_height,
+                                );
+                            }
+                            tracing::warn!(
+                                resolved,
+                                "legacy state migration: resolved validator height via chain scan"
+                            );
+                            resolved
                         }
                     }
-                }
+                    Some(_) => unreachable!(),
+                    None => unreachable!(
+                        "block_height is None for non-empty storage — state contract violation"
+                    ),
+                };
 
-                // Slow path: hint missed (Durability::None rollback, first run, etc.)
-                // Scan downward from the hint (or chain_height if no hint).
-                if height == 0 && hint != Some(0) {
-                    scanned = true;
-                    let scan_from = hint.unwrap_or(chain_height).min(chain_height);
-                    for h in (0..=scan_from).rev() {
-                        if h == 0 {
-                            let genesis_root: [u8; 33] = genesis_digest.into();
-                            if prover_digest_arr == genesis_root {
-                                height = 0;
-                                break;
-                            }
-                        } else if let Some(header) = chain_guard.header_at(h) {
-                            let header_root: [u8; 33] = header.state_root.into();
-                            if prover_digest_arr == header_root {
-                                height = h;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // Persist the resolved height for next startup
-                ergo_node_rust::write_validator_height(&store, height);
-
-                tracing::info!(height, chain_height, checkpoint, ?hint, scanned, "block validator resuming (UTXO mode)");
+                tracing::info!(height, chain_height, checkpoint, stored_height = ?stored_height, "block validator resuming (UTXO mode)");
 
                 // Now that we know the validator's resume height, load the
                 // chain's active parameters from the most recent epoch
@@ -1346,7 +1358,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })
                 });
                 Some(Validator::new(
-                    ValidatorInner::Utxo(UtxoValidator::new(persistent_prover, height, checkpoint)),
+                    ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint)),
                     shared_validated_height.clone(),
                     shared_state_context.clone(),
                     block_applied_tx.clone(),
@@ -1358,7 +1370,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!("UTXO state empty, will bootstrap from peer snapshot");
                 None
             } else {
-                // Create snapshot reader BEFORE prover consumes storage
+                // Genesis bootstrap: empty storage, no snapshot.
                 snapshot_reader = Some(storage.snapshot_reader());
                 let resolver = storage.resolver();
                 let tree = AVLTree::new(resolver, 32, None);
@@ -1371,11 +1383,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })).expect("genesis box insert failed");
                 }
 
-                let persistent_prover = PersistentBatchAVLProver::new(prover, Box::new(storage), vec![])
-                    .expect("failed to create persistent prover from genesis");
+                // First update commits genesis state with block_height=0
+                // (pre-block-1 state). Equivalent to what
+                // PersistentBatchAVLProver::new did via its empty-storage branch,
+                // but threads block_height through so the next startup resolves
+                // directly without a header scan.
+                storage
+                    .update_with_height(&mut prover, vec![], 0)
+                    .expect("genesis state update failed");
+                // generate_proof resets tree-local visited/new flags — matches
+                // the side effect of the old generate_proof_and_update_storage.
+                let _ = prover.generate_proof();
 
-                // Verify genesis digest matches expected
-                let actual = persistent_prover.digest();
+                let actual = prover.digest().expect("prover has no root after genesis");
                 let expected: [u8; 33] = genesis_digest.into();
                 assert_eq!(
                     actual.as_ref(), &expected[..],
@@ -1397,7 +1417,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })
                 });
                 Some(Validator::new(
-                    ValidatorInner::Utxo(UtxoValidator::new(persistent_prover, 0, checkpoint)),
+                    ValidatorInner::Utxo(UtxoValidator::new(storage, prover, 0, checkpoint)),
                     shared_validated_height.clone(),
                     shared_state_context.clone(),
                     block_applied_tx.clone(),
@@ -1566,21 +1586,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         (label, Bytes::from(packed))
                     });
 
-                    storage.load_snapshot(nodes_iter, root_hash, tree_height, version)
+                    storage.load_snapshot(nodes_iter, root_hash, tree_height, version.clone(), height)
                         .expect("failed to load snapshot into state");
 
                     tracing::info!("snapshot loaded, creating validator");
 
-                    // Create validator from loaded state
+                    // Build prover from the loaded snapshot. rollback() to the
+                    // just-written snapshot version is a short-circuit that
+                    // loads the root node — same shape as the resume branch.
                     let resolver = storage.resolver();
                     let tree = AVLTree::new(resolver, 32, None);
-                    let prover = BatchAVLProver::new(tree, true);
-                    let persistent = PersistentBatchAVLProver::new(
-                        prover, Box::new(storage), vec![],
-                    ).expect("failed to create prover from snapshot state");
+                    let mut prover = BatchAVLProver::new(tree, true);
+                    let (root, tree_h) = storage
+                        .rollback(&version)
+                        .expect("failed to load snapshot root from storage");
+                    prover.base.tree.root = Some(root);
+                    prover.base.tree.height = tree_h;
 
                     let validator = Validator::new(
-                        ValidatorInner::Utxo(UtxoValidator::new(persistent, height, checkpoint)),
+                        ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint)),
                         shared_validated_height.clone(),
                         shared_state_context.clone(),
                         block_applied_tx.clone(),
