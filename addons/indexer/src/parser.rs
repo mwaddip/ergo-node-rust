@@ -80,21 +80,27 @@ pub fn parse_block(
                 Err(_) => hex::encode(&ergo_tree_bytes),
             };
 
+            // Boxes may list the same token_id multiple times; the DB PK is
+            // (box_id, token_id) so we sum amounts per token to match explorer
+            // semantics and avoid constraint violations.
             let tokens: Vec<IndexedToken> = ergo_box
                 .tokens
                 .as_ref()
                 .map(|toks| {
-                    toks.iter()
-                        .map(|t| {
-                            let tid: &[u8] = t.token_id.as_ref();
-                            let token_id: [u8; 32] =
-                                tid.try_into().expect("TokenId should be 32 bytes");
-                            IndexedToken {
-                                token_id,
-                                amount: *t.amount.as_u64(),
+                    let mut deduped: Vec<IndexedToken> = Vec::with_capacity(toks.len());
+                    for t in toks.iter() {
+                        let tid: &[u8] = t.token_id.as_ref();
+                        let token_id: [u8; 32] =
+                            tid.try_into().expect("TokenId should be 32 bytes");
+                        let amount = *t.amount.as_u64();
+                        match deduped.iter_mut().find(|e| e.token_id == token_id) {
+                            Some(existing) => {
+                                existing.amount = existing.amount.saturating_add(amount);
                             }
-                        })
-                        .collect()
+                            None => deduped.push(IndexedToken { token_id, amount }),
+                        }
+                    }
+                    deduped
                 })
                 .unwrap_or_default();
 

@@ -32,8 +32,24 @@ pub async fn run(
         },
     };
 
-    // Detect network from node info
-    let info = client.info().await.context("initial /info call failed")?;
+    // Detect network from node info. The node may be restoring or otherwise
+    // unreachable at startup — retry rather than letting systemd respawn us.
+    let max_backoff = std::time::Duration::from_secs(60);
+    let mut init_backoff = std::time::Duration::from_secs(5);
+    let info = loop {
+        match client.info().await {
+            Ok(info) => break info,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    backoff_secs = init_backoff.as_secs(),
+                    "node unreachable at startup; retrying"
+                );
+                tokio::time::sleep(init_backoff).await;
+                init_backoff = (init_backoff * 2).min(max_backoff);
+            }
+        }
+    };
     let network = match info.network.as_str() {
         "mainnet" => NetworkPrefix::Mainnet,
         _ => NetworkPrefix::Testnet,
@@ -46,7 +62,6 @@ pub async fn run(
     );
 
     let mut backoff = std::time::Duration::from_secs(1);
-    let max_backoff = std::time::Duration::from_secs(30);
 
     loop {
         // Wait for new blocks via long-poll
