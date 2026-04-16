@@ -41,15 +41,22 @@ jobs:
       - name: Build .tar.gz bundle
         run: ./build-tar
 
+      - name: Build addon tar.gz bundles
+        run: ./build-addons-tar
+
       - name: Collect artifact paths
         id: artifacts
         run: |
           set -euo pipefail
           deb=$(ls target/ergo-node-rust_*.deb | head -1)
           tar=$(ls target/ergo-node-rust-*.tar.gz | head -1)
+          indexer=$(ls target/ergo-indexer-*.tar.gz | head -1)
+          fastsync=$(ls target/ergo-fastsync-*.tar.gz | head -1)
           echo "deb=${deb}" >> "$GITHUB_OUTPUT"
           echo "tar=${tar}" >> "$GITHUB_OUTPUT"
-          ls -lh "${deb}" "${tar}"
+          echo "indexer=${indexer}" >> "$GITHUB_OUTPUT"
+          echo "fastsync=${fastsync}" >> "$GITHUB_OUTPUT"
+          ls -lh "${deb}" "${tar}" "${indexer}" "${fastsync}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -57,5 +64,7 @@ jobs:
           files: |
             ${{ steps.artifacts.outputs.deb }}
             ${{ steps.artifacts.outputs.tar }}
+            ${{ steps.artifacts.outputs.indexer }}
+            ${{ steps.artifacts.outputs.fastsync }}
           generate_release_notes: true
           fail_on_unmatched_files: true

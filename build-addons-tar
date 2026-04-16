@@ -1,0 +1,74 @@
+#!/bin/bash
+set -euo pipefail
+
+# Build portable tar.gz bundles for the optional addon binaries:
+# `ergo-indexer` (blockchain indexer) and `ergo-fastsync` (parallel
+# bootstrap downloader). Each addon is its own Cargo workspace and
+# is excluded from the main crate's workspace, so it must be built
+# separately. Produces one tar.gz per addon with the stripped binary
+# and a minimal INSTALL.md.
+
+ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
+case "${ARCH}" in
+    amd64|x86_64)  TARGET_ARCH="amd64"  ;;
+    arm64|aarch64) TARGET_ARCH="arm64"  ;;
+    *)             TARGET_ARCH="${ARCH}" ;;
+esac
+
+# Build one addon bundle.
+#   $1 = addon directory under addons/ (e.g. "indexer")
+#   $2 = produced binary name (e.g. "ergo-indexer")
+build_addon() {
+    local dir="$1"
+    local bin="$2"
+    local version
+    version=$(grep '^version' "addons/${dir}/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+    local pkg="${bin}-${version}-linux-${TARGET_ARCH}"
+
+    echo ""
+    echo "=== Building ${pkg}.tar.gz ==="
+    (cd "addons/${dir}" && cargo build --release)
+
+    rm -rf "target/${pkg}"
+    mkdir -p "target/${pkg}"
+
+    cp "addons/${dir}/target/release/${bin}" "target/${pkg}/${bin}"
+    strip "target/${pkg}/${bin}"
+
+    cat > "target/${pkg}/INSTALL.md" <<EOF
+# ${bin} — manual install
+
+Portable Linux build of the \`${bin}\` addon for
+\`ergo-node-rust\`. Runs alongside an existing node; it is not a
+replacement for the main node binary.
+
+## Run in place
+
+\`\`\`sh
+./${bin} --help
+\`\`\`
+
+See the project README at
+<https://github.com/mwaddip/ergo-node-rust/tree/main/addons/${dir}>
+for configuration details.
+
+## System install
+
+\`\`\`sh
+sudo install -m 755 ${bin} /usr/bin/${bin}
+\`\`\`
+
+Run under the same systemd unit pattern as the main node if you
+want the addon supervised — see the main \`ergo-node-rust\` service
+file for a template.
+EOF
+
+    tar -czf "target/${pkg}.tar.gz" -C target "${pkg}"
+    rm -rf "target/${pkg}"
+
+    echo "Built: target/${pkg}.tar.gz"
+    ls -lh "target/${pkg}.tar.gz"
+}
+
+build_addon "indexer" "ergo-indexer"
+build_addon "fastsync" "ergo-fastsync"
