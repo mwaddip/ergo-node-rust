@@ -2017,7 +2017,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let chain_guard = mining_chain.lock().await;
                                 let n_bits = chain_guard.tip().n_bits;
                                 let bp = if chain_guard.is_epoch_boundary(candidate_height) {
-                                    match chain_guard.compute_expected_parameters(candidate_height) {
+                                    // Mining doesn't yet encode a proposed-update
+                                    // payload into candidate extensions; passing &[]
+                                    // is safe at non-activation boundaries (ignored)
+                                    // but would wrongly auto-insert SubblocksPerBlock
+                                    // at a v6 activation boundary. See
+                                    // prompts/voting-bug-proposed-update-tracking.md.
+                                    let block_proposed_update: &[u8] = &[];
+                                    match chain_guard.compute_expected_parameters(
+                                        candidate_height,
+                                        block_proposed_update,
+                                    ) {
                                         Ok(p) => Some(p),
                                         Err(e) => {
                                             tracing::warn!(

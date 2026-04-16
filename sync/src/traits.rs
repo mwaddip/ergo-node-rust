@@ -90,9 +90,15 @@ pub trait SyncChain {
     /// in its extension. Used by the validator at epoch-boundary blocks to verify
     /// the block's parameters match expected. Errors if the height is not a valid
     /// epoch boundary or required headers are missing.
+    ///
+    /// `block_proposed_update` is the raw `ErgoValidationSettingsUpdate` payload
+    /// (extension key `[0x00, 124]` value) from the boundary block's extension;
+    /// empty slice if the field is absent. Used to gate the `SubblocksPerBlock`
+    /// auto-insert at BlockVersion==4 voting activation — see `facts/chain.md`.
     fn compute_expected_parameters(
         &self,
         epoch_boundary_height: u32,
+        block_proposed_update: &[u8],
     ) -> impl std::future::Future<Output = Result<ergo_validation::Parameters, enr_chain::ChainError>>
     + Send;
 

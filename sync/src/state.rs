@@ -701,7 +701,21 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             // happen out-of-band before/after the call.
             let active_params = self.chain.active_parameters().await;
             let expected_boundary_params = if self.chain.is_epoch_boundary(height).await {
-                match self.chain.compute_expected_parameters(height).await {
+                let block_proposed_update =
+                    match enr_chain::parse_extension_bytes(&extension) {
+                        Ok((_header_id, fields)) => {
+                            enr_chain::extract_disabling_rules_from_kv(&fields)
+                        }
+                        Err(e) => {
+                            tracing::error!(height, error = %e, "extension parse for proposed update failed");
+                            break;
+                        }
+                    };
+                match self
+                    .chain
+                    .compute_expected_parameters(height, &block_proposed_update)
+                    .await
+                {
                     Ok(p) => Some(p),
                     Err(e) => {
                         tracing::error!(height, error = %e, "compute_expected_parameters failed");

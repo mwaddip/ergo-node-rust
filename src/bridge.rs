@@ -90,11 +90,12 @@ impl SyncChain for SharedChain {
     async fn compute_expected_parameters(
         &self,
         epoch_boundary_height: u32,
+        block_proposed_update: &[u8],
     ) -> Result<ergo_validation::Parameters, ChainError> {
         self.chain
             .lock()
             .await
-            .compute_expected_parameters(epoch_boundary_height)
+            .compute_expected_parameters(epoch_boundary_height, block_proposed_update)
     }
 
     async fn apply_epoch_boundary_parameters(&self, params: ergo_validation::Parameters) {

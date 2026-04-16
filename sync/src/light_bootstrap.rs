@@ -439,7 +439,7 @@ mod tests {
         }
         async fn is_epoch_boundary(&self, _h: u32) -> bool { false }
         async fn compute_expected_parameters(
-            &self, _h: u32,
+            &self, _h: u32, _pu: &[u8],
         ) -> Result<ergo_validation::Parameters, ChainError> {
             unimplemented!()
         }
@@ -748,7 +748,7 @@ mod tests {
             async fn active_parameters(&self) -> ergo_validation::Parameters { unimplemented!() }
             async fn is_epoch_boundary(&self, _h: u32) -> bool { false }
             async fn compute_expected_parameters(
-                &self, _h: u32,
+                &self, _h: u32, _pu: &[u8],
             ) -> Result<ergo_validation::Parameters, ChainError> { unimplemented!() }
             async fn apply_epoch_boundary_parameters(&self, _p: ergo_validation::Parameters) {}
             async fn verify_nipopow_envelope(&self, _b: &[u8]) -> Result<Vec<Header>, ChainError> {
