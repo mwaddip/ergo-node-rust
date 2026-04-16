@@ -125,6 +125,7 @@ Open PRs against [ergoplatform/sigma-rust](https://github.com/ergoplatform/sigma
 - [#857](https://github.com/ergoplatform/sigma-rust/pull/857) — BigInt modulo semantics (`mod` vs `rem`)
 - [#858](https://github.com/ergoplatform/sigma-rust/pull/858) — Lazy constant resolution in ErgoTree evaluation
 - [#859](https://github.com/ergoplatform/sigma-rust/pull/859) — Pre-JIT ErgoScript leniency for v0/v1 scripts
+- [#860](https://github.com/ergoplatform/sigma-rust/pull/860) — Parse-time `SOption(T)` leniency in `check_post_eval_tpe` (matches JVM `OneArgumentOperationSerializer`)
 
 ### ergo_avltree_rust
 
