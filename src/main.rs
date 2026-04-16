@@ -274,15 +274,16 @@ impl BlockValidator for Validator {
         preceding_headers: &[ergo_chain_types::Header],
         active_params: &ergo_validation::Parameters,
         expected_boundary_params: Option<&ergo_validation::Parameters>,
+        expected_proposed_update: Option<&[u8]>,
     ) -> Result<ApplyStateOutcome, ValidationError> {
         let result = match &mut self.inner {
             ValidatorInner::Digest(v) => v.apply_state(
                 header, block_txs, ad_proofs, extension, preceding_headers,
-                active_params, expected_boundary_params,
+                active_params, expected_boundary_params, expected_proposed_update,
             ),
             ValidatorInner::Utxo(v) => v.apply_state(
                 header, block_txs, ad_proofs, extension, preceding_headers,
-                active_params, expected_boundary_params,
+                active_params, expected_boundary_params, expected_proposed_update,
             ),
         };
         if result.is_ok() {

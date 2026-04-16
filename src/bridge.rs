@@ -98,11 +98,19 @@ impl SyncChain for SharedChain {
             .compute_expected_parameters(epoch_boundary_height, block_proposed_update)
     }
 
-    async fn apply_epoch_boundary_parameters(&self, params: ergo_validation::Parameters) {
+    async fn apply_epoch_boundary_parameters(
+        &self,
+        params: ergo_validation::Parameters,
+        proposed_update_bytes: Vec<u8>,
+    ) {
         self.chain
             .lock()
             .await
-            .apply_epoch_boundary_parameters(params);
+            .apply_epoch_boundary_parameters(params, proposed_update_bytes);
+    }
+
+    async fn active_proposed_update_bytes(&self) -> Vec<u8> {
+        self.chain.lock().await.active_proposed_update_bytes().to_vec()
     }
 
     async fn verify_nipopow_envelope(

@@ -104,11 +104,21 @@ pub trait SyncChain {
 
     /// Apply parameters from a successfully validated epoch-boundary block.
     /// Called by the validator's caller AFTER `validate_block` returns Ok with
-    /// `epoch_boundary_params: Some(params)`. Mutates the chain's active parameters.
+    /// `epoch_boundary_params: Some(params)`. Mutates the chain's active
+    /// parameters AND the active proposed-update bytes atomically.
     fn apply_epoch_boundary_parameters(
         &self,
         params: ergo_validation::Parameters,
+        proposed_update_bytes: Vec<u8>,
     ) -> impl std::future::Future<Output = ()> + Send;
+
+    /// The raw `ErgoValidationSettingsUpdate` payload currently in effect
+    /// on the chain (JVM `Parameters.proposedUpdate`). Used by the
+    /// validator at v4+ epoch boundaries to compare against the block's
+    /// `[0x00, 124]` extension field — JVM `matchParameters60`.
+    fn active_proposed_update_bytes(
+        &self,
+    ) -> impl std::future::Future<Output = Vec<u8>> + Send;
 
     /// Strip a `NipopowProof` (P2P code 91) message envelope and verify the
     /// inner proof bytes via [`enr_chain::verify_nipopow_proof_bytes`].

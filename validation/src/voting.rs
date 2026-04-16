@@ -80,6 +80,18 @@ pub fn parse_parameters_from_extension(
     Ok(params)
 }
 
+/// Extract the raw `ErgoValidationSettingsUpdate` payload (extension
+/// key `[0x00, 124]`) from a parsed extension. Returns an empty `Vec` if
+/// the field is absent — JVM treats this as `ErgoValidationSettingsUpdate.empty`.
+pub fn extract_proposed_update(extension: &ParsedExtension) -> Vec<u8> {
+    for field in &extension.fields {
+        if field.key[0] == 0x00 && (field.key[1] as i8) == 124 {
+            return field.value.clone();
+        }
+    }
+    Vec::new()
+}
+
 /// Verify that an `expected` parameter table from chain matches a `parsed`
 /// table from a block's extension, using JVM v6 `matchParameters60` semantics:
 ///
@@ -89,17 +101,19 @@ pub fn parse_parameters_from_extension(
 /// - For every entry `(param, value)` in `expected`, `parsed` must contain
 ///   the same value at the same key.
 /// - Entries that exist only in `parsed` (newer params) are ignored.
-///
-/// **Does NOT check `proposedUpdate` (param ID 124)**. JVM v6 still requires
-/// it to match, but this validator doesn't track it — the chain submodule
-/// holds the active disabling rules separately. ID 124 enforcement is a
-/// follow-up once the chain submodule exposes it.
+/// - On `block_version >= 4` (Interpreter60Version), the proposedUpdate
+///   byte-for-byte comparison also runs. For pre-v4 blocks the
+///   proposedUpdate check short-circuits, matching JVM `matchParameters60`
+///   (which returns `Success(())` for `blockVersion < Interpreter60Version`).
 ///
 /// Mirrors JVM `Parameters.matchParameters60`.
 pub fn check_parameters_v6(
     expected: &Parameters,
     parsed: &Parameters,
     height: u32,
+    block_version: u8,
+    expected_proposed_update: &[u8],
+    parsed_proposed_update: &[u8],
 ) -> Result<(), ValidationError> {
     if expected.parameters_table.len() > parsed.parameters_table.len() {
         tracing::warn!(
@@ -145,6 +159,28 @@ pub fn check_parameters_v6(
                 });
             }
         }
+    }
+
+    // JVM `matchParameters60` proposedUpdate byte-for-byte comparison,
+    // gated on `blockVersion >= Interpreter60Version` (v4). Pre-v4 blocks
+    // are short-circuited by JVM, so we skip the check too — mainnet's
+    // pre-v6 ID 124 payloads carry `statusUpdates` the chain crate does
+    // not model, and the chain's seed default does not byte-match them.
+    // By h=1,628,160 (first v4 boundary on mainnet), the chain's tracked
+    // value has been overwritten by every prior `apply_epoch_boundary_parameters`
+    // call and matches the on-chain payload exactly.
+    if block_version >= 4 && expected_proposed_update != parsed_proposed_update {
+        tracing::warn!(
+            height,
+            expected_len = expected_proposed_update.len(),
+            parsed_len = parsed_proposed_update.len(),
+            "epoch-boundary proposedUpdate check: byte-for-byte mismatch"
+        );
+        return Err(ValidationError::ProposedUpdateMismatch {
+            height,
+            expected: expected_proposed_update.to_vec(),
+            actual: parsed_proposed_update.to_vec(),
+        });
     }
 
     Ok(())
@@ -332,7 +368,7 @@ mod tests {
         expected.parameters_table.insert(Parameter::BlockVersion, 4);
 
         let parsed = expected.clone();
-        assert!(check_parameters_v6(&expected, &parsed, 128).is_ok());
+        assert!(check_parameters_v6(&expected, &parsed, 128, 1, &[], &[]).is_ok());
     }
 
     #[test]
@@ -347,7 +383,7 @@ mod tests {
         let mut parsed = expected.clone();
         parsed.parameters_table.insert(Parameter::MaxBlockSize, 524_288);
 
-        assert!(check_parameters_v6(&expected, &parsed, 128).is_ok());
+        assert!(check_parameters_v6(&expected, &parsed, 128, 1, &[], &[]).is_ok());
     }
 
     #[test]
@@ -365,7 +401,7 @@ mod tests {
         parsed.parameters_table.insert(Parameter::StorageFeeFactor, 1_250_000);
         parsed.parameters_table.insert(Parameter::BlockVersion, 4);
 
-        let err = check_parameters_v6(&expected, &parsed, 128).unwrap_err();
+        let err = check_parameters_v6(&expected, &parsed, 128, 1, &[], &[]).unwrap_err();
         assert!(matches!(err, ValidationError::ParameterMismatch { .. }));
     }
 
@@ -379,7 +415,7 @@ mod tests {
         parsed.parameters_table.clear();
         parsed.parameters_table.insert(Parameter::BlockVersion, 4);
 
-        let err = check_parameters_v6(&expected, &parsed, 128).unwrap_err();
+        let err = check_parameters_v6(&expected, &parsed, 128, 1, &[], &[]).unwrap_err();
         assert!(matches!(err, ValidationError::ParameterMismatch { .. }));
     }
 
@@ -395,8 +431,43 @@ mod tests {
         parsed.parameters_table.clear();
         parsed.parameters_table.insert(Parameter::StorageFeeFactor, 1_250_000);
 
-        let err = check_parameters_v6(&expected, &parsed, 128).unwrap_err();
+        let err = check_parameters_v6(&expected, &parsed, 128, 1, &[], &[]).unwrap_err();
         assert!(matches!(err, ValidationError::ParameterMismatch { .. }));
+    }
+
+    #[test]
+    fn check_v6_proposed_update_mismatch_at_v4_fails() {
+        // At v4+ the proposedUpdate byte-for-byte check must fire.
+        let mut params = Parameters::default();
+        params.parameters_table.clear();
+        params.parameters_table.insert(Parameter::BlockVersion, 4);
+        let err = check_parameters_v6(
+            &params, &params, 1_628_160, 4, &[0x00, 0x00], &[0x02, 0xd7, 0x01],
+        )
+        .unwrap_err();
+        assert!(matches!(err, ValidationError::ProposedUpdateMismatch { .. }));
+    }
+
+    #[test]
+    fn check_v6_proposed_update_mismatch_pre_v4_skipped() {
+        // Pre-v4 the proposedUpdate check short-circuits (JVM matchParameters60
+        // returns Success for blockVersion < Interpreter60Version).
+        let mut params = Parameters::default();
+        params.parameters_table.clear();
+        params.parameters_table.insert(Parameter::BlockVersion, 3);
+        assert!(check_parameters_v6(
+            &params, &params, 1024, 3, &[0x00, 0x00], &[0x02, 0xd7, 0x01],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn check_v6_proposed_update_match_at_v4_ok() {
+        let mut params = Parameters::default();
+        params.parameters_table.clear();
+        params.parameters_table.insert(Parameter::BlockVersion, 4);
+        let pu = [0x02, 0xd7, 0x01, 0x99, 0x03];
+        assert!(check_parameters_v6(&params, &params, 1_628_160, 4, &pu, &pu).is_ok());
     }
 
     #[test]

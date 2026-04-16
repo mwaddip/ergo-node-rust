@@ -700,31 +700,34 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             // is sync and stateless w.r.t. chain state, so all chain queries
             // happen out-of-band before/after the call.
             let active_params = self.chain.active_parameters().await;
-            let expected_boundary_params = if self.chain.is_epoch_boundary(height).await {
-                let block_proposed_update =
-                    match enr_chain::parse_extension_bytes(&extension) {
-                        Ok((_header_id, fields)) => {
-                            enr_chain::extract_disabling_rules_from_kv(&fields)
-                        }
+            let (expected_boundary_params, expected_proposed_update) =
+                if self.chain.is_epoch_boundary(height).await {
+                    let block_proposed_update =
+                        match enr_chain::parse_extension_bytes(&extension) {
+                            Ok((_header_id, fields)) => {
+                                enr_chain::extract_disabling_rules_from_kv(&fields)
+                            }
+                            Err(e) => {
+                                tracing::error!(height, error = %e, "extension parse for proposed update failed");
+                                break;
+                            }
+                        };
+                    let params = match self
+                        .chain
+                        .compute_expected_parameters(height, &block_proposed_update)
+                        .await
+                    {
+                        Ok(p) => p,
                         Err(e) => {
-                            tracing::error!(height, error = %e, "extension parse for proposed update failed");
+                            tracing::error!(height, error = %e, "compute_expected_parameters failed");
                             break;
                         }
                     };
-                match self
-                    .chain
-                    .compute_expected_parameters(height, &block_proposed_update)
-                    .await
-                {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        tracing::error!(height, error = %e, "compute_expected_parameters failed");
-                        break;
-                    }
-                }
-            } else {
-                None
-            };
+                    let expected_pu = self.chain.active_proposed_update_bytes().await;
+                    (Some(params), Some(expected_pu))
+                } else {
+                    (None, None)
+                };
 
             let result = self.validator.as_mut().unwrap().apply_state(
                 &header,
@@ -734,14 +737,21 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 &preceding,
                 &active_params,
                 expected_boundary_params.as_ref(),
+                expected_proposed_update.as_deref(),
             );
 
             match result {
                 Ok(outcome) => {
                     // If this was an epoch-boundary block, apply the new parameters
-                    // to chain state. The validator already verified they match expected.
-                    if let Some(new_params) = outcome.epoch_boundary_params {
-                        self.chain.apply_epoch_boundary_parameters(new_params).await;
+                    // and proposed-update bytes to chain state atomically. The
+                    // validator already verified they match expected.
+                    if let (Some(new_params), Some(new_pu)) = (
+                        outcome.epoch_boundary_params,
+                        outcome.epoch_boundary_proposed_update,
+                    ) {
+                        self.chain
+                            .apply_epoch_boundary_parameters(new_params, new_pu)
+                            .await;
                     }
                     validated_to = height;
 

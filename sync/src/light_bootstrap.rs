@@ -443,7 +443,10 @@ mod tests {
         ) -> Result<ergo_validation::Parameters, ChainError> {
             unimplemented!()
         }
-        async fn apply_epoch_boundary_parameters(&self, _p: ergo_validation::Parameters) {}
+        async fn apply_epoch_boundary_parameters(
+            &self, _p: ergo_validation::Parameters, _pu: Vec<u8>,
+        ) {}
+        async fn active_proposed_update_bytes(&self) -> Vec<u8> { Vec::new() }
 
         async fn verify_nipopow_envelope(
             &self,
@@ -750,7 +753,10 @@ mod tests {
             async fn compute_expected_parameters(
                 &self, _h: u32, _pu: &[u8],
             ) -> Result<ergo_validation::Parameters, ChainError> { unimplemented!() }
-            async fn apply_epoch_boundary_parameters(&self, _p: ergo_validation::Parameters) {}
+            async fn apply_epoch_boundary_parameters(
+                &self, _p: ergo_validation::Parameters, _pu: Vec<u8>,
+            ) {}
+            async fn active_proposed_update_bytes(&self) -> Vec<u8> { Vec::new() }
             async fn verify_nipopow_envelope(&self, _b: &[u8]) -> Result<Vec<Header>, ChainError> {
                 unimplemented!()
             }

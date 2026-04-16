@@ -35,6 +35,12 @@ pub struct ApplyStateOutcome {
     /// The caller MUST pass these to `chain.apply_epoch_boundary_parameters()`
     /// after persisting the block, before validating the next block.
     pub epoch_boundary_params: Option<Parameters>,
+    /// `Some(bytes)` if this was an epoch-boundary block. The raw
+    /// `ErgoValidationSettingsUpdate` payload from extension key
+    /// `[0x00, 124]` (empty Vec if the field is absent). The caller
+    /// passes this to `chain.apply_epoch_boundary_parameters` alongside
+    /// the parameters so both advance atomically.
+    pub epoch_boundary_proposed_update: Option<Vec<u8>>,
     /// `Some` if script evaluation is needed (height > checkpoint).
     /// The caller should pass this to `evaluate_scripts()` — either
     /// inline or on a background thread.
@@ -91,6 +97,7 @@ pub trait BlockValidator {
         preceding_headers: &[Header],
         active_params: &Parameters,
         expected_boundary_params: Option<&Parameters>,
+        expected_proposed_update: Option<&[u8]>,
     ) -> Result<ApplyStateOutcome, ValidationError>;
 
     /// Height of the last validated block. 0 = genesis state set but no blocks applied.
@@ -168,5 +175,12 @@ pub enum ValidationError {
         height: u32,
         expected: Box<Parameters>,
         actual: Box<Parameters>,
+    },
+
+    #[error("epoch-boundary proposed-update mismatch at height {height}")]
+    ProposedUpdateMismatch {
+        height: u32,
+        expected: Vec<u8>,
+        actual: Vec<u8>,
     },
 }

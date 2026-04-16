@@ -96,6 +96,7 @@ impl BlockValidator for UtxoValidator {
         preceding_headers: &[Header],
         active_params: &Parameters,
         expected_boundary_params: Option<&Parameters>,
+        expected_proposed_update: Option<&[u8]>,
     ) -> Result<ApplyStateOutcome, ValidationError> {
         let expected_height = self.validated_height + 1;
         if header.height != expected_height {
@@ -112,13 +113,23 @@ impl BlockValidator for UtxoValidator {
         // 1a. Epoch-boundary parameter check (consensus-critical).
         // Uses JVM v6 matchParameters60 semantics: local can have fewer
         // entries than received, every entry in local must match received.
-        let epoch_boundary_params = match expected_boundary_params {
+        // At v4+ the proposedUpdate byte-for-byte comparison also runs.
+        let (epoch_boundary_params, epoch_boundary_proposed_update) = match expected_boundary_params {
             Some(expected) => {
                 let parsed = voting::parse_parameters_from_extension(&parsed_ext)?;
-                voting::check_parameters_v6(expected, &parsed, header.height)?;
-                Some(parsed)
+                let parsed_pu = voting::extract_proposed_update(&parsed_ext);
+                let expected_pu = expected_proposed_update.unwrap_or(&[]);
+                voting::check_parameters_v6(
+                    expected,
+                    &parsed,
+                    header.height,
+                    header.version,
+                    expected_pu,
+                    &parsed_pu,
+                )?;
+                (Some(parsed), Some(parsed_pu))
             }
-            None => None,
+            None => (None, None),
         };
 
         // 2. Compute state changes from transactions
@@ -234,7 +245,11 @@ impl BlockValidator for UtxoValidator {
 
         tracing::debug!(height = header.height, "state applied (UTXO mode)");
 
-        Ok(ApplyStateOutcome { epoch_boundary_params, deferred_eval })
+        Ok(ApplyStateOutcome {
+            epoch_boundary_params,
+            epoch_boundary_proposed_update,
+            deferred_eval,
+        })
     }
 
     fn validated_height(&self) -> u32 {
