@@ -1,0 +1,96 @@
+#!/bin/bash
+set -euo pipefail
+
+# Build .deb packages for the optional addon binaries:
+# - ergo-indexer   (blockchain indexer, installs with systemd unit)
+# - ergo-fastsync  (parallel bootstrap downloader, just the binary —
+#                   auto-spawned by the main node, no service of its own)
+#
+# Each addon is its own Cargo workspace and is excluded from the main
+# crate, so they are built separately. Version comes from each addon's
+# own Cargo.toml.
+
+ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
+
+build_indexer() {
+    local version
+    version=$(grep '^version' addons/indexer/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+    local pkg="ergo-indexer_${version}_${ARCH}"
+
+    echo ""
+    echo "=== Building ${pkg}.deb ==="
+    (cd addons/indexer && cargo build --release)
+
+    rm -rf "target/${pkg}"
+    mkdir -p "target/${pkg}/DEBIAN"
+    mkdir -p "target/${pkg}/usr/bin"
+    mkdir -p "target/${pkg}/usr/lib/systemd/system"
+    mkdir -p "target/${pkg}/var/lib/ergo-indexer"
+
+    cp addons/indexer/target/release/ergo-indexer "target/${pkg}/usr/bin/"
+    strip "target/${pkg}/usr/bin/ergo-indexer"
+    cp deploy/ergo-indexer.service "target/${pkg}/usr/lib/systemd/system/"
+
+    cat > "target/${pkg}/DEBIAN/control" <<CTRL
+Package: ergo-indexer
+Version: ${version}
+Architecture: ${ARCH}
+Depends: ergo-node-rust
+Maintainer: mwaddip
+Description: Blockchain indexer addon for ergo-node-rust
+ Rich query API over SQLite — box lookup by address, transaction history,
+ token metadata, and network statistics. Runs as a sidecar to the main
+ ergo-node-rust service.
+CTRL
+    local size
+    size=$(du -sk "target/${pkg}" | cut -f1)
+    echo "Installed-Size: ${size}" >> "target/${pkg}/DEBIAN/control"
+
+    dpkg-deb --build "target/${pkg}"
+    rm -rf "target/${pkg}"
+
+    echo "Built: target/${pkg}.deb"
+    ls -lh "target/${pkg}.deb"
+}
+
+build_fastsync() {
+    local version
+    version=$(grep '^version' addons/fastsync/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+    local pkg="ergo-fastsync_${version}_${ARCH}"
+
+    echo ""
+    echo "=== Building ${pkg}.deb ==="
+    (cd addons/fastsync && cargo build --release)
+
+    rm -rf "target/${pkg}"
+    mkdir -p "target/${pkg}/DEBIAN"
+    mkdir -p "target/${pkg}/usr/bin"
+
+    cp addons/fastsync/target/release/ergo-fastsync "target/${pkg}/usr/bin/"
+    strip "target/${pkg}/usr/bin/ergo-fastsync"
+
+    cat > "target/${pkg}/DEBIAN/control" <<CTRL
+Package: ergo-fastsync
+Version: ${version}
+Architecture: ${ARCH}
+Depends: ergo-node-rust
+Maintainer: mwaddip
+Description: Parallel bootstrap downloader for ergo-node-rust
+ Downloads headers in parallel from multiple peers to accelerate the
+ initial chain bootstrap. Auto-spawned by the main ergo-node-rust
+ service when enabled in the node config; no standalone systemd unit
+ is installed.
+CTRL
+    local size
+    size=$(du -sk "target/${pkg}" | cut -f1)
+    echo "Installed-Size: ${size}" >> "target/${pkg}/DEBIAN/control"
+
+    dpkg-deb --build "target/${pkg}"
+    rm -rf "target/${pkg}"
+
+    echo "Built: target/${pkg}.deb"
+    ls -lh "target/${pkg}.deb"
+}
+
+build_indexer
+build_fastsync

@@ -44,19 +44,26 @@ jobs:
       - name: Build addon tar.gz bundles
         run: ./build-addons-tar
 
+      - name: Build addon .deb packages
+        run: ./build-addons-deb
+
       - name: Collect artifact paths
         id: artifacts
         run: |
           set -euo pipefail
           deb=$(ls target/ergo-node-rust_*.deb | head -1)
           tar=$(ls target/ergo-node-rust-*.tar.gz | head -1)
-          indexer=$(ls target/ergo-indexer-*.tar.gz | head -1)
-          fastsync=$(ls target/ergo-fastsync-*.tar.gz | head -1)
+          indexer_tar=$(ls target/ergo-indexer-*.tar.gz | head -1)
+          fastsync_tar=$(ls target/ergo-fastsync-*.tar.gz | head -1)
+          indexer_deb=$(ls target/ergo-indexer_*.deb | head -1)
+          fastsync_deb=$(ls target/ergo-fastsync_*.deb | head -1)
           echo "deb=${deb}" >> "$GITHUB_OUTPUT"
           echo "tar=${tar}" >> "$GITHUB_OUTPUT"
-          echo "indexer=${indexer}" >> "$GITHUB_OUTPUT"
-          echo "fastsync=${fastsync}" >> "$GITHUB_OUTPUT"
-          ls -lh "${deb}" "${tar}" "${indexer}" "${fastsync}"
+          echo "indexer_tar=${indexer_tar}" >> "$GITHUB_OUTPUT"
+          echo "fastsync_tar=${fastsync_tar}" >> "$GITHUB_OUTPUT"
+          echo "indexer_deb=${indexer_deb}" >> "$GITHUB_OUTPUT"
+          echo "fastsync_deb=${fastsync_deb}" >> "$GITHUB_OUTPUT"
+          ls -lh "${deb}" "${tar}" "${indexer_tar}" "${fastsync_tar}" "${indexer_deb}" "${fastsync_deb}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -64,7 +71,9 @@ jobs:
           files: |
             ${{ steps.artifacts.outputs.deb }}
             ${{ steps.artifacts.outputs.tar }}
-            ${{ steps.artifacts.outputs.indexer }}
-            ${{ steps.artifacts.outputs.fastsync }}
+            ${{ steps.artifacts.outputs.indexer_tar }}
+            ${{ steps.artifacts.outputs.fastsync_tar }}
+            ${{ steps.artifacts.outputs.indexer_deb }}
+            ${{ steps.artifacts.outputs.fastsync_deb }}
           generate_release_notes: true
           fail_on_unmatched_files: true
