@@ -318,7 +318,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             match self.sync_from_peer().await {
                 SyncOutcome::Synced => {
                     // Snapshot bootstrap: if enabled, no validator, and channels ready
-                    tracing::info!(
+                    tracing::debug!(
                         utxo_bootstrap = self.config.utxo_bootstrap,
                         has_validator = self.validator.is_some(),
                         has_snapshot_tx = self.snapshot_tx.is_some(),
@@ -406,7 +406,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 self.last_progress = Instant::now();
                 self.sync_sent_count = 0;
                 let height = self.chain.chain_height().await;
-                tracing::info!(peer = %peer, height, "starting header sync");
+                tracing::debug!(peer = %peer, height, "starting header sync");
                 return true;
             }
 
@@ -541,15 +541,39 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
 
     /// Request announced modifiers from a peer and track delivery.
     ///
-    /// Chunks into messages of at most 400 IDs to stay within the JVM's
-    /// `desiredInvObjects` limit. Larger requests are silently rejected.
+    /// Filters out IDs already in the store or pending in the delivery
+    /// tracker before sending. Chunks into messages of at most 400 IDs
+    /// to stay within the JVM's `desiredInvObjects` limit.
     async fn request_announced(&mut self, peer: PeerId, modifier_type: u8, ids: Vec<[u8; 32]>) {
         if !self.block_request_gate.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        self.tracker.mark_requested(&ids, peer, modifier_type);
+        // Filter out already-known and already-in-flight IDs
+        let mut needed = Vec::with_capacity(ids.len());
+        for id in &ids {
+            if self.tracker.is_pending(id) {
+                continue;
+            }
+            if self.store.has_modifier(modifier_type, id).await {
+                continue;
+            }
+            needed.push(*id);
+        }
+        let filtered = ids.len() - needed.len();
+        if filtered > 0 {
+            tracing::debug!(
+                announced = ids.len(),
+                filtered,
+                remaining = needed.len(),
+                "Inv pre-filter: skipped known/pending modifiers"
+            );
+        }
+        if needed.is_empty() {
+            return;
+        }
+        self.tracker.mark_requested(&needed, peer, modifier_type);
         // JVM rejects ModifierRequest with >400 elements
-        for chunk in ids.chunks(400) {
+        for chunk in needed.chunks(400) {
             if let Err(e) = self
                 .transport
                 .send_to(
@@ -607,7 +631,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             let advanced = new_height - self.downloaded_height;
             self.downloaded_height = new_height;
             self.shared_downloaded_height.store(new_height, std::sync::atomic::Ordering::Relaxed);
-            tracing::info!(
+            tracing::debug!(
                 downloaded_height = new_height,
                 advanced,
                 chain_height,
@@ -791,7 +815,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         let rate = done as f64 / elapsed as f64;
                         let remaining = sweep_to - height;
                         let eta_secs = if rate > 0.0 { remaining as f64 / rate } else { 0.0 };
-                        tracing::info!(
+                        tracing::debug!(
                             height,
                             done,
                             remaining,
@@ -849,7 +873,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     "=== VALIDATION SWEEP COMPLETE ==="
                 );
             } else {
-                tracing::info!(
+                tracing::debug!(
                     state_applied_height = validated_to,
                     advanced,
                     downloaded_height = self.downloaded_height,
@@ -1020,7 +1044,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     if modifier_type == HEADER_TYPE_ID =>
                 {
                     let height = self.chain.chain_height().await;
-                    tracing::info!(height, "peer reports no more headers");
+                    tracing::debug!(height, "peer reports no more headers");
                     EventResult::Synced
                 }
 
@@ -1053,12 +1077,12 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
 
                             // "Caught up" only counts from the peer we're syncing from
                             if peer_id == peer && peer_tip <= our_height {
-                                tracing::info!(our_height, peer_tip, "caught up with peer");
+                                tracing::debug!(our_height, peer_tip, "caught up with peer");
                                 return EventResult::Synced;
                             }
                             // Any peer ahead of us triggers a switch
                             if peer_tip > our_height + 1 {
-                                tracing::info!(our_height, peer_tip, peer = %peer_id, "peer is ahead, resuming sync");
+                                tracing::debug!(our_height, peer_tip, peer = %peer_id, "peer is ahead, resuming sync");
                                 return EventResult::BehindPeer(peer_id);
                             }
                         }
@@ -1079,7 +1103,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 }
 
                 ProtocolMessage::Inv { modifier_type, ref ids } => {
-                    tracing::info!(
+                    tracing::debug!(
                         peer = %peer_id,
                         modifier_type,
                         count = ids.len(),
@@ -1089,7 +1113,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 }
 
                 other => {
-                    tracing::info!(
+                    tracing::debug!(
                         peer = %peer_id,
                         msg_type = %msg_type_name(&other),
                         "unhandled message from peer"
@@ -1189,7 +1213,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     if let Some(&peer) = peers.first() {
                         let _ = self.send_sync_info(peer).await;
                     } else {
-                        tracing::info!("no outbound peers, returning to idle");
+                        tracing::debug!("no outbound peers, returning to idle");
                         self.sync_peer = None;
                         return;
                     }
@@ -1305,7 +1329,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         }
 
         if sent > 0 {
-            tracing::info!(
+            tracing::debug!(
                 sent,
                 peer_count = peers.len(),
                 window = format!("{}..{}", self.downloaded_height + 1, window_end),
@@ -1336,7 +1360,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 .map(|b| format!("{:02x}", b))
                 .collect::<Vec<_>>()
                 .join(" ");
-            tracing::info!(
+            tracing::debug!(
                 body_len = body.len(),
                 headers = ?heights,
                 count = self.sync_sent_count,

@@ -274,6 +274,14 @@ impl BlockValidator for UtxoValidator {
         self.prover.base.tree.root = Some(root);
         self.prover.base.tree.height = tree_height;
 
+        // Drop stale dirty-node bookkeeping from the pre-rollback chain —
+        // the freshly-unpacked tree is the ground truth. Without this, the
+        // next flush's undo record would list nodes from the demoted branch
+        // as "inserted", and a subsequent rollback would delete them.
+        self.prover.base.tree.reset();
+        self.prover.base.changed_nodes_buffer.clear();
+        self.prover.base.changed_nodes_buffer_to_check.clear();
+
         self.validated_height = height;
         self.current_digest = digest;
         tracing::info!(height, "UTXO validator reset to fork point");

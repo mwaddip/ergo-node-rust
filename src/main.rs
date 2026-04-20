@@ -1311,6 +1311,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 prover.base.tree.root = Some(root);
                 prover.base.tree.height = tree_height;
 
+                // Freshly-unpacked nodes have is_new=true (NodeHeader::new).
+                // Clear it so the first flush after restart doesn't treat the
+                // entire tree as "newly inserted".
+                prover.base.tree.reset();
+
                 let prover_digest = prover.digest().expect("prover has no root");
                 let prover_digest_arr: [u8; 33] = prover_digest.as_ref().try_into()
                     .expect("prover digest should be 33 bytes");
@@ -1433,9 +1438,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 storage
                     .update_with_height(&mut prover, vec![], 0)
                     .expect("genesis state update failed");
-                // generate_proof resets tree-local visited/new flags — matches
-                // the side effect of the old generate_proof_and_update_storage.
-                let _ = prover.generate_proof();
 
                 let actual = prover.digest().expect("prover has no root after genesis");
                 let expected: [u8; 33] = genesis_digest.into();
@@ -1667,6 +1669,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .expect("failed to load snapshot root from storage");
                     prover.base.tree.root = Some(root);
                     prover.base.tree.height = tree_h;
+
+                    // Freshly-unpacked nodes have is_new=true. Clear it so
+                    // the first flush doesn't treat the whole snapshot tree
+                    // as "newly inserted" in its undo record.
+                    prover.base.tree.reset();
 
                     let validator = Validator::new(
                         ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint)),

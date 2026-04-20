@@ -289,7 +289,7 @@ impl ValidationPipeline {
                     chained += 1;
                     store_entries.push((HEADER_TYPE_ID, header_id.0.0, header_height, raw));
                     if header_height % 400 < 2 {
-                        tracing::info!(height = header_height, id = %header_id, "chained header ID");
+                        tracing::debug!(height = header_height, id = %header_id, "chained header ID");
                     }
                     // Drain buffer: follow the chain of buffered children
                     let mut next_parent = header_id;
@@ -531,7 +531,7 @@ impl ValidationPipeline {
         }
 
         if height_after > height_before {
-            tracing::info!(
+            tracing::debug!(
                 chain_height = height_after,
                 chained,
                 buffer = self.buffer.len(),
@@ -542,12 +542,19 @@ impl ValidationPipeline {
             }
         }
 
-        if buffered > 0 || rejected > 0 || purged > 0 {
-            tracing::info!(
+        if chained > 0 || buffered > 0 {
+            tracing::debug!(
                 batch_size,
                 chained, buffered, rejected, purged,
                 chain_tip = height_after,
                 "pipeline: batch breakdown"
+            );
+        } else if rejected > 0 || purged > 0 {
+            tracing::debug!(
+                batch_size,
+                rejected, purged,
+                chain_tip = height_after,
+                "pipeline: batch breakdown (all known)"
             );
         }
     }
