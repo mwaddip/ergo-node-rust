@@ -1,0 +1,33 @@
+[workspace]
+
+[package]
+name = "ergo-fastsync"
+version = "0.1.0"
+edition = "2021"
+description = "Fast bootstrap for ergo-node-rust via peer REST API — based on Arkadia Network's fast header sync (https://github.com/arkadianet/ergo)"
+
+[dependencies]
+# Ergo types — header PoW verification, transaction serialization
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "46e94c21" }
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "46e94c21" }
+sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "46e94c21" }
+
+# HTTP client — rustls so we ship static, no openssl
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+hex = "0.4"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Crypto (blake2b256 for modifier IDs)
+blake2 = "0.10"
+
+# Misc
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
