@@ -13,8 +13,8 @@ postgres = ["dep:sqlx"]
 
 [dependencies]
 # Ergo types — address derivation, register decoding
-ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "d8a588a1" }
-ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "d8a588a1" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "46e94c21" }
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "46e94c21" }
 
 # HTTP client — rustls for static binary
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
