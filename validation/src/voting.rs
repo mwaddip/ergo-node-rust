@@ -161,27 +161,19 @@ pub fn check_parameters_v6(
         }
     }
 
-    // JVM `matchParameters60` proposedUpdate byte-for-byte comparison,
-    // gated on `blockVersion >= Interpreter60Version` (v4). Pre-v4 blocks
-    // are short-circuited by JVM, so we skip the check too — mainnet's
-    // pre-v6 ID 124 payloads carry `statusUpdates` the chain crate does
-    // not model, and the chain's seed default does not byte-match them.
-    // By h=1,628,160 (first v4 boundary on mainnet), the chain's tracked
-    // value has been overwritten by every prior `apply_epoch_boundary_parameters`
-    // call and matches the on-chain payload exactly.
-    if block_version >= 4 && expected_proposed_update != parsed_proposed_update {
-        tracing::warn!(
-            height,
-            expected_len = expected_proposed_update.len(),
-            parsed_len = parsed_proposed_update.len(),
-            "epoch-boundary proposedUpdate check: byte-for-byte mismatch"
-        );
-        return Err(ValidationError::ProposedUpdateMismatch {
-            height,
-            expected: expected_proposed_update.to_vec(),
-            actual: parsed_proposed_update.to_vec(),
-        });
-    }
+    // NOTE: No byte-for-byte proposedUpdate comparison against a
+    // chain-tracked "expected" value. The earlier implementation was based
+    // on a misreading of JVM `matchParameters60`: JVM compares
+    // `parsedParams.proposedUpdate` to `calculatedParams.proposedUpdate`,
+    // but `calculatedParams` is built via `Parameters.update(..., parsedParams.proposedUpdate, ...)`
+    // which returns `Parameters(height, table3, proposedUpdate)` with
+    // `proposedUpdate` = the block's parsed value (Parameters.scala:95).
+    // So both sides of JVM's `p1.proposedUpdate != p2.proposedUpdate` are
+    // the same object — the check is tautologically false. Verified against
+    // mainnet block 1,629,184 where the block's ID 124 (6 bytes, empty
+    // statusUpdates) differs from the previous boundary's 18 bytes, yet
+    // JVM v6.0.3 accepts the chain.
+    let _ = (block_version, expected_proposed_update, parsed_proposed_update);
 
     Ok(())
 }
@@ -436,16 +428,20 @@ mod tests {
     }
 
     #[test]
-    fn check_v6_proposed_update_mismatch_at_v4_fails() {
-        // At v4+ the proposedUpdate byte-for-byte check must fire.
+    fn check_v6_proposed_update_byte_mismatch_accepted_at_v4() {
+        // Mainnet h=1,629,184: block's ID 124 drops legacy statusUpdates
+        // (6 bytes), previous boundary carried them (18 bytes). JVM accepts
+        // this because `matchParameters60` compares the block's parsed
+        // proposedUpdate to `calculatedParams.proposedUpdate`, and
+        // calculatedParams is built via `update(..., parsedParams.proposedUpdate, ...)`
+        // which reuses the input — both sides are the same object.
         let mut params = Parameters::default();
         params.parameters_table.clear();
         params.parameters_table.insert(Parameter::BlockVersion, 4);
-        let err = check_parameters_v6(
-            &params, &params, 1_628_160, 4, &[0x00, 0x00], &[0x02, 0xd7, 0x01],
+        assert!(check_parameters_v6(
+            &params, &params, 1_629_184, 4, &[0x00, 0x00], &[0x02, 0xd7, 0x01],
         )
-        .unwrap_err();
-        assert!(matches!(err, ValidationError::ProposedUpdateMismatch { .. }));
+        .is_ok());
     }
 
     #[test]
