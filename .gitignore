@@ -4,3 +4,16 @@
 .worktrees/
 prompts/
 addons/indexer/target/
+addons/fastsync/target/
+
+# Session and tool state
+.claude/
+.local-data/
+org/
+
+# Operator-local configs
+local-standalone.toml
+snapshot-bootstrap-test.toml
+
+# Profiling output
+**/perf.data
