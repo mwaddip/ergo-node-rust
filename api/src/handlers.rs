@@ -778,11 +778,22 @@ pub async fn info_wait(
         return Ok(get_info(State(state)).await);
     }
 
+    // Loop until the requested height is actually exceeded, or the deadline
+    // fires. `rx.changed()` wakes on every validated block, which during a
+    // long resync fires ~10 Hz — returning on every wake would hot-loop the
+    // caller while our current height is still far below `after`.
     let mut rx = state.height_watch.clone();
-    tokio::select! {
-        _ = rx.changed() => Ok(get_info(State(state)).await),
-        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-            Err(StatusCode::NO_CONTENT)
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        tokio::select! {
+            _ = rx.changed() => {
+                if *rx.borrow() > params.after {
+                    return Ok(get_info(State(state)).await);
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(StatusCode::NO_CONTENT);
+            }
         }
     }
 }
