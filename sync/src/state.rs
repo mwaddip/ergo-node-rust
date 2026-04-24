@@ -844,6 +844,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         } else {
                             self.last_flush_height = height;
                         }
+                        // Pair modifier-store flush with state flush so
+                        // crash-recovery bounds cover both databases.
+                        self.store.flush().await;
                     }
                 }
                 Err(e) => {
@@ -901,6 +904,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 }
             }
         }
+        // Same pairing as the mid-sweep flush — keeps modifier and state
+        // stores on the same durability horizon at every commit point.
+        self.store.flush().await;
     }
 
     /// Drain completed script evaluation results from the channel.

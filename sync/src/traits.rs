@@ -29,6 +29,10 @@ pub trait SyncStore {
         &self,
         height: u32,
     ) -> impl std::future::Future<Output = ()> + Send;
+
+    /// Fsync outstanding modifier writes. Paired with validator flushes so
+    /// state and modifier stores advance durably together.
+    fn flush(&self) -> impl std::future::Future<Output = ()> + Send;
 }
 
 /// How the sync machine sends messages and observes the network.

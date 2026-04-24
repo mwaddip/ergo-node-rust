@@ -230,4 +230,15 @@ impl SyncStore for SharedStore {
         .await
         .ok();
     }
+
+    async fn flush(&self) {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = store.flush() {
+                tracing::warn!("modifier store flush failed: {e}");
+            }
+        })
+        .await
+        .ok();
+    }
 }
