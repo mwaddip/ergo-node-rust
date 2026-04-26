@@ -13,6 +13,15 @@ RestartSec=10
 StandardOutput=append:/var/log/ergo-node/ergo-node.log
 StandardError=append:/var/log/ergo-node/ergo-node.log
 Environment=RUST_LOG=info
+# Opt jemalloc out of Transparent Huge Pages.
+# With kernel THP=always, jemalloc cannot effectively return memory to
+# the OS via madvise(MADV_DONTNEED) — partial THP regions can't be
+# reclaimed without splitting, so RSS grows over time even when
+# allocated stays flat. Setting thp:never tells jemalloc to
+# madvise(MADV_NOHUGEPAGE) its arenas, restoring granular reclaim.
+# The _RJEM_ prefix is required by tikv-jemallocator (jemalloc symbols
+# are mangled — standard MALLOC_CONF is silently ignored).
+Environment=_RJEM_MALLOC_CONF=thp:never
 
 NoNewPrivileges=yes
 ProtectSystem=strict
