@@ -1233,12 +1233,49 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         }
     }
 
-    /// Synced: periodically check for new blocks, download block sections.
-    async fn synced(&mut self) {
-        // Swap to at-tip flush settings on first entry. Each synced_* override
-        // is applied iff the operator configured it. The transition happens
-        // once per process — re-entries (e.g. after a peer rotation that
-        // dropped to sync_from_peer and came back) leave the values alone.
+    /// At-tip predicate window. The handshake fires when
+    /// `validator.validated_height() + AT_TIP_WINDOW >= chain.chain_height()`.
+    /// 16 blocks is bigger than typical reorg depth and small enough that any
+    /// remaining replay on the cold-sync cache before the swap is negligible.
+    const AT_TIP_WINDOW: u32 = 16;
+
+    /// Run the at-tip transition (flush settings swap + storage reopen) iff
+    /// the validator is within `AT_TIP_WINDOW` of the header tip.
+    ///
+    /// Both transitions are idempotent via `Option::take`: once fired, the
+    /// channels and `synced_*` overrides are `None` and subsequent calls are
+    /// no-ops. Safe to invoke on `synced()` entry and on every section ticker.
+    ///
+    /// On flush failure or channel close the validator is restored / kept,
+    /// but the channels have already been taken — the handshake won't retry
+    /// in this process. Operator restart is the documented recovery path
+    /// (cold-sync re-opens with `cache_mb` and re-attempts at next tip arrival).
+    async fn maybe_fire_at_tip(&mut self) {
+        // Fast-path: nothing left to do. Avoids the chain lock acquisition
+        // every section_ticker tick once the transition has already fired
+        // (or was never wired in the first place).
+        let nothing_left = self.at_tip_request_tx.is_none()
+            && self.at_tip_validator_rx.is_none()
+            && self.config.synced_flush_heap_threshold_mb.is_none()
+            && self.config.synced_flush_max_blocks.is_none()
+            && self.config.synced_flush_min_blocks.is_none();
+        if nothing_left {
+            return;
+        }
+
+        // Gate on validator-tip proximity. Without a validator (light mode,
+        // or pre-snapshot-bootstrap before validator_rx delivers) we have no
+        // height to compare and nothing to swap into anyway — defer.
+        let validator_h = match self.validator.as_ref() {
+            Some(v) => v.validated_height(),
+            None => return,
+        };
+        let chain_h = self.chain.chain_height().await;
+        if validator_h.saturating_add(Self::AT_TIP_WINDOW) < chain_h {
+            return;
+        }
+
+        // ── Flush settings swap (option a: gated alongside cache reopen) ──
         if let Some(v) = self.config.synced_flush_heap_threshold_mb.take() {
             tracing::info!(
                 from = self.config.flush_heap_threshold_mb,
@@ -1264,10 +1301,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             self.config.flush_min_blocks = v;
         }
 
-        // At-tip storage reopen. If the integrator wired the channels,
-        // hand the current validator's height to main, drop the validator
-        // (releasing the AVL storage handle), and await the rebuild. Done
-        // exactly once per process.
+        // ── Storage reopen handshake ──
         if let (Some(req_tx), Some(val_rx)) =
             (self.at_tip_request_tx.take(), self.at_tip_validator_rx.take())
         {
@@ -1307,11 +1341,21 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     }
                     Err(_) => {
                         tracing::error!("at-tip: validator rebuild channel closed; sync cannot proceed");
-                        return;
                     }
                 }
             }
         }
+    }
+
+    /// Synced: periodically check for new blocks, download block sections.
+    async fn synced(&mut self) {
+        // The at-tip transition (flush settings swap + storage reopen) is
+        // gated on validator-tip proximity, not on `synced()` entry. The
+        // header chain reaches tip well before validator catches up after
+        // snapshot bootstrap, and firing prematurely runs the entire
+        // catch-up replay on the smaller `synced_cache_mb` cache. See
+        // [`Self::maybe_fire_at_tip`].
+        self.maybe_fire_at_tip().await;
 
         let mut ticker = tokio::time::interval(self.config.synced_poll_interval);
         // Section download timer — recomputes the sliding window every 2s
@@ -1352,10 +1396,15 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     self.handle_delivery_check(result, peer).await;
                 }
 
-                // Sliding window section download — recompute and request every 2s
+                // Sliding window section download — recompute and request every 2s.
+                // Also re-evaluates the at-tip gate so the handshake fires the
+                // moment validator catches up to the header tip during a long
+                // snapshot-bootstrap replay, without bouncing through
+                // sync_from_peer to re-enter `synced()`.
                 _ = section_ticker.tick() => {
                     self.advance_downloaded_height().await;
                     self.request_next_sections().await;
+                    self.maybe_fire_at_tip().await;
                 }
 
                 event = self.transport.next_event() => {
