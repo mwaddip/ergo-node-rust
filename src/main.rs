@@ -1905,6 +1905,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let shared_state_context = shared_state_context.clone();
         let block_applied_tx = block_applied_tx.clone();
         let snapshot_swap_reader = swap_reader.clone();
+        let snapshot_chain = chain.clone();
         tokio::spawn(async move {
             match snapshot_rx.await {
                 Ok(snapshot_data) => {
@@ -1937,6 +1938,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     tracing::info!("snapshot loaded, creating validator");
 
+                    // Recompute chain's active parameters from the most recent
+                    // epoch boundary at or before the snapshot height. Done
+                    // BEFORE constructing the prover — `BatchAVLProver` holds
+                    // !Send Rc internals, so any .await between prover creation
+                    // and the val_tx.send() makes the spawned future !Send.
+                    // Mirrors the resume branch in the UTXO validator block.
+                    {
+                        let mut chain_guard = snapshot_chain.lock().await;
+                        if let Err(e) = chain_guard.recompute_active_parameters_from_storage(height) {
+                            tracing::warn!(
+                                error = %e,
+                                resume_height = height,
+                                "failed to recompute active parameters from snapshot height; using current defaults"
+                            );
+                        } else {
+                            tracing::info!(
+                                resume_height = height,
+                                "recomputed active blockchain parameters for snapshot bootstrap"
+                            );
+                        }
+                    }
+
                     // Install the SnapshotReader so mempool/API/dump trigger see
                     // the loaded state. Done before constructing the validator so
                     // any concurrent reads land on the new DB.
@@ -1967,6 +1990,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         height_watch_tx.clone(),
                         None, // TODO: mining ctx for snapshot bootstrap
                     );
+
                     // Publish the bootstrap snapshot height to the
                     // shared atomic — see the UTXO resume branch in
                     // main() for the rationale. Snapshot bootstrap
