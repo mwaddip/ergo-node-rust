@@ -1273,6 +1273,22 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         {
             if let Some(validator) = self.validator.take() {
                 let height = validator.validated_height();
+                // Persist any pending in-memory state BEFORE dropping. Without
+                // this, blocks applied since the last cold-sync flush remain in
+                // the redb write tx and are GC'd with the prover. The rebuilt
+                // validator would then load the older stored digest while sync
+                // (and the new validator's height field) believe state is at
+                // `height`, leaving an N-block gap where any later block that
+                // spends an output from the gap fails with "Key does not exist".
+                if let Err(e) = validator.flush() {
+                    tracing::error!(
+                        height,
+                        error = ?e,
+                        "at-tip: flush before rebuild failed; aborting rebuild and keeping old validator"
+                    );
+                    self.validator = Some(validator);
+                    return;
+                }
                 drop(validator); // releases AVL storage so main can reopen it
                 tracing::info!(height, "at-tip: requesting validator rebuild with synced cache");
                 if req_tx.send(height).is_err() {
@@ -1281,6 +1297,11 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 }
                 match val_rx.await {
                     Ok(new_validator) => {
+                        debug_assert_eq!(
+                            new_validator.validated_height(),
+                            height,
+                            "at-tip: rebuilt validator height does not match flushed height"
+                        );
                         tracing::info!(height, "at-tip: validator rebuilt with synced cache");
                         self.validator = Some(new_validator);
                     }
