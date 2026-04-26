@@ -17,10 +17,18 @@ flush_heap_threshold_mb = 2048
 # updates are tiny at tip cadence, so the validator can run with a much
 # smaller working set. The synced_cache_mb transition reopens the AVL
 # state DB (a few-ms pause) since redb's cache size is fixed at open.
+#
+# synced_flush_min_blocks: keep at 5+. With value 1 (per-block flush),
+# a remove-then-reinsert AVL pattern across two adjacent blocks can leak
+# past the prover's dirty-node tracking and orphan a node on disk. A
+# wider window lets the pattern cancel within prover state before any
+# disk write. See state crate's update_internal: nodes get deleted from
+# nodes_table when they leave the current tree, so anything that would
+# need re-writing across a flush boundary needs the prover to know it.
 synced_cache_mb = 256
 synced_flush_heap_threshold_mb = 512
-synced_flush_max_blocks = 5
-synced_flush_min_blocks = 1
+synced_flush_max_blocks = 10
+synced_flush_min_blocks = 5
 
 [listen.ipv6]
 address = "[::]:9030"
