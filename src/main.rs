@@ -781,6 +781,31 @@ struct NodeConfig {
     /// heap growth is driven by something other than the redb write tx.
     #[serde(default = "default_flush_min_blocks")]
     flush_min_blocks: u32,
+
+    // ── At-tip memory mirrors ────────────────────────────────────────────
+    // These take effect once chain sync reaches tip. Until then the cold-
+    // sync values above are used. The transition swaps flush settings live
+    // and reopens the AVL state DB once with the synced_cache_mb value.
+    // Default: each mirror equals its cold-sync parent (= no-op until
+    // configured), so existing configs keep their current behavior.
+
+    /// redb cache size (MB) used at tip. Smaller = lower steady-state RSS;
+    /// the tradeoff is more disk reads when cold-restarting at tip (cache
+    /// has to re-warm from the working set).
+    #[serde(default)]
+    synced_cache_mb: Option<u64>,
+    /// Live-heap flush threshold (MB) used at tip. Per-block updates are
+    /// tiny at tip cadence (~1 block / 2 min), so a much lower threshold
+    /// is essentially free and keeps the dirty-page cache small.
+    #[serde(default)]
+    synced_flush_heap_threshold_mb: Option<u64>,
+    /// Upper bound on blocks between flushes used at tip.
+    #[serde(default)]
+    synced_flush_max_blocks: Option<u32>,
+    /// Lower bound on blocks between flushes used at tip.
+    #[serde(default)]
+    synced_flush_min_blocks: Option<u32>,
+
     /// Mining configuration.
     #[serde(default)]
     mining: MiningConfig,
@@ -810,6 +835,10 @@ impl Default for NodeConfig {
             flush_heap_threshold_mb: default_flush_heap_threshold_mb(),
             flush_max_blocks: default_flush_max_blocks(),
             flush_min_blocks: default_flush_min_blocks(),
+            synced_cache_mb: None,
+            synced_flush_heap_threshold_mb: None,
+            synced_flush_max_blocks: None,
+            synced_flush_min_blocks: None,
             mining: MiningConfig::default(),
         }
     }
@@ -1623,6 +1652,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         flush_heap_threshold_mb: node_config.flush_heap_threshold_mb,
         flush_max_blocks: node_config.flush_max_blocks,
         flush_min_blocks: node_config.flush_min_blocks,
+        synced_flush_heap_threshold_mb: node_config.synced_flush_heap_threshold_mb,
+        synced_flush_max_blocks: node_config.synced_flush_max_blocks,
+        synced_flush_min_blocks: node_config.synced_flush_min_blocks,
         flush_probe,
         ..SyncConfig::default()
     };

@@ -7,8 +7,20 @@ network = "mainnet"
 data_dir = ".local-data/mainnet"
 state_type = "utxo"
 blocks_to_keep = 0
+
+# Cold-sync memory settings — used during initial sync from genesis (or
+# from a snapshot) up to the chain tip. Tuned for throughput.
 cache_mb = 1024
 flush_heap_threshold_mb = 2048
+
+# At-tip memory settings — applied once the chain reaches tip. Per-block
+# updates are tiny at tip cadence, so the validator can run with a much
+# smaller working set. The synced_cache_mb transition reopens the AVL
+# state DB (a few-ms pause) since redb's cache size is fixed at open.
+synced_cache_mb = 256
+synced_flush_heap_threshold_mb = 512
+synced_flush_max_blocks = 5
+synced_flush_min_blocks = 1
 
 [listen.ipv6]
 address = "[::]:9030"

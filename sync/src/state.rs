@@ -65,6 +65,15 @@ pub struct SyncConfig {
     /// even if heap is over threshold. Prevents flush storms when heap growth
     /// comes from sources other than the redb write transaction.
     pub flush_min_blocks: u32,
+    /// At-tip override for `flush_heap_threshold_mb`. Applied once on entry to
+    /// `synced()`. None = keep the cold-sync value.
+    pub synced_flush_heap_threshold_mb: Option<u64>,
+    /// At-tip override for `flush_max_blocks`. Applied once on entry to
+    /// `synced()`. None = keep the cold-sync value.
+    pub synced_flush_max_blocks: Option<u32>,
+    /// At-tip override for `flush_min_blocks`. Applied once on entry to
+    /// `synced()`. None = keep the cold-sync value.
+    pub synced_flush_min_blocks: Option<u32>,
     /// Probe returning the current live heap in bytes. Main crate wires this
     /// to `tikv_jemalloc_ctl::stats::allocated` when built with jemalloc.
     /// When `None`, flushing is purely count-based (every `flush_max_blocks`).
@@ -92,6 +101,9 @@ impl Default for SyncConfig {
             // 100 preserves the prior hardcoded cadence as the upper bound.
             flush_max_blocks: 100,
             flush_min_blocks: 5,
+            synced_flush_heap_threshold_mb: None,
+            synced_flush_max_blocks: None,
+            synced_flush_min_blocks: None,
             flush_probe: None,
         }
     }
@@ -156,6 +168,12 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     /// memory-aware flush policy to enforce `flush_min_blocks` spacing and
     /// `flush_max_blocks` upper bound.
     last_flush_height: u32,
+    /// At-tip transition: oneshot to request a validator rebuild from main.
+    /// Set by the integrator via [`set_at_tip_channels`]. None if the
+    /// integrator did not configure synced-mode cache resize.
+    at_tip_request_tx: Option<tokio::sync::oneshot::Sender<u32>>,
+    /// At-tip transition: oneshot to receive the rebuilt validator.
+    at_tip_validator_rx: Option<tokio::sync::oneshot::Receiver<V>>,
 }
 
 impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync<T, C, S, V> {
@@ -206,7 +224,23 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             block_request_gate,
             peer_chain_tip,
             last_flush_height,
+            at_tip_request_tx: None,
+            at_tip_validator_rx: None,
         }
+    }
+
+    /// Configure the at-tip transition channels. When `synced()` is first
+    /// entered, the existing validator is taken (releasing its AVL storage
+    /// handle), its height is sent on `request_tx`, and the new validator
+    /// is awaited on `validator_rx`. The integrator handles the actual
+    /// storage reopen + validator rebuild on the other end of the pair.
+    pub fn set_at_tip_channels(
+        &mut self,
+        request_tx: tokio::sync::oneshot::Sender<u32>,
+        validator_rx: tokio::sync::oneshot::Receiver<V>,
+    ) {
+        self.at_tip_request_tx = Some(request_tx);
+        self.at_tip_validator_rx = Some(validator_rx);
     }
 
     /// Decide whether to `validator.flush()` after validating `height`.
@@ -1201,6 +1235,63 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
 
     /// Synced: periodically check for new blocks, download block sections.
     async fn synced(&mut self) {
+        // Swap to at-tip flush settings on first entry. Each synced_* override
+        // is applied iff the operator configured it. The transition happens
+        // once per process — re-entries (e.g. after a peer rotation that
+        // dropped to sync_from_peer and came back) leave the values alone.
+        if let Some(v) = self.config.synced_flush_heap_threshold_mb.take() {
+            tracing::info!(
+                from = self.config.flush_heap_threshold_mb,
+                to = v,
+                "at-tip: switching flush_heap_threshold_mb"
+            );
+            self.config.flush_heap_threshold_mb = v;
+        }
+        if let Some(v) = self.config.synced_flush_max_blocks.take() {
+            tracing::info!(
+                from = self.config.flush_max_blocks,
+                to = v,
+                "at-tip: switching flush_max_blocks"
+            );
+            self.config.flush_max_blocks = v;
+        }
+        if let Some(v) = self.config.synced_flush_min_blocks.take() {
+            tracing::info!(
+                from = self.config.flush_min_blocks,
+                to = v,
+                "at-tip: switching flush_min_blocks"
+            );
+            self.config.flush_min_blocks = v;
+        }
+
+        // At-tip storage reopen. If the integrator wired the channels,
+        // hand the current validator's height to main, drop the validator
+        // (releasing the AVL storage handle), and await the rebuild. Done
+        // exactly once per process.
+        if let (Some(req_tx), Some(val_rx)) =
+            (self.at_tip_request_tx.take(), self.at_tip_validator_rx.take())
+        {
+            if let Some(validator) = self.validator.take() {
+                let height = validator.validated_height();
+                drop(validator); // releases AVL storage so main can reopen it
+                tracing::info!(height, "at-tip: requesting validator rebuild with synced cache");
+                if req_tx.send(height).is_err() {
+                    tracing::error!("at-tip: failed to signal main; continuing without rebuild");
+                    return;
+                }
+                match val_rx.await {
+                    Ok(new_validator) => {
+                        tracing::info!(height, "at-tip: validator rebuilt with synced cache");
+                        self.validator = Some(new_validator);
+                    }
+                    Err(_) => {
+                        tracing::error!("at-tip: validator rebuild channel closed; sync cannot proceed");
+                        return;
+                    }
+                }
+            }
+        }
+
         let mut ticker = tokio::time::interval(self.config.synced_poll_interval);
         // Section download timer — recomputes the sliding window every 2s
         let mut section_ticker = tokio::time::interval(Duration::from_secs(2));
