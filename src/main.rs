@@ -1143,7 +1143,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Control channel: unbounded — Reorg/NeedModifier must never be dropped
     let (delivery_control_tx, delivery_control_rx) = tokio::sync::mpsc::unbounded_channel();
     // Data channel: bounded — Received/Evicted are lossy, ok to drop
-    let (delivery_data_tx, delivery_data_rx) = tokio::sync::mpsc::channel(64);
+    // Bursty channel — pipeline produces one notification per stored
+    // batch, sync-state drains in tokio::select!. The `try_send` path drops
+    // on full (data plane is recoverable via section_ticker), but a tight
+    // sliding-window cycle can produce hundreds of batches in milliseconds.
+    let (delivery_data_tx, delivery_data_rx) = tokio::sync::mpsc::channel(4096);
     // Transaction channel — pipeline forwards unconfirmed txs to mempool task
     let (tx_tx, tx_rx) = tokio::sync::mpsc::channel::<([u8; 32], Vec<u8>)>(256);
 

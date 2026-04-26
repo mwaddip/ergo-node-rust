@@ -1268,6 +1268,30 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     tracing::debug!(height, "pipeline progress while synced");
                     self.request_next_sections().await;
                 }
+
+                // Data-plane delivery notifications: received / evicted modifiers.
+                // Mirrors the arm in `sync_from_peer`. Without this, the
+                // pipeline's try_send on the bounded delivery_data channel fills,
+                // notifications get dropped, and `tracker.mark_received` is never
+                // called for arrived sections — so the tracker treats them as
+                // pending forever, and `request_announced` skips re-requesting
+                // (and skips requesting the next window, because pending count
+                // saturates the per-window picks). End result: peers keep
+                // streaming data the node ignores, fullHeight stalls until a
+                // restart clears the tracker.
+                Some(data) = self.delivery_data_rx.recv() => {
+                    match data {
+                        DeliveryData::Received(ids) => {
+                            for id in &ids {
+                                self.tracker.mark_received(id);
+                            }
+                            self.advance_downloaded_height().await;
+                        }
+                        DeliveryData::Evicted(ids) => {
+                            self.tracker.schedule_rerequest(&ids);
+                        }
+                    }
+                }
             }
         }
     }
