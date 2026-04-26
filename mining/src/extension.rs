@@ -60,6 +60,15 @@ pub fn unpack_parent_interlinks(parent_extension_bytes: &[u8]) -> Vec<BlockId> {
 /// epoch-boundary block per the consensus rules. When `None`, only
 /// interlinks are emitted (within-epoch blocks).
 ///
+/// `proposed_update_bytes` is the chain's active proposed-update payload
+/// (typically `chain.active_proposed_update_bytes()`). When non-empty,
+/// emitted as field `[0x00, 124]` (`SoftForkDisablingRules`). Required for
+/// the boundary block where v6 activates: `compute_expected_parameters`
+/// gates the `SubblocksPerBlock` auto-insert on the activated proposed
+/// update containing rule 409, and the block's own extension must carry
+/// that same payload so other peers compute identical expected params.
+/// Empty payload at non-activation boundaries is a no-op.
+///
 /// Voting decisions (which parameters to vote for) are encoded in the
 /// header's `votes` field, NOT in the extension. The extension at an
 /// epoch-boundary block carries the RESULT of the just-ended voting epoch.
@@ -67,6 +76,7 @@ pub fn build_extension(
     parent: &Header,
     parent_interlinks: &[BlockId],
     boundary_params: Option<&Parameters>,
+    proposed_update_bytes: &[u8],
 ) -> Result<ExtensionCandidate, MiningError> {
     // Update interlinks from parent
     let updated_interlinks =
@@ -79,6 +89,11 @@ pub fn build_extension(
     // At epoch boundary, append packed parameters
     if let Some(params) = boundary_params {
         fields.extend(ergo_validation::pack_parameters(params));
+    }
+
+    // Carry the active proposed-update payload at key [0x00, 124] when set.
+    if !proposed_update_bytes.is_empty() {
+        fields.push(([0x00, 124], proposed_update_bytes.to_vec()));
     }
 
     Ok(ExtensionCandidate { fields })

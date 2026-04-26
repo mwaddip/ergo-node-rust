@@ -188,6 +188,7 @@ fn generate_candidate_and_mine_block() {
         &[], // empty interlinks for genesis
         &emission_box,
         None, // no boundary params (height 2 is not an epoch boundary)
+        &[],  // no proposed-update payload
         &mock_proofs,
     )
     .expect("candidate generation failed");
@@ -258,6 +259,7 @@ fn mine_three_consecutive_blocks() {
             &interlinks,
             &current_emission_box,
             None, // no boundary params (heights 2-4 are not epoch boundaries)
+            &[],  // no proposed-update payload
             &mock_proofs,
         )
         .unwrap_or_else(|e| panic!("candidate at height {height} failed: {e}"));

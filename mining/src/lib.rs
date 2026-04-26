@@ -62,6 +62,7 @@ pub fn generate_candidate(
     parent_interlinks: &[BlockId],
     emission_box: &ErgoBox,
     boundary_params: Option<&ergo_lib::chain::parameters::Parameters>,
+    proposed_update_bytes: &[u8],
     validator_proofs: &dyn Fn(&[Transaction]) -> Option<Result<(Vec<u8>, ADDigest), ValidationError>>,
 ) -> Result<(CandidateBlock, WorkMessage), MiningError> {
     let height = parent.height + 1;
@@ -91,7 +92,12 @@ pub fn generate_candidate(
         .map_err(MiningError::Validation)?;
 
     // 4. Build extension
-    let extension = extension::build_extension(parent, parent_interlinks, boundary_params)?;
+    let extension = extension::build_extension(
+        parent,
+        parent_interlinks,
+        boundary_params,
+        proposed_update_bytes,
+    )?;
 
     // 5. Assemble candidate
     let mut block = CandidateBlock {

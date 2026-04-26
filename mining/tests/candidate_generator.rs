@@ -88,7 +88,7 @@ fn gen_candidate(config: &MinerConfig, parent: &Header) -> (CandidateBlock, Work
     let pks = founder_pks();
     let (emission_box, _, _) = genesis::genesis_boxes(&settings, &pks, 2, PROOFS).unwrap();
     ergo_mining::generate_candidate(
-        config, parent, INITIAL_N_BITS, &[], &emission_box, None, &mock_proofs,
+        config, parent, INITIAL_N_BITS, &[], &emission_box, None, &[], &mock_proofs,
     ).unwrap()
 }
 
@@ -270,7 +270,7 @@ fn mined_block_advances_emission_box() {
     // Generate and mine block 2
     let interlinks_1: Vec<BlockId> = vec![];
     let (candidate_2, _) = ergo_mining::generate_candidate(
-        &config, &parent, INITIAL_N_BITS, &interlinks_1, &emission_box, None, &mock_proofs,
+        &config, &parent, INITIAL_N_BITS, &interlinks_1, &emission_box, None, &[], &mock_proofs,
     ).unwrap();
     let header_2 = cpu_mine(&candidate_2);
     assert_eq!(header_2.height, 2);
@@ -284,7 +284,7 @@ fn mined_block_advances_emission_box() {
 
     // Generate block 3 using the updated emission box
     let (candidate_3, _) = ergo_mining::generate_candidate(
-        &config, &header_2, INITIAL_N_BITS, &interlinks_2, &new_emission_box, None, &mock_proofs,
+        &config, &header_2, INITIAL_N_BITS, &interlinks_2, &new_emission_box, None, &[], &mock_proofs,
     ).unwrap();
     let header_3 = cpu_mine(&candidate_3);
     assert_eq!(header_3.height, 3);
