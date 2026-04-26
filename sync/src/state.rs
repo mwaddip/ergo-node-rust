@@ -305,6 +305,11 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 // Advance to match — the gap blocks' state transitions are
                 // already proven correct by the AVL digest check in apply_state.
                 self.script_verified_height = self.state_applied_height;
+                // Lock in the new floor durably so a restart before the next
+                // flush doesn't re-discover the same gap. Without this the
+                // persisted SVH stays stuck at the old value across restarts.
+                self.store.set_script_verified_height(self.script_verified_height).await;
+                self.store.flush().await;
             }
         }
 
@@ -952,10 +957,11 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             self.script_verified_height += 1;
             verified.remove(&self.script_verified_height);
         }
-        // Persist periodically (every 100 blocks) to limit re-eval on restart
-        if self.script_verified_height > prev
-            && self.script_verified_height / 100 > prev / 100
-        {
+        // Persist on every advance. With Durability::None the write hits the
+        // redb WAL only and gets fsynced when the paired store.flush() runs at
+        // the next state-flush point — so persisted SVH always tracks
+        // persisted state without an extra fsync per block.
+        if self.script_verified_height > prev {
             self.store.set_script_verified_height(self.script_verified_height).await;
         }
     }
@@ -979,6 +985,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
 
         self.state_applied_height = rollback_to;
         self.script_verified_height = rollback_to;
+        self.store.set_script_verified_height(self.script_verified_height).await;
         if self.downloaded_height > rollback_to {
             self.downloaded_height = rollback_to;
         }
@@ -1020,6 +1027,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     }
                     self.state_applied_height = fork_point;
                     self.script_verified_height = fork_point;
+                    self.store.set_script_verified_height(self.script_verified_height).await;
                 }
 
                 // Purge pending requests — they're for the wrong branch
