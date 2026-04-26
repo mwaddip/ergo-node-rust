@@ -64,6 +64,33 @@ pub async fn run(
     let mut backoff = std::time::Duration::from_secs(1);
 
     loop {
+        // Verify our tip is still canonical before waiting for new blocks.
+        // Catches reorgs at or below `last_indexed` that the per-target check
+        // misses (it only fires on the next height, where `get_block_id_at`
+        // returns None and the comparison is skipped). Also necessary to
+        // unblock `info_wait` in deep-reorg cases where the node's height has
+        // dropped below ours — without rolling back first we'd block forever
+        // waiting for the node to surpass a stale watermark.
+        // Errors are logged-and-skipped so transient node connectivity blips
+        // don't terminate the indexer; the next iteration retries.
+        if last_indexed > 0 {
+            match check_canonical_or_rollback(&db, &client, last_indexed).await {
+                Ok(Some(fork)) => {
+                    tracing::warn!(
+                        prev_tip = last_indexed,
+                        fork_point = fork,
+                        "tip reorg detected — rolled back"
+                    );
+                    last_indexed = fork;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "tip canonical check failed, proceeding");
+                }
+            }
+        }
+
         // Wait for new blocks via long-poll
         let node_height = match client.info_wait(last_indexed).await {
             Ok(Some(info)) => info.full_height as u64,
@@ -81,33 +108,13 @@ pub async fn run(
         while last_indexed < node_height {
             let target = last_indexed + 1;
 
-            // Reorg detection
-            if let Some(existing_id) = db.get_block_id_at(target).await? {
-                let block_ids = client.block_ids_at(target).await?;
-                if let Some(canonical_id) = block_ids.first() {
-                    let canonical_bytes = hex::decode(canonical_id)?;
-                    if canonical_bytes != existing_id {
-                        tracing::warn!(height = target, "reorg detected — rolling back");
-                        let mut fork = target;
-                        while fork > 0 {
-                            fork -= 1;
-                            if let Some(db_id) = db.get_block_id_at(fork).await? {
-                                let ids = client.block_ids_at(fork).await?;
-                                if let Some(node_id) = ids.first() {
-                                    if hex::decode(node_id)? == db_id {
-                                        break;
-                                    }
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                        tracing::info!(fork_point = fork, "rolling back to fork point");
-                        db.rollback_to(fork).await?;
-                        last_indexed = fork;
-                        continue;
-                    }
-                }
+            // Per-target reorg detection — safety net for the `start_height=`
+            // re-run case where target is already in the DB. Tip-level reorgs
+            // are caught earlier by the outer check above.
+            if let Some(fork) = check_canonical_or_rollback(&db, &client, target).await? {
+                tracing::warn!(height = target, fork_point = fork, "reorg detected at target — rolled back");
+                last_indexed = fork;
+                continue;
             }
 
             // Fetch block data
@@ -147,4 +154,45 @@ pub async fn run(
             }
         }
     }
+}
+
+/// Compare the stored block ID at `height` against the canonical chain.
+/// If they match, returns `Ok(None)`. If they differ, walks back from `height`
+/// to find the fork point, rolls back the DB to that fork, and returns
+/// `Ok(Some(fork))`. If there's no stored ID at `height` (nothing to compare)
+/// or the node returns no canonical ID, returns `Ok(None)`.
+async fn check_canonical_or_rollback(
+    db: &Arc<dyn IndexerDb>,
+    client: &NodeClient,
+    height: u64,
+) -> Result<Option<u64>> {
+    let stored_id = match db.get_block_id_at(height).await? {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+    let canonical_ids = client.block_ids_at(height).await?;
+    let canonical = match canonical_ids.first() {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    if hex::decode(canonical)? == stored_id {
+        return Ok(None);
+    }
+    let mut fork = height;
+    while fork > 0 {
+        fork -= 1;
+        let db_id = match db.get_block_id_at(fork).await? {
+            Some(id) => id,
+            None => break,
+        };
+        let ids = client.block_ids_at(fork).await?;
+        if let Some(node_id) = ids.first() {
+            if hex::decode(node_id)? == db_id {
+                break;
+            }
+        }
+    }
+    tracing::info!(fork_point = fork, "rolling back to fork point");
+    db.rollback_to(fork).await?;
+    Ok(Some(fork))
 }
