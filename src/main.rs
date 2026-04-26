@@ -625,7 +625,7 @@ impl ergo_api::UtxoAccess for ApiUtxoReader {
 /// the next candidate.
 struct MinedBlockSubmitter {
     store: Arc<RedbModifierStore>,
-    modifier_tx: tokio::sync::mpsc::Sender<(u8, [u8; 32], Vec<u8>, Option<u64>)>,
+    modifier_tx: tokio::sync::mpsc::Sender<ergo_api::ModifierBatchItem>,
 }
 
 impl ergo_api::BlockSubmitter for MinedBlockSubmitter {
@@ -665,7 +665,7 @@ impl ergo_api::BlockSubmitter for MinedBlockSubmitter {
 
         tracing::info!(
             height = header.height,
-            header_id = %hex::encode(&header_id),
+            header_id = %hex::encode(header_id),
             "mined block sections stored, injecting header into pipeline"
         );
 
@@ -949,7 +949,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mining_proof_cache: MiningProofCache = Arc::new(std::sync::Mutex::new(None));
 
     if let Some(ref pk) = miner_pk_opt {
-        let pk_hex: String = (*pk.h).clone().into();
+        let pk_hex: String = (*pk.h).into();
         tracing::info!(miner_pk = %pk_hex, votes = %node_config.mining.votes, "mining configured");
     }
 
@@ -1062,17 +1062,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let store_for_loader = store.clone();
         chain.set_extension_loader(move |height: u32| -> Option<Vec<u8>> {
-            let header_id = store_for_loader.best_header_at(height).ok().flatten()?;
-            let header_bytes = store_for_loader
-                .get(enr_chain::HEADER_TYPE_ID, &header_id)
-                .ok()
-                .flatten()?;
-            let header = enr_chain::parse_header(&header_bytes).ok()?;
-            let extension_id = enr_chain::section_ids(&header)[2].1;
-            store_for_loader
-                .get(enr_chain::EXTENSION_TYPE_ID, &extension_id)
-                .ok()
-                .flatten()
+            let header_id = match store_for_loader.best_header_at(height) {
+                Ok(v) => v?,
+                Err(e) => {
+                    tracing::warn!(height, error = %e, "extension_loader: best_header_at failed");
+                    return None;
+                }
+            };
+            let header_bytes = match store_for_loader.get(enr_chain::HEADER_TYPE_ID, &header_id) {
+                Ok(v) => v?,
+                Err(e) => {
+                    tracing::warn!(height, error = %e, "extension_loader: get(header) failed");
+                    return None;
+                }
+            };
+            let header = match enr_chain::parse_header(&header_bytes) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(height, error = %e, "extension_loader: parse_header failed");
+                    return None;
+                }
+            };
+            let extension_id = enr_chain::section_ids(&header)
+                .iter()
+                .find(|(t, _)| *t == enr_chain::EXTENSION_TYPE_ID)
+                .map(|(_, id)| *id)?;
+            match store_for_loader.get(enr_chain::EXTENSION_TYPE_ID, &extension_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(height, error = %e, "extension_loader: get(extension) failed");
+                    None
+                }
+            }
         });
 
         // Wire the header loader so chain's LRU cache can fall through to
@@ -1083,11 +1104,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // scores), so chain's Vec<BigUint> safety net is still authoritative.
         let store_for_header_loader = store.clone();
         chain.set_header_loader(move |height: u32| -> Option<ergo_chain_types::Header> {
-            let header_bytes = store_for_header_loader
-                .read_header_at(height)
-                .ok()
-                .flatten()?;
-            enr_chain::parse_header(&header_bytes).ok()
+            let header_bytes = match store_for_header_loader.read_header_at(height) {
+                Ok(v) => v?,
+                Err(e) => {
+                    tracing::warn!(height, error = %e, "header_loader: read_header_at failed");
+                    return None;
+                }
+            };
+            match enr_chain::parse_header(&header_bytes) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    tracing::warn!(height, error = %e, "header_loader: parse_header failed");
+                    None
+                }
+            }
         });
 
         // Note: active_parameters is recomputed from storage AFTER the
@@ -1254,11 +1284,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     false
                 };
 
-                if !handled {
-                    if sync_events_tx.send(event).await.is_err() {
+                if !handled
+                    && sync_events_tx.send(event).await.is_err() {
                         break;
                     }
-                }
             }
         });
     }

@@ -326,7 +326,13 @@ pub async fn get_unconfirmed(
         .into_iter()
         .skip(offset)
         .take(limit)
-        .filter_map(|utx| serde_json::to_value(&utx.tx).ok())
+        .filter_map(|utx| match serde_json::to_value(&utx.tx) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(error = %e, tx_id = %hex::encode(utx.tx.id().0.0), "unconfirmed_transactions: serde failed; tx omitted");
+                None
+            }
+        })
         .collect();
     Json(txs)
 }
@@ -623,7 +629,7 @@ pub async fn get_mining_reward_address(
     let mining = state.mining.as_ref().ok_or_else(mining_err)?;
 
     // Derive P2S address from miner PK
-    let pk_hex: String = (*mining.config.miner_pk.h).clone().into();
+    let pk_hex: String = (*mining.config.miner_pk.h).into();
     Ok(Json(serde_json::json!({
         "rewardAddress": pk_hex,
     })))
@@ -674,7 +680,7 @@ pub async fn post_mining_solution(
 
     // Build Autolykos v2 solution (miner_pk not used in PoW calc, use configured pk)
     let solution = ergo_chain_types::AutolykosSolution {
-        miner_pk: Box::new((*mining.config.miner_pk.h).clone()),
+        miner_pk: Box::new(*mining.config.miner_pk.h),
         pow_onetime_pk: None,
         nonce,
         pow_distance: None,
@@ -851,7 +857,7 @@ fn read_proc_memory() -> ProcessMemory {
             Some(p) => p,
             None => continue,
         };
-        let kb = rest.trim().split_whitespace().next()
+        let kb = rest.split_whitespace().next()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
         let bytes = kb * 1024;

@@ -82,7 +82,7 @@ pub fn build_fee_tx(
         if let Some(ref tokens) = fee_box.tokens {
             let token_slice: &[Token] = tokens.as_ref();
             for token in token_slice {
-                *token_map.entry(token.token_id.clone()).or_insert(0) += u64::from(token.amount);
+                *token_map.entry(token.token_id).or_insert(0) += u64::from(token.amount);
             }
         }
     }

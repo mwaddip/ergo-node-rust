@@ -19,7 +19,13 @@ pub fn handle_snapshot_request(
 ) -> Option<(u8, Vec<u8>)> {
     match code {
         GET_SNAPSHOTS_INFO => {
-            let info = store.snapshots_info().ok()?;
+            let info = match store.snapshots_info() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "snapshot_serve: snapshots_info failed");
+                    return None;
+                }
+            };
             let entries: Vec<SnapshotEntry> = info
                 .into_iter()
                 .map(|(height, manifest_id)| SnapshotEntry {
@@ -39,7 +45,13 @@ pub fn handle_snapshot_request(
             }
             let mut id = [0u8; 32];
             id.copy_from_slice(&body[..32]);
-            let data = store.get_manifest(&id).ok()??;
+            let data = match store.get_manifest(&id) {
+                Ok(v) => v?,
+                Err(e) => {
+                    tracing::warn!(id = %hex::encode(id), error = %e, "snapshot_serve: get_manifest failed");
+                    return None;
+                }
+            };
             Some(SnapshotMessage::Manifest(data).encode())
         }
 
@@ -49,7 +61,13 @@ pub fn handle_snapshot_request(
             }
             let mut id = [0u8; 32];
             id.copy_from_slice(&body[..32]);
-            let data = store.get_chunk(&id).ok()??;
+            let data = match store.get_chunk(&id) {
+                Ok(v) => v?,
+                Err(e) => {
+                    tracing::warn!(id = %hex::encode(id), error = %e, "snapshot_serve: get_chunk failed");
+                    return None;
+                }
+            };
             Some(SnapshotMessage::UtxoSnapshotChunk(data).encode())
         }
 

@@ -204,27 +204,25 @@ fn estimate_tx_size(inputs: &[InputRef], outputs: &[IndexedBox]) -> u32 {
     (input_bytes + output_bytes) as u32
 }
 
-/// Try to extract a UTF-8 string from a register (expects Coll[Byte]).
-fn extract_register_string(out_val: &serde_json::Value, reg_key: &str) -> Option<String> {
+/// Decode a register's hex string and parse it as a sigma Constant.
+fn parse_register_constant(out_val: &serde_json::Value, reg_key: &str) -> Option<Constant> {
     let hex_str = out_val
         .get("additionalRegisters")?
         .get(reg_key)?
         .as_str()?;
     let bytes = hex::decode(hex_str).ok()?;
-    let constant = Constant::sigma_parse_bytes(&bytes).ok()?;
-    let data: Vec<u8> = constant.try_extract_into().ok()?;
+    Constant::sigma_parse_bytes(&bytes).ok()
+}
+
+/// Try to extract a UTF-8 string from a register (expects Coll[Byte]).
+fn extract_register_string(out_val: &serde_json::Value, reg_key: &str) -> Option<String> {
+    let data: Vec<u8> = parse_register_constant(out_val, reg_key)?.try_extract_into().ok()?;
     String::from_utf8(data).ok()
 }
 
 /// Try to extract an i32 from a register.
 fn extract_register_int(out_val: &serde_json::Value, reg_key: &str) -> Option<i32> {
-    let hex_str = out_val
-        .get("additionalRegisters")?
-        .get(reg_key)?
-        .as_str()?;
-    let bytes = hex::decode(hex_str).ok()?;
-    let constant = Constant::sigma_parse_bytes(&bytes).ok()?;
-    constant.try_extract_into::<i32>().ok()
+    parse_register_constant(out_val, reg_key)?.try_extract_into::<i32>().ok()
 }
 
 /// Extract non-empty registers R4-R9 as their original serialized bytes.

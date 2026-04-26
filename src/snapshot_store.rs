@@ -89,8 +89,8 @@ impl SnapshotStore {
         let info = self.snapshots_info()?;
         if info.len() > storing_snapshots as usize {
             let to_prune = info.len() - storing_snapshots as usize;
-            for i in 0..to_prune {
-                if let Err(e) = self.prune_snapshot(info[i].1) {
+            for entry in info.iter().take(to_prune) {
+                if let Err(e) = self.prune_snapshot(entry.1) {
                     tracing::warn!("snapshot prune failed: {e}");
                 }
             }

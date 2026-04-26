@@ -73,7 +73,7 @@ pub fn build_work_message(
         height,
         extension_root: Digest32::from(ext_root_bytes),
         autolykos_solution: AutolykosSolution {
-            miner_pk: Box::new(miner_pk.clone()),
+            miner_pk: Box::new(*miner_pk),
             pow_onetime_pk: None,
             nonce: vec![0u8; 8],
             pow_distance: None,
@@ -99,7 +99,7 @@ pub fn build_work_message(
     let target = decode_compact_bits(candidate.n_bits);
 
     // pk = compressed EcPoint hex
-    let pk_hex: String = miner_pk.clone().into();
+    let pk_hex: String = (*miner_pk).into();
 
     let work = WorkMessage {
         msg: hex::encode(msg),

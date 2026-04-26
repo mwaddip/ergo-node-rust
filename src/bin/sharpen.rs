@@ -23,6 +23,9 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
+use enr_chain::{
+    AD_PROOFS_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, EXTENSION_TYPE_ID, HEADER_TYPE_ID,
+};
 use ergo_avltree_rust::versioned_avl_storage::VersionedAVLStorage;
 use enr_state::{AVLTreeParams, CacheSize, RedbAVLStorage};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -39,11 +42,6 @@ const HEADER_SCORES: TableDefinition<[u8; 32], &[u8]> =
     TableDefinition::new("header_scores");
 const BEST_CHAIN: TableDefinition<u32, [u8; 32]> =
     TableDefinition::new("best_chain");
-
-const HEADER_TYPE_ID: u8 = 101;
-const BLOCK_TRANSACTIONS_TYPE_ID: u8 = 102;
-const AD_PROOFS_TYPE_ID: u8 = 104;
-const EXTENSION_TYPE_ID: u8 = 108;
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);

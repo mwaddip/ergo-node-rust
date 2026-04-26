@@ -57,7 +57,7 @@ impl FeeStats {
         }
 
         let range = max_fee - min_fee + 1;
-        let bucket_width = (range + bucket_count as u64 - 1) / bucket_count as u64;
+        let bucket_width = range.div_ceil(bucket_count as u64);
 
         let mut buckets: Vec<(usize, u64)> = vec![(0, 0); bucket_count];
 
@@ -90,7 +90,7 @@ impl FeeStats {
         let mut count = 0u64;
 
         for &(fee, wait) in &self.history {
-            let diff = if fee > fee_per_factor { fee - fee_per_factor } else { fee_per_factor - fee };
+            let diff = fee.abs_diff(fee_per_factor);
             if diff < closest_fee_diff {
                 closest_fee_diff = diff;
                 closest_wait = wait;

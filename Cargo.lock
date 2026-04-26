@@ -563,7 +563,6 @@ dependencies = [
  "tokio-test",
  "toml",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -784,7 +783,6 @@ dependencies = [
  "ergo-validation",
  "ergo_avltree_rust 0.1.1 (git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=de1a79a)",
  "hex",
- "rand 0.8.5",
  "rayon",
  "redb",
  "tempfile",

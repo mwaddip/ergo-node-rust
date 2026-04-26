@@ -86,6 +86,12 @@ pub struct DeliveryTracker {
     max_checks: u32,
 }
 
+impl Default for DeliveryTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DeliveryTracker {
     pub fn new() -> Self {
         Self {

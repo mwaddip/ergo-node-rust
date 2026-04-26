@@ -31,6 +31,8 @@ impl OrderedPool {
 
     pub fn len(&self) -> usize { self.ordered.len() }
 
+    pub fn is_empty(&self) -> bool { self.ordered.is_empty() }
+
     pub fn is_full(&self) -> bool { self.len() >= self.capacity }
 
     /// Insert a transaction with its pre-computed weight.

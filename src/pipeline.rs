@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use enr_chain::{
     AppendResult, BlockId, ChainError, Header, HeaderChain, HeaderTracker,
-    decode_compact_bits, HEADER_TYPE_ID,
+    decode_compact_bits, HEADER_TYPE_ID, TRANSACTION_TYPE_ID,
 };
 use enr_store::{ModifierStore, RedbModifierStore};
 use ergo_sync::delivery::{DeliveryControl, DeliveryData};
@@ -14,9 +14,6 @@ use tokio::sync::{mpsc, Mutex};
 /// LRU buffer capacity for out-of-order headers (JVM: `headersCache` = 8192).
 const BUFFER_CAPACITY: usize = 8_192;
 
-/// Ergo unconfirmed transaction modifier type.
-const TRANSACTION_TYPE_ID: u8 = 2;
-
 /// Async validation pipeline for modifiers.
 ///
 /// Receives raw modifier data from the P2P layer via a channel, validates
@@ -26,7 +23,7 @@ const TRANSACTION_TYPE_ID: u8 = 2;
 /// Out-of-order headers are buffered in an LRU cache. Evicted headers are
 /// reported to the delivery tracker for re-request.
 pub struct ValidationPipeline {
-    rx: mpsc::Receiver<(u8, [u8; 32], Vec<u8>, Option<u64>)>,
+    rx: mpsc::Receiver<ergo_api::ModifierBatchItem>,
     chain: Arc<Mutex<HeaderChain>>,
     store: Arc<RedbModifierStore>,
     progress_tx: mpsc::Sender<u32>,
@@ -42,7 +39,7 @@ pub struct ValidationPipeline {
 
 impl ValidationPipeline {
     pub fn new(
-        rx: mpsc::Receiver<(u8, [u8; 32], Vec<u8>, Option<u64>)>,
+        rx: mpsc::Receiver<ergo_api::ModifierBatchItem>,
         chain: Arc<Mutex<HeaderChain>>,
         store: Arc<RedbModifierStore>,
         progress_tx: mpsc::Sender<u32>,
@@ -153,7 +150,7 @@ impl ValidationPipeline {
     }
 
     /// Process a batch of raw modifiers.
-    pub(crate) async fn process_batch(&mut self, batch: Vec<(u8, [u8; 32], Vec<u8>, Option<u64>)>) {
+    pub(crate) async fn process_batch(&mut self, batch: Vec<ergo_api::ModifierBatchItem>) {
         // Single pass: collect IDs for delivery tracker, partition headers from sections
         let mut received_ids = Vec::with_capacity(batch.len());
         let mut raw_headers: Vec<(&[u8], Option<u64>)> = Vec::new();
@@ -187,11 +184,10 @@ impl ValidationPipeline {
         } // drop chain_guard
 
         // Notify delivery tracker (data plane — ok to drop)
-        if !received_ids.is_empty() {
-            if self.delivery_data_tx.try_send(DeliveryData::Received(received_ids)).is_err() {
+        if !received_ids.is_empty()
+            && self.delivery_data_tx.try_send(DeliveryData::Received(received_ids)).is_err() {
                 tracing::debug!("delivery data channel full, dropped Received notification");
             }
-        }
 
         // Store non-header block sections directly (no validation)
         if !section_entries.is_empty() {
@@ -413,8 +409,8 @@ impl ValidationPipeline {
                         // batch to avoid flooding. The fork chain links backward,
                         // so fetching the lowest missing parent is sufficient: once
                         // it arrives and chains, the rest drain from the buffer.
-                        if self.reorg_requested.is_empty() || self.reorg_requested.len() < 3 {
-                            if self.reorg_requested.insert(parent_id.0.0) {
+                        if (self.reorg_requested.is_empty() || self.reorg_requested.len() < 3)
+                            && self.reorg_requested.insert(parent_id.0.0) {
                                 let _ = self.delivery_control_tx.send(
                                     DeliveryControl::NeedModifier {
                                         type_id: HEADER_TYPE_ID,
@@ -422,7 +418,6 @@ impl ValidationPipeline {
                                     },
                                 );
                             }
-                        }
 
                         buffered += 1;
                         if let Some((_, (evicted, _))) = self.buffer.push(parent_id, (header, raw)) {
@@ -568,7 +563,7 @@ mod tests {
     /// Build a pipeline with a testnet chain, channels, and a temp store.
     fn test_pipeline() -> (
         ValidationPipeline,
-        mpsc::Sender<(u8, [u8; 32], Vec<u8>, Option<u64>)>,
+        mpsc::Sender<ergo_api::ModifierBatchItem>,
         mpsc::Receiver<u32>,
         mpsc::UnboundedReceiver<DeliveryControl>,
         mpsc::Receiver<DeliveryData>,

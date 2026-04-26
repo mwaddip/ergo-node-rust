@@ -12,13 +12,11 @@ use tokio::time::{Duration, Instant};
 use crate::delivery::{DeliveryControl, DeliveryData, DeliveryTracker};
 use enr_chain::{
     StateType, HEADER_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID, EXTENSION_TYPE_ID,
+    TRANSACTION_TYPE_ID,
 };
 
 use crate::traits::{SyncChain, SyncStore, SyncTransport};
 use ergo_validation::BlockValidator;
-
-/// Ergo unconfirmed transaction modifier type.
-const TRANSACTION_TYPE_ID: u8 = 2;
 
 /// Number of block section requests to send per batch (per type).
 /// The JVM's Akka layer can silently drop large ModifierResponse bodies via
@@ -815,7 +813,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
 
                     // Progress report every 1000 blocks during large sweeps
                     let done = height - self.state_applied_height;
-                    if done % 1000 == 0 && sweep_size > 100 {
+                    if done.is_multiple_of(1000) && sweep_size > 100 {
                         let elapsed = sweep_start.elapsed().as_secs().max(1);
                         let rate = done as f64 / elapsed as f64;
                         let remaining = sweep_to - height;

@@ -145,7 +145,7 @@ pub fn build_emission_tx(
                 let remaining = i64::from(token.amount) - reemission_amount;
                 if remaining > 0 {
                     new_emission_builder.add_token(Token {
-                        token_id: token.token_id.clone(),
+                        token_id: token.token_id,
                         amount: TokenAmount::try_from(remaining as u64).map_err(|e| {
                             MiningError::Emission(format!("reemission token amount: {e}"))
                         })?,
@@ -153,7 +153,7 @@ pub fn build_emission_tx(
                 }
                 // If remaining <= 0, the reemission token is exhausted — don't add it
             } else {
-                new_emission_builder.add_token(token.clone());
+                new_emission_builder.add_token(*token);
             }
         }
     }
@@ -181,7 +181,7 @@ pub fn build_emission_tx(
             let token_slice: &[Token] = tokens.as_ref();
             if token_slice.len() >= 2 {
                 reward_builder.add_token(Token {
-                    token_id: token_slice[1].token_id.clone(),
+                    token_id: token_slice[1].token_id,
                     amount: TokenAmount::try_from(reemission_amount as u64).map_err(|e| {
                         MiningError::Emission(format!("miner reemission token: {e}"))
                     })?,

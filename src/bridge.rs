@@ -174,23 +174,27 @@ impl SyncStore for SharedStore {
     async fn has_modifier(&self, type_id: u8, id: &[u8; 32]) -> bool {
         let store = self.store.clone();
         let id = *id;
-        tokio::task::spawn_blocking(move || {
-            match store.contains(type_id, &id) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!("store.contains failed: {e}");
-                    false
-                }
+        match tokio::task::spawn_blocking(move || match store.contains(type_id, &id) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("store.contains failed: {e}");
+                false
             }
         })
         .await
-        .unwrap_or(false)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(?e, type_id, id = %hex::encode(id), "spawn_blocking panicked: has_modifier");
+                false
+            }
+        }
     }
 
     async fn get_modifier(&self, type_id: u8, id: &[u8; 32]) -> Option<Vec<u8>> {
         let store = self.store.clone();
         let id = *id;
-        tokio::task::spawn_blocking(move || match store.get(type_id, &id) {
+        match tokio::task::spawn_blocking(move || match store.get(type_id, &id) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("store.get failed: {e}");
@@ -198,12 +202,18 @@ impl SyncStore for SharedStore {
             }
         })
         .await
-        .unwrap_or(None)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(?e, type_id, id = %hex::encode(id), "spawn_blocking panicked: get_modifier");
+                None
+            }
+        }
     }
 
     async fn script_verified_height(&self) -> Option<u32> {
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             match store.get(SYNC_META_TYPE_ID, &SCRIPT_VERIFIED_HEIGHT_KEY) {
                 Ok(Some(bytes)) if bytes.len() == 4 => {
                     Some(u32::from_le_bytes(bytes[..4].try_into().unwrap()))
@@ -212,12 +222,18 @@ impl SyncStore for SharedStore {
             }
         })
         .await
-        .unwrap_or(None)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(?e, "spawn_blocking panicked: script_verified_height");
+                None
+            }
+        }
     }
 
     async fn set_script_verified_height(&self, height: u32) {
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || {
+        if let Err(e) = tokio::task::spawn_blocking(move || {
             if let Err(e) = store.put(
                 SYNC_META_TYPE_ID,
                 &SCRIPT_VERIFIED_HEIGHT_KEY,
@@ -228,17 +244,21 @@ impl SyncStore for SharedStore {
             }
         })
         .await
-        .ok();
+        {
+            tracing::error!(?e, height, "spawn_blocking panicked: set_script_verified_height");
+        }
     }
 
     async fn flush(&self) {
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || {
+        if let Err(e) = tokio::task::spawn_blocking(move || {
             if let Err(e) = store.flush() {
                 tracing::warn!("modifier store flush failed: {e}");
             }
         })
         .await
-        .ok();
+        {
+            tracing::error!(?e, "spawn_blocking panicked: flush");
+        }
     }
 }

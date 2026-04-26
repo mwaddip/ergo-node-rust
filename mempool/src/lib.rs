@@ -46,6 +46,7 @@ impl Mempool {
     pub fn contains(&self, tx_id: &[u8; 32]) -> bool { self.pool.contains(tx_id) || self.invalidated.contains(tx_id) }
     pub fn is_invalidated(&self, tx_id: &[u8; 32]) -> bool { self.invalidated.contains(tx_id) }
     pub fn len(&self) -> usize { self.pool.len() }
+    pub fn is_empty(&self) -> bool { self.pool.is_empty() }
     pub fn top(&self, limit: usize) -> Vec<&UnconfirmedTx> { self.pool.top(limit) }
     pub fn all_prioritized(&self) -> Vec<&UnconfirmedTx> { self.pool.all_prioritized() }
     pub fn tx_ids(&self) -> Vec<[u8; 32]> { self.pool.tx_ids() }
@@ -100,11 +101,10 @@ impl Mempool {
             for input in tx.inputs.iter() {
                 let input_id = process::input_box_id_raw(&input.box_id);
                 if let Some(conflict_weight) = self.pool.spending_tx(&input_id).cloned() {
-                    if conflict_weight.tx_id != tx_id {
-                        if self.pool.remove(&conflict_weight.tx_id).is_some() {
+                    if conflict_weight.tx_id != tx_id
+                        && self.pool.remove(&conflict_weight.tx_id).is_some() {
                             removed.push(conflict_weight.tx_id);
                         }
-                    }
                 }
             }
         }

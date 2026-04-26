@@ -11,9 +11,6 @@ ergo-validation = { path = "../validation" }
 crossbeam-channel = "0.5"
 rayon = "1"
 blake2 = "0.10"
-bytes = "1"
-hex = "0.4"
-rand = "0.8"
 redb = "4"
 thiserror = "2"
 tokio = { version = "1", features = ["time", "sync"] }
@@ -22,4 +19,6 @@ tracing = "0.1"
 [dev-dependencies]
 ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "de1a79a" }
 ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "46e94c21" }
+bytes = "1"
+hex = "0.4"
 tempfile = "3"

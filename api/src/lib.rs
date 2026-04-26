@@ -10,6 +10,10 @@ use ergo_mining::CandidateGenerator;
 use ergo_validation::ErgoStateContext;
 use tokio::sync::{Mutex, RwLock};
 
+/// Modifier delivered into the validation pipeline.
+/// Tuple: `(type_id, modifier_id, raw_bytes, optional_height_hint)`.
+pub type ModifierBatchItem = (u8, [u8; 32], Vec<u8>, Option<u64>);
+
 /// Shared state available to all API handlers.
 ///
 /// Constructed by the main crate from its existing shared handles.
@@ -42,7 +46,7 @@ pub struct ApiState {
     /// Peer REST URL callback — returns connected peers with their socket addr and REST URL.
     pub peer_api_urls: Arc<dyn Fn() -> Vec<PeerRestInfo> + Send + Sync>,
     /// Modifier pipeline sender — for the /ingest/modifiers endpoint.
-    pub modifier_tx: Option<tokio::sync::mpsc::Sender<(u8, [u8; 32], Vec<u8>, Option<u64>)>>,
+    pub modifier_tx: Option<tokio::sync::mpsc::Sender<ModifierBatchItem>>,
     /// Watch channel for validated block height — used by /info/wait long-poll.
     pub height_watch: tokio::sync::watch::Receiver<u32>,
     /// Jemalloc stats probe. Populated by the main crate when built with

@@ -5,6 +5,63 @@ use sqlx::PgPool;
 use crate::db::IndexerDb;
 use crate::types::*;
 
+type BlockTuple = (i64, Vec<u8>, i64, i64, Vec<u8>, i32, i32);
+type TxTuple = (Vec<u8>, Vec<u8>, i64, i32, i32);
+type BoxTuple = (Vec<u8>, Vec<u8>, Vec<u8>, i64, i32, Vec<u8>, Vec<u8>, String, i64, Option<Vec<u8>>, Option<i64>);
+type TokenTuple = (Vec<u8>, Vec<u8>, i64, Option<String>, Option<String>, Option<i32>);
+
+fn tuple_to_block((h, hid, ts, d, mpk, bs, tc): BlockTuple) -> BlockRow {
+    BlockRow {
+        height: h as u64,
+        header_id: hex::encode(hid),
+        timestamp: ts as u64,
+        difficulty: d as u64,
+        miner_pk: hex::encode(mpk),
+        block_size: bs as u32,
+        tx_count: tc as u32,
+    }
+}
+
+fn tuple_to_tx((tid, hid, h, ti, s): TxTuple) -> TxRow {
+    TxRow {
+        tx_id: hex::encode(tid),
+        header_id: hex::encode(hid),
+        height: h as u64,
+        tx_index: ti as u32,
+        size: s as u32,
+    }
+}
+
+/// Build a BoxRow from a sqlx tuple. Caller is responsible for filling tokens/registers.
+fn tuple_to_box_bare((bid, tid, hid, h, oi, et, eth, addr, v, stid, sh): BoxTuple) -> BoxRow {
+    BoxRow {
+        box_id: hex::encode(bid),
+        tx_id: hex::encode(tid),
+        header_id: hex::encode(hid),
+        height: h as u64,
+        output_index: oi as u32,
+        ergo_tree: hex::encode(et),
+        ergo_tree_hash: hex::encode(eth),
+        address: addr,
+        value: v as u64,
+        spent_tx_id: stid.map(hex::encode),
+        spent_height: sh.map(|h| h as u64),
+        tokens: vec![],
+        registers: vec![],
+    }
+}
+
+fn tuple_to_token((tid, mtid, mh, n, d, dec): TokenTuple) -> TokenRow {
+    TokenRow {
+        token_id: hex::encode(tid),
+        minting_tx_id: hex::encode(mtid),
+        minting_height: mh as u64,
+        name: n,
+        description: d,
+        decimals: dec,
+    }
+}
+
 const CREATE_TABLES_PG: &str = "
 CREATE TABLE IF NOT EXISTS indexer_state (
     key   TEXT PRIMARY KEY,
@@ -262,71 +319,54 @@ impl IndexerDb for PgDb {
     // Pattern: query → map to row type → return
 
     async fn get_block_by_height(&self, height: u64) -> Result<Option<BlockRow>> {
-        let row: Option<(i64, Vec<u8>, i64, i64, Vec<u8>, i32, i32)> = sqlx::query_as(
+        let row: Option<BlockTuple> = sqlx::query_as(
             "SELECT height, header_id, timestamp, difficulty, miner_pk, block_size, tx_count FROM blocks WHERE height = $1",
         ).bind(height as i64).fetch_optional(&self.pool).await?;
-        Ok(row.map(|(h, hid, ts, d, mpk, bs, tc)| BlockRow {
-            height: h as u64, header_id: hex::encode(hid), timestamp: ts as u64,
-            difficulty: d as u64, miner_pk: hex::encode(mpk), block_size: bs as u32, tx_count: tc as u32,
-        }))
+        Ok(row.map(tuple_to_block))
     }
 
     async fn get_block_by_id(&self, id: &[u8]) -> Result<Option<BlockRow>> {
-        let row: Option<(i64, Vec<u8>, i64, i64, Vec<u8>, i32, i32)> = sqlx::query_as(
+        let row: Option<BlockTuple> = sqlx::query_as(
             "SELECT height, header_id, timestamp, difficulty, miner_pk, block_size, tx_count FROM blocks WHERE header_id = $1",
         ).bind(id).fetch_optional(&self.pool).await?;
-        Ok(row.map(|(h, hid, ts, d, mpk, bs, tc)| BlockRow {
-            height: h as u64, header_id: hex::encode(hid), timestamp: ts as u64,
-            difficulty: d as u64, miner_pk: hex::encode(mpk), block_size: bs as u32, tx_count: tc as u32,
-        }))
+        Ok(row.map(tuple_to_block))
     }
 
     async fn get_blocks(&self, offset: u64, limit: u64) -> Result<Page<BlockRow>> {
         let (total,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM blocks").fetch_one(&self.pool).await?;
-        let rows: Vec<(i64, Vec<u8>, i64, i64, Vec<u8>, i32, i32)> = sqlx::query_as(
+        let rows: Vec<BlockTuple> = sqlx::query_as(
             "SELECT height, header_id, timestamp, difficulty, miner_pk, block_size, tx_count FROM blocks ORDER BY height DESC LIMIT $1 OFFSET $2",
         ).bind(limit as i64).bind(offset as i64).fetch_all(&self.pool).await?;
-        let items = rows.into_iter().map(|(h, hid, ts, d, mpk, bs, tc)| BlockRow {
-            height: h as u64, header_id: hex::encode(hid), timestamp: ts as u64,
-            difficulty: d as u64, miner_pk: hex::encode(mpk), block_size: bs as u32, tx_count: tc as u32,
-        }).collect();
+        let items = rows.into_iter().map(tuple_to_block).collect();
         Ok(Page { items, total: total as u64 })
     }
 
     async fn get_transactions_for_block(&self, header_id: &[u8]) -> Result<Vec<TxRow>> {
-        let rows: Vec<(Vec<u8>, Vec<u8>, i64, i32, i32)> = sqlx::query_as(
+        let rows: Vec<TxTuple> = sqlx::query_as(
             "SELECT tx_id, header_id, height, tx_index, size FROM transactions WHERE header_id = $1 ORDER BY tx_index",
         ).bind(header_id).fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(|(tid, hid, h, ti, s)| TxRow {
-            tx_id: hex::encode(tid), header_id: hex::encode(hid), height: h as u64, tx_index: ti as u32, size: s as u32,
-        }).collect())
+        Ok(rows.into_iter().map(tuple_to_tx).collect())
     }
 
     async fn get_transaction(&self, tx_id: &[u8]) -> Result<Option<TxRow>> {
-        let row: Option<(Vec<u8>, Vec<u8>, i64, i32, i32)> = sqlx::query_as(
+        let row: Option<TxTuple> = sqlx::query_as(
             "SELECT tx_id, header_id, height, tx_index, size FROM transactions WHERE tx_id = $1",
         ).bind(tx_id).fetch_optional(&self.pool).await?;
-        Ok(row.map(|(tid, hid, h, ti, s)| TxRow {
-            tx_id: hex::encode(tid), header_id: hex::encode(hid), height: h as u64, tx_index: ti as u32, size: s as u32,
-        }))
+        Ok(row.map(tuple_to_tx))
     }
 
     async fn get_box(&self, box_id: &[u8]) -> Result<Option<BoxRow>> {
-        let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, i64, i32, Vec<u8>, Vec<u8>, String, i64, Option<Vec<u8>>, Option<i64>)> = sqlx::query_as(
+        let row: Option<BoxTuple> = sqlx::query_as(
             "SELECT box_id, tx_id, header_id, height, output_index, ergo_tree, ergo_tree_hash, address, value, spent_tx_id, spent_height FROM boxes WHERE box_id = $1",
         ).bind(box_id).fetch_optional(&self.pool).await?;
         match row {
             None => Ok(None),
-            Some((bid, tid, hid, h, oi, et, eth, addr, v, stid, sh)) => {
-                let tokens = self.fetch_box_tokens(&bid).await?;
-                let registers = self.fetch_box_registers(&bid).await?;
-                Ok(Some(BoxRow {
-                    box_id: hex::encode(&bid), tx_id: hex::encode(tid), header_id: hex::encode(hid),
-                    height: h as u64, output_index: oi as u32, ergo_tree: hex::encode(et),
-                    ergo_tree_hash: hex::encode(eth), address: addr, value: v as u64,
-                    spent_tx_id: stid.map(hex::encode), spent_height: sh.map(|h| h as u64),
-                    tokens, registers,
-                }))
+            Some(tup) => {
+                let bid_bytes = tup.0.clone();
+                let mut row = tuple_to_box_bare(tup);
+                row.tokens = self.fetch_box_tokens(&bid_bytes).await?;
+                row.registers = self.fetch_box_registers(&bid_bytes).await?;
+                Ok(Some(row))
             }
         }
     }
@@ -356,26 +396,19 @@ impl IndexerDb for PgDb {
 
     async fn get_txs_by_address(&self, addr: &str, offset: u64, limit: u64) -> Result<Page<TxRow>> {
         let (total,): (i64,) = sqlx::query_as("SELECT COUNT(DISTINCT t.tx_id) FROM transactions t JOIN boxes b ON b.tx_id = t.tx_id WHERE b.address = $1").bind(addr).fetch_one(&self.pool).await?;
-        let rows: Vec<(Vec<u8>, Vec<u8>, i64, i32, i32)> = sqlx::query_as(
+        let rows: Vec<TxTuple> = sqlx::query_as(
             "SELECT DISTINCT t.tx_id, t.header_id, t.height, t.tx_index, t.size FROM transactions t JOIN boxes b ON b.tx_id = t.tx_id WHERE b.address = $1 ORDER BY t.height DESC LIMIT $2 OFFSET $3",
         ).bind(addr).bind(limit as i64).bind(offset as i64).fetch_all(&self.pool).await?;
-        let items = rows.into_iter().map(|(tid, hid, h, ti, s)| TxRow {
-            tx_id: hex::encode(tid), header_id: hex::encode(hid), height: h as u64, tx_index: ti as u32, size: s as u32,
-        }).collect();
+        let items = rows.into_iter().map(tuple_to_tx).collect();
         Ok(Page { items, total: total as u64 })
     }
 
     async fn get_unspent_by_ergo_tree(&self, hash: &[u8], offset: u64, limit: u64) -> Result<Page<BoxRow>> {
         let (total,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM boxes WHERE ergo_tree_hash = $1 AND spent_tx_id IS NULL").bind(hash).fetch_one(&self.pool).await?;
-        let rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, i64, i32, Vec<u8>, Vec<u8>, String, i64, Option<Vec<u8>>, Option<i64>)> = sqlx::query_as(
+        let rows: Vec<BoxTuple> = sqlx::query_as(
             "SELECT box_id, tx_id, header_id, height, output_index, ergo_tree, ergo_tree_hash, address, value, spent_tx_id, spent_height FROM boxes WHERE ergo_tree_hash = $1 AND spent_tx_id IS NULL ORDER BY height DESC LIMIT $2 OFFSET $3",
         ).bind(hash).bind(limit as i64).bind(offset as i64).fetch_all(&self.pool).await?;
-        let mut items: Vec<BoxRow> = rows.into_iter().map(|(bid, tid, hid, h, oi, et, eth, addr, v, stid, sh)| BoxRow {
-            box_id: hex::encode(&bid), tx_id: hex::encode(tid), header_id: hex::encode(hid), height: h as u64,
-            output_index: oi as u32, ergo_tree: hex::encode(et), ergo_tree_hash: hex::encode(eth),
-            address: addr, value: v as u64, spent_tx_id: stid.map(hex::encode), spent_height: sh.map(|h| h as u64),
-            tokens: vec![], registers: vec![],
-        }).collect();
+        let mut items: Vec<BoxRow> = rows.into_iter().map(tuple_to_box_bare).collect();
         for bx in &mut items {
             let bid = hex::decode(&bx.box_id)?;
             bx.tokens = self.fetch_box_tokens(&bid).await?;
@@ -385,13 +418,10 @@ impl IndexerDb for PgDb {
     }
 
     async fn get_token(&self, token_id: &[u8]) -> Result<Option<TokenRow>> {
-        let row: Option<(Vec<u8>, Vec<u8>, i64, Option<String>, Option<String>, Option<i32>)> = sqlx::query_as(
+        let row: Option<TokenTuple> = sqlx::query_as(
             "SELECT token_id, minting_tx_id, minting_height, name, description, decimals FROM tokens WHERE token_id = $1",
         ).bind(token_id).fetch_optional(&self.pool).await?;
-        Ok(row.map(|(tid, mtid, mh, n, d, dec)| TokenRow {
-            token_id: hex::encode(tid), minting_tx_id: hex::encode(mtid), minting_height: mh as u64,
-            name: n, description: d, decimals: dec,
-        }))
+        Ok(row.map(tuple_to_token))
     }
 
     async fn get_token_holders(&self, token_id: &[u8], offset: u64, limit: u64) -> Result<Page<HolderRow>> {
@@ -405,15 +435,10 @@ impl IndexerDb for PgDb {
 
     async fn get_token_boxes(&self, token_id: &[u8], offset: u64, limit: u64) -> Result<Page<BoxRow>> {
         let (total,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM box_tokens bt JOIN boxes b ON b.box_id = bt.box_id WHERE bt.token_id = $1 AND b.spent_tx_id IS NULL").bind(token_id).fetch_one(&self.pool).await?;
-        let rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, i64, i32, Vec<u8>, Vec<u8>, String, i64, Option<Vec<u8>>, Option<i64>)> = sqlx::query_as(
+        let rows: Vec<BoxTuple> = sqlx::query_as(
             "SELECT b.box_id, b.tx_id, b.header_id, b.height, b.output_index, b.ergo_tree, b.ergo_tree_hash, b.address, b.value, b.spent_tx_id, b.spent_height FROM box_tokens bt JOIN boxes b ON b.box_id = bt.box_id WHERE bt.token_id = $1 AND b.spent_tx_id IS NULL ORDER BY b.height DESC LIMIT $2 OFFSET $3",
         ).bind(token_id).bind(limit as i64).bind(offset as i64).fetch_all(&self.pool).await?;
-        let mut items: Vec<BoxRow> = rows.into_iter().map(|(bid, tid, hid, h, oi, et, eth, addr, v, stid, sh)| BoxRow {
-            box_id: hex::encode(&bid), tx_id: hex::encode(tid), header_id: hex::encode(hid), height: h as u64,
-            output_index: oi as u32, ergo_tree: hex::encode(et), ergo_tree_hash: hex::encode(eth),
-            address: addr, value: v as u64, spent_tx_id: stid.map(hex::encode), spent_height: sh.map(|h| h as u64),
-            tokens: vec![], registers: vec![],
-        }).collect();
+        let mut items: Vec<BoxRow> = rows.into_iter().map(tuple_to_box_bare).collect();
         for bx in &mut items {
             let bid = hex::decode(&bx.box_id)?;
             bx.tokens = self.fetch_box_tokens(&bid).await?;
@@ -424,13 +449,10 @@ impl IndexerDb for PgDb {
 
     async fn get_tokens(&self, offset: u64, limit: u64) -> Result<Page<TokenRow>> {
         let (total,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM tokens").fetch_one(&self.pool).await?;
-        let rows: Vec<(Vec<u8>, Vec<u8>, i64, Option<String>, Option<String>, Option<i32>)> = sqlx::query_as(
+        let rows: Vec<TokenTuple> = sqlx::query_as(
             "SELECT token_id, minting_tx_id, minting_height, name, description, decimals FROM tokens ORDER BY minting_height DESC LIMIT $1 OFFSET $2",
         ).bind(limit as i64).bind(offset as i64).fetch_all(&self.pool).await?;
-        let items = rows.into_iter().map(|(tid, mtid, mh, n, d, dec)| TokenRow {
-            token_id: hex::encode(tid), minting_tx_id: hex::encode(mtid), minting_height: mh as u64,
-            name: n, description: d, decimals: dec,
-        }).collect();
+        let items = rows.into_iter().map(tuple_to_token).collect();
         Ok(Page { items, total: total as u64 })
     }
 
@@ -474,16 +496,10 @@ impl PgDb {
     }
 
     async fn fetch_boxes_query(&self, sql: &str, addr: &str, limit: u64, offset: u64) -> Result<Vec<BoxRow>> {
-        let rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, i64, i32, Vec<u8>, Vec<u8>, String, i64, Option<Vec<u8>>, Option<i64>)> = sqlx::query_as(sql)
+        let rows: Vec<BoxTuple> = sqlx::query_as(sql)
             .bind(addr).bind(limit as i64).bind(offset as i64)
             .fetch_all(&self.pool).await?;
-        let mut items: Vec<BoxRow> = rows.into_iter().map(|(bid, tid, hid, h, oi, et, eth, a, v, stid, sh)| BoxRow {
-            box_id: hex::encode(&bid), tx_id: hex::encode(tid), header_id: hex::encode(hid),
-            height: h as u64, output_index: oi as u32, ergo_tree: hex::encode(et),
-            ergo_tree_hash: hex::encode(eth), address: a, value: v as u64,
-            spent_tx_id: stid.map(hex::encode), spent_height: sh.map(|h| h as u64),
-            tokens: vec![], registers: vec![],
-        }).collect();
+        let mut items: Vec<BoxRow> = rows.into_iter().map(tuple_to_box_bare).collect();
         for bx in &mut items {
             let bid = hex::decode(&bx.box_id)?;
             bx.tokens = self.fetch_box_tokens(&bid).await?;

@@ -3,16 +3,16 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use enr_chain::{parse_extension_bytes, required_section_ids, StateType};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use enr_chain::{
+    parse_extension_bytes, required_section_ids, StateType, EXTENSION_TYPE_ID, HEADER_TYPE_ID,
+};
+use redb::{Database, ReadableDatabase, TableDefinition};
 use sigma_ser::ScorexSerializable;
 
 const PRIMARY: TableDefinition<(u8, [u8; 32]), &[u8]> =
     TableDefinition::new("primary");
 const BEST_CHAIN: TableDefinition<u32, [u8; 32]> =
     TableDefinition::new("best_chain");
-const HEADER_TYPE_ID: u8 = 101;
-const EXTENSION_TYPE_ID: u8 = 108;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
