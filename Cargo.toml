@@ -44,6 +44,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lru = "0.16"
 anyhow = "1"
+parking_lot = "0.12"
 redb = "4"
 thiserror = "2"
 

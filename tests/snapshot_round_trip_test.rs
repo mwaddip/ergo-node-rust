@@ -128,6 +128,7 @@ fn dump_serve_receive_round_trip() {
             dump.root_hash,
             dump.tree_height as usize,
             version,
+            1000,
         )
         .unwrap();
 

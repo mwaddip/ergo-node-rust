@@ -530,15 +530,16 @@ async fn handle_nipopow_event(
 
 /// UtxoReader for the mempool — looks up boxes from the persistent AVL+ tree.
 ///
-/// Uses SnapshotReader's read-only database handle to traverse the tree
-/// without interfering with the validator's prover.
-struct MempoolUtxoReader<'a> {
-    snapshot_reader: Option<&'a SnapshotReader>,
+/// Owns an `Arc<SnapshotReader>` for the duration of one mempool operation.
+/// Constructed per-call from `SwappableReader::current()` so the at-tip
+/// transition's reopen of state.redb is observable on subsequent calls.
+struct MempoolUtxoReader {
+    reader: Option<Arc<SnapshotReader>>,
 }
 
-impl<'a> ergo_mempool::types::UtxoReader for MempoolUtxoReader<'a> {
+impl ergo_mempool::types::UtxoReader for MempoolUtxoReader {
     fn box_by_id(&self, box_id: &[u8; 32]) -> Option<ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox> {
-        let reader = self.snapshot_reader?;
+        let reader = self.reader.as_ref()?;
         let value_bytes = reader.lookup_key(box_id)?;
         ergo_validation::deserialize_box(&value_bytes).ok()
     }
@@ -603,14 +604,18 @@ impl ergo_api::StoreAccess for StoreAdapter {
     }
 }
 
-/// Adapter: SnapshotReader → UtxoAccess for the API crate.
+/// Adapter: SwappableReader → UtxoAccess for the API crate.
+///
+/// Returns `None` when the at-tip handler is mid-swap (reopen window).
+/// Callers see 404; the window is bounded to milliseconds in the typical
+/// path, ~6s worst case if a snapshot dump holds the old DB.
 struct ApiUtxoReader {
-    snapshot_reader: Option<SnapshotReader>,
+    swap_reader: Arc<ergo_node_rust::SwappableReader>,
 }
 
 impl ergo_api::UtxoAccess for ApiUtxoReader {
     fn box_by_id(&self, box_id: &[u8; 32]) -> Option<ergo_validation::ErgoBox> {
-        let reader = self.snapshot_reader.as_ref()?;
+        let reader = self.swap_reader.current()?;
         let value_bytes = reader.lookup_key(box_id)?;
         ergo_validation::deserialize_box(&value_bytes).ok()
     }
@@ -682,7 +687,7 @@ impl ergo_api::BlockSubmitter for MinedBlockSubmitter {
 }
 
 /// Mining config parsed from `[node.mining]` in ergo.toml.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 struct MiningConfig {
     /// Miner public key (hex-encoded compressed EC point, 33 bytes).
     /// Empty = mining disabled.
@@ -895,6 +900,157 @@ fn default_flush_min_blocks() -> u32 {
 struct RootConfig {
     #[serde(default)]
     node: Option<NodeConfig>,
+}
+
+/// At-tip storage reopen handler. Awaits a one-shot from sync's `synced()`
+/// entry, reopens `state.redb` with a smaller cache, rebuilds the validator
+/// from the resume pattern, swaps the shared SnapshotReader, and hands the
+/// new validator back. Runs at most once per process. On failure, the
+/// validator never returns; sync stalls and the operator restarts (cold-sync
+/// path opens with `cache_mb` and re-attempts the at-tip transition once
+/// tip is reached again).
+#[allow(clippy::too_many_arguments)]
+async fn at_tip_storage_reopen(
+    req_rx: tokio::sync::oneshot::Receiver<u32>,
+    val_tx: tokio::sync::oneshot::Sender<Validator>,
+    state_path: std::path::PathBuf,
+    synced_cache_mb: u64,
+    swap_reader: Arc<ergo_node_rust::SwappableReader>,
+    chain: Arc<Mutex<HeaderChain>>,
+    mining_proof_cache: MiningProofCache,
+    miner_pk_opt: Option<ProveDlog>,
+    mining_cfg: MiningConfig,
+    miner_votes: [u8; 3],
+    network: enr_p2p::types::Network,
+    shared_validated_height: Arc<std::sync::atomic::AtomicU32>,
+    shared_state_context: Arc<tokio::sync::RwLock<Option<ergo_validation::ErgoStateContext>>>,
+    block_applied_tx: tokio::sync::mpsc::Sender<Vec<ergo_validation::Transaction>>,
+    height_watch_tx: tokio::sync::watch::Sender<u32>,
+    checkpoint: u32,
+) {
+    let height = match req_rx.await {
+        Ok(h) => h,
+        Err(_) => {
+            tracing::warn!("at-tip handler: request channel closed before signal");
+            return;
+        }
+    };
+    tracing::info!(height, synced_cache_mb, "at-tip handler: received resume signal");
+
+    // Drop the wrapper's hold on the old SnapshotReader. After this the
+    // remaining Arc<Database> refs are: in-flight `current()` callers
+    // (transient, microseconds) and an in-flight snapshot dump if one is
+    // running (rare, but can run for tens of seconds). The retry loop in
+    // `open_state_with_retry` covers both.
+    drop(swap_reader.take());
+
+    let mut storage = match open_state_with_retry(&state_path, synced_cache_mb, 30).await {
+        Some(s) => s,
+        None => {
+            tracing::error!(
+                "at-tip handler: state.redb still locked after retries; giving up. Sync will stall — restart the process to recover."
+            );
+            return;
+        }
+    };
+
+    let current_version = match storage.version() {
+        Some(v) => v,
+        None => {
+            tracing::error!("at-tip handler: reopened state has no version (unexpected); aborting");
+            return;
+        }
+    };
+
+    // Recompute active parameters at the resume height BEFORE building the
+    // prover. BatchAVLProver internally holds Rc<RefCell<Node>> (not Send);
+    // any .await between prover creation and Validator wrapping (which has
+    // an unsafe Send impl) breaks the spawned future's Send bound.
+    {
+        let mut chain_guard = chain.lock().await;
+        if let Err(e) = chain_guard.recompute_active_parameters_from_storage(height) {
+            tracing::warn!(error = %e, "at-tip handler: recompute_active_parameters failed");
+        }
+    }
+
+    // From here on out: NO .await until val_tx.send(). Synchronous block.
+    // Resume pattern (mirrors the UTXO resume branch in main()). Install
+    // the new SnapshotReader into the swap wrapper before constructing the
+    // prover so concurrent mempool/API/dump-trigger reads land on the new DB.
+    let new_sr = storage.snapshot_reader();
+    swap_reader.install(new_sr.clone());
+
+    let resolver = storage.resolver();
+    let tree = AVLTree::new(resolver, 32, None);
+    let mut prover = BatchAVLProver::new(tree, true);
+    let (root, tree_height) = match storage.rollback(&current_version) {
+        Ok(rh) => rh,
+        Err(e) => {
+            tracing::error!(error = %e, "at-tip handler: rollback to current version failed");
+            return;
+        }
+    };
+    prover.base.tree.root = Some(root);
+    prover.base.tree.height = tree_height;
+    // load-bearing — see memory/feedback_avl_prover_flush_reset.md
+    prover.base.tree.reset();
+
+    let mining_ctx = miner_pk_opt.as_ref().map(|pk| MiningCtx {
+        config: build_miner_config(pk, &mining_cfg, miner_votes, network),
+        proof_cache: mining_proof_cache,
+        snapshot_reader: Arc::new(new_sr),
+    });
+
+    let validator = Validator::new(
+        ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint)),
+        shared_validated_height,
+        shared_state_context,
+        block_applied_tx,
+        height_watch_tx,
+        mining_ctx,
+    );
+
+    if val_tx.send(validator).is_err() {
+        tracing::error!("at-tip handler: validator send failed (sync dropped val_rx)");
+        return;
+    }
+    tracing::info!(
+        height,
+        synced_cache_mb,
+        "at-tip handler: validator rebuilt and handed back to sync"
+    );
+}
+
+/// Try to open `state.redb` with the given cache size, retrying briefly on
+/// file-lock errors so an in-flight snapshot dump (or any other transient
+/// holder of the old `Arc<Database>`) has time to release.
+async fn open_state_with_retry(
+    path: &std::path::Path,
+    cache_mb: u64,
+    max_attempts: u32,
+) -> Option<RedbAVLStorage> {
+    for attempt in 1..=max_attempts {
+        let params = AVLTreeParams { key_length: 32, value_length: None };
+        let cache = CacheSize::Bytes(cache_mb as usize * 1024 * 1024);
+        match RedbAVLStorage::open(path, params, 200, cache) {
+            Ok(s) => {
+                if attempt > 1 {
+                    tracing::info!(attempt, "at-tip handler: state.redb opened after retry");
+                }
+                return Some(s);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    attempt,
+                    max_attempts,
+                    error = %e,
+                    "at-tip handler: state.redb open failed; will retry"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+    None
 }
 
 #[tokio::main]
@@ -1343,7 +1499,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (height_watch_tx, height_watch_rx) = tokio::sync::watch::channel(0u32);
     let mut chain_guard = chain.lock().await;
 
-    let mut snapshot_reader: Option<SnapshotReader> = None;
+    let swap_reader = Arc::new(ergo_node_rust::SwappableReader::empty());
 
     let validator: Option<Validator> = match state_type {
         StateType::Utxo => {
@@ -1358,7 +1514,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(current_version) = storage.version() {
                 // Resume branch: storage has data, load its root into a fresh
                 // prover and resolve the block height from state's own metadata.
-                snapshot_reader = Some(storage.snapshot_reader());
+                let sr = storage.snapshot_reader();
+                swap_reader.install(sr.clone());
                 let resolver = storage.resolver();
                 let tree = AVLTree::new(resolver, 32, None);
                 let mut prover = BatchAVLProver::new(tree, true);
@@ -1459,12 +1616,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // between binary restart and the first new block being
                 // processed.
                 shared_validated_height.store(height, std::sync::atomic::Ordering::Relaxed);
-                let mining_ctx = miner_pk_opt.as_ref().and_then(|pk| {
-                    snapshot_reader.as_ref().map(|sr| MiningCtx {
-                        config: build_miner_config(pk, &node_config.mining, miner_votes, network),
-                        proof_cache: mining_proof_cache.clone(),
-                        snapshot_reader: Arc::new(sr.clone()),
-                    })
+                let mining_ctx = miner_pk_opt.as_ref().map(|pk| MiningCtx {
+                    config: build_miner_config(pk, &node_config.mining, miner_votes, network),
+                    proof_cache: mining_proof_cache.clone(),
+                    snapshot_reader: Arc::new(sr),
                 });
                 Some(Validator::new(
                     ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint)),
@@ -1480,7 +1635,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None
             } else {
                 // Genesis bootstrap: empty storage, no snapshot.
-                snapshot_reader = Some(storage.snapshot_reader());
+                let sr = storage.snapshot_reader();
+                swap_reader.install(sr.clone());
                 let resolver = storage.resolver();
                 let tree = AVLTree::new(resolver, 32, None);
                 let mut prover = BatchAVLProver::new(tree, true);
@@ -1515,12 +1671,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // (v1-era for mainnet, matching what block 1024's extension
                 // will carry).
                 let _ = chain_guard.recompute_active_parameters_from_storage(0);
-                let mining_ctx = miner_pk_opt.as_ref().and_then(|pk| {
-                    snapshot_reader.as_ref().map(|sr| MiningCtx {
-                        config: build_miner_config(pk, &node_config.mining, miner_votes, network),
-                        proof_cache: mining_proof_cache.clone(),
-                        snapshot_reader: Arc::new(sr.clone()),
-                    })
+                let mining_ctx = miner_pk_opt.as_ref().map(|pk| MiningCtx {
+                    config: build_miner_config(pk, &node_config.mining, miner_votes, network),
+                    proof_cache: mining_proof_cache.clone(),
+                    snapshot_reader: Arc::new(sr),
                 });
                 Some(Validator::new(
                     ValidatorInner::Utxo(UtxoValidator::new(storage, prover, 0, checkpoint)),
@@ -1673,13 +1827,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sync_shared_downloaded_height = shared_downloaded_height.clone();
     let sync_block_request_gate = block_request_gate.clone();
     let sync_peer_chain_tip = peer_chain_tip.clone();
+    let mut sync = HeaderSync::new(
+        sync_config, transport, sync_chain, sync_store, validator,
+        progress_rx, delivery_control_rx, delivery_data_rx,
+        snapshot_tx, validator_rx, sync_shared_downloaded_height,
+        sync_block_request_gate, sync_peer_chain_tip,
+    );
+
+    // At-tip storage reopen wiring. When `synced_cache_mb` is configured
+    // and we're in UTXO mode, hand HeaderSync a pair of oneshots and spawn
+    // the handler task. On first synced() entry sync drops its validator
+    // and signals us with the resume height; we reopen state.redb with the
+    // smaller cache, rebuild the validator (resume pattern), swap the
+    // shared SnapshotReader, and send the new validator back.
+    //
+    // The handler runs at most once per process. If anything fails, the
+    // validator never returns and sync stalls; restart re-runs the cold
+    // path. See `prompts/main-at-tip-storage-reopen.md` for the design.
+    if state_type == StateType::Utxo {
+        if let Some(synced_cache_mb) = node_config.synced_cache_mb {
+            let (at_tip_req_tx, at_tip_req_rx) = tokio::sync::oneshot::channel::<u32>();
+            let (at_tip_val_tx, at_tip_val_rx) = tokio::sync::oneshot::channel::<Validator>();
+            sync.set_at_tip_channels(at_tip_req_tx, at_tip_val_rx);
+
+            let handler_state_path = data_dir.join("state.redb");
+            let handler_swap = swap_reader.clone();
+            let handler_chain = chain.clone();
+            let handler_proof_cache = mining_proof_cache.clone();
+            let handler_pk = miner_pk_opt.clone();
+            let handler_mining_cfg = node_config.mining.clone();
+            let handler_votes = miner_votes;
+            let handler_network = network;
+            let handler_validated = shared_validated_height.clone();
+            let handler_state_ctx = shared_state_context.clone();
+            let handler_block_applied = block_applied_tx.clone();
+            let handler_height_watch = height_watch_tx.clone();
+            let handler_checkpoint = configured_checkpoint.unwrap_or(0);
+
+            tokio::spawn(async move {
+                at_tip_storage_reopen(
+                    at_tip_req_rx,
+                    at_tip_val_tx,
+                    handler_state_path,
+                    synced_cache_mb,
+                    handler_swap,
+                    handler_chain,
+                    handler_proof_cache,
+                    handler_pk,
+                    handler_mining_cfg,
+                    handler_votes,
+                    handler_network,
+                    handler_validated,
+                    handler_state_ctx,
+                    handler_block_applied,
+                    handler_height_watch,
+                    handler_checkpoint,
+                )
+                .await;
+            });
+            tracing::info!(
+                synced_cache_mb,
+                "at-tip storage reopen wired; will fire on first synced() entry"
+            );
+        }
+    }
+
     tokio::spawn(async move {
-        let mut sync = HeaderSync::new(
-            sync_config, transport, sync_chain, sync_store, validator,
-            progress_rx, delivery_control_rx, delivery_data_rx,
-            snapshot_tx, validator_rx, sync_shared_downloaded_height,
-            sync_block_request_gate, sync_peer_chain_tip,
-        );
         sync.run().await;
     });
 
@@ -1691,6 +1904,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let shared_validated_height = shared_validated_height.clone();
         let shared_state_context = shared_state_context.clone();
         let block_applied_tx = block_applied_tx.clone();
+        let snapshot_swap_reader = swap_reader.clone();
         tokio::spawn(async move {
             match snapshot_rx.await {
                 Ok(snapshot_data) => {
@@ -1722,6 +1936,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .expect("failed to load snapshot into state");
 
                     tracing::info!("snapshot loaded, creating validator");
+
+                    // Install the SnapshotReader so mempool/API/dump trigger see
+                    // the loaded state. Done before constructing the validator so
+                    // any concurrent reads land on the new DB.
+                    snapshot_swap_reader.install(storage.snapshot_reader());
 
                     // Build prover from the loaded snapshot. rollback() to the
                     // just-written snapshot version is a short-circuit that
@@ -1766,18 +1985,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Clone snapshot reader for mempool UTXO lookups before snapshot trigger consumes it
-    let mempool_snapshot_reader = snapshot_reader.clone();
-
     // Snapshot creation trigger — periodically dump UTXO state for serving.
-    if let Some(reader) = snapshot_reader {
-        if node_config.storing_snapshots > 0 {
-            let snapshot_store_for_trigger = snapshot_store
-                .clone()
-                .expect("snapshot_store must exist when storing_snapshots > 0");
+    // Always spawned when configured; pulls a fresh reader from `swap_reader`
+    // per iteration so the at-tip storage reopen is observable next cycle.
+    if node_config.storing_snapshots > 0 && state_type == StateType::Utxo {
+        if let Some(snapshot_store_for_trigger) = snapshot_store.clone() {
             let snapshot_interval = node_config.snapshot_interval;
             let storing_snapshots = node_config.storing_snapshots;
-            let reader = std::sync::Arc::new(reader);
+            let trigger_swap = swap_reader.clone();
             let shared_height = shared_validated_height.clone();
 
             tokio::spawn(async move {
@@ -1811,10 +2026,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
+                    let Some(reader) = trigger_swap.current() else {
+                        // Mid at-tip swap or pre-bootstrap. Skip; the next
+                        // boundary tick re-fetches.
+                        continue;
+                    };
+
                     let height = snapshot_height;
                     tracing::info!(height, "creating UTXO snapshot");
 
-                    let reader = reader.clone();
                     let store = snapshot_store_for_trigger.clone();
                     let storing = storing_snapshots;
 
@@ -1869,7 +2089,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // and runs periodic cleanup/revalidation.
     {
         let mempool = mempool.clone();
-        let snapshot_reader_for_mempool = mempool_snapshot_reader.clone();
+        let mempool_swap = swap_reader.clone();
         let state_context = shared_state_context.clone();
         let p2p_for_mempool = p2p.clone();
         let mut block_applied_rx = block_applied_rx;
@@ -1926,7 +2146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
 
                         let utxo_reader = MempoolUtxoReader {
-                            snapshot_reader: snapshot_reader_for_mempool.as_ref(),
+                            reader: mempool_swap.current(),
                         };
 
                         let mut pool = mempool.lock().await;
@@ -1993,7 +2213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let ctx_guard = state_context.read().await;
                         if let Some(ref ctx) = *ctx_guard {
                             let utxo_reader = MempoolUtxoReader {
-                                snapshot_reader: snapshot_reader_for_mempool.as_ref(),
+                                reader: mempool_swap.current(),
                             };
                             let mut pool = mempool.lock().await;
                             let removed = pool.revalidate(&utxo_reader, ctx);
@@ -2204,7 +2424,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             store: Arc::new(StoreAdapter { store: api_store }),
             mempool: api_mempool,
             utxo_reader: Arc::new(ApiUtxoReader {
-                snapshot_reader: mempool_snapshot_reader.clone(),
+                swap_reader: swap_reader.clone(),
             }),
             state_context: api_state_ctx,
             peer_count: Arc::new(move || {

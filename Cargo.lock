@@ -755,6 +755,7 @@ dependencies = [
  "k256",
  "lru",
  "mimalloc",
+ "parking_lot",
  "redb",
  "secp256k1",
  "serde",
