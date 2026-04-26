@@ -10,11 +10,12 @@ Validated from genesis through the full mainnet chain with zero checkpoints — 
 - **Parallel pipeline** — intra-block `par_iter` over transactions + cross-block apply_state/evaluate_scripts overlap
 - **P2P networking** — IPv4/IPv6, peer discovery, handshake, SyncInfo exchange, section download, deep chain reorg
 - **Mempool** — validate-on-entry, replace-by-fee, family weighting, fee statistics, P2P relay
-- **REST API** — 19 JVM-compatible endpoints: blocks, transactions, UTXO lookups, peers, emission, mining
+- **REST API** — 23 JVM-compatible endpoints: blocks, transactions, UTXO lookups, peers, emission, mining, plus a `/debug/memory` diagnostic
 - **Mining API** — Autolykos v2 candidate assembly with EIP-27 re-emission, solution validation
 - **Soft-fork voting** — epoch-boundary parameter tracking, JVM v6 `matchParameters60` semantics
 - **NiPoPoW** — build and verify proofs (P2P codes 90/91), light-client bootstrap mode
 - **UTXO snapshot sync** — bootstrap from peer snapshots, serve snapshots to peers
+- **At-tip memory tuning** — runtime AVL state DB reopen with smaller redb cache once chain sync reaches tip; ~80% steady-state RSS reduction on mainnet (7.3 GB → 1.35 GB) via opt-in `synced_*` config
 - **Crash recovery** — all stateful components survive `kill -9` and resume correctly
 
 ## Addons
@@ -24,7 +25,7 @@ Optional binaries that extend the node without adding dependencies to the core:
 | Addon | What |
 |-------|------|
 | **fastsync** | Fast bootstrap via JVM peer REST API. Parallel multi-peer header and block section fetching. Auto-spawns on startup if installed. |
-| **indexer** | SQLite transaction/box indexer with 17 REST endpoints and Swagger UI (port 9054). |
+| **indexer** | SQLite transaction/box indexer with 18 REST endpoints and Swagger UI (port 9054). |
 
 ## Architecture
 
@@ -56,7 +57,7 @@ Optional binaries that extend the node without adding dependencies to the core:
 | `store/` | [enr-store](https://github.com/mwaddip/enr-store) | Persistent storage for headers, blocks, modifiers |
 | `mempool/` | in-repo | Transaction pool, replace-by-fee, family weighting |
 | `mining/` | in-repo | Candidate assembly, emission tx, PoW validation |
-| `api/` | in-repo | REST API (axum), 19 endpoints |
+| `api/` | in-repo | REST API (axum), 23 endpoints |
 | `facts/` | [ergo-node-facts](https://github.com/mwaddip/ergo-node-facts) | Interface contracts between components |
 
 Components communicate through traits — the P2P layer doesn't know what validation means, and the validation layer doesn't know about networking.
@@ -99,11 +100,23 @@ network = "mainnet"
 state_type = "utxo"        # "utxo", "digest", or "light"
 data_dir = "/var/lib/ergo-node/data"
 
+# Memory dials. Cold-sync values are tuned for throughput.
+cache_mb = 1024
+flush_heap_threshold_mb = 2048
+
+# At-tip mirrors. Applied automatically once sync reaches tip — the
+# AVL state DB reopens with the smaller cache (~ms pause). Omit to
+# keep cold-sync values at tip.
+synced_cache_mb = 256
+synced_flush_heap_threshold_mb = 512
+synced_flush_max_blocks = 5
+synced_flush_min_blocks = 1
+
 [p2p]
 bind_addr = "[::]:9030"
 ```
 
-See `local-standalone.toml` for a full example.
+See `mainnet.toml` for a full example.
 
 ## Upstream dependencies
 
