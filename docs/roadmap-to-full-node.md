@@ -1,5 +1,10 @@
 # From Proxy to Full Node: Roadmap
 
+> **Archived** — written during early development (Phase 1–2 era).
+> All phases 1–6 are complete as of v0.4.x (Apr 2026). See README.md
+> and CLAUDE.md for current status. Kept here as a record of the
+> original plan vs reality.
+
 ## What Exists in Rust
 
 The ecosystem is more complete than expected. Here's the inventory:
