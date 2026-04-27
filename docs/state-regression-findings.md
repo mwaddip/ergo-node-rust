@@ -1,5 +1,9 @@
 # State Regression Findings — 2026-04-15
 
+> **Archived incident report** — diagnosis preserved for reference.
+> The underlying issues were resolved across the v0.3.x and v0.4.x
+> releases.
+
 ## Summary
 
 State.redb is intact. The bug is in `src/main.rs` at the validator-resume

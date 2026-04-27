@@ -1,5 +1,9 @@
 # Handoff notes — voting + nipopow follow-ups
 
+> **Archived session handoff** — voting + NiPoPoW follow-ups landed
+> across v0.3.x. Voting matchParameters60 correctness was further
+> refined in session 28 / v0.3.2.
+
 Written 2026-04-07 at the end of session 13 after implementing soft-fork
 voting end-to-end and the NiPoPoW serve+verify handler. Two tasks were
 left partially verified — this file is the quickest on-ramp for the next

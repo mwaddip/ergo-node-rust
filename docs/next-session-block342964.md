@@ -1,5 +1,8 @@
 # Session 22 — COMPLETED
 
+> **Archived session handoff** — work landed in v0.2.0. Preserved for
+> historical context.
+
 Block 342,964 investigation → full mainnet validation from genesis.
 
 ## Results

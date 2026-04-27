@@ -1,5 +1,9 @@
 # Session 17 — Known Issues Sweep
 
+> **Archived session handoff** — known-issues sweep completed; the
+> tracked items have either been fixed or are documented in current
+> CLAUDE.md/README.
+
 ## 2026-04-15 — State regression: resume scan direction bug
 
 **See** `docs/state-regression-findings.md` for full writeup.

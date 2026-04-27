@@ -1,5 +1,8 @@
 # Session 21 — Indexer Addon
 
+> **Archived session handoff** — indexer addon was built and shipped.
+> See `addons/indexer/` and the indexer entry in CLAUDE.md.
+
 Load CLAUDE.md, ~/projects/OVERRIDES.md, ergo-node-development skill, and
 memory. Read `project_plugin_architecture.md` and `project_fastsync_design.md`
 from memory for the addon pattern.

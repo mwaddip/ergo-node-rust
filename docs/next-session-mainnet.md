@@ -1,5 +1,7 @@
 # Session 18 — Mainnet Support (v0.2)
 
+> **Archived session handoff** — mainnet support landed in v0.2.0.
+
 Load CLAUDE.md, SESSION_CONTEXT.md, ergo-node-development skill, and memory.
 
 ## Goal

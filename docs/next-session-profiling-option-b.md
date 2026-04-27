@@ -1,5 +1,10 @@
 # Next session: heap profile the running node, then decide on option B
 
+> **Archived session handoff** — profiling work informed v0.3.0's
+> chain lazy header store + flush dial work and v0.4.x's at-tip cache
+> resize. See feedback memories for the lessons learned (jemalloc
+> retained vs RSS, THP retention, dhat/heaptrack limitations).
+
 ## Goal
 
 Get a usable heap profile of the mainnet node during active sync, figure out

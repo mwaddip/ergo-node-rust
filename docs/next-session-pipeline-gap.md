@@ -1,5 +1,8 @@
 # Session 23 — Pipeline height gap on restart
 
+> **Archived session handoff** — pipeline gap fixes landed across
+> v0.3.x and v0.4.x (synced-drain, SVH persist, at-tip handshake).
+
 Load CLAUDE.md, ~/projects/OVERRIDES.md, ergo-node-development skill,
 and memory. Read `project_parallel_validation_todo.md` from memory.
 

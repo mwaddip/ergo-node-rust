@@ -52,7 +52,10 @@ Multi-session development following the BlockHost pattern:
 | Block/modifier storage | **Done** | `enr-store` submodule |
 | UTXO snapshot sync | **Done** | `sync/src/snapshot/` in-repo |
 | Mempool | **Done** | `mempool/` in-repo |
-| REST API | To build | Separate crate |
+| REST API | **Done** | `api/` in-repo, 23 endpoints + `/debug/memory` |
+| Mining API | **Done** | `mining/` in-repo, Autolykos v2 candidate assembly |
+| Soft-fork voting | **Done** | epoch-boundary parameter tracking, JVM v6 `matchParameters60` |
+| At-tip memory tuning | **Done** | runtime AVL DB cache resize on synced() (v0.4.0+) |
 
 ## Design Principles
 
@@ -98,13 +101,15 @@ Multi-session development following the BlockHost pattern:
 | UTXO snapshot sync | **Done** | Bootstrap from peer snapshot, 6 P2P messages (76-81), crash-safe download |
 | Mempool | **Done** | Validate-on-entry, replace-by-fee, family weighting, fee stats, rate limiting |
 
-### Must Build
+### Optional Future Work
 
-| Component | Difficulty | Reference |
-|---|---|---|
-| REST API | Medium | Query interface for wallets and dApps |
-| Mining API | Medium | `getWork`/`submitSolution` for external GPU miners |
-| Soft-fork voting | Easy | Parameter voting, rule activation |
+Not in the consensus-critical path; node is feature-complete for
+operators today. Listed for awareness:
+
+| Component | Notes |
+|---|---|
+| Integrated wallet | JVM ships `ergo-wallet` with HTTP endpoints for seed mgmt, address derivation, sending txs from the node itself. We assume operators run a separate wallet (Nautilus, etc.) — arguably the right architecture. |
+| `/utils/*` endpoints | JVM has seedHex/blake2b/address-conversion convenience endpoints. Niche; add on demand. |
 
 ### Dead / Superseded
 
@@ -131,8 +136,10 @@ Validate blocks in digest mode (AD proofs, `BatchAVLVerifier`) and UTXO mode (`P
 ### Phase 5: UTXO State Management
 Persistent AVL+ tree over redb (`enr-state` crate). Implements `VersionedAVLStorage` from forked `ergo_avltree_rust`. Undo-log rollback, configurable version retention, crash-safe atomic writes. Genesis bootstrap from chain parameters via ported `ErgoTreePredef`. Sliding 192-block download window for sequential sync. **Done.**
 
-### Phase 6: Full Node
-Mempool is done. REST API and mining API remain. UTXO snapshot sync is done (Phase 5b).
+### Phase 6: Full Node — **Done**
+Mempool, REST API (23 endpoints + `/debug/memory`), mining API,
+soft-fork voting, NiPoPoW serve/verify, UTXO snapshot bootstrap, light
+client mode, at-tip memory tuning. Released as v0.4.x.
 
 ## Protocol Reference
 
