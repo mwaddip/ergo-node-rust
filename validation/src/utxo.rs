@@ -91,6 +91,102 @@ impl BlockValidator for UtxoValidator {
         &mut self,
         header: &Header,
         block_txs: &[u8],
+        ad_proofs: Option<&[u8]>,
+        extension: &[u8],
+        preceding_headers: &[Header],
+        active_params: &Parameters,
+        expected_boundary_params: Option<&Parameters>,
+        expected_proposed_update: Option<&[u8]>,
+    ) -> Result<ApplyStateOutcome, ValidationError> {
+        // The op loop in apply_state_internal mutates the in-memory prover.
+        // An early-return after partial mutation leaves the prover dirty;
+        // sync's retry then re-enters with a half-applied tree and surfaces
+        // a different error on a different op number, burying the original
+        // failure cause. Roll the prover back to pre-block state on any
+        // failure so retries are deterministic and the original error
+        // survives.
+        let saved_digest = self.current_digest;
+
+        match self.apply_state_internal(
+            header,
+            block_txs,
+            ad_proofs,
+            extension,
+            preceding_headers,
+            active_params,
+            expected_boundary_params,
+            expected_proposed_update,
+        ) {
+            Ok(outcome) => Ok(outcome),
+            Err(e) => {
+                self.rollback_prover_to(saved_digest);
+                Err(e)
+            }
+        }
+    }
+
+    fn validated_height(&self) -> u32 {
+        self.validated_height
+    }
+
+    fn current_digest(&self) -> &ADDigest {
+        &self.current_digest
+    }
+
+    fn reset_to(&mut self, height: u32, digest: ADDigest) {
+        let digest_bytes: [u8; 33] = digest.into();
+        let avl_digest = Bytes::copy_from_slice(&digest_bytes);
+
+        let (root, tree_height) = match self.storage.rollback(&avl_digest) {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::error!(height, error = %e, "UTXO state rollback failed");
+                return;
+            }
+        };
+        self.prover.base.tree.root = Some(root);
+        self.prover.base.tree.height = tree_height;
+
+        // Drop stale dirty-node bookkeeping from the pre-rollback chain —
+        // the freshly-unpacked tree is the ground truth. Without this, the
+        // next flush's undo record would list nodes from the demoted branch
+        // as "inserted", and a subsequent rollback would delete them.
+        self.prover.base.tree.reset();
+        self.prover.base.changed_nodes_buffer.clear();
+        self.prover.base.changed_nodes_buffer_to_check.clear();
+
+        self.validated_height = height;
+        self.current_digest = digest;
+        tracing::info!(height, "UTXO validator reset to fork point");
+    }
+
+    fn flush(&self) -> Result<(), ValidationError> {
+        self.storage.flush().map_err(|e| {
+            ValidationError::StateOperationFailed(format!("flush: {e}"))
+        })
+    }
+
+    fn proofs_for_transactions(
+        &self,
+        txs: &[ergo_lib::chain::transaction::Transaction],
+    ) -> Option<Result<(Vec<u8>, ADDigest), ValidationError>> {
+        Some(self.compute_proofs(txs))
+    }
+
+    fn emission_box_id(&self) -> Option<[u8; 32]> {
+        self.emission_box_id
+    }
+}
+
+impl UtxoValidator {
+    /// Apply a block, mutating the prover's in-memory tree and committing
+    /// state changes to storage. Wrapped by `apply_state` (the trait impl)
+    /// to handle rollback-on-failure — call sites should always go through
+    /// the trait method.
+    fn apply_state_internal(
+        &mut self,
+        header: &Header,
+        block_txs: &[u8],
         _ad_proofs: Option<&[u8]>,
         extension: &[u8],
         preceding_headers: &[Header],
@@ -252,60 +348,37 @@ impl BlockValidator for UtxoValidator {
         })
     }
 
-    fn validated_height(&self) -> u32 {
-        self.validated_height
-    }
-
-    fn current_digest(&self) -> &ADDigest {
-        &self.current_digest
-    }
-
-    fn reset_to(&mut self, height: u32, digest: ADDigest) {
+    /// Restore the in-memory prover to match the on-disk state at `digest`.
+    /// Called after a failed `apply_state` to clear half-applied operations
+    /// from the prover's tree before sync retries the block.
+    ///
+    /// Storage's `current_version` typically equals `digest` after a
+    /// failure (we haven't called `update_with_height` yet), so
+    /// `storage.rollback` hits its short-circuit path and just unpacks
+    /// the on-disk root — fast.
+    fn rollback_prover_to(&mut self, digest: ADDigest) {
         let digest_bytes: [u8; 33] = digest.into();
         let avl_digest = Bytes::copy_from_slice(&digest_bytes);
 
-        let (root, tree_height) = match self.storage.rollback(&avl_digest) {
-            Ok(x) => x,
-            Err(e) => {
-                tracing::error!(height, error = %e, "UTXO state rollback failed");
-                return;
+        match self.storage.rollback(&avl_digest) {
+            Ok((root, tree_height)) => {
+                self.prover.base.tree.root = Some(root);
+                self.prover.base.tree.height = tree_height;
+                // Mirrors reset_to — feedback_avl_prover_flush_reset.md.
+                self.prover.base.tree.reset();
+                self.prover.base.changed_nodes_buffer.clear();
+                self.prover.base.changed_nodes_buffer_to_check.clear();
             }
-        };
-        self.prover.base.tree.root = Some(root);
-        self.prover.base.tree.height = tree_height;
-
-        // Drop stale dirty-node bookkeeping from the pre-rollback chain —
-        // the freshly-unpacked tree is the ground truth. Without this, the
-        // next flush's undo record would list nodes from the demoted branch
-        // as "inserted", and a subsequent rollback would delete them.
-        self.prover.base.tree.reset();
-        self.prover.base.changed_nodes_buffer.clear();
-        self.prover.base.changed_nodes_buffer_to_check.clear();
-
-        self.validated_height = height;
-        self.current_digest = digest;
-        tracing::info!(height, "UTXO validator reset to fork point");
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "prover rollback after apply_state failure also failed; \
+                     validator state may be inconsistent — operator restart required"
+                );
+            }
+        }
     }
 
-    fn flush(&self) -> Result<(), ValidationError> {
-        self.storage.flush().map_err(|e| {
-            ValidationError::StateOperationFailed(format!("flush: {e}"))
-        })
-    }
-
-    fn proofs_for_transactions(
-        &self,
-        txs: &[ergo_lib::chain::transaction::Transaction],
-    ) -> Option<Result<(Vec<u8>, ADDigest), ValidationError>> {
-        Some(self.compute_proofs(txs))
-    }
-
-    fn emission_box_id(&self) -> Option<[u8; 32]> {
-        self.emission_box_id
-    }
-}
-
-impl UtxoValidator {
     /// Compute AD proofs and new state root for a set of transactions
     /// without modifying persistent state.
     ///
