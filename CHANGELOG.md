@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.4.4 — 2026-05-03
+
+Packaging: wire fail2ban via systemd journal so the shipped jail
+actually catches PENALTY events.
+
+### Fixed
+- **fail2ban jail used non-existent log file**: jail had
+  `logpath=/var/log/ergo-node/ergo-node.log` but the systemd unit
+  writes to journald only. Switched to `backend=systemd` with
+  `journalmatch=_SYSTEMD_UNIT=ergo-node-rust.service`.
+- **fail2ban silently ignored the jail**: file was named
+  `ergo-node.jail` but fail2ban only loads `.conf`/`.local`. Renamed
+  to `ergo-node-jail.conf` (matches the proxy package convention).
+
+### Changed
+- **postinst NOTE when fail2ban absent**: now explains what PENALTY
+  lines are, mentions alternative operator tooling, and prints the
+  absolute filter/jail file paths so operators can wire alternative
+  log-to-firewall pipelines.
+- **Package description**: now describes the full-node reality
+  (validates blocks, persistent UTXO state, mempool, REST API,
+  mining) instead of "header-validating proxy evolving toward a
+  full validating node".
+
 ## v0.4.3 — 2026-05-03
 
 At-tip steady-state corruption fixes. v0.4.x mainnet validators were
