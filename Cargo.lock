@@ -572,7 +572,7 @@ dependencies = [
  "anyhow",
  "blake2",
  "bytes",
- "ergo_avltree_rust 0.1.1 (git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=de1a79a)",
+ "ergo_avltree_rust 0.1.1 (git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=879545c)",
  "redb",
  "tempfile",
  "tracing",
@@ -750,7 +750,7 @@ dependencies = [
  "ergo-mining",
  "ergo-sync",
  "ergo-validation",
- "ergo_avltree_rust 0.1.1 (git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=de1a79a)",
+ "ergo_avltree_rust 0.1.1 (git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=879545c)",
  "hex",
  "k256",
  "lru",
@@ -782,7 +782,7 @@ dependencies = [
  "enr-p2p",
  "ergo-chain-types",
  "ergo-validation",
- "ergo_avltree_rust 0.1.1 (git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=de1a79a)",
+ "ergo_avltree_rust 0.1.1 (git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=879545c)",
  "hex",
  "rayon",
  "redb",
@@ -801,7 +801,7 @@ dependencies = [
  "enr-state",
  "ergo-chain-types",
  "ergo-lib",
- "ergo_avltree_rust 0.1.1 (git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=de1a79a)",
+ "ergo_avltree_rust 0.1.1 (git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=879545c)",
  "ergotree-interpreter",
  "ergotree-ir",
  "hex",
@@ -829,7 +829,7 @@ dependencies = [
 [[package]]
 name = "ergo_avltree_rust"
 version = "0.1.1"
-source = "git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=de1a79a#de1a79a4acc25592662701245f2d3b78a2cc5d01"
+source = "git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=879545c#879545c8bde6dfd7853b66f799f4b29b1e241571"
 dependencies = [
  "anyhow",
  "base16",
