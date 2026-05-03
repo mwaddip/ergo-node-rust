@@ -14,14 +14,23 @@ case "$1" in
 
         # fail2ban integration
         if command -v fail2ban-client >/dev/null 2>&1; then
-            echo "fail2ban detected — enabling ergo-node jails"
+            echo "fail2ban detected — reloading to pick up ergo-node jails"
             fail2ban-client reload 2>/dev/null || true
         else
             echo "NOTE: fail2ban is not installed."
-            echo "  ergo-node-rust ships with fail2ban rules for automatic"
-            echo "  peer banning. Install fail2ban and run:"
+            echo "  ergo-node-rust emits structured PENALTY log lines to journald"
+            echo "  for misbehaving peers (wire-level attacks, spam, slow delivery)."
+            echo "  Install fail2ban (or other operator-supplied tooling) to turn"
+            echo "  those penalties into firewall bans."
+            echo ""
+            echo "  Filter and jail files are installed at:"
+            echo "    /etc/fail2ban/filter.d/ergo-node.conf"
+            echo "    /etc/fail2ban/jail.d/ergo-node-jail.conf"
+            echo ""
+            echo "  After installing fail2ban:"
+            echo "    sudo systemctl restart fail2ban"
+            echo "  or simply re-run:"
             echo "    sudo dpkg-reconfigure ergo-node-rust"
-            echo "  to enable them."
         fi
         ;;
 esac

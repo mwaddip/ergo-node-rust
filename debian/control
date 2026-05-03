@@ -10,5 +10,6 @@ Replaces: ergo-proxy-node
 Maintainer: Muad'Dib <dev@blockhost.io>
 Description: Ergo blockchain full node in Rust
  Ground-up Rust implementation of the Ergo blockchain node.
- Header-validating proxy with PoW verification, evolving toward
- a full validating node.
+ Validates headers and blocks against mainnet consensus, maintains
+ a persistent UTXO state (AVL+ tree), bootstraps via UTXO snapshot
+ sync, runs a mempool, exposes a REST API, and supports mining.
