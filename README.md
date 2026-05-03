@@ -1,30 +1,30 @@
 # ergo-node-rust
 
-A full Ergo blockchain node in Rust. Not a port of the JVM reference node — a ground-up implementation that reuses the [sigma-rust](https://github.com/ergoplatform/sigma-rust) ecosystem for cryptography and script evaluation, with a custom P2P networking layer reverse-engineered from the JVM node's wire protocol.
+Full Ergo blockchain node in Rust. Not a port of the JVM reference node — a ground-up implementation that reuses [sigma-rust](https://github.com/ergoplatform/sigma-rust) for cryptography and ErgoScript evaluation, with a custom P2P layer reverse-engineered from the JVM wire protocol.
 
-Validated from genesis through the full mainnet chain with zero checkpoints — every block, every transaction, every ErgoScript evaluation.
+Validated from genesis through mainnet with no checkpoints.
 
 ## Features
 
-- **Full validation** — UTXO mode (persistent AVL+ tree) and digest mode (AD proof verification)
-- **Parallel pipeline** — intra-block `par_iter` over transactions + cross-block apply_state/evaluate_scripts overlap
-- **P2P networking** — IPv4/IPv6, peer discovery, handshake, SyncInfo exchange, section download, deep chain reorg
+- **Full validation** — UTXO mode (persistent AVL+ tree) and digest mode (AD-proof verification)
+- **Parallel validation** — concurrent transaction evaluation within blocks, pipelined across blocks
+- **P2P** — IPv4/IPv6, peer discovery, deep reorg support
 - **Mempool** — validate-on-entry, replace-by-fee, family weighting, fee statistics, P2P relay
-- **REST API** — 23 JVM-compatible endpoints: blocks, transactions, UTXO lookups, peers, emission, mining, plus a `/debug/memory` diagnostic
-- **Mining API** — Autolykos v2 candidate assembly with EIP-27 re-emission, solution validation
-- **Soft-fork voting** — epoch-boundary parameter tracking, JVM v6 `matchParameters60` semantics
-- **NiPoPoW** — build and verify proofs (P2P codes 90/91), light-client bootstrap mode
-- **UTXO snapshot sync** — bootstrap from peer snapshots, serve snapshots to peers
-- **At-tip memory tuning** — runtime AVL state DB reopen with smaller redb cache once chain sync reaches tip; ~80% steady-state RSS reduction on mainnet (7.3 GB → 1.35 GB) via opt-in `synced_*` config
-- **Crash recovery** — all stateful components survive `kill -9` and resume correctly
+- **REST API** — 23 JVM-compatible endpoints (blocks, transactions, UTXO, peers, mining) plus `/debug/memory`
+- **Mining** — Autolykos v2 candidate assembly with EIP-27 re-emission, solution validation
+- **Soft-fork voting** — epoch-boundary parameter tracking, v6.0.3-compatible
+- **NiPoPoW** — build and verify proofs, light-client bootstrap mode
+- **UTXO snapshot sync** — bootstrap from peer snapshots; serve snapshots to peers
+- **At-tip memory tuning** — opt-in `synced_*` config swaps to a smaller redb cache once at tip (~80% RSS reduction on mainnet, 7.3 GB → 1.35 GB)
+- **Crash recovery** — clean resume after `kill -9`
 
 ## Addons
 
-Optional binaries that extend the node without adding dependencies to the core:
+Optional binaries:
 
 | Addon | What |
 |-------|------|
-| **fastsync** | Fast bootstrap via JVM peer REST API. Parallel multi-peer header and block section fetching. Auto-spawns on startup if installed. |
+| **fastsync** | Fast bootstrap via JVM peer REST API; parallel multi-peer fetching. Auto-spawns at startup if installed. |
 | **indexer** | SQLite transaction/box indexer with 18 REST endpoints and Swagger UI (port 9054). |
 
 ## Architecture
@@ -82,41 +82,56 @@ Pre-built `.deb` packages are available on the [releases page](https://github.co
 
 ### Addons
 
-Addons are separate binaries in `addons/`:
+Separate binaries in `addons/`:
 
 ```bash
-# fastsync
 cd addons/fastsync && cargo build --release
-
-# indexer
-cd addons/indexer && cargo build --release
+cd addons/indexer  && cargo build --release
 ```
+
+## Running
+
+The `.deb` installs a systemd unit and a working default config at
+`/etc/ergo-node/ergo.toml`:
+
+```bash
+sudo systemctl start ergo-node-rust
+journalctl -u ergo-node-rust -f
+```
+
+Operator docs ship as manpages: `man ergo-node-rust`,
+`man ergo-node-rust.conf`, `man sharpen`.
+
+The `sharpen(8)` tool rolls the chain back to a target height —
+useful for recovering from corrupt state without resyncing from
+genesis.
 
 ## Configuration
 
-```toml
-[node]
-network = "mainnet"
-state_type = "utxo"        # "utxo", "digest", or "light"
-data_dir = "/var/lib/ergo-node/data"
+Memory dials are what most operators tune. Defaults are conservative.
 
-# Memory dials. Cold-sync values are tuned for throughput.
+```toml
+[proxy]
+network = "mainnet"
+
+[node]
+data_dir = "/var/lib/ergo-node/data"
+state_type = "utxo"             # "utxo" | "digest" | "light"
+
+# Cold-sync (initial sync from genesis or snapshot)
 cache_mb = 1024
 flush_heap_threshold_mb = 2048
 
-# At-tip mirrors. Applied automatically once sync reaches tip — the
-# AVL state DB reopens with the smaller cache (~ms pause). Omit to
-# keep cold-sync values at tip.
+# At-tip mirrors. Once sync reaches tip, the AVL state DB reopens
+# with the smaller cache (~ms pause). Omit to keep cold-sync values.
 synced_cache_mb = 256
 synced_flush_heap_threshold_mb = 512
 synced_flush_max_blocks = 5
 synced_flush_min_blocks = 1
-
-[p2p]
-bind_addr = "[::]:9030"
 ```
 
-See `mainnet.toml` for a full example.
+See `mainnet.toml` for a full annotated example, or
+`man ergo-node-rust.conf` for every key with its default.
 
 ## Upstream dependencies
 

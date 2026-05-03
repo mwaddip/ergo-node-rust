@@ -35,6 +35,7 @@ ergo-mempool = { path = "mempool" }
 ergo-mining = { path = "mining" }
 ergo-validation = { path = "validation" }
 bytes = "1"
+clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "46e94c21" }

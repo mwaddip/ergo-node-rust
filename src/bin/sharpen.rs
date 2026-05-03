@@ -8,14 +8,6 @@
 //! Optionally also truncates the indexer's SQLite DB above the target
 //! height, keeping node and indexer aligned. Uses the sqlite3 CLI.
 //!
-//! Usage:
-//!   sharpen <height> [--data-dir PATH] [--indexer] [--indexer-db PATH]
-//!
-//! Defaults:
-//!   --data-dir    /var/lib/ergo-node/data
-//!   --indexer-db  /var/lib/ergo-indexer/index.db  (only used if --indexer
-//!                 or --indexer-db is passed)
-//!
 //! The node AND indexer MUST be stopped. redb holds an exclusive lock;
 //! sqlite will happily write over a running indexer and corrupt it.
 
@@ -23,6 +15,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
+use clap::Parser;
 use enr_chain::{
     AD_PROOFS_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, EXTENSION_TYPE_ID, HEADER_TYPE_ID,
 };
@@ -43,38 +36,43 @@ const HEADER_SCORES: TableDefinition<[u8; 32], &[u8]> =
 const BEST_CHAIN: TableDefinition<u32, [u8; 32]> =
     TableDefinition::new("best_chain");
 
-fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
-    let target: u32 = args
-        .next()
-        .context("missing height argument")?
-        .parse()
-        .context("height must be a number")?;
+/// Cut the node's chain tip off above a given height.
+///
+/// Rolls back state.redb to the target header's AVL digest and deletes
+/// all header, section, and fork data above the target height from
+/// modifiers.redb. The node and indexer MUST be stopped — redb holds
+/// an exclusive lock.
+#[derive(Parser, Debug)]
+#[command(name = "sharpen", version)]
+struct Cli {
+    /// Block height to cut at; data above this height is removed.
+    height: u32,
 
-    let mut data_dir = PathBuf::from("/var/lib/ergo-node/data");
-    let mut indexer_db: Option<PathBuf> = None;
-    let mut indexer_default = false;
-    while let Some(flag) = args.next() {
-        match flag.as_str() {
-            "--data-dir" => {
-                data_dir = PathBuf::from(
-                    args.next().context("--data-dir needs a value")?,
-                );
-            }
-            "--indexer" => {
-                indexer_default = true;
-            }
-            "--indexer-db" => {
-                indexer_db = Some(PathBuf::from(
-                    args.next().context("--indexer-db needs a value")?,
-                ));
-            }
-            other => bail!("unknown argument: {other}"),
-        }
-    }
-    if indexer_default && indexer_db.is_none() {
-        indexer_db = Some(PathBuf::from("/var/lib/ergo-indexer/index.db"));
-    }
+    /// Path to the node data directory containing state.redb and
+    /// modifiers.redb.
+    #[arg(long, default_value = "/var/lib/ergo-node/data", value_name = "PATH")]
+    data_dir: PathBuf,
+
+    /// Also truncate the indexer SQLite DB at the default path
+    /// (/var/lib/ergo-indexer/index.db).
+    #[arg(long)]
+    indexer: bool,
+
+    /// Path to the indexer SQLite DB to truncate; implies --indexer.
+    /// Overrides the default indexer DB path.
+    #[arg(long, value_name = "PATH")]
+    indexer_db: Option<PathBuf>,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let target = cli.height;
+    let data_dir = cli.data_dir;
+    let indexer_db = match (cli.indexer, cli.indexer_db) {
+        (_, Some(path)) => Some(path),
+        (true, None) => Some(PathBuf::from("/var/lib/ergo-indexer/index.db")),
+        (false, None) => None,
+    };
 
     let modifiers_path = data_dir.join("modifiers.redb");
     let state_path = data_dir.join("state.redb");

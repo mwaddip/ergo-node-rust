@@ -2,8 +2,30 @@
 
 ## v0.4.4 — 2026-05-03
 
-Packaging: wire fail2ban via systemd journal so the shipped jail
-actually catches PENALTY events.
+Packaging polish: wire fail2ban via systemd journal so the shipped
+jail actually catches PENALTY events; add manpages; ship the
+chain-tip rollback tool.
+
+### Added
+- **Manpages**: `ergo-node-rust(8)` (daemon, signals, env, log
+  format, fail2ban integration), `ergo-node-rust.conf(5)` (every
+  config key with defaults and examples), `sharpen(8)` (rollback
+  tool). Sources are markdown in `man/`; `man/build` regenerates the
+  installed `.gz` artifacts via pandoc.
+- **`sharpen` shipped in the `.deb`** at `/usr/bin/sharpen`. The
+  recovery tool every operator will eventually need.
+
+### Changed
+- **`sharpen` CLI polished**: now uses clap for `--help` /
+  `--version` and proper option parsing. No behavior change.
+- **postinst NOTE when fail2ban absent**: now explains what PENALTY
+  lines are, mentions alternative operator tooling, and prints the
+  absolute filter/jail file paths so operators can wire alternative
+  log-to-firewall pipelines.
+- **Package description**: now describes the full-node reality
+  (validates blocks, persistent UTXO state, mempool, REST API,
+  mining) instead of "header-validating proxy evolving toward a
+  full validating node".
 
 ### Fixed
 - **fail2ban jail used non-existent log file**: jail had
@@ -14,15 +36,11 @@ actually catches PENALTY events.
   `ergo-node.jail` but fail2ban only loads `.conf`/`.local`. Renamed
   to `ergo-node-jail.conf` (matches the proxy package convention).
 
-### Changed
-- **postinst NOTE when fail2ban absent**: now explains what PENALTY
-  lines are, mentions alternative operator tooling, and prints the
-  absolute filter/jail file paths so operators can wire alternative
-  log-to-firewall pipelines.
-- **Package description**: now describes the full-node reality
-  (validates blocks, persistent UTXO state, mempool, REST API,
-  mining) instead of "header-validating proxy evolving toward a
-  full validating node".
+### Removed
+- **`inspect-ext` debugging binary**: one-off tool from the v0.3.1
+  voting investigation. Hardcoded data dir and field ID 124, no real
+  CLI. The forensic `inspect-state` tool stays in `src/bin/` for
+  ad-hoc debugging but is not shipped in the `.deb`.
 
 ## v0.4.3 — 2026-05-03
 

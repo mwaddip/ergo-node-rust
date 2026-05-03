@@ -1,0 +1,27 @@
+#!/bin/bash
+# Regenerate gzipped manpages from markdown sources.
+#
+# Run after editing any *.md file in this directory. The generated
+# *.gz files are checked into git so that build-deb does not require
+# pandoc at deb-build time.
+#
+# Requires: pandoc, gzip.
+
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+for src in *.md; do
+    base="${src%.md}"
+    section="${base##*.}"
+    case "$section" in
+        [1-9])
+            pandoc -s -f markdown-smart -t man "$src" -o "$base"
+            gzip -f -n "$base"
+            echo "  $base.gz"
+            ;;
+        *)
+            echo "skip: $src (no recognized section suffix)" >&2
+            ;;
+    esac
+done

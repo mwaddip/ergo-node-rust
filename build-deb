@@ -7,7 +7,7 @@ PKG="ergo-node-rust_${VERSION}_${ARCH}"
 
 echo "Building ergo-node-rust v${VERSION} for ${ARCH}..."
 
-cargo build --release
+cargo build --release --bin ergo-node-rust --bin sharpen
 
 rm -rf "target/${PKG}"
 mkdir -p "target/${PKG}/DEBIAN"
@@ -16,7 +16,9 @@ mkdir -p "target/${PKG}/etc/ergo-node"
 mkdir -p "target/${PKG}/usr/lib/systemd/system"
 
 cp target/release/ergo-node-rust "target/${PKG}/usr/bin/"
+cp target/release/sharpen "target/${PKG}/usr/bin/"
 strip "target/${PKG}/usr/bin/ergo-node-rust"
+strip "target/${PKG}/usr/bin/sharpen"
 
 cp ergo.toml "target/${PKG}/etc/ergo-node/ergo.toml"
 
@@ -26,6 +28,12 @@ mkdir -p "target/${PKG}/etc/fail2ban/filter.d"
 mkdir -p "target/${PKG}/etc/fail2ban/jail.d"
 cp deploy/fail2ban/ergo-node.conf "target/${PKG}/etc/fail2ban/filter.d/"
 cp deploy/fail2ban/ergo-node-jail.conf "target/${PKG}/etc/fail2ban/jail.d/"
+
+mkdir -p "target/${PKG}/usr/share/man/man5"
+mkdir -p "target/${PKG}/usr/share/man/man8"
+cp man/ergo-node-rust.conf.5.gz "target/${PKG}/usr/share/man/man5/"
+cp man/ergo-node-rust.8.gz "target/${PKG}/usr/share/man/man8/"
+cp man/sharpen.8.gz "target/${PKG}/usr/share/man/man8/"
 
 sed "s/^Architecture:.*/Architecture: ${ARCH}/" debian/control > "target/${PKG}/DEBIAN/control"
 sed -i "s/^Version:.*/Version: ${VERSION}/" "target/${PKG}/DEBIAN/control"
