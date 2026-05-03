@@ -146,6 +146,7 @@ Open PRs against [ergoplatform/sigma-rust](https://github.com/ergoplatform/sigma
 
 - [#10](https://github.com/ergoplatform/ergo_avltree_rust/pull/10) — `Resolver` type change to support disk-backed storage
 - [#11](https://github.com/ergoplatform/ergo_avltree_rust/pull/11) — `VersionedAVLStorage::flush()` for durable commits on demand
+- [#13](https://github.com/ergoplatform/ergo_avltree_rust/pull/13) — `contains_recursive` fail-safes on unresolvable `LabelOnly` (prevents `removed_nodes()` over-deletion with persistent backends)
 
 ## Credits
 
