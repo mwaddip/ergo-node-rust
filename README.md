@@ -47,20 +47,30 @@ Optional binaries:
               +----------+     +-------------+
 ```
 
-| Crate | Repo | Role |
-|-------|------|------|
-| `p2p/` | [enr-p2p](https://github.com/mwaddip/enr-p2p) | P2P networking, handshake, message framing, routing |
-| `chain/` | [enr-chain](https://github.com/mwaddip/enr-chain) | Header parsing, PoW, difficulty adjustment, chain validation |
-| `sync/` | in-repo | Sync state machine, section download, validation coordination |
-| `validation/` | in-repo | Block validation: digest mode + UTXO mode, section serializers |
-| `state/` | [enr-state](https://github.com/mwaddip/enr-state) | UTXO state via authenticated AVL+ tree over redb |
-| `store/` | [enr-store](https://github.com/mwaddip/enr-store) | Persistent storage for headers, blocks, modifiers |
-| `mempool/` | in-repo | Transaction pool, replace-by-fee, family weighting |
-| `mining/` | in-repo | Candidate assembly, emission tx, PoW validation |
-| `api/` | in-repo | REST API (axum), 23 endpoints |
-| `facts/` | [ergo-node-facts](https://github.com/mwaddip/ergo-node-facts) | Interface contracts between components |
+| Crate | Role |
+|-------|------|
+| `p2p/` | P2P networking, handshake, message framing, routing |
+| `chain/` | Header parsing, PoW, difficulty adjustment, chain validation |
+| `sync/` | Sync state machine, section download, validation coordination |
+| `validation/` | Block validation: digest mode + UTXO mode, section serializers |
+| `state/` | UTXO state via authenticated AVL+ tree over redb |
+| `store/` | Persistent storage for headers, blocks, modifiers |
+| `mempool/` | Transaction pool, replace-by-fee, family weighting |
+| `mining/` | Candidate assembly, emission tx, PoW validation |
+| `api/` | REST API (axum), 23 endpoints |
+| `facts/` | Per-component contract markdown |
 
 Components communicate through traits — the P2P layer doesn't know what validation means, and the validation layer doesn't know about networking.
+
+`p2p/`, `chain/`, `state/`, `store/`, and `facts/` were originally separate repositories absorbed into the main repo at v0.4.5. Their pre-absorb histories are preserved at the archived origins:
+
+| Crate | Pre-absorb origin (archived) | Last submodule commit |
+|-------|------------------------------|------------------------|
+| `p2p/` | [mwaddip/enr-p2p](https://github.com/mwaddip/enr-p2p) | `e8185cc` |
+| `chain/` | [mwaddip/enr-chain](https://github.com/mwaddip/enr-chain) | `8e28fc0` |
+| `state/` | [mwaddip/enr-state](https://github.com/mwaddip/enr-state) | `9077d10` |
+| `store/` | [mwaddip/enr-store](https://github.com/mwaddip/enr-store) | `b997da5` |
+| `facts/` | [mwaddip/ergo-node-facts](https://github.com/mwaddip/ergo-node-facts) | `8a8ad45` |
 
 ## Building
 

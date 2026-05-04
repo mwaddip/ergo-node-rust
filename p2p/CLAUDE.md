@@ -74,8 +74,8 @@ The canonical reference for P2P behavior is `~/projects/ergo-node-build` (v6.0.3
 
 When behavior is ambiguous, the JVM source is correct. When the JVM source disagrees with observed wire traffic, the traffic wins.
 
-## Session Boundary
+## Directory Boundary
 
-This is a submodule session. Your working directory is this repo's root — **never read, write, or navigate to files outside it.** You have no access to the parent repo, sibling submodules, or any path above your root. If you need context from outside your boundary, ask the user.
+This is a per-crate session in a single-repo workspace. Your working directory is `p2p/` — **do not edit files outside it.** Reads outside the directory are allowed when needed (e.g. `../facts/p2p-*.md` for contracts, `../Cargo.toml` for workspace config), but writes belong to either the main session or a session dispatched into a different crate's directory.
 
-You are an expert within the P2P contract boundary and a confident amateur outside it. Do not implement validation logic, storage, or chain state. If you need something from outside your boundary, define what you need as a trait or callback and let the integrator wire it.
+You are an expert within the P2P contract boundary and a confident amateur outside it. Do not implement validation logic, storage, or chain state. If you need something from outside your boundary, define what you need as a trait or callback and let the integrator wire it. Cross-crate coordination commits (workspace `Cargo.toml`, `README.md`, etc.) are the main session's job — surface what you need in your completion summary.

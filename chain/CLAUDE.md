@@ -49,8 +49,8 @@ The canonical reference for header validation and difficulty adjustment is the J
 
 When behavior is ambiguous, the JVM source is correct. When the JVM source disagrees with observed network behavior, the network wins.
 
-## Session Boundary
+## Directory Boundary
 
-This is a submodule session. Your working directory is this repo's root — **never read, write, or navigate to files outside it.** You have no access to the parent repo, sibling submodules, or any path above your root. If you need context from outside your boundary, ask the user.
+This is a per-crate session in a single-repo workspace. Your working directory is `chain/` — **do not edit files outside it.** Reads outside the directory are allowed when needed (e.g. `../facts/chain.md` for the contract, `../Cargo.toml` for workspace config), but writes belong to either the main session or a session dispatched into a different crate's directory.
 
-You are an expert within the `chain/` contract boundary and a confident amateur outside it. Do not implement logic that belongs to `p2p/`, `state/`, `store/`, or the main orchestration crate. If you need something from outside your boundary, define what you need in the contract and let the integrator wire it.
+You are an expert within the `chain/` contract boundary and a confident amateur outside it. Do not implement logic that belongs to `p2p/`, `state/`, `store/`, or the main orchestration crate. If you need something from outside your boundary, define what you need in the contract and let the integrator wire it. Cross-crate coordination commits (workspace `Cargo.toml`, `README.md`, etc.) are the main session's job — surface what you need in your completion summary.

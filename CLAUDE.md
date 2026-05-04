@@ -22,9 +22,22 @@ Full Ergo blockchain node in Rust. Not a port of the JVM node — a ground-up im
 
 **Contract specs live in the `facts/` directory.** Read and internalize the relevant contract before modifying any code that touches that boundary. Do not rely on memory or assumptions about how a component interfaces — read the contract. When a contract needs changing, change it first, then update the implementations.
 
-## Submodule Separation (RULE)
+## Per-Crate Dispatch (RULE)
 
-When the project grows to multiple repos, the same rule as BlockHost applies: **You CANNOT modify files in submodule directories.** Instead, provide the user with a complete prompt to send to that submodule's Claude session. Format the prompt clearly so the user can copy-paste it directly. Prompts go in `prompts/` as markdown files.
+**Main session does not edit crate-internal source files.** All work
+inside `sync/`, `validation/`, `state/`, `store/`, `mempool/`, `api/`,
+`mining/`, `p2p/`, `chain/`, `facts/`, or `addons/*/` is dispatched to
+a per-crate Claude session via the `dispatching-prompts` skill. Main
+session edits are limited to top-level orchestration: `Cargo.toml`
+(workspace), `README.md`, `CHANGELOG.md`, `LICENSE`, `build-deb`,
+`deploy/`, `man/`, top-level docs, scripts under repo root, and the
+prompt files in `prompts/`.
+
+The dispatched session runs in `cd <crate>` and operates within that
+directory's boundary — it does not edit parent or sibling
+directories. The repo-root `facts/` directory is the single source
+of truth for cross-crate contracts; per-crate sessions read it via
+`../facts/`.
 
 ## Skill Ownership (PERSISTENT RULE)
 
@@ -36,26 +49,26 @@ Replace the JVM reference node with a Rust implementation that is memory-safe, e
 
 ## Architecture
 
-Multi-session development following the BlockHost pattern:
-- **Main session**: interface contracts, orchestration, integration
-- **Submodule sessions**: one per component, each with its own contract boundary
+Single-repo, multi-session development:
+- **Main session**: interface contracts, orchestration, integration. Does not edit crate-internal source.
+- **Per-crate sessions**: dispatched on demand via the `dispatching-prompts` skill, scoped to a single crate directory.
 
 ### Components
 
-| Component | Status | Session |
-|---|---|---|
-| P2P networking | **Done** | `enr-p2p` submodule |
-| Header chain validation | **Done** | `enr-chain` submodule |
-| Block validation (digest + UTXO) | **Done** | `validation/` in-repo |
-| UTXO state management | **Done** | `enr-state` submodule |
-| Chain sync state machine | **Done** | `sync/` in-repo |
-| Block/modifier storage | **Done** | `enr-store` submodule |
-| UTXO snapshot sync | **Done** | `sync/src/snapshot/` in-repo |
-| Mempool | **Done** | `mempool/` in-repo |
-| REST API | **Done** | `api/` in-repo, 23 endpoints + `/debug/memory` |
-| Mining API | **Done** | `mining/` in-repo, Autolykos v2 candidate assembly |
-| Soft-fork voting | **Done** | epoch-boundary parameter tracking, JVM v6 `matchParameters60` |
-| At-tip memory tuning | **Done** | runtime AVL DB cache resize on synced() (v0.4.0+) |
+| Component | Crate | Status | Notes |
+|---|---|---|---|
+| P2P networking | `p2p/` | **Done** | Handshake, framing, routing, IPv4/IPv6 |
+| Header chain validation | `chain/` | **Done** | Parsing, PoW, difficulty adjustment |
+| Block validation | `validation/` | **Done** | Digest mode + UTXO mode |
+| UTXO state | `state/` | **Done** | AVL+ tree over redb |
+| Chain sync | `sync/` | **Done** | State machine + snapshot bootstrap |
+| Block/modifier storage | `store/` | **Done** | redb backend, height-indexed |
+| Mempool | `mempool/` | **Done** | Validate-on-entry, replace-by-fee |
+| REST API | `api/` | **Done** | 23 endpoints + `/debug/memory` |
+| Mining | `mining/` | **Done** | Autolykos v2 candidate assembly |
+| Soft-fork voting | (in `chain/`, `validation/`) | **Done** | Epoch-boundary parameter tracking, v6.0.3-compatible |
+| At-tip memory tuning | (in `sync/`) | **Done** | Runtime AVL DB cache resize on synced() (v0.4.0+) |
+| Contracts | `facts/` | — | Per-component contract markdown |
 
 ## Design Principles
 
