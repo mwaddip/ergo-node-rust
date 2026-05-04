@@ -2,6 +2,7 @@
 name = "ergo-sync"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Chain sync state machine for the Ergo Rust node"
 
 [dependencies]

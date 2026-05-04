@@ -171,4 +171,4 @@ Open PRs against [ergoplatform/sigma-rust](https://github.com/ergoplatform/sigma
 
 ## License
 
-Public domain. No rights reserved.
+MIT — see [LICENSE](LICENSE).

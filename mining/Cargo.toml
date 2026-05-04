@@ -2,6 +2,7 @@
 name = "ergo-mining"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Block candidate assembly and PoW solution validation for external miners"
 
 [dependencies]

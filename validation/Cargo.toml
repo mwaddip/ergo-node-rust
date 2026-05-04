@@ -2,6 +2,7 @@
 name = "ergo-validation"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Block validation for the Ergo Rust node"
 
 [dependencies]
