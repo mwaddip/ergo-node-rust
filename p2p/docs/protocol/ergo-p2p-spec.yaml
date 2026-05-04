@@ -1,0 +1,324 @@
+---
+# Ergo P2P Wire Protocol Specification
+# Machine-readable format for code generation and LLM consumption.
+# Reverse-engineered from JVM reference node (ergoplatform/ergo v6.0.3).
+# Verified against pcap captures 2026-03-30.
+
+protocol:
+  name: Ergo P2P
+  version: "6.0.3"
+  transport: TCP
+  encoding_framework: Scorex VLQ
+
+networks:
+  mainnet:
+    magic: [0x01, 0x00, 0x02, 0x04]
+  testnet:
+    magic: [0x02, 0x03, 0x02, 0x03]
+    note: "Changed Feb 2026 testnet reset"
+
+# CRITICAL: Scorex uses VLQ for all integer serialization methods.
+# Method names like putUShort/putUInt are misleading — they are NOT fixed-width.
+serialization_primitives:
+  raw_byte:
+    scorex_method: "put(byte)"
+    encoding: "1 raw byte"
+
+  raw_bytes:
+    scorex_method: "putBytes(arr)"
+    encoding: "raw bytes, no length prefix"
+
+  short_string:
+    scorex_method: "putShortString(s)"
+    encoding: "[length: 1 byte][utf8: length bytes]"
+    max_length: 255
+
+  vlq_unsigned:
+    scorex_methods: ["putUShort", "putUInt", "putULong"]
+    encoding: "VLQ: 7 data bits per byte, MSB=continuation, little-endian groups"
+    max_bytes: 10
+    algorithm: |
+      while value > 0x7F:
+          emit (value & 0x7F) | 0x80
+          value >>= 7
+      emit value & 0x7F
+
+  zigzag_vlq_signed:
+    scorex_methods: ["putInt", "putLong"]
+    encoding: "ZigZag then VLQ"
+    zigzag_i32: "((n << 1) ^ (n >> 31)) as u32"
+    zigzag_i64: "((n << 1) ^ (n >> 63)) as u64"
+    examples:
+      - { signed: 0, zigzag: 0, vlq: [0x00] }
+      - { signed: -1, zigzag: 1, vlq: [0x01] }
+      - { signed: 1, zigzag: 2, vlq: [0x02] }
+      - { signed: -2, zigzag: 3, vlq: [0x03] }
+
+  option:
+    scorex_method: "putOption(opt)(body_fn)"
+    encoding: "0x00 if None; 0x01 + body if Some"
+
+handshake:
+  framing: none  # raw bytes, no message frame
+  direction: both  # initiator sends first, responder sends after validation
+  max_size: 8096
+  timeout: 30s
+
+  fields:
+    - name: timestamp
+      type: vlq_unsigned
+      description: "Milliseconds since epoch"
+
+    - name: agent_name
+      type: short_string
+      description: "Software identifier, e.g. 'ergoref'"
+
+    - name: version
+      type: raw_bytes
+      length: 3
+      description: "Protocol version as [major, minor, patch]"
+
+    - name: peer_name
+      type: short_string
+      description: "User-configured node name"
+
+    - name: declared_address
+      type: option
+      description: "Public-facing socket address"
+      body:
+        - name: addr_size
+          type: raw_byte
+          description: "ip_bytes.len + 4 (8 for IPv4, 20 for IPv6)"
+
+        - name: ip_bytes
+          type: raw_bytes
+          length: "addr_size - 4"
+          description: "4 bytes for IPv4, 16 bytes for IPv6"
+
+        - name: port
+          type: vlq_unsigned
+          description: "Listening port. VLQ, NOT 4-byte big-endian."
+
+    - name: feature_count
+      type: raw_byte
+
+    - name: features
+      type: repeated
+      count: feature_count
+      item:
+        - name: feature_id
+          type: raw_byte
+        - name: body_length
+          type: vlq_unsigned
+          description: "VLQ, NOT 2-byte big-endian"
+        - name: body
+          type: raw_bytes
+          length: body_length
+
+  validation:
+    - rule: "version >= 4.0.100"
+      description: "EIP-37 hard fork minimum"
+      on_fail: "permanent ban"
+
+    - rule: "session feature magic matches network"
+      on_fail: "permanent ban"
+
+features:
+  - id: 2
+    name: LocalAddress
+    description: "Local/loopback address"
+    note: "Hardcoded to IPv4 (4 bytes) in JVM node"
+
+  - id: 3
+    name: Session
+    description: "Network identification and self-connection detection"
+    body:
+      - name: magic
+        type: raw_bytes
+        length: 4
+        description: "Network magic bytes"
+      - name: session_id
+        type: zigzag_vlq_signed  # putLong
+        description: "Random i64, ZigZag+VLQ encoded (5-14 bytes)"
+
+  - id: 4
+    name: RestApiUrl
+    description: "Public REST API URL"
+
+  - id: 16
+    name: Mode
+    description: "Node capabilities"
+    body:
+      - name: state_type
+        type: raw_byte
+        values: { 0x00: UTXO, 0x01: Digest }
+
+      - name: verifying_transactions
+        type: raw_byte
+        values: { 0x00: false, 0x01: true }
+
+      - name: nipopow_bootstrapped
+        type: option
+        body:
+          - name: nipopow_flag
+            type: zigzag_vlq_signed  # putInt
+            description: "Value 1 = NiPoPoWDefaultFlag"
+
+      - name: blocks_to_keep
+        type: zigzag_vlq_signed  # putInt
+        values:
+          -1: "all blocks (archival)"
+          -2: "UTXO snapshot bootstrapped"
+          positive_N: "pruned, keeping last N blocks"
+
+    common_encodings:
+      full_archival: [0x00, 0x01, 0x00, 0x01]
+      nipopow_light: [0x00, 0x01, 0x01, 0x02, 0x01]
+      utxo_snapshot: [0x00, 0x01, 0x00, 0x03]
+
+  - id: 64
+    name: Proxy
+    description: "Custom: identifies peer as a relay proxy"
+    note: "JVM nodes silently ignore unknown feature IDs"
+    body:
+      - name: proxy_version
+        type: raw_byte
+        values: { 0x01: "version 1" }
+
+message_frame:
+  description: "All post-handshake communication uses this framing"
+  fields:
+    - name: magic
+      type: raw_bytes
+      length: 4
+      description: "Network magic"
+
+    - name: code
+      type: raw_byte
+      description: "Message type identifier"
+
+    - name: body_length
+      type: fixed_u32_be
+      description: "4-byte big-endian unsigned. NOT VLQ (framing is outside Scorex)."
+      max: 262144  # 256 KB
+
+    - name: checksum
+      type: raw_bytes
+      length: 4
+      description: "First 4 bytes of blake2b256(body)"
+
+    - name: body
+      type: raw_bytes
+      length: body_length
+
+  total_header_size: 13  # 4 + 1 + 4 + 4
+
+messages:
+  - code: 1
+    name: GetPeers
+    body: empty
+
+  - code: 2
+    name: Peers
+    body:
+      - name: count
+        type: vlq_unsigned
+      - name: peers
+        type: repeated
+        count: count
+        item: "PeerSpec (same as handshake fields, without timestamp)"
+
+  - code: 22
+    name: RequestModifier
+    body:
+      - name: modifier_type
+        type: raw_byte
+      - name: count
+        type: vlq_unsigned
+      - name: ids
+        type: repeated
+        count: count
+        item:
+          type: raw_bytes
+          length: 32
+
+  - code: 33
+    name: ModifierResponse
+    body:
+      - name: modifier_type
+        type: raw_byte
+      - name: count
+        type: vlq_unsigned
+      - name: modifiers
+        type: repeated
+        count: count
+        item:
+          - name: id
+            type: raw_bytes
+            length: 32
+          - name: data_length
+            type: vlq_unsigned
+          - name: data
+            type: raw_bytes
+            length: data_length
+
+  - code: 55
+    name: Inv
+    body:
+      - name: modifier_type
+        type: raw_byte
+      - name: count
+        type: vlq_unsigned
+      - name: ids
+        type: repeated
+        count: count
+        item:
+          type: raw_bytes
+          length: 32
+
+  - code: 65
+    name: SyncInfo
+    body: opaque
+    note: "Contains chain tip header IDs. Format depends on protocol version."
+
+modifier_types:
+  - { id: 1, name: Header }
+  - { id: 2, name: Transaction }
+  - { id: 3, name: BlockTransactions }
+  - { id: 4, name: ADProofs }
+  - { id: 5, name: Extension }
+
+peer_management:
+  note: "JVM reference node behavior, not protocol requirements"
+
+  timeouts:
+    handshake: 30s
+    inactivity: 10m
+    delivery: 10s
+
+  keepalive:
+    method: "Send GetPeers every 2 minutes"
+
+  penalties:
+    - { type: NonDelivery, score: 2, trigger: "Modifier not delivered in time" }
+    - { type: Misbehavior, score: 10, trigger: "Invalid modifier, wrong ID" }
+    - { type: Spam, score: 25, trigger: "Unrequested modifier" }
+    - { type: Permanent, score: 1000000000, trigger: "Bad handshake, version < 4.0.100" }
+    threshold: 500
+    temp_ban_duration: 60m
+    permanent_ban_duration: "~3600 days"
+    safe_interval: 2m  # same peer not penalized twice within this window
+
+  anti_eclipse:
+    method: "Disconnect one random peer every hour (if 5+ connections)"
+
+sources:
+  jvm_node: "ergoplatform/ergo v6.0.3 branch"
+  scorex_util: "ScorexFoundation/scorex-util v0.2.1 (decompiled)"
+  pcap_capture: "2026-03-30, JVM testnet node handshake"
+  key_files:
+    - "ergo-core/src/main/scala/org/ergoplatform/network/PeerSpec.scala"
+    - "ergo-core/src/main/scala/org/ergoplatform/network/HandshakeSerializer.scala"
+    - "ergo-core/src/main/scala/org/ergoplatform/network/peer/SessionIdPeerFeature.scala"
+    - "ergo-core/src/main/scala/org/ergoplatform/network/ModePeerFeature.scala"
+    - "src/main/scala/scorex/core/network/PeerConnectionHandler.scala"

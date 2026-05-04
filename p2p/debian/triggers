@@ -1,0 +1,2 @@
+# Re-run postinst when fail2ban is installed/configured after us
+interest-noawait /usr/bin/fail2ban-client

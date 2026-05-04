@@ -1,0 +1,29 @@
+#!/bin/sh
+set -e
+
+# Enable and configure fail2ban plugin if fail2ban is installed
+configure_fail2ban() {
+    if command -v fail2ban-client >/dev/null 2>&1; then
+        echo "fail2ban detected — enabling ergo-proxy jail"
+        # Filter and jail are shipped in /usr/share, symlink into fail2ban config
+        ln -sf /usr/share/ergo-proxy/fail2ban/ergo-proxy.conf /etc/fail2ban/filter.d/ergo-proxy.conf
+        ln -sf /usr/share/ergo-proxy/fail2ban/ergo-proxy-jail.conf /etc/fail2ban/jail.d/ergo-proxy-jail.conf
+        # Reload fail2ban if running
+        if systemctl is-active --quiet fail2ban; then
+            fail2ban-client reload 2>/dev/null || true
+        fi
+    fi
+}
+
+case "$1" in
+    configure|reconfigure)
+        configure_fail2ban
+        systemctl daemon-reload
+        systemctl enable ergo-proxy-node 2>/dev/null || true
+        systemctl start ergo-proxy-node 2>/dev/null || true
+        ;;
+    triggered)
+        # dpkg trigger fired (e.g., fail2ban was just installed)
+        configure_fail2ban
+        ;;
+esac

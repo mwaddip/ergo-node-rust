@@ -1,0 +1,12 @@
+Package: ergo-proxy-node
+Version: 0.1.0
+Section: net
+Priority: optional
+Architecture: amd64
+Depends: libc6
+Suggests: fail2ban, rrdtool
+Maintainer: BlockHost <dev@blockhost.io>
+Description: Lightweight Ergo P2P relay proxy
+ Message-forwarding proxy for the Ergo P2P network. Connects to Ergo
+ nodes as a peer, accepts inbound connections, and relays P2P messages
+ between them. First IPv6-enabled Ergo network endpoint.

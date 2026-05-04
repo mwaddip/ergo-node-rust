@@ -1,0 +1,58 @@
+#!/bin/bash
+set -euo pipefail
+
+VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
+PKG="ergo-proxy-node_${VERSION}_${ARCH}"
+
+echo "Building ergo-proxy-node v${VERSION} for ${ARCH}..."
+
+# Build release binary
+cargo build --release
+
+# Create package directory structure
+rm -rf "target/${PKG}"
+mkdir -p "target/${PKG}/DEBIAN"
+mkdir -p "target/${PKG}/usr/bin"
+mkdir -p "target/${PKG}/etc/ergo-proxy"
+mkdir -p "target/${PKG}/usr/share/ergo-proxy/fail2ban"
+mkdir -p "target/${PKG}/usr/lib/systemd/system"
+
+# Binary
+cp target/release/ergo-proxy-node "target/${PKG}/usr/bin/"
+strip "target/${PKG}/usr/bin/ergo-proxy-node"
+
+# Config
+cp ergo-proxy.toml "target/${PKG}/etc/ergo-proxy/ergo-proxy.toml"
+
+# fail2ban filter and jail (shipped to /usr/share, symlinked by postinst)
+cp deploy/fail2ban/ergo-proxy.conf "target/${PKG}/usr/share/ergo-proxy/fail2ban/"
+cp deploy/fail2ban/ergo-proxy-jail.conf "target/${PKG}/usr/share/ergo-proxy/fail2ban/"
+
+# systemd service
+cp deploy/ergo-proxy-node.service "target/${PKG}/usr/lib/systemd/system/"
+
+# Debian control files
+sed "s/^Architecture:.*/Architecture: ${ARCH}/" debian/control > "target/${PKG}/DEBIAN/control"
+sed -i "s/^Version:.*/Version: ${VERSION}/" "target/${PKG}/DEBIAN/control"
+# Add installed size
+SIZE=$(du -sk "target/${PKG}" | cut -f1)
+echo "Installed-Size: ${SIZE}" >> "target/${PKG}/DEBIAN/control"
+
+cp debian/conffiles "target/${PKG}/DEBIAN/"
+cp debian/triggers  "target/${PKG}/DEBIAN/"
+
+for script in preinst postinst prerm postrm; do
+    cp "debian/${script}" "target/${PKG}/DEBIAN/"
+    chmod 755 "target/${PKG}/DEBIAN/${script}"
+done
+
+# Build .deb
+dpkg-deb --build "target/${PKG}"
+
+# Clean up staging directory
+rm -rf "target/${PKG}"
+
+echo ""
+echo "Built: target/${PKG}.deb"
+ls -lh "target/${PKG}.deb"

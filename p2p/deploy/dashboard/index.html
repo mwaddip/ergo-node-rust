@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ergo-proxy-node</title>
+<style>
+  body {
+    background: #0f0f23;
+    color: #e0e0e0;
+    font-family: monospace;
+    max-width: 900px;
+    margin: 2rem auto;
+    padding: 0 1rem;
+  }
+  h1 { color: #52d681; margin-bottom: 0.2rem; }
+  .subtitle { color: #888; margin-bottom: 2rem; }
+  .subtitle a { color: #4bc8c8; }
+  .graph { margin: 1.5rem 0; }
+  .graph img {
+    width: 100%;
+    border-radius: 4px;
+  }
+  .updated {
+    color: #555;
+    font-size: 0.8rem;
+    text-align: right;
+    margin-top: 0.5rem;
+  }
+</style>
+</head>
+<body>
+  <h1>ergo-proxy-node</h1>
+  <p class="subtitle">
+    Ergo P2P relay on ergo-relay.blockhost.io
+    &mdash; <a href="https://github.com/mwaddip/ergo-proxy">source</a>
+  </p>
+
+  <div class="graph">
+    <img src="latency-6h.png" alt="Peer latency (6 hours)">
+  </div>
+
+  <div class="graph">
+    <img src="latency-24h.png" alt="Peer latency (24 hours)">
+  </div>
+
+  <div class="graph">
+    <img src="latency-7d.png" alt="Peer latency (7 days)">
+  </div>
+
+  <div class="graph">
+    <img src="peers-24h.png" alt="Connected peers (24 hours)">
+  </div>
+
+  <p class="updated">Graphs regenerated every 30 seconds.</p>
+</body>
+</html>

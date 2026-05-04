@@ -1,0 +1,16 @@
+[package]
+name = "enr-p2p"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+blake2 = { version = "0.10", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+igd-next = { version = "0.17", features = ["aio_tokio"] }
+if-addrs = "0.15"
+
+[dev-dependencies]
+tokio-test = "0.4"

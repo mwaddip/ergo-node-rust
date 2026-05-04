@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Package .deb
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ARCH="amd64"
+          PKG="ergo-proxy-node_${VERSION}_${ARCH}"
+
+          mkdir -p "${PKG}/DEBIAN"
+          mkdir -p "${PKG}/usr/bin"
+          mkdir -p "${PKG}/etc/ergo-proxy"
+          mkdir -p "${PKG}/usr/share/ergo-proxy/fail2ban"
+          mkdir -p "${PKG}/usr/lib/systemd/system"
+
+          cp target/release/ergo-proxy-node "${PKG}/usr/bin/"
+          strip "${PKG}/usr/bin/ergo-proxy-node"
+
+          cp ergo-proxy.toml "${PKG}/etc/ergo-proxy/ergo-proxy.toml"
+          cp deploy/fail2ban/ergo-proxy.conf "${PKG}/usr/share/ergo-proxy/fail2ban/"
+          cp deploy/fail2ban/ergo-proxy-jail.conf "${PKG}/usr/share/ergo-proxy/fail2ban/"
+          cp deploy/ergo-proxy-node.service "${PKG}/usr/lib/systemd/system/"
+
+          sed "s/^Architecture:.*/Architecture: ${ARCH}/" debian/control > "${PKG}/DEBIAN/control"
+          sed -i "s/^Version:.*/Version: ${VERSION}/" "${PKG}/DEBIAN/control"
+          SIZE=$(du -sk "${PKG}" | cut -f1)
+          echo "Installed-Size: ${SIZE}" >> "${PKG}/DEBIAN/control"
+
+          cp debian/conffiles "${PKG}/DEBIAN/"
+          cp debian/triggers "${PKG}/DEBIAN/"
+          for script in preinst postinst prerm postrm; do
+            cp "debian/${script}" "${PKG}/DEBIAN/"
+            chmod 755 "${PKG}/DEBIAN/${script}"
+          done
+
+          dpkg-deb --build "${PKG}"
+          rm -rf "${PKG}"
+          echo "DEB_FILE=${PKG}.deb" >> $GITHUB_ENV
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.DEB_FILE }}
+          generate_release_notes: true

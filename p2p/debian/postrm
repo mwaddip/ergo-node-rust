@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|purge)
+        # Remove fail2ban symlinks
+        rm -f /etc/fail2ban/filter.d/ergo-proxy.conf
+        rm -f /etc/fail2ban/jail.d/ergo-proxy-jail.conf
+        if command -v fail2ban-client >/dev/null 2>&1 && systemctl is-active --quiet fail2ban; then
+            fail2ban-client reload 2>/dev/null || true
+        fi
+        systemctl daemon-reload
+        ;;
+    purge)
+        # Remove config, logs, data
+        rm -rf /etc/ergo-proxy /var/log/ergo-proxy /var/lib/ergo-proxy
+        # Remove user
+        deluser --quiet ergo-proxy 2>/dev/null || true
+        ;;
+esac

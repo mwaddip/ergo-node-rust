@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+# Create unprivileged user if it doesn't exist
+if ! getent passwd ergo-proxy >/dev/null 2>&1; then
+    adduser --system --group --no-create-home --home /var/lib/ergo-proxy ergo-proxy
+fi
+
+mkdir -p /var/lib/ergo-proxy /var/log/ergo-proxy
+chown ergo-proxy:ergo-proxy /var/lib/ergo-proxy /var/log/ergo-proxy

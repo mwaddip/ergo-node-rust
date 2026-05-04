@@ -1,3 +1,0 @@
-[submodule "p2p"]
-	path = p2p
-	url = git@github.com:mwaddip/enr-p2p.git
