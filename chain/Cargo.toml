@@ -1,0 +1,21 @@
+[package]
+name = "enr-chain"
+version = "0.1.0"
+edition = "2021"
+description = "Header chain validation for the Ergo Rust node"
+
+[dependencies]
+# Using fork with gen_indexes zero-modulo fix (PR pending: ergoplatform/sigma-rust).
+# AutolykosPowScheme not exported in published 0.15.0 — need git version.
+# When upstream merges, switch back to ergoplatform remote + new rev.
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "46e94c21" }
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "46e94c21" }
+ergo-nipopow = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "46e94c21" }
+sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "46e94c21" }
+hashbrown = "0.16"
+lru = "0.16"
+num-bigint = "0.4"
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"
