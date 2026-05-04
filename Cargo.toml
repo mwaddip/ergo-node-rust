@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "sync", "validation", "state", "mempool", "api", "mining"]
+members = [".", "sync", "validation", "state", "mempool", "api", "mining", "p2p", "chain", "store"]
 exclude = ["addons/fastsync", "addons/indexer"]
 
 [package]
