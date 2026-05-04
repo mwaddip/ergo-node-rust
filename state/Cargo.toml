@@ -1,0 +1,15 @@
+[package]
+name = "enr-state"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "879545c" }
+redb = "4"
+bytes = "1"
+anyhow = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+blake2 = "0.10"

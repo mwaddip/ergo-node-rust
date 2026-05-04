@@ -4,6 +4,3 @@
 [submodule "chain"]
 	path = chain
 	url = git@github.com:mwaddip/enr-chain.git
-[submodule "state"]
-	path = state
-	url = git@github.com:mwaddip/enr-state.git
