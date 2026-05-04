@@ -7,6 +7,3 @@
 [submodule "state"]
 	path = state
 	url = git@github.com:mwaddip/enr-state.git
-[submodule "store"]
-	path = store
-	url = git@github.com:mwaddip/enr-store.git
