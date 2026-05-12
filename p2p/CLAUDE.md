@@ -14,7 +14,7 @@ Started as a message-forwarding proxy. Gradually gaining awareness of what it fo
 
 ## S.P.E.C.I.A.L.
 
-Read `SPECIAL.md` (symlinked to `facts/SPECIAL.md`). This component's profile is under **Submodule: `p2p/` (enr-p2p)**.
+Read `SPECIAL.md` (symlinked to `facts/SPECIAL.md`). This component's profile is under **Crate: `p2p/` (enr-p2p)**.
 
 Key stats: **P10** (untrusted peers send arbitrary bytes), **L9** (adversarial traffic, protocol confusion), **E9** (must survive anything).
 

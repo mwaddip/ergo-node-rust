@@ -12,7 +12,7 @@ Header chain validation for the Ergo Rust node. Owns header parsing, PoW verific
 
 ## S.P.E.C.I.A.L.
 
-Read `SPECIAL.md` (symlinked to `facts/SPECIAL.md`). This component's profile is under **Submodule: `chain/` (enr-chain)**.
+Read `SPECIAL.md` (symlinked to `facts/SPECIAL.md`). This component's profile is under **Crate: `chain/` (enr-chain)**.
 
 ## Contract
 
