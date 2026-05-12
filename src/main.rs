@@ -586,6 +586,20 @@ impl ergo_api::ChainAccess for HeaderChainAdapter {
             if h == 0 { None } else { c.header_at(h) }
         })
     }
+    fn build_nipopow_proof(
+        &self,
+        m: u32,
+        k: u32,
+        header_id: Option<[u8; 32]>,
+    ) -> Result<Vec<u8>, String> {
+        let block_id = header_id.map(|id| {
+            ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(id))
+        });
+        self.with_chain(|c| {
+            enr_chain::build_nipopow_proof(c, m, k, block_id)
+                .map_err(|e| e.to_string())
+        })
+    }
 }
 
 /// Adapter: RedbModifierStore → StoreAccess for the API crate.

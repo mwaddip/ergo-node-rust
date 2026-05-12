@@ -94,6 +94,27 @@ pub trait ChainAccess: Send + Sync {
     fn header_at(&self, height: u32) -> Option<ergo_chain_types::Header>;
     fn header_by_id(&self, id: &[u8; 32]) -> Option<ergo_chain_types::Header>;
     fn tip(&self) -> Option<ergo_chain_types::Header>;
+
+    /// Build a NiPoPoW proof anchored at the tip (when `header_id` is `None`)
+    /// or at the given header.
+    ///
+    /// The implementation is expected to call
+    /// `enr_chain::nipopow_proof::build_nipopow_proof`. Returns serialized
+    /// proof bytes (NipopowProof scorex wire format) or a human-readable
+    /// reason on failure. The reason text is propagated to the client as the
+    /// HTTP error body.
+    ///
+    /// Caller must validate that `header_id` exists in the chain *before*
+    /// invoking this — chain-level bounds errors (`m`/`k` out of range,
+    /// chain too short, MissingPopowHeader) are returned in `Err` and the
+    /// handler maps them to 400. Unknown header_id is mapped to 404 via the
+    /// caller's pre-check.
+    fn build_nipopow_proof(
+        &self,
+        m: u32,
+        k: u32,
+        header_id: Option<[u8; 32]>,
+    ) -> Result<Vec<u8>, String>;
 }
 
 /// Trait for block store access.
@@ -159,6 +180,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/ingest/modifiers", axum::routing::post(handlers::post_ingest_modifiers))
         // Emission
         .route("/emission/at/{height}", get(handlers::get_emission_at))
+        // NiPoPoW
+        .route("/nipopow/proof/{m}/{k}", get(handlers::get_nipopow_proof))
+        .route("/nipopow/proof/{m}/{k}/{header_id}", get(handlers::get_nipopow_proof_by_header))
         // Mining
         .route("/mining/candidate", get(handlers::get_mining_candidate))
         .route("/mining/solution", axum::routing::post(handlers::post_mining_solution))

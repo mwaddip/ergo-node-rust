@@ -3,7 +3,10 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
 
+use std::sync::Arc;
+
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+use sigma_ser::ScorexSerializable;
 
 use crate::types::*;
 use crate::ApiState;
@@ -604,6 +607,98 @@ pub async fn get_emission_at(Path(height): Path<u32>) -> ApiResult<EmissionInfo>
 }
 
 // ---------------------------------------------------------------------------
+// GET /nipopow/proof/{m}/{k}
+// GET /nipopow/proof/{m}/{k}/{header_id}
+// ---------------------------------------------------------------------------
+
+pub async fn get_nipopow_proof(
+    State(state): State<ApiState>,
+    Path((m, k)): Path<(u32, u32)>,
+) -> ApiResult<serde_json::Value> {
+    nipopow_proof_response(Arc::clone(&state.chain), m, k, None).await
+}
+
+pub async fn get_nipopow_proof_by_header(
+    State(state): State<ApiState>,
+    Path((m, k, header_id)): Path<(u32, u32, String)>,
+) -> ApiResult<serde_json::Value> {
+    let id = hex_to_id(&header_id)?;
+    // Surface "unknown header_id" as 404 before kicking off the (potentially
+    // expensive) proof construction. The chain-side `build_nipopow_proof`
+    // returns `MissingPopowHeader` for this case but doesn't distinguish it
+    // from other reader failures, so we filter it out here at the boundary.
+    if state.chain.header_by_id(&id).is_none() {
+        return err(StatusCode::NOT_FOUND, "header not found");
+    }
+    nipopow_proof_response(Arc::clone(&state.chain), m, k, Some(id)).await
+}
+
+async fn nipopow_proof_response(
+    chain: Arc<dyn crate::ChainAccess>,
+    m: u32,
+    k: u32,
+    header_id: Option<[u8; 32]>,
+) -> ApiResult<serde_json::Value> {
+    // Proof construction walks the interlink hierarchy and can take tens of
+    // ms on a long chain. Move it off the async runtime.
+    let bytes = match tokio::task::spawn_blocking(move || {
+        chain.build_nipopow_proof(m, k, header_id)
+    })
+    .await
+    {
+        Ok(Ok(b)) => b,
+        Ok(Err(reason)) => return err(StatusCode::BAD_REQUEST, reason),
+        Err(join_err) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("nipopow build task panicked: {join_err}"),
+            )
+        }
+    };
+
+    let proof = ergo_nipopow::NipopowProof::scorex_parse_bytes(&bytes).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: 500,
+                reason: "failed to parse just-built proof".into(),
+                detail: Some(format!("{e:?}")),
+            }),
+        )
+    })?;
+
+    // sigma-rust's NipopowProof serde shape matches the JVM encoder for every
+    // field EXCEPT `continuous`, which the JVM emits but the Rust struct
+    // doesn't carry. We flatten the derived serialization and add the
+    // missing field. `continuous` is always `false` for this release — the
+    // chain-side proof builder never produces continuous-mode proofs (see
+    // `facts/nipopow.md`).
+    #[derive(serde::Serialize)]
+    struct JvmCompatProof<'a> {
+        #[serde(flatten)]
+        proof: &'a ergo_nipopow::NipopowProof,
+        continuous: bool,
+    }
+
+    let value = serde_json::to_value(JvmCompatProof {
+        proof: &proof,
+        continuous: false,
+    })
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: 500,
+                reason: "failed to serialize nipopow proof".into(),
+                detail: Some(format!("{e}")),
+            }),
+        )
+    })?;
+
+    Ok(Json(value))
+}
+
+// ---------------------------------------------------------------------------
 // GET /mining/candidate
 // ---------------------------------------------------------------------------
 
@@ -925,4 +1020,198 @@ mod tests {
         assert!(!url_host_matches_addr("not-a-url", &addr));
         assert!(!url_host_matches_addr("", &addr));
     }
+
+    // -----------------------------------------------------------------------
+    // NiPoPoW handler tests
+    // -----------------------------------------------------------------------
+
+    use crate::ChainAccess;
+    use ergo_chain_types::{
+        ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint, Header, Votes,
+    };
+    use ergo_merkle_tree::BatchMerkleProof;
+    use ergo_nipopow::{NipopowProof, PoPowHeader};
+    use sigma_ser::ScorexSerializable;
+    use std::sync::Arc;
+
+    /// Mock `ChainAccess` for handler tests. `header_by_id` returns the
+    /// header iff its id matches `known_header_id`. `build_nipopow_proof`
+    /// returns whatever the caller stashed in `proof_result`.
+    struct MockChain {
+        known_header_id: Option<[u8; 32]>,
+        header_for_known_id: Option<Header>,
+        proof_result: Result<Vec<u8>, String>,
+    }
+
+    impl ChainAccess for MockChain {
+        fn height(&self) -> u32 {
+            0
+        }
+        fn header_at(&self, _h: u32) -> Option<Header> {
+            None
+        }
+        fn header_by_id(&self, id: &[u8; 32]) -> Option<Header> {
+            if Some(*id) == self.known_header_id {
+                self.header_for_known_id.clone()
+            } else {
+                None
+            }
+        }
+        fn tip(&self) -> Option<Header> {
+            None
+        }
+        fn build_nipopow_proof(
+            &self,
+            _m: u32,
+            _k: u32,
+            _header_id: Option<[u8; 32]>,
+        ) -> Result<Vec<u8>, String> {
+            self.proof_result.clone()
+        }
+    }
+
+    fn make_minimal_header(height: u32) -> Header {
+        let zero32 = Digest32::zero();
+        let mut header = Header {
+            version: 2,
+            id: BlockId(Digest32::zero()),
+            parent_id: BlockId(Digest32::zero()),
+            ad_proofs_root: zero32,
+            state_root: ADDigest::zero(),
+            transaction_root: zero32,
+            timestamp: 1_000_000 + height as u64,
+            n_bits: 100_000,
+            height,
+            extension_root: zero32,
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce: height.to_be_bytes().repeat(2),
+                pow_distance: None,
+            },
+            votes: Votes([0, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        };
+        // Reparse to recompute the id field.
+        let bytes = header.scorex_serialize_bytes().unwrap();
+        let reparsed = Header::scorex_parse_bytes(&bytes).unwrap();
+        header.id = reparsed.id;
+        header
+    }
+
+    /// Construct a minimal `NipopowProof` (empty interlinks/proof) and
+    /// serialize to wire bytes. The proof would fail
+    /// `has_valid_connections` against a real chain, but it round-trips
+    /// through `scorex_parse_bytes` cleanly — that's all the handler does.
+    fn make_test_proof_bytes() -> Vec<u8> {
+        let suffix_head = PoPowHeader {
+            header: make_minimal_header(2),
+            interlinks: vec![],
+            interlinks_proof: BatchMerkleProof::new(vec![], vec![]),
+        };
+        let proof = NipopowProof::new(1, 1, vec![], suffix_head, vec![]).unwrap();
+        proof.scorex_serialize_bytes().unwrap()
+    }
+
+    fn build_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn nipopow_proof_invalid_m_returns_400() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("m and k must be >= 1".into()),
+        });
+        let rt = build_runtime();
+        let result =
+            rt.block_on(nipopow_proof_response(chain as Arc<dyn ChainAccess>, 0, 2, None));
+        match result {
+            Err((status, body)) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(body.reason.contains("m and k"));
+            }
+            Ok(_) => panic!("expected 400, got 200"),
+        }
+    }
+
+    #[test]
+    fn nipopow_proof_invalid_k_returns_400() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("m and k must be >= 1".into()),
+        });
+        let rt = build_runtime();
+        let result =
+            rt.block_on(nipopow_proof_response(chain as Arc<dyn ChainAccess>, 2, 0, None));
+        match result {
+            Err((status, _)) => assert_eq!(status, StatusCode::BAD_REQUEST),
+            Ok(_) => panic!("expected 400, got 200"),
+        }
+    }
+
+    #[test]
+    fn nipopow_proof_chain_too_short_returns_400() {
+        // Simulates `ChainError::Nipopow("chain too short...")`.
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("prove_with_reader failed: ChainTooShort".into()),
+        });
+        let rt = build_runtime();
+        let result =
+            rt.block_on(nipopow_proof_response(chain as Arc<dyn ChainAccess>, 6, 10, None));
+        match result {
+            Err((status, body)) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(body.reason.contains("ChainTooShort") || body.reason.contains("too short"));
+            }
+            Ok(_) => panic!("expected 400, got 200"),
+        }
+    }
+
+    #[test]
+    fn nipopow_proof_happy_path_returns_jvm_compat_json() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Ok(make_test_proof_bytes()),
+        });
+        let rt = build_runtime();
+        let result =
+            rt.block_on(nipopow_proof_response(chain as Arc<dyn ChainAccess>, 1, 1, None));
+        let Json(value) = match result {
+            Ok(v) => v,
+            Err((status, body)) => panic!("expected 200, got {status} / {}", body.reason),
+        };
+
+        // JVM-compat field shape: m, k, prefix, suffixHead, suffixTail, continuous.
+        let obj = value.as_object().expect("response must be a JSON object");
+        assert_eq!(obj.get("m").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(obj.get("k").and_then(|v| v.as_u64()), Some(1));
+        assert!(obj.get("prefix").is_some_and(|v| v.is_array()));
+        assert!(obj.get("suffixHead").is_some_and(|v| v.is_object()));
+        assert!(obj.get("suffixTail").is_some_and(|v| v.is_array()));
+        // `continuous` is the JVM-only field we inject — must be present and false.
+        assert_eq!(obj.get("continuous"), Some(&serde_json::Value::Bool(false)));
+
+        // suffixHead must carry the JVM-compat sub-shape: header + interlinks + interlinksProof
+        let suffix_head = obj["suffixHead"].as_object().unwrap();
+        assert!(suffix_head.contains_key("header"));
+        assert!(suffix_head.contains_key("interlinks"));
+        assert!(suffix_head.contains_key("interlinksProof"));
+    }
+
+    // Note on 404 coverage: `header_by_id` is the pre-check that turns an
+    // unknown header_id into 404 *before* `nipopow_proof_response` is called.
+    // The pre-check happens in `get_nipopow_proof_by_header`. Testing that
+    // wrapper through the full axum extractors requires constructing a
+    // complete `ApiState`, which is heavy for a one-call assertion — the
+    // pre-check is a single `is_none()` branch and is covered by integration
+    // testing against a real chain.
 }
