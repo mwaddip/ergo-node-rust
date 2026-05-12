@@ -33,8 +33,7 @@ What does NOT ship:
   stays at network defaults in light mode (documented limitation in
   `facts/chain.md`).
 - Modifications to the P2P submodule (router treats codes 90/91 as
-  Unknown and forwards them — wasteful, see
-  `project_unknown_message_forwarding` memory; fix is a follow-up).
+  Unknown and forwards them — wasteful; fix is a follow-up).
 
 ## SPECIAL Profile
 
@@ -189,8 +188,7 @@ opposite direction" (`facts/p2p-routing.md` line 48). This means:
 
 This is wasteful but harmless: we still see the events via `subscribe()`
 and respond correctly. The forwarded copies are extra noise on the
-network. Tracked in memory `project_unknown_message_forwarding` as a
-follow-up.
+network. Fixing this is a follow-up.
 
 For first release, **accept the waste**. Document it in the release notes.
 
@@ -279,6 +277,5 @@ hard limit). Lower values are valid for resource-constrained nodes.
 - `facts/snapshot.md` — pattern reference (codes 76-81 use the same approach)
 - `facts/p2p-node.md` — `subscribe()` and `send_to` API
 - `facts/p2p-routing.md` line 48 — Unknown forwarding behavior
-- Memory `project_unknown_message_forwarding` — follow-up to fix waste
 - JVM: `ergo-core/src/main/scala/org/ergoplatform/network/message/GetNipopowProofSpec.scala`
 - JVM: `ergo-core/src/main/scala/org/ergoplatform/network/message/NipopowProofSpec.scala`
