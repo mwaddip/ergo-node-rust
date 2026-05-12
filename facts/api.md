@@ -500,6 +500,51 @@ Pure calculation, no state access.
 
 ---
 
+### NiPoPoW
+
+Non-interactive proofs of proof-of-work. Light clients use these to bootstrap
+from a synced node without downloading the full chain. The proof builder is
+shared with the P2P serve path (`facts/nipopow.md`) — both REST and P2P go
+through `chain.build_nipopow_proof(m, k, header_id_opt)`.
+
+#### `GET /nipopow/proof/{m}/{k}`
+
+NiPoPoW proof anchored at the chain tip.
+
+**Path params:**
+- `m`: minimum chain length, `1..=MAX_M_K` (chain-side: 256)
+- `k`: suffix length, `1..=MAX_M_K` (chain-side: 256)
+
+Bounds are enforced by `chain::build_nipopow_proof`; the API handler
+propagates the chain's bounds error as `400`.
+
+**Response 200:** JVM-compatible `NipopowProof` JSON.
+**Response 400:** `m` or `k` out of range.
+**Response 500:** chain failed to build proof (e.g., chain shorter than `m+k`).
+
+**Source:** chain (`build_nipopow_proof(m, k, None)`). The returned wire
+bytes are deserialized via `ergo-nipopow` and re-serialized as JSON to match
+JVM's `/nipopow/proof/{m}/{k}` response shape.
+
+#### `GET /nipopow/proof/{m}/{k}/{headerId}`
+
+NiPoPoW proof anchored at a specific header instead of the tip.
+
+**Path params:**
+- `m`: minimum chain length (same bounds as above)
+- `k`: suffix length (same bounds as above)
+- `headerId`: hex-encoded modifier ID of the anchor header
+
+**Response 200:** JVM-compatible `NipopowProof` JSON.
+**Response 400:** `m`/`k` out of range or `headerId` malformed hex.
+**Response 404:** `headerId` not in chain.
+**Response 500:** chain failed to build proof.
+
+**Source:** chain (`build_nipopow_proof(m, k, Some(header_id))`). Same
+deserialization path as the no-anchor variant.
+
+---
+
 ### Debug
 
 #### `GET /debug/memory`
@@ -550,7 +595,7 @@ mempool tx count). Useful for tracking RSS vs allocated divergence
 | `/scan/*` | No scanning/tracking subsystem. |
 | `/script/*` | Script compilation/execution is a dev tool, not a node function. Add later. |
 | `/blockchain/*` | Requires extra indexing infrastructure. Add later. |
-| `/nipopow/*` | Separate roadmap item (NiPoPoW support). |
+| `/nipopow/popowHeader/*` | Per-header interlinks view — different code path from proof building. Add later if needed. |
 | `/node/shutdown` | Operational concern. Signal-based shutdown is sufficient. |
 | `/utils/*` | Utility functions. Add later if wallets need them. |
 | `POST /blocks` | Block submission via API (miners use `/mining/solution`). |
