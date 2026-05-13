@@ -203,6 +203,22 @@ Last N block headers, newest first.
 
 **Source:** chain (headers from tip descending).
 
+#### `GET /blocks/modifier/{modifierId}`
+
+Fetch any modifier (header, block transactions, AD proofs, extension)
+by its modifier ID, without specifying type. Useful for forensics and
+generic explorer tooling — REST surface for what the `inspect-modifier`
+local tool does.
+
+**Response 200:** modifier as JSON (shape depends on type). Type
+indicated via a `type` field or by JSON shape.
+**Response 404:** modifier not found across any type.
+
+**Source:** store. The handler iterates the four modifier types
+(Header=101, BlockTransactions=102, ADProofs=104, Extension=108) and
+returns the first match. Performance is acceptable because each lookup
+is a single redb key probe.
+
 ---
 
 ### Transactions
@@ -343,6 +359,32 @@ Batch lookup of boxes from UTXO set + mempool.
 
 **Source:** utxo_state + mempool, per box.
 
+#### `GET /utxo/getSnapshotsInfo`
+
+Discovery endpoint for UTXO snapshots this node has available. Used by
+external tools that want to know whether snapshot-based bootstrap is
+possible from this node, and at which heights snapshots are anchored.
+
+**Response 200:**
+```json
+{
+  "availableManifests": [
+    {"height": 1700000, "digest": "01abcdef..."}
+  ]
+}
+```
+
+**Response 200 empty:** `{ "availableManifests": [] }` when no snapshots
+are stored.
+
+**Source:** state/snapshot subsystem. The chain knows which heights have
+snapshot manifests stored locally (via `state` crate's snapshot inventory).
+The implementation may need a new `ChainAccess::snapshots_info()` or
+similar trait method — surface to main session if so.
+
+**Note:** snapshot serving over P2P is already implemented (codes 76-81).
+This REST endpoint exposes the same inventory to non-P2P consumers.
+
 ---
 
 ### Mining
@@ -478,6 +520,43 @@ Network status summary.
 }
 ```
 
+#### `GET /peers/blacklisted`
+
+Peers currently penalty-banned by this node. Surfaces the penalty
+system (already implemented for misbehavior tracking) to operators
+and monitoring.
+
+**Response 200:**
+```json
+{
+  "addresses": ["1.2.3.4:9030", "5.6.7.8:9030"]
+}
+```
+
+**Source:** peer manager (penalty store). May require a new closure
+in `ApiState` (e.g. `peer_blacklisted: Arc<dyn Fn() -> Vec<SocketAddr>>`)
+following the existing `peer_count` / `peer_api_urls` pattern, OR a new
+`PeerAccess` trait if the closure list grows large. Implementation choice
+is up to the dispatched session.
+
+#### `POST /peers/connect`
+
+Manually initiate an outbound connection to a peer. Operationally useful
+for testing or recovery.
+
+**Request body:** `"1.2.3.4:9030"` (string socket address).
+**Response 200:** connection attempt queued.
+**Response 400:** malformed address.
+
+**Authentication:** Required when `api_key_hash` is configured (write
+operation that affects networking state).
+
+**Source:** peer manager (outbound connection initiator). Needs a new
+trigger — likely a callback `peer_connect: Arc<dyn Fn(SocketAddr) -> Result<(), String>>`
+or a method on a new `PeerAccess` trait. Implementation does not need to
+wait for the connection to succeed — the call is fire-and-forget, success
+means "queued, the outbound manager will attempt it."
+
 ---
 
 ### Emission
@@ -543,6 +622,36 @@ NiPoPoW proof anchored at a specific header instead of the tip.
 **Source:** chain (`build_nipopow_proof(m, k, Some(header_id))`). Same
 deserialization path as the no-anchor variant.
 
+#### `GET /nipopow/popowHeader/{headerId}`
+
+Per-header NiPoPoW view — the header plus its interlinks vector and
+the interlinks Merkle proof. Used by light clients that want to verify
+a specific header's PoPoW properties without pulling a full proof.
+
+**Path params:**
+- `headerId`: hex-encoded modifier ID of the header
+
+**Response 200:** JVM-compatible `PoPowHeader` JSON (header +
+interlinks array + interlinksProof).
+**Response 400:** malformed `headerId` hex.
+**Response 404:** header not in chain.
+
+**Source:** chain — needs a new method or use of existing popow header
+construction (see `enr_chain::nipopow_proof` internals, the
+`ChainPopowReader::popow_header_at(height)` machinery already builds
+these for the proof code path). Likely a new `ChainAccess::popow_header_by_id`
+trait method.
+
+#### `GET /nipopow/popowHeader/last`
+
+`PoPowHeader` for the current chain tip.
+
+**Response 200:** same shape as the byId variant.
+**Response 404:** chain is empty (no tip).
+
+**Source:** chain. Convenience over the byId variant — internally
+resolves the tip header ID, then delegates to the byId path.
+
 ---
 
 ### Debug
@@ -595,7 +704,6 @@ mempool tx count). Useful for tracking RSS vs allocated divergence
 | `/scan/*` | No scanning/tracking subsystem. |
 | `/script/*` | Script compilation/execution is a dev tool, not a node function. Add later. |
 | `/blockchain/*` | Requires extra indexing infrastructure. Add later. |
-| `/nipopow/popowHeader/*` | Per-header interlinks view — different code path from proof building. Add later if needed. |
 | `/node/shutdown` | Operational concern. Signal-based shutdown is sufficient. |
 | `/utils/*` | Utility functions. Add later if wallets need them. |
 | `POST /blocks` | Block submission via API (miners use `/mining/solution`). |
