@@ -213,6 +213,46 @@ pub fn build_nipopow_proof(
         .map_err(|e| ChainError::Nipopow(format!("serialize failed: {e:?}")))
 }
 
+/// Fetch a single popow header by its block id and return the
+/// Scorex-serialized bytes.
+///
+/// **Semantics**:
+/// - `Ok(Some(bytes))` — header exists in the chain; `bytes` is the
+///   Scorex-serialized `PoPowHeader` (header + interlinks +
+///   interlinksProof). Maps to HTTP 200 at the API layer.
+/// - `Ok(None)` — header not in the chain. Maps to HTTP 404.
+/// - `Err(ChainError::Nipopow)` — header is in the chain but the
+///   `PoPowHeader` could not be constructed (missing extension bytes,
+///   parse failure, etc). Maps to HTTP 500.
+///
+/// Thin adapter over [`ChainPopowReader::popow_header_by_id`], with the
+/// extra step of separating "not found" from "internal failure" since
+/// the trait collapses both into `None`.
+pub fn popow_header_by_id(
+    chain: &HeaderChain,
+    id: &BlockId,
+) -> Result<Option<Vec<u8>>, ChainError> {
+    // Header not in chain → 404, not a server error.
+    if chain.height_of(id).is_none() {
+        return Ok(None);
+    }
+
+    // Header IS in chain; if we can't materialize the PoPowHeader from
+    // here it's a real failure (missing extension, parse error, etc).
+    let reader = ChainPopowReader { chain };
+    let popow_header = reader.popow_header_by_id(id).ok_or_else(|| {
+        ChainError::Nipopow(format!(
+            "failed to construct PoPowHeader for {id:?}"
+        ))
+    })?;
+
+    let bytes = popow_header
+        .scorex_serialize_bytes()
+        .map_err(|e| ChainError::Nipopow(format!("serialize failed: {e:?}")))?;
+
+    Ok(Some(bytes))
+}
+
 /// Compare two NiPoPoW proofs from raw bytes (post-envelope, inner proof
 /// payload only). Returns `true` if `a` represents a better chain than `b`
 /// per KMZ17 §4.3.
@@ -721,5 +761,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn popow_header_by_id_returns_some_for_known_header() {
+        let chain = build_chain_with_interlinks(20);
+        // Pick a non-genesis header so the loader path is exercised.
+        let known = chain.header_at(10).expect("header at h=10 exists");
+        let known_id = known.id;
+
+        let bytes = popow_header_by_id(&chain, &known_id)
+            .expect("call succeeds")
+            .expect("known header must return Some(bytes)");
+        assert!(!bytes.is_empty());
+
+        // Round-trip through the inverse Scorex deserializer.
+        let parsed = PoPowHeader::scorex_parse_bytes(&bytes).expect("parses cleanly");
+        assert_eq!(parsed.header.id, known_id);
+    }
+
+    #[test]
+    fn popow_header_by_id_returns_some_for_genesis() {
+        // h=1 hits the in-process synthesis path — no loader involvement.
+        let chain = build_chain_with_interlinks(20);
+        let genesis_id = chain.header_at(1).expect("genesis exists").id;
+
+        let bytes = popow_header_by_id(&chain, &genesis_id)
+            .expect("call succeeds")
+            .expect("genesis must return Some(bytes)");
+        let parsed = PoPowHeader::scorex_parse_bytes(&bytes).expect("parses cleanly");
+        assert_eq!(parsed.header.id, genesis_id);
+        // Genesis interlinks convention: [genesis_id].
+        assert_eq!(parsed.interlinks, vec![genesis_id]);
+    }
+
+    #[test]
+    fn popow_header_by_id_returns_none_for_unknown_id() {
+        let chain = build_chain_with_interlinks(20);
+        let unknown = BlockId(Digest32::zero());
+        // Blake2b of a non-degenerate header is overwhelmingly unlikely
+        // to collide with all-zeros, but assert for explicitness.
+        assert_ne!(chain.tip().id, unknown);
+
+        let result = popow_header_by_id(&chain, &unknown).expect("call succeeds");
+        assert!(result.is_none(), "unknown id must return Ok(None)");
     }
 }

@@ -45,6 +45,21 @@ pub struct ApiState {
     pub downloaded_height: Arc<AtomicU32>,
     /// Peer REST URL callback — returns connected peers with their socket addr and REST URL.
     pub peer_api_urls: Arc<dyn Fn() -> Vec<PeerRestInfo> + Send + Sync>,
+    /// All known peers (connected + disconnected). For `GET /peers/all`.
+    pub peer_all: Arc<dyn Fn() -> Vec<PeerInfo> + Send + Sync>,
+    /// Network status summary (last incoming msg time + current network time).
+    pub peer_status: Arc<dyn Fn() -> PeerStatusSummary + Send + Sync>,
+    /// Currently penalty-banned peers. For `GET /peers/blacklisted`.
+    pub peer_blacklisted: Arc<dyn Fn() -> Vec<std::net::SocketAddr> + Send + Sync>,
+    /// Manual outbound-connect trigger. For `POST /peers/connect`.
+    /// Returns `Err(reason)` if the address is rejected (malformed, banned, already connecting).
+    pub peer_connect: Arc<dyn Fn(std::net::SocketAddr) -> Result<(), String> + Send + Sync>,
+    /// Available UTXO snapshot manifests as (height, manifest_digest) pairs.
+    /// For `GET /utxo/getSnapshotsInfo`. Returns empty vec when none stored.
+    pub snapshots_info: Arc<dyn Fn() -> Vec<SnapshotInfoEntry> + Send + Sync>,
+    /// Optional API key hash (Blake2b256). None = no auth required.
+    /// Authenticated endpoints check this against the `api_key` request header.
+    pub api_key_hash: Option<[u8; 32]>,
     /// Modifier pipeline sender — for the /ingest/modifiers endpoint.
     pub modifier_tx: Option<tokio::sync::mpsc::Sender<ModifierBatchItem>>,
     /// Watch channel for validated block height — used by /info/wait long-poll.
@@ -87,6 +102,30 @@ pub struct PeerRestInfo {
     pub rest_url: Option<String>,
 }
 
+/// Per-peer info returned by the `peer_all` / `peer_connected` callbacks.
+/// `name` is the peer's advertised agent string (None if never handshaked).
+/// `last_seen` is Unix epoch ms (None if never connected).
+/// `connection_type` is "Outgoing" / "Incoming" for connected peers, None for known-but-disconnected.
+pub struct PeerInfo {
+    pub address: std::net::SocketAddr,
+    pub name: Option<String>,
+    pub last_seen: Option<u64>,
+    pub connection_type: Option<String>,
+}
+
+/// Network status summary for `GET /peers/status`.
+/// Both timestamps are Unix epoch milliseconds.
+pub struct PeerStatusSummary {
+    pub last_incoming_message: Option<u64>,
+    pub current_network_time: u64,
+}
+
+/// Snapshot inventory entry for `GET /utxo/getSnapshotsInfo`.
+pub struct SnapshotInfoEntry {
+    pub height: u32,
+    pub digest: [u8; 32],
+}
+
 /// Trait for chain access — avoids API depending on enr-chain internals.
 /// Implementations handle their own locking.
 pub trait ChainAccess: Send + Sync {
@@ -115,6 +154,24 @@ pub trait ChainAccess: Send + Sync {
         k: u32,
         header_id: Option<[u8; 32]>,
     ) -> Result<Vec<u8>, String>;
+
+    /// Header IDs from the chain tip, newest first.
+    ///
+    /// `offset` skips that many positions from the tip; `limit` caps the result
+    /// length. If `offset >= height`, returns an empty vec. If fewer headers
+    /// remain than `limit`, returns what's available (not an error).
+    fn header_ids(&self, offset: u32, limit: u32) -> Vec<[u8; 32]>;
+
+    /// Serialized `PoPowHeader` for the given header ID (Scorex wire format).
+    ///
+    /// The handler deserializes via `ergo_nipopow::PoPowHeader::scorex_parse_bytes`
+    /// and re-serializes as JVM-compatible JSON. Mirrors the
+    /// `build_nipopow_proof` pattern of returning raw bytes.
+    ///
+    /// - `Ok(Some(bytes))` — header found, PoPowHeader constructed.
+    /// - `Ok(None)` — header not in chain (handler returns 404).
+    /// - `Err(reason)` — chain-internal failure (e.g., extension missing for an interlink ancestor); handler returns 500.
+    fn popow_header_by_id(&self, id: &[u8; 32]) -> Result<Option<Vec<u8>>, String>;
 }
 
 /// Trait for block store access.
@@ -151,41 +208,54 @@ pub trait BlockSubmitter: Send + Sync {
 
 /// Build the axum Router with all API routes.
 pub fn router(state: ApiState) -> Router {
-    use axum::routing::get;
+    use axum::routing::{get, head, post};
 
     Router::new()
         // Node info
         .route("/info", get(handlers::get_info))
         .route("/info/wait", get(handlers::info_wait))
         // Blocks
+        .route("/blocks", get(handlers::get_blocks))
         .route("/blocks/at/{height}", get(handlers::get_block_ids_at_height))
+        .route("/blocks/modifier/{modifier_id}", get(handlers::get_block_modifier))
+        .route("/blocks/lastHeaders/{count}", get(handlers::get_last_headers))
+        .route("/blocks/{header_id}", get(handlers::get_full_block))
         .route("/blocks/{header_id}/header", get(handlers::get_block_header))
         .route("/blocks/{header_id}/transactions", get(handlers::get_block_transactions))
-        .route("/blocks/lastHeaders/{count}", get(handlers::get_last_headers))
         // Transactions
-        .route("/transactions", axum::routing::post(handlers::post_transaction))
-        .route("/transactions/check", axum::routing::post(handlers::check_transaction))
+        .route("/transactions", post(handlers::post_transaction))
+        .route("/transactions/check", post(handlers::check_transaction))
         .route("/transactions/unconfirmed", get(handlers::get_unconfirmed))
+        .route("/transactions/unconfirmed/{tx_id}", head(handlers::head_unconfirmed))
         .route("/transactions/unconfirmed/transactionIds", get(handlers::get_unconfirmed_ids))
         .route("/transactions/unconfirmed/byTransactionId/{tx_id}", get(handlers::get_unconfirmed_by_id))
         .route("/transactions/getFee", get(handlers::get_recommended_fee))
+        .route("/transactions/waitTime", get(handlers::get_wait_time))
         .route("/transactions/poolHistogram", get(handlers::get_pool_histogram))
         // UTXO
         .route("/utxo/byId/{box_id}", get(handlers::get_utxo_by_id))
         .route("/utxo/withPool/byId/{box_id}", get(handlers::get_utxo_with_pool))
+        .route("/utxo/withPool/byIds", post(handlers::post_utxo_with_pool_by_ids))
+        .route("/utxo/getSnapshotsInfo", get(handlers::get_snapshots_info))
         // Peers
+        .route("/peers/all", get(handlers::get_all_peers))
         .route("/peers/connected", get(handlers::get_connected_peers))
+        .route("/peers/status", get(handlers::get_peers_status))
+        .route("/peers/blacklisted", get(handlers::get_blacklisted_peers))
+        .route("/peers/connect", post(handlers::post_peers_connect))
         .route("/peers/api-urls", get(handlers::get_peer_api_urls))
         // Ingest (localhost only)
-        .route("/ingest/modifiers", axum::routing::post(handlers::post_ingest_modifiers))
+        .route("/ingest/modifiers", post(handlers::post_ingest_modifiers))
         // Emission
         .route("/emission/at/{height}", get(handlers::get_emission_at))
         // NiPoPoW
         .route("/nipopow/proof/{m}/{k}", get(handlers::get_nipopow_proof))
         .route("/nipopow/proof/{m}/{k}/{header_id}", get(handlers::get_nipopow_proof_by_header))
+        .route("/nipopow/popowHeader/last", get(handlers::get_popow_header_last))
+        .route("/nipopow/popowHeader/{header_id}", get(handlers::get_popow_header_by_id))
         // Mining
         .route("/mining/candidate", get(handlers::get_mining_candidate))
-        .route("/mining/solution", axum::routing::post(handlers::post_mining_solution))
+        .route("/mining/solution", post(handlers::post_mining_solution))
         .route("/mining/rewardAddress", get(handlers::get_mining_reward_address))
         // Debug
         .route("/debug/memory", get(handlers::get_debug_memory))

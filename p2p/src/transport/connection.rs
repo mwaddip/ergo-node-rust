@@ -83,8 +83,8 @@ impl Connection {
     }
 
     /// Read the next message frame.
-    pub async fn read_frame(&mut self) -> io::Result<Frame> {
-        frame::read_frame(&mut self.reader, &self.magic, self.peer_addr).await
+    pub async fn read_frame(&mut self, blacklist: &crate::blacklist::Blacklist) -> io::Result<Frame> {
+        frame::read_frame(&mut self.reader, &self.magic, self.peer_addr, blacklist).await
     }
 
     /// Write a message frame.

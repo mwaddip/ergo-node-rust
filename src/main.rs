@@ -600,6 +600,33 @@ impl ergo_api::ChainAccess for HeaderChainAdapter {
                 .map_err(|e| e.to_string())
         })
     }
+    fn header_ids(&self, offset: u32, limit: u32) -> Vec<[u8; 32]> {
+        self.with_chain(|c| {
+            let tip = c.height();
+            if tip == 0 || offset >= tip {
+                return Vec::new();
+            }
+            let start_height = tip - offset;
+            let mut out = Vec::with_capacity(limit as usize);
+            let mut h = start_height;
+            while out.len() < limit as usize && h >= 1 {
+                if let Some(header) = c.header_at(h) {
+                    let mut id = [0u8; 32];
+                    id.copy_from_slice(header.id.0.as_ref());
+                    out.push(id);
+                }
+                if h == 0 { break; }
+                h -= 1;
+            }
+            out
+        })
+    }
+    fn popow_header_by_id(&self, id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
+        let block_id = ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(*id));
+        self.with_chain(|c| {
+            enr_chain::popow_header_by_id(c, &block_id).map_err(|e| e.to_string())
+        })
+    }
 }
 
 /// Adapter: RedbModifierStore → StoreAccess for the API crate.
@@ -2304,6 +2331,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let api_state_ctx = shared_state_context.clone();
         let p2p_for_api = p2p.clone();
         let p2p_for_api_urls = p2p.clone();
+        let p2p_for_all = p2p.clone();
+        let p2p_for_status = p2p.clone();
+        let p2p_for_blacklisted = p2p.clone();
+        let p2p_for_connect = p2p.clone();
+        let snapshot_store_for_api = snapshot_store.clone();
 
         // Mining: construct CandidateGenerator + mining task if configured
         let mining_generator: Option<Arc<ergo_mining::CandidateGenerator>> =
@@ -2494,6 +2526,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .collect()
             }),
+            peer_all: Arc::new(move || {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(p2p_for_all.all_peers())
+                })
+                .into_iter()
+                .map(|entry| ergo_api::PeerInfo {
+                    address: entry.address,
+                    name: entry.agent_name,
+                    last_seen: entry.last_seen_ms,
+                    connection_type: entry.connection_type.map(|ct| match ct {
+                        enr_p2p::types::ConnectionType::Outgoing => "Outgoing".to_string(),
+                        enr_p2p::types::ConnectionType::Incoming => "Incoming".to_string(),
+                    }),
+                })
+                .collect()
+            }),
+            peer_status: Arc::new(move || {
+                let status = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(p2p_for_status.network_status())
+                });
+                ergo_api::PeerStatusSummary {
+                    last_incoming_message: status.last_incoming_message_ms,
+                    current_network_time: status.current_network_time_ms,
+                }
+            }),
+            peer_blacklisted: Arc::new(move || {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(p2p_for_blacklisted.blacklisted_peers())
+                })
+            }),
+            peer_connect: Arc::new(move |addr| {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(p2p_for_connect.queue_outbound_connection(addr))
+                })
+            }),
+            snapshots_info: Arc::new(move || {
+                match &snapshot_store_for_api {
+                    Some(store) => store
+                        .snapshots_info()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(height, digest)| ergo_api::SnapshotInfoEntry { height, digest })
+                        .collect(),
+                    None => Vec::new(),
+                }
+            }),
+            api_key_hash: None,
             modifier_tx: Some(modifier_tx_for_mining.clone()),
             height_watch: height_watch_rx,
             jemalloc_probe: {

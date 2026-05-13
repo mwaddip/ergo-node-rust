@@ -1,4 +1,5 @@
 use std::fmt;
+use std::net::SocketAddr;
 
 /// Unique identifier for a connected peer. Wraps a u64 counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,4 +70,49 @@ pub enum ProxyMode {
     Full,
     /// Light: gossip only, advertise as NiPoPoW-bootstrapped.
     Light,
+}
+
+/// Direction of an established peer connection, as seen by external API
+/// consumers. Names match the JVM `connectionType` JSON field exactly so the
+/// API layer does not have to remap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionType {
+    Outgoing,
+    Incoming,
+}
+
+impl fmt::Display for ConnectionType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConnectionType::Outgoing => write!(f, "Outgoing"),
+            ConnectionType::Incoming => write!(f, "Incoming"),
+        }
+    }
+}
+
+impl From<Direction> for ConnectionType {
+    fn from(d: Direction) -> Self {
+        match d {
+            Direction::Outbound => ConnectionType::Outgoing,
+            Direction::Inbound => ConnectionType::Incoming,
+        }
+    }
+}
+
+/// A single peer entry returned by `P2pNode::all_peers()`. Covers both
+/// currently-connected peers and peers we've handshaked with at some point.
+#[derive(Debug, Clone)]
+pub struct PeerEntry {
+    pub address: SocketAddr,
+    pub agent_name: Option<String>,
+    pub last_seen_ms: Option<u64>,
+    pub connection_type: Option<ConnectionType>,
+}
+
+/// Network status snapshot returned by `P2pNode::network_status()`. Both
+/// timestamps are Unix epoch milliseconds.
+#[derive(Debug, Clone, Copy)]
+pub struct NetworkStatus {
+    pub last_incoming_message_ms: Option<u64>,
+    pub current_network_time_ms: u64,
 }

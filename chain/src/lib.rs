@@ -36,12 +36,12 @@ pub use sync_info::{build_sync_info, parse_sync_info, SyncInfo};
 pub use num_bigint::BigUint;
 pub use tracker::HeaderTracker;
 pub use nipopow_proof::{
-    build_nipopow_proof, compare_nipopow_proof_bytes, verify_nipopow_proof_bytes,
-    NipopowVerificationResult,
+    build_nipopow_proof, compare_nipopow_proof_bytes, popow_header_by_id,
+    verify_nipopow_proof_bytes, NipopowVerificationResult,
 };
 pub use voting::{
     extract_disabling_rules_from_kv, pack_extension_bytes, pack_parameters_to_kv,
-    parse_extension_bytes, parse_parameters_from_kv, VotingConfig,
+    parse_extension_bytes, parse_parameters_from_kv, ExtensionField, VotingConfig,
     ID_BLOCK_VERSION, ID_SOFT_FORK_DISABLING_RULES, ID_SOFT_FORK_STARTING_HEIGHT,
     ID_SOFT_FORK_VOTES_COLLECTED, SOFT_FORK_VOTE,
 };

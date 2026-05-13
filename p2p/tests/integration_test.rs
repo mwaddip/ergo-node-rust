@@ -13,8 +13,8 @@ fn full_tx_relay_scenario() {
     let mut router = Router::new();
     let outbound = PeerId(1);
     let inbound = PeerId(2);
-    router.register_peer(outbound, Direction::Outbound, ProxyMode::Full, dummy_addr(), None);
-    router.register_peer(inbound, Direction::Inbound, ProxyMode::Full, dummy_addr(), None);
+    router.register_peer(outbound, Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
+    router.register_peer(inbound, Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
 
     let tx_id = [0x42; 32];
 
@@ -56,9 +56,9 @@ fn disconnect_cleanup_scenario() {
     let out1 = PeerId(1);
     let out2 = PeerId(2);
     let inb = PeerId(3);
-    router.register_peer(out1, Direction::Outbound, ProxyMode::Full, dummy_addr(), None);
-    router.register_peer(out2, Direction::Outbound, ProxyMode::Full, dummy_addr(), None);
-    router.register_peer(inb, Direction::Inbound, ProxyMode::Full, dummy_addr(), None);
+    router.register_peer(out1, Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
+    router.register_peer(out2, Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
+    router.register_peer(inb, Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
 
     let tx_id = [0x55; 32];
 
@@ -92,10 +92,10 @@ fn inv_does_not_fanout() {
     // directly, and relayed Invs can exceed the 400-modifier cap).
     let mut router = Router::new();
     let outbound = PeerId(1);
-    router.register_peer(outbound, Direction::Outbound, ProxyMode::Full, dummy_addr(), None);
+    router.register_peer(outbound, Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
 
     for i in 2..=5 {
-        router.register_peer(PeerId(i), Direction::Inbound, ProxyMode::Full, dummy_addr(), None);
+        router.register_peer(PeerId(i), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
     }
 
     let tx_id = [0xaa; 32];
@@ -119,8 +119,8 @@ fn inv_does_not_fanout() {
 #[test]
 fn light_mode_blocks_sync() {
     let mut router = Router::new();
-    router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None);
-    router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Light, dummy_addr(), None);
+    router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
+    router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Light, dummy_addr(), None, None);
 
     let actions = router.handle_event(ProtocolEvent::Message {
         peer_id: PeerId(2),
@@ -132,8 +132,8 @@ fn light_mode_blocks_sync() {
 #[test]
 fn full_mode_sync_flow() {
     let mut router = Router::new();
-    router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None);
-    router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None);
+    router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
+    router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
 
     let actions = router.handle_event(ProtocolEvent::Message {
         peer_id: PeerId(2),

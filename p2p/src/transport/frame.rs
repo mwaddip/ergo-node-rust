@@ -113,10 +113,14 @@ pub fn decode(magic: &[u8; 4], data: &[u8]) -> io::Result<Frame> {
 /// # Contract
 /// - **Precondition**: reader is positioned at the start of a frame.
 /// - **Postcondition**: returns a validated Frame, or error on I/O, bad magic, bad checksum, or oversize.
+/// - On permanent-penalty failures (bad magic, oversized frame, bad checksum)
+///   the peer's address is recorded in `blacklist` in addition to emitting
+///   the PENALTY log line that fail2ban consumes.
 pub async fn read_frame(
     reader: &mut (impl tokio::io::AsyncReadExt + Unpin),
     magic: &[u8; 4],
     peer_addr: SocketAddr,
+    blacklist: &crate::blacklist::Blacklist,
 ) -> io::Result<Frame> {
     // Read fixed prefix: magic(4) + code(1) + length(4) = 9 bytes.
     // Checksum(4) follows only when body length > 0 (JVM omits it for empty bodies).
@@ -130,6 +134,7 @@ pub async fn read_frame(
             "Frame magic mismatch — stream likely misaligned"
         );
         tracing::warn!("PENALTY peer_ip={} type=permanent reason=\"bad magic bytes\"", peer_addr.ip());
+        blacklist.record_permanent(peer_addr).await;
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Bad magic: {:?} (expected {:?})", &prefix[0..4], magic),
@@ -141,6 +146,7 @@ pub async fn read_frame(
 
     if body_len > MAX_BODY_SIZE {
         tracing::warn!("PENALTY peer_ip={} type=permanent reason=\"oversized frame\"", peer_addr.ip());
+        blacklist.record_permanent(peer_addr).await;
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Body too large: {} bytes", body_len),
@@ -169,6 +175,7 @@ pub async fn read_frame(
             "Checksum mismatch"
         );
         tracing::warn!("PENALTY peer_ip={} type=permanent reason=\"bad checksum\"", peer_addr.ip());
+        blacklist.record_permanent(peer_addr).await;
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Checksum mismatch"));
     }
 

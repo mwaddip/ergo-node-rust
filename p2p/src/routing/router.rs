@@ -13,10 +13,17 @@ use crate::protocol::peer::ProtocolEvent;
 use crate::routing::inv_table::InvTable;
 use crate::routing::latency::{LatencyTracker, LatencyStats};
 use crate::routing::tracker::{RequestTracker, SyncTracker};
-use crate::types::{Direction, PeerId, ProxyMode};
+use crate::types::{ConnectionType, Direction, PeerEntry as PublicPeerEntry, PeerId, ProxyMode};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// A routing directive.
 #[derive(Debug)]
@@ -39,10 +46,22 @@ struct PeerEntry {
     mode: ProxyMode,
     addr: SocketAddr,
     rest_api_url: Option<String>,
+    agent_name: Option<String>,
+}
+
+/// Tracking entry for a peer we've handshaked with at some point. May or may
+/// not be currently connected — the `peers` map answers that.
+struct KnownPeer {
+    agent_name: Option<String>,
+    /// Unix epoch ms of the most recent connect or disconnect event for this peer.
+    last_seen_ms: u64,
 }
 
 pub struct Router {
     peers: HashMap<PeerId, PeerEntry>,
+    /// Peers we've handshaked with this session, keyed by socket address.
+    /// Populated on register; updated on disconnect.
+    known_peers: HashMap<SocketAddr, KnownPeer>,
     inv_table: InvTable,
     request_tracker: RequestTracker,
     sync_tracker: SyncTracker,
@@ -62,6 +81,7 @@ impl Router {
     pub fn new() -> Self {
         Self {
             peers: HashMap::new(),
+            known_peers: HashMap::new(),
             inv_table: InvTable::new(),
             request_tracker: RequestTracker::new(),
             sync_tracker: SyncTracker::new(),
@@ -76,8 +96,63 @@ impl Router {
         self.consumed_codes.insert(code);
     }
 
-    pub fn register_peer(&mut self, peer_id: PeerId, direction: Direction, mode: ProxyMode, addr: SocketAddr, rest_api_url: Option<String>) {
-        self.peers.insert(peer_id, PeerEntry { direction, mode, addr, rest_api_url });
+    pub fn register_peer(
+        &mut self,
+        peer_id: PeerId,
+        direction: Direction,
+        mode: ProxyMode,
+        addr: SocketAddr,
+        rest_api_url: Option<String>,
+        agent_name: Option<String>,
+    ) {
+        self.peers.insert(
+            peer_id,
+            PeerEntry {
+                direction,
+                mode,
+                addr,
+                rest_api_url,
+                agent_name: agent_name.clone(),
+            },
+        );
+        self.known_peers.insert(addr, KnownPeer { agent_name, last_seen_ms: now_ms() });
+    }
+
+    /// Whether any currently-connected peer is bound to `addr`.
+    pub fn is_addr_connected(&self, addr: SocketAddr) -> bool {
+        self.peers.values().any(|p| p.addr == addr)
+    }
+
+    /// Snapshot of all known peers — currently connected ones first, then any
+    /// peers we've handshaked with this session but are no longer connected.
+    pub fn all_peers(&self) -> Vec<PublicPeerEntry> {
+        let mut out: Vec<PublicPeerEntry> = Vec::with_capacity(self.peers.len() + self.known_peers.len());
+        let mut connected_addrs: HashSet<SocketAddr> = HashSet::new();
+
+        for entry in self.peers.values() {
+            let last_seen = self.known_peers.get(&entry.addr).map(|k| k.last_seen_ms);
+            out.push(PublicPeerEntry {
+                address: entry.addr,
+                agent_name: entry.agent_name.clone(),
+                last_seen_ms: last_seen,
+                connection_type: Some(ConnectionType::from(entry.direction)),
+            });
+            connected_addrs.insert(entry.addr);
+        }
+
+        for (addr, known) in &self.known_peers {
+            if connected_addrs.contains(addr) {
+                continue;
+            }
+            out.push(PublicPeerEntry {
+                address: *addr,
+                agent_name: known.agent_name.clone(),
+                last_seen_ms: Some(known.last_seen_ms),
+                connection_type: None,
+            });
+        }
+
+        out
     }
 
     pub fn peer_addr(&self, peer_id: PeerId) -> Option<SocketAddr> {
@@ -102,7 +177,16 @@ impl Router {
                 self.request_tracker.purge_peer(peer_id);
                 self.sync_tracker.purge_peer(peer_id);
                 self.latency_tracker.purge_peer(peer_id);
-                self.peers.remove(&peer_id);
+                if let Some(entry) = self.peers.remove(&peer_id) {
+                    // Bump last_seen so the known-peer record reflects the
+                    // disconnect moment rather than the connect moment.
+                    self.known_peers.entry(entry.addr)
+                        .and_modify(|k| k.last_seen_ms = now_ms())
+                        .or_insert_with(|| KnownPeer {
+                            agent_name: entry.agent_name.clone(),
+                            last_seen_ms: now_ms(),
+                        });
+                }
                 vec![]
             }
 

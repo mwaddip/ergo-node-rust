@@ -50,6 +50,13 @@ pub const ID_BLOCK_VERSION: i8 = 123;
 /// i32 like the other IDs.
 pub const ID_SOFT_FORK_DISABLING_RULES: i8 = 124;
 
+/// One key-value field inside an extension section.
+///
+/// Wire layout: `key: [u8; 2]` (`SUBID || ID`) followed by `value: Vec<u8>`
+/// (max 64 bytes per JVM `ExtensionSerializer`). Used as the unit of both
+/// the parsed and packed forms of extension-section payloads.
+pub type ExtensionField = ([u8; 2], Vec<u8>);
+
 /// Voting epoch lengths and soft-fork timing parameters.
 ///
 /// Derived from network type (testnet vs mainnet) — not a runtime config
@@ -257,7 +264,7 @@ pub(crate) fn apply_ordinary_step(table: &mut HbHashMap<Parameter, i32>, signed_
 /// Returns a map keyed by signed param ID. The map will include ordinary
 /// IDs 1-8 plus reserved IDs 121, 122, 123 when present.
 pub fn parse_parameters_from_kv(
-    kv: &[([u8; 2], Vec<u8>)],
+    kv: &[ExtensionField],
 ) -> Result<HashMap<i8, i32>, crate::ChainError> {
     let mut out = HashMap::new();
     for (key, value) in kv {
@@ -293,7 +300,7 @@ pub fn parse_parameters_from_kv(
 /// passing through to the next epoch's expected output.
 ///
 /// Returns an empty `Vec` if no ID 124 entry is present.
-pub fn extract_disabling_rules_from_kv(kv: &[([u8; 2], Vec<u8>)]) -> Vec<u8> {
+pub fn extract_disabling_rules_from_kv(kv: &[ExtensionField]) -> Vec<u8> {
     for (key, value) in kv {
         if key[0] == 0x00 && (key[1] as i8) == ID_SOFT_FORK_DISABLING_RULES {
             return value.clone();
@@ -419,7 +426,7 @@ pub fn default_proposed_update_bytes(network: crate::Network) -> Vec<u8> {
 ///
 /// Output ordering is sorted by param ID for determinism. Skips ID 124
 /// (deferred — see [`parse_parameters_from_kv`]).
-pub fn pack_parameters_to_kv(params: &HashMap<i8, i32>) -> Vec<([u8; 2], Vec<u8>)> {
+pub fn pack_parameters_to_kv(params: &HashMap<i8, i32>) -> Vec<ExtensionField> {
     let mut entries: Vec<(i8, i32)> = params
         .iter()
         .filter(|(&id, _)| id != ID_SOFT_FORK_DISABLING_RULES)
@@ -452,7 +459,7 @@ pub fn pack_parameters_to_kv(params: &HashMap<i8, i32>) -> Vec<([u8; 2], Vec<u8>
 /// should validate the header ID matches the expected modifier link.
 pub fn parse_extension_bytes(
     bytes: &[u8],
-) -> Result<(ergo_chain_types::BlockId, Vec<([u8; 2], Vec<u8>)>), crate::ChainError> {
+) -> Result<(ergo_chain_types::BlockId, Vec<ExtensionField>), crate::ChainError> {
     use crate::ChainError;
     use ergo_chain_types::{BlockId, Digest32};
     use sigma_ser::vlq_encode::ReadSigmaVlqExt;
@@ -508,7 +515,7 @@ pub fn parse_extension_bytes(
 /// `ExtensionSerializer` body format (header_id + VLQ count + fields).
 pub fn pack_extension_bytes(
     header_id: &ergo_chain_types::BlockId,
-    fields: &[([u8; 2], Vec<u8>)],
+    fields: &[ExtensionField],
 ) -> Vec<u8> {
     use sigma_ser::vlq_encode::WriteSigmaVlqExt;
 
@@ -589,7 +596,7 @@ mod tests {
 
     #[test]
     fn tally_three_slots_per_header() {
-        let headers = vec![[1u8, 0, 0], [1, 2, 0], [1, 2, 3]];
+        let headers = [[1u8, 0, 0], [1, 2, 0], [1, 2, 3]];
         let refs: Vec<&[u8; 3]> = headers.iter().collect();
         let tally = tally_votes(refs);
         assert_eq!(tally.get(&1), Some(&3));
@@ -608,7 +615,7 @@ mod tests {
     #[test]
     fn tally_negative_votes_distinct() {
         // 0xFF = -1 as i8 = "decrease StorageFeeFactor"
-        let headers = vec![[1u8, 0xFF, 0]];
+        let headers = [[1u8, 0xFF, 0]];
         let refs: Vec<&[u8; 3]> = headers.iter().collect();
         let tally = tally_votes(refs);
         assert_eq!(tally.get(&1), Some(&1));

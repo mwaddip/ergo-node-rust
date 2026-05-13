@@ -52,6 +52,51 @@ pub struct PeerApiUrl {
     pub url: String,
 }
 
+/// Single peer entry for GET /peers/all and GET /peers/connected.
+/// `connection_type` is "Outgoing" / "Incoming" for connected peers, null otherwise.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerInfoEntry {
+    pub address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<u64>,
+    pub connection_type: Option<String>,
+}
+
+/// GET /peers/status response.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerStatus {
+    /// Unix epoch ms of the last incoming P2P message; null if none yet.
+    pub last_incoming_message: Option<u64>,
+    /// Current local clock (Unix epoch ms).
+    pub current_network_time: u64,
+}
+
+/// GET /peers/blacklisted response.
+#[derive(Serialize)]
+pub struct PeersBlacklisted {
+    /// Penalty-banned peer addresses as "host:port".
+    pub addresses: Vec<String>,
+}
+
+/// Single entry inside GET /utxo/getSnapshotsInfo's `availableManifests`.
+#[derive(Serialize)]
+pub struct SnapshotManifestEntry {
+    pub height: u32,
+    /// Hex-encoded Blake2b256 manifest digest.
+    pub digest: String,
+}
+
+/// GET /utxo/getSnapshotsInfo response.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotsInfo {
+    pub available_manifests: Vec<SnapshotManifestEntry>,
+}
+
 /// GET /debug/memory response — breakdown of where the process's memory goes.
 ///
 /// Helps answer "do we actually need everything that's resident?" Combines

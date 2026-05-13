@@ -27,6 +27,25 @@ fn mining_err() -> (StatusCode, Json<ApiError>) {
     }))
 }
 
+/// Parse the inner proof_bytes out of a raw AD proofs section.
+///
+/// Stored format: `[header_id: 32B] [proof_size: VLQ u32] [proof_bytes: proof_size B]`.
+/// Returns the proof_bytes slice. None on malformed input.
+fn inline_ad_proof_bytes(data: &[u8]) -> Option<&[u8]> {
+    use sigma_ser::vlq_encode::ReadSigmaVlqExt;
+    if data.len() < 33 {
+        return None;
+    }
+    let mut cursor = std::io::Cursor::new(&data[32..]);
+    let proof_size = cursor.get_u32().ok()? as usize;
+    let pos = 32 + cursor.position() as usize;
+    let end = pos.checked_add(proof_size)?;
+    if end > data.len() {
+        return None;
+    }
+    Some(&data[pos..end])
+}
+
 /// Compute modifier ID = blake2b256(type_id || header_id || section_root).
 /// Matches JVM's `Algos.hash.prefixedHash`.
 fn section_modifier_id(type_id: u8, header_id: &[u8; 32], root: &[u8]) -> [u8; 32] {
@@ -48,6 +67,53 @@ fn hex_to_id(hex_str: &str) -> Result<[u8; 32], (StatusCode, Json<ApiError>)> {
         (StatusCode::BAD_REQUEST, Json(ApiError { error: 400, reason: "ID must be 32 bytes".into(), detail: None }))
     })?;
     Ok(arr)
+}
+
+/// Constant-time check of the `api_key` request header against the configured hash.
+/// When `state.api_key_hash` is `None`, every request passes (unauth mode).
+/// When set, requests must supply a header whose Blake2b256 matches.
+fn check_api_key(
+    state: &ApiState,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let Some(expected) = state.api_key_hash else {
+        return Ok(());
+    };
+    let provided = headers
+        .get("api_key")
+        .or_else(|| headers.get("api-key"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if provided.is_empty() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError { error: 403, reason: "api_key required".into(), detail: None }),
+        ));
+    }
+    use blake2::digest::consts::U32;
+    use blake2::{Blake2b, Digest};
+    type Blake2b256 = Blake2b<U32>;
+    let mut hasher = Blake2b256::new();
+    hasher.update(provided.as_bytes());
+    let provided_hash: [u8; 32] = hasher.finalize().into();
+    // Constant-time compare to defeat timing oracles.
+    if subtle_constant_eq(&provided_hash, &expected) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError { error: 403, reason: "invalid api_key".into(), detail: None }),
+        ))
+    }
+}
+
+/// Constant-time byte comparison. Bit-OR all diffs, return early-exit-free `==`.
+fn subtle_constant_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff: u8 = 0;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -989,6 +1055,429 @@ fn read_proc_memory() -> ProcessMemory {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GET /blocks?offset=0&limit=50
+// ---------------------------------------------------------------------------
+
+pub async fn get_blocks(
+    State(state): State<ApiState>,
+    Query(params): Query<PaginationParams>,
+) -> Json<Vec<String>> {
+    let limit = params.limit.min(100) as u32;
+    let offset = params.offset.min(u32::MAX as usize) as u32;
+    let ids = state.chain.header_ids(offset, limit);
+    Json(ids.iter().map(hex::encode).collect())
+}
+
+// ---------------------------------------------------------------------------
+// GET /blocks/{header_id}  — full block (header + transactions + adProofs + extension)
+// ---------------------------------------------------------------------------
+
+/// Block sections modifier type IDs.
+const AD_PROOFS_TYPE: u8 = 104;
+const EXTENSION_TYPE: u8 = 108;
+const HEADER_TYPE: u8 = 101;
+
+pub async fn get_full_block(
+    State(state): State<ApiState>,
+    Path(header_id): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let id = hex_to_id(&header_id)?;
+    let header = match state.chain.header_by_id(&id) {
+        Some(h) => h,
+        None => return err(StatusCode::NOT_FOUND, "header not found"),
+    };
+    let header_id_hex = hex::encode(id);
+
+    // Block transactions: keyed by blake2b256(102 || header_id || transaction_root).
+    let txs_modifier_id =
+        section_modifier_id(BLOCK_TRANSACTIONS_TYPE, &id, header.transaction_root.0.as_ref());
+    let txs_value = match state.store.get(BLOCK_TRANSACTIONS_TYPE, &txs_modifier_id) {
+        Some(data) => {
+            let parsed = ergo_validation::parse_block_transactions(&data).map_err(|e| {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
+                    error: 500,
+                    reason: format!("failed to parse stored transactions: {e}"),
+                    detail: None,
+                }))
+            })?;
+            serde_json::json!({
+                "headerId": header_id_hex,
+                "transactions": parsed.transactions,
+                "blockVersion": parsed.block_version,
+                "size": data.len(),
+            })
+        }
+        None => return err(StatusCode::NOT_FOUND, "transactions not found"),
+    };
+
+    // AD proofs (optional in JVM): keyed by blake2b256(104 || header_id || ad_proofs_root).
+    // Stored format: [header_id: 32B] [proof_size: VLQ u32] [proof_bytes: proof_size B].
+    let ad_modifier_id =
+        section_modifier_id(AD_PROOFS_TYPE, &id, header.ad_proofs_root.0.as_ref());
+    let ad_proofs_value = state.store.get(AD_PROOFS_TYPE, &ad_modifier_id).and_then(|data| {
+        let proof_bytes = inline_ad_proof_bytes(&data)?;
+        Some(serde_json::json!({
+            "headerId": header_id_hex,
+            "proofBytes": hex::encode(proof_bytes),
+            "digest": hex::encode(header.ad_proofs_root.0.as_ref()),
+            "size": data.len(),
+        }))
+    });
+
+    // Extension: keyed by blake2b256(108 || header_id || extension_root).
+    let ext_modifier_id =
+        section_modifier_id(EXTENSION_TYPE, &id, header.extension_root.0.as_ref());
+    let extension_value = match state.store.get(EXTENSION_TYPE, &ext_modifier_id) {
+        Some(data) => {
+            let parsed = ergo_validation::parse_extension(&data).map_err(|e| {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
+                    error: 500,
+                    reason: format!("failed to parse stored extension: {e}"),
+                    detail: None,
+                }))
+            })?;
+            let fields: Vec<[String; 2]> = parsed
+                .fields
+                .iter()
+                .map(|f| [hex::encode(f.key), hex::encode(&f.value)])
+                .collect();
+            serde_json::json!({
+                "headerId": header_id_hex,
+                "digest": hex::encode(header.extension_root.0.as_ref()),
+                "fields": fields,
+            })
+        }
+        None => return err(StatusCode::NOT_FOUND, "extension not found"),
+    };
+
+    let mut full = serde_json::Map::new();
+    full.insert("header".into(), serde_json::to_value(&header).map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
+            error: 500, reason: format!("header serialization failed: {e}"), detail: None,
+        }))
+    })?);
+    full.insert("blockTransactions".into(), txs_value);
+    full.insert("extension".into(), extension_value);
+    full.insert("adProofs".into(), ad_proofs_value.unwrap_or(serde_json::Value::Null));
+    Ok(Json(serde_json::Value::Object(full)))
+}
+
+// ---------------------------------------------------------------------------
+// GET /blocks/modifier/{modifier_id}  — fetch by ID across types 101/102/104/108
+// ---------------------------------------------------------------------------
+
+pub async fn get_block_modifier(
+    State(state): State<ApiState>,
+    Path(modifier_id): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let id = hex_to_id(&modifier_id)?;
+    for &type_id in &[HEADER_TYPE, BLOCK_TRANSACTIONS_TYPE, AD_PROOFS_TYPE, EXTENSION_TYPE] {
+        let Some(data) = state.store.get(type_id, &id) else { continue };
+        let id_hex = hex::encode(id);
+        let value = match type_id {
+            HEADER_TYPE => {
+                // Headers stored by header ID, so id IS the header ID.
+                match state.chain.header_by_id(&id) {
+                    Some(h) => serde_json::to_value(&h).map_err(|e| {
+                        (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
+                            error: 500, reason: format!("header serialization failed: {e}"), detail: None,
+                        }))
+                    })?,
+                    None => serde_json::json!({ "type": "header", "id": id_hex, "size": data.len() }),
+                }
+            }
+            BLOCK_TRANSACTIONS_TYPE => {
+                let parsed = ergo_validation::parse_block_transactions(&data).map_err(|e| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
+                        error: 500, reason: format!("parse failed: {e}"), detail: None,
+                    }))
+                })?;
+                serde_json::json!({
+                    "headerId": hex::encode(parsed.header_id),
+                    "transactions": parsed.transactions,
+                    "blockVersion": parsed.block_version,
+                    "size": data.len(),
+                })
+            }
+            AD_PROOFS_TYPE => {
+                // Stored: [header_id: 32B] [proof_size: VLQ] [proof_bytes].
+                if data.len() < 32 {
+                    return err(StatusCode::INTERNAL_SERVER_ERROR, "ad_proofs too short");
+                }
+                let inner_header_id = hex::encode(&data[..32]);
+                let proof_bytes = match inline_ad_proof_bytes(&data) {
+                    Some(b) => b,
+                    None => return err(StatusCode::INTERNAL_SERVER_ERROR, "malformed ad_proofs"),
+                };
+                serde_json::json!({
+                    "headerId": inner_header_id,
+                    "proofBytes": hex::encode(proof_bytes),
+                    "size": data.len(),
+                })
+            }
+            EXTENSION_TYPE => {
+                let parsed = ergo_validation::parse_extension(&data).map_err(|e| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
+                        error: 500, reason: format!("parse failed: {e}"), detail: None,
+                    }))
+                })?;
+                let fields: Vec<[String; 2]> = parsed
+                    .fields
+                    .iter()
+                    .map(|f| [hex::encode(f.key), hex::encode(&f.value)])
+                    .collect();
+                serde_json::json!({
+                    "headerId": hex::encode(parsed.header_id),
+                    "fields": fields,
+                })
+            }
+            _ => unreachable!(),
+        };
+        return Ok(Json(value));
+    }
+    err(StatusCode::NOT_FOUND, "modifier not found")
+}
+
+// ---------------------------------------------------------------------------
+// HEAD /transactions/unconfirmed/{tx_id}  — status only, empty body
+// ---------------------------------------------------------------------------
+
+pub async fn head_unconfirmed(
+    State(state): State<ApiState>,
+    Path(tx_id): Path<String>,
+) -> StatusCode {
+    // Malformed hex → 404 (HEAD has no body to put a reason in, so we map to 404
+    // for any input the mempool can't possibly contain).
+    let Ok(id) = hex_to_id_status(&tx_id) else {
+        return StatusCode::NOT_FOUND;
+    };
+    let pool = state.mempool.lock().await;
+    if pool.contains(&id) {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
+fn hex_to_id_status(hex_str: &str) -> Result<[u8; 32], ()> {
+    let bytes = hex::decode(hex_str).map_err(|_| ())?;
+    bytes.try_into().map_err(|_| ())
+}
+
+// ---------------------------------------------------------------------------
+// GET /transactions/waitTime?fee=...&txSize=...
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct WaitTimeParams {
+    fee: u64,
+    #[serde(rename = "txSize", default = "default_tx_size")]
+    tx_size: usize,
+}
+
+#[derive(serde::Serialize)]
+pub struct WaitTimeResponse {
+    #[serde(rename = "waitTime")]
+    wait_time: u64,
+}
+
+pub async fn get_wait_time(
+    State(state): State<ApiState>,
+    Query(params): Query<WaitTimeParams>,
+) -> ApiResult<WaitTimeResponse> {
+    let tx_size = params.tx_size.min(1_000_000);
+    let pool = state.mempool.lock().await;
+    match pool.expected_wait_time(params.fee, tx_size) {
+        Some(wait_ms) => {
+            // Convert milliseconds back to blocks (target block time ~2 min).
+            // recommended_fee/expected_wait_time work in ms; the endpoint
+            // returns blocks per the JVM contract.
+            let blocks = wait_ms / 120_000;
+            Ok(Json(WaitTimeResponse { wait_time: blocks }))
+        }
+        None => err(StatusCode::BAD_REQUEST, "insufficient fee history"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /utxo/withPool/byIds  — batch lookup, max 100, positional null for missing
+// ---------------------------------------------------------------------------
+
+pub async fn post_utxo_with_pool_by_ids(
+    State(state): State<ApiState>,
+    Json(ids): Json<Vec<String>>,
+) -> ApiResult<Vec<Option<ergo_validation::ErgoBox>>> {
+    if ids.len() > 100 {
+        return err(StatusCode::BAD_REQUEST, "max 100 box IDs per request");
+    }
+    // Parse and lookup. Malformed IDs are treated as "not found" (return null),
+    // not as a 400 — the contract is positional, and rejecting the whole batch
+    // for one bad ID would be operationally hostile.
+    let mut results: Vec<Option<ergo_validation::ErgoBox>> = Vec::with_capacity(ids.len());
+    let pool = state.mempool.lock().await;
+    for hex_id in &ids {
+        let parsed = hex::decode(hex_id).ok().and_then(|b| <[u8; 32]>::try_from(b).ok());
+        match parsed {
+            Some(id) => {
+                let found = state
+                    .utxo_reader
+                    .box_by_id(&id)
+                    .or_else(|| pool.unconfirmed_box(&id).cloned());
+                results.push(found);
+            }
+            None => results.push(None),
+        }
+    }
+    Ok(Json(results))
+}
+
+// ---------------------------------------------------------------------------
+// GET /utxo/getSnapshotsInfo  — { "availableManifests": [ {height, digest} ] }
+// ---------------------------------------------------------------------------
+
+pub async fn get_snapshots_info(State(state): State<ApiState>) -> Json<SnapshotsInfo> {
+    let inventory = (state.snapshots_info)();
+    let available_manifests = inventory
+        .into_iter()
+        .map(|e| SnapshotManifestEntry {
+            height: e.height,
+            digest: hex::encode(e.digest),
+        })
+        .collect();
+    Json(SnapshotsInfo { available_manifests })
+}
+
+// ---------------------------------------------------------------------------
+// GET /peers/all  — connected + disconnected
+// ---------------------------------------------------------------------------
+
+pub async fn get_all_peers(State(state): State<ApiState>) -> Json<Vec<PeerInfoEntry>> {
+    let peers = (state.peer_all)();
+    Json(peers.into_iter().map(peer_info_to_entry).collect())
+}
+
+fn peer_info_to_entry(p: crate::PeerInfo) -> PeerInfoEntry {
+    PeerInfoEntry {
+        address: p.address.to_string(),
+        name: p.name,
+        last_seen: p.last_seen,
+        connection_type: p.connection_type,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /peers/status  — { lastIncomingMessage, currentNetworkTime }
+// ---------------------------------------------------------------------------
+
+pub async fn get_peers_status(State(state): State<ApiState>) -> Json<PeerStatus> {
+    let s = (state.peer_status)();
+    Json(PeerStatus {
+        last_incoming_message: s.last_incoming_message,
+        current_network_time: s.current_network_time,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// GET /peers/blacklisted  — { "addresses": [ "host:port", ... ] }
+// ---------------------------------------------------------------------------
+
+pub async fn get_blacklisted_peers(State(state): State<ApiState>) -> Json<PeersBlacklisted> {
+    let addrs = (state.peer_blacklisted)();
+    Json(PeersBlacklisted {
+        addresses: addrs.into_iter().map(|a| a.to_string()).collect(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// POST /peers/connect  — body: "host:port" string, auth required
+// ---------------------------------------------------------------------------
+
+pub async fn post_peers_connect(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> ApiResult<serde_json::Value> {
+    check_api_key(&state, &headers)?;
+    // Body is a JSON string like "1.2.3.4:9030". Strip surrounding quotes.
+    let trimmed = body.trim();
+    let addr_str = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(trimmed);
+    let addr: std::net::SocketAddr = addr_str.parse().map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(ApiError {
+            error: 400,
+            reason: format!("malformed socket address: {e}"),
+            detail: None,
+        }))
+    })?;
+    match (state.peer_connect)(addr) {
+        Ok(()) => Ok(Json(serde_json::json!({ "status": "queued" }))),
+        Err(reason) => err(StatusCode::BAD_REQUEST, reason),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /nipopow/popowHeader/{header_id}
+// GET /nipopow/popowHeader/last
+// ---------------------------------------------------------------------------
+
+pub async fn get_popow_header_by_id(
+    State(state): State<ApiState>,
+    Path(header_id): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let id = hex_to_id(&header_id)?;
+    popow_header_response(&state, id).await
+}
+
+pub async fn get_popow_header_last(
+    State(state): State<ApiState>,
+) -> ApiResult<serde_json::Value> {
+    let tip = match state.chain.tip() {
+        Some(t) => t,
+        None => return err(StatusCode::NOT_FOUND, "chain is empty"),
+    };
+    let mut tip_id = [0u8; 32];
+    tip_id.copy_from_slice(tip.id.0.as_ref());
+    popow_header_response(&state, tip_id).await
+}
+
+async fn popow_header_response(
+    state: &ApiState,
+    header_id: [u8; 32],
+) -> ApiResult<serde_json::Value> {
+    let chain = Arc::clone(&state.chain);
+    let result = tokio::task::spawn_blocking(move || chain.popow_header_by_id(&header_id))
+        .await
+        .map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
+                error: 500,
+                reason: format!("popow_header task panicked: {e}"),
+                detail: None,
+            }))
+        })?;
+    let bytes = match result {
+        Ok(Some(b)) => b,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "header not found"),
+        Err(reason) => return err(StatusCode::INTERNAL_SERVER_ERROR, reason),
+    };
+    let header = ergo_nipopow::PoPowHeader::scorex_parse_bytes(&bytes).map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
+            error: 500,
+            reason: "failed to parse popow header bytes".into(),
+            detail: Some(format!("{e:?}")),
+        }))
+    })?;
+    serde_json::to_value(&header).map(Json).map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
+            error: 500,
+            reason: format!("popow header serialization failed: {e}"),
+            detail: None,
+        }))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1067,6 +1556,12 @@ mod tests {
             _header_id: Option<[u8; 32]>,
         ) -> Result<Vec<u8>, String> {
             self.proof_result.clone()
+        }
+        fn header_ids(&self, _offset: u32, _limit: u32) -> Vec<[u8; 32]> {
+            vec![]
+        }
+        fn popow_header_by_id(&self, _id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
+            Ok(None)
         }
     }
 
@@ -1214,4 +1709,616 @@ mod tests {
     // complete `ApiState`, which is heavy for a one-call assertion — the
     // pre-check is a single `is_none()` branch and is covered by integration
     // testing against a real chain.
+
+    // -----------------------------------------------------------------------
+    // Helper / inline-parser tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn subtle_constant_eq_matches() {
+        let a = [0x11u8; 32];
+        let b = [0x11u8; 32];
+        assert!(subtle_constant_eq(&a, &b));
+    }
+
+    #[test]
+    fn subtle_constant_eq_differs() {
+        let a = [0x11u8; 32];
+        let mut b = [0x11u8; 32];
+        b[17] = 0x12;
+        assert!(!subtle_constant_eq(&a, &b));
+    }
+
+    #[test]
+    fn hex_to_id_status_ok() {
+        let hex = "00".repeat(32);
+        assert!(hex_to_id_status(&hex).is_ok());
+    }
+
+    #[test]
+    fn hex_to_id_status_bad_hex() {
+        assert!(hex_to_id_status("zzz").is_err());
+    }
+
+    #[test]
+    fn hex_to_id_status_wrong_length() {
+        assert!(hex_to_id_status("00").is_err()); // too short
+        assert!(hex_to_id_status(&"00".repeat(40)).is_err()); // too long
+    }
+
+    #[test]
+    fn inline_ad_proof_bytes_round_trip() {
+        // [header_id: 32] [VLQ-encoded size=3] [3 bytes payload]
+        let mut data = vec![0u8; 32];
+        // VLQ encoding of 3 is just the single byte 0x03 (no continuation).
+        data.push(0x03);
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let bytes = inline_ad_proof_bytes(&data).expect("ok");
+        assert_eq!(bytes, &[0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn inline_ad_proof_bytes_too_short() {
+        assert!(inline_ad_proof_bytes(&[]).is_none());
+        assert!(inline_ad_proof_bytes(&[0u8; 32]).is_none()); // missing size
+    }
+
+    #[test]
+    fn inline_ad_proof_bytes_truncated_payload() {
+        let mut data = vec![0u8; 32];
+        data.push(0x05); // claims 5 bytes
+        data.extend_from_slice(&[0xAA, 0xBB]); // only 2
+        assert!(inline_ad_proof_bytes(&data).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // ApiState builder + handler tests for the new endpoints
+    // -----------------------------------------------------------------------
+
+    use crate::{
+        BlockSubmitter, NodeMeta, PeerCounts, PeerInfo, PeerRestInfo,
+        PeerStatusSummary, SnapshotInfoEntry, StoreAccess, UtxoAccess,
+    };
+    use std::sync::atomic::AtomicU32;
+
+    /// Empty UTXO reader — every lookup returns None.
+    struct EmptyUtxoReader;
+    impl UtxoAccess for EmptyUtxoReader {
+        fn box_by_id(&self, _id: &[u8; 32]) -> Option<ergo_validation::ErgoBox> {
+            None
+        }
+    }
+
+    /// Empty store — every lookup returns None.
+    struct EmptyStore;
+    impl StoreAccess for EmptyStore {
+        fn get(&self, _type_id: u8, _id: &[u8; 32]) -> Option<Vec<u8>> {
+            None
+        }
+        fn get_at_height(&self, _type_id: u8, _height: u32) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    struct UnusedSubmitter;
+    impl BlockSubmitter for UnusedSubmitter {
+        fn submit(
+            &self,
+            _h: Header,
+            _b: Vec<u8>,
+            _a: Vec<u8>,
+            _e: Vec<u8>,
+        ) -> Result<(), String> {
+            Err("unused".into())
+        }
+    }
+
+    /// Build a minimal `ApiState` suitable for unit-testing handlers.
+    /// Callers override the relevant fields before invoking handlers.
+    fn test_state(chain: Arc<dyn ChainAccess>) -> ApiState {
+        let (_tx, rx) = tokio::sync::watch::channel(0u32);
+        ApiState {
+            chain,
+            store: Arc::new(EmptyStore),
+            mempool: Arc::new(tokio::sync::Mutex::new(ergo_mempool::Mempool::new(
+                ergo_mempool::types::MempoolConfig::default(),
+            ))),
+            utxo_reader: Arc::new(EmptyUtxoReader),
+            state_context: Arc::new(tokio::sync::RwLock::new(None)),
+            peer_count: Arc::new(|| PeerCounts { connected: 0 }),
+            node_info: Arc::new(NodeMeta {
+                name: "test".into(),
+                version: "0.0.0".into(),
+                network: "testnet".into(),
+                state_type: "utxo".into(),
+            }),
+            mining: None,
+            block_submitter: Some(Arc::new(UnusedSubmitter)),
+            validated_height: Arc::new(AtomicU32::new(0)),
+            downloaded_height: Arc::new(AtomicU32::new(0)),
+            peer_api_urls: Arc::new(Vec::<PeerRestInfo>::new) as _,
+            peer_all: Arc::new(Vec::<PeerInfo>::new) as _,
+            peer_status: Arc::new(|| PeerStatusSummary {
+                last_incoming_message: None,
+                current_network_time: 0,
+            }),
+            peer_blacklisted: Arc::new(Vec::<std::net::SocketAddr>::new) as _,
+            peer_connect: Arc::new(|_| Err("unused".into())) as _,
+            snapshots_info: Arc::new(Vec::<SnapshotInfoEntry>::new) as _,
+            api_key_hash: None,
+            modifier_tx: None,
+            height_watch: rx,
+            jemalloc_probe: None,
+        }
+    }
+
+    /// Mock chain that returns a configurable list of header IDs.
+    struct PaginatingChain {
+        ids: Vec<[u8; 32]>,
+    }
+    impl ChainAccess for PaginatingChain {
+        fn height(&self) -> u32 {
+            self.ids.len() as u32
+        }
+        fn header_at(&self, _h: u32) -> Option<Header> {
+            None
+        }
+        fn header_by_id(&self, _id: &[u8; 32]) -> Option<Header> {
+            None
+        }
+        fn tip(&self) -> Option<Header> {
+            None
+        }
+        fn build_nipopow_proof(
+            &self,
+            _m: u32,
+            _k: u32,
+            _id: Option<[u8; 32]>,
+        ) -> Result<Vec<u8>, String> {
+            Err("unused".into())
+        }
+        fn header_ids(&self, offset: u32, limit: u32) -> Vec<[u8; 32]> {
+            self.ids
+                .iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .copied()
+                .collect()
+        }
+        fn popow_header_by_id(&self, _id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn get_blocks_paginates() {
+        let ids = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
+        let chain = Arc::new(PaginatingChain { ids: ids.clone() });
+        let state = test_state(chain);
+        let rt = build_runtime();
+        let Json(result) = rt.block_on(get_blocks(
+            State(state),
+            Query(PaginationParams { offset: 0, limit: 2 }),
+        ));
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], hex::encode(ids[0]));
+    }
+
+    #[test]
+    fn get_blocks_limit_caps_at_100() {
+        let ids: Vec<_> = (0..200u8).map(|i| [i; 32]).collect();
+        let chain = Arc::new(PaginatingChain { ids });
+        let state = test_state(chain);
+        let rt = build_runtime();
+        let Json(result) = rt.block_on(get_blocks(
+            State(state),
+            // Request 500, hard cap is 100.
+            Query(PaginationParams { offset: 0, limit: 500 }),
+        ));
+        assert_eq!(result.len(), 100);
+    }
+
+    #[test]
+    fn head_unconfirmed_not_in_pool_returns_404() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let state = test_state(chain);
+        let rt = build_runtime();
+        let status = rt.block_on(head_unconfirmed(
+            State(state),
+            Path("00".repeat(32)),
+        ));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn head_unconfirmed_malformed_returns_404() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let state = test_state(chain);
+        let rt = build_runtime();
+        let status = rt.block_on(head_unconfirmed(State(state), Path("zzz".into())));
+        // Malformed id → can't possibly be in mempool → 404, not 400.
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn get_wait_time_no_history_returns_400() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let state = test_state(chain);
+        let rt = build_runtime();
+        let result = rt.block_on(get_wait_time(
+            State(state),
+            Query(WaitTimeParams { fee: 1_000_000, tx_size: 100 }),
+        ));
+        match result {
+            Err((status, body)) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(body.reason.contains("fee history"));
+            }
+            Ok(_) => panic!("expected 400 with empty mempool, got 200"),
+        }
+    }
+
+    #[test]
+    fn post_utxo_with_pool_by_ids_caps_at_100() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let state = test_state(chain);
+        let rt = build_runtime();
+        let ids: Vec<String> = (0..101).map(|_| "00".repeat(32)).collect();
+        let result = rt.block_on(post_utxo_with_pool_by_ids(State(state), Json(ids)));
+        match result {
+            Err((status, _)) => assert_eq!(status, StatusCode::BAD_REQUEST),
+            Ok(_) => panic!("expected 400 for >100 IDs"),
+        }
+    }
+
+    #[test]
+    fn post_utxo_with_pool_by_ids_returns_positional_null() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let state = test_state(chain);
+        let rt = build_runtime();
+        let ids = vec!["00".repeat(32), "zz".repeat(32), "11".repeat(32)];
+        let Json(results) = match rt.block_on(post_utxo_with_pool_by_ids(State(state), Json(ids))) {
+            Ok(v) => v,
+            Err((status, body)) => panic!("expected 200, got {status} / {}", body.reason),
+        };
+        // All three positions present, all null (empty UTXO + empty mempool + bad hex).
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn get_snapshots_info_empty() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let state = test_state(chain);
+        let rt = build_runtime();
+        let Json(info) = rt.block_on(get_snapshots_info(State(state)));
+        assert!(info.available_manifests.is_empty());
+    }
+
+    #[test]
+    fn get_snapshots_info_returns_inventory() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let mut state = test_state(chain);
+        state.snapshots_info = Arc::new(|| {
+            vec![SnapshotInfoEntry { height: 1_700_000, digest: [0xAB; 32] }]
+        });
+        let rt = build_runtime();
+        let Json(info) = rt.block_on(get_snapshots_info(State(state)));
+        assert_eq!(info.available_manifests.len(), 1);
+        assert_eq!(info.available_manifests[0].height, 1_700_000);
+        assert_eq!(info.available_manifests[0].digest, "ab".repeat(32));
+    }
+
+    #[test]
+    fn get_peers_status_returns_summary() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let mut state = test_state(chain);
+        state.peer_status = Arc::new(|| PeerStatusSummary {
+            last_incoming_message: Some(1_712_400_000_000),
+            current_network_time: 1_712_400_001_000,
+        });
+        let rt = build_runtime();
+        let Json(s) = rt.block_on(get_peers_status(State(state)));
+        assert_eq!(s.last_incoming_message, Some(1_712_400_000_000));
+        assert_eq!(s.current_network_time, 1_712_400_001_000);
+    }
+
+    #[test]
+    fn get_blacklisted_returns_addresses() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let mut state = test_state(chain);
+        state.peer_blacklisted = Arc::new(|| {
+            vec![
+                "1.2.3.4:9030".parse().unwrap(),
+                "[::1]:9030".parse().unwrap(),
+            ]
+        });
+        let rt = build_runtime();
+        let Json(result) = rt.block_on(get_blacklisted_peers(State(state)));
+        assert_eq!(result.addresses.len(), 2);
+        assert_eq!(result.addresses[0], "1.2.3.4:9030");
+    }
+
+    #[test]
+    fn peers_connect_rejects_malformed_addr() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let state = test_state(chain);
+        let rt = build_runtime();
+        let result = rt.block_on(post_peers_connect(
+            State(state),
+            axum::http::HeaderMap::new(),
+            "\"not-an-address\"".into(),
+        ));
+        match result {
+            Err((status, _)) => assert_eq!(status, StatusCode::BAD_REQUEST),
+            Ok(_) => panic!("expected 400 for malformed addr"),
+        }
+    }
+
+    #[test]
+    fn peers_connect_calls_callback_on_valid_addr() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let mut state = test_state(chain);
+        let called = Arc::new(std::sync::Mutex::new(None));
+        let called_clone = Arc::clone(&called);
+        state.peer_connect = Arc::new(move |addr| {
+            *called_clone.lock().unwrap() = Some(addr);
+            Ok(())
+        });
+        let rt = build_runtime();
+        let result = rt.block_on(post_peers_connect(
+            State(state),
+            axum::http::HeaderMap::new(),
+            "\"1.2.3.4:9030\"".into(),
+        ));
+        assert!(result.is_ok());
+        let received = called.lock().unwrap().unwrap();
+        assert_eq!(received, "1.2.3.4:9030".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn peers_connect_propagates_callback_error() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let mut state = test_state(chain);
+        state.peer_connect = Arc::new(|_| Err("address is banned".into()));
+        let rt = build_runtime();
+        let result = rt.block_on(post_peers_connect(
+            State(state),
+            axum::http::HeaderMap::new(),
+            "\"1.2.3.4:9030\"".into(),
+        ));
+        match result {
+            Err((status, body)) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(body.reason.contains("banned"));
+            }
+            Ok(_) => panic!("expected 400, got 200"),
+        }
+    }
+
+    #[test]
+    fn peers_connect_rejects_without_api_key() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let mut state = test_state(chain);
+        // Pin a known hash that no missing-header request can match.
+        state.api_key_hash = Some([0x11u8; 32]);
+        let rt = build_runtime();
+        let result = rt.block_on(post_peers_connect(
+            State(state),
+            axum::http::HeaderMap::new(),
+            "\"1.2.3.4:9030\"".into(),
+        ));
+        match result {
+            Err((status, _)) => assert_eq!(status, StatusCode::FORBIDDEN),
+            Ok(_) => panic!("expected 403 without api_key"),
+        }
+    }
+
+    #[test]
+    fn peers_connect_rejects_wrong_api_key() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let mut state = test_state(chain);
+        state.api_key_hash = Some([0x11u8; 32]);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("api_key", "wrong".parse().unwrap());
+        let rt = build_runtime();
+        let result = rt.block_on(post_peers_connect(
+            State(state),
+            headers,
+            "\"1.2.3.4:9030\"".into(),
+        ));
+        match result {
+            Err((status, _)) => assert_eq!(status, StatusCode::FORBIDDEN),
+            Ok(_) => panic!("expected 403 for wrong key"),
+        }
+    }
+
+    #[test]
+    fn peers_connect_accepts_correct_api_key() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let mut state = test_state(chain);
+        // Hash of "secret"
+        use blake2::digest::consts::U32;
+        use blake2::{Blake2b, Digest};
+        type Blake2b256 = Blake2b<U32>;
+        let mut hasher = Blake2b256::new();
+        hasher.update(b"secret");
+        let expected: [u8; 32] = hasher.finalize().into();
+        state.api_key_hash = Some(expected);
+        state.peer_connect = Arc::new(|_| Ok(()));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("api_key", "secret".parse().unwrap());
+        let rt = build_runtime();
+        let result = rt.block_on(post_peers_connect(
+            State(state),
+            headers,
+            "\"1.2.3.4:9030\"".into(),
+        ));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn block_modifier_not_found_returns_404() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let state = test_state(chain);
+        let rt = build_runtime();
+        let result = rt.block_on(get_block_modifier(State(state), Path("aa".repeat(32))));
+        match result {
+            Err((status, _)) => assert_eq!(status, StatusCode::NOT_FOUND),
+            Ok(_) => panic!("expected 404"),
+        }
+    }
+
+    #[test]
+    fn block_modifier_bad_hex_returns_400() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let state = test_state(chain);
+        let rt = build_runtime();
+        let result = rt.block_on(get_block_modifier(State(state), Path("zzz".into())));
+        match result {
+            Err((status, _)) => assert_eq!(status, StatusCode::BAD_REQUEST),
+            Ok(_) => panic!("expected 400"),
+        }
+    }
+
+    #[test]
+    fn popow_header_unknown_returns_404() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let state = test_state(chain);
+        let rt = build_runtime();
+        let result =
+            rt.block_on(get_popow_header_by_id(State(state), Path("aa".repeat(32))));
+        match result {
+            Err((status, _)) => assert_eq!(status, StatusCode::NOT_FOUND),
+            Ok(_) => panic!("expected 404"),
+        }
+    }
+
+    #[test]
+    fn popow_header_last_empty_chain_returns_404() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let state = test_state(chain);
+        let rt = build_runtime();
+        let result = rt.block_on(get_popow_header_last(State(state)));
+        match result {
+            Err((status, _)) => assert_eq!(status, StatusCode::NOT_FOUND),
+            Ok(_) => panic!("expected 404"),
+        }
+    }
+
+    #[test]
+    fn full_block_unknown_header_returns_404() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let state = test_state(chain);
+        let rt = build_runtime();
+        let result =
+            rt.block_on(get_full_block(State(state), Path("aa".repeat(32))));
+        match result {
+            Err((status, _)) => assert_eq!(status, StatusCode::NOT_FOUND),
+            Ok(_) => panic!("expected 404"),
+        }
+    }
+
+    #[test]
+    fn get_all_peers_returns_entries() {
+        let chain = Arc::new(MockChain {
+            known_header_id: None,
+            header_for_known_id: None,
+            proof_result: Err("unused".into()),
+        });
+        let mut state = test_state(chain);
+        state.peer_all = Arc::new(|| {
+            vec![PeerInfo {
+                address: "1.2.3.4:9030".parse().unwrap(),
+                name: Some("ergo-mainnet-6.0.3".into()),
+                last_seen: Some(1_712_400_000_000),
+                connection_type: Some("Outgoing".into()),
+            }]
+        });
+        let rt = build_runtime();
+        let Json(entries) = rt.block_on(get_all_peers(State(state)));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].address, "1.2.3.4:9030");
+        assert_eq!(entries[0].connection_type.as_deref(), Some("Outgoing"));
+    }
 }
