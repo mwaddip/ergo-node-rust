@@ -2733,7 +2733,12 @@ mod light_client_install_tests {
     #[test]
     fn install_succeeds_on_empty_chain() {
         // A fresh chain accepts the install. tip(), height(), and is_empty()
-        // reflect the installed suffix.
+        // reflect the installed suffix. The returned Vec<InstalledHeader>
+        // enumerates every installed header in ascending height order with
+        // its cumulative score (head = 0, then accumulating per-header diffs).
+        use ergo_chain_types::autolykos_pow_scheme::decode_compact_bits;
+        use num_bigint::BigUint;
+
         let config = testnet_config();
         let mut chain = HeaderChain::new(config.clone());
         assert!(chain.is_empty());
@@ -2747,7 +2752,7 @@ mod light_client_install_tests {
         let last_id = suffix.last().unwrap().id;
         let last_height = suffix.last().unwrap().height;
 
-        chain
+        let installed = chain
             .install_from_nipopow_proof_no_pow(suffix_head, suffix_tail)
             .expect("install must succeed on empty chain");
 
@@ -2755,8 +2760,31 @@ mod light_client_install_tests {
         assert_eq!(chain.height(), last_height);
         assert_eq!(chain.tip().id, last_id);
         assert!(chain.light_client_mode());
-        // scores[0] = 0 — see Phase 6 doc on cumulative-difficulty meaninglessness.
-        assert_eq!(chain.score_at(1000).unwrap(), num_bigint::BigUint::ZERO);
+        // Suffix head's score is 0 — see Phase 6 doc on
+        // cumulative-difficulty meaninglessness across the install boundary.
+        assert_eq!(chain.score_at(1000).unwrap(), BigUint::ZERO);
+
+        // Returned Vec mirrors the installed suffix in ascending height
+        // order. Head entry starts at zero; subsequent entries accumulate
+        // decode_compact_bits(n_bits) per header.
+        assert_eq!(installed.len(), 5);
+        assert_eq!(installed[0].height, 1000);
+        assert_eq!(installed[0].id, suffix[0].id);
+        assert_eq!(installed[0].score_be, BigUint::ZERO.to_bytes_be());
+
+        let diff = decode_compact_bits(config.initial_n_bits)
+            .to_biguint()
+            .expect("non-negative difficulty");
+        for (i, entry) in installed.iter().enumerate().skip(1) {
+            let expected_score = diff.clone() * i as u32;
+            assert_eq!(entry.height, 1000 + i as u32, "entry {i} height");
+            assert_eq!(entry.id, suffix[i].id, "entry {i} id");
+            assert_eq!(
+                entry.score_be,
+                expected_score.to_bytes_be(),
+                "entry {i} score_be"
+            );
+        }
     }
 
     #[test]
@@ -2769,13 +2797,19 @@ mod light_client_install_tests {
         let head = make_chain_header(500, parent, 5_000_000, config.initial_n_bits);
         let head_id = head.id;
 
-        chain
+        let installed = chain
             .install_from_nipopow_proof_no_pow(head, vec![])
             .expect("install must succeed");
 
         assert_eq!(chain.height(), 500);
         assert_eq!(chain.tip().id, head_id);
         assert!(chain.light_client_mode());
+
+        // Single-entry Vec for a single-header install.
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].height, 500);
+        assert_eq!(installed[0].id, head_id);
+        assert_eq!(installed[0].score_be, num_bigint::BigUint::ZERO.to_bytes_be());
     }
 
     #[test]
@@ -3380,6 +3414,149 @@ mod lazy_cache_tests {
             BigUint::ZERO,
             "install-boundary score must be zero in cache"
         );
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    //! Tests for [`HeaderChain::restore`] — the v0.5.0 reconstruction
+    //! path that bypasses validation and trusts the store's
+    //! `BEST_CHAIN` index.
+
+    use ergo_chain_types::{BlockId, Digest32};
+
+    use crate::{ChainConfig, HeaderChain, RestoreError};
+
+    fn testnet_config() -> ChainConfig {
+        ChainConfig::testnet()
+    }
+
+    /// Deterministic block id from a height — fixture entries only need
+    /// to be distinct per height, no real chain linkage.
+    fn id_at(h: u32) -> BlockId {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&h.to_be_bytes());
+        BlockId(Digest32::from(bytes))
+    }
+
+    #[test]
+    fn restore_empty_iterator_yields_empty_chain() {
+        let chain = HeaderChain::restore(testnet_config(), std::iter::empty())
+            .expect("empty restore must succeed");
+        assert!(chain.is_empty());
+        assert_eq!(chain.len(), 0);
+        assert_eq!(chain.height(), 0);
+        // light_client_mode defaults to false when base_height is None.
+        assert!(!chain.light_client_mode());
+        // Loaders must not be auto-wired by restore.
+        assert!(!chain.has_header_loader());
+        assert!(!chain.has_score_loader());
+    }
+
+    #[test]
+    fn restore_single_entry_at_genesis_height_is_full_chain() {
+        let entries = vec![(1u32, id_at(1))];
+        let chain = HeaderChain::restore(testnet_config(), entries)
+            .expect("single-entry restore at h=1 must succeed");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain.height(), 1);
+        assert!(chain.contains(&id_at(1)));
+        // base_height == 1 → not a light-installed chain.
+        assert!(!chain.light_client_mode());
+    }
+
+    #[test]
+    fn restore_single_entry_above_genesis_implies_light_mode() {
+        // A chain whose store index starts above height 1 must have been
+        // installed from a NiPoPoW proof — the SPV difficulty skip is
+        // preserved across restart.
+        let entries = vec![(5_000_000u32, id_at(5_000_000))];
+        let chain = HeaderChain::restore(testnet_config(), entries)
+            .expect("single-entry restore at h=5M must succeed");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain.height(), 5_000_000);
+        assert!(chain.light_client_mode(), "h>1 base implies light mode");
+        assert_eq!(chain.reorg_floor(), 5_000_000);
+    }
+
+    #[test]
+    fn restore_multi_entry_contiguous_populates_by_id() {
+        let entries: Vec<(u32, BlockId)> =
+            (10u32..=14).map(|h| (h, id_at(h))).collect();
+        let chain = HeaderChain::restore(testnet_config(), entries)
+            .expect("contiguous restore must succeed");
+        assert_eq!(chain.len(), 5);
+        assert_eq!(chain.height(), 14);
+        // height_of round-trips for every entry.
+        for h in 10..=14 {
+            assert_eq!(chain.height_of(&id_at(h)), Some(h));
+        }
+        // base_height = 10 > 1 → light_client_mode.
+        assert!(chain.light_client_mode());
+        assert_eq!(chain.reorg_floor(), 10);
+    }
+
+    /// Unwrap the error variant — `HeaderChain` does not derive `Debug`
+    /// (loaders are `Arc<dyn Fn>`), so the standard `unwrap_err` won't
+    /// compile here.
+    fn restore_err(
+        config: ChainConfig,
+        entries: Vec<(u32, BlockId)>,
+    ) -> RestoreError {
+        match HeaderChain::restore(config, entries) {
+            Ok(_) => panic!("expected RestoreError, got Ok(HeaderChain)"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn restore_non_contiguous_heights_errors() {
+        // 1, 2, 4 — missing height 3.
+        let entries = vec![(1u32, id_at(1)), (2, id_at(2)), (4, id_at(4))];
+        assert_eq!(
+            restore_err(testnet_config(), entries),
+            RestoreError::NonContiguousHeights { expected: 3, got: 4 }
+        );
+    }
+
+    #[test]
+    fn restore_duplicate_height_errors() {
+        // 1, 2, 2 with distinct ids — second occurrence at height 2 fails
+        // the contiguity check (expected 3, got 2) BEFORE we'd reach the
+        // duplicate-id check, which is fine: it's still surfaced as a
+        // restore error and the chain is rejected.
+        let mut bytes = [0u8; 32];
+        bytes[31] = 0xAA;
+        let other_id_at_2 = BlockId(Digest32::from(bytes));
+        let entries = vec![(1u32, id_at(1)), (2, id_at(2)), (2, other_id_at_2)];
+        assert_eq!(
+            restore_err(testnet_config(), entries),
+            RestoreError::NonContiguousHeights { expected: 3, got: 2 }
+        );
+    }
+
+    #[test]
+    fn restore_duplicate_id_at_distinct_heights_errors() {
+        // Different heights but the same id — by_id.insert returns Some
+        // and we surface DuplicateHeight for the offending entry.
+        let entries = vec![(1u32, id_at(1)), (2, id_at(1))];
+        assert_eq!(
+            restore_err(testnet_config(), entries),
+            RestoreError::DuplicateHeight(2)
+        );
+    }
+
+    #[test]
+    fn restore_score_queries_miss_without_score_loader() {
+        // Score cache is empty after restore; with no ScoreLoader wired,
+        // queries within the chain's range must return None — the
+        // "Vec safety net" is gone in v0.5.0.
+        let entries: Vec<(u32, BlockId)> = (1u32..=3).map(|h| (h, id_at(h))).collect();
+        let chain = HeaderChain::restore(testnet_config(), entries)
+            .expect("contiguous restore must succeed");
+        assert!(chain.score_at(2).is_none());
+        // cumulative_score on a populated chain with no loader → 0 fallback.
+        assert_eq!(chain.cumulative_score(), num_bigint::BigUint::ZERO);
     }
 }
 

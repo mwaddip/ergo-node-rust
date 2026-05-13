@@ -9,7 +9,7 @@ use num_bigint::BigUint;
 
 use crate::cache::LazyHeaderStore;
 use crate::config::ChainConfig;
-use crate::error::ChainError;
+use crate::error::{ChainError, RestoreError};
 use crate::voting::{default_parameters, default_proposed_update_bytes, SOFT_FORK_VOTE};
 
 /// Map a signed parameter ID (1-8) to its [`Parameter`] enum variant.
@@ -46,6 +46,33 @@ pub enum AppendResult {
     Forked { fork_height: u32 },
 }
 
+/// One entry in the list returned by
+/// [`HeaderChain::install_from_nipopow_proof`]: a header that was just
+/// installed plus the chain's internal cumulative-difficulty score
+/// for it.
+///
+/// `score_be` is the big-endian byte encoding of [`BigUint`], suitable
+/// for direct persistence via `store.put_header(id, height, fork=0,
+/// score=score_be, data=...)`. The chain does NOT persist these — the
+/// integrator does; otherwise the store's [`ScoreLoader`] will return
+/// `None` on later queries and the chain's score-dependent paths
+/// break.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledHeader {
+    /// Block id of the installed header.
+    pub id: BlockId,
+    /// Height of the installed header.
+    pub height: u32,
+    /// Big-endian encoding of the cumulative-difficulty score this
+    /// chain assigned to the header. Starts at zero for the
+    /// suffix-head entry (cumulative-difficulty across the install
+    /// boundary is meaningless — see the install postcondition in
+    /// `facts/chain.md`) and accumulates
+    /// `decode_compact_bits(header.n_bits)` per subsequent suffix
+    /// header.
+    pub score_be: Vec<u8>,
+}
+
 /// A validated chain of headers.
 ///
 /// Every header in the chain has been checked for parent linkage, timestamp
@@ -66,18 +93,10 @@ pub struct HeaderChain {
     /// lookup. Kept as an in-memory index because hitting storage on
     /// every `contains()` / `height_of()` check is not worth the save
     /// (~64 MB at mainnet scale — an order of magnitude below the
-    /// retired header Vec, which was ~1.4 GB).
+    /// retired header Vec, which was ~1.4 GB). Also the canonical
+    /// source for [`Self::height`] / [`Self::len`] — chain length is
+    /// `by_id.len()` and the tip height is `base_height + by_id.len() - 1`.
     by_id: HashMap<BlockId, u32>,
-    /// Cumulative difficulty score at each height, base-relative:
-    /// `scores[0]` is the score at [`Self::base_height`].
-    ///
-    /// Not yet migrated to the lazy loader — `enr-store` currently
-    /// persists empty-placeholder scores for the best chain (see
-    /// `facts/store.md`). Chain keeps this Vec (~105 MB at mainnet)
-    /// as the source of truth until the store contract carries real
-    /// scores. That's a ~10× smaller footprint than the retired
-    /// header Vec, so leaving it is a pragmatic Phase 3 trade.
-    scores: Vec<BigUint>,
     /// Currently active blockchain parameters (Phase 6: Soft-Fork Voting).
     /// Updated only at epoch-boundary block validation via
     /// [`Self::apply_epoch_boundary_parameters`].
@@ -123,13 +142,14 @@ pub struct HeaderChain {
     /// they don't have. PoW verification, parent linkage, and timestamp
     /// bounds remain in force. See `facts/chain.md` Phase 6 invariants.
     light_client_mode: bool,
-    /// Lazy header/score store. After Phase 3, this is the sole
-    /// source of truth for header reads — the old `by_height` Vec is
-    /// gone. Callers register a [`HeaderLoader`] at startup so the
-    /// cache can fall through to persistent storage on eviction.
-    /// Score lookups still use the in-memory [`Self::scores`] Vec as
-    /// a safety net; the score slots on this store are coherent via
-    /// write-through but not yet authoritative.
+    /// Lazy header/score store. After v0.5.0 this is the sole source
+    /// of truth for both header and cumulative-score reads at heights
+    /// not currently in the LRU cache — the old `Vec<Header>` and
+    /// `Vec<BigUint>` safety nets are gone. Integrators MUST register
+    /// both a [`HeaderLoader`] and a [`ScoreLoader`] at startup; a
+    /// query that misses the cache and has no loader (or whose loader
+    /// returns `None`) is treated as "absent" exactly as the contract
+    /// specifies.
     lazy: LazyHeaderStore,
 }
 
@@ -154,13 +174,86 @@ impl HeaderChain {
             config,
             base_height: None,
             by_id: HashMap::new(),
-            scores: Vec::new(),
             active_parameters,
             active_proposed_update_bytes,
             extension_loader: None,
             light_client_mode: false,
             lazy: LazyHeaderStore::with_default_capacity(),
         }
+    }
+
+    /// Reconstruct a `HeaderChain` from a contiguous best-chain index
+    /// of `(height, header_id)` pairs.
+    ///
+    /// See `facts/chain.md` "Chain restore from store index" for the
+    /// full contract. Highlights:
+    /// - The first yielded entry's height becomes [`Self::base_height`].
+    ///   An empty iterator returns an empty chain.
+    /// - Each subsequent entry's height must equal the previous height
+    ///   plus one; otherwise [`RestoreError::NonContiguousHeights`] is
+    ///   returned and the partially-built chain is discarded.
+    /// - A duplicate height OR a duplicate header id is reported as
+    ///   [`RestoreError::DuplicateHeight`] for the offending height.
+    /// - `light_client_mode` is derived from the first entry's height:
+    ///   a chain starting above height 1 must have been installed from
+    ///   a NiPoPoW proof, and the SPV difficulty skip is preserved
+    ///   across restart. (A chain whose store index starts at height 1
+    ///   is treated as a normal full chain.)
+    /// - `active_parameters` and `active_proposed_update_bytes` are
+    ///   left at construction defaults. The integrator must call
+    ///   [`Self::recompute_active_parameters_from_storage`] after
+    ///   wiring an extension loader to bring them current.
+    /// - The header and score caches are empty; both loaders are
+    ///   unwired. The integrator MUST call [`Self::set_header_loader`]
+    ///   and [`Self::set_score_loader`] before any query that may miss
+    ///   the LRU cache.
+    pub fn restore<I>(config: ChainConfig, entries: I) -> Result<Self, RestoreError>
+    where
+        I: IntoIterator<Item = (u32, BlockId)>,
+    {
+        let active_parameters = default_parameters(config.network);
+        let active_proposed_update_bytes = default_proposed_update_bytes(config.network);
+
+        let mut by_id: HashMap<BlockId, u32> = HashMap::new();
+        let mut base_height: Option<u32> = None;
+        let mut prev_height: Option<u32> = None;
+
+        for (height, id) in entries {
+            match prev_height {
+                None => {
+                    base_height = Some(height);
+                }
+                Some(prev) => {
+                    let expected = prev + 1;
+                    if height != expected {
+                        return Err(RestoreError::NonContiguousHeights {
+                            expected,
+                            got: height,
+                        });
+                    }
+                }
+            }
+            // Duplicate id at a different height is reported via the
+            // offending entry's height — the user wants the height of
+            // the duplicate, not of the original.
+            if by_id.insert(id, height).is_some() {
+                return Err(RestoreError::DuplicateHeight(height));
+            }
+            prev_height = Some(height);
+        }
+
+        let light_client_mode = base_height.unwrap_or(1) > 1;
+
+        Ok(Self {
+            config,
+            base_height,
+            by_id,
+            active_parameters,
+            active_proposed_update_bytes,
+            extension_loader: None,
+            light_client_mode,
+            lazy: LazyHeaderStore::with_default_capacity(),
+        })
     }
 
     /// Validate and append a header to the chain.
@@ -198,12 +291,13 @@ impl HeaderChain {
 
     /// Height of the best validated chain tip, or 0 if empty.
     ///
-    /// Post-Phase-3 this is derived from [`Self::base_height`] and
-    /// the length of the score vector, which remain in lockstep on
-    /// every push/pop/reorg path.
+    /// Derived from [`Self::base_height`] and the `by_id` map size,
+    /// which remain in lockstep on every push/pop/reorg path. The
+    /// retired `scores: Vec<BigUint>` field used to play this role —
+    /// `by_id` carries the same information at no extra cost.
     pub fn height(&self) -> u32 {
         match self.base_height {
-            Some(base) if !self.scores.is_empty() => base + (self.scores.len() as u32) - 1,
+            Some(base) if !self.by_id.is_empty() => base + (self.by_id.len() as u32) - 1,
             _ => 0,
         }
     }
@@ -293,18 +387,21 @@ impl HeaderChain {
 
     /// Number of headers in the chain.
     pub fn len(&self) -> usize {
-        self.scores.len()
+        self.by_id.len()
     }
 
     /// Whether the chain is empty.
     pub fn is_empty(&self) -> bool {
-        self.scores.is_empty()
+        self.by_id.is_empty()
     }
 
     /// Cumulative difficulty score at the chain tip.
     ///
-    /// Phase 2 routing: delegates to [`Self::score_at`] for uniform
-    /// cache/loader/Vec resolution.
+    /// Returns `BigUint::ZERO` on an empty chain. Otherwise delegates
+    /// to [`Self::score_at`] for the tip height — that path is a
+    /// cache-resident hit in the common case (the tip was just
+    /// pushed) and only falls through to the [`ScoreLoader`] when the
+    /// cache has been evicted since.
     pub fn cumulative_score(&self) -> BigUint {
         if self.is_empty() {
             return BigUint::ZERO;
@@ -312,30 +409,20 @@ impl HeaderChain {
         self.score_at(self.height()).unwrap_or_default()
     }
 
-    /// Cumulative difficulty score at a given height.
+    /// Cumulative difficulty score at the given height, if it exists
+    /// in the chain.
     ///
-    /// Cache first; Vec safety net on miss. The score Vec remains
-    /// authoritative until `enr-store` carries real best-chain
-    /// scores — see the `scores` field comment.
+    /// Cache first; on miss falls through to the [`ScoreLoader`]. The
+    /// retired in-memory `Vec<BigUint>` safety net is gone — a height
+    /// not in cache and not returned by the loader is treated as
+    /// absent (`None`). Integrators MUST wire `set_score_loader`
+    /// before any query that may miss the LRU window.
     pub fn score_at(&self, height: u32) -> Option<BigUint> {
-        if let Some(cached) = self.lazy.get_score(height) {
-            debug_assert_eq!(
-                self.score_ref_from_vec(height),
-                Some(&cached),
-                "score cache/Vec disagreement at height {}",
-                height,
-            );
-            return Some(cached);
-        }
-        self.score_ref_from_vec(height).cloned()
-    }
-
-    /// Vec-only score lookup by height. The score Vec is still the
-    /// in-memory source of truth post-Phase-3.
-    fn score_ref_from_vec(&self, height: u32) -> Option<&BigUint> {
         let base = self.base_height?;
-        let idx = height.checked_sub(base)? as usize;
-        self.scores.get(idx)
+        if height < base || height > self.height() {
+            return None;
+        }
+        self.lazy.get_score(height)
     }
 
     /// `true` iff `height` is the start of a new voting epoch.
@@ -955,7 +1042,7 @@ impl HeaderChain {
         &mut self,
         suffix_head: Header,
         suffix_tail: Vec<Header>,
-    ) -> Result<(), ChainError> {
+    ) -> Result<Vec<InstalledHeader>, ChainError> {
         self.install_from_nipopow_proof_impl(suffix_head, suffix_tail, true)
     }
 
@@ -964,7 +1051,7 @@ impl HeaderChain {
         suffix_head: Header,
         suffix_tail: Vec<Header>,
         verify_pow: bool,
-    ) -> Result<(), ChainError> {
+    ) -> Result<Vec<InstalledHeader>, ChainError> {
         if !self.is_empty() {
             return Err(ChainError::ChainNotEmpty);
         }
@@ -977,30 +1064,38 @@ impl HeaderChain {
             crate::verify_pow(&suffix_head)?;
         }
 
+        let mut installed: Vec<InstalledHeader> =
+            Vec::with_capacity(1 + suffix_tail.len());
+
         // Push suffix_head bypassing validate_genesis: it is rarely actually
         // genesis (height 1) and its parent_id is whatever the upstream chain
-        // happens to be. scores[0] starts at 0 — see doc above.
+        // happens to be. The installed score for the suffix head starts at 0
+        // — see doc above.
         let head_id = suffix_head.id;
         let head_height = suffix_head.height;
         self.base_height = Some(head_height);
         self.by_id.insert(head_id, head_height);
         self.lazy.put(head_height, suffix_head, BigUint::ZERO);
-        self.scores.push(BigUint::ZERO);
         self.light_client_mode = true;
+        installed.push(InstalledHeader {
+            id: head_id,
+            height: head_height,
+            score_be: BigUint::ZERO.to_bytes_be(),
+        });
 
         // Walk suffix_tail. On any failure, roll back EVERYTHING (including
         // suffix_head and the light_client_mode flag) so the chain is
         // unchanged on Err per the postcondition.
         for header in suffix_tail {
-            let tip_id = self.tip().id;
-            if header.parent_id != tip_id {
+            let tip = self.tip();
+            if header.parent_id != tip.id {
                 self.rollback_install();
                 return Err(ChainError::ParentNotFound {
                     parent_id: header.parent_id,
                 });
             }
-            if header.height != self.tip().height + 1 {
-                let expected = self.tip().height + 1;
+            if header.height != tip.height + 1 {
+                let expected = tip.height + 1;
                 self.rollback_install();
                 return Err(ChainError::NonSequentialHeight {
                     expected,
@@ -1014,13 +1109,23 @@ impl HeaderChain {
                 }
             }
             // Use push_header so suffix_tail headers' scores are
-            // parent_score + diff. Since scores[0] = 0, this just accumulates
-            // diffs from the install boundary onwards — only deltas matter
-            // for post-install reorg comparisons.
+            // parent_score + diff. Since the head's score = 0, this just
+            // accumulates diffs from the install boundary onwards — only
+            // deltas matter for post-install reorg comparisons.
+            let height = header.height;
+            let id = header.id;
             self.push_header(header);
+            let score = self
+                .score_at(height)
+                .expect("score must be cache-resident immediately after push_header");
+            installed.push(InstalledHeader {
+                id,
+                height,
+                score_be: score.to_bytes_be(),
+            });
         }
 
-        Ok(())
+        Ok(installed)
     }
 
     /// Test variant of [`Self::install_from_nipopow_proof`] that skips the
@@ -1031,7 +1136,7 @@ impl HeaderChain {
         &mut self,
         suffix_head: Header,
         suffix_tail: Vec<Header>,
-    ) -> Result<(), ChainError> {
+    ) -> Result<Vec<InstalledHeader>, ChainError> {
         self.install_from_nipopow_proof_impl(suffix_head, suffix_tail, false)
     }
 
@@ -1039,7 +1144,6 @@ impl HeaderChain {
     fn rollback_install(&mut self) {
         self.base_height = None;
         self.by_id.clear();
-        self.scores.clear();
         self.light_client_mode = false;
         self.lazy.clear();
     }
@@ -1097,36 +1201,59 @@ impl HeaderChain {
 
     // --- Internal helpers ---
 
-    /// Push a validated header onto the chain with its cumulative
-    /// score. Sets [`Self::base_height`] on the first push.
+    /// Push a validated header onto the chain.
+    ///
+    /// Looks up the parent's cumulative score via [`Self::score_at`]
+    /// (cache + [`ScoreLoader`] fall-through), adds the header's
+    /// difficulty contribution, and writes through to the lazy store
+    /// plus `by_id`. On the first push (empty chain) the parent score
+    /// is `0` and `base_height` is set to the pushed header's height.
+    ///
+    /// # Panics
+    ///
+    /// On a non-empty chain, panics if the parent's score cannot be
+    /// resolved through cache or loader. That can only happen if the
+    /// integrator failed to wire a [`ScoreLoader`] AND the parent has
+    /// been evicted from the LRU cache — a configuration bug per the
+    /// `facts/chain.md` contract.
     fn push_header(&mut self, header: Header) {
-        if self.base_height.is_none() {
+        let is_first = self.base_height.is_none();
+        if is_first {
             self.base_height = Some(header.height);
         }
-        let parent_score = self.scores.last().cloned().unwrap_or_default();
+        let parent_score = if is_first {
+            BigUint::ZERO
+        } else {
+            self.score_at(header.height - 1).unwrap_or_else(|| {
+                panic!(
+                    "parent score at height {} unavailable during push_header — \
+                     cache evicted with no ScoreLoader wired",
+                    header.height - 1,
+                )
+            })
+        };
         let diff = header_difficulty(&header);
         let score = parent_score + diff;
         let height = header.height;
         let id = header.id;
-        self.lazy.put(height, header, score.clone());
-        self.scores.push(score);
+        self.lazy.put(height, header, score);
         self.by_id.insert(id, height);
     }
 
     /// Pop the tip header and its score. Returns both for rollback.
     /// Clears [`Self::base_height`] when the chain becomes empty.
     fn pop_header(&mut self) -> Option<(Header, BigUint)> {
-        if self.scores.is_empty() {
+        if self.is_empty() {
             return None;
         }
         let tip_height = self.height();
         let header = self.lazy.get_header(tip_height).expect(
             "tip header unavailable during pop — cache evicted with no loader wired",
         );
-        let score = self.scores.pop().unwrap_or_default();
+        let score = self.score_at(tip_height).unwrap_or_default();
         self.by_id.remove(&header.id);
         self.lazy.evict(tip_height);
-        if self.scores.is_empty() {
+        if self.by_id.is_empty() {
             self.base_height = None;
         }
         Some((header, score))
@@ -1142,8 +1269,7 @@ impl HeaderChain {
         let height = header.height;
         let id = header.id;
         self.by_id.insert(id, height);
-        self.lazy.put(height, header, score.clone());
-        self.scores.push(score);
+        self.lazy.put(height, header, score);
     }
 
     fn try_reorg_impl(
@@ -1153,7 +1279,7 @@ impl HeaderChain {
         verify_pow: bool,
     ) -> Result<BlockId, ChainError> {
         // Need at least 2 headers — can't reorg genesis.
-        if self.scores.len() < 2 {
+        if self.by_id.len() < 2 {
             return Err(ChainError::Reorg(
                 "chain too short for reorg (need at least 2 headers)".into(),
             ));
@@ -1241,13 +1367,12 @@ impl HeaderChain {
         }
 
         let base = self.base_height.expect("non-empty chain has a base_height");
-        let fork_idx = fork_point_height
-            .checked_sub(base)
-            .map(|i| i as usize)
-            .filter(|&i| i < self.scores.len())
-            .ok_or_else(|| {
-                ChainError::Reorg(format!("fork point height {fork_point_height} not in chain"))
-            })?;
+        let tip_height = self.height();
+        if fork_point_height < base || fork_point_height > tip_height {
+            return Err(ChainError::Reorg(format!(
+                "fork point height {fork_point_height} not in chain"
+            )));
+        }
 
         // First header's parent must match the fork point.
         let fork_point_id = self
@@ -1265,23 +1390,28 @@ impl HeaderChain {
             ));
         }
 
-        // Collect headers above the fork point so we can restore on
-        // failure. Pull from the lazy store (cache || loader) — if
-        // any is missing we can't safely reorg and we bail before
-        // mutating state.
-        let tip_height = self.height();
-        let mut saved_headers: Vec<Header> = Vec::with_capacity(
-            (tip_height - fork_point_height) as usize,
-        );
+        // Collect headers AND scores above the fork point so we can
+        // restore on failure. Pull from cache || loader — capturing
+        // scores BEFORE eviction is load-bearing now that the Vec
+        // safety net is gone. If any is missing we can't safely reorg
+        // and we bail before mutating state.
+        let saved_capacity = (tip_height - fork_point_height) as usize;
+        let mut saved_headers: Vec<Header> = Vec::with_capacity(saved_capacity);
+        let mut saved_scores: Vec<BigUint> = Vec::with_capacity(saved_capacity);
         for h in (fork_point_height + 1)..=tip_height {
             let hdr = self.lazy.get_header(h).ok_or_else(|| {
                 ChainError::Reorg(format!(
                     "header at height {h} unavailable for reorg drain"
                 ))
             })?;
+            let score = self.score_at(h).ok_or_else(|| {
+                ChainError::Reorg(format!(
+                    "score at height {h} unavailable for reorg drain"
+                ))
+            })?;
             saved_headers.push(hdr);
+            saved_scores.push(score);
         }
-        let saved_scores: Vec<BigUint> = self.scores.drain(fork_idx + 1..).collect();
         for h in &saved_headers {
             self.by_id.remove(&h.id);
             self.lazy.evict(h.height);
@@ -1327,8 +1457,9 @@ impl HeaderChain {
         }
 
         if failed {
-            // Rollback: pop any new headers we added.
-            while self.scores.len() > fork_idx + 1 {
+            // Rollback: pop any new headers we added (their heights
+            // sit strictly above the fork point).
+            while self.height() > fork_point_height {
                 self.pop_header();
             }
             // Restore saved state.
@@ -1336,8 +1467,7 @@ impl HeaderChain {
                 let height = header.height;
                 let id = header.id;
                 self.by_id.insert(id, height);
-                self.lazy.put(height, header, score.clone());
-                self.scores.push(score);
+                self.lazy.put(height, header, score);
             }
             return Err(fail_err.unwrap());
         }

@@ -20,11 +20,11 @@ mod tracker;
 mod voting;
 
 pub use cache::{HeaderLoader, ScoreLoader, DEFAULT_CACHE_CAPACITY};
-pub use chain::{AppendResult, HeaderChain};
+pub use chain::{AppendResult, HeaderChain, InstalledHeader};
 pub use config::{ChainConfig, Network};
 pub use ergo_chain_types::autolykos_pow_scheme::decode_compact_bits;
 pub use ergo_chain_types::{BlockId, Header};
-pub use error::ChainError;
+pub use error::{ChainError, RestoreError};
 pub use pow::verify_pow;
 pub use section::{
     required_section_ids, section_ids,

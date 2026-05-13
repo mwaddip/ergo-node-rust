@@ -1,5 +1,73 @@
 # Changelog
 
+## v0.5.0 — 2026-05-14
+
+Fast restart on partially-synced chains. Closes the v0.4.x crash-recovery
+silent-loading window from minutes to seconds by completing a deferred
+storage migration: header cumulative scores now live in the store
+(`HEADER_SCORES`) as real values instead of empty placeholders. Startup
+restores the chain by iterating `BEST_CHAIN` once and wiring loaders —
+no header replay, no PoW recheck, no difficulty recalculation.
+
+### **Operator notice: one-time scores backfill migration on first start**
+
+The v0.4.x store wrote empty placeholders to `HEADER_SCORES` for
+main-chain headers (a documented but deferred-to-someday migration —
+see [the chain crate's `scores` field comment](https://github.com/mwaddip/ergo-node-rust/blob/v0.4.4/chain/src/chain.rs)).
+v0.5.0 needs real cumulative scores there, so on the first start with
+the new binary, a one-shot migration walks `BEST_CHAIN` from height 1
+and computes `score(h) = score(h-1) + decode_compact_bits(header.n_bits)`
+into `HEADER_SCORES`.
+
+For a 1.76M-header full-mainnet store this is ~5-15 minutes on commodity
+SSD. **Progress is logged** every 10 000 headers:
+
+```
+INFO scores migration: starting (one-time backfill, may take 5-15 min on full mainnet) total=1784690
+INFO scores migration: progress done=10000 total=1784690
+INFO scores migration: progress done=20000 total=1784690
+...
+INFO scores migration: complete headers=1784690
+INFO scores migration: sentinel written
+```
+
+The migration is **resumable** — killing the process mid-walk leaves
+the sentinel unwritten, and the next start re-runs from height 1
+(every write is idempotent). After completion, the `chain_meta`
+sentinel `scores_migrated_v1` ensures the migration runs at most once.
+
+Subsequent restarts skip the migration and complete header chain
+restore in seconds.
+
+### Added
+- **`HeaderChain::restore`** constructor (`enr-chain`). Builds a chain
+  in O(n) HashMap inserts from a `(height, header_id)` iterator. No
+  header parsing, no PoW, no difficulty recalc — store vouches for the
+  data. `light_client_mode` is derived from `base_height > 1`.
+- **`ModifierStore::best_chain_entries`**, **`put_header_score`**,
+  **`chain_meta_get`**/**`chain_meta_put`** (`enr-store`). Building
+  blocks for the new restore path and the scores migration.
+- **`ModifierStore::put_batch` carries real scores for `type_id=101`**.
+  The entry tuple grows from 4 to 5 elements with an `Option<Vec<u8>>`
+  score required for headers and `None` for everything else.
+
+### Changed
+- **Startup restore replaces the v0.4.x backward-walk-then-replay path**.
+  On the reporter's 804k-height test node ([#6](https://github.com/mwaddip/ergo-node-rust/issues/6))
+  this was ~28 minutes of silent CPU-bound work after an unclean
+  shutdown. v0.5.0 restores the same chain in seconds — single
+  sequential `best_chain_entries` read + `HeaderChain::restore`.
+- **The chain's `scores: Vec<BigUint>` field is retired** (~105 MB
+  RSS reduction at full mainnet). Score lookups go exclusively
+  through the `ScoreLoader` wired by the main crate.
+- **`install_from_nipopow_proof` returns `Vec<InstalledHeader>`**
+  (each `{id, height, score_be}`) so the integrator persists scores
+  via the store, matching the new "store is the source of truth"
+  invariant. Chain no longer owns score persistence.
+- **`put` (single) with `type_id=101` is now rejected** — main-chain
+  header writes must use `put_batch` so the score travels alongside
+  the data atomically.
+
 ## v0.4.5 — 2026-05-13
 
 Operator-reported packaging and startup-visibility fixes. No protocol

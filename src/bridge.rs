@@ -9,6 +9,7 @@ use enr_p2p::protocol::peer::ProtocolEvent;
 use enr_p2p::types::PeerId;
 use enr_store::{ModifierStore, RedbModifierStore};
 use ergo_sync::{SyncChain, SyncStore, SyncTransport};
+use sigma_ser::ScorexSerializable;
 use tokio::sync::{mpsc, Mutex};
 
 /// Wraps `P2pNode` + event receiver to implement `SyncTransport`.
@@ -47,11 +48,12 @@ impl SyncTransport for P2pTransport {
 /// Wraps `Arc<Mutex<HeaderChain>>` to implement `SyncChain`.
 pub struct SharedChain {
     chain: Arc<Mutex<HeaderChain>>,
+    store: Arc<RedbModifierStore>,
 }
 
 impl SharedChain {
-    pub fn new(chain: Arc<Mutex<HeaderChain>>) -> Self {
-        Self { chain }
+    pub fn new(chain: Arc<Mutex<HeaderChain>>, store: Arc<RedbModifierStore>) -> Self {
+        Self { chain, store }
     }
 }
 
@@ -143,10 +145,27 @@ impl SyncChain for SharedChain {
         suffix_head: Header,
         suffix_tail: Vec<Header>,
     ) -> Result<(), ChainError> {
-        self.chain
+        let all_headers: Vec<Header> = std::iter::once(suffix_head.clone())
+            .chain(suffix_tail.iter().cloned())
+            .collect();
+        let installed = self
+            .chain
             .lock()
             .await
-            .install_from_nipopow_proof(suffix_head, suffix_tail)
+            .install_from_nipopow_proof(suffix_head, suffix_tail)?;
+
+        // Persist each installed header with its real cumulative score so
+        // the store's ScoreLoader can serve subsequent chain queries.
+        // install_from_nipopow_proof returns InstalledHeader entries in
+        // the same order as `all_headers`.
+        for (header, ih) in all_headers.iter().zip(installed.iter()) {
+            let raw = header.scorex_serialize_bytes()
+                .map_err(|e| ChainError::Nipopow(format!("re-serialize installed header: {e}")))?;
+            self.store
+                .put_header(&ih.id.0.0, ih.height, 0, &ih.score_be, &raw)
+                .map_err(|e| ChainError::Nipopow(format!("persist installed header: {e}")))?;
+        }
+        Ok(())
     }
 }
 

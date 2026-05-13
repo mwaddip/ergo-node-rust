@@ -22,6 +22,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use ergo_chain_types::{BlockId, Digest32};
+use enr_p2p::blacklist::Blacklist;
 use enr_p2p::transport::connection::Connection;
 use enr_p2p::transport::frame::Frame;
 use enr_p2p::transport::handshake::{HandshakeConfig, ModeConfig};
@@ -121,7 +122,7 @@ async fn nipopow_serve_round_trip_against_running_node() {
     let proof_bytes = timeout(Duration::from_secs(RESPONSE_TIMEOUT_SECS), async {
         loop {
             let frame = conn
-                .read_frame()
+                .read_frame(&Blacklist::new())
                 .await
                 .expect("read frame failed");
             eprintln!("received frame code={} body_len={}", frame.code, frame.body.len());
@@ -242,7 +243,7 @@ async fn nipopow_serve_full_chain_round_trip() {
         async {
             loop {
                 let frame = conn
-                    .read_frame()
+                    .read_frame(&Blacklist::new())
                     .await
                     .expect("read frame failed");
                 eprintln!(
@@ -347,7 +348,7 @@ async fn nipopow_serve_no_anchor_repro() {
 
     let proof_bytes = timeout(Duration::from_secs(FULL_CHAIN_BUILD_TIMEOUT_SECS), async {
         loop {
-            let frame = conn.read_frame().await.expect("read frame failed");
+            let frame = conn.read_frame(&Blacklist::new()).await.expect("read frame failed");
             if frame.code == NIPOPOW_PROOF {
                 return parse_nipopow_proof(&frame.body).expect("parse_nipopow_proof failed");
             }

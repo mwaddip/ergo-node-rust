@@ -154,7 +154,7 @@ impl ValidationPipeline {
         // Single pass: collect IDs for delivery tracker, partition headers from sections
         let mut received_ids = Vec::with_capacity(batch.len());
         let mut raw_headers: Vec<(&[u8], Option<u64>)> = Vec::new();
-        let mut section_entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = Vec::new();
+        let mut section_entries: Vec<(u8, [u8; 32], u32, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
 
         {
         let chain_guard = self.chain.lock().await;
@@ -178,7 +178,7 @@ impl ValidationPipeline {
                 } else {
                     0
                 };
-                section_entries.push((*type_id, *id, height, data.clone()));
+                section_entries.push((*type_id, *id, height, data.clone(), None));
             }
         }
         } // drop chain_guard
@@ -266,7 +266,7 @@ impl ValidationPipeline {
         let mut buffered = 0u32;
         let mut rejected = 0u32;
         let mut evicted_ids: Vec<[u8; 32]> = Vec::new();
-        let mut store_entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = Vec::new();
+        let mut store_entries: Vec<(u8, [u8; 32], u32, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
         // Pending deep reorg: (fork_point_height, [(header, raw_bytes)] in ascending order)
         let mut pending_reorg: Option<(u32, Vec<(Header, Vec<u8>)>)> = None;
 
@@ -283,7 +283,10 @@ impl ValidationPipeline {
             match chain.try_append(header.clone()) {
                 Ok(AppendResult::Extended) => {
                     chained += 1;
-                    store_entries.push((HEADER_TYPE_ID, header_id.0.0, header_height, raw));
+                    let score_bytes = chain.score_at(header_height)
+                        .expect("score for just-appended header")
+                        .to_bytes_be();
+                    store_entries.push((HEADER_TYPE_ID, header_id.0.0, header_height, raw, Some(score_bytes)));
                     if header_height % 400 < 2 {
                         tracing::debug!(height = header_height, id = %header_id, "chained header ID");
                     }
@@ -295,7 +298,10 @@ impl ValidationPipeline {
                         match chain.try_append(buf.clone()) {
                             Ok(AppendResult::Extended) => {
                                 chained += 1;
-                                store_entries.push((HEADER_TYPE_ID, bid.0.0, buf_height, buf_raw));
+                                let buf_score_bytes = chain.score_at(buf_height)
+                                    .expect("score for just-appended buffered header")
+                                    .to_bytes_be();
+                                store_entries.push((HEADER_TYPE_ID, bid.0.0, buf_height, buf_raw, Some(buf_score_bytes)));
                                 self.tracker.observe(&buf);
                                 next_parent = bid;
                             }
@@ -469,9 +475,14 @@ impl ValidationPipeline {
                     // parameter recomputation) would see the demoted chain.
                     // put_batch's unconditional BEST_CHAIN insert for type 101
                     // makes the new branch authoritative.
-                    let reorg_entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = new_branch_with_raw
+                    let reorg_entries: Vec<(u8, [u8; 32], u32, Vec<u8>, Option<Vec<u8>>)> = new_branch_with_raw
                         .into_iter()
-                        .map(|(h, raw)| (HEADER_TYPE_ID, h.id.0.0, h.height, raw))
+                        .map(|(h, raw)| {
+                            let score_bytes = chain.score_at(h.height)
+                                .expect("score for reorged header")
+                                .to_bytes_be();
+                            (HEADER_TYPE_ID, h.id.0.0, h.height, raw, Some(score_bytes))
+                        })
                         .collect();
                     let reorg_entry_count = reorg_entries.len();
                     if let Err(e) = self.store.put_batch(&reorg_entries) {

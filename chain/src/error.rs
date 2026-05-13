@@ -82,3 +82,21 @@ pub enum ChainError {
     #[error("chain not empty: install_from_nipopow_proof requires is_empty()")]
     ChainNotEmpty,
 }
+
+/// Errors returned by [`crate::HeaderChain::restore`] when the `(height,
+/// header_id)` iterator yielded by the store does not represent a
+/// contiguous best-chain index.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RestoreError {
+    /// A height in the iterator is not exactly one greater than the
+    /// previous height. The integrator's store index is gapped or
+    /// out-of-order — a chain restore cannot proceed.
+    #[error("restore: non-contiguous heights: expected {expected}, got {got}")]
+    NonContiguousHeights { expected: u32, got: u32 },
+
+    /// Two entries share the same height, or two entries share the same
+    /// header ID. Either case violates the "one header per height on the
+    /// best chain" invariant.
+    #[error("restore: duplicate height {0}")]
+    DuplicateHeight(u32),
+}

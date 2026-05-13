@@ -701,9 +701,9 @@ impl ergo_api::BlockSubmitter for MinedBlockSubmitter {
         // Pre-store all sections in the modifier store so the sync task can
         // find them when the chain advances.
         let entries = vec![
-            (enr_chain::BLOCK_TRANSACTIONS_TYPE_ID, block_txs_id, header.height, block_txs_bytes),
-            (enr_chain::AD_PROOFS_TYPE_ID, ad_proofs_id, header.height, ad_proofs_bytes),
-            (enr_chain::EXTENSION_TYPE_ID, extension_id, header.height, extension_bytes),
+            (enr_chain::BLOCK_TRANSACTIONS_TYPE_ID, block_txs_id, header.height, block_txs_bytes, None),
+            (enr_chain::AD_PROOFS_TYPE_ID, ad_proofs_id, header.height, ad_proofs_bytes, None),
+            (enr_chain::EXTENSION_TYPE_ID, extension_id, header.height, extension_bytes, None),
         ];
         self.store
             .put_batch(&entries)
@@ -1185,114 +1185,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(RedbModifierStore::new(&data_dir.join("modifiers.redb"))?);
     tracing::info!("modifier store opened");
 
-    // Shared header chain: pipeline writes, sync reads
-    let mut chain = HeaderChain::new(chain_config);
-
-    // Restore chain from stored headers by walking backward from the
-    // best-chain tip via parent_id. This is authoritative and resilient
-    // to holes in the best-chain height index: the headers-by-id
-    // (PRIMARY) table is dense, so following parent links from the
-    // recorded tip always reconstructs a contiguous chain if the header
-    // data itself is intact. The height-index approach was observed to
-    // fail on the Apr 7 test server, where a single-height hole at
-    // 219851 truncated the restored chain at 219850, which in turn
-    // made the resume-height scan fail and drop the validator back to
-    // sweep-from-1 against a persistent AVL at height 228737. Root
-    // cause in enr-store's write path is tracked separately; this
-    // loader tolerates the divergence regardless.
-    if let Some((tip_height, tip_id)) = store.best_header_tip()? {
-        tracing::info!(tip = tip_height, "restoring header chain from store (walk backward)");
-        // Walk backward collecting IDs only. Parsing each header just to
-        // extract parent_id and dropping it avoids keeping 1.76M fully
-        // deserialized Header structs resident alongside chain's own
-        // by_height storage — the previous Vec<Header> intermediate was
-        // the dominant startup RSS peak.
-        let mut ids: Vec<[u8; 32]> = Vec::with_capacity(tip_height as usize);
-        let mut current_id: [u8; 32] = tip_id;
-        let walk_ok = loop {
-            let data = match store.get(HEADER_TYPE_ID, &current_id)? {
-                Some(d) => d,
-                None => {
-                    tracing::error!(
-                        walked = ids.len(),
-                        missing_id = ?current_id,
-                        "backward chain walk: header data not found in store"
-                    );
-                    break false;
-                }
-            };
-            let header = match enr_chain::parse_header(&data) {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::error!(
-                        walked = ids.len(),
-                        "backward chain walk: header parse failed: {e}"
-                    );
-                    break false;
-                }
-            };
-            let parent_id: [u8; 32] = header.parent_id.0.0;
-            let is_genesis = header.height == 1;
-            ids.push(current_id);
-            if ids.len() % 100_000 == 0 {
-                tracing::info!(walked = ids.len(), tip = tip_height, "header chain restore: walking backward");
-            }
-            if is_genesis {
-                break true;
-            }
-            current_id = parent_id;
-        };
-
-        tracing::info!(headers = ids.len(), "header chain restore: walk complete, replaying forward");
-        // Replay forward, re-fetching and re-parsing one header at a time.
-        // redb's cache makes the second fetch cheap. If the walk failed
-        // before reaching genesis, the first try_append will fail parent
-        // linkage and we bail — matching the previous partial-replay behavior.
-        let mut loaded = 0u32;
-        for id in ids.into_iter().rev() {
-            let data = match store.get(HEADER_TYPE_ID, &id)? {
-                Some(d) => d,
-                None => {
-                    tracing::error!(
-                        loaded,
-                        "replay: header data vanished between walk and replay"
-                    );
-                    break;
-                }
-            };
-            let header = match enr_chain::parse_header(&data) {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::error!(loaded, "replay: header parse failed: {e}");
-                    break;
-                }
-            };
-            let h = header.height;
-            match chain.try_append(header) {
-                Ok(enr_chain::AppendResult::Extended) => {
-                    loaded += 1;
-                    if loaded % 100_000 == 0 {
-                        tracing::info!(loaded, tip = tip_height, "header chain restore: replaying forward");
-                    }
-                }
-                Ok(enr_chain::AppendResult::Forked { .. }) => {
-                    tracing::error!(height = h, "restored header detected as fork — store corrupted?");
-                    break;
-                }
-                Err(e) => {
-                    tracing::error!(height = h, "restored header append failed: {e}");
-                    break;
+    // One-shot scores backfill migration. v0.4.x stored empty
+    // placeholder scores for main-chain headers; v0.5.0 needs real
+    // cumulative scores so the chain's ScoreLoader can serve them.
+    // Idempotent — re-runs safely if killed mid-walk.
+    if store.chain_meta_get(b"scores_migrated_v1")?.is_none() {
+        let entries = store.best_chain_entries()?;
+        let total = entries.len();
+        if total > 0 {
+            tracing::info!(
+                total,
+                "scores migration: starting (one-time backfill, may take 5-15 min on full mainnet)"
+            );
+            let mut prev_score = enr_chain::BigUint::default();
+            for (i, (height, header_id)) in entries.iter().enumerate() {
+                let data = store
+                    .get(HEADER_TYPE_ID, header_id)?
+                    .ok_or_else(|| format!(
+                        "scores migration: header at h={} missing from PRIMARY (id={})",
+                        height,
+                        hex::encode(header_id),
+                    ))?;
+                let header = enr_chain::parse_header(&data)
+                    .map_err(|e| format!("scores migration: parse_header at h={}: {e}", height))?;
+                let difficulty = enr_chain::decode_compact_bits(header.n_bits)
+                    .to_biguint()
+                    .ok_or_else(|| format!("scores migration: bad nBits at h={}", height))?;
+                let score = if i == 0 && *height == 1 {
+                    // Full chain from genesis: score(1) = difficulty(1).
+                    difficulty.clone()
+                } else if i == 0 {
+                    // Light-client install boundary: base header score = 0
+                    // (matches install_from_nipopow_proof convention).
+                    enr_chain::BigUint::default()
+                } else {
+                    &prev_score + &difficulty
+                };
+                store.put_header_score(header_id, &score.to_bytes_be())?;
+                prev_score = score;
+                if (i + 1) % 10_000 == 0 {
+                    tracing::info!(done = i + 1, total, "scores migration: progress");
                 }
             }
+            tracing::info!(headers = total, "scores migration: complete, persisting sentinel");
+            store.flush()?;
         }
-        tracing::info!(
-            loaded,
-            tip = chain.height(),
-            declared_tip = tip_height,
-            walk_ok,
-            "restored header chain from store"
-        );
+        store.chain_meta_put(b"scores_migrated_v1", &[1u8])?;
+        store.flush()?;
+        tracing::info!("scores migration: sentinel written");
     }
+
+    // Restore chain state from BEST_CHAIN. Single sequential scan;
+    // ~25 MB ID material for a 1.76M-height chain, restored in
+    // milliseconds. No header parsing, no PoW recheck, no
+    // difficulty replay — the store vouches for that data.
+    tracing::info!("restoring header chain from store");
+    let best_chain_entries = store.best_chain_entries()?;
+    let entry_count = best_chain_entries.len();
+    let restore_entries = best_chain_entries.into_iter().map(|(h, id_bytes)| {
+        (h, ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(id_bytes)))
+    });
+    let mut chain = HeaderChain::restore(chain_config, restore_entries)
+        .map_err(|e| format!("header chain restore failed: {e:?}"))?;
+    tracing::info!(
+        headers = entry_count,
+        tip = chain.height(),
+        "header chain restored",
+    );
 
     // Wire the extension loader so chain can read epoch-boundary extensions
     // for parameter recomputation and nipopow proof construction. Bridges
@@ -1337,9 +1296,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Wire the header loader so chain's LRU cache can fall through to
         // storage on miss. Replaces the materialize-all-headers-in-memory
         // behavior — at 1.76M mainnet headers that was 1.4 GB of live heap.
-        // Score loader stays unwired: scores for main-chain headers are
-        // empty placeholders in the store (only fork headers carry real
-        // scores), so chain's Vec<BigUint> safety net is still authoritative.
         let store_for_header_loader = store.clone();
         chain.set_header_loader(move |height: u32| -> Option<ergo_chain_types::Header> {
             let header_bytes = match store_for_header_loader.read_header_at(height) {
@@ -1353,6 +1309,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(h) => Some(h),
                 Err(e) => {
                     tracing::warn!(height, error = %e, "header_loader: parse_header failed");
+                    None
+                }
+            }
+        });
+
+        // Wire the score loader. After v0.5.0 HEADER_SCORES carries
+        // real cumulative scores for every header, so this is now
+        // authoritative — there is no in-memory Vec<BigUint> safety
+        // net in the chain. Must be wired before any try_append that
+        // could miss the LRU cache (e.g. during sync's difficulty
+        // recalc walk on long chains).
+        let store_for_score_loader = store.clone();
+        chain.set_score_loader(move |height: u32| -> Option<enr_chain::BigUint> {
+            let header_id = match store_for_score_loader.best_header_at(height) {
+                Ok(v) => v?,
+                Err(e) => {
+                    tracing::warn!(height, error = %e, "score_loader: best_header_at failed");
+                    return None;
+                }
+            };
+            match store_for_score_loader.header_score(&header_id) {
+                Ok(Some(bytes)) if !bytes.is_empty() => Some(enr_chain::BigUint::from_bytes_be(&bytes)),
+                Ok(_) => {
+                    tracing::warn!(height, "score_loader: empty or missing score (post-migration store bug?)");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(height, error = %e, "score_loader: header_score failed");
                     None
                 }
             }
@@ -1532,7 +1516,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Bridge implementations
     let transport = P2pTransport::new(p2p.clone(), sync_events_rx);
-    let sync_chain = SharedChain::new(chain.clone());
+    let sync_chain = SharedChain::new(chain.clone(), store.clone());
 
     // Genesis state root — needed for fresh start or revalidation
     let genesis_digest_hex = match network {

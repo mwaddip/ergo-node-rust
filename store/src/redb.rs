@@ -1,4 +1,4 @@
-use crate::ModifierStore;
+use crate::{ModifierBatchEntry, ModifierStore};
 use ::redb::{Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::collections::HashMap;
 use std::path::Path;
@@ -9,6 +9,7 @@ const HEIGHT_INDEX: TableDefinition<(u8, u32), [u8; 32]> = TableDefinition::new(
 const HEADER_FORKS: TableDefinition<(u32, u32), [u8; 32]> = TableDefinition::new("header_forks");
 const HEADER_SCORES: TableDefinition<[u8; 32], &[u8]> = TableDefinition::new("header_scores");
 const BEST_CHAIN: TableDefinition<u32, [u8; 32]> = TableDefinition::new("best_chain");
+const CHAIN_META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chain_meta");
 
 /// redb-backed modifier store.
 pub struct RedbModifierStore {
@@ -17,7 +18,8 @@ pub struct RedbModifierStore {
     best_header_tip: RwLock<Option<(u32, [u8; 32])>>,
 }
 
-/// Error type wrapping redb's various error kinds.
+/// Error type wrapping redb's various error kinds, plus a few logical
+/// invariants this crate enforces above redb.
 #[derive(Debug)]
 pub enum StoreError {
     Database(::redb::DatabaseError),
@@ -25,6 +27,18 @@ pub enum StoreError {
     Table(::redb::TableError),
     Storage(::redb::StorageError),
     Commit(::redb::CommitError),
+    /// `put` was called with `type_id == 101`. Main-chain headers must
+    /// go through `put_batch` so the cumulative score is carried
+    /// alongside the data in a single atomic write.
+    SingleHeaderPutForbidden,
+    /// A `put_batch` entry with `type_id == 101` was missing its
+    /// cumulative score (`score == None`). No entries were written.
+    ScoreRequiredForHeader,
+    /// `put_header_score` was called for a header ID that has no
+    /// entry in PRIMARY. The migration that consumes this method
+    /// walks BEST_CHAIN, which is invariant-consistent with PRIMARY,
+    /// so this signals a caller bug.
+    HeaderNotInPrimary([u8; 32]),
 }
 
 impl std::fmt::Display for StoreError {
@@ -35,6 +49,21 @@ impl std::fmt::Display for StoreError {
             Self::Table(e) => write!(f, "table: {e}"),
             Self::Storage(e) => write!(f, "storage: {e}"),
             Self::Commit(e) => write!(f, "commit: {e}"),
+            Self::SingleHeaderPutForbidden => write!(
+                f,
+                "put(type_id=101, ...) forbidden; use put_batch with score=Some(...)"
+            ),
+            Self::ScoreRequiredForHeader => write!(
+                f,
+                "put_batch entry with type_id=101 requires score=Some(big_endian_bigint_bytes)"
+            ),
+            Self::HeaderNotInPrimary(id) => {
+                write!(f, "header_id 0x")?;
+                for b in id {
+                    write!(f, "{b:02x}")?;
+                }
+                write!(f, " not present in PRIMARY")
+            }
         }
     }
 }
@@ -47,6 +76,9 @@ impl std::error::Error for StoreError {
             Self::Table(e) => Some(e),
             Self::Storage(e) => Some(e),
             Self::Commit(e) => Some(e),
+            Self::SingleHeaderPutForbidden
+            | Self::ScoreRequiredForHeader
+            | Self::HeaderNotInPrimary(_) => None,
         }
     }
 }
@@ -210,9 +242,12 @@ impl ModifierStore for RedbModifierStore {
         height: u32,
         data: &[u8],
     ) -> Result<(), Self::Error> {
-        // Single-entry put is just put_batch with one entry; route through
-        // the same code path so type_id=101 lands in the fork-aware tables.
-        self.put_batch(&[(type_id, *id, height, data.to_vec())])
+        // Headers must go through put_batch so the cumulative score is
+        // written in the same atomic transaction as the header data.
+        if type_id == 101 {
+            return Err(StoreError::SingleHeaderPutForbidden);
+        }
+        self.put_batch(&[(type_id, *id, height, data.to_vec(), None)])
     }
 
     /// Stores a batch of modifiers atomically.
@@ -224,13 +259,28 @@ impl ModifierStore for RedbModifierStore {
     /// fork headers must go through put_header, which respects existing
     /// best-chain entries.
     ///
+    /// Each header entry carries its cumulative-difficulty score in the
+    /// 5th tuple element; this lands in HEADER_SCORES alongside the
+    /// PRIMARY/HEADER_FORKS/BEST_CHAIN writes. A `type_id == 101` entry
+    /// with `score == None` is rejected before any writes.
+    ///
     /// BEST_CHAIN inserts for headers are unconditional: main-chain headers
     /// authoritatively own their height slot and will overwrite a stale
     /// entry left by an earlier fork-first arrival or a deep reorg.
     fn put_batch(
         &self,
-        entries: &[(u8, [u8; 32], u32, Vec<u8>)],
+        entries: &[ModifierBatchEntry],
     ) -> Result<(), Self::Error> {
+        // Validate score precondition upfront so that an invalid batch
+        // is rejected without partial writes. (redb would roll back an
+        // un-committed txn anyway, but failing here is cheaper and the
+        // failure mode is obvious from the call site.)
+        for (type_id, _id, _height, _data, score) in entries {
+            if *type_id == 101 && score.is_none() {
+                return Err(StoreError::ScoreRequiredForHeader);
+            }
+        }
+
         let mut write_txn = self.db.begin_write()?;
         // Redb defaults to Durability::Immediate (fsync every commit). A
         // put_batch per block section saturates the disk's fsync budget on
@@ -249,27 +299,35 @@ impl ModifierStore for RedbModifierStore {
             let mut scores = write_txn.open_table(HEADER_SCORES)?;
             let mut best = write_txn.open_table(BEST_CHAIN)?;
 
-            for (type_id, id, height, data) in entries {
+            for (type_id, id, height, data, score) in entries {
                 primary.insert((*type_id, *id), data.as_slice())?;
 
-                if *type_id == 101 && *height > 0 {
+                if *type_id == 101 {
                     // Header — fork-aware tables. HEIGHT_INDEX is the legacy
                     // schema and is intentionally NOT written for type_id=101.
-                    // height==0 means "height unknown" — only update PRIMARY,
-                    // matching the long-standing put/put_batch contract.
-                    forks.insert((*height, 0u32), *id)?;
-                    // Empty score placeholder. Real cumulative-difficulty
-                    // scores are only computed for fork headers in pipeline;
-                    // main-chain header scores live in the in-memory chain
-                    // and are not currently persisted alongside the header.
-                    scores.insert(*id, [].as_slice())?;
-                    // Unconditional insert: main-chain is authoritative and
-                    // overwrites any stale fork or reorged entry at this height.
-                    best.insert(*height, *id)?;
-                    if new_best_tip.is_none_or(|t| *height > t.0) {
-                        new_best_tip = Some((*height, *id));
+                    // The score is now caller-provided real cumulative
+                    // difficulty (big-endian BigUint bytes), not an empty
+                    // placeholder; validated as Some(...) above.
+                    let score_bytes = score
+                        .as_ref()
+                        .expect("score validated as Some for type=101")
+                        .as_slice();
+                    scores.insert(*id, score_bytes)?;
+                    if *height > 0 {
+                        // height==0 means "height unknown" — update PRIMARY
+                        // and HEADER_SCORES (per-id) but skip the
+                        // height-indexed tables, matching the long-standing
+                        // "data refresh" semantics of put/put_batch.
+                        forks.insert((*height, 0u32), *id)?;
+                        // Unconditional insert: main-chain is authoritative
+                        // and overwrites any stale fork or reorged entry at
+                        // this height.
+                        best.insert(*height, *id)?;
+                        if new_best_tip.is_none_or(|t| *height > t.0) {
+                            new_best_tip = Some((*height, *id));
+                        }
                     }
-                } else if *type_id != 101 && *height > 0 {
+                } else if *height > 0 {
                     height_idx.insert((*type_id, *height), *id)?;
                 }
             }
@@ -278,7 +336,7 @@ impl ModifierStore for RedbModifierStore {
 
         // Update non-header tips cache (HEIGHT_INDEX-backed).
         let mut tips = self.tips.write();
-        for (type_id, id, height, _) in entries {
+        for (type_id, id, height, _, _) in entries {
             if *type_id != 101
                 && *height > 0
                 && tips.get(type_id).is_none_or(|tip| *height > tip.0)
@@ -443,6 +501,74 @@ impl ModifierStore for RedbModifierStore {
         Ok(value.map(|guard| guard.value().to_vec()))
     }
 
+    fn put_header_score(
+        &self,
+        id: &[u8; 32],
+        score: &[u8],
+    ) -> Result<(), Self::Error> {
+        // Verify the header exists in PRIMARY before writing. The
+        // scores backfill migration walks BEST_CHAIN — which is
+        // invariant-consistent with PRIMARY — so a missing PRIMARY
+        // entry indicates a caller bug.
+        {
+            let read_txn = self.db.begin_read()?;
+            let primary = match read_txn.open_table(PRIMARY) {
+                Ok(t) => t,
+                Err(::redb::TableError::TableDoesNotExist(_)) => {
+                    return Err(StoreError::HeaderNotInPrimary(*id));
+                }
+                Err(e) => return Err(StoreError::Table(e)),
+            };
+            if primary.get((101u8, *id))?.is_none() {
+                return Err(StoreError::HeaderNotInPrimary(*id));
+            }
+        }
+
+        let mut write_txn = self.db.begin_write()?;
+        // See `put_batch` — skip fsync; durability is enforced by
+        // explicit `flush()` paired with state-storage flushes.
+        write_txn
+            .set_durability(Durability::None)
+            .expect("set_durability on fresh txn");
+        {
+            let mut scores = write_txn.open_table(HEADER_SCORES)?;
+            scores.insert(*id, score)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    fn chain_meta_get(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(CHAIN_META) {
+            Ok(t) => t,
+            Err(::redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(StoreError::Table(e)),
+        };
+        let value = table.get(key)?;
+        Ok(value.map(|guard| guard.value().to_vec()))
+    }
+
+    fn chain_meta_put(
+        &self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), Self::Error> {
+        let mut write_txn = self.db.begin_write()?;
+        write_txn
+            .set_durability(Durability::None)
+            .expect("set_durability on fresh txn");
+        {
+            let mut table = write_txn.open_table(CHAIN_META)?;
+            table.insert(key, value)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     fn best_header_at(
         &self,
         height: u32,
@@ -460,6 +586,21 @@ impl ModifierStore for RedbModifierStore {
     fn best_header_tip(&self) -> Result<Option<(u32, [u8; 32])>, Self::Error> {
         let tip = self.best_header_tip.read();
         Ok(*tip)
+    }
+
+    fn best_chain_entries(&self) -> Result<Vec<(u32, [u8; 32])>, Self::Error> {
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(BEST_CHAIN) {
+            Ok(t) => t,
+            Err(::redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(StoreError::Table(e)),
+        };
+        let mut result = Vec::with_capacity(table.len()? as usize);
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            result.push((k.value(), v.value()));
+        }
+        Ok(result)
     }
 
     fn read_header_at(
@@ -516,13 +657,18 @@ mod tests {
         id
     }
 
+    /// Standard score for tests that don't care about the bytes.
+    fn s() -> Option<Vec<u8>> {
+        Some(vec![0x01])
+    }
+
     #[test]
     fn round_trip() {
         let (store, _dir) = test_store();
         let id = test_id(1);
         let data = b"hello world";
 
-        store.put(101, &id, 1, data).unwrap();
+        store.put_batch(&[(101, id, 1, data.to_vec(), s())]).unwrap();
         let result = store.get(101, &id).unwrap();
         assert_eq!(result, Some(data.to_vec()));
     }
@@ -531,9 +677,9 @@ mod tests {
     fn batch_atomicity() {
         let (store, _dir) = test_store();
         let entries = vec![
-            (101, test_id(1), 1, b"data1".to_vec()),
-            (101, test_id(2), 2, b"data2".to_vec()),
-            (102, test_id(3), 1, b"data3".to_vec()),
+            (101, test_id(1), 1, b"data1".to_vec(), s()),
+            (101, test_id(2), 2, b"data2".to_vec(), s()),
+            (102, test_id(3), 1, b"data3".to_vec(), None),
         ];
 
         store.put_batch(&entries).unwrap();
@@ -548,7 +694,9 @@ mod tests {
         let (store, _dir) = test_store();
         let id = test_id(1);
 
-        store.put(101, &id, 42, b"block data").unwrap();
+        store
+            .put_batch(&[(101, id, 42, b"block data".to_vec(), s())])
+            .unwrap();
         let result = store.get_id_at(101, 42).unwrap();
         assert_eq!(result, Some(id));
     }
@@ -557,14 +705,20 @@ mod tests {
     fn tip_tracking() {
         let (store, _dir) = test_store();
 
-        store.put(101, &test_id(1), 10, b"a").unwrap();
+        store
+            .put_batch(&[(101, test_id(1), 10, b"a".to_vec(), s())])
+            .unwrap();
         assert_eq!(store.tip(101).unwrap(), Some((10, test_id(1))));
 
-        store.put(101, &test_id(2), 20, b"b").unwrap();
+        store
+            .put_batch(&[(101, test_id(2), 20, b"b".to_vec(), s())])
+            .unwrap();
         assert_eq!(store.tip(101).unwrap(), Some((20, test_id(2))));
 
         // Lower height should not update tip
-        store.put(101, &test_id(3), 5, b"c").unwrap();
+        store
+            .put_batch(&[(101, test_id(3), 5, b"c".to_vec(), s())])
+            .unwrap();
         assert_eq!(store.tip(101).unwrap(), Some((20, test_id(2))));
     }
 
@@ -574,7 +728,9 @@ mod tests {
         let id = test_id(1);
 
         assert!(!store.contains(101, &id).unwrap());
-        store.put(101, &id, 1, b"data").unwrap();
+        store
+            .put_batch(&[(101, id, 1, b"data".to_vec(), s())])
+            .unwrap();
         assert!(store.contains(101, &id).unwrap());
     }
 
@@ -584,8 +740,8 @@ mod tests {
         let id = test_id(1);
         let data = b"same data";
 
-        store.put(101, &id, 1, data).unwrap();
-        store.put(101, &id, 1, data).unwrap();
+        store.put_batch(&[(101, id, 1, data.to_vec(), s())]).unwrap();
+        store.put_batch(&[(101, id, 1, data.to_vec(), s())]).unwrap();
         assert_eq!(store.get(101, &id).unwrap(), Some(data.to_vec()));
     }
 
@@ -595,12 +751,16 @@ mod tests {
         let id = test_id(1);
 
         // Put with real height — establishes height index and tip
-        store.put(101, &id, 5, b"original").unwrap();
+        store
+            .put_batch(&[(101, id, 5, b"original".to_vec(), s())])
+            .unwrap();
         assert_eq!(store.get_id_at(101, 5).unwrap(), Some(id));
         assert_eq!(store.tip(101).unwrap(), Some((5, id)));
 
         // Re-put same (type_id, id) with height=0 and new data
-        store.put(101, &id, 0, b"updated").unwrap();
+        store
+            .put_batch(&[(101, id, 0, b"updated".to_vec(), s())])
+            .unwrap();
 
         // Primary data updated
         assert_eq!(store.get(101, &id).unwrap(), Some(b"updated".to_vec()));
@@ -689,7 +849,9 @@ mod tests {
         let (store, _dir) = test_store();
         let id = test_id(1);
 
-        store.put_batch(&[(101, id, 100, b"header".to_vec())]).unwrap();
+        store
+            .put_batch(&[(101, id, 100, b"header".to_vec(), s())])
+            .unwrap();
 
         // PRIMARY populated
         assert_eq!(store.get(101, &id).unwrap(), Some(b"header".to_vec()));
@@ -713,8 +875,8 @@ mod tests {
         // Session 1: heights 1..=100
         {
             let store = RedbModifierStore::new(&path).unwrap();
-            let entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = (1..=100u32)
-                .map(|h| (101, test_id(h as u8), h, format!("h{h}").into_bytes()))
+            let entries: Vec<ModifierBatchEntry> = (1..=100u32)
+                .map(|h| (101, test_id(h as u8), h, format!("h{h}").into_bytes(), s()))
                 .collect();
             store.put_batch(&entries).unwrap();
         }
@@ -727,8 +889,8 @@ mod tests {
                 Some((100, test_id(100))),
                 "after session 1, tip should be 100"
             );
-            let entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = (101..=200u32)
-                .map(|h| (101, test_id(h as u8), h, format!("h{h}").into_bytes()))
+            let entries: Vec<ModifierBatchEntry> = (101..=200u32)
+                .map(|h| (101, test_id(h as u8), h, format!("h{h}").into_bytes(), s()))
                 .collect();
             store.put_batch(&entries).unwrap();
         }
@@ -769,8 +931,8 @@ mod tests {
         // Phase 1: fresh start, sync 100 main-chain headers via put_batch.
         {
             let store = RedbModifierStore::new(&path).unwrap();
-            let entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = (1..=100u32)
-                .map(|h| (101, test_id(h as u8), h, format!("h{h}").into_bytes()))
+            let entries: Vec<ModifierBatchEntry> = (1..=100u32)
+                .map(|h| (101, test_id(h as u8), h, format!("h{h}").into_bytes(), s()))
                 .collect();
             store.put_batch(&entries).unwrap();
         }
@@ -792,8 +954,8 @@ mod tests {
             );
 
             // More main-chain headers arrive via put_batch.
-            let entries: Vec<(u8, [u8; 32], u32, Vec<u8>)> = (101..=200u32)
-                .map(|h| (101, test_id(h as u8), h, format!("h{h}").into_bytes()))
+            let entries: Vec<ModifierBatchEntry> = (101..=200u32)
+                .map(|h| (101, test_id(h as u8), h, format!("h{h}").into_bytes(), s()))
                 .collect();
             store.put_batch(&entries).unwrap();
         }
@@ -843,7 +1005,9 @@ mod tests {
 
         // Main-chain header at height 100 lands via put_batch (no BEST_CHAIN).
         let main_100 = test_id(100);
-        store.put_batch(&[(101, main_100, 100, b"main100".to_vec())]).unwrap();
+        store
+            .put_batch(&[(101, main_100, 100, b"main100".to_vec(), s())])
+            .unwrap();
 
         // Fork header at height 100 arrives via put_header. The guard says
         // "BEST_CHAIN[100] is empty, so insert me." Now BEST_CHAIN[100] points
@@ -937,7 +1101,9 @@ mod tests {
         let id = test_id(1);
         let data = b"header bytes";
 
-        store.put_batch(&[(101, id, 42, data.to_vec())]).unwrap();
+        store
+            .put_batch(&[(101, id, 42, data.to_vec(), s())])
+            .unwrap();
 
         assert_eq!(store.read_header_at(42).unwrap(), Some(data.to_vec()));
     }
@@ -963,12 +1129,200 @@ mod tests {
             .put_header(&fork_id, 100, 1, &[0x99], b"fork bytes")
             .unwrap();
         store
-            .put_batch(&[(101, main_id, 100, b"main bytes".to_vec())])
+            .put_batch(&[(101, main_id, 100, b"main bytes".to_vec(), s())])
             .unwrap();
 
         assert_eq!(
             store.read_header_at(100).unwrap(),
             Some(b"main bytes".to_vec())
+        );
+    }
+
+    // --- v0.5.0: real cumulative scores + chain_meta + migration primitives ---
+
+    #[test]
+    fn put_batch_header_persists_real_score() {
+        let (store, _dir) = test_store();
+        let id = test_id(1);
+        let score = vec![0x0A, 0xBC, 0xDE, 0xF0];
+
+        store
+            .put_batch(&[(101, id, 1, b"hdr".to_vec(), Some(score.clone()))])
+            .unwrap();
+
+        assert_eq!(store.header_score(&id).unwrap(), Some(score));
+        // And the rest of the header tables are still populated as before.
+        assert_eq!(store.best_header_at(1).unwrap(), Some(id));
+        assert_eq!(store.get(101, &id).unwrap(), Some(b"hdr".to_vec()));
+    }
+
+    #[test]
+    fn put_batch_header_without_score_is_rejected_and_writes_nothing() {
+        let (store, _dir) = test_store();
+        let header_id = test_id(1);
+        let other_id = test_id(2);
+
+        // Batch mixes a valid non-header entry with an invalid type=101
+        // entry (score=None). The whole batch must roll back; atomicity
+        // says either all-or-none.
+        let entries = vec![
+            (102, other_id, 1, b"valid".to_vec(), None),
+            (101, header_id, 2, b"header".to_vec(), None),
+        ];
+        let err = store.put_batch(&entries).unwrap_err();
+        assert!(
+            matches!(err, StoreError::ScoreRequiredForHeader),
+            "expected ScoreRequiredForHeader, got {err:?}"
+        );
+
+        // Neither entry should be visible.
+        assert!(!store.contains(101, &header_id).unwrap());
+        assert!(!store.contains(102, &other_id).unwrap());
+        assert_eq!(store.best_header_at(2).unwrap(), None);
+        assert_eq!(store.header_score(&header_id).unwrap(), None);
+    }
+
+    #[test]
+    fn put_single_with_header_type_is_rejected() {
+        let (store, _dir) = test_store();
+        let id = test_id(1);
+
+        let err = store.put(101, &id, 1, b"header").unwrap_err();
+        assert!(
+            matches!(err, StoreError::SingleHeaderPutForbidden),
+            "expected SingleHeaderPutForbidden, got {err:?}"
+        );
+
+        // No write should have leaked through.
+        assert!(!store.contains(101, &id).unwrap());
+        assert_eq!(store.best_header_at(1).unwrap(), None);
+        assert_eq!(store.header_score(&id).unwrap(), None);
+    }
+
+    #[test]
+    fn put_header_score_updates_only_header_scores() {
+        let (store, _dir) = test_store();
+        let id = test_id(1);
+        let initial_score = vec![0x01];
+
+        // Establish a header with an initial score via put_batch.
+        store
+            .put_batch(&[(101, id, 10, b"hdr".to_vec(), Some(initial_score))])
+            .unwrap();
+
+        // Snapshot the other tables before the score-only update.
+        let primary_before = store.get(101, &id).unwrap();
+        let forks_before = store.header_ids_at_height(10).unwrap();
+        let best_before = store.best_header_at(10).unwrap();
+        let tip_before = store.best_header_tip().unwrap();
+
+        // Replace just the score.
+        let real_score = vec![0xFF, 0xEE, 0xDD, 0xCC];
+        store.put_header_score(&id, &real_score).unwrap();
+
+        // HEADER_SCORES updated, everything else untouched.
+        assert_eq!(store.header_score(&id).unwrap(), Some(real_score));
+        assert_eq!(store.get(101, &id).unwrap(), primary_before);
+        assert_eq!(store.header_ids_at_height(10).unwrap(), forks_before);
+        assert_eq!(store.best_header_at(10).unwrap(), best_before);
+        assert_eq!(store.best_header_tip().unwrap(), tip_before);
+    }
+
+    #[test]
+    fn put_header_score_unknown_id_returns_err() {
+        let (store, _dir) = test_store();
+        let unknown = test_id(0xAB);
+
+        let err = store.put_header_score(&unknown, &[0x01, 0x02]).unwrap_err();
+        match err {
+            StoreError::HeaderNotInPrimary(reported) => assert_eq!(reported, unknown),
+            other => panic!("expected HeaderNotInPrimary, got {other:?}"),
+        }
+        // Nothing was written.
+        assert_eq!(store.header_score(&unknown).unwrap(), None);
+    }
+
+    #[test]
+    fn put_header_score_unknown_id_returns_err_on_empty_store() {
+        // Same as above but with a completely empty store — the PRIMARY
+        // table may not even exist yet. The check must still reject the
+        // write rather than silently succeed.
+        let (store, _dir) = test_store();
+        let unknown = test_id(0xCD);
+
+        let err = store.put_header_score(&unknown, &[0x01]).unwrap_err();
+        assert!(
+            matches!(err, StoreError::HeaderNotInPrimary(reported) if reported == unknown),
+            "expected HeaderNotInPrimary({unknown:?}), got {err:?}"
+        );
+        assert_eq!(store.header_score(&unknown).unwrap(), None);
+    }
+
+    #[test]
+    fn best_chain_entries_returns_ascending_height_pairs() {
+        let (store, _dir) = test_store();
+
+        // Empty store returns empty Vec.
+        let empty = store.best_chain_entries().unwrap();
+        assert_eq!(empty, Vec::<(u32, [u8; 32])>::new());
+
+        // Write a handful of main-chain headers in non-ascending order to
+        // make sure the result is sorted by height, not by insert order.
+        let heights = [3u32, 1, 5, 2, 4];
+        let entries: Vec<_> = heights
+            .iter()
+            .map(|h| {
+                (
+                    101,
+                    test_id(*h as u8),
+                    *h,
+                    format!("h{h}").into_bytes(),
+                    Some(vec![*h as u8]),
+                )
+            })
+            .collect();
+        store.put_batch(&entries).unwrap();
+
+        let got = store.best_chain_entries().unwrap();
+        let expected: Vec<(u32, [u8; 32])> =
+            (1..=5u32).map(|h| (h, test_id(h as u8))).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn chain_meta_round_trips_and_overwrites() {
+        let (store, _dir) = test_store();
+
+        // Absent key returns None even before the table exists on disk.
+        assert_eq!(store.chain_meta_get(b"absent").unwrap(), None);
+
+        // Put + get round-trip.
+        store.chain_meta_put(b"k", b"v1").unwrap();
+        assert_eq!(store.chain_meta_get(b"k").unwrap(), Some(b"v1".to_vec()));
+
+        // Overwrite at the same key.
+        store.chain_meta_put(b"k", b"v2-longer-bytes").unwrap();
+        assert_eq!(
+            store.chain_meta_get(b"k").unwrap(),
+            Some(b"v2-longer-bytes".to_vec())
+        );
+
+        // Independent keys.
+        store.chain_meta_put(b"other", b"x").unwrap();
+        assert_eq!(
+            store.chain_meta_get(b"k").unwrap(),
+            Some(b"v2-longer-bytes".to_vec())
+        );
+        assert_eq!(store.chain_meta_get(b"other").unwrap(), Some(b"x".to_vec()));
+
+        // Sentinel-style write used by the v0.5.0 scores backfill migration.
+        assert_eq!(store.chain_meta_get(b"scores_migrated_v1").unwrap(), None);
+        store
+            .chain_meta_put(b"scores_migrated_v1", &[1u8])
+            .unwrap();
+        assert_eq!(
+            store.chain_meta_get(b"scores_migrated_v1").unwrap(),
+            Some(vec![1u8])
         );
     }
 }
