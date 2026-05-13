@@ -56,9 +56,14 @@ pub trait ModifierStore: Send + Sync {
 
     /// Store a batch of modifiers atomically. All entries written in a
     /// single transaction — all succeed or none do.
+    ///
+    /// Entry tuple: `(type_id, id, height, data, score)`.
+    /// `score` is `Some(big_endian_bigint_bytes)` required when
+    /// `type_id == 101`, `None` for all other modifier types. A
+    /// `type_id == 101` entry with `score == None` is rejected.
     fn put_batch(
         &self,
-        entries: &[(u8, [u8; 32], u32, Vec<u8>)],
+        entries: &[(u8, [u8; 32], u32, Vec<u8>, Option<Vec<u8>>)],
     ) -> Result<(), Self::Error>;
 
     /// Retrieve a modifier by type and ID.
@@ -117,13 +122,50 @@ pub trait ModifierStore: Send + Sync {
     ) -> Result<Vec<([u8; 32], u32)>, Self::Error>;
 
     /// Get the cumulative score for a header.
-    /// Main-chain headers written via put/put_batch have an empty
-    /// placeholder score; real scores are only populated for fork
-    /// headers by put_header.
+    ///
+    /// Returns the cumulative difficulty score as big-endian BigUint
+    /// bytes. Populated for **every** header — main-chain and forks
+    /// alike — after the one-shot scores backfill migration runs at
+    /// store open. Returns `None` only when `id` was never written.
     fn header_score(
         &self,
         id: &[u8; 32],
     ) -> Result<Option<Vec<u8>>, Self::Error>;
+
+    /// Update only the score for an existing header.
+    ///
+    /// Writes `header_scores[id] = score`. Does NOT touch PRIMARY,
+    /// HEADER_FORKS, or BEST_CHAIN. Used by the scores backfill
+    /// migration to upgrade empty-placeholder scores to real values
+    /// without rewriting the full header record.
+    ///
+    /// Returns Err if `id` is not present in PRIMARY (would be a
+    /// caller bug — migration walks BEST_CHAIN which is consistent
+    /// with PRIMARY).
+    fn put_header_score(
+        &self,
+        id: &[u8; 32],
+        score: &[u8],
+    ) -> Result<(), Self::Error>;
+
+    // --- Chain metadata ---
+
+    /// Read a value from the chain_meta table.
+    ///
+    /// Tiny key-value store inside the modifier store, used for
+    /// migration sentinels and per-chain-state flags. Keys are
+    /// stable byte strings (see "Chain metadata table" below).
+    fn chain_meta_get(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, Self::Error>;
+
+    /// Write a value to the chain_meta table.
+    fn chain_meta_put(
+        &self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), Self::Error>;
 
     /// Get the best chain header ID at a height.
     fn best_header_at(
@@ -133,6 +175,16 @@ pub trait ModifierStore: Send + Sync {
 
     /// Get the best chain tip (highest height and header ID).
     fn best_header_tip(&self) -> Result<Option<(u32, [u8; 32])>, Self::Error>;
+
+    /// Read every entry in BEST_CHAIN, in ascending height order.
+    ///
+    /// Single read transaction; sequential B-tree traversal —
+    /// substantially faster than 1.76M point lookups when restoring
+    /// chain state at startup. The returned Vec is `(height,
+    /// header_id)` pairs starting at the lowest height in BEST_CHAIN
+    /// and ending at `best_header_tip().height`. Empty Vec on an
+    /// empty store.
+    fn best_chain_entries(&self) -> Result<Vec<(u32, [u8; 32])>, Self::Error>;
 
     /// Read the stored header bytes at a best-chain height.
     /// Single read transaction combining best_header_at + get(101, id).
@@ -151,8 +203,13 @@ which write method the caller uses:
 
 | Caller intent | Methods | Tables written |
 |---|---|---|
-| Main-chain header (certified best by caller) | `put`, `put_batch` with `type_id=101` | PRIMARY + HEADER_FORKS (h, 0) + HEADER_SCORES (empty) + BEST_CHAIN (unconditional) |
-| Fork header at an already-occupied height | `put_header` with `fork>0` | PRIMARY + HEADER_FORKS (h, fork) + HEADER_SCORES + BEST_CHAIN (only if absent) |
+| Main-chain header (certified best by caller) | `put_batch` with `type_id=101` and `score=Some(...)` | PRIMARY + HEADER_FORKS (h, 0) + HEADER_SCORES (real cumulative score) + BEST_CHAIN (unconditional) |
+| Fork header at an already-occupied height | `put_header` with `fork>0` | PRIMARY + HEADER_FORKS (h, fork) + HEADER_SCORES (real cumulative score) + BEST_CHAIN (only if absent) |
+
+`put` with `type_id=101` is rejected — main-chain headers must always
+go through `put_batch` so the score is carried alongside the data in
+a single atomic write. Single-header writes from the validation
+pipeline use `put_batch` with a one-element slice.
 
 For headers, `put` / `put_batch` **never write to `HEIGHT_INDEX`**. The
 `(101, h)` slot in `HEIGHT_INDEX` is the legacy pre-deep-reorg schema and
@@ -182,41 +239,123 @@ HEIGHT_INDEX.
 | `primary` | `(type_id, id)` | `data` | Lookup by modifier ID |
 | `height_index` | `(type_id, height)` | `id` | Lookup by height, non-header types only |
 | `header_forks` | `(height, fork)` | `header_id` | All known headers per height; `fork=0` reserved for best chain |
-| `header_scores` | `header_id` | BigUint bytes | Cumulative difficulty per header (empty placeholder for main-chain) |
+| `header_scores` | `header_id` | BigUint bytes | Cumulative difficulty per header. Real values for all headers post-scores-migration. |
 | `best_chain` | `height` | `header_id` | Current best chain, one entry per height |
+| `chain_meta` | `key (bytes)` | `value (bytes)` | Tiny KV store for migration sentinels and per-chain-state flags |
 
 On startup, the `best_header_tip` cache is seeded by scanning `best_chain`
-for the highest key. A one-shot migration moves pre-deep-reorg `(101, h)`
-entries from `height_index` into `best_chain` + `header_forks` +
-`header_scores`, then removes them from `height_index`. The migration is
-guarded by `header_forks.len() > 0` and runs until the guard trips.
+for the highest key. Two one-shot migrations run before the store is
+returned from `open`:
+
+1. **`height_index` → `header_forks`** (pre-existing). Moves
+   pre-deep-reorg `(101, h)` entries from `height_index` into
+   `best_chain` + `header_forks` + `header_scores`, then removes them
+   from `height_index`. Guarded by `header_forks.len() > 0`; runs
+   until the guard trips.
+2. **Empty-placeholder scores → real cumulative scores** (new in
+   v0.5.0). Not run by the store crate (would require depending on
+   `ergo-chain-types` for `decode_compact_bits` and on VLQ header
+   parsing — violates the store's domain isolation). The main crate
+   orchestrates: it iterates `best_chain` in height order, reads each
+   header via `get(101, &id)`, decodes `n_bits` via chain, computes
+   `parent_score + decode_compact_bits(header.n_bits)`, and writes
+   the result via `put_header_score(id, score)`. Fork headers
+   (`fork>0`) already carry real scores and are skipped — they keep
+   whatever was written by `put_header`.
+
+   The store crate provides the building blocks:
+   - `chain_meta_get(b"scores_migrated_v1")` — sentinel check
+   - `chain_meta_put(b"scores_migrated_v1", &[1u8])` — sentinel set on completion
+   - `put_header_score(id, score)` — narrow write that touches only
+     `header_scores`, leaving PRIMARY / HEADER_FORKS / BEST_CHAIN
+     untouched. Required because the migration only needs to update
+     scores; rewriting the full header record would be slow and
+     pointless.
+
+   The migration runs **synchronously** during startup, before any
+   header reads that depend on scores. Progress is logged at every
+   N=10_000 headers. For a 1.76M-header mainnet store the migration
+   is roughly 1.76M `get(101,id)` calls + 1.76M `put_header_score`
+   writes, which the main crate batches into transactions of ~50_000
+   headers each via repeated `put_header_score` calls inside an
+   in-progress write transaction (or repeated `put_header_score`
+   calls if the store does its own auto-batching). Expected wall
+   time on commodity SSD: ~5-15 minutes one-time on first v0.5.0
+   start.
+
+   The migration is **resumable**. If the process is killed mid-walk,
+   the sentinel is not yet written and the next start re-runs from
+   height 1. Headers already updated to real scores are overwritten
+   with the same value (idempotent).
+
+## Chain metadata table
+
+Stable keys, all little-known to the store but consumed by the chain
+crate via `chain_meta_get`:
+
+| Key | Value semantics | Set by |
+|---|---|---|
+| `b"scores_migrated_v1"` | `[1u8]` once migration completes; absent before | Empty-placeholder → real scores migration |
+
+Future keys are added at the discretion of the integrator. The store
+crate treats values as opaque byte strings.
 
 ## Preconditions
 
-- **`put` / `put_batch`**: `data` is non-empty. `id` is the canonical modifier ID
+- **`put`**: `data` is non-empty. `id` is the canonical modifier ID
   (Blake2b256 of the serialized bytes for headers). `height` is the block height
   this modifier belongs to, or `0` for "height unknown" (skips height indexing).
-  The caller has already validated the modifier. For `type_id=101`, the caller
-  asserts this header is on the best chain.
-- **`put_header`**: Same as `put` plus `fork` is either 0 (best chain) or a
-  positive fork number, and `score` is the cumulative difficulty encoded as
-  big-endian BigUint bytes.
-- **`get` / `get_id_at` / `contains` / `tip`**: No preconditions beyond valid type_id.
+  The caller has already validated the modifier. `type_id != 101` —
+  main-chain headers must use `put_batch`.
+- **`put_batch`**: Each entry satisfies the per-entry `put` preconditions.
+  Additionally, for entries with `type_id == 101`: `score` is `Some(bytes)`
+  where `bytes` is the cumulative difficulty as big-endian BigUint bytes,
+  and the caller asserts this header is on the best chain. For
+  `type_id != 101`: `score` is `None`.
+- **`put_header`**: `fork` is either 0 (best chain) or a positive fork number,
+  and `score` is the cumulative difficulty encoded as big-endian BigUint bytes
+  (real value, never empty placeholder).
+- **`put_header_score`**: `id` corresponds to a header previously
+  written via `put_batch` (type=101) or `put_header`. `score` is
+  non-empty big-endian BigUint bytes.
+- **`best_chain_entries`**: no preconditions.
+- **`chain_meta_put`** / **`chain_meta_get`**: `key` is non-empty.
+- **`get` / `get_id_at` / `contains` / `tip` / `header_score`**: No
+  preconditions beyond valid `type_id` (or `id` for `header_score`).
 
 ## Postconditions
 
 - **`put`**: On Ok, the modifier is durable on disk. A subsequent `get` with the
-  same `(type_id, id)` returns `Some(data)`. For non-headers,
-  `get_id_at(type_id, height)` returns `Some(id)` and `tip(type_id).height` is
-  at least `height`. For headers, `best_header_at(height)` returns `Some(id)`
-  (unconditional overwrite) and `best_header_tip` is updated if `height` exceeds
-  the previous tip.
-- **`put_batch`**: Same as `put` for each entry, atomically. On Err, no entries
-  are written.
+  same `(type_id, id)` returns `Some(data)`. `get_id_at(type_id, height)`
+  returns `Some(id)` and `tip(type_id).height` is at least `height`.
+- **`put_batch`**: Each entry's `put`-like postconditions hold,
+  atomically. For `type_id == 101` entries: `best_header_at(height)`
+  returns `Some(id)` (unconditional overwrite), `best_header_tip` is
+  updated if `height` exceeds the previous tip, and
+  `header_score(id)` returns `Some(score_bytes)` exactly as provided
+  in the entry. On Err, no entries are written.
 - **`put_header` (fork=0)**: Inserts into BEST_CHAIN only if the height slot is
-  empty. Always writes PRIMARY, HEADER_FORKS, HEADER_SCORES.
-- **`put_header` (fork>0)**: Writes PRIMARY, HEADER_FORKS, HEADER_SCORES. Leaves
-  BEST_CHAIN untouched unless the slot was empty.
+  empty. Always writes PRIMARY, HEADER_FORKS, HEADER_SCORES with the
+  provided real score.
+- **`put_header` (fork>0)**: Writes PRIMARY, HEADER_FORKS, HEADER_SCORES with
+  the provided real score. Leaves BEST_CHAIN untouched unless the slot
+  was empty.
+- **`header_score`**: Returns `Some(bytes)` for any header previously written
+  via `put_batch` (type=101) or `put_header`, where `bytes` is the
+  big-endian BigUint cumulative score. Returns `None` only if the
+  header_id was never stored.
+- **`put_header_score`**: On Ok, the header_scores entry for `id` is
+  updated to `score`. Subsequent `header_score(id)` returns
+  `Some(score)`. Touches no other table. Returns Err if `id` is not
+  in PRIMARY.
+- **`best_chain_entries`**: Returns a Vec of `(height, header_id)`
+  pairs covering every entry in BEST_CHAIN, in ascending height
+  order. Empty when the chain is empty.
+- **`chain_meta_put`**: On Ok, the value is durable. A subsequent
+  `chain_meta_get(key)` returns `Some(value)`. Overwrites any previous value
+  at the same key.
+- **`chain_meta_get`**: Returns the stored bytes or `None` if the key
+  was never written.
 - **`get`**: Returns the stored bytes or None. Never errors on missing data.
 - **`get_id_at`**: Returns the modifier ID at that height or None. For type 101
   this is the best-chain header at that height.
@@ -237,9 +376,15 @@ guarded by `header_forks.len() > 0` and runs until the guard trips.
   `get_id_at(t, h)` returns `Some(id)` then `get(t, &id)` returns `Some(data)`.
 - For headers, BEST_CHAIN is consistent with PRIMARY: if `best_header_at(h)`
   returns `Some(id)` then `get(101, &id)` returns `Some(data)`.
+- HEADER_SCORES is consistent with BEST_CHAIN after migration: for every
+  height `h` in `[1, best_header_tip().height]`,
+  `header_score(best_header_at(h))` returns `Some(score_bytes)` with a
+  non-empty real value. The score at height `h` equals the score at
+  `h-1` plus `decode_compact_bits(header_at_h.n_bits)`; the score at
+  height 1 equals `decode_compact_bits(genesis_header.n_bits)`.
 - BEST_CHAIN is dense from 1 to `best_header_tip().height` after any sequence
-  of `put` / `put_batch` calls for contiguous main-chain headers. A single-height
-  hole inside this range is a store bug.
+  of `put_batch` / `put_header` calls for contiguous main-chain headers. A
+  single-height hole inside this range is a store bug.
 - The store survives `kill -9` at any point. On restart, it contains exactly the
   modifiers from completed transactions.
 - Duplicate `put` with the same `(type_id, id)` is idempotent — overwrites with
@@ -251,6 +396,11 @@ guarded by `header_forks.len() > 0` and runs until the guard trips.
 - Deciding what to store or when — that's the pipeline.
 - Chain state reconstruction — that's the chain crate, using data read from the store.
 - Network I/O — that's P2P.
+- The scores backfill migration — the main crate orchestrates (it
+  has the chain dependency for `decode_compact_bits` and header
+  parsing); the store crate just exposes the `best_chain_entries`,
+  `header_score`, `put_header_score`, and `chain_meta_*` primitives
+  the migration needs.
 
 ## Dependencies
 

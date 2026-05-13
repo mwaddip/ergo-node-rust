@@ -91,6 +91,11 @@ parent linkage, PoW validity, timestamp bounds, and correct difficulty.
   `header_at`, via the separate `ScoreLoader` (see below). Split from the
   header loader so walks that only need headers (difficulty recalc,
   NiPoPoW) don't pay `BigUint` deserialization on every lookup.
+- **Authority**: The score loader is the sole source of truth for heights
+  not currently in the LRU cache. There is no in-memory `Vec<BigUint>`
+  safety net — a height not in cache and not returned by the loader is
+  treated as absent. Integrators must wire `set_score_loader` before any
+  query that could miss the cache.
 
 #### `cumulative_score() -> BigUint`
 - Returns the cumulative difficulty score at the chain tip.
@@ -134,6 +139,14 @@ Where `F: Fn(u32) -> Option<Header> + Send + Sync + 'static`.
 Where `F: Fn(u32) -> Option<BigUint> + Send + Sync + 'static`.
 - **Postcondition**: Subsequent `score_at` / `cumulative_score` calls
   that miss the cache consult the loader.
+- **Required**: Unlike `set_header_loader` (which has a degenerate "no
+  scores available" failure mode that propagates as `None`), the score
+  loader is *required* for any chain non-trivially populated by
+  `restore` or by progressing past the LRU window. The chain holds no
+  in-memory score Vec — heights outside the cache are entirely the
+  loader's responsibility. Integrators MUST wire this before the
+  chain's score-dependent paths run (difficulty adjustment, NiPoPoW
+  proof construction, sync's chain-comparison logic).
 
 #### `has_header_loader() -> bool` / `has_score_loader() -> bool`
 - Diagnostic queries so the integrator can assert wiring completeness
@@ -144,6 +157,50 @@ Where `F: Fn(u32) -> Option<BigUint> + Send + Sync + 'static`.
   resized to `capacity` in place. Excess entries beyond the new cap are
   evicted in LRU order.
 - **Default**: `DEFAULT_CACHE_CAPACITY` (16_384 entries).
+
+### Chain restore from store index
+
+After v0.5.0 the entire chain state is reconstructable from the store
+without per-header validation replay. The integrator iterates
+`enr-store`'s `BEST_CHAIN` table, hands the `(height, header_id)`
+pairs to `HeaderChain::restore`, wires the loaders, and re-derives
+`active_parameters` via
+`recompute_active_parameters_from_storage(tip_height)`. There is no
+chain-side snapshot blob — the store is the single source of truth.
+
+#### `restore<I>(config: ChainConfig, entries: I) -> Result<Self, RestoreError>`
+Where `I: IntoIterator<Item = (u32, BlockId)>`.
+- **Precondition**: `entries` yields `(height, header_id)` pairs in
+  ascending height order with no gaps. The first yielded pair's
+  height becomes `base_height`. If multiple pairs share a height or
+  heights are non-contiguous, returns `RestoreError::NonContiguousHeights`.
+- **Postcondition**:
+  - The returned chain has `by_id` populated from `entries` for O(1)
+    `contains` / `height_of` lookups.
+  - `base_height = first entry's height` (or `None` if `entries` is empty).
+  - `height() = last entry's height` (or `0` if empty).
+  - `light_client_mode = (base_height.unwrap_or(1) > 1)` — a chain
+    starting above height 1 must have been installed from a NiPoPoW
+    proof and the SPV difficulty skip is preserved.
+  - `active_parameters` / `active_proposed_update_bytes` are at
+    construction defaults. The integrator must call
+    `recompute_active_parameters_from_storage(height())` after
+    wiring `set_extension_loader` to bring them current.
+  - `HeaderLoader` and `ScoreLoader` are unwired. The integrator
+    must call `set_header_loader` / `set_score_loader` before any
+    query that may miss the LRU cache.
+  - LRU caches are empty.
+- **Performance**: O(n) HashMap inserts where n = number of entries.
+  No header parsing, no PoW recomputation, no difficulty recalc — the
+  store already vouches for that data.
+
+#### `RestoreError`
+```rust
+pub enum RestoreError {
+    NonContiguousHeights { expected: u32, got: u32 },
+    DuplicateHeight(u32),
+}
+```
 
 ### Cache invariants
 
@@ -660,10 +717,18 @@ new return shape. The serve-side log path in the main crate is the only
 existing call site and just gets the field rename plus an unused-headers
 field; no semantic change for that consumer.
 
-### `install_from_nipopow_proof(suffix_head: Header, suffix_tail: Vec<Header>) -> Result<()>`
+### `install_from_nipopow_proof(suffix_head: Header, suffix_tail: Vec<Header>) -> Result<Vec<InstalledHeader>>`
 
 Install a verified NiPoPoW proof's suffix as the chain's starting point for
 light-client mode.
+
+```rust
+pub struct InstalledHeader {
+    pub id: BlockId,
+    pub height: u32,
+    pub score_be: Vec<u8>,
+}
+```
 
 - **Precondition**: Chain is empty (`is_empty() == true`). The headers in
   `suffix_head` + `suffix_tail` MUST already have been validated by the
@@ -675,7 +740,14 @@ light-client mode.
   `suffix_tail` (or `suffix_head` if `suffix_tail` is empty). `height()`
   returns `suffix_head.height + suffix_tail.len() as u32`. Subsequent
   `try_append` calls extend the tip from there using the normal
-  parent-linkage rules.
+  parent-linkage rules. The returned `Vec<InstalledHeader>` lists every
+  installed header in height order with the chain's internal cumulative
+  score for that header (starting at `0` for `suffix_head` and
+  accumulating `decode_compact_bits(header.n_bits)` for each subsequent
+  header). The integrator persists these by calling
+  `store.put_header(id, height, fork=0, score=score_be, data=...)` for
+  each — without this write the store's score loader will return `None`
+  on later queries and the chain's score-dependent paths break.
 - **Postcondition on Err**: Chain is unchanged (rolled back). Possible errors:
   - Chain not empty.
   - `suffix_head.parent_id` is anything other than what the caller expects
@@ -698,11 +770,14 @@ light-client mode.
   - `suffix_head` is pushed via the same internal `push_header` path used
     by `try_append`'s tip-extension branch, but the genesis-validation check
     is bypassed.
-  - `scores[0]` (the cumulative-difficulty entry for the installed
-    `suffix_head`) is initialized to **`0`**. The absolute score values are
-    meaningless once the chain refuses to reorg below the install boundary
-    (see "Reorg floor" below) — only deltas matter, and starting from zero
-    makes that obvious.
+  - The cumulative-difficulty score for the installed `suffix_head` is
+    `0`. The absolute score values are meaningless once the chain
+    refuses to reorg below the install boundary (see "Reorg floor"
+    below) — only deltas matter, and starting from zero makes that
+    obvious. Each subsequent suffix header adds
+    `decode_compact_bits(header.n_bits)` to the running total. These
+    scores are returned to the integrator in the `Vec<InstalledHeader>`
+    result; the chain itself does NOT persist them, only emits them.
   - For each header in `suffix_tail`, validate parent linkage (`parent_id ==
     previous.id`), validate PoW, and push. Skip the difficulty-target check.
   - `active_parameters` is left at `default_parameters(network)` — light
