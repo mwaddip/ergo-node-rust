@@ -36,6 +36,37 @@ The handle to a running P2P layer. Created by `P2pNode::start()`. The P2P layer 
 - Bounded channel (256): if the subscriber falls behind, events are dropped (not blocking the event loop).
 - The subscriber sees raw events — the router may subsequently drop, reroute, or transform them.
 
+### `all_peers() -> Vec<PeerEntry>` (async)
+- Returns information about all known peers (connected + disconnected).
+- Each `PeerEntry` includes:
+  - `address: SocketAddr` — peer's socket address
+  - `agent_name: Option<String>` — advertised agent string (None if never handshaked)
+  - `last_seen_ms: Option<u64>` — Unix epoch ms of last seen, None if never connected
+  - `connection_type: Option<ConnectionType>` — `Outgoing` / `Incoming` for currently connected peers; `None` for known-but-disconnected
+- Used by the API layer for `GET /peers/all`.
+
+### `network_status() -> NetworkStatus` (async)
+- Returns:
+  - `last_incoming_message_ms: Option<u64>` — Unix epoch ms of the last received protocol message. `None` if no messages have arrived since startup. Reads from a tracker that updates on every incoming message in the event loop.
+  - `current_network_time_ms: u64` — current Unix epoch ms (`SystemTime::now()`).
+- Used by the API layer for `GET /peers/status`.
+
+### `blacklisted_peers() -> Vec<SocketAddr>` (async)
+- Returns the addresses of all peers currently penalty-banned by this node.
+- Reads from the penalty store. Does NOT include temporarily rate-limited peers.
+- Used by the API layer for `GET /peers/blacklisted`.
+
+### `queue_outbound_connection(addr: SocketAddr) -> Result<(), String>` (async)
+- Fire-and-forget request to initiate an outbound connection to `addr`.
+- Returns `Ok(())` when the request is successfully queued (not when the connection completes).
+- Returns `Err(reason)` for:
+  - Unroutable / loopback addresses (when policy forbids)
+  - Blacklisted peer
+  - Already connected to this address (no-op)
+  - Outbound queue full (rare under normal operation)
+- The outbound manager picks up the queued request asynchronously.
+- Used by the API layer for `POST /peers/connect`.
+
 ## Router: Action::Validate
 
 The router emits `Action::Validate { modifier_type, id, data, peer_id }` for each modifier in a `ModifierResponse`. `peer_id` identifies which peer sent the modifier, enabling penalty attribution when validation fails downstream. The event loop dispatches these to the `modifier_sink` channel as `(modifier_type, id, data, Some(peer_id.0))` via `try_send` (non-blocking). If no sink is provided, validate actions are dropped (pure proxy mode).
