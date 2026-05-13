@@ -1,5 +1,67 @@
 # Changelog
 
+## v0.4.5 — 2026-05-13
+
+Operator-reported packaging and startup-visibility fixes. No protocol
+or validation changes.
+
+### Fixed
+- **systemd unit logged to file while fail2ban watched journald**
+  ([#4](https://github.com/mwaddip/ergo-node-rust/issues/4)). The unit
+  carried `StandardOutput=append:/var/log/ergo-node/ergo-node.log` and
+  `StandardError=append:...` left over from the pre-fail2ban era; the
+  v0.4.4 jail uses `backend=systemd` with
+  `journalmatch=_SYSTEMD_UNIT=ergo-node-rust.service`, so PENALTY
+  lines never reached the journal and the jail was effectively inert.
+  Dropped both redirects — stdout/stderr now default to journald.
+
+  **Upgrade note for v0.4.4 operators**: after `apt upgrade` the unit
+  reload is automatic, but the daemon must be restarted to pick up the
+  new logging target. The existing `/var/log/ergo-node/ergo-node.log`
+  file stops growing; switch to `journalctl -u ergo-node-rust -f` for
+  live tailing. If you have a systemd drop-in that already overrides
+  `StandardOutput`/`StandardError`, remove it so the package default
+  applies:
+
+  ```
+  sudo systemctl daemon-reload
+  sudo systemctl restart ergo-node-rust
+  sudo fail2ban-client reload
+  journalctl -u ergo-node-rust -f
+  ```
+
+  The fail2ban jail itself is unchanged.
+- **Packaged files owned by build-runner UID instead of root:root**
+  ([#2](https://github.com/mwaddip/ergo-node-rust/issues/2)). The
+  v0.4.4 `.deb` shipped `/usr/bin/ergo-node-rust`, `/usr/bin/sharpen`,
+  config files, and the systemd unit owned by the build host's
+  numeric UID (1001 on the GitHub Actions runner), surfacing as
+  `UNKNOWN:UNKNOWN` on hosts without that UID. `build-deb` now passes
+  `--root-owner-group` to `dpkg-deb --build`.
+- **`preinst` warned about missing home directory**
+  ([#3](https://github.com/mwaddip/ergo-node-rust/issues/3)). The
+  script ran `adduser --home /var/lib/ergo-node` before the directory
+  existed, emitting `info: The home dir /var/lib/ergo-node you
+  specified can't be accessed`. Reordered: `mkdir -p` runs first.
+- **Manpage example used stale `:9020` mainnet seed peers**
+  ([#5](https://github.com/mwaddip/ergo-node-rust/issues/5)). The
+  `ergo-node-rust.conf(5)` minimal example referenced
+  `213.239.193.208:9020` and `176.9.15.237:9020`, both currently
+  unreachable on that port. Refreshed with a 4-peer `:9030` subset
+  from the shipped `mainnet.toml`.
+- **Silent startup after unclean shutdown**
+  ([#6](https://github.com/mwaddip/ergo-node-rust/issues/6)). After a
+  power loss mid-sync, the daemon logged only the initial `node
+  config` line for many minutes before binding the API/P2P ports —
+  the header-chain restore (one redb read per stored header, walked
+  backward then replayed forward) and the state.redb open are
+  inherently slow on a cold cache and can run for tens of minutes on
+  a partially-synced node. Added INFO logs at each boundary
+  (`opening modifier store`, `restoring header chain from store
+  (walk backward)`, periodic progress every 100k headers,
+  `opening UTXO state storage`, etc.) so operators can distinguish a
+  long-but-healthy load from a hang.
+
 ## v0.4.4 — 2026-05-03
 
 Packaging polish: wire fail2ban via systemd journal so the shipped

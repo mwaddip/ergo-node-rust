@@ -187,10 +187,10 @@ testnet peer behavior is noisier than mainnet by design.
 **/var/lib/ergo-node/data/modifiers.redb**
 :   Headers, block sections, chain index.
 
-**/var/log/ergo-node/ergo-node.log**
-:   stdout/stderr captured by the systemd unit. Operators are
-    encouraged to read from journald instead
-    (**journalctl -u ergo-node-rust**).
+**/var/log/ergo-node/**
+:   Reserved for operator-supplied log dumps. The daemon itself emits
+    structured **tracing** events to stdout/stderr, which the systemd
+    unit forwards to journald. Read with **journalctl -u ergo-node-rust**.
 
 **/etc/fail2ban/filter.d/ergo-node.conf**, **/etc/fail2ban/jail.d/ergo-node-jail.conf**
 :   fail2ban filter and jail definitions.

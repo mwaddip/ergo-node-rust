@@ -10,8 +10,9 @@ Group=ergo-node
 ExecStart=/usr/bin/ergo-node-rust /etc/ergo-node/ergo.toml
 Restart=on-failure
 RestartSec=10
-StandardOutput=append:/var/log/ergo-node/ergo-node.log
-StandardError=append:/var/log/ergo-node/ergo-node.log
+# stdout/stderr default to journald — the shipped fail2ban jail uses
+# backend=systemd and journalmatch=_SYSTEMD_UNIT=ergo-node-rust.service,
+# so PENALTY lines must reach the journal to be acted on.
 Environment=RUST_LOG=info
 # Opt jemalloc out of Transparent Huge Pages.
 # With kernel THP=always, jemalloc cannot effectively return memory to

@@ -1181,7 +1181,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let data_dir = std::path::PathBuf::from(node_config.data_dir);
     std::fs::create_dir_all(&data_dir)?;
+    tracing::info!(path = %data_dir.join("modifiers.redb").display(), "opening modifier store");
     let store = Arc::new(RedbModifierStore::new(&data_dir.join("modifiers.redb"))?);
+    tracing::info!("modifier store opened");
 
     // Shared header chain: pipeline writes, sync reads
     let mut chain = HeaderChain::new(chain_config);
@@ -1199,6 +1201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // cause in enr-store's write path is tracked separately; this
     // loader tolerates the divergence regardless.
     if let Some((tip_height, tip_id)) = store.best_header_tip()? {
+        tracing::info!(tip = tip_height, "restoring header chain from store (walk backward)");
         // Walk backward collecting IDs only. Parsing each header just to
         // extract parent_id and dropping it avoids keeping 1.76M fully
         // deserialized Header structs resident alongside chain's own
@@ -1231,12 +1234,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let parent_id: [u8; 32] = header.parent_id.0.0;
             let is_genesis = header.height == 1;
             ids.push(current_id);
+            if ids.len() % 100_000 == 0 {
+                tracing::info!(walked = ids.len(), tip = tip_height, "header chain restore: walking backward");
+            }
             if is_genesis {
                 break true;
             }
             current_id = parent_id;
         };
 
+        tracing::info!(headers = ids.len(), "header chain restore: walk complete, replaying forward");
         // Replay forward, re-fetching and re-parsing one header at a time.
         // redb's cache makes the second fetch cheap. If the walk failed
         // before reaching genesis, the first try_append will fail parent
@@ -1262,7 +1269,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let h = header.height;
             match chain.try_append(header) {
-                Ok(enr_chain::AppendResult::Extended) => loaded += 1,
+                Ok(enr_chain::AppendResult::Extended) => {
+                    loaded += 1;
+                    if loaded % 100_000 == 0 {
+                        tracing::info!(loaded, tip = tip_height, "header chain restore: replaying forward");
+                    }
+                }
                 Ok(enr_chain::AppendResult::Forked { .. }) => {
                     tracing::error!(height = h, "restored header detected as fork — store corrupted?");
                     break;
@@ -1547,8 +1559,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let state_path = data_dir.join("state.redb");
             let params = AVLTreeParams { key_length: 32, value_length: None };
             let keep_versions = 200u32;
+            tracing::info!(
+                path = %state_path.display(),
+                cache_mb = node_config.cache_mb,
+                "opening UTXO state storage (this may take a while after unclean shutdown)"
+            );
             let mut storage = RedbAVLStorage::open(&state_path, params, keep_versions, CacheSize::Bytes(node_config.cache_mb as usize * 1024 * 1024))
                 .expect("failed to open UTXO state storage");
+            tracing::info!("UTXO state storage opened");
 
             let checkpoint = configured_checkpoint.unwrap_or(0);
 

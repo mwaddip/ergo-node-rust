@@ -294,7 +294,12 @@ max_inbound = 20
 [outbound]
 min_peers = 3
 max_peers = 10
-seed_peers = ["213.239.193.208:9020", "176.9.15.237:9020"]
+seed_peers = [
+    "213.239.193.208:9030",
+    "159.65.11.55:9030",
+    "165.227.26.175:9030",
+    "94.130.108.35:9030",
+]
 
 [identity]
 agent_name = "ergo-node-rust"

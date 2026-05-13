@@ -47,7 +47,7 @@ for script in preinst postinst prerm postrm; do
     chmod 755 "target/${PKG}/DEBIAN/${script}"
 done
 
-dpkg-deb --build "target/${PKG}"
+dpkg-deb --root-owner-group --build "target/${PKG}"
 
 rm -rf "target/${PKG}"
 
