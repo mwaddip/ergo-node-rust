@@ -148,6 +148,26 @@ pub trait ModifierStore: Send + Sync {
         score: &[u8],
     ) -> Result<(), Self::Error>;
 
+    /// Batch variant of `put_header_score` — writes many `(id, score)`
+    /// pairs in a single redb write transaction.
+    ///
+    /// Order is preserved but irrelevant; HEADER_SCORES is keyed by
+    /// header id, not height. Each entry must satisfy the same
+    /// preconditions as `put_header_score` (id present in PRIMARY,
+    /// score is non-empty big-endian BigUint bytes).
+    ///
+    /// Atomic: on Ok all entries are committed; on Err none are.
+    ///
+    /// Used by the scores backfill migration to cut per-transaction
+    /// overhead by ~100×. With 1.78M individual writes the migration
+    /// also leaves substantial redb recovery work for the next
+    /// unclean restart (~6 min open time observed) — chunking into
+    /// ~50_000-entry batches collapses that.
+    fn put_header_score_batch(
+        &self,
+        entries: &[([u8; 32], Vec<u8>)],
+    ) -> Result<(), Self::Error>;
+
     // --- Chain metadata ---
 
     /// Read a value from the chain_meta table.
@@ -318,6 +338,8 @@ crate treats values as opaque byte strings.
 - **`put_header_score`**: `id` corresponds to a header previously
   written via `put_batch` (type=101) or `put_header`. `score` is
   non-empty big-endian BigUint bytes.
+- **`put_header_score_batch`**: every entry's id corresponds to a
+  header in PRIMARY; every entry's score is non-empty.
 - **`best_chain_entries`**: no preconditions.
 - **`chain_meta_put`** / **`chain_meta_get`**: `key` is non-empty.
 - **`get` / `get_id_at` / `contains` / `tip` / `header_score`**: No
@@ -348,6 +370,9 @@ crate treats values as opaque byte strings.
   updated to `score`. Subsequent `header_score(id)` returns
   `Some(score)`. Touches no other table. Returns Err if `id` is not
   in PRIMARY.
+- **`put_header_score_batch`**: On Ok, every entry's HEADER_SCORES
+  row is updated to its score, atomically (single redb write tx).
+  On Err, no entries are written. Touches no other table.
 - **`best_chain_entries`**: Returns a Vec of `(height, header_id)`
   pairs covering every entry in BEST_CHAIN, in ascending height
   order. Empty when the chain is empty.
