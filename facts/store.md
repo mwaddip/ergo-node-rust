@@ -455,10 +455,15 @@ authoritative for its height slot" without a second atomic-swap API.
 ## Open-time cost
 
 `RedbModifierStore::new` must run in single-digit seconds even on a
-multi-GB store after unclean shutdown. The `load_tips` helper that
-populates the per-type tip cache MUST NOT iterate the entire
-`HEIGHT_INDEX` table — at a full mainnet store (~5.3M entries across
-section types 102/104/108) that iteration dominates open time.
+multi-GB store after unclean shutdown. Two contributors dominate
+open time and are both controlled here:
+
+### load_tips
+
+The `load_tips` helper that populates the per-type tip cache MUST
+NOT iterate the entire `HEIGHT_INDEX` table — at a full mainnet
+store (~5.3M entries across section types 102/104/108) that
+iteration dominates open time.
 
 Acceptable implementations:
 - Per-type backward range scan: for each known modifier type id,
@@ -471,6 +476,39 @@ Acceptable implementations:
 
 The implementation is not visible in the public API; either approach
 satisfies the contract.
+
+### redb quick-repair
+
+Every redb `WriteTransaction` opened by the store MUST call
+`set_quick_repair(true)` before committing. From the redb
+documentation:
+
+> By default, when reopening the database after a crash, redb
+> needs to do a full repair. This involves walking the entire
+> database to verify the checksums and reconstruct the allocator
+> state, so it can be very slow if the database is large.
+>
+> Alternatively, you can enable quick-repair. In this mode, redb
+> saves the allocator state as part of each commit (so it doesn't
+> need to be reconstructed), and enables 2-phase commit (which
+> guarantees that the primary commit slot is valid without needing
+> to look at the checksums). This means commits are slower, but
+> recovery after a crash is almost instant.
+
+Measured on the laptop's full-mainnet modifier store: without
+quick-repair, `Database::create` after `kill -9` takes ~5m43s. With
+quick-repair enabled going forward, that drops to seconds.
+
+Trade-off: per-commit cost is slightly higher (allocator state is
+serialized into every commit). For our write profile — a handful of
+small commits per block at-tip, occasional larger commits during
+sync — the overhead is negligible. For the scores backfill
+migration the per-commit cost is amortized across 50_000 score
+writes per chunk.
+
+quick-repair becomes effective from the first commit that sets it;
+unrelated `Database::create` calls between two non-quick-repair
+commits still need full repair.
 
 ## Known follow-ups
 

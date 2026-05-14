@@ -467,6 +467,26 @@ The primary design constraint. The node WILL be killed mid-operation.
   version, restoring the root node from storage. Subsequent operations lazy-load
   the rest of the tree via the resolver.
 
+### Open-time cost (v0.5.0+)
+
+Every redb `WriteTransaction` opened by `RedbAVLStorage` MUST call
+`set_quick_repair(true)` before committing. Without quick-repair,
+`Database::open` after `kill -9` does a full file scan to
+reconstruct the allocator state — measured ~1m57s on the laptop's
+full-mainnet state.redb. With quick-repair, recovery is "almost
+instant" per redb's docs.
+
+This applies to every write path: `update`, `flush`, genesis
+bootstrap, version pruning, and any metadata writes. Pruning a
+single call site (e.g. only the bulk `update` path) leaves the
+database non-quick-repair-ready after any other commit, defeating
+the purpose.
+
+Trade-off: per-commit cost is slightly higher (allocator state
+serialized into every commit, 2-phase commit). For state.redb's
+write profile (one update per block at-tip, larger updates during
+sync) the overhead is negligible against the recovery-time win.
+
 ## Bootstrap Modes
 
 Not owned by this crate — bootstrap logic lives in the orchestration layer
