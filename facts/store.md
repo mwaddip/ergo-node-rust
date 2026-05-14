@@ -187,6 +187,16 @@ pub trait ModifierStore: Send + Sync {
         value: &[u8],
     ) -> Result<(), Self::Error>;
 
+    /// Remove a value from the chain_meta table.
+    ///
+    /// Idempotent: removing a key that does not exist is `Ok(())`.
+    /// Primary use case is operator-driven re-runs of one-shot
+    /// migrations (delete the migration's sentinel and restart).
+    fn chain_meta_delete(
+        &self,
+        key: &[u8],
+    ) -> Result<(), Self::Error>;
+
     /// Get the best chain header ID at a height.
     fn best_header_at(
         &self,
@@ -442,13 +452,31 @@ overwrites BEST_CHAIN at each height. This is the single write path
 for main-chain headers and keeps the invariant "main-chain is
 authoritative for its height slot" without a second atomic-swap API.
 
+## Open-time cost
+
+`RedbModifierStore::new` must run in single-digit seconds even on a
+multi-GB store after unclean shutdown. The `load_tips` helper that
+populates the per-type tip cache MUST NOT iterate the entire
+`HEIGHT_INDEX` table — at a full mainnet store (~5.3M entries across
+section types 102/104/108) that iteration dominates open time.
+
+Acceptable implementations:
+- Per-type backward range scan: for each known modifier type id,
+  `table.range((type, 0)..(type+1, 0)).rev().next()` reads at most
+  one entry per type. O(K log N) total reads where K = number of
+  modifier types and N = total entries.
+- Separate `type_tips` table maintained write-through on every `put`
+  for non-header types. `load_tips` then becomes a single small
+  table scan (one row per type).
+
+The implementation is not visible in the public API; either approach
+satisfies the contract.
+
 ## Known follow-ups
 
-- Non-header modifier `tip` uses an in-memory `HashMap<type_id, (height, id)>`
-  cache separate from BEST_CHAIN. That cache is only updated by writes in
-  the current process — a fresh open loads it from `HEIGHT_INDEX` via
-  `load_tips`. This is fine for single-writer use but would need attention
-  if the store ever has concurrent writers.
+- The in-memory tip caches (`tips` and `best_header_tip`) are
+  single-writer-safe. Concurrent writers would need them moved into
+  the database or coordinated externally.
 
 ## SPECIAL Profile
 

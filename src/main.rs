@@ -1188,16 +1188,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // One-shot scores backfill migration. v0.4.x stored empty
     // placeholder scores for main-chain headers; v0.5.0 needs real
     // cumulative scores so the chain's ScoreLoader can serve them.
-    // Idempotent — re-runs safely if killed mid-walk.
+    // Idempotent — re-runs safely if killed mid-walk. Batched into
+    // 50_000-entry chunks per redb write tx so unclean-restart
+    // recovery work stays bounded.
     if store.chain_meta_get(b"scores_migrated_v1")?.is_none() {
         let entries = store.best_chain_entries()?;
         let total = entries.len();
         if total > 0 {
             tracing::info!(
                 total,
-                "scores migration: starting (one-time backfill, may take 5-15 min on full mainnet)"
+                "scores migration: starting (one-time backfill)"
             );
+            const CHUNK_SIZE: usize = 50_000;
             let mut prev_score = enr_chain::BigUint::default();
+            let mut batch: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(CHUNK_SIZE);
             for (i, (height, header_id)) in entries.iter().enumerate() {
                 let data = store
                     .get(HEADER_TYPE_ID, header_id)?
@@ -1221,10 +1225,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     &prev_score + &difficulty
                 };
-                store.put_header_score(header_id, &score.to_bytes_be())?;
+                batch.push((*header_id, score.to_bytes_be()));
                 prev_score = score;
-                if (i + 1) % 10_000 == 0 {
-                    tracing::info!(done = i + 1, total, "scores migration: progress");
+                let done = i + 1;
+                if batch.len() >= CHUNK_SIZE || done == total {
+                    store.put_header_score_batch(&batch)?;
+                    batch.clear();
+                    tracing::info!(done, total, "scores migration: progress");
                 }
             }
             tracing::info!(headers = total, "scores migration: complete, persisting sentinel");
