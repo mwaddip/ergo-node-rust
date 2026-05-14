@@ -151,7 +151,37 @@ impl P2pNode {
         let (outbound_request_tx, outbound_request_rx) =
             mpsc::channel::<SocketAddr>(OUTBOUND_REQUEST_CAPACITY);
 
-        let peer_db = PeerDb::new(peer_storage, blacklist.clone(), DEFAULT_CAP)
+        // Discover external addresses before starting listeners.
+        // UPnP for IPv4 (NAT traversal), interface enumeration for IPv6 (globally routable).
+        // Done before PeerDb construction so the declared addresses can
+        // feed `self_addresses` and PeerDb drops self-loop gossip records.
+        let mut upnp_mapping: Option<UpnpMapping> = None;
+        let mut ipv4_declared: Option<SocketAddr> = None;
+        let mut ipv6_declared: Option<SocketAddr> = None;
+
+        if config.upnp.enabled {
+            if let Some(ref listener_cfg) = config.listen.ipv4 {
+                if let Some(mapping) = crate::upnp::attempt(
+                    &config.upnp,
+                    listener_cfg.address.port(),
+                    listener_cfg.address,
+                ).await {
+                    ipv4_declared = Some(mapping.external_addr);
+                    upnp_mapping = Some(mapping);
+                }
+            }
+        }
+
+        if let Some(ref listener_cfg) = config.listen.ipv6 {
+            ipv6_declared = crate::netif::find_global_ipv6(listener_cfg.address.port());
+        }
+
+        let self_addresses: HashSet<SocketAddr> = [ipv4_declared, ipv6_declared]
+            .into_iter()
+            .flatten()
+            .collect();
+
+        let peer_db = PeerDb::new(peer_storage, blacklist.clone(), DEFAULT_CAP, self_addresses)
             .map_err(|e| -> Box<dyn std::error::Error> {
                 format!("PeerDb init: {}", e).into()
             })?;
@@ -175,29 +205,6 @@ impl P2pNode {
             blacklist: blacklist.clone(),
             peer_db: peer_db.clone(),
         };
-
-        // Discover external addresses before starting listeners.
-        // UPnP for IPv4 (NAT traversal), interface enumeration for IPv6 (globally routable).
-        let mut upnp_mapping: Option<UpnpMapping> = None;
-        let mut ipv4_declared: Option<SocketAddr> = None;
-        let mut ipv6_declared: Option<SocketAddr> = None;
-
-        if config.upnp.enabled {
-            if let Some(ref listener_cfg) = config.listen.ipv4 {
-                if let Some(mapping) = crate::upnp::attempt(
-                    &config.upnp,
-                    listener_cfg.address.port(),
-                    listener_cfg.address,
-                ).await {
-                    ipv4_declared = Some(mapping.external_addr);
-                    upnp_mapping = Some(mapping);
-                }
-            }
-        }
-
-        if let Some(ref listener_cfg) = config.listen.ipv6 {
-            ipv6_declared = crate::netif::find_global_ipv6(listener_cfg.address.port());
-        }
 
         // Start listeners
         if let Some(ref listener_cfg) = config.listen.ipv6 {
@@ -886,7 +893,7 @@ mod tests {
     fn shared_peer_db(blacklist: Arc<Blacklist>) -> Arc<StdMutex<PeerDb>> {
         let storage: Box<dyn PeerStorage> =
             Box::new(crate::peer_db::MemoryPeerStorage::new());
-        let db = PeerDb::new(storage, blacklist, DEFAULT_CAP)
+        let db = PeerDb::new(storage, blacklist, DEFAULT_CAP, HashSet::new())
             .expect("MemoryPeerStorage::load_all is infallible");
         Arc::new(StdMutex::new(db))
     }

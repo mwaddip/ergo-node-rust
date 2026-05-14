@@ -111,6 +111,7 @@ impl Router {
             storage,
             blacklist.clone(),
             crate::peer_db::DEFAULT_CAP,
+            HashSet::new(),
         )
         .expect("MemoryPeerStorage::load_all is infallible");
         Self::with_peer_db(Arc::new(StdMutex::new(peer_db)), blacklist, 64)

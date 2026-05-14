@@ -15,6 +15,13 @@ The handle to a running P2P layer. Created by `P2pNode::start()`. The P2P layer 
   to repopulate the table, then constructs the PeerDb and hands it
   to the router and outbound manager. On `load_all` failure, `start`
   returns the error.
+- Before constructing the PeerDb, `start` assembles a
+  `self_addresses: HashSet<SocketAddr>` from every listener's
+  declared address (post-UPnP, post-IPv6-auto-detect — i.e. the
+  same value passed to `HandshakeConfig::declared_address` for that
+  listener). This set is passed to `PeerDb::new` so gossip entries
+  for our own addresses are filtered out at record-time. Listeners
+  with no declared address contribute nothing.
 
 ### `peer_count() -> usize`
 - Returns the number of currently connected peers (inbound + outbound).

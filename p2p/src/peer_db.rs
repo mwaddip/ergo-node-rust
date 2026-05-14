@@ -57,10 +57,21 @@ pub struct PeerDb {
     cap: usize,
     blacklist: Arc<Blacklist>,
     storage: Box<dyn PeerStorage>,
+    /// Addresses considered "self" — every listener's declared address
+    /// at startup. Records with these addresses are dropped at every
+    /// entry point (gossip-time `record`, startup `load_all` filter).
+    /// Captured by value at construction; not tracked after.
+    self_addresses: HashSet<SocketAddr>,
 }
 
 impl PeerDb {
     /// Construct a `PeerDb` and repopulate it from `storage`.
+    ///
+    /// `self_addresses` is the set of our own declared listener
+    /// addresses (post-UPnP, post-IPv6-auto-detect). Persisted records
+    /// matching one of these addresses are dropped from the in-memory
+    /// table but left on disk — a self-address today may legitimately
+    /// be a different host tomorrow (e.g. IPv6 prefix change).
     ///
     /// # Errors
     /// Returns the storage error from `load_all`. The caller (main
@@ -70,22 +81,30 @@ impl PeerDb {
         storage: Box<dyn PeerStorage>,
         blacklist: Arc<Blacklist>,
         cap: usize,
+        self_addresses: HashSet<SocketAddr>,
     ) -> Result<Self, PeerStorageError> {
         let loaded = storage.load_all()?;
         let mut entries = HashMap::with_capacity(loaded.len());
         for rec in loaded {
+            if self_addresses.contains(&rec.address) {
+                continue;
+            }
             entries.insert(rec.address, rec);
         }
-        Ok(Self { entries, cap, blacklist, storage })
+        Ok(Self { entries, cap, blacklist, storage, self_addresses })
     }
 
     /// Insert or update a record.
     ///
-    /// Drops blacklisted addresses silently. Merges `last_seen_ms` with
-    /// any prior value (max wins) and overwrites the rest of the fields.
-    /// Evicts the least-recently-seen entry when the cap is hit.
+    /// Drops blacklisted addresses and self-loop candidates silently.
+    /// Merges `last_seen_ms` with any prior value (max wins) and
+    /// overwrites the rest of the fields. Evicts the least-recently-seen
+    /// entry when the cap is hit.
     pub fn record(&mut self, mut record: PeerRecord) {
         if self.blacklist.contains(record.address) {
+            return;
+        }
+        if self.self_addresses.contains(&record.address) {
             return;
         }
         if let Some(prior) = self.entries.get(&record.address) {
@@ -251,7 +270,7 @@ mod tests {
     fn db_with_cap(cap: usize) -> (PeerDb, Arc<Blacklist>) {
         let bl = Arc::new(Blacklist::new());
         let storage: Box<dyn PeerStorage> = Box::new(MemoryPeerStorage::new());
-        let db = PeerDb::new(storage, bl.clone(), cap).expect("new ok");
+        let db = PeerDb::new(storage, bl.clone(), cap, HashSet::new()).expect("new ok");
         (db, bl)
     }
 
@@ -287,7 +306,7 @@ mod tests {
     fn blacklist_drops_silently_in_record() {
         let bl = Arc::new(Blacklist::new());
         let storage: Box<dyn PeerStorage> = Box::new(MemoryPeerStorage::new());
-        let mut db = PeerDb::new(storage, bl.clone(), 10).unwrap();
+        let mut db = PeerDb::new(storage, bl.clone(), 10, HashSet::new()).unwrap();
         bl.record_permanent(addr("1.2.3.4:9030"));
         db.record(record("1.2.3.4:9030", 1000));
         assert_eq!(db.count(), 0);
@@ -322,7 +341,7 @@ mod tests {
     fn recent_filters_blacklisted() {
         let bl = Arc::new(Blacklist::new());
         let storage: Box<dyn PeerStorage> = Box::new(MemoryPeerStorage::new());
-        let mut db = PeerDb::new(storage, bl.clone(), 10).unwrap();
+        let mut db = PeerDb::new(storage, bl.clone(), 10, HashSet::new()).unwrap();
         db.record(record("1.0.0.1:9030", 100));
         db.record(record("1.0.0.2:9030", 300));
         bl.record_permanent(addr("1.0.0.2:9030"));
@@ -370,6 +389,7 @@ mod tests {
             Box::new(MemoryPeerStorageHandle(storage.clone())),
             bl,
             10,
+            HashSet::new(),
         ).unwrap();
         db.record(record("1.2.3.4:9030", 1000));
         let ops = storage.ops();
@@ -385,6 +405,7 @@ mod tests {
             Box::new(MemoryPeerStorageHandle(storage.clone())),
             bl,
             10,
+            HashSet::new(),
         ).unwrap();
         db.record(record("1.2.3.4:9030", 1000));
         db.forget(addr("1.2.3.4:9030"));
@@ -400,6 +421,7 @@ mod tests {
             Box::new(MemoryPeerStorageHandle(storage.clone())),
             bl,
             2,
+            HashSet::new(),
         ).unwrap();
         db.record(record("1.0.0.1:9030", 100));
         db.record(record("1.0.0.2:9030", 200));
@@ -418,8 +440,60 @@ mod tests {
             Box::new(MemoryPeerStorageHandle(storage)),
             Arc::new(Blacklist::new()),
             10,
+            HashSet::new(),
         ).unwrap();
         assert_eq!(db.count(), 2);
+    }
+
+    #[test]
+    fn record_drops_self_address() {
+        let bl = Arc::new(Blacklist::new());
+        let storage = Arc::new(MemoryPeerStorage::new());
+        let mut self_addresses = HashSet::new();
+        self_addresses.insert(addr("1.2.3.4:9030"));
+        let mut db = PeerDb::new(
+            Box::new(MemoryPeerStorageHandle(storage.clone())),
+            bl,
+            10,
+            self_addresses,
+        ).unwrap();
+        db.record(record("1.2.3.4:9030", 1000));
+        assert_eq!(db.count(), 0);
+        let ops = storage.ops();
+        assert!(
+            !ops.iter().any(|op| matches!(op, MemoryStorageOp::Put(_))),
+            "no storage write should fire for a self-address record"
+        );
+    }
+
+    #[test]
+    fn load_all_filters_self_addresses() {
+        let storage = Arc::new(MemoryPeerStorage::new());
+        storage.preload(record("1.2.3.4:9030", 100));
+        storage.preload(record("5.6.7.8:9030", 200));
+        let mut self_addresses = HashSet::new();
+        self_addresses.insert(addr("1.2.3.4:9030"));
+        let db = PeerDb::new(
+            Box::new(MemoryPeerStorageHandle(storage.clone())),
+            Arc::new(Blacklist::new()),
+            10,
+            self_addresses,
+        ).unwrap();
+        assert_eq!(db.count(), 1);
+        assert!(db.get(addr("1.2.3.4:9030")).is_none());
+        assert!(db.get(addr("5.6.7.8:9030")).is_some());
+        // The self-record must remain on disk — re-reading the storage
+        // directly must still return both rows. PeerDb::new never calls
+        // storage.delete on filtered self-addresses.
+        let persisted = storage.load_all().expect("infallible");
+        let persisted_addrs: HashSet<SocketAddr> =
+            persisted.iter().map(|r| r.address).collect();
+        assert!(persisted_addrs.contains(&addr("1.2.3.4:9030")));
+        assert!(persisted_addrs.contains(&addr("5.6.7.8:9030")));
+        assert!(
+            !storage.ops().iter().any(|op| matches!(op, MemoryStorageOp::Delete(_))),
+            "PeerDb::new must not delete filtered self-addresses from disk"
+        );
     }
 
     /// Wraps an `Arc<MemoryPeerStorage>` so a single backing store can

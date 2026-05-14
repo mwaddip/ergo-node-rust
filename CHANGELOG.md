@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.5.2 — 2026-05-14
+
+Self-loop fix. With v0.5.1, the outbound manager's fill phase
+would occasionally dial our own declared address — a JVM peer
+gossips us back to ourselves in a `Peers` message, the candidate
+selection sees a recently-seen entry, and we dial it. The
+listener accepts, the handshake completes, and we end up with one
+outbound + one inbound peer that are both ourselves. Harmless,
+but wastes two peer slots and pollutes `/peers/all`.
+
+`PeerDb::new` now takes a `self_addresses: HashSet<SocketAddr>`
+assembled by `P2pNode::start` from every listener's declared
+address (post-UPnP, post-IPv6-auto-detect). `record()` drops
+entries whose address is in that set; `load_all` filters them out
+of the in-memory population at startup. Persisted self entries on
+disk are NOT deleted — a self-address today (current IPv6 prefix)
+may legitimately be a different host tomorrow, so the disk row
+stays viable.
+
+The outbound side is the only mechanism we needed to plug — once
+gossiped self-entries never enter the in-memory DB, candidate
+selection never sees them, no self-dial happens, no self-loop is
+formed. No inbound-side handshake rejection needed.
+
 ## v0.5.1 — 2026-05-14
 
 Real peer discovery. v0.4.x and v0.5.0 had `GetPeers` and `Peers`

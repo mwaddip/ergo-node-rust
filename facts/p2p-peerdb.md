@@ -27,11 +27,25 @@ The PeerDb does not distinguish; both feed the same table.
 
 ## Module: `peer_db::PeerDb`
 
+### Constructor
+
+`PeerDb::new(storage, blacklist, cap, self_addresses)` takes a
+`HashSet<SocketAddr>` of addresses considered "self" — populated by
+the main session from each listener's declared address (post-UPnP,
+post-IPv6-auto-detect). Used to drop self-loop candidates that
+peers gossip back to us. The set is captured by value at
+construction; the PeerDb does not track address changes after
+that.
+
 ### `record(record: PeerRecord)`
 - **Precondition**: `record.address` is not on the blacklist.
-- **Postcondition**: An entry for `record.address` exists with
-  `last_seen_ms` set to the maximum of any prior value and the new
-  value. Other fields are overwritten from the new record.
+- **Postcondition**: If `record.address ∈ self_addresses` or is on
+  the blacklist, the call is a no-op (no in-memory insert, no
+  storage write).
+- **Postcondition**: Otherwise, an entry for `record.address`
+  exists with `last_seen_ms` set to the maximum of any prior value
+  and the new value. Other fields are overwritten from the new
+  record.
 - **Postcondition**: If insertion would exceed the soft cap, the
   entry with the smallest `last_seen_ms` is evicted before insertion.
 - **Side effect**: `PeerStorage::put` is called with the resulting
@@ -72,7 +86,11 @@ pub trait PeerStorage: Send + Sync {
 
 - **`load_all`**: Called once at `PeerDb` construction to repopulate
   the in-memory table. Returns every persisted record. Order does not
-  matter — PeerDb sorts on demand.
+  matter — PeerDb sorts on demand. `PeerDb::new` filters loaded
+  records against `self_addresses` before populating the in-memory
+  set; the disk rows are NOT deleted (a self-address today may
+  legitimately be a different host tomorrow — e.g. when an IPv6
+  prefix changes).
 - **`put`**: Write-through. Called on every `record()` (including
   updates). Implementations should be fast (single redb write) and
   must not block longer than a few ms.
