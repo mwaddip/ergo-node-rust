@@ -1,5 +1,7 @@
 mod redb;
 
+use std::net::SocketAddr;
+
 pub use self::redb::{RedbModifierStore, StoreError};
 
 /// A single entry in a `put_batch` slice.
@@ -207,6 +209,37 @@ pub trait ModifierStore: Send + Sync {
         &self,
         height: u32,
     ) -> Result<Option<Vec<u8>>, Self::Error>;
+
+    /// Write or overwrite a peer record.
+    ///
+    /// Key is the encoded `SocketAddr` (family byte + IP octets + port).
+    /// Value is the serialized peer record — treated as opaque bytes by
+    /// the store; the p2p crate owns the schema.
+    ///
+    /// Overwrites any prior value at the same address.
+    fn put_peer(
+        &self,
+        addr: SocketAddr,
+        record: &[u8],
+    ) -> Result<(), Self::Error>;
+
+    /// Remove a peer record. Idempotent: removing an absent address
+    /// is `Ok(())`.
+    fn delete_peer(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<(), Self::Error>;
+
+    /// Read every peer record. Single read transaction. Returns a
+    /// `Vec<(addr, record_bytes)>` with no ordering guarantee — caller
+    /// sorts if it cares.
+    ///
+    /// Rows whose key cannot be decoded as a `SocketAddr` are skipped
+    /// with a `tracing::warn!` rather than aborting the call; the
+    /// store is not the place to nuke the p2p layer over a corrupt row.
+    fn list_peers(
+        &self,
+    ) -> Result<Vec<(SocketAddr, Vec<u8>)>, Self::Error>;
 
     /// Force a durable commit — fsync all pending writes to disk.
     ///

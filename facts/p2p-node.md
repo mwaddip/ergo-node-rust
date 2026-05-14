@@ -4,10 +4,17 @@
 
 The handle to a running P2P layer. Created by `P2pNode::start()`. The P2P layer runs as background tokio tasks — the caller owns the runtime.
 
-### `start(config, modifier_sink) -> Result<P2pNode>`
+### `start(config, modifier_sink, peer_storage) -> Result<P2pNode>`
 - **Precondition**: Called within a tokio runtime.
-- **Postcondition**: Listeners, outbound connections, keepalive, and event loop are spawned as background tasks. Returns immediately.
+- **Postcondition**: Listeners, outbound connections, keepalive,
+  outbound-fill dialer, and event loop are spawned as background tasks.
+  Returns immediately.
 - If `modifier_sink` is `Some`, every modifier from a `ModifierResponse` is sent to the channel as `(modifier_type, id, data, peer_id)` via the `Action::Validate` mechanism. `peer_id` is `Option<u64>` — `Some(id)` for peer-delivered modifiers, `None` for locally-ingested ones. The P2P layer never blocks on validation.
+- `peer_storage: Box<dyn PeerStorage>` provides persistent backing
+  for the in-memory PeerDb. `start` calls `peer_storage.load_all()`
+  to repopulate the table, then constructs the PeerDb and hands it
+  to the router and outbound manager. On `load_all` failure, `start`
+  returns the error.
 
 ### `peer_count() -> usize`
 - Returns the number of currently connected peers (inbound + outbound).
@@ -37,12 +44,24 @@ The handle to a running P2P layer. Created by `P2pNode::start()`. The P2P layer 
 - The subscriber sees raw events — the router may subsequently drop, reroute, or transform them.
 
 ### `all_peers() -> Vec<PeerEntry>` (async)
-- Returns information about all known peers (connected + disconnected).
+- Returns information about all peers in the PeerDb, with connection
+  state overlaid from the live router state.
 - Each `PeerEntry` includes:
-  - `address: SocketAddr` — peer's socket address
-  - `agent_name: Option<String>` — advertised agent string (None if never handshaked)
-  - `last_seen_ms: Option<u64>` — Unix epoch ms of last seen, None if never connected
-  - `connection_type: Option<ConnectionType>` — `Outgoing` / `Incoming` for currently connected peers; `None` for known-but-disconnected
+  - `address: SocketAddr` — peer's declared address (the PeerDb key).
+  - `agent_name: Option<String>` — `Some` whenever the PeerDb has an
+    agent string for the entry. May come from our own handshake or
+    from a gossiped Peers entry.
+  - `last_seen_ms: Option<u64>` — Unix epoch ms of `PeerRecord.last_seen_ms`.
+    `None` only for entries with no recorded contact time (currently
+    none in practice — PeerDb sets it on every `record`).
+  - `connection_type: Option<ConnectionType>` — `Outgoing` / `Incoming`
+    for addresses currently connected per the router; `None` for
+    PeerDb entries we are not currently connected to.
+- The set is the PeerDb union with the currently-connected addresses
+  (the latter rare-but-possible case is an inbound peer whose
+  declared address differs from its observed socket — both addresses
+  appear: the declared one in the PeerDb entry, the observed one in
+  the connection overlay).
 - Used by the API layer for `GET /peers/all`.
 
 ### `network_status() -> NetworkStatus` (async)
@@ -72,6 +91,40 @@ The handle to a running P2P layer. Created by `P2pNode::start()`. The P2P layer 
 The router emits `Action::Validate { modifier_type, id, data, peer_id }` for each modifier in a `ModifierResponse`. `peer_id` identifies which peer sent the modifier, enabling penalty attribution when validation fails downstream. The event loop dispatches these to the `modifier_sink` channel as `(modifier_type, id, data, Some(peer_id.0))` via `try_send` (non-blocking). If no sink is provided, validate actions are dropped (pure proxy mode).
 
 The router does NOT validate modifiers. It routes them, emits them for external validation, and forwards to requesters. Validation is the pipeline's job.
+
+## Outbound Manager
+
+The outbound manager runs as a background task. Two distinct phases:
+
+### Floor phase (current behaviour, preserved)
+- While `connected_outbound < min_peers`, dial seeds aggressively
+  with the existing retry/backoff behaviour. The PeerDb is not
+  consulted in this phase — seeds are the bootstrap source.
+
+### Fill phase (new in v0.6.0+)
+- Once `connected_outbound >= min_peers` and `< max_peers`, the
+  manager enters a slow-trickle mode:
+  - Every `outbound_fill_interval` (default **30s**), it queries
+    `PeerDb::recent(N, exclude=currently_connected_addrs)` where
+    `N = max_peers - connected_outbound`.
+  - If the result is non-empty, it dials the **first** entry
+    (most-recently-seen). One dial per tick, not N.
+  - If `connected_outbound >= max_peers`, the manager sleeps the tick.
+  - If the PeerDb is empty or fully exhausted (every fresh candidate
+    has been tried and failed within the last `fill_retry_cooldown`),
+    the manager remains idle until new peers arrive (via gossip).
+- The fill phase respects the blacklist and the address-already-connected
+  check. It never re-dials a peer disconnected in the last
+  `outbound_redial_cooldown` (default 60s).
+
+### Failure handling
+- A dial failure (TCP refused, handshake timeout, version mismatch)
+  marks the address with a transient cooldown but does not remove it
+  from PeerDb. A peer that repeatedly fails may still gossip back
+  through other peers; the PeerDb has no concept of "gave up" — that
+  belongs to the cooldown set inside the outbound manager.
+- A `PermanentPenalty` from the blacklist removes the entry from
+  PeerDb via `forget`.
 
 ## Invariants
 

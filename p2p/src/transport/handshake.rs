@@ -82,50 +82,71 @@ pub fn build(config: &HandshakeConfig) -> Vec<u8> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
     vlq::write_vlq(&mut buf, now);
 
-    // Agent name
-    vlq::write_short_string(&mut buf, &config.agent_name);
+    write_peer_entry_from_config(config, &mut buf);
+    buf
+}
 
-    // Version
+/// Serialize a `PeerSpec` in the wire-format used inside a `Peers` message
+/// body (and after the timestamp inside a handshake). Inverse of
+/// [`parse_peer_entry`].
+pub fn serialize_peer_entry(spec: &PeerSpec, buf: &mut Vec<u8>) {
+    vlq::write_short_string(buf, &spec.agent);
+    buf.push(spec.version.major);
+    buf.push(spec.version.minor);
+    buf.push(spec.version.patch);
+    vlq::write_short_string(buf, &spec.name);
+
+    write_declared_address(spec.address.as_ref(), buf);
+
+    debug_assert!(spec.features.len() <= u8::MAX as usize, "feature count overflow");
+    buf.push(spec.features.len() as u8);
+    for feature in &spec.features {
+        buf.push(feature.id);
+        // Feature body length is VLQ-encoded (Scorex putUShort → putUInt → putULong → VLQ).
+        vlq::write_vlq(buf, feature.body.len() as u64);
+        buf.extend_from_slice(&feature.body);
+    }
+}
+
+fn write_peer_entry_from_config(config: &HandshakeConfig, buf: &mut Vec<u8>) {
+    vlq::write_short_string(buf, &config.agent_name);
+
     buf.push(config.version.major);
     buf.push(config.version.minor);
     buf.push(config.version.patch);
 
-    // Peer name
-    vlq::write_short_string(&mut buf, &config.peer_name);
+    vlq::write_short_string(buf, &config.peer_name);
 
-    // Declared address
-    match &config.declared_address {
+    write_declared_address(config.declared_address.as_ref(), buf);
+
+    buf.push(2); // feature count: Mode + Session
+
+    buf.push(FEATURE_MODE);
+    let mode_body = build_mode_body(config);
+    vlq::write_vlq(buf, mode_body.len() as u64);
+    buf.extend_from_slice(&mode_body);
+
+    buf.push(FEATURE_SESSION);
+    let session_body = build_session_body(config.network);
+    vlq::write_vlq(buf, session_body.len() as u64);
+    buf.extend_from_slice(&session_body);
+}
+
+fn write_declared_address(addr: Option<&SocketAddr>, buf: &mut Vec<u8>) {
+    match addr {
         None => buf.push(0x00),
         Some(addr) => {
             buf.push(0x01);
-            let ip_bytes = match addr.ip() {
+            let ip_bytes: Vec<u8> = match addr.ip() {
                 IpAddr::V4(ip) => ip.octets().to_vec(),
                 IpAddr::V6(ip) => ip.octets().to_vec(),
             };
             buf.push((ip_bytes.len() + 4) as u8);
             buf.extend_from_slice(&ip_bytes);
-            // Port is VLQ-encoded (Scorex putUInt → putULong → VLQ)
-            vlq::write_vlq(&mut buf, addr.port() as u64);
+            // Port is VLQ-encoded (Scorex putUInt → putULong → VLQ).
+            vlq::write_vlq(buf, addr.port() as u64);
         }
     }
-
-    // Features: Mode + Session
-    buf.push(2); // feature count
-
-    // Mode feature (id=16)
-    buf.push(FEATURE_MODE);
-    let mode_body = build_mode_body(config);
-    // Feature body length is VLQ-encoded (Scorex putUShort → putUInt → putULong → VLQ)
-    vlq::write_vlq(&mut buf, mode_body.len() as u64);
-    buf.extend_from_slice(&mode_body);
-
-    // Session feature (id=3)
-    buf.push(FEATURE_SESSION);
-    let session_body = build_session_body(config.network);
-    vlq::write_vlq(&mut buf, session_body.len() as u64);
-    buf.extend_from_slice(&session_body);
-
-    buf
 }
 
 fn build_mode_body(config: &HandshakeConfig) -> Vec<u8> {

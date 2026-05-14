@@ -11,6 +11,7 @@
 //!   never sees raw bytes.
 
 use crate::transport::frame::Frame;
+use crate::transport::handshake::{parse_peer_entry, serialize_peer_entry, PeerSpec};
 use crate::transport::vlq;
 use crate::types::ModifierId;
 use std::io::{self, Cursor, Read};
@@ -186,9 +187,183 @@ fn encode_modifier_response_body(modifier_type: u8, modifiers: &[(ModifierId, Ve
     body
 }
 
+/// Parse a `Peers` message body: `length: VLQ` followed by that many
+/// serialized `PeerSpec` entries.
+///
+/// # Errors
+/// `InvalidData` if `length > cap`, the body is truncated, or any
+/// per-entry parse fails. The caller treats this as a permanent ban
+/// signal — JVM's `PeerSynchronizer` does the same via
+/// `penalizeMaliciousPeer`.
+pub fn parse_peers_body(body: &[u8], cap: usize) -> io::Result<Vec<PeerSpec>> {
+    let mut cursor = Cursor::new(body);
+    let count = vlq::read_vlq_length(&mut cursor)?;
+    if count > cap {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Peers count {count} exceeds cap {cap}"),
+        ));
+    }
+    let mut specs = Vec::with_capacity(count);
+    for _ in 0..count {
+        specs.push(parse_peer_entry(&mut cursor)?);
+    }
+    Ok(specs)
+}
+
+/// Build a `Peers` message body. Caller is responsible for capping the
+/// list before calling — this function does not enforce a cap.
+///
+/// An empty `specs` produces a single-byte body `[0x00]` (VLQ-encoded
+/// count = 0), matching the JVM serializer.
+pub fn build_peers_body(specs: &[PeerSpec]) -> Vec<u8> {
+    let mut body = Vec::new();
+    vlq::write_vlq(&mut body, specs.len() as u64);
+    for spec in specs {
+        serialize_peer_entry(spec, &mut body);
+    }
+    body
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::handshake::Feature;
+    use crate::types::Version;
+    use std::net::SocketAddr;
+
+    fn spec(addr: Option<&str>, features: Vec<Feature>) -> PeerSpec {
+        PeerSpec {
+            agent: "ergoref".into(),
+            version: Version::new(5, 0, 25),
+            name: "node".into(),
+            address: addr.map(|a| a.parse::<SocketAddr>().unwrap()),
+            features,
+        }
+    }
+
+    fn assert_specs_equal(a: &PeerSpec, b: &PeerSpec) {
+        assert_eq!(a.agent, b.agent);
+        assert_eq!(a.version, b.version);
+        assert_eq!(a.name, b.name);
+        assert_eq!(a.address, b.address);
+        assert_eq!(a.features.len(), b.features.len());
+        for (fa, fb) in a.features.iter().zip(b.features.iter()) {
+            assert_eq!(fa.id, fb.id);
+            assert_eq!(fa.body, fb.body);
+        }
+    }
+
+    #[test]
+    fn peers_body_roundtrip_empty() {
+        let body = build_peers_body(&[]);
+        assert_eq!(body, vec![0x00]);
+        let parsed = parse_peers_body(&body, 64).unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn peers_body_roundtrip_single_v4() {
+        let s = spec(Some("203.0.113.5:9030"), vec![]);
+        let body = build_peers_body(std::slice::from_ref(&s));
+        let parsed = parse_peers_body(&body, 64).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_specs_equal(&parsed[0], &s);
+    }
+
+    #[test]
+    fn peers_body_roundtrip_three_mixed() {
+        let s1 = spec(Some("203.0.113.5:9030"), vec![Feature { id: 16, body: vec![0, 1, 0] }]);
+        let s2 = spec(Some("[2001:db8::1]:9030"), vec![]);
+        let s3 = spec(None, vec![
+            Feature { id: 16, body: vec![0, 0, 0, 0xFE, 0x01] },
+            Feature { id: 64, body: vec![] },
+        ]);
+        let specs = vec![s1, s2, s3];
+        let body = build_peers_body(&specs);
+        let parsed = parse_peers_body(&body, 64).unwrap();
+        assert_eq!(parsed.len(), 3);
+        for (a, b) in parsed.iter().zip(specs.iter()) {
+            assert_specs_equal(a, b);
+        }
+    }
+
+    #[test]
+    fn peers_body_roundtrip_sixty_four_entries() {
+        let specs: Vec<PeerSpec> = (0..64)
+            .map(|i| {
+                let addr = format!("203.0.113.{}:9030", i + 1);
+                spec(Some(&addr), vec![])
+            })
+            .collect();
+        let body = build_peers_body(&specs);
+        let parsed = parse_peers_body(&body, 64).unwrap();
+        assert_eq!(parsed.len(), 64);
+    }
+
+    #[test]
+    fn peers_body_rejects_count_above_cap() {
+        let specs: Vec<PeerSpec> = (0..10)
+            .map(|i| spec(Some(&format!("203.0.113.{}:9030", i + 1)), vec![]))
+            .collect();
+        let body = build_peers_body(&specs);
+        let err = parse_peers_body(&body, 5).expect_err("must reject oversize");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn peers_body_rejects_truncated() {
+        // Declare count = 3 but only provide one entry.
+        let mut body = build_peers_body(&[spec(Some("203.0.113.5:9030"), vec![])]);
+        body[0] = 3; // VLQ for 3 is single byte 0x03; overwriting the declared count
+        let err = parse_peers_body(&body, 64).expect_err("truncated body must error");
+        assert!(matches!(
+            err.kind(),
+            io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[test]
+    fn empty_peers_body_is_single_zero_byte() {
+        assert_eq!(build_peers_body(&[]), vec![0x00]);
+    }
+
+    /// Document the wire-format size for sanity-checking against pcap.
+    /// Numbers come from hand-computing the encoding: 1-byte VLQ count
+    /// plus per-entry: agent (1+N), version (3), name (1+N), declared
+    /// address (1 option byte + 1 size byte + 4|16 IP bytes + VLQ port
+    /// 9030 = 2 bytes), feature count (1 byte = 0).
+    #[test]
+    fn peers_body_byte_counts() {
+        let v4 = |i: u8| spec(
+            Some(&format!("203.0.113.{}:9030", i)),
+            vec![],
+        );
+        let v6 = |i: u8| {
+            let mut octets = [0u8; 16];
+            octets[0] = 0x20; octets[1] = 0x01; octets[2] = 0x0d; octets[3] = 0xb8;
+            octets[15] = i;
+            let addr = std::net::SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)),
+                9030,
+            );
+            PeerSpec {
+                agent: "ergoref".into(),
+                version: Version::new(5, 0, 25),
+                name: "node".into(),
+                address: Some(addr),
+                features: vec![],
+            }
+        };
+
+        assert_eq!(build_peers_body(&[]).len(), 1, "0 peers");
+        assert_eq!(build_peers_body(&[v4(1)]).len(), 26, "1 v4 peer");
+        let eight_v4: Vec<_> = (1..=8).map(v4).collect();
+        assert_eq!(build_peers_body(&eight_v4).len(), 1 + 8 * 25, "8 v4 peers");
+        assert_eq!(build_peers_body(&[v6(1)]).len(), 38, "1 v6 peer");
+        let eight_v6: Vec<_> = (1..=8).map(v6).collect();
+        assert_eq!(build_peers_body(&eight_v6).len(), 1 + 8 * 37, "8 v6 peers");
+    }
 
     #[test]
     fn parse_inv_body_rejects_count_above_cap() {

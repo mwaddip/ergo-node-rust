@@ -134,7 +134,7 @@ pub async fn read_frame(
             "Frame magic mismatch — stream likely misaligned"
         );
         tracing::warn!("PENALTY peer_ip={} type=permanent reason=\"bad magic bytes\"", peer_addr.ip());
-        blacklist.record_permanent(peer_addr).await;
+        blacklist.record_permanent(peer_addr);
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Bad magic: {:?} (expected {:?})", &prefix[0..4], magic),
@@ -146,7 +146,7 @@ pub async fn read_frame(
 
     if body_len > MAX_BODY_SIZE {
         tracing::warn!("PENALTY peer_ip={} type=permanent reason=\"oversized frame\"", peer_addr.ip());
-        blacklist.record_permanent(peer_addr).await;
+        blacklist.record_permanent(peer_addr);
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Body too large: {} bytes", body_len),
@@ -175,7 +175,7 @@ pub async fn read_frame(
             "Checksum mismatch"
         );
         tracing::warn!("PENALTY peer_ip={} type=permanent reason=\"bad checksum\"", peer_addr.ip());
-        blacklist.record_permanent(peer_addr).await;
+        blacklist.record_permanent(peer_addr);
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Checksum mismatch"));
     }
 

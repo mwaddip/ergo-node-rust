@@ -14,9 +14,14 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 
 /// Set of peer addresses that have been permanently penalized this session.
+//
+// Backed by a `std::sync::Mutex` so callers in both sync and async
+// contexts (e.g. `PeerDb::record`, which runs inside a sync mutex) can
+// query the blacklist without ceremony. The critical sections are
+// HashSet ops — bounded in time, no awaits.
 pub struct Blacklist {
     banned: Mutex<HashSet<SocketAddr>>,
 }
@@ -27,18 +32,26 @@ impl Blacklist {
     }
 
     /// Record a permanent ban for `addr`.
-    pub async fn record_permanent(&self, addr: SocketAddr) {
-        self.banned.lock().await.insert(addr);
+    pub fn record_permanent(&self, addr: SocketAddr) {
+        self.banned.lock().expect("blacklist mutex poisoned").insert(addr);
     }
 
     /// Return all currently-banned addresses, in unspecified order.
-    pub async fn list(&self) -> Vec<SocketAddr> {
-        self.banned.lock().await.iter().copied().collect()
+    pub fn list(&self) -> Vec<SocketAddr> {
+        self.banned
+            .lock()
+            .expect("blacklist mutex poisoned")
+            .iter()
+            .copied()
+            .collect()
     }
 
     /// Whether `addr` is in the banned set.
-    pub async fn contains(&self, addr: SocketAddr) -> bool {
-        self.banned.lock().await.contains(&addr)
+    pub fn contains(&self, addr: SocketAddr) -> bool {
+        self.banned
+            .lock()
+            .expect("blacklist mutex poisoned")
+            .contains(&addr)
     }
 }
 
@@ -56,33 +69,33 @@ mod tests {
         s.parse().unwrap()
     }
 
-    #[tokio::test]
-    async fn empty_blacklist_lists_nothing() {
+    #[test]
+    fn empty_blacklist_lists_nothing() {
         let bl = Blacklist::new();
-        assert!(bl.list().await.is_empty());
-        assert!(!bl.contains(addr("1.2.3.4:9000")).await);
+        assert!(bl.list().is_empty());
+        assert!(!bl.contains(addr("1.2.3.4:9000")));
     }
 
-    #[tokio::test]
-    async fn record_and_query() {
+    #[test]
+    fn record_and_query() {
         let bl = Blacklist::new();
-        bl.record_permanent(addr("1.2.3.4:9000")).await;
-        bl.record_permanent(addr("5.6.7.8:9001")).await;
+        bl.record_permanent(addr("1.2.3.4:9000"));
+        bl.record_permanent(addr("5.6.7.8:9001"));
 
-        assert!(bl.contains(addr("1.2.3.4:9000")).await);
-        assert!(bl.contains(addr("5.6.7.8:9001")).await);
-        assert!(!bl.contains(addr("9.9.9.9:9000")).await);
+        assert!(bl.contains(addr("1.2.3.4:9000")));
+        assert!(bl.contains(addr("5.6.7.8:9001")));
+        assert!(!bl.contains(addr("9.9.9.9:9000")));
 
-        let mut list = bl.list().await;
+        let mut list = bl.list();
         list.sort();
         assert_eq!(list, vec![addr("1.2.3.4:9000"), addr("5.6.7.8:9001")]);
     }
 
-    #[tokio::test]
-    async fn duplicate_record_is_idempotent() {
+    #[test]
+    fn duplicate_record_is_idempotent() {
         let bl = Blacklist::new();
-        bl.record_permanent(addr("1.2.3.4:9000")).await;
-        bl.record_permanent(addr("1.2.3.4:9000")).await;
-        assert_eq!(bl.list().await.len(), 1);
+        bl.record_permanent(addr("1.2.3.4:9000"));
+        bl.record_permanent(addr("1.2.3.4:9000"));
+        assert_eq!(bl.list().len(), 1);
     }
 }

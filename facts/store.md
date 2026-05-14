@@ -223,6 +223,43 @@ pub trait ModifierStore: Send + Sync {
         &self,
         height: u32,
     ) -> Result<Option<Vec<u8>>, Self::Error>;
+
+    // --- Peer database ---
+
+    /// Write or overwrite a peer record.
+    ///
+    /// Key is the encoded `SocketAddr` (see "Tables" / `peer_db`). Value
+    /// is the serialized record body: `(last_seen_ms u64 LE,
+    /// agent_name shortString, node_name shortString, version 3B,
+    /// features_blob)`. Overwrites any prior value at the same address.
+    ///
+    /// The store treats record bytes as opaque — encoding is owned by
+    /// the p2p crate. Only the key encoding (`SocketAddr → bytes`) is
+    /// the store's concern, because it determines lookup and iteration
+    /// behaviour.
+    fn put_peer(
+        &self,
+        addr: SocketAddr,
+        record: &[u8],
+    ) -> Result<(), Self::Error>;
+
+    /// Remove a peer record. Idempotent: removing an absent address
+    /// is `Ok(())`.
+    fn delete_peer(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<(), Self::Error>;
+
+    /// Read every peer record. Single read transaction. Returns a
+    /// `Vec<(addr, record_bytes)>` with no ordering guarantee.
+    ///
+    /// Called once at p2p startup to repopulate the in-memory PeerDb
+    /// via `PeerStorage::load_all`. At <= ~1000 entries (the PeerDb
+    /// soft cap) the linear scan is trivial; no incremental
+    /// iteration is needed.
+    fn list_peers(
+        &self,
+    ) -> Result<Vec<(SocketAddr, Vec<u8>)>, Self::Error>;
 }
 ```
 
@@ -272,6 +309,7 @@ HEIGHT_INDEX.
 | `header_scores` | `header_id` | BigUint bytes | Cumulative difficulty per header. Real values for all headers post-scores-migration. |
 | `best_chain` | `height` | `header_id` | Current best chain, one entry per height |
 | `chain_meta` | `key (bytes)` | `value (bytes)` | Tiny KV store for migration sentinels and per-chain-state flags |
+| `peer_db` | `SocketAddr bytes` | `record bytes` | Persistent peer registry. Key is the encoded socket addr; value is the p2p crate's opaque record. |
 
 On startup, the `best_header_tip` cache is seeded by scanning `best_chain`
 for the highest key. Two one-shot migrations run before the store is
@@ -327,6 +365,19 @@ crate via `chain_meta_get`:
 |---|---|---|
 | `b"scores_migrated_v1"` | `[1u8]` once migration completes; absent before | Empty-placeholder → real scores migration |
 
+## Peer DB key encoding
+
+A `SocketAddr` is encoded as:
+
+| Field | Bytes | Notes |
+|---|---|---|
+| family | 1 | `0x04` for IPv4, `0x06` for IPv6. |
+| ip | 4 or 16 | Octets in network order. |
+| port | 2 | Big-endian. |
+
+Total: 7 bytes (IPv4) or 19 bytes (IPv6). The encoding is internal
+to the store — callers pass `SocketAddr` and never see the bytes.
+
 Future keys are added at the discretion of the integrator. The store
 crate treats values as opaque byte strings.
 
@@ -352,6 +403,9 @@ crate treats values as opaque byte strings.
   header in PRIMARY; every entry's score is non-empty.
 - **`best_chain_entries`**: no preconditions.
 - **`chain_meta_put`** / **`chain_meta_get`**: `key` is non-empty.
+- **`put_peer`**: `record` is non-empty. The caller (p2p crate) owns
+  the record encoding; the store does not parse it.
+- **`delete_peer`** / **`list_peers`**: no preconditions.
 - **`get` / `get_id_at` / `contains` / `tip` / `header_score`**: No
   preconditions beyond valid `type_id` (or `id` for `header_score`).
 
@@ -391,6 +445,12 @@ crate treats values as opaque byte strings.
   at the same key.
 - **`chain_meta_get`**: Returns the stored bytes or `None` if the key
   was never written.
+- **`put_peer`**: On Ok, the record is durable. A subsequent
+  `list_peers` includes `(addr, record)`. Overwrites any previous
+  record at the same address.
+- **`delete_peer`**: On Ok, no entry for `addr` exists. Idempotent.
+- **`list_peers`**: Returns every entry in the `peer_db` table.
+  Ordering is not guaranteed.
 - **`get`**: Returns the stored bytes or None. Never errors on missing data.
 - **`get_id_at`**: Returns the modifier ID at that height or None. For type 101
   this is the best-chain header at that height.
@@ -436,6 +496,10 @@ crate treats values as opaque byte strings.
   parsing); the store crate just exposes the `best_chain_entries`,
   `header_score`, `put_header_score`, and `chain_meta_*` primitives
   the migration needs.
+- Peer record format. `put_peer` / `list_peers` carry opaque bytes.
+  The p2p crate owns the record schema and its evolution; the store
+  is responsible only for `SocketAddr` key encoding and durable
+  storage of the value bytes.
 
 ## Dependencies
 

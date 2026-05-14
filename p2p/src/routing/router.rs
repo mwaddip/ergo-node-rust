@@ -7,16 +7,28 @@
 //! - `register_peer` / peer removal on disconnect: manage the peer registry.
 //! - Invariant: Inv table, request tracker, and sync tracker are consistent with
 //!   the peer registry — no references to unregistered peers.
+//! - PeerDb is the canonical store of "addresses we know about"; see
+//!   `facts/p2p-peerdb.md`.
 
-use crate::protocol::messages::ProtocolMessage;
+use crate::blacklist::Blacklist;
+use crate::peer_db::{MemoryPeerStorage, PeerDb, PeerRecord, PeerStorage};
+use crate::protocol::messages::{build_peers_body, parse_peers_body, ProtocolMessage};
 use crate::protocol::peer::ProtocolEvent;
 use crate::routing::inv_table::InvTable;
-use crate::routing::latency::{LatencyTracker, LatencyStats};
+use crate::routing::latency::{LatencyStats, LatencyTracker};
 use crate::routing::tracker::{RequestTracker, SyncTracker};
-use crate::types::{ConnectionType, Direction, PeerEntry as PublicPeerEntry, PeerId, ProxyMode};
+use crate::transport::handshake::PeerSpec;
+use crate::types::{ConnectionType, Direction, PeerId, ProxyMode};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// JVM's `PeerSynchronizer.gossipPeers` sends `max/8` peers when the
+/// cap is >= 16, matching its post-5.0.8 convention. With our default
+/// cap of 64, that's 8.
+const PEERS_PER_GOSSIP_DIVISOR: usize = 8;
+const PEERS_PER_GOSSIP_MIN_CAP: usize = 16;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -49,19 +61,16 @@ struct PeerEntry {
     agent_name: Option<String>,
 }
 
-/// Tracking entry for a peer we've handshaked with at some point. May or may
-/// not be currently connected — the `peers` map answers that.
-struct KnownPeer {
-    agent_name: Option<String>,
-    /// Unix epoch ms of the most recent connect or disconnect event for this peer.
-    last_seen_ms: u64,
+/// Snapshot of one currently-connected peer for `P2pNode::all_peers`.
+#[derive(Debug, Clone)]
+pub struct ConnectedPeerSummary {
+    pub address: SocketAddr,
+    pub direction: Direction,
+    pub agent_name: Option<String>,
 }
 
 pub struct Router {
     peers: HashMap<PeerId, PeerEntry>,
-    /// Peers we've handshaked with this session, keyed by socket address.
-    /// Populated on register; updated on disconnect.
-    known_peers: HashMap<SocketAddr, KnownPeer>,
     inv_table: InvTable,
     request_tracker: RequestTracker,
     sync_tracker: SyncTracker,
@@ -69,6 +78,19 @@ pub struct Router {
     /// Message codes handled by the main crate via the event stream.
     /// Unknown messages with these codes are not forwarded to peers.
     consumed_codes: HashSet<u8>,
+
+    /// Shared peer database. Populated by the PeerConnected event arm,
+    /// the Peers gossip arm, and `register_peer`. Read by the outbound
+    /// manager's fill phase and by `P2pNode::all_peers`.
+    peer_db: Arc<StdMutex<PeerDb>>,
+    /// Shared blacklist. Used by the GetPeers / Peers / PeerConnected
+    /// arms to filter and to permanently ban senders of malformed
+    /// Peers messages.
+    blacklist: Arc<Blacklist>,
+    /// Cap on the `length` field of an inbound `Peers` body. Above this,
+    /// the parser rejects and the source is permanently banned. Mirrors
+    /// the JVM `NetworkSettings.maxPeerSpecObjects` (default 64).
+    max_peer_spec_objects: usize,
 }
 
 impl Default for Router {
@@ -78,15 +100,39 @@ impl Default for Router {
 }
 
 impl Router {
+    /// Construct a router with an internal default `PeerDb` and a
+    /// fresh `Blacklist`. Useful for tests; production should use
+    /// [`Router::with_peer_db`] so the PeerDb is shared with the
+    /// outbound manager.
     pub fn new() -> Self {
+        let blacklist = Arc::new(Blacklist::new());
+        let storage: Box<dyn PeerStorage> = Box::new(MemoryPeerStorage::new());
+        let peer_db = PeerDb::new(
+            storage,
+            blacklist.clone(),
+            crate::peer_db::DEFAULT_CAP,
+        )
+        .expect("MemoryPeerStorage::load_all is infallible");
+        Self::with_peer_db(Arc::new(StdMutex::new(peer_db)), blacklist, 64)
+    }
+
+    /// Construct a router with an externally-owned PeerDb + Blacklist.
+    /// `max_peer_spec_objects` caps inbound `Peers` bodies.
+    pub fn with_peer_db(
+        peer_db: Arc<StdMutex<PeerDb>>,
+        blacklist: Arc<Blacklist>,
+        max_peer_spec_objects: usize,
+    ) -> Self {
         Self {
             peers: HashMap::new(),
-            known_peers: HashMap::new(),
             inv_table: InvTable::new(),
             request_tracker: RequestTracker::new(),
             sync_tracker: SyncTracker::new(),
             latency_tracker: LatencyTracker::new(),
             consumed_codes: HashSet::new(),
+            peer_db,
+            blacklist,
+            max_peer_spec_objects,
         }
     }
 
@@ -115,7 +161,27 @@ impl Router {
                 agent_name: agent_name.clone(),
             },
         );
-        self.known_peers.insert(addr, KnownPeer { agent_name, last_seen_ms: now_ms() });
+        // Best-effort seed of PeerDb for outbound peers so the
+        // register-only test path (no event-loop) gets an entry without
+        // also driving the PeerConnected event. Production overwrites
+        // this stub via PeerConnected's full handshake spec (merge-max
+        // on last_seen).
+        //
+        // Inbound peers are excluded: their observed socket is the
+        // peer's ephemeral outgoing port, not a listening address worth
+        // gossiping. Their listening address (declared in the
+        // handshake) is recorded by PeerConnected.
+        if direction == Direction::Outbound && !self.blacklist.contains(addr) {
+            let mut db = self.peer_db.lock().expect("peer_db poisoned");
+            db.record(PeerRecord {
+                address: addr,
+                last_seen_ms: now_ms(),
+                agent_name: agent_name.unwrap_or_default(),
+                node_name: String::new(),
+                version: (0, 0, 0),
+                features: vec![],
+            });
+        }
     }
 
     /// Whether any currently-connected peer is bound to `addr`.
@@ -123,36 +189,26 @@ impl Router {
         self.peers.values().any(|p| p.addr == addr)
     }
 
-    /// Snapshot of all known peers — currently connected ones first, then any
-    /// peers we've handshaked with this session but are no longer connected.
-    pub fn all_peers(&self) -> Vec<PublicPeerEntry> {
-        let mut out: Vec<PublicPeerEntry> = Vec::with_capacity(self.peers.len() + self.known_peers.len());
-        let mut connected_addrs: HashSet<SocketAddr> = HashSet::new();
+    /// Per-connection summary for [`P2pNode::all_peers`]. The caller
+    /// merges this with the PeerDb snapshot.
+    pub fn connected_summary(&self) -> Vec<ConnectedPeerSummary> {
+        self.peers
+            .values()
+            .map(|e| ConnectedPeerSummary {
+                address: e.addr,
+                direction: e.direction,
+                agent_name: e.agent_name.clone(),
+            })
+            .collect()
+    }
 
-        for entry in self.peers.values() {
-            let last_seen = self.known_peers.get(&entry.addr).map(|k| k.last_seen_ms);
-            out.push(PublicPeerEntry {
-                address: entry.addr,
-                agent_name: entry.agent_name.clone(),
-                last_seen_ms: last_seen,
-                connection_type: Some(ConnectionType::from(entry.direction)),
-            });
-            connected_addrs.insert(entry.addr);
-        }
-
-        for (addr, known) in &self.known_peers {
-            if connected_addrs.contains(addr) {
-                continue;
-            }
-            out.push(PublicPeerEntry {
-                address: *addr,
-                agent_name: known.agent_name.clone(),
-                last_seen_ms: Some(known.last_seen_ms),
-                connection_type: None,
-            });
-        }
-
-        out
+    /// Currently-connected addresses, by direction. Used by the
+    /// outbound manager's fill phase to build its exclude set.
+    pub fn connected_addrs(&self) -> Vec<(SocketAddr, ConnectionType)> {
+        self.peers
+            .values()
+            .map(|e| (e.addr, ConnectionType::from(e.direction)))
+            .collect()
     }
 
     pub fn peer_addr(&self, peer_id: PeerId) -> Option<SocketAddr> {
@@ -161,14 +217,16 @@ impl Router {
 
     /// REST API URLs for all connected peers.
     pub fn peer_rest_urls(&self) -> Vec<(PeerId, SocketAddr, Option<String>)> {
-        self.peers.iter()
+        self.peers
+            .iter()
             .map(|(pid, entry)| (*pid, entry.addr, entry.rest_api_url.clone()))
             .collect()
     }
 
     pub fn handle_event(&mut self, event: ProtocolEvent) -> Vec<Action> {
         match event {
-            ProtocolEvent::PeerConnected { .. } => {
+            ProtocolEvent::PeerConnected { spec, addr, .. } => {
+                self.record_peer_connected(&spec, addr);
                 vec![]
             }
 
@@ -177,16 +235,7 @@ impl Router {
                 self.request_tracker.purge_peer(peer_id);
                 self.sync_tracker.purge_peer(peer_id);
                 self.latency_tracker.purge_peer(peer_id);
-                if let Some(entry) = self.peers.remove(&peer_id) {
-                    // Bump last_seen so the known-peer record reflects the
-                    // disconnect moment rather than the connect moment.
-                    self.known_peers.entry(entry.addr)
-                        .and_modify(|k| k.last_seen_ms = now_ms())
-                        .or_insert_with(|| KnownPeer {
-                            agent_name: entry.agent_name.clone(),
-                            last_seen_ms: now_ms(),
-                        });
-                }
+                self.peers.remove(&peer_id);
                 vec![]
             }
 
@@ -194,6 +243,25 @@ impl Router {
                 self.route_message(peer_id, message)
             }
         }
+    }
+
+    fn record_peer_connected(&self, spec: &PeerSpec, observed_addr: SocketAddr) {
+        // Prefer the peer's declared address; fall back to the observed
+        // socket so that NAT'd peers without a declared address are
+        // still tracked.
+        let key_addr = spec.address.unwrap_or(observed_addr);
+        if self.blacklist.contains(key_addr) {
+            return;
+        }
+        let mut db = self.peer_db.lock().expect("peer_db poisoned");
+        db.record(PeerRecord {
+            address: key_addr,
+            last_seen_ms: now_ms(),
+            agent_name: spec.agent.clone(),
+            node_name: spec.name.clone(),
+            version: (spec.version.major, spec.version.minor, spec.version.patch),
+            features: spec.features.iter().map(|f| (f.id, f.body.clone())).collect(),
+        });
     }
 
     fn route_message(&mut self, source: PeerId, message: ProtocolMessage) -> Vec<Action> {
@@ -205,6 +273,7 @@ impl Router {
         };
         let source_direction = source_entry.direction;
         let source_mode = source_entry.mode;
+        let source_addr = source_entry.addr;
 
         match message {
             ProtocolMessage::Inv { ids, .. } => {
@@ -319,14 +388,61 @@ impl Router {
             }
 
             ProtocolMessage::GetPeers => {
+                let limit = self.peers_to_send();
+                let mut exclude: HashSet<SocketAddr> =
+                    self.peers.values().map(|p| p.addr).collect();
+                exclude.insert(source_addr);
+
+                let specs: Vec<PeerSpec> = {
+                    let db = self.peer_db.lock().expect("peer_db poisoned");
+                    db.recent(limit, &exclude)
+                        .into_iter()
+                        .map(record_to_spec)
+                        .collect()
+                };
+                let body = build_peers_body(&specs);
                 vec![Action::Send {
                     target: source,
-                    message: ProtocolMessage::Peers { body: vec![0x00] },
+                    message: ProtocolMessage::Peers { body },
                 }]
             }
 
-            ProtocolMessage::Peers { .. } => {
-                vec![]
+            ProtocolMessage::Peers { body } => {
+                match parse_peers_body(&body, self.max_peer_spec_objects) {
+                    Ok(specs) => {
+                        let mut db = self.peer_db.lock().expect("peer_db poisoned");
+                        for spec in specs {
+                            let Some(addr) = spec.address else { continue };
+                            if self.blacklist.contains(addr) { continue; }
+                            db.record(PeerRecord {
+                                address: addr,
+                                last_seen_ms: now_ms(),
+                                agent_name: spec.agent.clone(),
+                                node_name: spec.name.clone(),
+                                version: (
+                                    spec.version.major,
+                                    spec.version.minor,
+                                    spec.version.patch,
+                                ),
+                                features: spec.features.iter().map(|f| (f.id, f.body.clone())).collect(),
+                            });
+                        }
+                        vec![]
+                    }
+                    Err(e) => {
+                        // JVM PeerSynchronizer.penalizeMaliciousPeer →
+                        // PermanentPenalty. We log on the same shape as
+                        // other permanent-ban paths so fail2ban catches
+                        // it.
+                        tracing::warn!(
+                            "PENALTY peer_ip={} type=permanent reason=\"malformed Peers: {}\"",
+                            source_addr.ip(),
+                            e
+                        );
+                        self.blacklist.record_permanent(source_addr);
+                        vec![]
+                    }
+                }
             }
 
             ProtocolMessage::Unknown { code, body } => {
@@ -370,5 +486,252 @@ impl Router {
 
     pub fn latency_stats(&self) -> Option<LatencyStats> {
         self.latency_tracker.stats()
+    }
+
+    fn peers_to_send(&self) -> usize {
+        if self.max_peer_spec_objects >= PEERS_PER_GOSSIP_MIN_CAP {
+            self.max_peer_spec_objects / PEERS_PER_GOSSIP_DIVISOR
+        } else {
+            self.max_peer_spec_objects
+        }
+    }
+}
+
+/// Convert a `PeerRecord` back into a `PeerSpec` for serialization in a
+/// `Peers` response.
+fn record_to_spec(rec: PeerRecord) -> PeerSpec {
+    use crate::transport::handshake::Feature;
+    use crate::types::Version;
+    PeerSpec {
+        agent: rec.agent_name,
+        version: Version::new(rec.version.0, rec.version.1, rec.version.2),
+        name: rec.node_name,
+        address: Some(rec.address),
+        features: rec.features
+            .into_iter()
+            .map(|(id, body)| Feature { id, body })
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::handshake::{Feature, PeerSpec};
+    use crate::types::Version;
+
+    fn pub_addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn spec_for(agent: &str, declared: SocketAddr) -> PeerSpec {
+        PeerSpec {
+            agent: agent.into(),
+            version: Version::new(5, 0, 25),
+            name: "node".into(),
+            address: Some(declared),
+            features: vec![],
+        }
+    }
+
+    #[test]
+    fn get_peers_returns_recent_excluding_source() {
+        let mut router = Router::new();
+        // Five known peers in the PeerDb but none currently connected.
+        {
+            let mut db = router.peer_db.lock().unwrap();
+            for i in 1..=5 {
+                db.record(PeerRecord {
+                    address: pub_addr(&format!("203.0.113.{i}:9030")),
+                    last_seen_ms: 1000 + i as u64 * 100,
+                    agent_name: "ergoref".into(),
+                    node_name: "node".into(),
+                    version: (5, 0, 25),
+                    features: vec![],
+                });
+            }
+        }
+        // Register a single connected outbound peer that will issue GetPeers.
+        let source = PeerId(1);
+        let source_addr = pub_addr("203.0.113.3:9030"); // also in the DB
+        router.register_peer(source, Direction::Outbound, ProxyMode::Full, source_addr, None, None);
+
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::GetPeers,
+        });
+        assert_eq!(actions.len(), 1);
+        let body = match &actions[0] {
+            Action::Send { target, message: ProtocolMessage::Peers { body } } => {
+                assert_eq!(*target, source);
+                body.clone()
+            }
+            _ => panic!("expected Peers reply"),
+        };
+        let specs = parse_peers_body(&body, 64).unwrap();
+        // Source addr (203.0.113.3) is excluded.
+        for s in &specs {
+            assert_ne!(s.address.unwrap(), source_addr);
+        }
+        // At most peers_to_send (= 64/8 = 8) entries.
+        assert!(specs.len() <= 8);
+    }
+
+    #[test]
+    fn get_peers_empty_db_returns_zero_count_body() {
+        let mut router = Router::new();
+        let source = PeerId(1);
+        router.register_peer(source, Direction::Outbound, ProxyMode::Full, pub_addr("198.51.100.1:9030"), None, None);
+
+        // Forget the stub PeerDb entry that register_peer just wrote so
+        // we exercise the genuinely-empty case.
+        router.peer_db.lock().unwrap().forget(pub_addr("198.51.100.1:9030"));
+
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::GetPeers,
+        });
+        match &actions[0] {
+            Action::Send { message: ProtocolMessage::Peers { body }, .. } => {
+                assert_eq!(body, &vec![0x00]);
+            }
+            _ => panic!("expected Peers reply"),
+        }
+    }
+
+    #[test]
+    fn peers_message_records_specs_into_db() {
+        let mut router = Router::new();
+        let source = PeerId(1);
+        router.register_peer(source, Direction::Outbound, ProxyMode::Full, pub_addr("198.51.100.1:9030"), None, None);
+
+        let specs = vec![
+            spec_for("ergoref", pub_addr("203.0.113.10:9030")),
+            spec_for("ergoref", pub_addr("203.0.113.11:9030")),
+            spec_for("ergoref", pub_addr("203.0.113.12:9030")),
+            spec_for("ergoref", pub_addr("203.0.113.13:9030")),
+            spec_for("ergoref", pub_addr("203.0.113.14:9030")),
+        ];
+        let body = build_peers_body(&specs);
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::Peers { body },
+        });
+        assert!(actions.is_empty());
+
+        let db = router.peer_db.lock().unwrap();
+        for s in &specs {
+            let addr = s.address.unwrap();
+            let rec = db.get(addr).expect("recorded");
+            assert_eq!(rec.agent_name, "ergoref");
+        }
+    }
+
+    #[test]
+    fn malformed_peers_bans_source_permanently() {
+        let mut router = Router::new();
+        let source = PeerId(7);
+        let source_addr = pub_addr("198.51.100.7:9030");
+        router.register_peer(source, Direction::Outbound, ProxyMode::Full, source_addr, None, None);
+
+        // Body declares a count above cap.
+        let mut body = vec![];
+        crate::transport::vlq::write_vlq(&mut body, (router.max_peer_spec_objects as u64) + 1);
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::Peers { body },
+        });
+        assert!(actions.is_empty());
+        assert!(router.blacklist.contains(source_addr));
+    }
+
+    #[test]
+    fn peer_connected_records_with_declared_address() {
+        let mut router = Router::new();
+        let observed = pub_addr("198.51.100.20:9030");
+        let declared = pub_addr("203.0.113.20:9030");
+        let event = ProtocolEvent::PeerConnected {
+            peer_id: PeerId(1),
+            spec: PeerSpec {
+                agent: "ergoref".into(),
+                version: Version::new(5, 0, 25),
+                name: "node20".into(),
+                address: Some(declared),
+                features: vec![Feature { id: 16, body: vec![0, 1, 0] }],
+            },
+            direction: Direction::Outbound,
+            addr: observed,
+        };
+        router.handle_event(event);
+        let db = router.peer_db.lock().unwrap();
+        let rec = db.get(declared).expect("declared address recorded");
+        assert_eq!(rec.agent_name, "ergoref");
+        assert_eq!(rec.node_name, "node20");
+        assert_eq!(rec.version, (5, 0, 25));
+        assert_eq!(rec.features.len(), 1);
+    }
+
+    #[test]
+    fn peer_connected_falls_back_to_observed_when_no_declared() {
+        let mut router = Router::new();
+        let observed = pub_addr("198.51.100.21:9030");
+        let event = ProtocolEvent::PeerConnected {
+            peer_id: PeerId(1),
+            spec: PeerSpec {
+                agent: "ergoref".into(),
+                version: Version::new(5, 0, 25),
+                name: "node21".into(),
+                address: None,
+                features: vec![],
+            },
+            direction: Direction::Outbound,
+            addr: observed,
+        };
+        router.handle_event(event);
+        let db = router.peer_db.lock().unwrap();
+        assert!(db.get(observed).is_some());
+    }
+
+    #[test]
+    fn get_peers_excludes_connected_addresses() {
+        let mut router = Router::new();
+        // Outbound source.
+        let source = PeerId(1);
+        let source_addr = pub_addr("198.51.100.40:9030");
+        router.register_peer(source, Direction::Outbound, ProxyMode::Full, source_addr, None, None);
+        // Another connected peer at a different address.
+        let other = PeerId(2);
+        let other_addr = pub_addr("198.51.100.41:9030");
+        router.register_peer(other, Direction::Outbound, ProxyMode::Full, other_addr, None, None);
+        // A non-connected gossiped entry.
+        {
+            let mut db = router.peer_db.lock().unwrap();
+            db.record(PeerRecord {
+                address: pub_addr("203.0.113.42:9030"),
+                last_seen_ms: 5000,
+                agent_name: "ergoref".into(),
+                node_name: "".into(),
+                version: (5, 0, 25),
+                features: vec![],
+            });
+        }
+
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::GetPeers,
+        });
+        let body = match &actions[0] {
+            Action::Send { message: ProtocolMessage::Peers { body }, .. } => body.clone(),
+            _ => panic!(),
+        };
+        let specs = parse_peers_body(&body, 64).unwrap();
+        // Source and other connected peer must be excluded.
+        for s in &specs {
+            let a = s.address.unwrap();
+            assert_ne!(a, source_addr);
+            assert_ne!(a, other_addr);
+        }
+        // The gossiped entry should be present.
+        assert!(specs.iter().any(|s| s.address == Some(pub_addr("203.0.113.42:9030"))));
     }
 }

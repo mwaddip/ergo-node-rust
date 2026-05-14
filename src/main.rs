@@ -23,7 +23,7 @@ use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
 use ergo_chain_types::EcPoint;
 use enr_store::{ModifierStore, RedbModifierStore};
-use ergo_node_rust::{P2pTransport, SharedChain, SharedStore, ValidationPipeline};
+use ergo_node_rust::{P2pTransport, PeerStorageAdapter, SharedChain, SharedStore, ValidationPipeline};
 use ergo_sync::{HeaderSync, SyncConfig};
 use ergo_validation::{ApplyStateOutcome, BlockValidator, DigestValidator, UtxoValidator, ValidationError};
 use serde::Deserialize;
@@ -1404,7 +1404,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Start P2P with modifier sink (no validator)
-    let p2p = Arc::new(enr_p2p::node::P2pNode::start(config, Some(modifier_tx), mode_config).await?);
+    let peer_storage = Box::new(PeerStorageAdapter::new(store.clone()));
+    let p2p = Arc::new(enr_p2p::node::P2pNode::start(config, Some(modifier_tx), mode_config, peer_storage).await?);
 
     // Register message codes consumed by the main crate's event stream so
     // the router doesn't blindly forward them to all peers.

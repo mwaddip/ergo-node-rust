@@ -1,6 +1,7 @@
 use crate::{ModifierBatchEntry, ModifierStore};
 use ::redb::{Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::time::Instant;
 use parking_lot::RwLock;
@@ -11,6 +12,56 @@ const HEADER_FORKS: TableDefinition<(u32, u32), [u8; 32]> = TableDefinition::new
 const HEADER_SCORES: TableDefinition<[u8; 32], &[u8]> = TableDefinition::new("header_scores");
 const BEST_CHAIN: TableDefinition<u32, [u8; 32]> = TableDefinition::new("best_chain");
 const CHAIN_META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chain_meta");
+// Persistent peer registry. Key is an encoded SocketAddr (7 bytes for
+// IPv4, 19 bytes for IPv6 — see `encode_addr`); value is the p2p crate's
+// opaque record. Variable-length keys are supported by redb.
+const PEER_DB: TableDefinition<&[u8], &[u8]> = TableDefinition::new("peer_db");
+
+/// Encode a `SocketAddr` into the on-disk key layout documented in
+/// `facts/store.md` ("Peer DB key encoding"):
+///
+/// | Field  | Bytes | Notes                                   |
+/// |--------|-------|-----------------------------------------|
+/// | family | 1     | `0x04` for IPv4, `0x06` for IPv6        |
+/// | ip     | 4/16  | Octets, network order                   |
+/// | port   | 2     | Big-endian                              |
+fn encode_addr(addr: SocketAddr) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(19);
+    match addr.ip() {
+        IpAddr::V4(v4) => {
+            buf.push(0x04);
+            buf.extend_from_slice(&v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            buf.push(0x06);
+            buf.extend_from_slice(&v6.octets());
+        }
+    }
+    buf.extend_from_slice(&addr.port().to_be_bytes());
+    buf
+}
+
+/// Inverse of `encode_addr`. Returns `None` for any byte sequence that
+/// isn't exactly one of the two valid layouts (7 bytes v4, 19 bytes v6,
+/// matching family byte). `list_peers` uses this to skip corrupt rows
+/// instead of failing the whole call.
+fn decode_addr(bytes: &[u8]) -> Option<SocketAddr> {
+    match (bytes.first().copied(), bytes.len()) {
+        (Some(0x04), 7) => {
+            let ip = Ipv4Addr::new(bytes[1], bytes[2], bytes[3], bytes[4]);
+            let port = u16::from_be_bytes([bytes[5], bytes[6]]);
+            Some(SocketAddr::new(IpAddr::V4(ip), port))
+        }
+        (Some(0x06), 19) => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&bytes[1..17]);
+            let ip = Ipv6Addr::from(octets);
+            let port = u16::from_be_bytes([bytes[17], bytes[18]]);
+            Some(SocketAddr::new(IpAddr::V6(ip), port))
+        }
+        _ => None,
+    }
+}
 
 /// Modifier types stored in HEIGHT_INDEX (i.e. everything except
 /// headers, which live in the fork-aware tables).
@@ -777,6 +828,72 @@ impl ModifierStore for RedbModifierStore {
             Err(e) => return Err(StoreError::Table(e)),
         };
         Ok(primary.get((101u8, id))?.map(|guard| guard.value().to_vec()))
+    }
+
+    fn put_peer(
+        &self,
+        addr: SocketAddr,
+        record: &[u8],
+    ) -> Result<(), Self::Error> {
+        let key = encode_addr(addr);
+        let mut write_txn = self.db.begin_write()?;
+        write_txn
+            .set_durability(Durability::None)
+            .expect("set_durability on fresh txn");
+        write_txn.set_quick_repair(true);
+        {
+            let mut table = write_txn.open_table(PEER_DB)?;
+            table.insert(key.as_slice(), record)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    fn delete_peer(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<(), Self::Error> {
+        let key = encode_addr(addr);
+        let mut write_txn = self.db.begin_write()?;
+        write_txn
+            .set_durability(Durability::None)
+            .expect("set_durability on fresh txn");
+        write_txn.set_quick_repair(true);
+        {
+            // open_table auto-creates on a fresh DB; remove() returns
+            // Some(old)/None and neither is an error — absent-key deletes
+            // are a no-op, matching chain_meta_delete.
+            let mut table = write_txn.open_table(PEER_DB)?;
+            table.remove(key.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    fn list_peers(
+        &self,
+    ) -> Result<Vec<(SocketAddr, Vec<u8>)>, Self::Error> {
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(PEER_DB) {
+            Ok(t) => t,
+            Err(::redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(StoreError::Table(e)),
+        };
+        let mut result = Vec::with_capacity(table.len()? as usize);
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            let key_bytes = k.value();
+            match decode_addr(key_bytes) {
+                Some(addr) => result.push((addr, v.value().to_vec())),
+                None => {
+                    tracing::warn!(
+                        key_len = key_bytes.len(),
+                        "peer_db: skipping row with undecodable SocketAddr key"
+                    );
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Empty write transaction committed with `Durability::Immediate` to
@@ -1617,6 +1734,120 @@ mod tests {
         store.chain_meta_delete(b"k").unwrap();
         store.chain_meta_delete(b"k").unwrap();
         assert_eq!(store.chain_meta_get(b"k").unwrap(), None);
+    }
+
+    // --- peer_db: opaque per-SocketAddr KV used by the p2p crate's
+    //              persistent peer registry. ---
+
+    fn v4_addr(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), port)
+    }
+
+    fn v6_addr(segments: [u16; 8], port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::new(
+            segments[0], segments[1], segments[2], segments[3],
+            segments[4], segments[5], segments[6], segments[7],
+        )), port)
+    }
+
+    #[test]
+    fn peer_db_roundtrip_v4_and_v6() {
+        let (store, _dir) = test_store();
+
+        let a4 = v4_addr(192, 168, 1, 42, 9053);
+        let a6 = v6_addr([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1], 9053);
+        let r4 = b"v4-record-bytes".to_vec();
+        let r6 = b"v6-record-bytes".to_vec();
+
+        store.put_peer(a4, &r4).unwrap();
+        store.put_peer(a6, &r6).unwrap();
+
+        let mut listed = store.list_peers().unwrap();
+        // list_peers makes no ordering guarantee; sort by addr for
+        // stable assertions.
+        listed.sort_by_key(|(a, _)| a.to_string());
+        let mut expected = vec![(a4, r4), (a6, r6)];
+        expected.sort_by_key(|(a, _)| a.to_string());
+        assert_eq!(listed, expected);
+    }
+
+    #[test]
+    fn peer_db_overwrite_keeps_single_entry() {
+        let (store, _dir) = test_store();
+        let addr = v4_addr(10, 0, 0, 1, 9053);
+
+        store.put_peer(addr, b"first").unwrap();
+        store.put_peer(addr, b"second").unwrap();
+
+        let listed = store.list_peers().unwrap();
+        assert_eq!(listed, vec![(addr, b"second".to_vec())]);
+    }
+
+    #[test]
+    fn peer_db_delete_removes_entry() {
+        let (store, _dir) = test_store();
+        let addr = v4_addr(127, 0, 0, 1, 9053);
+
+        store.put_peer(addr, b"record").unwrap();
+        assert_eq!(store.list_peers().unwrap().len(), 1);
+
+        store.delete_peer(addr).unwrap();
+        assert_eq!(store.list_peers().unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn peer_db_delete_absent_address_is_ok() {
+        let (store, _dir) = test_store();
+        let addr = v4_addr(203, 0, 113, 1, 9053);
+
+        // Fresh store — table doesn't exist yet, but delete must
+        // still succeed.
+        store.delete_peer(addr).unwrap();
+
+        // Put then delete twice — second delete is a no-op.
+        store.put_peer(addr, b"r").unwrap();
+        store.delete_peer(addr).unwrap();
+        store.delete_peer(addr).unwrap();
+        assert_eq!(store.list_peers().unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn peer_db_empty_store_lists_empty() {
+        let (store, _dir) = test_store();
+        assert_eq!(store.list_peers().unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn peer_db_corrupt_row_is_skipped() {
+        // Hand-write a row with a key that decode_addr will reject
+        // (wrong length / wrong family byte), alongside a valid row.
+        // list_peers must skip the bad row and return only the good one.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("peer_corrupt.redb");
+
+        let good = v4_addr(8, 8, 8, 8, 9053);
+        let good_key = encode_addr(good);
+
+        {
+            let db = Database::create(&path).unwrap();
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(PEER_DB).unwrap();
+                // Garbage key: family byte 0xFF, 5-byte total — neither
+                // a valid v4 (7 bytes) nor v6 (19 bytes) layout.
+                table
+                    .insert(&[0xFFu8, 1, 2, 3, 4][..], b"junk".as_slice())
+                    .unwrap();
+                table
+                    .insert(good_key.as_slice(), b"good-record".as_slice())
+                    .unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let store = RedbModifierStore::new(&path).unwrap();
+        let listed = store.list_peers().unwrap();
+        assert_eq!(listed, vec![(good, b"good-record".to_vec())]);
     }
 
     // --- quick-repair: every store write txn calls set_quick_repair(true)

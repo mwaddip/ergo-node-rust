@@ -6,4 +6,5 @@ pub mod protocol;
 pub mod routing;
 pub mod netif;
 pub mod upnp;
+pub mod peer_db;
 pub mod node;
