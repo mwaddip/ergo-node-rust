@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.5.1 — 2026-05-14
+
+Real peer discovery. v0.4.x and v0.5.0 had `GetPeers` and `Peers`
+stubbed in `enr-p2p`'s router — we replied with empty lists and
+discarded incoming peer specs. Result: the node was capped at
+`seed_peers ∩ operators who accept us` (3 in practice on a laptop
+operating under network-wide 3600-day bans from earlier misbehaviour).
+This release lands the four working pieces:
+
+1. **Wire-format Peers codec.** VLQ count + sequence of `PeerSpec`
+   entries (capped at `max_peer_spec_objects`, default 64). Reuses
+   the existing handshake `parse_peer_entry` / serializer.
+2. **In-memory PeerDb.** Soft cap 1000 entries, write-through to a
+   persistent backing store, blacklist-filtered, evict-oldest-by-
+   `last_seen` on cap hit. Lives in `enr-p2p`; persistence is a
+   trait so other backends are pluggable.
+3. **Real `GetPeers` / `Peers` handlers.** GetPeers returns up to 8
+   most-recently-seen non-blacklisted peers (the JVM 5.0.8
+   convention — `max_peer_spec_objects / 8`); malformed Peers
+   triggers a permanent ban of the sender (matches JVM
+   `PeerSynchronizer.penalizeMaliciousPeer`).
+4. **Outbound manager fill phase.** Above `min_peers`, dial one
+   PeerDb candidate every 30s up to `max_peers`. Slow-trickle to
+   avoid burst-dial spam.
+
+Persistence lands in `enr-store` as a new `peer_db` redb table:
+`put_peer` / `delete_peer` / `list_peers`, keyed by encoded
+`SocketAddr`. Records are opaque to the store; the main crate's
+`PeerStorageAdapter` owns the wire-irrelevant length-prefixed
+codec. quick_repair covers the new table for free.
+
+### Operator notice
+
+**Bump `max_peers` if you want more than 10 outbound connections.**
+The fill phase respects the config — a node with `min_peers=3,
+max_peers=10` will now actually climb to 10 (previously stuck at
+3). Operators on stable connections may want `max_peers=32` or so.
+`min_peers` stays the dial-aggressively floor.
+
+The PeerDb is empty on first start with this binary. Within ~2
+minutes (the keepalive `GetPeers` cadence), peers in the seed pool
+will gossip back a fresh peer list — observed on the laptop:
+3 → 10 connected peers in ~3 minutes, 64 entries in the PeerDb,
+zero malformed-Peers bans.
+
+### Side change: Blacklist sync API
+
+`enr_p2p::Blacklist` moved from `tokio::sync::Mutex` to
+`std::sync::Mutex` because `PeerDb` runs inside a sync mutex and
+can't await. Critical sections are `HashSet` ops — bounded in time,
+no awaits. API breaking only for direct consumers of `Blacklist` —
+the internal callers (`record_permanent` in `transport::frame`)
+were updated in-tree.
+
 ## v0.5.0 — 2026-05-14
 
 Crash recovery overhaul. The v0.4.x silent-loading window after an
