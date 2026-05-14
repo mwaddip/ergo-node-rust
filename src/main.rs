@@ -1109,6 +1109,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // Maintenance subcommand: clear the scores-migration sentinel so the
+    // next normal start re-runs the migration. Operator tool; intentionally
+    // hidden from --help. Takes the same config path arg as the daemon so
+    // the data_dir is resolved consistently.
+    if args.iter().any(|a| a == "--reset-scores-migration") {
+        let config_path = args.iter().find(|a| !a.starts_with("--") && !a.ends_with("ergo-node-rust"))
+            .cloned()
+            .unwrap_or_else(|| "ergo.toml".to_string());
+        let config_content = std::fs::read_to_string(&config_path)?;
+        let root_config: RootConfig = toml::from_str(&config_content)?;
+        let node_config = root_config.node.unwrap_or_default();
+        let data_dir = std::path::PathBuf::from(node_config.data_dir);
+        let store = RedbModifierStore::new(&data_dir.join("modifiers.redb"))?;
+        store.chain_meta_delete(b"scores_migrated_v1")?;
+        store.flush()?;
+        tracing::info!("scores-migration sentinel cleared; next normal start will re-run the migration");
+        return Ok(());
+    }
+
     let config_path = args.get(1)
         .cloned()
         .unwrap_or_else(|| "ergo.toml".to_string());
