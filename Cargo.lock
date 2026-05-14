@@ -681,6 +681,7 @@ dependencies = [
  "parking_lot",
  "redb",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

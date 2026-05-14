@@ -7,6 +7,7 @@ description = "Persistent modifier storage for ergo-node-rust"
 [dependencies]
 parking_lot = "0.12"
 redb = "4"
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

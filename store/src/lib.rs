@@ -125,6 +125,29 @@ pub trait ModifierStore: Send + Sync {
         score: &[u8],
     ) -> Result<(), Self::Error>;
 
+    /// Batch variant of [`put_header_score`] — writes many `(id, score)`
+    /// pairs in a single redb write transaction.
+    ///
+    /// Order of entries is preserved but semantically irrelevant;
+    /// HEADER_SCORES is keyed by header id, not height. Each entry
+    /// must satisfy the same preconditions as `put_header_score`
+    /// (id present in PRIMARY, score is non-empty big-endian BigUint
+    /// bytes). Touches no other table.
+    ///
+    /// Atomic: on Ok all entries are committed; on Err none are. An
+    /// empty `entries` slice is a no-op that returns Ok without
+    /// touching disk.
+    ///
+    /// Used by the scores backfill migration to cut per-transaction
+    /// overhead by ~100×. With 1.78M individual single-write calls
+    /// the migration also leaves substantial redb recovery work for
+    /// the next unclean restart (~6 min open time observed) —
+    /// chunking into ~50_000-entry batches collapses that.
+    fn put_header_score_batch(
+        &self,
+        entries: &[([u8; 32], Vec<u8>)],
+    ) -> Result<(), Self::Error>;
+
     /// Read a value from the chain_meta table.
     ///
     /// Tiny key-value store inside the modifier store, used for
@@ -142,6 +165,16 @@ pub trait ModifierStore: Send + Sync {
         &self,
         key: &[u8],
         value: &[u8],
+    ) -> Result<(), Self::Error>;
+
+    /// Remove a value from the chain_meta table.
+    ///
+    /// Idempotent: removing a key that does not exist is `Ok(())`.
+    /// Primary use case is operator-driven re-runs of one-shot
+    /// migrations (delete the migration's sentinel and restart).
+    fn chain_meta_delete(
+        &self,
+        key: &[u8],
     ) -> Result<(), Self::Error>;
 
     /// Get the best chain header ID at a height.

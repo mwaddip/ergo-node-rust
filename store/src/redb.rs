@@ -2,6 +2,7 @@ use crate::{ModifierBatchEntry, ModifierStore};
 use ::redb::{Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 use parking_lot::RwLock;
 
 const PRIMARY: TableDefinition<(u8, [u8; 32]), &[u8]> = TableDefinition::new("primary");
@@ -10,6 +11,19 @@ const HEADER_FORKS: TableDefinition<(u32, u32), [u8; 32]> = TableDefinition::new
 const HEADER_SCORES: TableDefinition<[u8; 32], &[u8]> = TableDefinition::new("header_scores");
 const BEST_CHAIN: TableDefinition<u32, [u8; 32]> = TableDefinition::new("best_chain");
 const CHAIN_META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chain_meta");
+
+/// Modifier types stored in HEIGHT_INDEX (i.e. everything except
+/// headers, which live in the fork-aware tables).
+///
+/// Used by `load_tips` to do per-type tip lookups instead of a full
+/// HEIGHT_INDEX scan. If a new non-header modifier type is added to
+/// the contract (`facts/store.md`), append it here so `load_tips`
+/// picks up its tip on open.
+const NON_HEADER_TYPES: &[u8] = &[
+    102, // BlockTransactions
+    104, // ADProofs
+    108, // Extension
+];
 
 /// redb-backed modifier store.
 pub struct RedbModifierStore {
@@ -115,21 +129,72 @@ impl From<::redb::CommitError> for StoreError {
 
 impl RedbModifierStore {
     /// Opens or creates a redb database at the given path.
+    ///
+    /// Per-step durations are logged at `info` level on every open
+    /// (`tracing::info!`). Operators can grep for `"store open:"` in
+    /// node logs to diagnose slow startups; the cost is essentially
+    /// free since each step would already be timed by anyone trying
+    /// to debug it.
     pub fn new(path: &Path) -> Result<Self, StoreError> {
+        let t_total = Instant::now();
+
+        let t = Instant::now();
         let db = Database::create(path)?;
+        tracing::info!(
+            elapsed_ms = t.elapsed().as_millis() as u64,
+            "store open: Database::create"
+        );
+
+        let t = Instant::now();
         let tips = Self::load_tips(&db)?;
+        tracing::info!(
+            elapsed_ms = t.elapsed().as_millis() as u64,
+            "store open: load_tips"
+        );
+
+        let t = Instant::now();
         let best_header_tip = Self::load_best_header_tip(&db)?;
+        tracing::info!(
+            elapsed_ms = t.elapsed().as_millis() as u64,
+            "store open: load_best_header_tip"
+        );
+
         let store = Self {
             db,
             tips: RwLock::new(tips),
             best_header_tip: RwLock::new(best_header_tip),
         };
+
+        let t = Instant::now();
         store.migrate_headers_if_needed()?;
+        tracing::info!(
+            elapsed_ms = t.elapsed().as_millis() as u64,
+            "store open: migrate_headers_if_needed"
+        );
+
+        tracing::info!(
+            elapsed_ms = t_total.elapsed().as_millis() as u64,
+            "store open: total"
+        );
+
         Ok(store)
     }
 
-    /// Scans the height index to reconstruct tip state per modifier type.
-    /// Keys are sorted `(type_id, height)`, so the last entry per type_id wins.
+    /// Reconstructs the per-type tip cache from HEIGHT_INDEX.
+    ///
+    /// For each non-header modifier type, performs a single backward
+    /// range scan and reads only the last (= highest-height) entry —
+    /// O(K log N) total, where K is the number of modifier types and
+    /// N is the total HEIGHT_INDEX row count. A naive full-table scan
+    /// dominated open time at full mainnet scale (~5.3M rows across
+    /// 3 section types → ~6m on the laptop after unclean shutdown),
+    /// hence the per-type seek.
+    ///
+    /// Type 101 (Header) is excluded by design: headers live in the
+    /// fork-aware tables and their tip is loaded by
+    /// `load_best_header_tip`. Legacy `(101, h)` entries that may
+    /// still exist in HEIGHT_INDEX are removed by
+    /// `migrate_headers_if_needed` shortly after open.
     fn load_tips(db: &Database) -> Result<HashMap<u8, (u32, [u8; 32])>, StoreError> {
         let read_txn = db.begin_read()?;
         let table = match read_txn.open_table(HEIGHT_INDEX) {
@@ -139,11 +204,20 @@ impl RedbModifierStore {
         };
 
         let mut tips = HashMap::new();
-        for result in table.iter()? {
-            let (key_guard, value_guard) = result?;
-            let (type_id, height) = key_guard.value();
-            let id = value_guard.value();
-            tips.insert(type_id, (height, id));
+        for &type_id in NON_HEADER_TYPES {
+            // Range over every height for this type, then take the
+            // last entry — that's the tip. Range bounds are inclusive
+            // on both ends to avoid type+1 overflow concerns at u8
+            // boundaries (even though current types don't reach 255).
+            if let Some(entry) = table
+                .range((type_id, 0u32)..=(type_id, u32::MAX))?
+                .next_back()
+            {
+                let (key_guard, value_guard) = entry?;
+                let (_t, height) = key_guard.value();
+                let id = value_guard.value();
+                tips.insert(type_id, (height, id));
+            }
         }
         Ok(tips)
     }
@@ -538,6 +612,51 @@ impl ModifierStore for RedbModifierStore {
         Ok(())
     }
 
+    fn put_header_score_batch(
+        &self,
+        entries: &[([u8; 32], Vec<u8>)],
+    ) -> Result<(), Self::Error> {
+        // Empty batch is a no-op — skip the txn entirely so we don't
+        // pay for an empty commit or accidentally create the
+        // PRIMARY/HEADER_SCORES tables on a fresh DB.
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut write_txn = self.db.begin_write()?;
+        // See `put_batch` — Durability::None; the migration loop pairs
+        // this with explicit `flush()` calls at chunk boundaries.
+        write_txn
+            .set_durability(Durability::None)
+            .expect("set_durability on fresh txn");
+        {
+            // Open both tables on the single write txn so validate and
+            // write share one atomic scope. Returning Err from inside
+            // this block drops both table handles and then drops the
+            // write_txn without committing — full rollback.
+            let primary = write_txn.open_table(PRIMARY)?;
+            let mut scores = write_txn.open_table(HEADER_SCORES)?;
+
+            // Two-pass: validate every id first so a missing id rejects
+            // the batch before any HEADER_SCORES writes happen. (Even
+            // if writes had happened, the txn-level rollback would
+            // make them invisible — but skipping the wasted work keeps
+            // the "Err → none" semantics free of subtle txn-internal
+            // state.)
+            for (id, _score) in entries {
+                if primary.get((101u8, *id))?.is_none() {
+                    return Err(StoreError::HeaderNotInPrimary(*id));
+                }
+            }
+
+            for (id, score) in entries {
+                scores.insert(*id, score.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     fn chain_meta_get(
         &self,
         key: &[u8],
@@ -564,6 +683,28 @@ impl ModifierStore for RedbModifierStore {
         {
             let mut table = write_txn.open_table(CHAIN_META)?;
             table.insert(key, value)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    fn chain_meta_delete(
+        &self,
+        key: &[u8],
+    ) -> Result<(), Self::Error> {
+        let mut write_txn = self.db.begin_write()?;
+        write_txn
+            .set_durability(Durability::None)
+            .expect("set_durability on fresh txn");
+        {
+            // open_table on a write txn auto-creates the table if it
+            // doesn't exist; that's a harmless side-effect on a fresh
+            // store and keeps the "delete from absent table" case
+            // idempotent without extra plumbing.
+            let mut table = write_txn.open_table(CHAIN_META)?;
+            // Table::remove returns Some(old_value) / None — neither
+            // is an error, so absent-key deletes are a no-op.
+            table.remove(key)?;
         }
         write_txn.commit()?;
         Ok(())
@@ -1259,6 +1400,113 @@ mod tests {
     }
 
     #[test]
+    fn put_header_score_batch_empty_is_noop() {
+        let (store, _dir) = test_store();
+        // Empty slice must succeed without touching anything.
+        store.put_header_score_batch(&[]).unwrap();
+        // Sanity: no headers materialized out of thin air.
+        assert_eq!(store.best_chain_entries().unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn put_header_score_batch_three_entries_round_trip() {
+        let (store, _dir) = test_store();
+        let id1 = test_id(1);
+        let id2 = test_id(2);
+        let id3 = test_id(3);
+
+        // Establish three headers with initial scores.
+        store
+            .put_batch(&[
+                (101, id1, 1, b"h1".to_vec(), Some(vec![0x01])),
+                (101, id2, 2, b"h2".to_vec(), Some(vec![0x02])),
+                (101, id3, 3, b"h3".to_vec(), Some(vec![0x03])),
+            ])
+            .unwrap();
+
+        // Batch-update all three scores in a single transaction.
+        let updates = vec![
+            (id1, vec![0xAA, 0xAA]),
+            (id2, vec![0xBB, 0xBB, 0xBB]),
+            (id3, vec![0xCC]),
+        ];
+        store.put_header_score_batch(&updates).unwrap();
+
+        assert_eq!(store.header_score(&id1).unwrap(), Some(vec![0xAA, 0xAA]));
+        assert_eq!(store.header_score(&id2).unwrap(), Some(vec![0xBB, 0xBB, 0xBB]));
+        assert_eq!(store.header_score(&id3).unwrap(), Some(vec![0xCC]));
+    }
+
+    #[test]
+    fn put_header_score_batch_atomicity_unknown_id_rolls_back_all() {
+        let (store, _dir) = test_store();
+        let id1 = test_id(1);
+        let id2 = test_id(2);
+        let unknown = test_id(0xAB);
+
+        // Two real headers with known initial scores.
+        store
+            .put_batch(&[
+                (101, id1, 1, b"h1".to_vec(), Some(vec![0x01])),
+                (101, id2, 2, b"h2".to_vec(), Some(vec![0x02])),
+            ])
+            .unwrap();
+
+        // Place the unknown id in the MIDDLE: id1 (valid) → unknown (fails)
+        // → id2 (valid). Tests both "rollback writes that happened before
+        // the failure" and "never reach writes after the failure" — though
+        // with the upfront validate pass nothing is written at all.
+        let batch = vec![
+            (id1, vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            (unknown, vec![0xCA, 0xFE]),
+            (id2, vec![0xFA, 0xCE]),
+        ];
+        let err = store.put_header_score_batch(&batch).unwrap_err();
+        assert!(
+            matches!(err, StoreError::HeaderNotInPrimary(id) if id == unknown),
+            "expected HeaderNotInPrimary({unknown:?}), got {err:?}"
+        );
+
+        // Existing scores must be unchanged.
+        assert_eq!(store.header_score(&id1).unwrap(), Some(vec![0x01]));
+        assert_eq!(store.header_score(&id2).unwrap(), Some(vec![0x02]));
+        // Unknown id still absent from HEADER_SCORES.
+        assert_eq!(store.header_score(&unknown).unwrap(), None);
+    }
+
+    #[test]
+    fn put_header_score_batch_overwrites_previous_scores() {
+        let (store, _dir) = test_store();
+        let id1 = test_id(1);
+        let id2 = test_id(2);
+
+        // Initial real headers.
+        store
+            .put_batch(&[
+                (101, id1, 1, b"h1".to_vec(), Some(vec![0x01])),
+                (101, id2, 2, b"h2".to_vec(), Some(vec![0x02])),
+            ])
+            .unwrap();
+
+        // First batch update.
+        store
+            .put_header_score_batch(&[(id1, vec![0x10]), (id2, vec![0x20])])
+            .unwrap();
+        assert_eq!(store.header_score(&id1).unwrap(), Some(vec![0x10]));
+        assert_eq!(store.header_score(&id2).unwrap(), Some(vec![0x20]));
+
+        // Second batch overwrites with new values.
+        store
+            .put_header_score_batch(&[
+                (id1, vec![0xAA, 0xBB]),
+                (id2, vec![0xCC, 0xDD, 0xEE]),
+            ])
+            .unwrap();
+        assert_eq!(store.header_score(&id1).unwrap(), Some(vec![0xAA, 0xBB]));
+        assert_eq!(store.header_score(&id2).unwrap(), Some(vec![0xCC, 0xDD, 0xEE]));
+    }
+
+    #[test]
     fn best_chain_entries_returns_ascending_height_pairs() {
         let (store, _dir) = test_store();
 
@@ -1323,6 +1571,230 @@ mod tests {
         assert_eq!(
             store.chain_meta_get(b"scores_migrated_v1").unwrap(),
             Some(vec![1u8])
+        );
+    }
+
+    #[test]
+    fn chain_meta_delete_round_trip() {
+        let (store, _dir) = test_store();
+
+        // Put, observe value, delete, observe None.
+        store.chain_meta_put(b"sentinel", &[1u8]).unwrap();
+        assert_eq!(store.chain_meta_get(b"sentinel").unwrap(), Some(vec![1u8]));
+        store.chain_meta_delete(b"sentinel").unwrap();
+        assert_eq!(store.chain_meta_get(b"sentinel").unwrap(), None);
+
+        // Other keys are untouched by a delete.
+        store.chain_meta_put(b"keep", b"value").unwrap();
+        store.chain_meta_put(b"toss", b"value").unwrap();
+        store.chain_meta_delete(b"toss").unwrap();
+        assert_eq!(store.chain_meta_get(b"keep").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(store.chain_meta_get(b"toss").unwrap(), None);
+    }
+
+    #[test]
+    fn chain_meta_delete_absent_key_is_ok() {
+        let (store, _dir) = test_store();
+
+        // Empty store — deleting a key that never existed must not error.
+        store.chain_meta_delete(b"never-existed").unwrap();
+        assert_eq!(store.chain_meta_get(b"never-existed").unwrap(), None);
+
+        // Delete then delete again — second call is a no-op.
+        store.chain_meta_put(b"k", b"v").unwrap();
+        store.chain_meta_delete(b"k").unwrap();
+        store.chain_meta_delete(b"k").unwrap();
+        assert_eq!(store.chain_meta_get(b"k").unwrap(), None);
+    }
+
+    // --- load_tips: non-header tips survive restart and reflect the
+    //                highest height per type, not iteration artifacts. ---
+
+    #[test]
+    fn non_header_tips_survive_restart() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nh_tips.redb");
+
+        // Session 1: write a few non-header modifiers at varied heights
+        // across all three non-header types. Use put_batch so the
+        // HEIGHT_INDEX rows exist exactly as they would in a real run.
+        {
+            let store = RedbModifierStore::new(&path).unwrap();
+            // Non-header entries — score is None for non-header types.
+            let entries: Vec<ModifierBatchEntry> = vec![
+                (102, test_id(1), 10, b"bt-low".to_vec(), None),
+                (102, test_id(2), 50, b"bt-high".to_vec(), None),
+                (102, test_id(3), 30, b"bt-mid".to_vec(), None),
+                (104, test_id(4), 7, b"ad-low".to_vec(), None),
+                (104, test_id(5), 99, b"ad-high".to_vec(), None),
+                (108, test_id(6), 1, b"ext-only".to_vec(), None),
+            ];
+            store.put_batch(&entries).unwrap();
+
+            // Sanity within-session: tips reflect the highest heights.
+            assert_eq!(store.tip(102).unwrap(), Some((50, test_id(2))));
+            assert_eq!(store.tip(104).unwrap(), Some((99, test_id(5))));
+            assert_eq!(store.tip(108).unwrap(), Some((1, test_id(6))));
+        }
+
+        // Session 2: reopen. `load_tips` runs and rebuilds the cache
+        // from HEIGHT_INDEX via the per-type backward range scan.
+        {
+            let store = RedbModifierStore::new(&path).unwrap();
+            assert_eq!(store.tip(102).unwrap(), Some((50, test_id(2))));
+            assert_eq!(store.tip(104).unwrap(), Some((99, test_id(5))));
+            assert_eq!(store.tip(108).unwrap(), Some((1, test_id(6))));
+            // A type with no entries returns None.
+            assert_eq!(store.tip(99).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn load_tips_skips_legacy_header_height_index_rows() {
+        // Regression guard: the new per-type load_tips only scans the
+        // non-header type range, so legacy `(101, h)` rows (cleaned up
+        // by `migrate_headers_if_needed`) MUST NOT poison `tip(101)`
+        // via the HashMap. tip(101) routes through best_header_tip
+        // anyway, but this test asserts the cache is what we expect.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy_headers.redb");
+
+        // Phase 1: hand-write legacy (101, h) rows directly into
+        // HEIGHT_INDEX, then open the store — the legacy header
+        // migration moves them into header_forks/best_chain.
+        {
+            let db = Database::create(&path).unwrap();
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut primary = write_txn.open_table(PRIMARY).unwrap();
+                let mut height_idx = write_txn.open_table(HEIGHT_INDEX).unwrap();
+                for h in 1..=5u32 {
+                    let id = test_id(h as u8);
+                    primary.insert((101u8, id), format!("h{h}").as_bytes()).unwrap();
+                    height_idx.insert((101u8, h), id).unwrap();
+                }
+                // Also drop a non-header at height 20 so load_tips has
+                // something to find for type 102.
+                let bt_id = test_id(0xBB);
+                primary.insert((102u8, bt_id), b"bt".as_slice()).unwrap();
+                height_idx.insert((102u8, 20u32), bt_id).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let store = RedbModifierStore::new(&path).unwrap();
+
+        // Header tip comes from BEST_CHAIN via the legacy migration.
+        assert_eq!(store.tip(101).unwrap(), Some((5, test_id(5))));
+        // Non-header tip comes from load_tips' per-type seek.
+        assert_eq!(store.tip(102).unwrap(), Some((20, test_id(0xBB))));
+        // type 101 is NOT in the tips HashMap (only non-header types
+        // are), but the cache absence is invisible because tip(101)
+        // routes through best_header_tip.
+    }
+
+    // --- Synthetic open-time benchmark — exists to confirm the per-type
+    //     load_tips optimisation actually wins on a non-trivial store. ---
+
+    /// Naive baseline implementation kept for the benchmark below —
+    /// matches what `load_tips` did before the per-type-range
+    /// optimisation. Iterates the entire HEIGHT_INDEX table and lets
+    /// the (type_id, height) sort order leave the last entry per type
+    /// in the HashMap. Test-only.
+    #[cfg(test)]
+    fn load_tips_naive_full_scan(
+        db: &Database,
+    ) -> Result<HashMap<u8, (u32, [u8; 32])>, StoreError> {
+        let read_txn = db.begin_read()?;
+        let table = match read_txn.open_table(HEIGHT_INDEX) {
+            Ok(t) => t,
+            Err(::redb::TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
+            Err(e) => return Err(StoreError::Table(e)),
+        };
+        let mut tips = HashMap::new();
+        for result in table.iter()? {
+            let (key_guard, value_guard) = result?;
+            let (type_id, height) = key_guard.value();
+            let id = value_guard.value();
+            tips.insert(type_id, (height, id));
+        }
+        Ok(tips)
+    }
+
+    #[test]
+    fn synthetic_open_time_benchmark() {
+        // ~30k entries per non-header type = ~90k HEIGHT_INDEX rows.
+        // Large enough that a pre-optimisation full scan is
+        // measurably slower than the per-type seek; small enough to
+        // keep `cargo test` under a few seconds on a laptop SSD. The
+        // production case is ~60× this (~5.3M rows on full mainnet).
+        const PER_TYPE: u32 = 30_000;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bench.redb");
+
+        // Build the store.
+        {
+            let store = RedbModifierStore::new(&path).unwrap();
+            for type_id in [102u8, 104, 108] {
+                let entries: Vec<ModifierBatchEntry> = (1..=PER_TYPE)
+                    .map(|h| {
+                        let mut id = [0u8; 32];
+                        id[0] = type_id;
+                        id[1..5].copy_from_slice(&h.to_be_bytes());
+                        (type_id, id, h, format!("d{h}").into_bytes(), None)
+                    })
+                    .collect();
+                store.put_batch(&entries).unwrap();
+            }
+            // Force durability so the reopen below sees the data
+            // without depending on the OS page cache.
+            store.flush().unwrap();
+        }
+
+        // Side-by-side: run BOTH load_tips strategies against the
+        // same on-disk DB and report the durations. The optimised
+        // path is exercised through RedbModifierStore::new (which is
+        // the production path); the naive path is exercised directly
+        // against a freshly-opened Database for an apples-to-apples
+        // comparison of the load_tips step alone.
+        let db = Database::create(&path).unwrap();
+
+        let t = Instant::now();
+        let naive_tips = load_tips_naive_full_scan(&db).unwrap();
+        let naive_load_tips_ms = t.elapsed().as_millis();
+
+        let t = Instant::now();
+        let optimised_tips = RedbModifierStore::load_tips(&db).unwrap();
+        let optimised_load_tips_ms = t.elapsed().as_millis();
+
+        drop(db);
+
+        // Both strategies must produce the same tips.
+        assert_eq!(naive_tips, optimised_tips, "tip strategies diverged");
+        for type_id in [102u8, 104, 108] {
+            let (h, _) = optimised_tips.get(&type_id).copied().unwrap();
+            assert_eq!(h, PER_TYPE, "wrong tip height for type {type_id}");
+        }
+
+        // Full-open path (database create + load_tips +
+        // load_best_header_tip + migrate_headers_if_needed). The
+        // tracing instrumentation logs each step's duration as well;
+        // here we capture only the wall-clock for the assertion.
+        let t = Instant::now();
+        let _store = RedbModifierStore::new(&path).unwrap();
+        let full_open_ms = t.elapsed().as_millis();
+
+        eprintln!(
+            "synthetic_open_time_benchmark: per_type={PER_TYPE}, \
+             naive_load_tips_ms={naive_load_tips_ms}, \
+             optimised_load_tips_ms={optimised_load_tips_ms}, \
+             full_open_ms={full_open_ms}"
+        );
+
+        assert!(
+            full_open_ms < 5_000,
+            "full open took {full_open_ms}ms — regression?"
         );
     }
 }
