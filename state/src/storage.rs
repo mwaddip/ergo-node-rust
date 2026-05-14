@@ -135,7 +135,8 @@ impl RedbAVLStorage {
 
         // Ensure tables exist.
         {
-            let write_txn = db.begin_write()?;
+            let mut write_txn = db.begin_write()?;
+            write_txn.set_quick_repair(true);
             write_txn.open_table(NODES_TABLE)?;
             write_txn.open_table(UNDO_TABLE)?;
             write_txn.open_table(META_TABLE)?;
@@ -160,6 +161,7 @@ impl RedbAVLStorage {
             if !has_block_height {
                 warn!("state.redb predates block_height metadata — migrating to 0");
                 let mut write_txn = db.begin_write()?;
+                write_txn.set_quick_repair(true);
                 write_txn.set_durability(Durability::Immediate)?;
                 {
                     let mut meta = write_txn.open_table(META_TABLE)?;
@@ -409,7 +411,8 @@ impl RedbAVLStorage {
         version: ADDigest,
         block_height: u32,
     ) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
+        let mut write_txn = self.db.begin_write()?;
+        write_txn.set_quick_repair(true);
         {
             let mut nodes_table = write_txn.open_table(NODES_TABLE)?;
             let mut meta_table = write_txn.open_table(META_TABLE)?;
@@ -482,6 +485,7 @@ impl RedbAVLStorage {
     /// prior `Durability::None` commits still held in the page cache.
     pub fn flush(&self) -> Result<()> {
         let mut write_txn = self.db.begin_write()?;
+        write_txn.set_quick_repair(true);
         write_txn.set_durability(Durability::Immediate)?;
         write_txn.commit().context("flush commit failed")?;
         Ok(())
@@ -772,6 +776,7 @@ impl RedbAVLStorage {
         //    Skip fsync per commit — the OS page cache batches writes.
         //    On crash the sync layer re-applies missing blocks.
         let mut write_txn = self.db.begin_write()?;
+        write_txn.set_quick_repair(true);
         write_txn.set_durability(Durability::None)?;
         {
             let mut nodes_table = write_txn.open_table(NODES_TABLE)?;
@@ -957,7 +962,8 @@ impl VersionedAVLStorage for RedbAVLStorage {
             .position(|(_, d)| d == version)
             .context("version not found in rollback targets")?;
 
-        let write_txn = self.db.begin_write()?;
+        let mut write_txn = self.db.begin_write()?;
+        write_txn.set_quick_repair(true);
         let mut last_undo: Option<UndoRecord> = None;
         let mut skipped_deletions: usize = 0;
 

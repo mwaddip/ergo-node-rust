@@ -280,7 +280,12 @@ impl RedbModifierStore {
 
         entries.sort_by_key(|(h, _)| *h);
 
-        let write_txn = self.db.begin_write()?;
+        let mut write_txn = self.db.begin_write()?;
+        // Quick-repair: every write txn pays a small per-commit cost
+        // to save allocator state, in exchange for near-instant
+        // recovery on the next unclean-shutdown reopen. See
+        // `facts/store.md` → Open-time cost → redb quick-repair.
+        write_txn.set_quick_repair(true);
         {
             let mut forks = write_txn.open_table(HEADER_FORKS)?;
             let mut scores = write_txn.open_table(HEADER_SCORES)?;
@@ -365,6 +370,7 @@ impl ModifierStore for RedbModifierStore {
         write_txn
             .set_durability(Durability::None)
             .expect("set_durability on fresh txn");
+        write_txn.set_quick_repair(true);
         let mut new_best_tip: Option<(u32, [u8; 32])> = None;
         {
             let mut primary = write_txn.open_table(PRIMARY)?;
@@ -509,6 +515,7 @@ impl ModifierStore for RedbModifierStore {
         write_txn
             .set_durability(Durability::None)
             .expect("set_durability on fresh txn");
+        write_txn.set_quick_repair(true);
         {
             let mut primary = write_txn.open_table(PRIMARY)?;
             primary.insert((101u8, *id), data)?;
@@ -604,6 +611,7 @@ impl ModifierStore for RedbModifierStore {
         write_txn
             .set_durability(Durability::None)
             .expect("set_durability on fresh txn");
+        write_txn.set_quick_repair(true);
         {
             let mut scores = write_txn.open_table(HEADER_SCORES)?;
             scores.insert(*id, score)?;
@@ -629,6 +637,7 @@ impl ModifierStore for RedbModifierStore {
         write_txn
             .set_durability(Durability::None)
             .expect("set_durability on fresh txn");
+        write_txn.set_quick_repair(true);
         {
             // Open both tables on the single write txn so validate and
             // write share one atomic scope. Returning Err from inside
@@ -680,6 +689,7 @@ impl ModifierStore for RedbModifierStore {
         write_txn
             .set_durability(Durability::None)
             .expect("set_durability on fresh txn");
+        write_txn.set_quick_repair(true);
         {
             let mut table = write_txn.open_table(CHAIN_META)?;
             table.insert(key, value)?;
@@ -696,6 +706,7 @@ impl ModifierStore for RedbModifierStore {
         write_txn
             .set_durability(Durability::None)
             .expect("set_durability on fresh txn");
+        write_txn.set_quick_repair(true);
         {
             // open_table on a write txn auto-creates the table if it
             // doesn't exist; that's a harmless side-effect on a fresh
@@ -776,6 +787,7 @@ impl ModifierStore for RedbModifierStore {
         write_txn
             .set_durability(Durability::Immediate)
             .expect("set_durability on fresh txn");
+        write_txn.set_quick_repair(true);
         write_txn.commit()?;
         Ok(())
     }
@@ -1607,6 +1619,98 @@ mod tests {
         assert_eq!(store.chain_meta_get(b"k").unwrap(), None);
     }
 
+    // --- quick-repair: every store write txn calls set_quick_repair(true)
+    //                   so an UNCLEAN reopen (kill -9) finds the allocator
+    //                   state in the system table and skips the
+    //                   O(file-size) repair walk. ---
+    //
+    // Observability limit: redb's `Database::drop` itself runs a
+    // `set_quick_repair(true)` commit (`ensure_allocator_state_table_and_trim`
+    // in redb 4.0.0/src/db.rs:1040). That means EVERY graceful close
+    // — including pre-change builds without `set_quick_repair` on user
+    // commits — leaves a valid allocator state table. So the actual
+    // repair-skip win is only observable on UNGRACEFUL close (kill
+    // -9, OS crash, panic mid-commit), which requires a subprocess +
+    // kill harness rather than a unit test.
+    //
+    // We get coverage three ways:
+    //   1. Smoke test below — writes round-trip after a graceful
+    //      reopen, and the repair callback is not invoked.
+    //   2. `synthetic_open_time_benchmark` — confirms quick-repair
+    //      didn't regress open time on a non-trivial store.
+    //   3. Grepping the source for `begin_write` and verifying every
+    //      site is followed by `set_quick_repair(true)` (mechanical;
+    //      add new write paths to the same pattern).
+
+    #[test]
+    fn quick_repair_writes_round_trip_after_reopen() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("quick_repair.redb");
+
+        // Phase 1 — exercise every write path that should carry the
+        // quick-repair flag.
+        {
+            let store = RedbModifierStore::new(&path).unwrap();
+            store
+                .put_batch(&[(101, test_id(1), 1, b"h1".to_vec(), Some(vec![0x01]))])
+                .unwrap();
+            store
+                .put_batch(&[(102, test_id(2), 1, b"bt".to_vec(), None)])
+                .unwrap();
+            store
+                .put_header(&test_id(3), 2, 1, &[0x02], b"fork")
+                .unwrap();
+            store.put_header_score(&test_id(1), &[0xAA]).unwrap();
+            store
+                .put_header_score_batch(&[(test_id(1), vec![0xBB])])
+                .unwrap();
+            store.chain_meta_put(b"key", b"val").unwrap();
+            store.chain_meta_delete(b"key").unwrap();
+            store.flush().unwrap();
+        }
+
+        // Phase 2 — reopen via raw redb::Builder with a callback that
+        // counts repair-pipeline invocations. On a graceful close, this
+        // is always 0 regardless of user-level quick-repair settings
+        // (see observability-limit comment above) — but if our changes
+        // somehow broke the open path entirely, this would surface as
+        // an unwrap on create().
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let cb = callback_count.clone();
+        let _db = ::redb::Builder::new()
+            .set_repair_callback(move |_session| {
+                cb.fetch_add(1, Ordering::SeqCst);
+            })
+            .create(&path)
+            .unwrap();
+        assert_eq!(callback_count.load(Ordering::SeqCst), 0);
+        drop(_db);
+
+        // Phase 3 — reopen via the store and verify every write round-
+        // trips. Catches the case where set_quick_repair flips some
+        // bit redb doesn't expect at our use scale.
+        let store = RedbModifierStore::new(&path).unwrap();
+        assert_eq!(
+            store.get(101, &test_id(1)).unwrap(),
+            Some(b"h1".to_vec())
+        );
+        assert_eq!(
+            store.get(102, &test_id(2)).unwrap(),
+            Some(b"bt".to_vec())
+        );
+        assert_eq!(
+            store.get(101, &test_id(3)).unwrap(),
+            Some(b"fork".to_vec())
+        );
+        // Last score-batch write wins.
+        assert_eq!(store.header_score(&test_id(1)).unwrap(), Some(vec![0xBB]));
+        // chain_meta_delete after chain_meta_put leaves the key absent.
+        assert_eq!(store.chain_meta_get(b"key").unwrap(), None);
+    }
+
     // --- load_tips: non-header tips survive restart and reflect the
     //                highest height per type, not iteration artifacts. ---
 
@@ -1795,6 +1899,73 @@ mod tests {
         assert!(
             full_open_ms < 5_000,
             "full open took {full_open_ms}ms — regression?"
+        );
+    }
+
+    #[test]
+    fn quick_repair_per_commit_overhead_bench() {
+        // Side-by-side timing of N tiny commits with vs. without
+        // quick-repair on the underlying redb txn. The store's
+        // production path always uses quick-repair; this bench
+        // measures the cost so we know what we're paying for the
+        // recovery-time win.
+        //
+        // Numbers are wall-clock and noisy on a busy laptop — they're
+        // for the changelog, not for assertions. The only assertion
+        // is that the difference is plausibly small (< 100×) to catch
+        // a setting that accidentally turned into a 10s/commit hang.
+        const N: usize = 1_000;
+
+        // -- with quick-repair (matches production)
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("qr_on.redb");
+        let db = Database::create(&path).unwrap();
+        let t = Instant::now();
+        for i in 0..N {
+            let mut tx = db.begin_write().unwrap();
+            tx.set_durability(Durability::None).unwrap();
+            tx.set_quick_repair(true);
+            {
+                let mut table = tx.open_table(CHAIN_META).unwrap();
+                let key = format!("k{i}");
+                table.insert(key.as_bytes(), b"v".as_slice()).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let qr_on_ms = t.elapsed().as_millis();
+        drop(db);
+
+        // -- without quick-repair (baseline)
+        let path2 = dir.path().join("qr_off.redb");
+        let db = Database::create(&path2).unwrap();
+        let t = Instant::now();
+        for i in 0..N {
+            let mut tx = db.begin_write().unwrap();
+            tx.set_durability(Durability::None).unwrap();
+            // No set_quick_repair call.
+            {
+                let mut table = tx.open_table(CHAIN_META).unwrap();
+                let key = format!("k{i}");
+                table.insert(key.as_bytes(), b"v".as_slice()).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let qr_off_ms = t.elapsed().as_millis();
+        drop(db);
+
+        eprintln!(
+            "quick_repair_per_commit_overhead_bench: N={N}, \
+             qr_on_total_ms={qr_on_ms}, qr_off_total_ms={qr_off_ms}, \
+             per_commit_delta_us={}",
+            (qr_on_ms.saturating_sub(qr_off_ms)) * 1000 / (N as u128)
+        );
+
+        // Sanity bound — quick-repair shouldn't be a >100× slowdown.
+        // In practice it's a few % to a small constant factor.
+        assert!(
+            qr_on_ms < qr_off_ms.saturating_mul(100).max(1_000),
+            "quick-repair commits {qr_on_ms}ms vs baseline {qr_off_ms}ms \
+             — surprising slowdown"
         );
     }
 }
