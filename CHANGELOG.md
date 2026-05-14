@@ -2,32 +2,63 @@
 
 ## v0.5.0 — 2026-05-14
 
-Fast restart on partially-synced chains. Closes the v0.4.x crash-recovery
-silent-loading window from minutes to seconds by completing a deferred
-storage migration: header cumulative scores now live in the store
-(`HEADER_SCORES`) as real values instead of empty placeholders. Startup
-restores the chain by iterating `BEST_CHAIN` once and wiring loaders —
-no header replay, no PoW recheck, no difficulty recalculation.
+Crash recovery overhaul. The v0.4.x silent-loading window after an
+unclean shutdown ([#6](https://github.com/mwaddip/ergo-node-rust/issues/6))
+is closed: on the laptop's full-mainnet store, `kill -9` → REST API
+listening went from **7m54s** to **10.6s** (most of which is
+systemd's `RestartSec=10` cooldown — actual node startup work is
+~440ms). Four changes layer to get there:
+
+1. **Real cumulative scores in `HEADER_SCORES`.** v0.4.x wrote empty
+   placeholders for main-chain headers (a deferred chain-crate
+   migration), forcing the chain to maintain a ~105 MB in-memory
+   `scores: Vec<BigUint>` safety net and to replay the entire header
+   chain via `try_append` on every restart. v0.5.0 carries real
+   scores in the store and retires the Vec.
+2. **`HeaderChain::restore`**. New constructor that builds the chain
+   in O(n) HashMap inserts from a `(height, header_id)` iterator —
+   no header parsing, no PoW recheck, no difficulty recalc — instead
+   of the v0.4.x backward-walk-then-replay (the ~28-min step the
+   issue #6 reporter saw silently chewing CPU).
+3. **`load_tips` bound.** `RedbModifierStore::new` no longer
+   iterates the entire `HEIGHT_INDEX` (~5.3M entries at full
+   mainnet) to find per-type tips. One backward range scan per type
+   instead. Measured on a 90k-entry index: 254ms → <1ms.
+4. **redb quick-repair.** Every write transaction in
+   `enr-store` and `enr-state` calls `set_quick_repair(true)`. redb
+   saves the allocator state per commit, so `Database::open` after
+   `kill -9` skips the full-file scan that previously dominated
+   recovery (5m43s for modifiers.redb, 1m57s for state.redb on the
+   laptop's mainnet store — both drop to ~20ms).
+
+Measured restart-to-API timings on the laptop (mainnet store at
+height 1.78M):
+
+|                              | v0.4.4    | v0.5.0  |
+|------------------------------|-----------|---------|
+| Modifier store open (cold)   | 6m21s     | 18ms    |
+| Chain restore                | 28+ min   | 404ms   |
+| `state.redb` open (cold)     | 3m10s     | 13ms    |
+| Total kill-to-API            | 9m31s+    | 10.6s   |
 
 ### **Operator notice: one-time scores backfill migration on first start**
 
 The v0.4.x store wrote empty placeholders to `HEADER_SCORES` for
-main-chain headers (a documented but deferred-to-someday migration —
-see [the chain crate's `scores` field comment](https://github.com/mwaddip/ergo-node-rust/blob/v0.4.4/chain/src/chain.rs)).
-v0.5.0 needs real cumulative scores there, so on the first start with
-the new binary, a one-shot migration walks `BEST_CHAIN` from height 1
-and computes `score(h) = score(h-1) + decode_compact_bits(header.n_bits)`
-into `HEADER_SCORES`.
+main-chain headers. v0.5.0 needs real cumulative scores, so on the
+first start with the new binary, a one-shot migration walks
+`BEST_CHAIN` from height 1 and computes
+`score(h) = score(h-1) + decode_compact_bits(header.n_bits)` into
+`HEADER_SCORES`.
 
-For a 1.76M-header full-mainnet store this is ~5-15 minutes on commodity
-SSD. **Progress is logged** every 10 000 headers:
+**~50 seconds on the laptop for 1.78M headers** (50 000 scores per
+batched redb transaction). Progress is logged every 10 000 headers:
 
 ```
-INFO scores migration: starting (one-time backfill, may take 5-15 min on full mainnet) total=1784690
-INFO scores migration: progress done=10000 total=1784690
-INFO scores migration: progress done=20000 total=1784690
+INFO scores migration: starting (one-time backfill) total=1784795
+INFO scores migration: progress done=10000 total=1784795
+INFO scores migration: progress done=20000 total=1784795
 ...
-INFO scores migration: complete headers=1784690
+INFO scores migration: complete headers=1784795
 INFO scores migration: sentinel written
 ```
 
@@ -36,37 +67,47 @@ the sentinel unwritten, and the next start re-runs from height 1
 (every write is idempotent). After completion, the `chain_meta`
 sentinel `scores_migrated_v1` ensures the migration runs at most once.
 
-Subsequent restarts skip the migration and complete header chain
-restore in seconds.
+If you ever need to force a re-run, the hidden
+`--reset-scores-migration` flag clears the sentinel:
+
+```
+sudo systemctl stop ergo-node-rust
+sudo -u ergo-node /usr/bin/ergo-node-rust --reset-scores-migration \
+    /etc/ergo-node/ergo.toml
+sudo systemctl start ergo-node-rust
+```
 
 ### Added
-- **`HeaderChain::restore`** constructor (`enr-chain`). Builds a chain
-  in O(n) HashMap inserts from a `(height, header_id)` iterator. No
-  header parsing, no PoW, no difficulty recalc — store vouches for the
-  data. `light_client_mode` is derived from `base_height > 1`.
+- **`HeaderChain::restore`** constructor (`enr-chain`).
 - **`ModifierStore::best_chain_entries`**, **`put_header_score`**,
-  **`chain_meta_get`**/**`chain_meta_put`** (`enr-store`). Building
-  blocks for the new restore path and the scores migration.
-- **`ModifierStore::put_batch` carries real scores for `type_id=101`**.
-  The entry tuple grows from 4 to 5 elements with an `Option<Vec<u8>>`
-  score required for headers and `None` for everything else.
+  **`put_header_score_batch`**, **`chain_meta_get`**/**`put`**/**`delete`**
+  (`enr-store`).
+- **`--reset-scores-migration`** CLI flag in the main binary
+  (operator tool; not in `--help` output, documented here).
+- **Per-step `RedbModifierStore::new` timing logs** so operators see
+  where open time goes (`store open: Database::create elapsed_ms=...`
+  etc).
 
 ### Changed
-- **Startup restore replaces the v0.4.x backward-walk-then-replay path**.
-  On the reporter's 804k-height test node ([#6](https://github.com/mwaddip/ergo-node-rust/issues/6))
-  this was ~28 minutes of silent CPU-bound work after an unclean
-  shutdown. v0.5.0 restores the same chain in seconds — single
-  sequential `best_chain_entries` read + `HeaderChain::restore`.
-- **The chain's `scores: Vec<BigUint>` field is retired** (~105 MB
-  RSS reduction at full mainnet). Score lookups go exclusively
-  through the `ScoreLoader` wired by the main crate.
-- **`install_from_nipopow_proof` returns `Vec<InstalledHeader>`**
-  (each `{id, height, score_be}`) so the integrator persists scores
-  via the store, matching the new "store is the source of truth"
-  invariant. Chain no longer owns score persistence.
-- **`put` (single) with `type_id=101` is now rejected** — main-chain
+- **`ModifierStore::put_batch` carries real scores for `type_id=101`**.
+  Entry tuple grows from 4 to 5 elements with an `Option<Vec<u8>>`
+  score, required for headers and `None` for everything else.
+- **`put` (single) with `type_id=101` is rejected** — main-chain
   header writes must use `put_batch` so the score travels alongside
   the data atomically.
+- **`install_from_nipopow_proof` returns `Vec<InstalledHeader>`**
+  (`{id, height, score_be}`) so the integrator persists installed-
+  suffix scores via the store. Chain no longer owns score
+  persistence.
+- **Chain `scores: Vec<BigUint>` retired** in favour of the
+  `ScoreLoader` (~105 MB RSS reduction at full mainnet, contributing
+  to the ~500 MB at-tip RSS drop observed against v0.4.4).
+- **All redb writes use `set_quick_repair(true)`** in `enr-store`
+  (8 write paths) and `enr-state` (6 write paths). Measured per-
+  commit overhead at `Durability::None`: ~5 µs. Negligible against
+  the recovery-time win.
+- **`load_tips`** uses per-type backward range scan instead of full
+  `HEIGHT_INDEX` iteration.
 
 ## v0.4.5 — 2026-05-13
 

@@ -10,13 +10,13 @@ Validated from genesis through mainnet with no checkpoints.
 - **Parallel validation** — concurrent transaction evaluation within blocks, pipelined across blocks
 - **P2P** — IPv4/IPv6, peer discovery, deep reorg support
 - **Mempool** — validate-on-entry, replace-by-fee, family weighting, fee statistics, P2P relay
-- **REST API** — 23 JVM-compatible endpoints (blocks, transactions, UTXO, peers, mining) plus `/debug/memory`
+- **REST API** — 38 JVM-compatible endpoints (blocks, transactions, UTXO, peers, mining, NiPoPoW) plus `/debug/memory`
 - **Mining** — Autolykos v2 candidate assembly with EIP-27 re-emission, solution validation
 - **Soft-fork voting** — epoch-boundary parameter tracking, v6.0.3-compatible
 - **NiPoPoW** — build and verify proofs, light-client bootstrap mode
 - **UTXO snapshot sync** — bootstrap from peer snapshots; serve snapshots to peers
 - **At-tip memory tuning** — opt-in `synced_*` config swaps to a smaller redb cache once at tip (~80% RSS reduction on mainnet, 7.3 GB → 1.35 GB)
-- **Crash recovery** — clean resume after `kill -9`
+- **Fast crash recovery** — header chain state is reconstructable from the store; redb writes use `quick_repair` so `Database::open` after `kill -9` skips the full-file allocator scan. Restart-to-API on a fully-synced mainnet node is sub-second.
 
 ## Addons
 
@@ -57,7 +57,7 @@ Optional binaries:
 | `store/` | Persistent storage for headers, blocks, modifiers |
 | `mempool/` | Transaction pool, replace-by-fee, family weighting |
 | `mining/` | Candidate assembly, emission tx, PoW validation |
-| `api/` | REST API (axum), 23 endpoints |
+| `api/` | REST API (axum), 38 endpoints |
 | `facts/` | Per-component contract markdown |
 
 Components communicate through traits — the P2P layer doesn't know what validation means, and the validation layer doesn't know about networking.
