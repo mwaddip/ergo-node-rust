@@ -447,6 +447,7 @@ impl ValidationPipeline {
         // Execute pending deep reorg while still holding the chain lock
         if let Some((fork_point, new_branch_with_raw)) = pending_reorg {
             let old_tip = chain.height();
+            let old_tip_id = chain.tip().id;
             let headers_only: Vec<Header> = new_branch_with_raw
                 .iter()
                 .map(|(h, _)| h.clone())
@@ -454,11 +455,12 @@ impl ValidationPipeline {
             match chain.try_reorg_deep(fork_point, headers_only) {
                 Ok(demoted_ids) => {
                     let new_tip = chain.height();
+                    let new_tip_id = chain.tip().id;
                     tracing::info!(
-                        fork_point,
-                        demoted = demoted_ids.len(),
-                        old_tip,
-                        new_tip,
+                        fork_point = fork_point as u64,
+                        demoted = demoted_ids.len() as u64,
+                        old_tip = %old_tip_id,
+                        new_tip = %new_tip_id,
                         "deep reorg succeeded"
                     );
                     chained += new_branch_with_raw.len() as u32;

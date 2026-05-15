@@ -17,3 +17,7 @@ snapshot-bootstrap-test.toml
 
 # Profiling output
 **/perf.data
+
+# Python bytecode cache (rrd-demo-fill.sh has a python3 shebang)
+__pycache__/
+*.pyc

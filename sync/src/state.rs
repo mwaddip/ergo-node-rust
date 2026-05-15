@@ -695,10 +695,10 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
 
         if sweep_size > 100 {
             tracing::info!(
-                from = sweep_from,
-                to = sweep_to,
-                blocks = sweep_size,
-                "=== VALIDATION SWEEP STARTED ==="
+                from = sweep_from as u64,
+                to = sweep_to as u64,
+                blocks = sweep_size as u64,
+                "VALIDATION SWEEP STARTED"
             );
         }
 
@@ -816,6 +816,12 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     }
                     validated_to = height;
 
+                    tracing::info!(
+                        height = height as u64,
+                        id = %header.id,
+                        "block applied"
+                    );
+
                     // Spawn deferred script evaluation on rayon pool
                     if let Some(eval) = outcome.deferred_eval {
                         let tx = self.eval_tx.clone();
@@ -905,12 +911,12 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 let secs = elapsed.as_secs().max(1);
                 let rate = advanced as f64 / secs as f64;
                 tracing::info!(
-                    from = sweep_from,
-                    to = validated_to,
-                    blocks = advanced,
+                    from = sweep_from as u64,
+                    to = validated_to as u64,
+                    blocks = advanced as u64,
                     elapsed = format!("{}m{}s", secs / 60, secs % 60),
                     rate = format!("{rate:.0}/s"),
-                    "=== VALIDATION SWEEP COMPLETE ==="
+                    "VALIDATION SWEEP COMPLETE"
                 );
             } else {
                 tracing::debug!(
@@ -1349,6 +1355,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
 
     /// Synced: periodically check for new blocks, download block sections.
     async fn synced(&mut self) {
+        let tip_height = self.chain.chain_height().await;
+        tracing::info!(height = tip_height as u64, "chain tip reached");
+
         // The at-tip transition (flush settings swap + storage reopen) is
         // gated on validator-tip proximity, not on `synced()` entry. The
         // header chain reaches tip well before validator catches up after

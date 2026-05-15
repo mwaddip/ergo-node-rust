@@ -171,10 +171,26 @@ impl RedbAVLStorage {
             }
         }
 
+        // Journal-events contract: `state_storage_open_complete`.
+        // Marker is the parse anchor for the Doctor adapter; `digest` is the
+        // contract's optional field (empty storage → "none").
+        let digest_str = current_version
+            .as_ref()
+            .map(|v| {
+                let mut hex = String::with_capacity(v.len() * 2);
+                for b in v.as_ref() {
+                    let _ = write!(&mut hex, "{:02x}", b);
+                }
+                hex
+            })
+            .unwrap_or_else(|| String::from("none"));
+        info!(
+            digest = %digest_str,
+            "UTXO state storage opened"
+        );
         debug!(
-            version = ?current_version.as_ref().map(|v| v.len()),
             chain_len = version_chain.len(),
-            "state storage opened"
+            "state storage open: in-memory state restored"
         );
 
         Ok(Self {

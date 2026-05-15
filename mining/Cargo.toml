@@ -21,3 +21,4 @@ tracing = "0.1"
 [dev-dependencies]
 num-bigint = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing-test = { version = "0.2", features = ["no-env-filter"] }

@@ -10,6 +10,7 @@ use ergo_chain_types::{
     autolykos_pow_scheme::{decode_compact_bits, AutolykosPowScheme},
     ADDigest, AutolykosSolution, BlockId, Digest, Digest32, EcPoint, Header, Votes,
 };
+use tracing_test::traced_test;
 use ergo_lib::chain::emission::{EmissionRules, MonetarySettings};
 use ergo_lib::chain::genesis;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
@@ -303,5 +304,72 @@ fn mine_three_consecutive_blocks() {
         current_emission_box.value.as_i64(),
         original_value - total_reward,
         "emission box value should decrease by cumulative rewards"
+    );
+}
+
+/// Contract assertion for `mining_block_found` (facts/journal-events.md v1.0).
+///
+/// Mines one block under a per-test tracing subscriber (via `#[traced_test]`),
+/// then asserts:
+///   - marker prefix `"mining: block found"` appears,
+///   - field `height` is rendered as a bare integer (no `%`-Display wrap),
+///   - field `id` appears (the assembled header's hex block id).
+///
+/// `#[traced_test]` is used instead of an in-test `set_default` subscriber
+/// because the latter is per-thread; under default-parallel `cargo test` the
+/// emit (which lives in a separate module, `validate_solution`) can land on
+/// a worker thread that has no subscriber installed, producing an empty
+/// capture buffer.
+#[test]
+#[traced_test]
+fn mining_block_found_emits_contract_marker() {
+    let settings = MonetarySettings::default();
+    let pks = founder_pks();
+    let (emission_box, _, _) =
+        genesis::genesis_boxes(&settings, &pks, 2, PROOFS).unwrap();
+
+    let miner_pk = test_miner_pk();
+    let config = MinerConfig {
+        miner_pk: miner_pk.clone(),
+        reward_delay: 720,
+        votes: [0, 0, 0],
+        candidate_ttl: Duration::from_secs(15),
+        reemission_rules: ReemissionRules::mainnet(),
+    };
+
+    let parent = genesis_header();
+
+    let mock_proofs =
+        |_txs: &[ergo_lib::chain::transaction::Transaction]|
+         -> Option<Result<(Vec<u8>, ADDigest), ergo_validation::ValidationError>> {
+            Some(Ok((vec![0u8; 64], ADDigest::from([0u8; 33]))))
+        };
+
+    let (candidate, _work) = ergo_mining::generate_candidate(
+        &config,
+        &parent,
+        INITIAL_N_BITS,
+        &[],
+        &emission_box,
+        None,
+        &[],
+        &mock_proofs,
+    )
+    .expect("candidate generation failed");
+
+    let header =
+        cpu_mine(&candidate, 100).expect("mining should succeed with trivial difficulty");
+
+    assert!(
+        logs_contain("mining: block found"),
+        "marker prefix missing"
+    );
+    assert!(
+        logs_contain(&format!("height={}", header.height)),
+        "height field missing"
+    );
+    assert!(
+        logs_contain(&format!("id={}", header.id)),
+        "id field missing"
     );
 }

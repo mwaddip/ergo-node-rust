@@ -75,5 +75,11 @@ pub fn validate_solution(
         return Err(MiningError::InvalidSolution("pow_hit >= target".into()));
     }
 
+    tracing::info!(
+        height = u64::from(header.height),
+        id = %header.id,
+        "mining: block found"
+    );
+
     Ok(header)
 }

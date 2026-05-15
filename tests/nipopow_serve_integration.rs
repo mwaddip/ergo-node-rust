@@ -19,10 +19,12 @@
 
 use std::env;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ergo_chain_types::{BlockId, Digest32};
 use enr_p2p::blacklist::Blacklist;
+use enr_p2p::protocol::counters::TrafficCounters;
 use enr_p2p::transport::connection::Connection;
 use enr_p2p::transport::frame::Frame;
 use enr_p2p::transport::handshake::{HandshakeConfig, ModeConfig};
@@ -81,7 +83,8 @@ async fn nipopow_serve_round_trip_against_running_node() {
         mode_config: ModeConfig::default(),
     };
 
-    let mut conn = Connection::outbound(stream, &hs_config)
+    let counters = Arc::new(TrafficCounters::new());
+    let mut conn = Connection::outbound(stream, &hs_config, &counters)
         .await
         .expect("handshake failed");
     eprintln!(
@@ -202,7 +205,8 @@ async fn nipopow_serve_full_chain_round_trip() {
         mode_config: ModeConfig::default(),
     };
 
-    let mut conn = Connection::outbound(stream, &hs_config)
+    let counters = Arc::new(TrafficCounters::new());
+    let mut conn = Connection::outbound(stream, &hs_config, &counters)
         .await
         .expect("handshake failed");
     eprintln!(
@@ -331,7 +335,8 @@ async fn nipopow_serve_no_anchor_repro() {
         mode_config: ModeConfig::default(),
     };
 
-    let mut conn = Connection::outbound(stream, &hs_config)
+    let counters = Arc::new(TrafficCounters::new());
+    let mut conn = Connection::outbound(stream, &hs_config, &counters)
         .await
         .expect("handshake failed");
 

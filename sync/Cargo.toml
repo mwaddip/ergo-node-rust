@@ -23,3 +23,4 @@ ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "4
 bytes = "1"
 hex = "0.4"
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }

@@ -1229,6 +1229,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         enr_p2p::types::Network::Mainnet => ChainConfig::mainnet(),
     };
 
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        network = match network {
+            enr_p2p::types::Network::Testnet => "testnet",
+            enr_p2p::types::Network::Mainnet => "mainnet",
+        },
+        "Ergo node starting"
+    );
+
     // Parse node config from the same TOML file
     let config_content = std::fs::read_to_string(&config_path)?;
     let root_config: RootConfig = toml::from_str(&config_content)?;
@@ -1363,8 +1372,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut chain = HeaderChain::restore(chain_config, restore_entries)
         .map_err(|e| format!("header chain restore failed: {e:?}"))?;
     tracing::info!(
-        headers = entry_count,
-        tip = chain.height(),
+        headers = entry_count as u64,
+        tip = %chain.tip().id,
         "header chain restored",
     );
 
@@ -1662,11 +1671,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(
                 path = %state_path.display(),
                 cache_mb = node_config.cache_mb,
-                "opening UTXO state storage (this may take a while after unclean shutdown)"
+                "opening UTXO state storage"
             );
             let mut storage = RedbAVLStorage::open(&state_path, params, keep_versions, CacheSize::Bytes(node_config.cache_mb as usize * 1024 * 1024))
                 .expect("failed to open UTXO state storage");
-            tracing::info!("UTXO state storage opened");
 
             let checkpoint = configured_checkpoint.unwrap_or(0);
 
@@ -2241,7 +2249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     match result {
                         Ok(Ok(Some(h))) => {
-                            tracing::info!(height = h, "UTXO snapshot created and stored");
+                            tracing::info!(height = h as u64, "UTXO snapshot created and stored");
                         }
                         Ok(Ok(None)) => {
                             tracing::debug!("snapshot skipped — state is empty");
@@ -2853,7 +2861,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    tracing::info!("Ergo node running");
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "Ergo node running");
 
     // Run until interrupted — handle both SIGINT (ctrl-c) and SIGTERM
     // (systemd stop). Without SIGTERM handling, the process exits via
