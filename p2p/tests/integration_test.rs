@@ -1,7 +1,7 @@
 use enr_p2p::protocol::messages::ProtocolMessage;
 use enr_p2p::protocol::peer::ProtocolEvent;
 use enr_p2p::routing::router::{Action, Router};
-use enr_p2p::types::{Direction, PeerId, ProxyMode};
+use enr_p2p::types::{Direction, Network, PeerId, ProxyMode};
 use std::net::SocketAddr;
 
 fn dummy_addr() -> SocketAddr {
@@ -10,7 +10,7 @@ fn dummy_addr() -> SocketAddr {
 
 #[test]
 fn full_tx_relay_scenario() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     let outbound = PeerId(1);
     let inbound = PeerId(2);
     router.register_peer(outbound, Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
@@ -52,7 +52,7 @@ fn full_tx_relay_scenario() {
 
 #[test]
 fn disconnect_cleanup_scenario() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     let out1 = PeerId(1);
     let out2 = PeerId(2);
     let inb = PeerId(3);
@@ -90,7 +90,7 @@ fn inv_does_not_fanout() {
     // was leftover from the transparent-proxy origin of this crate and
     // is protocol-incorrect for a full node (peers announce to each other
     // directly, and relayed Invs can exceed the 400-modifier cap).
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     let outbound = PeerId(1);
     router.register_peer(outbound, Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
 
@@ -118,7 +118,7 @@ fn inv_does_not_fanout() {
 
 #[test]
 fn light_mode_blocks_sync() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Light, dummy_addr(), None, None);
 
@@ -131,7 +131,7 @@ fn light_mode_blocks_sync() {
 
 #[test]
 fn full_mode_sync_flow() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
 

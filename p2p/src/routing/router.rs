@@ -12,13 +12,14 @@
 
 use crate::blacklist::Blacklist;
 use crate::peer_db::{MemoryPeerStorage, PeerDb, PeerRecord, PeerStorage};
+use crate::protocol::address_sanity::is_bogus_address;
 use crate::protocol::messages::{build_peers_body, parse_peers_body, ProtocolMessage};
 use crate::protocol::peer::ProtocolEvent;
 use crate::routing::inv_table::InvTable;
 use crate::routing::latency::{LatencyStats, LatencyTracker};
 use crate::routing::tracker::{RequestTracker, SyncTracker};
 use crate::transport::handshake::PeerSpec;
-use crate::types::{ConnectionType, Direction, PeerId, ProxyMode};
+use crate::types::{ConnectionType, Direction, Network, PeerId, ProxyMode};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -91,11 +92,15 @@ pub struct Router {
     /// the parser rejects and the source is permanently banned. Mirrors
     /// the JVM `NetworkSettings.maxPeerSpecObjects` (default 64).
     max_peer_spec_objects: usize,
+    /// Network this router is operating on. Gates the network-conditional
+    /// classes in `is_bogus_address` (private/CGN/ULA/documentation ranges
+    /// are filtered on mainnet but allowed on testnet for LAN setups).
+    network: Network,
 }
 
 impl Default for Router {
     fn default() -> Self {
-        Self::new()
+        Self::new(Network::Mainnet)
     }
 }
 
@@ -104,7 +109,7 @@ impl Router {
     /// fresh `Blacklist`. Useful for tests; production should use
     /// [`Router::with_peer_db`] so the PeerDb is shared with the
     /// outbound manager.
-    pub fn new() -> Self {
+    pub fn new(network: Network) -> Self {
         let blacklist = Arc::new(Blacklist::new());
         let storage: Box<dyn PeerStorage> = Box::new(MemoryPeerStorage::new());
         let peer_db = PeerDb::new(
@@ -114,7 +119,7 @@ impl Router {
             HashSet::new(),
         )
         .expect("MemoryPeerStorage::load_all is infallible");
-        Self::with_peer_db(Arc::new(StdMutex::new(peer_db)), blacklist, 64)
+        Self::with_peer_db(Arc::new(StdMutex::new(peer_db)), blacklist, 64, network)
     }
 
     /// Construct a router with an externally-owned PeerDb + Blacklist.
@@ -123,6 +128,7 @@ impl Router {
         peer_db: Arc<StdMutex<PeerDb>>,
         blacklist: Arc<Blacklist>,
         max_peer_spec_objects: usize,
+        network: Network,
     ) -> Self {
         Self {
             peers: HashMap::new(),
@@ -134,6 +140,7 @@ impl Router {
             peer_db,
             blacklist,
             max_peer_spec_objects,
+            network,
         }
     }
 
@@ -398,6 +405,7 @@ impl Router {
                     let db = self.peer_db.lock().expect("peer_db poisoned");
                     db.recent(limit, &exclude)
                         .into_iter()
+                        .filter(|r| !is_bogus_address(r.address, self.network))
                         .map(record_to_spec)
                         .collect()
                 };
@@ -411,22 +419,47 @@ impl Router {
             ProtocolMessage::Peers { body } => {
                 match parse_peers_body(&body, self.max_peer_spec_objects) {
                     Ok(specs) => {
-                        let mut db = self.peer_db.lock().expect("peer_db poisoned");
-                        for spec in specs {
-                            let Some(addr) = spec.address else { continue };
-                            if self.blacklist.contains(addr) { continue; }
-                            db.record(PeerRecord {
-                                address: addr,
-                                last_seen_ms: now_ms(),
-                                agent_name: spec.agent.clone(),
-                                node_name: spec.name.clone(),
-                                version: (
-                                    spec.version.major,
-                                    spec.version.minor,
-                                    spec.version.patch,
-                                ),
-                                features: spec.features.iter().map(|f| (f.id, f.body.clone())).collect(),
-                            });
+                        let mut any_bogus = false;
+                        let mut bogus_examples: Vec<SocketAddr> = Vec::new();
+                        {
+                            let mut db = self.peer_db.lock().expect("peer_db poisoned");
+                            for spec in specs {
+                                let Some(addr) = spec.address else { continue };
+                                if is_bogus_address(addr, self.network) {
+                                    any_bogus = true;
+                                    if bogus_examples.len() < 3 {
+                                        bogus_examples.push(addr);
+                                    }
+                                    continue;
+                                }
+                                if self.blacklist.contains(addr) { continue; }
+                                db.record(PeerRecord {
+                                    address: addr,
+                                    last_seen_ms: now_ms(),
+                                    agent_name: spec.agent.clone(),
+                                    node_name: spec.name.clone(),
+                                    version: (
+                                        spec.version.major,
+                                        spec.version.minor,
+                                        spec.version.patch,
+                                    ),
+                                    features: spec.features.iter().map(|f| (f.id, f.body.clone())).collect(),
+                                });
+                            }
+                        }
+
+                        if any_bogus {
+                            // Same shape as the malformed-Peers ban —
+                            // fail2ban already catches this format.
+                            // Legitimate entries from the same body were
+                            // recorded above; we punish the gossiper,
+                            // not the gossiped peers.
+                            tracing::warn!(
+                                "PENALTY peer_ip={} type=permanent reason=\"gossiped bogus address(es): {:?}\"",
+                                source_addr.ip(),
+                                bogus_examples
+                            );
+                            self.blacklist.record_permanent(source_addr);
                         }
                         vec![]
                     }
@@ -537,13 +570,15 @@ mod tests {
 
     #[test]
     fn get_peers_returns_recent_excluding_source() {
-        let mut router = Router::new();
+        let mut router = Router::new(Network::Mainnet);
         // Five known peers in the PeerDb but none currently connected.
+        // Use a public-looking range — 203.0.113/24 was documentation
+        // (now filtered by the bogus-address sanity layer).
         {
             let mut db = router.peer_db.lock().unwrap();
             for i in 1..=5 {
                 db.record(PeerRecord {
-                    address: pub_addr(&format!("203.0.113.{i}:9030")),
+                    address: pub_addr(&format!("78.46.10.{i}:9030")),
                     last_seen_ms: 1000 + i as u64 * 100,
                     agent_name: "ergoref".into(),
                     node_name: "node".into(),
@@ -554,7 +589,7 @@ mod tests {
         }
         // Register a single connected outbound peer that will issue GetPeers.
         let source = PeerId(1);
-        let source_addr = pub_addr("203.0.113.3:9030"); // also in the DB
+        let source_addr = pub_addr("78.46.10.3:9030"); // also in the DB
         router.register_peer(source, Direction::Outbound, ProxyMode::Full, source_addr, None, None);
 
         let actions = router.handle_event(ProtocolEvent::Message {
@@ -570,7 +605,7 @@ mod tests {
             _ => panic!("expected Peers reply"),
         };
         let specs = parse_peers_body(&body, 64).unwrap();
-        // Source addr (203.0.113.3) is excluded.
+        // Source addr is excluded.
         for s in &specs {
             assert_ne!(s.address.unwrap(), source_addr);
         }
@@ -580,7 +615,7 @@ mod tests {
 
     #[test]
     fn get_peers_empty_db_returns_zero_count_body() {
-        let mut router = Router::new();
+        let mut router = Router::new(Network::Mainnet);
         let source = PeerId(1);
         router.register_peer(source, Direction::Outbound, ProxyMode::Full, pub_addr("198.51.100.1:9030"), None, None);
 
@@ -602,16 +637,19 @@ mod tests {
 
     #[test]
     fn peers_message_records_specs_into_db() {
-        let mut router = Router::new();
+        let mut router = Router::new(Network::Mainnet);
         let source = PeerId(1);
-        router.register_peer(source, Direction::Outbound, ProxyMode::Full, pub_addr("198.51.100.1:9030"), None, None);
+        // 198.51.100/24 and 203.0.113/24 are documentation ranges and
+        // would now trigger the bogus-address ban path. Use a public
+        // range so this test still exercises the happy path.
+        router.register_peer(source, Direction::Outbound, ProxyMode::Full, pub_addr("78.46.20.1:9030"), None, None);
 
         let specs = vec![
-            spec_for("ergoref", pub_addr("203.0.113.10:9030")),
-            spec_for("ergoref", pub_addr("203.0.113.11:9030")),
-            spec_for("ergoref", pub_addr("203.0.113.12:9030")),
-            spec_for("ergoref", pub_addr("203.0.113.13:9030")),
-            spec_for("ergoref", pub_addr("203.0.113.14:9030")),
+            spec_for("ergoref", pub_addr("78.46.20.10:9030")),
+            spec_for("ergoref", pub_addr("78.46.20.11:9030")),
+            spec_for("ergoref", pub_addr("78.46.20.12:9030")),
+            spec_for("ergoref", pub_addr("78.46.20.13:9030")),
+            spec_for("ergoref", pub_addr("78.46.20.14:9030")),
         ];
         let body = build_peers_body(&specs);
         let actions = router.handle_event(ProtocolEvent::Message {
@@ -630,7 +668,7 @@ mod tests {
 
     #[test]
     fn malformed_peers_bans_source_permanently() {
-        let mut router = Router::new();
+        let mut router = Router::new(Network::Mainnet);
         let source = PeerId(7);
         let source_addr = pub_addr("198.51.100.7:9030");
         router.register_peer(source, Direction::Outbound, ProxyMode::Full, source_addr, None, None);
@@ -648,7 +686,7 @@ mod tests {
 
     #[test]
     fn peer_connected_records_with_declared_address() {
-        let mut router = Router::new();
+        let mut router = Router::new(Network::Mainnet);
         let observed = pub_addr("198.51.100.20:9030");
         let declared = pub_addr("203.0.113.20:9030");
         let event = ProtocolEvent::PeerConnected {
@@ -674,7 +712,7 @@ mod tests {
 
     #[test]
     fn peer_connected_falls_back_to_observed_when_no_declared() {
-        let mut router = Router::new();
+        let mut router = Router::new(Network::Mainnet);
         let observed = pub_addr("198.51.100.21:9030");
         let event = ProtocolEvent::PeerConnected {
             peer_id: PeerId(1),
@@ -694,21 +732,159 @@ mod tests {
     }
 
     #[test]
-    fn get_peers_excludes_connected_addresses() {
-        let mut router = Router::new();
-        // Outbound source.
+    fn peers_with_bogus_entry_bans_source() {
+        let mut router = Router::new(Network::Mainnet);
         let source = PeerId(1);
-        let source_addr = pub_addr("198.51.100.40:9030");
+        let source_addr = pub_addr("198.51.100.50:9030");
         router.register_peer(source, Direction::Outbound, ProxyMode::Full, source_addr, None, None);
-        // Another connected peer at a different address.
-        let other = PeerId(2);
-        let other_addr = pub_addr("198.51.100.41:9030");
-        router.register_peer(other, Direction::Outbound, ProxyMode::Full, other_addr, None, None);
-        // A non-connected gossiped entry.
+
+        // 198.51.100/24 and 203.0.113/24 are documentation ranges and
+        // thus bogus — use a public-looking address (Hetzner-ish) for
+        // the "good" entry.
+        let good = pub_addr("78.46.1.50:9030");
+        let bogus = pub_addr("169.254.0.2:9030"); // link-local APIPA
+        let specs = vec![
+            spec_for("ergoref", good),
+            spec_for("ergoref", bogus),
+        ];
+        let body = build_peers_body(&specs);
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::Peers { body },
+        });
+        assert!(actions.is_empty(), "Peers ingest emits no Send actions");
+
+        // Good entry recorded; bogus entry not recorded.
+        let db = router.peer_db.lock().unwrap();
+        assert!(db.get(good).is_some(), "good address recorded");
+        assert!(db.get(bogus).is_none(), "bogus address skipped");
+        drop(db);
+
+        // Source permanently banned.
+        assert!(router.blacklist.contains(source_addr));
+    }
+
+    #[test]
+    fn peers_all_bogus_bans_source() {
+        let mut router = Router::new(Network::Mainnet);
+        let source = PeerId(2);
+        let source_addr = pub_addr("78.46.1.51:9030");
+        router.register_peer(source, Direction::Outbound, ProxyMode::Full, source_addr, None, None);
+        // register_peer seeded the source's own address into PeerDb (as
+        // an outbound stub). Capture the snapshot of addresses BEFORE
+        // the bogus Peers message so we can assert no new entries land.
+        let before: HashSet<SocketAddr> =
+            router.peer_db.lock().unwrap().all().into_iter().map(|r| r.address).collect();
+
+        let bogus_specs = vec![
+            spec_for("ergoref", pub_addr("169.254.0.2:9030")),    // link-local
+            spec_for("ergoref", pub_addr("10.0.0.1:9030")),       // RFC 1918
+            spec_for("ergoref", pub_addr("127.0.0.1:9030")),      // loopback
+        ];
+        let body = build_peers_body(&bogus_specs);
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::Peers { body },
+        });
+        assert!(actions.is_empty());
+
+        let after: HashSet<SocketAddr> =
+            router.peer_db.lock().unwrap().all().into_iter().map(|r| r.address).collect();
+        assert_eq!(before, after, "PeerDb unchanged after all-bogus Peers body");
+
+        assert!(router.blacklist.contains(source_addr));
+    }
+
+    #[test]
+    fn peers_clean_no_ban() {
+        let mut router = Router::new(Network::Mainnet);
+        let source = PeerId(3);
+        let source_addr = pub_addr("78.46.1.52:9030");
+        router.register_peer(source, Direction::Outbound, ProxyMode::Full, source_addr, None, None);
+
+        let clean_specs = vec![
+            spec_for("ergoref", pub_addr("78.46.2.10:9030")),
+            spec_for("ergoref", pub_addr("78.46.2.11:9030")),
+            spec_for("ergoref", pub_addr("78.46.2.12:9030")),
+        ];
+        let body = build_peers_body(&clean_specs);
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::Peers { body },
+        });
+        assert!(actions.is_empty());
+
+        let db = router.peer_db.lock().unwrap();
+        for s in &clean_specs {
+            assert!(db.get(s.address.unwrap()).is_some());
+        }
+        drop(db);
+        assert!(!router.blacklist.contains(source_addr), "source not banned for clean Peers");
+    }
+
+    #[test]
+    fn getpeers_skips_bogus_in_db() {
+        let mut router = Router::new(Network::Mainnet);
+        let source = PeerId(4);
+        let source_addr = pub_addr("78.46.1.53:9030");
+        router.register_peer(source, Direction::Outbound, ProxyMode::Full, source_addr, None, None);
+
+        // Preload PeerDb with one bogus + one good entry (bypass the
+        // Peers-arm filter so we exercise the defensive egress path).
+        let good = pub_addr("78.46.3.10:9030");
+        let bogus = pub_addr("192.168.1.42:9030"); // RFC 1918
         {
             let mut db = router.peer_db.lock().unwrap();
             db.record(PeerRecord {
-                address: pub_addr("203.0.113.42:9030"),
+                address: good,
+                last_seen_ms: 2000,
+                agent_name: "ergoref".into(),
+                node_name: "".into(),
+                version: (5, 0, 25),
+                features: vec![],
+            });
+            db.record(PeerRecord {
+                address: bogus,
+                last_seen_ms: 3000, // more recent than `good`
+                agent_name: "ergoref".into(),
+                node_name: "".into(),
+                version: (5, 0, 25),
+                features: vec![],
+            });
+        }
+
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::GetPeers,
+        });
+        let body = match &actions[0] {
+            Action::Send { message: ProtocolMessage::Peers { body }, .. } => body.clone(),
+            _ => panic!("expected Peers reply"),
+        };
+        let specs = parse_peers_body(&body, 64).unwrap();
+        let addrs: Vec<SocketAddr> = specs.iter().filter_map(|s| s.address).collect();
+        assert!(addrs.contains(&good), "good address present in response");
+        assert!(!addrs.contains(&bogus), "bogus address absent from response");
+    }
+
+    #[test]
+    fn get_peers_excludes_connected_addresses() {
+        let mut router = Router::new(Network::Mainnet);
+        // Outbound source. Use a public range — 198.51.100/24 and
+        // 203.0.113/24 are now stripped by the bogus-address filter.
+        let source = PeerId(1);
+        let source_addr = pub_addr("78.46.30.40:9030");
+        router.register_peer(source, Direction::Outbound, ProxyMode::Full, source_addr, None, None);
+        // Another connected peer at a different address.
+        let other = PeerId(2);
+        let other_addr = pub_addr("78.46.30.41:9030");
+        router.register_peer(other, Direction::Outbound, ProxyMode::Full, other_addr, None, None);
+        // A non-connected gossiped entry.
+        let gossiped = pub_addr("78.46.30.42:9030");
+        {
+            let mut db = router.peer_db.lock().unwrap();
+            db.record(PeerRecord {
+                address: gossiped,
                 last_seen_ms: 5000,
                 agent_name: "ergoref".into(),
                 node_name: "".into(),
@@ -733,6 +909,37 @@ mod tests {
             assert_ne!(a, other_addr);
         }
         // The gossiped entry should be present.
-        assert!(specs.iter().any(|s| s.address == Some(pub_addr("203.0.113.42:9030"))));
+        assert!(specs.iter().any(|s| s.address == Some(gossiped)));
+    }
+
+    /// On testnet, the network-conditional classes (RFC 1918, CGN, ULA,
+    /// documentation) are NOT bogus — a developer running a testnet
+    /// inside a LAN must be able to gossip private addresses without
+    /// getting their peers banned. The unconditional classes (loopback,
+    /// link-local, multicast, etc.) still ban.
+    #[test]
+    fn testnet_accepts_private_gossiped_address() {
+        let mut router = Router::new(Network::Testnet);
+        let source = PeerId(1);
+        let source_addr = pub_addr("192.168.50.1:9030");
+        router.register_peer(source, Direction::Outbound, ProxyMode::Full, source_addr, None, None);
+
+        let private = pub_addr("192.168.1.1:9030");
+        let specs = vec![spec_for("ergoref", private)];
+        let body = build_peers_body(&specs);
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::Peers { body },
+        });
+        assert!(actions.is_empty(), "Peers ingest emits no Send actions");
+
+        // Private address recorded on testnet, source not banned.
+        let db = router.peer_db.lock().unwrap();
+        assert!(db.get(private).is_some(), "private address recorded on testnet");
+        drop(db);
+        assert!(
+            !router.blacklist.contains(source_addr),
+            "testnet source not banned for gossiping private addresses"
+        );
     }
 }

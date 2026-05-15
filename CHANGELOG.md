@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.5.3 — 2026-05-15
+
+Network-aware address sanity filter on `Peers` gossip. Observed on
+the laptop: a gossiped `169.254.0.2:9030` (IPv4 link-local) sat in
+the PeerDb and the outbound fill phase kept timing out trying to
+dial it every ~40 seconds. No legitimate Ergo peer has a link-local
+address; some upstream peer is shipping junk in its `Peers` body
+and there's no enforcement layer between the wire and our DB.
+
+The new `protocol::address_sanity::is_bogus_address(addr, network)`
+classifier splits unroutable addresses into two sets:
+
+**Always-bogus** (any network): loopback (127/8, ::1), link-local
+(169.254/16, fe80::/10), multicast (224/4, ff00::/8), broadcast
+(255.255.255.255), unspecified (0.0.0.0, ::), benchmark (198.18/15),
+reserved Class E (240/4), IPv4-mapped IPv6 (::ffff:0:0/96).
+
+**Mainnet-only-bogus**: RFC 1918 private (10/8, 172.16/12,
+192.168/16), CGN (100.64/10), unique-local IPv6 (fc00::/7), and
+documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24,
+2001:db8::/32). On testnet these are legitimate (a developer running
+a testnet inside a LAN).
+
+Wiring:
+
+1. **Peers ingest**: bogus entries are dropped silently; if any
+   entry in the body is bogus, the source peer earns a permanent
+   ban (same shape as the existing malformed-Peers ban — fail2ban
+   picks it up). Legitimate entries in the same body are still
+   recorded.
+2. **GetPeers response selection**: bogus entries are filtered out
+   defensively before serialization. Even if a legacy or future
+   bug leaves a bogus row in our PeerDb, we never relay it.
+3. **Outbound fill candidate selection**: same filter applied
+   before dialing. Pre-v0.5.3 PeerDb rows persisted on disk are
+   covered without a forced migration.
+
+`Network` (mainnet vs testnet) is threaded through the router and
+the background context so each call site picks the right
+classification.
+
+### Side change
+
+The router's constructor signature gained a `network: Network`
+parameter. API breaking only for direct consumers of `Router::new`
+/ `Router::with_peer_db`; the in-tree `P2pNode::start` was updated
+in the same dispatch.
+
 ## v0.5.2 — 2026-05-14
 
 Self-loop fix. With v0.5.1, the outbound manager's fill phase

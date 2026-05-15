@@ -8,6 +8,7 @@
 use crate::blacklist::Blacklist;
 use crate::config::Config;
 use crate::peer_db::{PeerDb, PeerStorage, DEFAULT_CAP};
+use crate::protocol::address_sanity::is_bogus_address;
 use crate::protocol::messages::ProtocolMessage;
 use crate::protocol::peer::ProtocolEvent;
 use crate::routing::router::{Action, Router};
@@ -15,7 +16,7 @@ use crate::routing::latency::LatencyStats;
 use crate::transport::connection::Connection;
 use crate::transport::frame::Frame;
 use crate::transport::handshake::{self, HandshakeConfig};
-use crate::types::{ConnectionType, Direction, NetworkStatus, PeerEntry, PeerId, ProxyMode, Version};
+use crate::types::{ConnectionType, Direction, Network, NetworkStatus, PeerEntry, PeerId, ProxyMode, Version};
 use crate::upnp::UpnpMapping;
 
 use std::collections::{HashMap, HashSet};
@@ -60,6 +61,7 @@ struct BackgroundCtx {
     peer_counter: Arc<AtomicU64>,
     blacklist: Arc<Blacklist>,
     peer_db: Arc<StdMutex<PeerDb>>,
+    network: Network,
 }
 
 fn now_ms() -> u64 {
@@ -195,6 +197,7 @@ impl P2pNode {
             peer_db.clone(),
             blacklist.clone(),
             max_peer_spec_objects,
+            network,
         )));
 
         let ctx = BackgroundCtx {
@@ -204,6 +207,7 @@ impl P2pNode {
             peer_counter,
             blacklist: blacklist.clone(),
             peer_db: peer_db.clone(),
+            network,
         };
 
         // Start listeners
@@ -814,6 +818,7 @@ async fn pick_fill_candidate(
     let db = ctx.peer_db.lock().expect("peer_db poisoned");
     db.recent(fill_slots, &exclude)
         .into_iter()
+        .filter(|r| !is_bogus_address(r.address, ctx.network))
         .map(|r| r.address)
         .next()
 }
@@ -906,6 +911,7 @@ mod tests {
             peer_db.clone(),
             blacklist.clone(),
             64,
+            Network::Mainnet,
         )));
         let peer_senders = Arc::new(Mutex::new(HashMap::new()));
         let subscriber = Arc::new(Mutex::new(None));
@@ -1032,6 +1038,7 @@ mod tests {
             peer_db.clone(),
             blacklist.clone(),
             64,
+            Network::Mainnet,
         )));
         let peer_senders: Arc<Mutex<HashMap<PeerId, PeerSender>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -1105,6 +1112,7 @@ mod tests {
             peer_db.clone(),
             blacklist.clone(),
             64,
+            Network::Mainnet,
         )));
         let peer_senders: Arc<Mutex<HashMap<PeerId, PeerSender>>> =
             Arc::new(Mutex::new(HashMap::new()));

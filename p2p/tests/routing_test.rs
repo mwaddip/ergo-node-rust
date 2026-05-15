@@ -171,14 +171,14 @@ fn request_tracker_sweep_preserves_fresh_entries() {
 use enr_p2p::routing::router::{Router, Action};
 use enr_p2p::protocol::messages::ProtocolMessage;
 use enr_p2p::protocol::peer::ProtocolEvent;
-use enr_p2p::types::{Direction, ProxyMode};
+use enr_p2p::types::{Direction, Network, ProxyMode};
 
 #[test]
 fn router_inv_from_outbound_does_not_forward() {
     // Full-node semantics: Inv updates inv_table for our own request
     // routing, but is NOT relayed to other peers. See `router.rs` for
     // the reasoning (proxy-origin leftover, oversized-relay ban risk).
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(3), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
@@ -194,7 +194,7 @@ fn router_inv_from_outbound_does_not_forward() {
 
 #[test]
 fn router_modifier_request_routes_via_inv_table() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
 
@@ -217,7 +217,7 @@ fn router_modifier_request_routes_via_inv_table() {
 
 #[test]
 fn router_modifier_response_routes_to_requester() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
 
@@ -247,7 +247,7 @@ fn router_modifier_response_routes_to_requester() {
 
 #[test]
 fn router_get_peers_handled_directly() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
 
     let actions = router.handle_event(ProtocolEvent::Message {
@@ -262,7 +262,7 @@ fn router_get_peers_handled_directly() {
 
 #[test]
 fn router_light_mode_drops_sync_info() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Light, dummy_addr(), None, None);
 
@@ -275,7 +275,7 @@ fn router_light_mode_drops_sync_info() {
 
 #[test]
 fn router_full_mode_forwards_sync_info() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
 
@@ -288,7 +288,7 @@ fn router_full_mode_forwards_sync_info() {
 
 #[test]
 fn router_peer_disconnect_purges_state() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
 
@@ -313,7 +313,7 @@ fn router_peer_disconnect_purges_state() {
 
 #[test]
 fn modifier_response_emits_validate_action() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
 
@@ -347,7 +347,7 @@ fn modifier_response_emits_validate_action() {
 
 #[test]
 fn router_modifier_request_no_inv_falls_back_to_outbound() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
 
@@ -367,7 +367,7 @@ fn router_modifier_request_no_inv_falls_back_to_outbound() {
 
 #[test]
 fn router_modifier_request_no_inv_no_outbound_drops() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
 
@@ -382,7 +382,7 @@ fn router_modifier_request_no_inv_no_outbound_drops() {
 
 #[test]
 fn router_modifier_request_with_inv_ignores_fallback() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(3), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
@@ -408,7 +408,7 @@ fn router_modifier_request_with_inv_ignores_fallback() {
 
 #[test]
 fn router_fallback_request_response_reaches_requester() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
 
@@ -438,7 +438,7 @@ fn router_fallback_request_response_reaches_requester() {
 
 #[test]
 fn router_consumed_code_suppresses_forwarding() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_consumed_code(76); // snapshot manifest
@@ -452,7 +452,7 @@ fn router_consumed_code_suppresses_forwarding() {
 
 #[test]
 fn router_unregistered_code_still_forwards() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_consumed_code(76);
@@ -471,7 +471,7 @@ fn router_unregistered_code_still_forwards() {
 
 #[test]
 fn router_multiple_consumed_codes() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
 
@@ -613,7 +613,7 @@ fn request_tracker_fulfill_empty() {
 /// Test 7: Boundary code values 0 and 255.
 #[test]
 fn router_consumed_code_boundary_values() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
 
@@ -649,7 +649,7 @@ fn router_consumed_code_boundary_values() {
 /// Test 8: Register same code twice — idempotent, no panic.
 #[test]
 fn router_consumed_code_double_register() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
 
@@ -673,7 +673,7 @@ fn router_consumed_code_double_register() {
 /// Test 9: Consumed code from outbound peer — should suppress, not forward to inbound.
 #[test]
 fn router_consumed_code_from_outbound_suppresses() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(3), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
@@ -691,7 +691,7 @@ fn router_consumed_code_from_outbound_suppresses() {
 /// Test 10: Non-consumed unknown still forwards after registration (regression).
 #[test]
 fn router_non_consumed_unknown_unaffected_by_registration() {
-    let mut router = Router::new();
+    let mut router = Router::new(Network::Mainnet);
     router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
     router.register_peer(PeerId(3), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
