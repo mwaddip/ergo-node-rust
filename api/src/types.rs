@@ -27,6 +27,11 @@ pub struct NodeInfo {
     pub unconfirmed_count: usize,
     pub is_mining: bool,
     pub current_time: u64,
+    /// Always present — see `facts/journal-events.md`.
+    pub journal_events_version: String,
+    /// Present only when the operator stats endpoint is enabled — see `facts/stats.md`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats_version: Option<String>,
 }
 
 /// GET /emission/at/{height} response.

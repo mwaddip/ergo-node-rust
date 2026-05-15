@@ -659,6 +659,7 @@ dependencies = [
  "tokio-test",
  "toml",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -709,6 +710,7 @@ dependencies = [
  "sigma-ser",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

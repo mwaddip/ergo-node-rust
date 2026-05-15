@@ -1,4 +1,5 @@
 mod handlers;
+pub mod stats;
 pub mod types;
 
 use std::sync::atomic::AtomicU32;
@@ -9,6 +10,19 @@ use ergo_mempool::Mempool;
 use ergo_mining::CandidateGenerator;
 use ergo_validation::ErgoStateContext;
 use tokio::sync::{Mutex, RwLock};
+
+pub use stats::{
+    DirectionalCounter, ModifierTypeKey, P2pCountersSnapshot, P2pCountersSource, SnapshotCodeKey,
+    StatsConfig, StubP2pCounters,
+};
+
+/// Version of the journal-events contract this build promises.
+/// Bumped atomically with `facts/journal-events.md`.
+pub const JOURNAL_EVENTS_VERSION: &str = "1.0";
+
+/// Version of the operator stats endpoint schema this build promises.
+/// Bumped atomically with `facts/stats.md`.
+pub const STATS_VERSION: &str = "1.0";
 
 /// Modifier delivered into the validation pipeline.
 /// Tuple: `(type_id, modifier_id, raw_bytes, optional_height_hint)`.
@@ -68,6 +82,11 @@ pub struct ApiState {
     /// jemalloc; None with mimalloc or system allocator. The `/debug/memory`
     /// handler calls this to read live allocator counters.
     pub jemalloc_probe: Option<Arc<dyn Fn() -> JemallocSnapshot + Send + Sync>>,
+    /// Whether the operator stats endpoint is enabled. Overwritten by
+    /// `serve()` based on its `stats_config` + `p2p_counters` arguments;
+    /// callers should leave this `false`. When `true`, `/info` emits
+    /// `statsVersion`.
+    pub stats_enabled: bool,
 }
 
 /// Snapshot of jemalloc stats at a moment in time. The probe calls
@@ -264,14 +283,44 @@ pub fn router(state: ApiState) -> Router {
 
 /// Start the API server on the given address.
 ///
-/// Returns a future that runs until the server is shut down.
+/// `stats_config` and `p2p_counters` enable the operator stats endpoint (see
+/// `facts/stats.md`). Both must be `Some` for the listener to start and for
+/// `/info` to advertise `statsVersion`. If exactly one is `Some` the function
+/// logs an error and refuses to start the listener — `/info` omits
+/// `statsVersion` in that case.
+///
+/// Returns a future that runs until the public REST server stops. The stats
+/// listener is spawned as a child task and dies with it.
 pub async fn serve(
-    state: ApiState,
+    mut state: ApiState,
     bind_addr: std::net::SocketAddr,
+    stats_config: Option<stats::StatsConfig>,
+    p2p_counters: Option<Arc<dyn stats::P2pCountersSource>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match (stats_config, p2p_counters) {
+        (Some(cfg), Some(counters)) => {
+            state.stats_enabled = true;
+            tokio::spawn(async move {
+                if let Err(e) = stats::serve_stats(cfg, counters).await {
+                    tracing::error!(error = %e, "stats endpoint failed");
+                }
+            });
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            tracing::error!(
+                "stats endpoint misconfigured: stats_config and p2p_counters must \
+                 both be provided or both omitted; stats listener disabled"
+            );
+            state.stats_enabled = false;
+        }
+        (None, None) => {
+            state.stats_enabled = false;
+        }
+    }
+
     let app = router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    tracing::info!(%bind_addr, "REST API listening");
+    tracing::info!(bind = %bind_addr, "REST API listening");
     axum::serve(listener, app).await?;
     Ok(())
 }

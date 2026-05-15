@@ -154,6 +154,10 @@ pub async fn get_info(State(state): State<ApiState>) -> Json<NodeInfo> {
         unconfirmed_count: pool_size,
         is_mining: false,
         current_time: now,
+        journal_events_version: crate::JOURNAL_EVENTS_VERSION.to_string(),
+        stats_version: state
+            .stats_enabled
+            .then(|| crate::STATS_VERSION.to_string()),
     })
 }
 
@@ -1849,6 +1853,7 @@ mod tests {
             modifier_tx: None,
             height_watch: rx,
             jemalloc_probe: None,
+            stats_enabled: false,
         }
     }
 

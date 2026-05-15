@@ -113,9 +113,10 @@ pub fn decode(magic: &[u8; 4], data: &[u8]) -> io::Result<Frame> {
 /// # Contract
 /// - **Precondition**: reader is positioned at the start of a frame.
 /// - **Postcondition**: returns a validated Frame, or error on I/O, bad magic, bad checksum, or oversize.
-/// - On permanent-penalty failures (bad magic, oversized frame, bad checksum)
-///   the peer's address is recorded in `blacklist` in addition to emitting
-///   the PENALTY log line that fail2ban consumes.
+/// - On permanent-penalty failures (`kind=bad_magic`, `oversized_frame`,
+///   `bad_checksum`) the peer's address is recorded in `blacklist` in
+///   addition to emitting the `peer_penalised` log line (`facts/journal-events.md`)
+///   that fail2ban consumes.
 pub async fn read_frame(
     reader: &mut (impl tokio::io::AsyncReadExt + Unpin),
     magic: &[u8; 4],
@@ -133,7 +134,11 @@ pub async fn read_frame(
             expected = format!("{:02x}{:02x}{:02x}{:02x}", magic[0], magic[1], magic[2], magic[3]),
             "Frame magic mismatch — stream likely misaligned"
         );
-        tracing::warn!("PENALTY peer_ip={} type=permanent reason=\"bad magic bytes\"", peer_addr.ip());
+        tracing::warn!(
+            peer = %peer_addr.ip(),
+            kind = "bad_magic",
+            "PENALTY"
+        );
         blacklist.record_permanent(peer_addr);
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -145,7 +150,12 @@ pub async fn read_frame(
     let body_len = u32::from_be_bytes([prefix[5], prefix[6], prefix[7], prefix[8]]);
 
     if body_len > MAX_BODY_SIZE {
-        tracing::warn!("PENALTY peer_ip={} type=permanent reason=\"oversized frame\"", peer_addr.ip());
+        tracing::warn!(
+            peer = %peer_addr.ip(),
+            kind = "oversized_frame",
+            detail = body_len,
+            "PENALTY"
+        );
         blacklist.record_permanent(peer_addr);
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -174,7 +184,11 @@ pub async fn read_frame(
             computed = format!("{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3]),
             "Checksum mismatch"
         );
-        tracing::warn!("PENALTY peer_ip={} type=permanent reason=\"bad checksum\"", peer_addr.ip());
+        tracing::warn!(
+            peer = %peer_addr.ip(),
+            kind = "bad_checksum",
+            "PENALTY"
+        );
         blacklist.record_permanent(peer_addr);
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Checksum mismatch"));
     }

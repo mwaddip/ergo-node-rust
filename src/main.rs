@@ -936,11 +936,99 @@ fn default_flush_min_blocks() -> u32 {
     5
 }
 
-/// Top-level config wrapper — just the [node] section, P2P is parsed separately.
+/// Top-level config wrapper.
 #[derive(Debug, Deserialize)]
 struct RootConfig {
     #[serde(default)]
     node: Option<NodeConfig>,
+    #[serde(default)]
+    stats: Option<StatsConfig>,
+}
+
+/// `[stats]` toml section — opt-in. See `facts/stats.md`.
+#[derive(Debug, Deserialize, Clone)]
+struct StatsConfig {
+    #[serde(default = "default_stats_bind")]
+    bind_address: std::net::SocketAddr,
+}
+
+fn default_stats_bind() -> std::net::SocketAddr {
+    "127.0.0.1:9055".parse().expect("static parse")
+}
+
+/// Adapter wiring p2p/'s `TrafficSnapshot` to api/'s `P2pCountersSource`.
+struct P2pCountersAdapter {
+    node: Arc<enr_p2p::node::P2pNode>,
+}
+
+impl ergo_api::stats::P2pCountersSource for P2pCountersAdapter {
+    fn snapshot(&self) -> ergo_api::stats::P2pCountersSnapshot {
+        let s = self.node.traffic_snapshot();
+        ergo_api::stats::P2pCountersSnapshot {
+            since_unix_seconds: s.since_unix_seconds,
+            handshake: conv_p2p_counter(s.handshake),
+            get_peers: conv_p2p_counter(s.get_peers),
+            peers: conv_p2p_counter(s.peers),
+            sync_info: conv_p2p_counter(s.sync_info),
+            inv_by_modifier: conv_modifier_map(&s.inv_by_modifier),
+            modifier_request_by_modifier: conv_modifier_map(&s.modifier_request_by_modifier),
+            modifier_response_by_modifier: conv_modifier_map(&s.modifier_response_by_modifier),
+            snapshot_by_code: conv_snapshot_map(&s.snapshot_by_code),
+            unknown: conv_p2p_counter(s.unknown),
+        }
+    }
+}
+
+fn conv_p2p_counter(
+    c: enr_p2p::protocol::counters::DirectionalCounter,
+) -> ergo_api::stats::DirectionalCounter {
+    ergo_api::stats::DirectionalCounter {
+        in_count: c.in_count,
+        in_bytes: c.in_bytes,
+        out_count: c.out_count,
+        out_bytes: c.out_bytes,
+    }
+}
+
+fn conv_modifier_map(
+    m: &std::collections::BTreeMap<u8, enr_p2p::protocol::counters::DirectionalCounter>,
+) -> std::collections::BTreeMap<ergo_api::stats::ModifierTypeKey, ergo_api::stats::DirectionalCounter>
+{
+    use ergo_api::stats::ModifierTypeKey as K;
+    let mut out = std::collections::BTreeMap::new();
+    for (&k, &v) in m {
+        let key = match k {
+            1 => K::Header,
+            2 => K::Transaction,
+            3 => K::BlockTransactions,
+            4 => K::AdProofs,
+            5 => K::Extension,
+            _ => continue,
+        };
+        out.insert(key, conv_p2p_counter(v));
+    }
+    out
+}
+
+fn conv_snapshot_map(
+    m: &std::collections::BTreeMap<u8, enr_p2p::protocol::counters::DirectionalCounter>,
+) -> std::collections::BTreeMap<ergo_api::stats::SnapshotCodeKey, ergo_api::stats::DirectionalCounter>
+{
+    use ergo_api::stats::SnapshotCodeKey as K;
+    let mut out = std::collections::BTreeMap::new();
+    for (&k, &v) in m {
+        let key = match k {
+            76 => K::RequestManifest,
+            77 => K::Manifest,
+            78 => K::RequestSubtree,
+            79 => K::Subtree,
+            80 => K::RequestUtxoChunk,
+            81 => K::UtxoChunk,
+            _ => continue,
+        };
+        out.insert(key, conv_p2p_counter(v));
+    }
+    out
 }
 
 /// At-tip storage reopen handler. Awaits a one-shot from sync's `synced()`
@@ -1144,6 +1232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse node config from the same TOML file
     let config_content = std::fs::read_to_string(&config_path)?;
     let root_config: RootConfig = toml::from_str(&config_content)?;
+    let stats_config = root_config.stats.clone();
     let node_config = root_config.node.unwrap_or_default();
     let state_type = match node_config.state_type.as_str() {
         "utxo" => StateType::Utxo,
@@ -2640,10 +2729,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     StateType::Light => "light".to_string(),
                 },
             }),
+            stats_enabled: stats_config.is_some(),
         };
 
+        let api_stats_config = stats_config.as_ref().map(|c| ergo_api::stats::StatsConfig {
+            bind_address: c.bind_address,
+        });
+        let api_p2p_counters: Option<Arc<dyn ergo_api::stats::P2pCountersSource>> =
+            stats_config.as_ref().map(|_| {
+                Arc::new(P2pCountersAdapter { node: p2p.clone() })
+                    as Arc<dyn ergo_api::stats::P2pCountersSource>
+            });
+
         tokio::spawn(async move {
-            if let Err(e) = ergo_api::serve(api_state, api_bind_addr).await {
+            if let Err(e) = ergo_api::serve(
+                api_state,
+                api_bind_addr,
+                api_stats_config,
+                api_p2p_counters,
+            )
+            .await
+            {
                 tracing::error!("REST API server failed: {e}");
             }
         });

@@ -8,10 +8,12 @@
 //! - Invariant: the connection's magic is fixed at construction time.
 //! - Invariant: no bytes are lost between handshake and first frame.
 
+use crate::protocol::counters::TrafficCounters;
 use crate::transport::frame::{self, Frame};
 use crate::transport::handshake::{self, HandshakeConfig, PeerSpec};
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -31,9 +33,13 @@ pub struct Connection {
 
 impl Connection {
     /// Establish a connection by performing the handshake as initiator (outbound).
+    ///
+    /// Both directions of the handshake are accounted in `counters` so
+    /// operator stats reflect handshake bytes alongside frame traffic.
     pub async fn outbound(
         stream: TcpStream,
         config: &HandshakeConfig,
+        counters: &Arc<TrafficCounters>,
     ) -> io::Result<Self> {
         let magic = config.network.magic();
         let peer_addr = stream.peer_addr()?;
@@ -44,11 +50,13 @@ impl Connection {
         let hs_bytes = handshake::build(config);
         write_half.write_all(&hs_bytes).await?;
         write_half.flush().await?;
+        counters.record_handshake_out(hs_bytes.len() as u64);
 
         // Read peer's handshake (accumulates TCP segments)
-        let peer_spec = timeout(HANDSHAKE_TIMEOUT, read_handshake(&mut reader))
+        let (peer_spec, bytes_read) = timeout(HANDSHAKE_TIMEOUT, read_handshake(&mut reader))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Handshake timeout"))??;
+        counters.record_handshake_in(bytes_read as u64);
 
         handshake::validate_peer(&peer_spec, &config.network)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -60,6 +68,7 @@ impl Connection {
     pub async fn inbound(
         stream: TcpStream,
         config: &HandshakeConfig,
+        counters: &Arc<TrafficCounters>,
     ) -> io::Result<Self> {
         let magic = config.network.magic();
         let peer_addr = stream.peer_addr()?;
@@ -67,9 +76,10 @@ impl Connection {
         let mut reader = BufReader::new(read_half);
 
         // Read peer's handshake first (accumulates TCP segments)
-        let peer_spec = timeout(HANDSHAKE_TIMEOUT, read_handshake(&mut reader))
+        let (peer_spec, bytes_read) = timeout(HANDSHAKE_TIMEOUT, read_handshake(&mut reader))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Handshake timeout"))??;
+        counters.record_handshake_in(bytes_read as u64);
 
         handshake::validate_peer(&peer_spec, &config.network)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -78,6 +88,7 @@ impl Connection {
         let hs_bytes = handshake::build(config);
         write_half.write_all(&hs_bytes).await?;
         write_half.flush().await?;
+        counters.record_handshake_out(hs_bytes.len() as u64);
 
         Ok(Self { reader, writer: write_half, magic, peer_spec, peer_addr })
     }
@@ -118,7 +129,10 @@ impl Connection {
 /// Strategy: read byte-by-byte from the BufReader until parse succeeds.
 /// This is slow but handshakes are small (~200 bytes) and happen once per
 /// connection. The BufReader retains any excess bytes internally.
-async fn read_handshake(reader: &mut BufReader<OwnedReadHalf>) -> io::Result<PeerSpec> {
+///
+/// Returns the parsed spec and the number of bytes consumed from the
+/// stream so callers can credit handshake traffic counters.
+async fn read_handshake(reader: &mut BufReader<OwnedReadHalf>) -> io::Result<(PeerSpec, usize)> {
     let mut buf = Vec::with_capacity(256);
 
     loop {
@@ -149,7 +163,7 @@ async fn read_handshake(reader: &mut BufReader<OwnedReadHalf>) -> io::Result<Pee
                     handshake_bytes = buf.len(),
                     "handshake parsed successfully"
                 );
-                return Ok(spec);
+                return Ok((spec, buf.len()));
             }
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => continue,
             Err(e) => return Err(e),

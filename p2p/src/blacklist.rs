@@ -11,6 +11,26 @@
 //!
 //! Only permanent bans are recorded. Transient rate-limiting and
 //! misbehavior counters are not surfaced here.
+//!
+//! # `peer_penalised` kind vocabulary (`facts/journal-events.md`)
+//!
+//! Every PENALTY emission in this crate uses one of these `kind` values.
+//! New emit sites must reuse an existing kind rather than invent a new
+//! one; if a new category is genuinely needed, update both
+//! `facts/journal-events.md` and `deploy/fail2ban/ergo-proxy.conf`
+//! before adding it here.
+//!
+//! Permanent (fail2ban-actioned, [`Blacklist::record_permanent`]):
+//! - `bad_magic`               — frame magic bytes do not match the network
+//! - `oversized_frame`         — declared frame body exceeds the 2 MB cap
+//! - `bad_checksum`            — blake2b256 checksum disagrees with the body
+//! - `handshake_failed`        — peer's handshake refused validation
+//! - `address_sanity`          — peer gossiped a bogus address (loopback, private, etc.)
+//! - `malformed_peers`         — peer sent a `Peers` body that could not be parsed
+//!
+//! Misbehavior (logged only, no ban):
+//! - `message_parse_failed`    — a single frame's body could not be parsed
+//! - `connection_limit_exceeded` — inbound socket dropped at accept time
 
 use std::collections::HashSet;
 use std::net::SocketAddr;

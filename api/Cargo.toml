@@ -24,3 +24,4 @@ blake2 = "0.10"
 [dev-dependencies]
 ergo-merkle-tree = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "46e94c21" }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

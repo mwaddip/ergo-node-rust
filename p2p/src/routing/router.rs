@@ -13,6 +13,7 @@
 use crate::blacklist::Blacklist;
 use crate::peer_db::{MemoryPeerStorage, PeerDb, PeerRecord, PeerStorage};
 use crate::protocol::address_sanity::is_bogus_address;
+use crate::protocol::counters::{TrafficCounters, TrafficSnapshot};
 use crate::protocol::messages::{build_peers_body, parse_peers_body, ProtocolMessage};
 use crate::protocol::peer::ProtocolEvent;
 use crate::routing::inv_table::InvTable;
@@ -96,6 +97,11 @@ pub struct Router {
     /// classes in `is_bogus_address` (private/CGN/ULA/documentation ranges
     /// are filtered on mainnet but allowed on testnet for LAN setups).
     network: Network,
+    /// Cumulative traffic counters shared with peer tasks. Incremented
+    /// at the framing boundary on every inbound parsed message and every
+    /// outbound serialized frame. Exposed to operators via
+    /// [`Router::traffic_snapshot`].
+    counters: Arc<TrafficCounters>,
 }
 
 impl Default for Router {
@@ -141,7 +147,21 @@ impl Router {
             blacklist,
             max_peer_spec_objects,
             network,
+            counters: Arc::new(TrafficCounters::new()),
         }
+    }
+
+    /// Clone of the shared counter store. Hand this to peer tasks so
+    /// they can record traffic at the framing boundary.
+    pub fn counters(&self) -> Arc<TrafficCounters> {
+        self.counters.clone()
+    }
+
+    /// Plain-data snapshot of the cumulative traffic counters since
+    /// process start. Intended for the api crate's `/stats/p2p`
+    /// adapter; see `facts/stats.md`.
+    pub fn traffic_snapshot(&self) -> TrafficSnapshot {
+        self.counters.snapshot()
     }
 
     /// Register a message code as consumed by the main crate's event stream.
@@ -449,15 +469,15 @@ impl Router {
                         }
 
                         if any_bogus {
-                            // Same shape as the malformed-Peers ban —
-                            // fail2ban already catches this format.
+                            // Same shape as the malformed-Peers ban.
                             // Legitimate entries from the same body were
                             // recorded above; we punish the gossiper,
                             // not the gossiped peers.
                             tracing::warn!(
-                                "PENALTY peer_ip={} type=permanent reason=\"gossiped bogus address(es): {:?}\"",
-                                source_addr.ip(),
-                                bogus_examples
+                                peer = %source_addr.ip(),
+                                kind = "address_sanity",
+                                detail = format!("{:?}", bogus_examples),
+                                "PENALTY"
                             );
                             self.blacklist.record_permanent(source_addr);
                         }
@@ -465,13 +485,12 @@ impl Router {
                     }
                     Err(e) => {
                         // JVM PeerSynchronizer.penalizeMaliciousPeer →
-                        // PermanentPenalty. We log on the same shape as
-                        // other permanent-ban paths so fail2ban catches
-                        // it.
+                        // PermanentPenalty.
                         tracing::warn!(
-                            "PENALTY peer_ip={} type=permanent reason=\"malformed Peers: {}\"",
-                            source_addr.ip(),
-                            e
+                            peer = %source_addr.ip(),
+                            kind = "malformed_peers",
+                            detail = %e,
+                            "PENALTY"
                         );
                         self.blacklist.record_permanent(source_addr);
                         vec![]

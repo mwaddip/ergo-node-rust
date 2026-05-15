@@ -9,6 +9,7 @@ use crate::blacklist::Blacklist;
 use crate::config::Config;
 use crate::peer_db::{PeerDb, PeerStorage, DEFAULT_CAP};
 use crate::protocol::address_sanity::is_bogus_address;
+use crate::protocol::counters::{self, TrafficCounters, TrafficSnapshot};
 use crate::protocol::messages::ProtocolMessage;
 use crate::protocol::peer::ProtocolEvent;
 use crate::routing::router::{Action, Router};
@@ -62,6 +63,7 @@ struct BackgroundCtx {
     blacklist: Arc<Blacklist>,
     peer_db: Arc<StdMutex<PeerDb>>,
     network: Network,
+    counters: Arc<TrafficCounters>,
 }
 
 fn now_ms() -> u64 {
@@ -115,6 +117,10 @@ pub struct P2pNode {
     /// Sender for runtime outbound-connection requests. The outbound manager
     /// owns the matching receiver and drains it alongside its seed retry loop.
     outbound_request_tx: mpsc::Sender<SocketAddr>,
+    /// Cumulative traffic counters. Same `Arc` is shared with the
+    /// router and every peer task. The api adapter reads
+    /// [`P2pNode::traffic_snapshot`] for `/stats/p2p`.
+    counters: Arc<TrafficCounters>,
 }
 
 impl P2pNode {
@@ -193,12 +199,14 @@ impl P2pNode {
             "PeerDb initialised"
         );
 
-        let router = Arc::new(Mutex::new(Router::with_peer_db(
+        let router_inner = Router::with_peer_db(
             peer_db.clone(),
             blacklist.clone(),
             max_peer_spec_objects,
             network,
-        )));
+        );
+        let counters = router_inner.counters();
+        let router = Arc::new(Mutex::new(router_inner));
 
         let ctx = BackgroundCtx {
             event_tx,
@@ -208,6 +216,7 @@ impl P2pNode {
             blacklist: blacklist.clone(),
             peer_db: peer_db.clone(),
             network,
+            counters: counters.clone(),
         };
 
         // Start listeners
@@ -286,7 +295,14 @@ impl P2pNode {
             last_incoming_ms,
             blacklist,
             outbound_request_tx,
+            counters,
         })
+    }
+
+    /// Cumulative traffic counters since process start. The api crate's
+    /// `/stats/p2p` adapter consumes this snapshot.
+    pub fn traffic_snapshot(&self) -> TrafficSnapshot {
+        self.counters.snapshot()
     }
 
     /// Number of connected peers (inbound + outbound).
@@ -589,12 +605,15 @@ async fn run_peer(
     ctx.peer_senders.lock().await.insert(peer_id, write_tx);
 
     // Writer task
+    let writer_counters = ctx.counters.clone();
     let write_handle = tokio::spawn(async move {
         while let Some(frame) = write_rx.recv().await {
+            let wire_bytes = counters::frame_wire_bytes(&frame);
             if let Err(e) = crate::transport::frame::write_frame(&mut writer, &magic, &frame).await {
                 tracing::warn!(peer = %peer_id, error = %e, "Write failed");
                 break;
             }
+            writer_counters.record_out_frame(&frame, wire_bytes);
         }
     });
 
@@ -602,15 +621,22 @@ async fn run_peer(
     loop {
         match crate::transport::frame::read_frame(&mut reader, &magic, addr, &ctx.blacklist).await {
             Ok(frame) => {
+                let wire_bytes = counters::frame_wire_bytes(&frame);
                 match ProtocolMessage::from_frame(&frame) {
                     Ok(msg) => {
+                        ctx.counters.record_in_message(&msg, wire_bytes);
                         let event = ProtocolEvent::Message { peer_id, message: msg };
                         if ctx.event_tx.send(event).await.is_err() {
                             break;
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("PENALTY peer_ip={} type=misbehavior reason=\"message parse failed: {}\"", addr.ip(), e);
+                        tracing::warn!(
+                            peer = %addr.ip(),
+                            kind = "message_parse_failed",
+                            detail = %e,
+                            "PENALTY"
+                        );
                     }
                 }
             }
@@ -665,7 +691,11 @@ async fn accept_loop(
                 let remote_ip = addr.ip();
                 let inbound_count = ctx.router.lock().await.inbound_peers().len();
                 if inbound_count >= max_inbound {
-                    tracing::warn!("PENALTY peer_ip={} type=misbehavior reason=\"connection limit exceeded\"", remote_ip);
+                    tracing::warn!(
+                        peer = %remote_ip,
+                        kind = "connection_limit_exceeded",
+                        "PENALTY"
+                    );
                     continue;
                 }
 
@@ -684,12 +714,17 @@ async fn accept_loop(
                 let ctx = ctx.clone();
 
                 tokio::spawn(async move {
-                    match Connection::inbound(stream, &hs).await {
+                    match Connection::inbound(stream, &hs, &ctx.counters).await {
                         Ok(conn) => {
                             run_peer(peer_id, conn, Direction::Inbound, mode, addr, ctx).await;
                         }
                         Err(e) => {
-                            tracing::warn!("PENALTY peer_ip={} type=permanent reason=\"handshake failed: {}\"", addr.ip(), e);
+                            tracing::warn!(
+                                peer = %addr.ip(),
+                                kind = "handshake_failed",
+                                detail = %e,
+                                "PENALTY"
+                            );
                             ctx.blacklist.record_permanent(addr);
                         }
                     }
@@ -848,7 +883,7 @@ async fn spawn_outbound_connect(
                 mode_config: hs_config.mode_config,
             };
             tokio::spawn(async move {
-                match Connection::outbound(stream, &hs).await {
+                match Connection::outbound(stream, &hs, &ctx.counters).await {
                     Ok(conn) => {
                         if handshake::is_proxy(conn.peer_spec()) {
                             tracing::info!(peer = %peer_id, addr = %addr, "Outbound peer is a proxy, skipping");
@@ -907,12 +942,14 @@ mod tests {
     fn test_node() -> TestHarness {
         let blacklist = Arc::new(Blacklist::new());
         let peer_db = shared_peer_db(blacklist.clone());
-        let router = Arc::new(Mutex::new(Router::with_peer_db(
+        let router_inner = Router::with_peer_db(
             peer_db.clone(),
             blacklist.clone(),
             64,
             Network::Mainnet,
-        )));
+        );
+        let counters = router_inner.counters();
+        let router = Arc::new(Mutex::new(router_inner));
         let peer_senders = Arc::new(Mutex::new(HashMap::new()));
         let subscriber = Arc::new(Mutex::new(None));
         let (outbound_request_tx, outbound_request_rx) =
@@ -926,6 +963,7 @@ mod tests {
             last_incoming_ms: Arc::new(AtomicU64::new(0)),
             blacklist: blacklist.clone(),
             outbound_request_tx,
+            counters,
         };
         TestHarness { node, router, peer_senders, blacklist, outbound_request_rx }
     }
@@ -1034,12 +1072,14 @@ mod tests {
     async fn subscriber_receives_events() {
         let blacklist = Arc::new(Blacklist::new());
         let peer_db = shared_peer_db(blacklist.clone());
-        let router = Arc::new(Mutex::new(Router::with_peer_db(
+        let router_inner = Router::with_peer_db(
             peer_db.clone(),
             blacklist.clone(),
             64,
             Network::Mainnet,
-        )));
+        );
+        let counters = router_inner.counters();
+        let router = Arc::new(Mutex::new(router_inner));
         let peer_senders: Arc<Mutex<HashMap<PeerId, PeerSender>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let subscriber: Arc<Mutex<Option<mpsc::Sender<ProtocolEvent>>>> =
@@ -1057,6 +1097,7 @@ mod tests {
             last_incoming_ms: last_incoming_ms.clone(),
             blacklist,
             outbound_request_tx,
+            counters,
         };
 
         let mut events = node.subscribe().await;
@@ -1108,12 +1149,14 @@ mod tests {
         // event loop with a synthetic Message event.
         let blacklist = Arc::new(Blacklist::new());
         let peer_db = shared_peer_db(blacklist.clone());
-        let router = Arc::new(Mutex::new(Router::with_peer_db(
+        let router_inner = Router::with_peer_db(
             peer_db.clone(),
             blacklist.clone(),
             64,
             Network::Mainnet,
-        )));
+        );
+        let counters = router_inner.counters();
+        let router = Arc::new(Mutex::new(router_inner));
         let peer_senders: Arc<Mutex<HashMap<PeerId, PeerSender>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let subscriber: Arc<Mutex<Option<mpsc::Sender<ProtocolEvent>>>> =
@@ -1131,6 +1174,7 @@ mod tests {
             last_incoming_ms: last_incoming_ms.clone(),
             blacklist,
             outbound_request_tx,
+            counters,
         };
 
         // Confirm initial state

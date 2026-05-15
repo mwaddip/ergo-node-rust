@@ -14,3 +14,4 @@ if-addrs = "0.15"
 
 [dev-dependencies]
 tokio-test = "0.4"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
