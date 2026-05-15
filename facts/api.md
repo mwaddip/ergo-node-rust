@@ -126,9 +126,21 @@ Node status and chain state. No authentication.
   "peersCount": 8,
   "unconfirmedCount": 42,
   "isMining": false,
-  "currentTime": 1712400000000
+  "currentTime": 1712400000000,
+  "journalEventsVersion": "1.0",
+  "statsVersion": "1.0"
 }
 ```
+
+`journalEventsVersion` advertises the contract version of stable
+events the node emits to its journal — see `facts/journal-events.md`.
+Tooling that parses node logs (e.g. the Ergo Node Doctor adapter)
+keys off this. Absent when running a binary that predates the
+contract.
+
+`statsVersion` advertises the schema version of the operator stats
+endpoint — see `facts/stats.md`. Absent when the stats endpoint is
+not enabled (no `[stats]` section in config).
 
 **Source:** chain (heights, header IDs), mempool (unconfirmed count),
 peers (peer count), node_config (name, version, network, state type),
