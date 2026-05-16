@@ -58,3 +58,15 @@ seed_peers = [
 agent_name = "ergo-node-rust"
 peer_name = "ergo-node-rust-mainnet"
 protocol_version = "6.0.3"
+
+# Operator stats endpoint (optional, opt-in)
+#
+# Cumulative P2P traffic counters at /stats/p2p, separate from the
+# public REST API. Loopback-only by default; no authentication.
+# Consumed by external tooling (e.g. the Ergo Node Doctor adapter)
+# and the RRD harness under tools/. Schema in facts/stats.md.
+#
+# Uncomment the section header to enable. The listener doesn't start
+# while the section is absent.
+# [stats]
+# bind_address = "127.0.0.1:9055"
