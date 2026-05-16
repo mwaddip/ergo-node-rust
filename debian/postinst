@@ -10,7 +10,21 @@ case "$1" in
         fi
         systemctl daemon-reload
         systemctl enable ergo-node-rust 2>/dev/null || true
-        systemctl start ergo-node-rust 2>/dev/null || true
+
+        # On upgrade, restart if currently active so the new binary takes
+        # effect. `systemctl start` on a running service is a no-op — dpkg
+        # has already deleted the old binary inode, but the running
+        # process is still mapped to it (`/proc/<pid>/exe` shows
+        # `(deleted)`), so the upgrade silently fails to take effect
+        # until the operator restarts manually. `try-restart` respects
+        # operators who have stopped the service deliberately (no-op
+        # when inactive). $2 is the previous version on upgrade, empty
+        # on first install.
+        if [ -n "$2" ]; then
+            systemctl try-restart ergo-node-rust 2>/dev/null || true
+        else
+            systemctl start ergo-node-rust 2>/dev/null || true
+        fi
 
         # fail2ban integration
         if command -v fail2ban-client >/dev/null 2>&1; then
