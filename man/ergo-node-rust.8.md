@@ -81,7 +81,16 @@ API. Two endpoints worth highlighting:
 
 **GET /info**
 :   Standard node-status JSON: chain height, peer count, network,
-    software version, mempool size.
+    software version, mempool size. Two non-JVM fields advertise the
+    operator-contract versions the binary promises:
+
+    > **journalEventsVersion** — emitted unconditionally, semver string,
+    >   names the contract version of stable journal events (see **LOG
+    >   FORMAT** below).
+    >
+    > **statsVersion** — emitted only when **[stats]** is opted in
+    >   (see **ergo-node-rust.conf**(5)). Names the contract version of
+    >   the **/stats/p2p** payload.
 
 **GET /debug/memory**
 :   Process and per-component memory breakdown. Includes
@@ -94,38 +103,55 @@ For the full endpoint catalog, the JVM reference documentation at
 intentionally do not implement (integrated wallet, **/utils/\***) are
 documented in the project README.
 
+# OPERATOR STATS ENDPOINT (optional)
+
+Opt-in via a **[stats]** section in **ergo-node-rust.conf**(5).
+Defaults to **127.0.0.1:9055** — loopback-only, no authentication.
+
+**GET /stats/p2p**
+:   Cumulative P2P traffic counters since process start, keyed by
+    (message code, modifier type, direction). Suitable for RRD
+    **COUNTER**-style consumption, Prometheus exporters, or ad-hoc
+    **curl** inspection. Schema is **facts/stats.md** in the source
+    repo; field shape is stable across minor versions.
+
+    The wrapper scripts under **tools/** in the source repo
+    (**rrd-create.sh**, **rrd-update.sh**, **rrd-graph.sh**) are a
+    reference RRD harness. Operator-editable; not part of the
+    Debian package.
+
 # LOG FORMAT
 
 The daemon emits structured **tracing** events to standard output. Each
 line is timestamped, level-tagged, and includes the originating module.
 
-Peer misbehavior is logged in a single greppable format consumed by the
-shipped fail2ban filter:
+A stable subset of events is documented in **facts/journal-events.md**
+in the source repo (advertised via **/info**'s
+**journalEventsVersion**). Downstream parsers (e.g. the Ergo Node
+Doctor adapter) write against the contract; events outside the
+contract are internal and may move freely.
+
+Peer misbehavior is logged via the **peer_penalised** contract event,
+which the shipped fail2ban filter consumes:
 
 ```
-PENALTY peer_ip=<ip> type=<class> reason="<text>"
+PENALTY peer=<ip> kind="<kind>" detail=...
 ```
 
-where **\<class\>** is one of:
+The **kind** field is a snake_case identifier from a fixed vocabulary,
+listed in **p2p/src/blacklist.rs** in the source repo. Two categories:
 
-**permanent**
-:   Wire-level attack or unrecoverable protocol violation. The peer
-    cannot be trusted to send valid frames; one hit is enough to ban.
+**permanent-ban kinds** (one hit = banned)
+:   Wire-level attacks or unrecoverable protocol violations:
+    **bad_magic**, **oversized_frame**, **bad_checksum**,
+    **handshake_failed**, **address_sanity**, **malformed_peers**.
 
-**misbehavior**
-:   Recoverable misbehavior worth penalizing — e.g. a header that
-    fails to parse, a duplicate handshake. Accumulates 10 points per
-    hit, banned at 500.
-
-**spam**
-:   Unrequested or duplicate modifiers. 25 points per hit, banned at
-    500.
-
-**nondelivery**
-:   Failure to deliver a requested modifier within the timeout. 2
-    points per hit, banned at 500.
-
-The point thresholds match the JVM reference node's scoring.
+**logged-only kinds** (no auto-ban)
+:   Recoverable misbehavior the node handles in-process:
+    **message_parse_failed**, **connection_limit_exceeded**. The
+    in-memory blacklist closes connections from repeat offenders
+    without operator help; the journal entries remain for
+    forensics.
 
 # FAIL2BAN INTEGRATION
 
@@ -136,26 +162,26 @@ as conffiles, so dpkg preserves operator edits across upgrades.
 
 The jail reads from the systemd journal
 (**backend=systemd**, **journalmatch=_SYSTEMD_UNIT=ergo-node-rust.service**),
-so no log file plumbing is needed. Two sub-jails are defined:
+so no log file plumbing is needed. One jail is defined:
 
 **ergo-node-permanent**
-:   **maxretry=1**, **bantime=86400**. Any **type=permanent** PENALTY
+:   **maxretry=1**, **bantime=86400**. Any PENALTY line whose
+    **kind** is in the permanent-ban set (see **LOG FORMAT** above)
     bans the peer for 24 hours.
 
-**ergo-node-misbehavior**
-:   **maxretry=50**, **findtime=600**, **bantime=3600**. Approximates
-    the JVM 500-point threshold (50 × 10 points/misbehavior). Catches
-    **misbehavior**, **spam**, and **nondelivery**.
+Operators who want a second jail for the logged-only kinds can add
+one referencing **message_parse_failed** and **connection_limit_exceeded**
+— the jail file is a conffile, dpkg preserves operator edits across
+upgrades.
 
 fail2ban is recommended (Suggests:) but not required. If fail2ban is
 not installed at package configuration time, the postinst prints a
 notice with the file paths and instructions to enable later. Verify
-the jails are loaded:
+the jail is loaded:
 
 ```
 sudo fail2ban-client status
 sudo fail2ban-client status ergo-node-permanent
-sudo fail2ban-client status ergo-node-misbehavior
 ```
 
 To tune thresholds, edit the jail file directly and reload:

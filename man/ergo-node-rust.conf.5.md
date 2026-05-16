@@ -184,6 +184,20 @@ reference node and are appropriate for mainnet.
 :   Bind address for the REST API. Unset defaults to **0.0.0.0:9052**
     on mainnet and **0.0.0.0:9053** on testnet.
 
+# [stats] (optional)
+
+Opt-in operator stats endpoint, separate from the public REST API.
+Loopback-only by default. Used by external tooling (e.g. the Ergo
+Node Doctor) and the **tools/rrd-update.sh** RRD wrapper to read
+cumulative P2P traffic counters. When the section is absent, no
+stats listener is started and the port stays closed. Contract:
+**facts/stats.md** in the repo.
+
+**bind_address** = *"host:port"*
+:   Bind address for the stats listener. Default: **"127.0.0.1:9055"**.
+    A non-loopback bind emits a startup WARN — there is no auth, the
+    loopback bind is the security boundary.
+
 ## Fastsync
 
 ergo-fastsync is an optional sidecar that fetches headers and blocks

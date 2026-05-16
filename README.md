@@ -10,7 +10,9 @@ Validated from genesis through mainnet with no checkpoints.
 - **Parallel validation** — concurrent transaction evaluation within blocks, pipelined across blocks
 - **P2P** — IPv4/IPv6, peer discovery, deep reorg support
 - **Mempool** — validate-on-entry, replace-by-fee, family weighting, fee statistics, P2P relay
-- **REST API** — 38 JVM-compatible endpoints (blocks, transactions, UTXO, peers, mining, NiPoPoW) plus `/debug/memory`
+- **REST API** — 38 JVM-compatible endpoints (blocks, transactions, UTXO, peers, mining, NiPoPoW) plus `/debug/memory`. `/info` advertises `journalEventsVersion` (always) and `statsVersion` (when the optional `[stats]` section is configured) so downstream tooling can detect contract drift.
+- **Operator stats endpoint** — opt-in `[stats]` section binds a loopback-only `/stats/p2p` endpoint with cumulative P2P traffic counters by message type. Supports external diagnostics (e.g. the Ergo Node Doctor) and an RRD harness under `tools/`.
+- **Stable journal-event contract** — `facts/journal-events.md` names a versioned set of structured tracing events (startup phases, validation sweeps, reorgs, peer penalties, etc.) so log-parsing tools don't break on refactors.
 - **Mining** — Autolykos v2 candidate assembly with EIP-27 re-emission, solution validation
 - **Soft-fork voting** — epoch-boundary parameter tracking, v6.0.3-compatible
 - **NiPoPoW** — build and verify proofs, light-client bootstrap mode
