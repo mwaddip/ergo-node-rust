@@ -35,6 +35,12 @@ cp man/ergo-node-rust.conf.5.gz "target/${PKG}/usr/share/man/man5/"
 cp man/ergo-node-rust.8.gz "target/${PKG}/usr/share/man/man8/"
 cp man/sharpen.8.gz "target/${PKG}/usr/share/man/man8/"
 
+# RRD harness scripts ship as examples — operator-editable reference
+# tooling, not part of the active system. Suggests rrdtool.
+mkdir -p "target/${PKG}/usr/share/doc/ergo-node-rust/examples"
+cp tools/rrd-create.sh tools/rrd-update.sh tools/rrd-graph.sh tools/rrd-demo-fill.sh \
+    "target/${PKG}/usr/share/doc/ergo-node-rust/examples/"
+
 sed "s/^Architecture:.*/Architecture: ${ARCH}/" debian/control > "target/${PKG}/DEBIAN/control"
 sed -i "s/^Version:.*/Version: ${VERSION}/" "target/${PKG}/DEBIAN/control"
 SIZE=$(du -sk "target/${PKG}" | cut -f1)

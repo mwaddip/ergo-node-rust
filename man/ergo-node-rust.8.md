@@ -115,10 +115,11 @@ Defaults to **127.0.0.1:9055** — loopback-only, no authentication.
     **curl** inspection. Schema is **facts/stats.md** in the source
     repo; field shape is stable across minor versions.
 
-    The wrapper scripts under **tools/** in the source repo
-    (**rrd-create.sh**, **rrd-update.sh**, **rrd-graph.sh**) are a
-    reference RRD harness. Operator-editable; not part of the
-    Debian package.
+    A reference RRD harness ships as examples under
+    **/usr/share/doc/ergo-node-rust/examples/** (also in the source
+    repo under **tools/**): **rrd-create.sh**, **rrd-update.sh**,
+    **rrd-graph.sh**, **rrd-demo-fill.sh**. Operator-editable;
+    not invoked by the systemd unit. Suggests **rrdtool**(1).
 
 # LOG FORMAT
 

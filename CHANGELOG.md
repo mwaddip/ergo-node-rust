@@ -1,5 +1,141 @@
 # Changelog
 
+## v0.6.0 — 2026-05-16
+
+Ergo Node Doctor support. Stable contracts for what the node exposes
+to external diagnostics tooling, plus the supporting infrastructure:
+an operator stats endpoint with cumulative P2P traffic counters, a
+versioned journal-event registry parsers can write against, and a
+reference RRD harness. Motivated by @odiseusme's `Ergo Node Doctor`
+spec (`gist f5015bd91aa1cba3213db66344313334`) — the Rust adapter for
+that tool can now write its parsers against contracts, not free-text
+log lines.
+
+### Breaking changes
+
+**Fail2ban filter regex.** The PENALTY journal line changed from
+
+    PENALTY peer_ip=<ip> type=<class> reason="<text>"
+
+to the contract-mandated named-field shape
+
+    PENALTY peer=<ip> kind="<kind>" detail=...
+
+The shipped fail2ban filter (`/etc/fail2ban/filter.d/ergo-node.conf`)
+and jail (`/etc/fail2ban/jail.d/ergo-node-jail.conf`) were updated to
+match. Both files are conffiles — dpkg will prompt operators who
+have edited them locally. **Operators upgrading from v0.5.x must
+accept the new conffile or merge the new failregex into their edits;
+otherwise fail2ban silently stops banning peers.** Verify with
+`fail2ban-client status ergo-node-permanent`.
+
+The new jail layout is a single jail (one-hit-bans on the six
+permanent-ban kinds) instead of the previous two-jail scoring
+emulation. The two logged-only kinds (`message_parse_failed`,
+`connection_limit_exceeded`) aren't auto-banned by default; the
+node's in-memory blacklist handles repeat offenders. Operators who
+want a second jail for those kinds can add it.
+
+**Public crate API.** Three signatures gained parameters as the
+traffic-counter wiring landed:
+
+- `enr_p2p::routing::router::Router::new` and `Router::with_peer_db`
+  take a `&Arc<TrafficCounters>`.
+- `enr_p2p::transport::connection::Connection::outbound` takes a
+  `&Arc<TrafficCounters>`.
+- `ergo_api::serve` takes two new optional parameters,
+  `Option<ergo_api::stats::StatsConfig>` and
+  `Option<Arc<dyn ergo_api::stats::P2pCountersSource>>`. Pass
+  `(None, None)` to preserve the old behavior with no stats listener.
+
+In-tree consumers are updated. External consumers depending on these
+crates as libraries will need a one-line adaptation.
+
+**Log markers.** Some operator-relevant tracing emissions were
+aligned with the journal-events contract:
+
+- `header chain restored`: `tip` field is now a hex BlockId, not a
+  u32 height. Field name unchanged.
+- `deep reorg succeeded`: `old_tip` / `new_tip` are hex BlockIds, not
+  u32 heights. Names unchanged.
+- `VALIDATION SWEEP STARTED` / `VALIDATION SWEEP COMPLETE`: the `===`
+  decoration was stripped from the markers; fields are now u64 (were
+  u32). Log-grepping scripts using a regex anchored on the `===`
+  decoration need to drop the surrounding equals signs.
+- `opening UTXO state storage`: the parenthetical free-text suffix
+  was trimmed; the `path` and `cache_mb` fields are unchanged.
+- `state_storage_open_complete` (`UTXO state storage opened`) is now
+  emitted by `state` from inside `RedbAVLStorage::open`, not by the
+  main crate after the open call. The marker text is the same; only
+  the source module differs.
+
+**`/info` adds two new fields** (additive — strict-schema validators
+may notice): `journalEventsVersion` (always present, currently `"1.0"`)
+and `statsVersion` (present only when the `[stats]` section is
+configured).
+
+### New features
+
+**Operator stats endpoint.** Optional `[stats]` section in the config
+binds a loopback-only HTTP listener (default `127.0.0.1:9055`) on a
+separate port from the public REST API. `GET /stats/p2p` returns
+cumulative P2P traffic counters keyed by `(message code, modifier
+type, direction)` — 7 logical buckets (headers, blocks, transactions,
+peer-discovery, sync-info, snapshot, control) × 4 series each (in
+count/bytes, out count/bytes). Schema in `facts/stats.md`; designed
+for RRD `COUNTER`-style consumption, Prometheus exporters, or ad-hoc
+`curl`.
+
+The listener doesn't start unless the section is present in the
+config. The shipped `/etc/ergo-node/ergo.toml` ships with a
+commented-out template; the operator opts in by uncommenting it.
+
+**Traffic counters.** Lock-free atomic counters at the
+transport↔protocol boundary in `enr-p2p`. Counters are exposed via
+`Router::traffic_snapshot()` and `P2pNode::traffic_snapshot()`,
+returning a plain-data snapshot suitable for adapter wiring. Each
+message direction is counted once per frame; bytes include the
+13-byte framing header so operators graph link utilization rather
+than payload alone.
+
+**Journal-event contract.** `facts/journal-events.md` v1.0 names a
+stable set of structured tracing events (startup phases, validation
+sweeps, reorgs, peer lifecycle, peer penalties, mining-block-found,
+etc.) with marker prefixes, field schemas, stability levels, and a
+contract version. The contract version is advertised via
+`/info::journalEventsVersion` so downstream log parsers can detect
+contract drift. Events outside the contract are internal and may
+still move freely.
+
+**RRD harness scripts** in `tools/`:
+
+- `rrd-create.sh` — one-shot creation of `chain.rrd` (GAUGE) and
+  `p2p.rrd` (28 COUNTER DSes).
+- `rrd-demo-fill.sh` — backfills synthetic data for offline graph
+  demos (Python).
+- `rrd-update.sh` — production cron updater. Polls `/stats/p2p` +
+  `/info`, computes bucket sums via `jq`, calls `rrdupdate`.
+- `rrd-graph.sh` — renders four example PNGs (sync-height,
+  sync-rate, traffic-count, traffic-bytes).
+
+Packaged as examples under
+`/usr/share/doc/ergo-node-rust/examples/`; the `.deb` lists
+`rrdtool` in `Suggests:`. Operator-editable, not invoked by the
+systemd unit.
+
+### Internal changes
+
+- `peer_penalised` `kind` vocabulary now documented in
+  `p2p/src/blacklist.rs`; six permanent-ban kinds, two logged-only
+  kinds. New emit sites must reuse existing kinds rather than invent
+  new ones; if a new category is genuinely needed, the contract,
+  the fail2ban filter, and the man page all need updating in
+  lockstep.
+- `tracing-test` adopted as a dev-dependency in `state/`, `mining/`
+  for journal-event capture tests with the `no-env-filter` feature
+  (the macro's default `EnvFilter` filters out emissions from
+  external crates — surprisingly easy to miss).
+
 ## v0.5.3 — 2026-05-15
 
 Network-aware address sanity filter on `Peers` gossip. Observed on
