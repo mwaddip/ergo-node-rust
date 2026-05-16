@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.6.1 — 2026-05-16
+
+Hotfix: v0.6.0 panics deterministically on startup against a non-empty
+existing store. Operators on v0.6.0 must upgrade.
+
+The `header chain restored` journal-event alignment in v0.6.0 changed
+the `tip` field from `chain.height()` (a u32) to `chain.tip().id` (a
+hex BlockId), but `chain.tip()` reads through the lazy header store —
+which has no loader wired at that point in startup. `HeaderChain::restore`
+only populates the score/height table, not the cache. The header
+loader is wired later (further down `main`), so the intermediate
+`tip` access panics with:
+
+```
+thread 'main' panicked at chain/src/chain.rs:330:14:
+tip header unavailable — cache evicted with no loader wired
+```
+
+Fixed by capturing the tip BlockId directly from the entries we just
+read from the store, before consuming the iterator. No detour
+through the lazy header store, identical operator-visible field.
+
+The empty-chain case (fresh install before genesis) now emits the
+event with `headers=0` and no `tip` field, matching the prose contract
+(the contract specifies `tip` for the non-empty case).
+
+Reported by @odiseusme in #9. No data corruption — v0.6.0 panics
+before any block work, on-disk state is untouched.
+
+### Workaround for v0.6.0 operators
+
+Downgrade to v0.5.3 *or* upgrade to v0.6.1.
+
 ## v0.6.0 — 2026-05-16
 
 Ergo Node Doctor support. Stable contracts for what the node exposes

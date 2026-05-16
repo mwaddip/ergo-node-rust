@@ -1366,16 +1366,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("restoring header chain from store");
     let best_chain_entries = store.best_chain_entries()?;
     let entry_count = best_chain_entries.len();
+    // Capture the tip BlockId before consuming the entries — calling
+    // chain.tip() after HeaderChain::restore but before set_header_loader
+    // (wired further down) panics with "tip header unavailable — cache
+    // evicted with no loader wired", because restore only populates the
+    // score table, not the lazy Header cache.
+    let tip_id = best_chain_entries.last().map(|(_, id_bytes)| {
+        ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(*id_bytes))
+    });
     let restore_entries = best_chain_entries.into_iter().map(|(h, id_bytes)| {
         (h, ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(id_bytes)))
     });
     let mut chain = HeaderChain::restore(chain_config, restore_entries)
         .map_err(|e| format!("header chain restore failed: {e:?}"))?;
-    tracing::info!(
-        headers = entry_count as u64,
-        tip = %chain.tip().id,
-        "header chain restored",
-    );
+    match tip_id {
+        Some(tip) => tracing::info!(
+            headers = entry_count as u64,
+            tip = %tip,
+            "header chain restored",
+        ),
+        None => tracing::info!(
+            headers = 0u64,
+            "header chain restored",
+        ),
+    }
 
     // Wire the extension loader so chain can read epoch-boundary extensions
     // for parameter recomputation and nipopow proof construction. Bridges
