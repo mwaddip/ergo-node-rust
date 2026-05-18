@@ -278,6 +278,15 @@ prior `None`-durability commits.  Call periodically in long write
 sequences (every N blocks in the sync loop) and on graceful shutdown
 to bound worst-case data loss to the flush interval.
 
+**Cross-DB durability**: `block_height()` is the canonical record of
+"this storage has applied blocks up through height H." Higher-level
+code (see `facts/sync.md` "Cross-DB Durability Handshake") may persist
+a durable mirror of this value in a sibling database for startup
+reconciliation against unclean shutdown. This crate makes no claim
+about external mirrors; the caller coordinates the flush ordering.
+From this crate's perspective the canonical flush API is `flush()` and
+the canonical height is `block_height()`.
+
 ### `rollback_versions()` — available rollback targets
 
 Returns an iterator over ADDigests that `rollback()` can restore to.

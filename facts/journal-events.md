@@ -1,6 +1,6 @@
 # Journal Events Contract
 
-Version: 1.1.0
+Version: 1.2.0
 
 Stable contract for parseable events in the node's structured log
 output. Consumers (e.g. the Ergo Node Doctor adapter) write parsers
@@ -158,6 +158,25 @@ phase's `_started`.
 - **Fields:** none required; implementation may add `digest` (string).
 - **Since:** 1.0
 - **Stability:** stable
+
+#### `validated_height_drift`
+- **Level:** WARN
+- **Marker:** `"validated_height drift detected"`
+- **Fields:** `state_height` (u64), `store_height` (u64), `mode`
+  (string: `forward`|`rollback`|`forced_trust`|`regressed`), `gap`
+  (u64: `|state_height - store_height|`)
+- **Since:** 1.2
+- **Stability:** stable
+- **Emitted:** at most once at startup, after `state.redb` is opened
+  and the modifier store's `chain_meta[b"validated_height"]` is read,
+  when state's `META_BLOCK_HEIGHT` does not match the recorded value.
+  Surfaces cross-DB drift that crossed an unclean shutdown. Modes:
+  `forward` (state ran ahead, brought store forward); `rollback`
+  (state ran ahead beyond trust threshold, rolled state back to store);
+  `forced_trust` (state ran ahead, rollback impossible — store brought
+  forward with loud warning); `regressed` (state below store, sync
+  will re-validate forward).  Absence of this event at startup means
+  the two databases agreed.
 
 #### `peerdb_initialised`
 - **Level:** INFO

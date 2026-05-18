@@ -358,12 +358,13 @@ returned from `open`:
 
 ## Chain metadata table
 
-Stable keys, all little-known to the store but consumed by the chain
-crate via `chain_meta_get`:
+Stable keys, opaque to the store, consumed by higher-level crates
+(chain, sync, main) via `chain_meta_get` / `chain_meta_put`:
 
 | Key | Value semantics | Set by |
 |---|---|---|
 | `b"scores_migrated_v1"` | `[1u8]` once migration completes; absent before | Empty-placeholder → real scores migration |
+| `b"validated_height"` | 4-byte big-endian `u32`: highest height at which state.redb was flushed with `Durability::Immediate`. Absent ⇒ fresh install or pre-handshake upgrade. | sync's flush pair (see `facts/sync.md` "Cross-DB Durability Handshake") |
 
 ## Peer DB key encoding
 
@@ -484,6 +485,12 @@ crate treats values as opaque byte strings.
   modifiers from completed transactions.
 - Duplicate `put` with the same `(type_id, id)` is idempotent — overwrites with
   same data, no error.
+- `chain_meta[b"validated_height"]`, when present, equals state.redb's
+  `META_BLOCK_HEIGHT` **at some past moment** when state.redb was flushed
+  with `Durability::Immediate`. The store crate makes no claim about
+  state.redb's current contents — only that this value was a durable
+  horizon at the time of writing. Cross-DB ordering is the caller's
+  responsibility (see `facts/sync.md` "Cross-DB Durability Handshake").
 
 ## Does NOT own
 

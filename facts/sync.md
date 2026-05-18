@@ -49,6 +49,20 @@ How the sync machine queries persistent storage.
 - Persist the script_verified_height. Called every 100 blocks during
   the sweep's drain of deferred eval results.
 
+#### `validated_height() -> Option<u32>`
+- Read the durably-recorded validated_height from
+  `chain_meta[b"validated_height"]`. Returns `None` if absent (fresh
+  install or pre-handshake upgrade).
+- Used by the main crate's startup reconciliation to detect cross-DB
+  drift between state.redb's `META_BLOCK_HEIGHT` and the modifier
+  store's recorded value. See "Cross-DB Durability Handshake" below.
+
+#### `set_validated_height(height)`
+- Persist `validated_height` to `chain_meta` with `Durability::Immediate`.
+- **Precondition**: caller MUST have called `validator.flush()` before
+  invoking this — see the flush ordering rule under "Cross-DB
+  Durability Handshake" below.
+
 ### `SyncChain`
 
 How the sync machine queries and updates chain state.
@@ -252,6 +266,107 @@ channels are consumed and re-entries are no-ops.
 
 **At-tip flush settings** (the cheap part) are swapped at the same
 time as the storage reopen; same gate, same idempotence.
+
+## Cross-DB Durability Handshake
+
+The node uses two redb databases — `state.redb` (UTXO state) and
+`modifiers.redb` (chain index + sections). Each commits atomically
+per transaction, but the two are independent: an unclean shutdown
+can leave them on different durability horizons.
+
+### Invariants
+
+- **V1** — `state.META_BLOCK_HEIGHT` is the canonical record of "I have
+  applied blocks up through height H." `validator.validated_height()`
+  reads it.
+- **V2** — `modifiers.redb chain_meta[b"validated_height"]`, when
+  present and durable, equals what `state.META_BLOCK_HEIGHT` was at
+  some past moment when state.redb was flushed with
+  `Durability::Immediate`. May lag state's current value by up to
+  `flush_max_blocks` during normal operation. MUST NOT exceed state's
+  current value at runtime; on startup it MAY exceed it after a
+  post-flush reorg (legitimate; handled by reconciliation).
+
+### Flush ordering (per flush trigger)
+
+On every flush point in the sync sweep loop:
+
+1. `validator.flush()` — state.redb fsync with `Durability::Immediate`.
+   State is now durable at height M = `validator.validated_height()`.
+2. `store.set_validated_height(M)` — modifiers.redb chain_meta write
+   with `Durability::Immediate`. Records that state was durable at M.
+3. `store.flush()` — modifiers.redb fsync covering section writes and
+   header writes that accumulated under `Durability::None`.
+
+Order is load-bearing. A crash between (1) and (2) leaves state ahead
+of the recorded `validated_height` — handled by startup reconciliation
+below. A crash between (2) and (3) is covered by (2)'s Immediate
+commit; only ancillary modifier writes get rolled back, which sync
+re-fetches naturally.
+
+### Startup reconciliation
+
+Owned by the main crate; runs once before `HeaderSync::run()` is
+spawned. Reads:
+
+- `M = validator.validated_height()` — from `state.META_BLOCK_HEIGHT`
+- `V = store.validated_height().await.unwrap_or(0)`
+
+```text
+match M.cmp(&V) {
+    Equal => { /* consistent, no-op */ }
+
+    Greater => {
+        let gap = M - V;
+        if gap <= reconciliation_trust_threshold {
+            // Normal flush-window race. Trust state, bring V forward.
+            store.set_validated_height(M).await;
+            // warn!(M, V, gap, "validated_height brought forward; flush-pair race");
+        } else if let Some(header) = chain.header_at(V).await {
+            // Suspicious gap. Roll state back to V via existing reset_to
+            // (state.rollback + validator.validated_height = V).
+            validator.reset_to(V, header.state_root);
+            // warn!(M, V, gap, "state rolled back to recorded validated_height");
+        } else {
+            // V is below the persisted header range OR rollback window
+            // exceeded. Forced trust with loud warning.
+            store.set_validated_height(M).await;
+            // warn!(M, V, gap, "validated_height brought forward; rollback impossible");
+        }
+    }
+
+    Less => {
+        // State regressed below recorded V. Legitimate post-reorg case
+        // (state rolled back after V was written; crash before next
+        // flush pair). Sync's normal loop re-validates forward.
+        // warn!(M, V, "state regressed below recorded validated_height");
+    }
+}
+```
+
+The first flush after reconciliation re-establishes V == M durably.
+
+### Configuration
+
+- `reconciliation_trust_threshold: u32` — default `100`, matching the
+  default `flush_max_blocks`. Gaps within this threshold are trusted
+  as ordinary flush-window races (cheap: one Immediate write). Larger
+  gaps trigger state rollback to V (which re-validates V+1..M from
+  the modifier store's already-persisted block sections). Bounded
+  above by `state.keep_versions` (200 by default); gaps beyond that
+  fall back to forced trust with a loud warning.
+
+### Journal events
+
+When M != V, the reconciliation step emits `validated_height_drift`
+(see `facts/journal-events.md` — contract v1.2). The event carries
+`state_height`, `store_height`, `mode`, and `gap` fields; `mode`
+discriminates which branch above ran (`forward`, `rollback`,
+`forced_trust`, `regressed`). The M == V case emits no event;
+absence at startup is the success signal.
+
+Doctor and operators get a stable, single-line marker for cross-DB
+drift without parsing free-text log lines.
 
 ## JVM peer behavior (observed)
 

@@ -24,7 +24,7 @@ use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
 use ergo_chain_types::EcPoint;
 use enr_store::{ModifierStore, RedbModifierStore};
 use ergo_node_rust::{P2pTransport, PeerStorageAdapter, SharedChain, SharedStore, ValidationPipeline};
-use ergo_sync::{HeaderSync, SyncConfig};
+use ergo_sync::{HeaderSync, SyncConfig, SyncStore};
 use ergo_validation::{ApplyStateOutcome, BlockValidator, DigestValidator, UtxoValidator, ValidationError};
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -852,6 +852,19 @@ struct NodeConfig {
     #[serde(default)]
     synced_flush_min_blocks: Option<u32>,
 
+    /// Maximum gap between state.META_BLOCK_HEIGHT and the modifier
+    /// store's recorded validated_height that the startup reconciliation
+    /// will trust without a state rollback. Gaps within this threshold
+    /// are treated as ordinary flush-window races (cheap: one Immediate
+    /// write to bring the store's recorded value forward). Larger gaps
+    /// trigger a state rollback to the store's recorded value, forcing
+    /// re-validation of the intermediate blocks. Bounded above by
+    /// state.keep_versions (currently 256) — gaps beyond that fall back
+    /// to forced trust with a loud warning. See `facts/sync.md`
+    /// "Cross-DB Durability Handshake" § Configuration.
+    #[serde(default = "default_reconciliation_trust_threshold")]
+    reconciliation_trust_threshold: u32,
+
     /// Mining configuration.
     #[serde(default)]
     mining: MiningConfig,
@@ -885,6 +898,7 @@ impl Default for NodeConfig {
             synced_flush_heap_threshold_mb: None,
             synced_flush_max_blocks: None,
             synced_flush_min_blocks: None,
+            reconciliation_trust_threshold: default_reconciliation_trust_threshold(),
             mining: MiningConfig::default(),
         }
     }
@@ -934,6 +948,9 @@ fn default_flush_max_blocks() -> u32 {
 }
 fn default_flush_min_blocks() -> u32 {
     5
+}
+fn default_reconciliation_trust_threshold() -> u32 {
+    100
 }
 
 /// Top-level config wrapper.
@@ -1161,7 +1178,7 @@ async fn open_state_with_retry(
     for attempt in 1..=max_attempts {
         let params = AVLTreeParams { key_length: 32, value_length: None };
         let cache = CacheSize::Bytes(cache_mb as usize * 1024 * 1024);
-        match RedbAVLStorage::open(path, params, 200, cache) {
+        match RedbAVLStorage::open(path, params, 256, cache) {
             Ok(s) => {
                 if attempt > 1 {
                     tracing::info!(attempt, "at-tip handler: state.redb opened after retry");
@@ -1677,11 +1694,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let swap_reader = Arc::new(ergo_node_rust::SwappableReader::empty());
 
-    let validator: Option<Validator> = match state_type {
+    let mut validator: Option<Validator> = match state_type {
         StateType::Utxo => {
             let state_path = data_dir.join("state.redb");
             let params = AVLTreeParams { key_length: 32, value_length: None };
-            let keep_versions = 200u32;
+            let keep_versions = 256u32;
             tracing::info!(
                 path = %state_path.display(),
                 cache_mb = node_config.cache_mb,
@@ -1991,6 +2008,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         synced_flush_max_blocks: node_config.synced_flush_max_blocks,
         synced_flush_min_blocks: node_config.synced_flush_min_blocks,
         flush_probe,
+        reconciliation_trust_threshold: node_config.reconciliation_trust_threshold,
         ..SyncConfig::default()
     };
 
@@ -2002,6 +2020,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         (None, None, None, None)
     };
+
+    // Cross-DB durability handshake — startup reconciliation.
+    // Detect drift between state.redb's META_BLOCK_HEIGHT (canonical) and
+    // modifier store's recorded validated_height (durable mirror).
+    // Policy in facts/sync.md § "Cross-DB Durability Handshake".
+    // Skipped when validator is None (light mode, or utxo_bootstrap pending —
+    // the snapshot handler establishes a fresh validator with M == 0, no
+    // drift to reconcile).
+    if let Some(ref mut v) = validator {
+        let m = v.validated_height();
+        let stored = sync_store.validated_height().await.unwrap_or(0);
+        if m != stored {
+            let threshold = node_config.reconciliation_trust_threshold;
+            if m > stored {
+                let gap = m - stored;
+                if gap <= threshold {
+                    sync_store.set_validated_height(m).await;
+                    tracing::warn!(
+                        state_height = m,
+                        store_height = stored,
+                        mode = "forward",
+                        gap,
+                        "validated_height drift detected"
+                    );
+                } else {
+                    let chain_guard = chain.lock().await;
+                    let header_at_stored = chain_guard.header_at(stored);
+                    drop(chain_guard);
+                    if let Some(header) = header_at_stored {
+                        v.reset_to(stored, header.state_root);
+                        tracing::warn!(
+                            state_height = m,
+                            store_height = stored,
+                            mode = "rollback",
+                            gap,
+                            "validated_height drift detected"
+                        );
+                    } else {
+                        sync_store.set_validated_height(m).await;
+                        tracing::warn!(
+                            state_height = m,
+                            store_height = stored,
+                            mode = "forced_trust",
+                            gap,
+                            "validated_height drift detected"
+                        );
+                    }
+                }
+            } else {
+                let gap = stored - m;
+                tracing::warn!(
+                    state_height = m,
+                    store_height = stored,
+                    mode = "regressed",
+                    gap,
+                    "validated_height drift detected"
+                );
+            }
+        }
+    }
 
     // Start sync in a background task
     let api_downloaded_height = shared_downloaded_height.clone();
@@ -2097,7 +2175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
 
                     let params = AVLTreeParams { key_length: 32, value_length: None };
-                    let mut storage = RedbAVLStorage::open(&state_path, params, 200, CacheSize::Bytes(node_config.cache_mb as usize * 1024 * 1024))
+                    let mut storage = RedbAVLStorage::open(&state_path, params, 256, CacheSize::Bytes(node_config.cache_mb as usize * 1024 * 1024))
                         .expect("failed to open state storage for snapshot");
 
                     let root_hash = snapshot_data.root_hash;

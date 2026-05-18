@@ -280,4 +280,46 @@ impl SyncStore for SharedStore {
             tracing::error!(?e, "spawn_blocking panicked: flush");
         }
     }
+
+    async fn validated_height(&self) -> Option<u32> {
+        let store = self.store.clone();
+        match tokio::task::spawn_blocking(move || {
+            match store.chain_meta_get(b"validated_height") {
+                Ok(Some(bytes)) if bytes.len() == 4 => {
+                    Some(u32::from_be_bytes(bytes[..4].try_into().unwrap()))
+                }
+                _ => None,
+            }
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(?e, "spawn_blocking panicked: validated_height");
+                None
+            }
+        }
+    }
+
+    async fn set_validated_height(&self, height: u32) {
+        let store = self.store.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            if let Err(e) =
+                store.chain_meta_put(b"validated_height", &height.to_be_bytes())
+            {
+                tracing::warn!(height, "failed to persist validated_height: {e}");
+                return;
+            }
+            if let Err(e) = store.flush() {
+                tracing::warn!(
+                    height,
+                    "failed to flush after persisting validated_height: {e}"
+                );
+            }
+        })
+        .await
+        {
+            tracing::error!(?e, height, "spawn_blocking panicked: set_validated_height");
+        }
+    }
 }

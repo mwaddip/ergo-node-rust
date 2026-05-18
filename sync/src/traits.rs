@@ -30,6 +30,21 @@ pub trait SyncStore {
         height: u32,
     ) -> impl std::future::Future<Output = ()> + Send;
 
+    /// Read the durably-recorded validated_height from
+    /// `chain_meta[b"validated_height"]`. Returns None if absent.
+    /// See ../facts/sync.md "Cross-DB Durability Handshake" for the
+    /// invariant this implements.
+    fn validated_height(&self) -> impl std::future::Future<Output = Option<u32>> + Send;
+
+    /// Persist `validated_height` with `Durability::Immediate`.
+    /// PRECONDITION: caller MUST have called `validator.flush()` before
+    /// invoking this — the ordering is load-bearing for the cross-DB
+    /// invariant. See ../facts/sync.md.
+    fn set_validated_height(
+        &self,
+        height: u32,
+    ) -> impl std::future::Future<Output = ()> + Send;
+
     /// Fsync outstanding modifier writes. Paired with validator flushes so
     /// state and modifier stores advance durably together.
     fn flush(&self) -> impl std::future::Future<Output = ()> + Send;

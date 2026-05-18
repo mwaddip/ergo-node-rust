@@ -27,6 +27,81 @@ fn is_block_section_type(type_id: u8) -> bool {
     matches!(type_id, BLOCK_TRANSACTIONS_TYPE_ID | AD_PROOFS_TYPE_ID | EXTENSION_TYPE_ID)
 }
 
+/// Result of a paired state/store flush.
+///
+/// Discriminates three cases:
+/// - `Flushed(M)`: validator flushed successfully at height `M`; modifier
+///   store's `validated_height` was advanced to `M`.
+/// - `NoValidator`: light-mode path; there is no state to flush, and
+///   `validated_height` is not recorded.
+/// - `Failed`: validator's `flush()` returned an error; modifier store's
+///   `validated_height` was NOT advanced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlushOutcome {
+    Flushed(u32),
+    NoValidator,
+    Failed,
+}
+
+impl FlushOutcome {
+    /// Whether the caller should advance its `last_flush_height` bookkeeping.
+    /// Advances on either a successful flush or no-validator (light mode);
+    /// stays put on flush failure so the next `should_flush()` retries.
+    pub(crate) fn advances_last_flush(self) -> bool {
+        matches!(self, FlushOutcome::Flushed(_) | FlushOutcome::NoValidator)
+    }
+}
+
+/// Synchronously flush the validator and report the outcome.
+///
+/// Pure validator interaction — no `.await` inside, so `&V` is never held
+/// across an async boundary. This matters because the real `Validator` is
+/// `!Sync` (it owns a `PersistentBatchAVLProver` whose AVL nodes hold
+/// `Rc<RefCell<_>>`); spanning an await would force `V: Sync` to satisfy
+/// `tokio::spawn`'s `Send` bound on the surrounding future.
+///
+/// Pair with [`complete_store_flush_pair`] to perform the full cross-DB
+/// durability handshake. See `facts/sync.md` § "Cross-DB Durability
+/// Handshake" for the invariant.
+///
+/// `height_context` is used only for the warn-log on a failed flush — the
+/// height the sweep was attempting to commit. Not required for correctness;
+/// purely an operator-facing breadcrumb.
+pub(crate) fn try_flush_validator<V: BlockValidator>(
+    validator: Option<&V>,
+    height_context: u32,
+) -> FlushOutcome {
+    match validator {
+        None => FlushOutcome::NoValidator,
+        Some(v) => match v.flush() {
+            Ok(()) => FlushOutcome::Flushed(v.validated_height()),
+            Err(e) => {
+                tracing::warn!(height = height_context, error = %e, "validator flush failed");
+                FlushOutcome::Failed
+            }
+        },
+    }
+}
+
+/// Complete the cross-DB flush pair on the store side.
+///
+/// Takes the outcome of [`try_flush_validator`] (validator already flushed)
+/// and finishes the durability handshake on the store side. Order is
+/// load-bearing: `set_validated_height(M)` (only on `Flushed`) then
+/// `store.flush()`. A failed validator flush MUST NOT advance the modifier
+/// store's recorded `validated_height`; light mode (no validator) skips the
+/// `set_validated_height` write entirely. The store flush always runs to
+/// fsync any accumulated section writes.
+pub(crate) async fn complete_store_flush_pair<S: SyncStore>(
+    outcome: FlushOutcome,
+    store: &S,
+) {
+    if let FlushOutcome::Flushed(m) = outcome {
+        store.set_validated_height(m).await;
+    }
+    store.flush().await;
+}
+
 /// Timing configuration for the sync state machine.
 /// Built from the P2P network config by the main crate.
 pub struct SyncConfig {
@@ -79,6 +154,16 @@ pub struct SyncConfig {
     /// to `tikv_jemalloc_ctl::stats::allocated` when built with jemalloc.
     /// When `None`, flushing is purely count-based (every `flush_max_blocks`).
     pub flush_probe: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+    /// Maximum gap between state.META_BLOCK_HEIGHT and the modifier
+    /// store's recorded validated_height that the startup
+    /// reconciliation will trust without a state rollback. Default
+    /// matches `flush_max_blocks` (100). Used by the main crate's
+    /// reconciliation step, not by sync itself; threaded through here
+    /// because SyncConfig is sync's public configuration surface.
+    ///
+    /// See ../facts/sync.md "Cross-DB Durability Handshake" §
+    /// Configuration for the policy this knob controls.
+    pub reconciliation_trust_threshold: u32,
 }
 
 impl Default for SyncConfig {
@@ -106,6 +191,7 @@ impl Default for SyncConfig {
             synced_flush_max_blocks: None,
             synced_flush_min_blocks: None,
             flush_probe: None,
+            reconciliation_trust_threshold: 100,
         }
     }
 }
@@ -891,21 +977,11 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     // by `flush_max_blocks` and peak heap bounded by
                     // `flush_heap_threshold_mb` (when a probe is wired).
                     if self.should_flush(height) {
-                        if let Some(v) = self.validator.as_ref() {
-                            match v.flush() {
-                                Ok(()) => {
-                                    self.last_flush_height = height;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(height, error = %e, "validator flush failed");
-                                }
-                            }
-                        } else {
+                        let outcome = try_flush_validator(self.validator.as_ref(), height);
+                        complete_store_flush_pair(outcome, &self.store).await;
+                        if outcome.advances_last_flush() {
                             self.last_flush_height = height;
                         }
-                        // Pair modifier-store flush with state flush so
-                        // crash-recovery bounds cover both databases.
-                        self.store.flush().await;
                     }
                 }
                 Err(e) => {
@@ -965,19 +1041,12 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         // Durable flush at sweep end — catches the tail of blocks that
         // didn't hit a heap-threshold or max-blocks trigger mid-sweep. The
         // tip-following path (single block per sweep) always reaches this.
-        if let Some(v) = self.validator.as_ref() {
-            match v.flush() {
-                Ok(()) => {
-                    self.last_flush_height = self.state_applied_height;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "validator flush after sweep failed");
-                }
-            }
+        let outcome =
+            try_flush_validator(self.validator.as_ref(), self.state_applied_height);
+        complete_store_flush_pair(outcome, &self.store).await;
+        if outcome.advances_last_flush() {
+            self.last_flush_height = self.state_applied_height;
         }
-        // Same pairing as the mid-sweep flush — keeps modifier and state
-        // stores on the same durability horizon at every commit point.
-        self.store.flush().await;
     }
 
     /// Drain completed script evaluation results from the channel.
@@ -1655,5 +1724,201 @@ fn msg_type_name(msg: &ProtocolMessage) -> &'static str {
                 _ => "Unknown",
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cross_db_flush_tests {
+    //! Tests for the cross-DB durability handshake (`facts/sync.md`).
+    //!
+    //! The invariant under test: a successful `validator.flush()` MUST be
+    //! followed by `store.set_validated_height(M)` BEFORE `store.flush()`,
+    //! where `M = validator.validated_height()`. A failed validator flush
+    //! MUST NOT touch `validated_height`. Light mode (no validator) skips
+    //! both — there is no validated_height to record.
+    use super::*;
+    use ergo_chain_types::{ADDigest, Header};
+    use ergo_validation::{
+        ApplyStateOutcome, BlockValidator, Parameters, ValidationError,
+    };
+    use std::sync::Mutex;
+
+    /// Recorded call against the mock store. Order is the assertion target.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum StoreCall {
+        SetValidatedHeight(u32),
+        Flush,
+    }
+
+    /// Mock SyncStore for cross-DB flush ordering tests. Records every call
+    /// in invocation order; tests assert on the recorded sequence.
+    struct MockStore {
+        calls: Mutex<Vec<StoreCall>>,
+        validated_height: Mutex<Option<u32>>,
+    }
+
+    impl MockStore {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                validated_height: Mutex::new(None),
+            }
+        }
+
+        fn calls(&self) -> Vec<StoreCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl SyncStore for MockStore {
+        async fn has_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> bool {
+            unimplemented!("not called in flush-ordering tests")
+        }
+
+        async fn get_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> Option<Vec<u8>> {
+            unimplemented!("not called in flush-ordering tests")
+        }
+
+        async fn script_verified_height(&self) -> Option<u32> {
+            unimplemented!("not called in flush-ordering tests")
+        }
+
+        async fn set_script_verified_height(&self, _height: u32) {
+            unimplemented!("not called in flush-ordering tests")
+        }
+
+        async fn validated_height(&self) -> Option<u32> {
+            *self.validated_height.lock().unwrap()
+        }
+
+        async fn set_validated_height(&self, height: u32) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(StoreCall::SetValidatedHeight(height));
+            *self.validated_height.lock().unwrap() = Some(height);
+        }
+
+        async fn flush(&self) {
+            self.calls.lock().unwrap().push(StoreCall::Flush);
+        }
+    }
+
+    /// Fake BlockValidator with a controllable flush result. Other trait
+    /// methods are not exercised by these tests.
+    struct FakeValidator {
+        validated_height: u32,
+        flush_result: Result<(), &'static str>,
+        digest: ADDigest,
+    }
+
+    impl FakeValidator {
+        fn flushes_ok(height: u32) -> Self {
+            Self {
+                validated_height: height,
+                flush_result: Ok(()),
+                digest: ADDigest::zero(),
+            }
+        }
+
+        fn flushes_err(height: u32) -> Self {
+            Self {
+                validated_height: height,
+                flush_result: Err("simulated flush failure"),
+                digest: ADDigest::zero(),
+            }
+        }
+    }
+
+    impl BlockValidator for FakeValidator {
+        fn apply_state(
+            &mut self,
+            _header: &Header,
+            _block_txs: &[u8],
+            _ad_proofs: Option<&[u8]>,
+            _extension: &[u8],
+            _preceding_headers: &[Header],
+            _active_params: &Parameters,
+            _expected_boundary_params: Option<&Parameters>,
+            _expected_proposed_update: Option<&[u8]>,
+        ) -> Result<ApplyStateOutcome, ValidationError> {
+            unimplemented!("not called in flush-ordering tests")
+        }
+
+        fn validated_height(&self) -> u32 {
+            self.validated_height
+        }
+
+        fn current_digest(&self) -> &ADDigest {
+            &self.digest
+        }
+
+        fn reset_to(&mut self, _height: u32, _digest: ADDigest) {
+            unimplemented!("not called in flush-ordering tests")
+        }
+
+        fn flush(&self) -> Result<(), ValidationError> {
+            self.flush_result
+                .map_err(|s| ValidationError::ProofVerificationFailed(s.to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn records_validated_height_before_store_flush_on_success() {
+        let store = MockStore::new();
+        let validator = FakeValidator::flushes_ok(1_785_000);
+
+        let outcome = try_flush_validator(Some(&validator), 1_785_000);
+        complete_store_flush_pair(outcome, &store).await;
+
+        assert_eq!(outcome, FlushOutcome::Flushed(1_785_000));
+        assert_eq!(
+            store.calls(),
+            vec![
+                StoreCall::SetValidatedHeight(1_785_000),
+                StoreCall::Flush,
+            ],
+            "set_validated_height MUST precede store.flush() (cross-DB handshake ordering)"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_validator_flush_does_not_advance_validated_height() {
+        let store = MockStore::new();
+        let validator = FakeValidator::flushes_err(1_785_000);
+
+        let outcome = try_flush_validator(Some(&validator), 1_785_000);
+        complete_store_flush_pair(outcome, &store).await;
+
+        assert_eq!(outcome, FlushOutcome::Failed);
+        assert_eq!(
+            store.calls(),
+            vec![StoreCall::Flush],
+            "failed validator.flush() MUST NOT advance modifier store's validated_height"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_validator_does_not_record_validated_height() {
+        let store = MockStore::new();
+
+        // Light mode: validator is None — no state to flush, no validated_height
+        // to record. Modifier store flush still runs to fsync section writes.
+        let outcome = try_flush_validator::<FakeValidator>(None, 0);
+        complete_store_flush_pair(outcome, &store).await;
+
+        assert_eq!(outcome, FlushOutcome::NoValidator);
+        assert_eq!(
+            store.calls(),
+            vec![StoreCall::Flush],
+            "light mode MUST NOT touch validated_height — nothing to record"
+        );
+    }
+
+    #[test]
+    fn flush_outcome_advances_last_flush_only_on_success_or_no_validator() {
+        assert!(FlushOutcome::Flushed(42).advances_last_flush());
+        assert!(FlushOutcome::NoValidator.advances_last_flush());
+        assert!(!FlushOutcome::Failed.advances_last_flush());
     }
 }
