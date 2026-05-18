@@ -74,6 +74,12 @@ Components communicate through traits — the P2P layer doesn't know what valida
 | `store/` | [mwaddip/enr-store](https://github.com/mwaddip/enr-store) | `b997da5` |
 | `facts/` | [mwaddip/ergo-node-facts](https://github.com/mwaddip/ergo-node-facts) | `8a8ad45` |
 
+## Development
+
+This project is built with a multi-session AI workflow: one main session coordinates interface contracts (in `facts/`) and integration; per-crate dispatched sessions implement against those contracts within their crate's directory boundary. Every cross-crate disagreement is resolved by updating the contract first, not by writing glue code — "fix the interface, never wrap the mismatch."
+
+Codebase-specific guidance — design principles, S.P.E.C.I.A.L. attention weights, common mistakes, protocol references — lives in [`agents/ergo-node-development/SKILL.md`](agents/ergo-node-development/SKILL.md). The dispatch mechanics (kitty window automation, executor identity, anti-recursion guards) live in [`mwaddip/claude-dbc`](https://github.com/mwaddip/claude-dbc) — install that skill pair (`dispatching-prompts` + `receiving-prompts`) to use the same workflow.
+
 ## Building
 
 ### From source
