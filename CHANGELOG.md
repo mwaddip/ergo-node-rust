@@ -1,5 +1,121 @@
 # Changelog
 
+## v0.6.2 — 2026-05-18
+
+Three independent improvements that share a single release. Two
+operator-facing bug fixes plus a defense-in-depth measure for crash
+recovery across the state and modifier-store databases.
+
+### Postinst `try-restart` on upgrade
+
+`debian/ergo-node-rust.postinst` previously used `systemctl start` on
+upgrades, which is a no-op when the service is already running — so
+every `.deb` upgrade left the old (deleted) binary executing in
+memory. Operators had to manually `systemctl restart` to pick up the
+new binary, and most didn't notice the gap.
+
+Switched to `try-restart`, which restarts the service only if it was
+already active (respecting operator-stopped state) and replaces the
+running binary with the upgraded one. Fresh installs are unaffected
+— the postinst still falls back to `start` when the service has no
+prior active state. Commit `f068010`.
+
+### Stuck `apply_state` retry-loop detection
+
+@odiseusme reported in #10 that a node could deterministically retry
+the same block forever after state-DB corruption from an unclean
+shutdown, with no operator-visible signal beyond the steady per-sweep
+`ERROR apply_state failed` lines. The Doctor adapter and a casual
+operator both have no obvious "this node is wedged" indicator.
+
+Added a per-`(height, error_kind)` consecutive-failure tracker in
+`sync/`. After 5 consecutive failed `apply_state` calls on the same
+(height, kind), emits the contract event:
+
+```
+WARN validation stuck height=<H> attempts=<N> error_kind=<kind>
+```
+
+`error_kind=missing_key` carries the additional `missing_key=<hex>`
+field for cases where the prover hit a `LabelOnly` placeholder during
+traversal. Journal-events contract bumped to v1.1.0 (additive). The
+detection is observation-only — it doesn't auto-recover, just makes
+the retry loop visible.  Commit `2e800a7`.
+
+### Cross-DB durability handshake
+
+`state.redb` (UTXO state) and `modifiers.redb` (chain index +
+sections) are independent redb databases. Each commits atomically per
+transaction, but the two are flushed independently. The sync sweep's
+flush pair (`validator.flush()` then `store.flush()`) had a race
+window where an unclean shutdown between the two could leave state
+durable at a height the modifier store didn't know about, and vice
+versa.
+
+This release adds a durable mirror of state's `META_BLOCK_HEIGHT` in
+the modifier store's `chain_meta` table (`b"validated_height"`),
+written between the two flushes. On startup the node reads both
+values and reconciles drift per a four-branch policy:
+
+- **M == V**: consistent — no-op.
+- **M > V, gap ≤ `reconciliation_trust_threshold`** (default 100):
+  trust state, bring V forward with one Immediate write. Normal
+  flush-window race.
+- **M > V, gap > threshold**: roll state back to V via
+  `validator.reset_to(V, header.state_root)`, sync re-validates
+  forward. Catches drift that exceeded a single inter-flush window.
+- **M > V, header lookup at V fails**: forced trust (bring V forward
+  + loud WARN). First-deployment migration path lands here on a node
+  that has state.redb but no recorded V yet.
+- **M < V**: post-reorg recovery — sync re-validates forward; no
+  startup action needed.
+
+Each non-consistent case emits the contract event
+`validated_height_drift` (WARN) with `state_height`, `store_height`,
+`mode` (`forward` | `rollback` | `forced_trust` | `regressed`), and
+`gap` fields. Journal-events contract bumped to v1.2.0 (additive).
+The Doctor adapter and operators get a stable startup signal for
+cross-DB drift without parsing free-text log lines.
+
+`keep_versions` bumped 200 → 256 to give margin above the default
+threshold for the rollback branch.
+
+#### Scope and limits
+
+This work prevents one class of future drift — cross-DB horizon
+mismatch after a flush-pair race. It does **not** fix existing
+state-internal corruption such as #10 (an AVL tree missing a box
+that META says should be there); the prover's `LabelOnly` resolver
+miss path that produces the "Key does not exist" error is a
+different failure mode, and operators hitting it still need
+`sharpen(8)` or `utxo_bootstrap = true` to recover. The detection
+layer for that case shipped earlier in this release as
+`validation_stuck`.
+
+#### Operator-visible
+
+First restart after upgrading to v0.6.2 emits exactly one
+`validated_height_drift mode=forced_trust gap=<state_height>` WARN at
+startup — expected and benign. The `validated_height` chain_meta key
+bootstraps to the current state height on first run; subsequent
+restarts see `M == V` and emit nothing.
+
+New config knob `[node] reconciliation_trust_threshold` (default
+100) controls the M > V trust vs. rollback decision. Bounded above
+by `state.keep_versions` (256).
+
+#### Contracts
+
+- `facts/store.md` — `b"validated_height"` registered in `chain_meta`
+  table; durability invariant added.
+- `facts/sync.md` — new "Cross-DB Durability Handshake" section with
+  V1/V2 invariants, three-step flush ordering, startup reconciliation
+  algorithm.
+- `facts/state.md` — cross-DB durability cross-reference (state stays
+  canonical; no API additions).
+- `facts/journal-events.md` — `validated_height_drift` event added,
+  contract version 1.1.0 → 1.2.0.
+
 ## v0.6.1 — 2026-05-16
 
 Hotfix: v0.6.0 panics deterministically on startup against a non-empty
