@@ -387,20 +387,26 @@ mod tests {
         Err(String),
     }
 
-    /// Compare outcome for is_better_nipopow.
+    /// Compare outcome for is_better_nipopow. `Worse` is the matching
+    /// counterpart to `Better` — the mock can script a "this is worse
+    /// than that" comparison even if no test currently does.
     #[derive(Clone)]
     enum CompareResult {
         Better,
+        #[allow(dead_code)]
         Worse,
         Err(String),
     }
+
+    /// `(this_envelope, than_envelope, scripted_result)` triples.
+    type ScriptedComparison = (Vec<u8>, Vec<u8>, CompareResult);
 
     /// Mock chain that returns scripted verification and comparison results.
     struct MockChain {
         /// Map envelope body → verification result.
         verify_results: Mutex<Vec<(Vec<u8>, VerifyResult)>>,
         /// Pairwise comparison results: (this, that) → result.
-        compare_results: Mutex<Vec<(Vec<u8>, Vec<u8>, CompareResult)>>,
+        compare_results: Mutex<Vec<ScriptedComparison>>,
         installed: Mutex<Option<(Header, Vec<Header>)>>,
     }
 

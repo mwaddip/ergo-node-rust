@@ -489,15 +489,15 @@ fn label_from_packed(packed: &[u8], key_length: usize) -> Digest32 {
     let mut hasher = Blake2b256::new();
     if node_type == 0x00 {
         // Internal: pack uses 0x00, but label hash uses prefix 0x01
-        hasher.update(&[1u8]);
+        hasher.update([1u8]);
         let balance = packed[1];
-        hasher.update(&[balance]);
+        hasher.update([balance]);
         let left_offset = 2 + key_length;
         hasher.update(&packed[left_offset..left_offset + 32]);
         hasher.update(&packed[left_offset + 32..left_offset + 64]);
     } else {
         // Leaf: pack uses 0x01, but label hash uses prefix 0x00
-        hasher.update(&[0u8]);
+        hasher.update([0u8]);
         // key
         hasher.update(&packed[1..1 + key_length]);
         // value_len (BE u32) + value

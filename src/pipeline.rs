@@ -14,6 +14,14 @@ use tokio::sync::{mpsc, Mutex};
 /// LRU buffer capacity for out-of-order headers (JVM: `headersCache` = 8192).
 const BUFFER_CAPACITY: usize = 8_192;
 
+/// A modifier-store row: `(type_id, modifier_id, height, body_bytes, optional_aux_bytes)`.
+/// Used wherever we accumulate entries for `ModifierStore::put_batch`.
+type StoreEntry = (u8, [u8; 32], u32, Vec<u8>, Option<Vec<u8>>);
+
+/// Fork branch metadata: `(fork_point_height, [(header, raw_bytes)] in ascending order)`.
+/// Returned by `assemble_fork_branch` and held as pending state until a deep reorg fires.
+type ForkBranch = (u32, Vec<(Header, Vec<u8>)>);
+
 /// Async validation pipeline for modifiers.
 ///
 /// Receives raw modifier data from the P2P layer via a channel, validates
@@ -76,7 +84,7 @@ impl ValidationPipeline {
         _tip_id: BlockId,
         tip_header: &Header,
         tip_raw: Vec<u8>,
-    ) -> Option<(u32, Vec<(Header, Vec<u8>)>)> {
+    ) -> Option<ForkBranch> {
         let mut branch: Vec<(Header, Vec<u8>)> = vec![(tip_header.clone(), tip_raw)];
         let mut current_parent = tip_header.parent_id;
 
@@ -154,7 +162,7 @@ impl ValidationPipeline {
         // Single pass: collect IDs for delivery tracker, partition headers from sections
         let mut received_ids = Vec::with_capacity(batch.len());
         let mut raw_headers: Vec<(&[u8], Option<u64>)> = Vec::new();
-        let mut section_entries: Vec<(u8, [u8; 32], u32, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+        let mut section_entries: Vec<StoreEntry> = Vec::new();
 
         {
         let chain_guard = self.chain.lock().await;
@@ -266,9 +274,8 @@ impl ValidationPipeline {
         let mut buffered = 0u32;
         let mut rejected = 0u32;
         let mut evicted_ids: Vec<[u8; 32]> = Vec::new();
-        let mut store_entries: Vec<(u8, [u8; 32], u32, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
-        // Pending deep reorg: (fork_point_height, [(header, raw_bytes)] in ascending order)
-        let mut pending_reorg: Option<(u32, Vec<(Header, Vec<u8>)>)> = None;
+        let mut store_entries: Vec<StoreEntry> = Vec::new();
+        let mut pending_reorg: Option<ForkBranch> = None;
 
         for (header, raw) in valid_headers {
             // Skip headers already in the chain (duplicates from overlapping peer responses)
@@ -477,7 +484,7 @@ impl ValidationPipeline {
                     // parameter recomputation) would see the demoted chain.
                     // put_batch's unconditional BEST_CHAIN insert for type 101
                     // makes the new branch authoritative.
-                    let reorg_entries: Vec<(u8, [u8; 32], u32, Vec<u8>, Option<Vec<u8>>)> = new_branch_with_raw
+                    let reorg_entries: Vec<StoreEntry> = new_branch_with_raw
                         .into_iter()
                         .map(|(h, raw)| {
                             let score_bytes = chain.score_at(h.height)

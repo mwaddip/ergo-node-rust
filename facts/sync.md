@@ -86,7 +86,7 @@ How the sync machine queries and updates chain state.
 
 ## HeaderSync
 
-### `HeaderSync::new(config, transport, chain, store, validator, progress, delivery_control, delivery_data, snapshot_tx, validator_rx, shared_downloaded_height, block_request_gate, peer_chain_tip) -> Self`
+### `HeaderSync::new(config, transport, chain, store, validator, progress, delivery_control, delivery_data, snapshot_tx, validator_rx, shared_downloaded_height, block_request_gate, peer_chain_tip, shutdown_rx) -> Self`
 - Create the sync state machine with injected dependencies.
 - `config`: `SyncConfig` with timing parameters, delivery settings, and `state_type`.
   The `state_type` field (`StateType::Utxo`, `StateType::Digest`, or
@@ -133,9 +133,21 @@ How the sync machine queries and updates chain state.
   heights vector. Read by the main crate to compute the bootstrap gap
   (`peer_chain_tip - downloaded_height`). Initialized to 0; remains 0 until
   at least one `SyncInfo` is received.
+- `shutdown_rx`: `tokio::sync::oneshot::Receiver<()>`. The host signals
+  graceful shutdown by sending `()` on the matching `Sender`. Sync's
+  `run()` wraps `run_inner()` in a `tokio::select!` against this receiver;
+  the signal cancels `run_inner` and falls through to `shutdown_flush`.
+  An explicit channel is required because `P2pTransport` holds a
+  `clone()` of the host's `Arc<P2pNode>` (along with mining, API, and
+  mempool), so dropping the host's reference does not actually close the
+  events channel — sync has no implicit way to know shutdown is in
+  progress. See "Graceful shutdown" below.
 
-### `HeaderSync::run() -> !`
-- Long-running async task. Drives the sync loop until the runtime shuts down.
+### `HeaderSync::run()`
+- Long-running async task. Drives the sync loop until the host signals
+  shutdown via the `shutdown_rx` oneshot or a fatal startup error occurs.
+  Before returning, flushes all accumulated in-memory state — see
+  "Graceful shutdown" below.
 
 ## Architecture: Event-driven loop
 
@@ -367,6 +379,88 @@ absence at startup is the success signal.
 
 Doctor and operators get a stable, single-line marker for cross-DB
 drift without parsing free-text log lines.
+
+## Graceful shutdown
+
+When the host process receives SIGTERM/SIGINT, `HeaderSync::run()` MUST
+durably persist all in-memory state before returning. Without this,
+`Durability::None` commits accumulated since the last sweep flush are
+lost on restart. The Cross-DB Durability Handshake's `regressed`
+reconciliation branch recovers from this on startup, but the recovery
+costs re-validation work on every clean shutdown. The handshake is for
+unclean shutdowns; clean shutdowns should preserve everything.
+
+### Run-loop exit invariant
+
+`run()` exits via one of three paths:
+
+1. **Shutdown signal** — the host sends `()` on the `shutdown_tx` oneshot
+   passed at construction time. Sync's `run()` wraps `run_inner()` in
+   `tokio::select!` against the matching receiver; the signal cancels
+   `run_inner` mid-flight and falls through to `shutdown_flush`. This is
+   the normal shutdown path.
+2. **Light bootstrap error** — returns from `run_inner` before entering
+   the main sync loop.
+3. **Snapshot-bootstrap validator channel closed** — abnormal but
+   possible during UTXO snapshot bootstrap if the validator-rebuild
+   handler exits unexpectedly.
+
+In all three cases `run()` MUST flush before returning, using the same
+sequence as the per-flush-trigger ordering (see "Flush ordering"):
+
+1. `validator.flush()` — state.redb fsync with `Durability::Immediate`.
+2. `store.set_validated_height(M)` if (1) succeeded, where M is the
+   validator's reported `validated_height()` after flushing.
+3. `store.flush()` — modifiers.redb fsync.
+
+Failure of `validator.flush()` is logged but MUST NOT block return —
+the host must be able to exit. The next startup's reconciliation
+re-validates whatever gap results.
+
+The structural pattern: `run_inner` owns the loop body; `run` wraps the
+`run_inner` call in `tokio::select!` against the shutdown receiver,
+then unconditionally runs `shutdown_flush` after either side resolves.
+This funnels every exit — signal, internal early return, light-bootstrap
+error — through the same flush block.
+
+A direct `tokio::select! { _ = self.run_inner() => ..., _ = &mut self.shutdown_rx => ... }`
+fails the borrow checker (E0499: two mutable borrows of `self` across
+disjoint fields, which the compiler doesn't see as disjoint when both
+go through method/field access on `self`). The compiling pattern moves
+`shutdown_rx` out of `self` via `std::mem::replace`, with a sentinel
+receiver in its place whose paired sender is held alive for the
+duration of `run()` so the sentinel never resolves spuriously.
+
+**Why an explicit signal:** earlier drafts of this contract relied on
+event-stream-closure (sync's `next_event()` returning `None` after the
+host dropped its P2P reference) as the implicit shutdown signal. That
+design is broken: `P2pTransport` holds `Arc<P2pNode>` and the host
+clones that Arc into the mining, API, mempool, and other paths. The
+host's `drop(p2p)` only releases one of many references — the node
+stays alive, its event-emitting tasks stay alive, the channel never
+closes, and sync hangs in `next_event().await` until the runtime
+forcibly aborts it. The oneshot signal is the only deterministic exit.
+
+### Host shutdown ordering
+
+The host (`src/main.rs`) drives shutdown:
+
+1. Receive SIGTERM/SIGINT.
+2. Send `()` on `shutdown_tx`. Failed send (receiver already dropped)
+   is logged at info-level and tolerated — sync's task may have
+   already exited (e.g. snapshot-bootstrap error before this point).
+3. Await the sync task's `JoinHandle` with a bounded timeout (default
+   30s). The timeout caps the wait at sync's actual flush latency.
+   Hitting the timeout is an error condition (logged) but does not
+   block process exit.
+4. Drop the P2P node (and other shared Arcs). Safe at this point —
+   the consumer that needed it for shutdown ordering has exited.
+5. Process exits.
+
+Fire-and-forget shutdown (no JoinHandle await) is incorrect: the
+tokio runtime aborts spawned tasks at process exit, racing with
+sync's flush sequence and risking state loss. The bounded await is
+the cleanest pattern.
 
 ## JVM peer behavior (observed)
 

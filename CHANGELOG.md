@@ -1,5 +1,84 @@
 # Changelog
 
+## v0.6.3 — 2026-05-18
+
+Graceful shutdown — `systemctl stop` now persists in-memory state
+before the process exits, instead of relying on the v0.6.2 cross-DB
+durability handshake to re-validate the gap on every restart.
+
+### Shutdown-flush via explicit oneshot signal
+
+Previous shutdown was fire-and-forget: drop the P2P node, sleep 500ms,
+exit. Sync's `run()` had no flush on its exit paths and no way to know
+the host was shutting down. `Durability::None` commits accumulated
+since the last sweep flush were lost on exit; the cross-DB handshake's
+`regressed` reconciliation branch caught it on next start and
+re-validated forward, but the recovery cost real CPU on every restart.
+
+The fix is an explicit `tokio::sync::oneshot::channel::<()>` created
+in `src/main.rs` and passed into `HeaderSync::new`. The SIGTERM
+handler sends `()` on the sender; sync's `run()` wraps `run_inner()`
+in `tokio::select!` against the receiver, falling through to a new
+`shutdown_flush()` that runs the same three-step flush as the
+per-sweep flush trigger (`validator.flush()` →
+`store.set_validated_height(M)` → `store.flush()`). Main awaits the
+sync task's `JoinHandle` with a 30s bounded timeout (previously a
+blind 500ms sleep with no JoinHandle at all).
+
+An earlier design pass tried to use event-stream-closure as the
+implicit shutdown signal — drop the P2P node, let sync's
+`next_event().await` return `None`, exit. That doesn't work:
+`P2pTransport` holds an `Arc<P2pNode>` and the host clones that Arc
+to mining, mempool, REST API, and the snapshot / nipopow serve paths.
+Dropping main's reference releases one of many — the node stays
+alive, its event-emitting tasks stay alive, and sync hangs in
+`next_event().await` until systemd SIGKILLs at `TimeoutStopSec`. The
+oneshot is the only deterministic signal.
+
+Live measurement on the laptop validator: 32 ms from SIGTERM to
+`Deactivated successfully`, with the full flush sequence visible in
+the journal (`shutdown signal received`, `header sync exiting —
+flushing state`, `header sync stopped`, `sync task exited cleanly`).
+No state regression across the cycle. The cross-DB handshake's
+`regressed` branch becomes unreachable for clean shutdowns; it
+remains as defense for `kill -9`, OOM, and hardware faults.
+
+Implementation note: a direct `tokio::select!` with `_ = &mut
+self.shutdown_rx` fails the borrow checker (E0499 — two mutable
+borrows of `self` across method-call and field-access arms). The
+compiling pattern moves the receiver out via `std::mem::replace` and
+keeps a sentinel sender alive for the duration of `run()`. Documented
+in `facts/sync.md` § "Graceful shutdown".
+
+### Clippy cleanup in `src/`
+
+`src/pipeline.rs` accumulated five copies of two complex tuple types
+during the chain-reorg and put-batch work. Factored into two type
+aliases at the top of the file:
+
+```rust
+type StoreEntry = (u8, [u8; 32], u32, Vec<u8>, Option<Vec<u8>>);
+type ForkBranch = (u32, Vec<(Header, Vec<u8>)>);
+```
+
+`src/main.rs::ValidatorInner` carries a 340-byte size difference
+between its two variants (UTXO mode's persistent prover vs digest
+mode's stateless verifier). With exactly one validator per process,
+boxing the larger variant would save ~330 bytes once at the cost of a
+heap indirection on every `apply_state` / `flush`. Not worth it;
+`#[allow(clippy::large_enum_variant)]` with a comment explaining the
+trade-off.
+
+The mining hot path's `proofs_for_transactions(&[emission_tx.clone()])`
+became `proofs_for_transactions(std::slice::from_ref(&emission_tx))`
+— same semantics, one fewer clone per mined-block candidate.
+
+### State test-suite clippy
+
+`state/tests/storage_tests.rs` had three `hasher.update(&[byte])`
+sites flagged for `needless_borrows_for_generic_args`. Dropped the
+leading `&` on each. No behavioral change.
+
 ## v0.6.2 — 2026-05-18
 
 Three independent improvements that share a single release. Two

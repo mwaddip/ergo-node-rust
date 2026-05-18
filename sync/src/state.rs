@@ -268,9 +268,22 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     /// Ok outcome or change of `(height, error_kind)`. See
     /// [`crate::apply_state_tracker`].
     apply_state_failure_tracker: Option<ApplyStateFailureTracker>,
+    /// Explicit shutdown signal from the host. `run()` selects against
+    /// this alongside `run_inner()`; the signal cancels the loop and
+    /// falls through to `shutdown_flush`. An explicit channel is
+    /// required because `P2pTransport` holds a clone of the host's
+    /// `Arc<P2pNode>` (along with mining, API, mempool), so dropping
+    /// the host's reference does not close the events channel.
+    /// See `../facts/sync.md` § "Graceful shutdown".
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync<T, C, S, V> {
+    // 13-arg constructor reflects the dependency-inversion surface (4 trait
+    // objects + 6 channels/atomics + 3 config-ish args). Bundling these would
+    // hide the wiring without simplifying it. A builder is reasonable future
+    // work but not justified for one caller (`src/main.rs`).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: SyncConfig,
         transport: T,
@@ -285,6 +298,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         shared_downloaded_height: std::sync::Arc<std::sync::atomic::AtomicU32>,
         block_request_gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
         peer_chain_tip: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> Self {
         let tracker = DeliveryTracker::with_config(config.delivery_timeout, config.max_delivery_checks);
         let initial_validated = validator.as_ref().map_or(0, |v| v.validated_height());
@@ -321,6 +335,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             at_tip_request_tx: None,
             at_tip_validator_rx: None,
             apply_state_failure_tracker: None,
+            shutdown_rx,
         }
     }
 
@@ -375,10 +390,37 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     /// Matches JVM's `FullBlocksToDownloadAhead = 192`.
     const DOWNLOAD_WINDOW: u32 = 192;
 
-    /// Run the sync loop. Returns only if all event sources close.
+    /// Run the sync loop. Returns when the host signals shutdown via
+    /// `shutdown_rx` or `run_inner` exits on its own (light-bootstrap
+    /// error / snapshot-bootstrap validator channel closed).
+    ///
+    /// All exit paths funnel through [`Self::shutdown_flush`] so that
+    /// `Durability::None` commits accumulated since the last sweep flush
+    /// are persisted before the function returns. See
+    /// `../facts/sync.md` § "Graceful shutdown".
     pub async fn run(&mut self) {
         tracing::info!("header sync started");
+        // Move `shutdown_rx` out of `self` so the select arm doesn't
+        // collide with `run_inner`'s `&mut self` borrow. A sentinel
+        // receiver takes its place; `_sentinel_tx` is held alive for the
+        // duration of `run()` so the sentinel never resolves spuriously.
+        let (_sentinel_tx, sentinel_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut shutdown_rx = std::mem::replace(&mut self.shutdown_rx, sentinel_rx);
+        tokio::select! {
+            _ = self.run_inner() => {
+                // run_inner returned on its own (light-bootstrap error
+                // or snapshot-bootstrap validator-channel-closed path).
+            }
+            _ = &mut shutdown_rx => {
+                tracing::info!("shutdown signal received");
+            }
+        }
+        self.shutdown_flush().await;
+    }
 
+    /// Inner driver containing the loop body. Each `return` here falls
+    /// through to [`Self::shutdown_flush`] via [`Self::run`].
+    async fn run_inner(&mut self) {
         // Light-client bootstrap: if state_type is Light AND chain is empty,
         // run a one-shot NiPoPoW bootstrap before entering the normal sync
         // cycle. The bootstrap installs the proof's suffix as the chain
@@ -526,6 +568,35 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 }
             }
         }
+    }
+
+    /// Durably persist all in-memory state before `run` returns. Mirrors
+    /// the end-of-sweep flush block (cross-DB durability handshake order:
+    /// `validator.flush()` → `store.set_validated_height(M)` →
+    /// `store.flush()`). Runs unconditionally on every exit path of
+    /// [`Self::run_inner`]. Without this, `Durability::None` commits
+    /// since the last sweep flush sit in redb's page cache and are
+    /// lost on process exit. See `../facts/sync.md` § "Graceful shutdown".
+    ///
+    /// Failure of `validator.flush()` is logged by
+    /// [`try_flush_validator`] and does NOT block return — the host
+    /// must be able to exit. The next startup's reconciliation handles
+    /// the resulting gap.
+    async fn shutdown_flush(&mut self) {
+        // Prefer the validator's own height when available; fall back
+        // to `state_applied_height` for light mode (no validator) and
+        // for the snapshot-bootstrap exit (validator may be `None`).
+        let height = match self.validator.as_ref() {
+            Some(v) => v.validated_height(),
+            None => self.state_applied_height,
+        };
+        tracing::info!(height, "header sync exiting — flushing state");
+        let outcome = try_flush_validator(self.validator.as_ref(), height);
+        complete_store_flush_pair(outcome, &self.store).await;
+        if outcome.advances_last_flush() {
+            self.last_flush_height = height;
+        }
+        tracing::info!("header sync stopped");
     }
 
     /// Wait until we have an outbound peer to sync from.
@@ -1920,5 +1991,354 @@ mod cross_db_flush_tests {
         assert!(FlushOutcome::Flushed(42).advances_last_flush());
         assert!(FlushOutcome::NoValidator.advances_last_flush());
         assert!(!FlushOutcome::Failed.advances_last_flush());
+    }
+}
+
+#[cfg(test)]
+mod shutdown_flush_tests {
+    //! Tests for the run-loop shutdown flush (`facts/sync.md` §
+    //! "Graceful shutdown").
+    //!
+    //! Invariant under test: every exit path of `run_inner` funnels
+    //! through `shutdown_flush`, which mirrors the end-of-sweep flush
+    //! block (validator.flush → store.set_validated_height(M) →
+    //! store.flush). Without this, `Durability::None` commits
+    //! accumulated since the last sweep flush are lost on process exit.
+    use super::*;
+    use enr_chain::{ChainError, SyncInfo};
+    use ergo_chain_types::{ADDigest, Header};
+    use ergo_validation::{
+        ApplyStateOutcome, BlockValidator, Parameters, ValidationError,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum StoreCall {
+        SetValidatedHeight(u32),
+        Flush,
+    }
+
+    struct MockStore {
+        calls: Mutex<Vec<StoreCall>>,
+    }
+
+    impl MockStore {
+        fn new() -> Self {
+            Self { calls: Mutex::new(Vec::new()) }
+        }
+
+        fn calls(&self) -> Vec<StoreCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl SyncStore for MockStore {
+        async fn has_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> bool {
+            unreachable!("not called when chain_height=0")
+        }
+
+        async fn get_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> Option<Vec<u8>> {
+            unreachable!("not called in shutdown-flush tests")
+        }
+
+        async fn script_verified_height(&self) -> Option<u32> {
+            None
+        }
+
+        async fn set_script_verified_height(&self, _height: u32) {
+            unreachable!("not called when script_verified_height returns None")
+        }
+
+        async fn validated_height(&self) -> Option<u32> {
+            None
+        }
+
+        async fn set_validated_height(&self, height: u32) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(StoreCall::SetValidatedHeight(height));
+        }
+
+        async fn flush(&self) {
+            self.calls.lock().unwrap().push(StoreCall::Flush);
+        }
+    }
+
+    /// Tracks `flush()` invocations so the test can assert exactly-once.
+    struct FakeValidator {
+        validated_height: u32,
+        flush_result: Result<(), &'static str>,
+        flush_count: Mutex<u32>,
+        digest: ADDigest,
+    }
+
+    impl FakeValidator {
+        fn flushes_ok(height: u32) -> Self {
+            Self {
+                validated_height: height,
+                flush_result: Ok(()),
+                flush_count: Mutex::new(0),
+                digest: ADDigest::zero(),
+            }
+        }
+
+        fn flushes_err(height: u32) -> Self {
+            Self {
+                validated_height: height,
+                flush_result: Err("simulated flush failure"),
+                flush_count: Mutex::new(0),
+                digest: ADDigest::zero(),
+            }
+        }
+
+        fn flush_count(&self) -> u32 {
+            *self.flush_count.lock().unwrap()
+        }
+    }
+
+    impl BlockValidator for FakeValidator {
+        fn apply_state(
+            &mut self,
+            _header: &Header,
+            _block_txs: &[u8],
+            _ad_proofs: Option<&[u8]>,
+            _extension: &[u8],
+            _preceding_headers: &[Header],
+            _active_params: &Parameters,
+            _expected_boundary_params: Option<&Parameters>,
+            _expected_proposed_update: Option<&[u8]>,
+        ) -> Result<ApplyStateOutcome, ValidationError> {
+            unreachable!("not called in shutdown-flush tests")
+        }
+
+        fn validated_height(&self) -> u32 {
+            self.validated_height
+        }
+
+        fn current_digest(&self) -> &ADDigest {
+            &self.digest
+        }
+
+        fn reset_to(&mut self, _height: u32, _digest: ADDigest) {
+            unreachable!("not called in shutdown-flush tests")
+        }
+
+        fn flush(&self) -> Result<(), ValidationError> {
+            *self.flush_count.lock().unwrap() += 1;
+            self.flush_result
+                .map_err(|s| ValidationError::ProofVerificationFailed(s.to_string()))
+        }
+    }
+
+    /// Transport that models production behavior: `outbound_peers`
+    /// returns empty and `next_event` hangs forever. The events channel
+    /// in production never closes (multi-Arc to `P2pNode` keeps it
+    /// alive even after the host drops its reference), so the only
+    /// deterministic exit is the explicit `shutdown_rx` signal.
+    struct HangingTransport;
+
+    impl SyncTransport for HangingTransport {
+        async fn send_to(
+            &self,
+            _peer: PeerId,
+            _message: ProtocolMessage,
+        ) -> Result<(), Box<dyn std::error::Error + Send>> {
+            unreachable!("not called when there are no peers")
+        }
+
+        async fn outbound_peers(&self) -> Vec<PeerId> {
+            Vec::new()
+        }
+
+        async fn next_event(&mut self) -> Option<ProtocolEvent> {
+            std::future::pending().await
+        }
+    }
+
+    /// Empty chain (height 0) — the startup tip-scan and the
+    /// light-bootstrap branch both fall through without exercising
+    /// the rest of the `SyncChain` surface.
+    struct EmptyChain;
+
+    impl SyncChain for EmptyChain {
+        async fn chain_height(&self) -> u32 {
+            0
+        }
+
+        async fn build_sync_info(&self) -> Vec<u8> {
+            unreachable!("not called without a sync peer")
+        }
+
+        async fn header_at(&self, _height: u32) -> Option<Header> {
+            unreachable!("not called when chain_height=0")
+        }
+
+        async fn header_state_root(&self, _height: u32) -> Option<[u8; 33]> {
+            unreachable!("not called in shutdown-flush tests")
+        }
+
+        fn parse_sync_info(&self, _body: &[u8]) -> Result<SyncInfo, ChainError> {
+            unreachable!("not called without a sync peer")
+        }
+
+        async fn active_parameters(&self) -> Parameters {
+            unreachable!("not called in shutdown-flush tests")
+        }
+
+        async fn is_epoch_boundary(&self, _height: u32) -> bool {
+            unreachable!("not called in shutdown-flush tests")
+        }
+
+        async fn compute_expected_parameters(
+            &self,
+            _epoch_boundary_height: u32,
+            _block_proposed_update: &[u8],
+        ) -> Result<Parameters, ChainError> {
+            unreachable!("not called in shutdown-flush tests")
+        }
+
+        async fn apply_epoch_boundary_parameters(
+            &self,
+            _params: Parameters,
+            _proposed_update_bytes: Vec<u8>,
+        ) {
+            unreachable!("not called in shutdown-flush tests")
+        }
+
+        async fn active_proposed_update_bytes(&self) -> Vec<u8> {
+            unreachable!("not called in shutdown-flush tests")
+        }
+
+        async fn verify_nipopow_envelope(
+            &self,
+            _envelope_body: &[u8],
+        ) -> Result<Vec<Header>, ChainError> {
+            unreachable!("not called when state_type=Utxo")
+        }
+
+        async fn is_better_nipopow(
+            &self,
+            _this: &[u8],
+            _than: &[u8],
+        ) -> Result<bool, ChainError> {
+            unreachable!("not called in shutdown-flush tests")
+        }
+
+        async fn install_nipopow_suffix(
+            &self,
+            _suffix_head: Header,
+            _suffix_tail: Vec<Header>,
+        ) -> Result<(), ChainError> {
+            unreachable!("not called when state_type=Utxo")
+        }
+    }
+
+    fn build_sync(
+        validator: Option<FakeValidator>,
+        store: MockStore,
+        shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> HeaderSync<HangingTransport, EmptyChain, MockStore, FakeValidator> {
+        let (_progress_tx, progress_rx) = mpsc::channel(1);
+        let (_dc_tx, delivery_control_rx) = mpsc::unbounded_channel::<DeliveryControl>();
+        let (_dd_tx, delivery_data_rx) = mpsc::channel::<DeliveryData>(1);
+        HeaderSync::new(
+            SyncConfig::default(),
+            HangingTransport,
+            EmptyChain,
+            store,
+            validator,
+            progress_rx,
+            delivery_control_rx,
+            delivery_data_rx,
+            None,
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(0)),
+            shutdown_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn run_flushes_state_on_shutdown_signal() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut sync = build_sync(
+            Some(FakeValidator::flushes_ok(1_785_000)),
+            MockStore::new(),
+            shutdown_rx,
+        );
+
+        shutdown_tx.send(()).expect("sync must be polling shutdown_rx");
+        sync.run().await;
+
+        assert_eq!(
+            sync.validator.as_ref().unwrap().flush_count(),
+            1,
+            "validator.flush() must be called exactly once on shutdown"
+        );
+        assert_eq!(
+            sync.store.calls(),
+            vec![
+                StoreCall::SetValidatedHeight(1_785_000),
+                StoreCall::Flush,
+            ],
+            "shutdown_flush must mirror the end-of-sweep ordering: \
+             set_validated_height(M) precedes store.flush(), where \
+             M = validator.validated_height()"
+        );
+        assert_eq!(
+            sync.last_flush_height, 1_785_000,
+            "successful shutdown flush advances last_flush_height"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_flushes_store_even_when_validator_flush_fails() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut sync = build_sync(
+            Some(FakeValidator::flushes_err(1_785_000)),
+            MockStore::new(),
+            shutdown_rx,
+        );
+
+        // Dropping the sender closes the channel; the receiver resolves
+        // with `Err(_)` and triggers the shutdown arm of the select.
+        drop(shutdown_tx);
+        sync.run().await;
+
+        assert_eq!(
+            sync.validator.as_ref().unwrap().flush_count(),
+            1,
+            "validator.flush() must still be attempted on shutdown"
+        );
+        assert_eq!(
+            sync.store.calls(),
+            vec![StoreCall::Flush],
+            "failed validator.flush() must NOT advance modifier store's \
+             validated_height, but store.flush() must still run to \
+             fsync section writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_flushes_store_in_light_mode_without_validator() {
+        // No validator wired — the snapshot-bootstrap and light-mode
+        // exit paths share this shape. shutdown_flush falls back to
+        // state_applied_height for the height_context and the
+        // FlushOutcome::NoValidator branch skips set_validated_height.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut sync = build_sync(None, MockStore::new(), shutdown_rx);
+
+        drop(shutdown_tx);
+        sync.run().await;
+
+        assert_eq!(
+            sync.store.calls(),
+            vec![StoreCall::Flush],
+            "shutdown without a validator records no validated_height \
+             but still flushes the store"
+        );
     }
 }

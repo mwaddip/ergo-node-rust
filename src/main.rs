@@ -62,8 +62,10 @@ const SNAPSHOT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_s
 const MEMPOOL_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 /// Mining task poll interval for new tip heights.
 const MINING_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-/// Grace period before shutdown to let in-flight work finish.
-const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+/// Bounded wait on sync's `JoinHandle` during shutdown — caps how long
+/// the process will block for sync's final flush sequence before
+/// forcing exit. See facts/sync.md "Graceful shutdown".
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Genesis UTXO state root digest (hex, 33 bytes with tree height suffix).
 const TESTNET_GENESIS_DIGEST: &str =
@@ -178,6 +180,12 @@ struct Validator {
     mining: Option<MiningCtx>,
 }
 
+// Size difference between variants is fundamental: UTXO mode carries a
+// persistent AVL+ prover (~384 bytes); digest mode doesn't (~44 bytes).
+// There's exactly one validator instance per process, so boxing
+// `UtxoValidator` saves ~330 bytes once at the cost of an extra alloc
+// and a heap indirection on every apply_state / flush call. Not worth it.
+#[allow(clippy::large_enum_variant)]
 enum ValidatorInner {
     Digest(DigestValidator),
     Utxo(UtxoValidator),
@@ -244,7 +252,7 @@ impl Validator {
             }
         };
 
-        let (ad_proof_bytes, state_root) = match self.proofs_for_transactions(&[emission_tx.clone()]) {
+        let (ad_proof_bytes, state_root) = match self.proofs_for_transactions(std::slice::from_ref(&emission_tx)) {
             Some(Ok(result)) => result,
             Some(Err(e)) => {
                 tracing::warn!("mining: proof computation failed: {e}");
@@ -2086,11 +2094,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sync_shared_downloaded_height = shared_downloaded_height.clone();
     let sync_block_request_gate = block_request_gate.clone();
     let sync_peer_chain_tip = peer_chain_tip.clone();
+    // Shutdown signal: an explicit oneshot is the only deterministic way
+    // to tell sync to exit. `drop(p2p)` alone can't close sync's events
+    // channel because `P2pTransport` and many other consumers hold Arc
+    // clones of the P2P node. See facts/sync.md "Graceful shutdown".
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let mut sync = HeaderSync::new(
         sync_config, transport, sync_chain, sync_store, validator,
         progress_rx, delivery_control_rx, delivery_data_rx,
         snapshot_tx, validator_rx, sync_shared_downloaded_height,
         sync_block_request_gate, sync_peer_chain_tip,
+        shutdown_rx,
     );
 
     // At-tip storage reopen wiring. When `synced_cache_mb` is configured
@@ -2151,7 +2165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    tokio::spawn(async move {
+    let sync_handle = tokio::spawn(async move {
         sync.run().await;
     });
 
@@ -2975,13 +2989,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let peers = p2p.peer_count().await;
     tracing::info!(chain_height = height, peers, "Shutting down");
 
-    // Drop P2P node to close event streams, triggering task shutdown.
-    // The pipeline exits when its modifier channel closes (sender dropped
-    // with the P2P node). The sync task exits when its event stream ends
-    // and runs its end-of-sweep flush in the process.
+    // Signal sync to exit. The oneshot is the only deterministic
+    // shutdown signal: P2pTransport holds an Arc<P2pNode> clone (and
+    // mining/API/mempool hold more), so dropping our own reference
+    // can't close sync's events channel. See facts/sync.md
+    // "Graceful shutdown".
+    if shutdown_tx.send(()).is_err() {
+        tracing::info!("sync task already exited before shutdown signal");
+    }
+
+    // Await sync's completion with a bounded timeout. Hitting the
+    // timeout is an error condition — sync should normally complete its
+    // flush in tens of milliseconds, even at tip. We log and proceed
+    // rather than blocking process exit indefinitely.
+    match tokio::time::timeout(SHUTDOWN_GRACE, sync_handle).await {
+        Ok(Ok(())) => {
+            tracing::info!("sync task exited cleanly");
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "sync task panicked during shutdown");
+        }
+        Err(_) => {
+            tracing::error!(
+                timeout_secs = SHUTDOWN_GRACE.as_secs(),
+                "sync task did not complete within shutdown timeout; state may be incomplete"
+            );
+        }
+    }
+
+    // Drop the P2P node after sync has exited — sync was the only
+    // consumer that needed the node alive for shutdown ordering.
     drop(p2p);
-    // Brief grace period for tasks to finish in-flight work and flush state
-    tokio::time::sleep(SHUTDOWN_GRACE).await;
 
     Ok(())
 }

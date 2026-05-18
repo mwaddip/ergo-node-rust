@@ -143,11 +143,11 @@ fn parse_real_jvm_snapshots_info() {
             assert_eq!(entries[1].height, 268927);
             // Manifest IDs from JVM REST API
             assert_eq!(
-                hex::encode(&entries[0].manifest_id),
+                hex::encode(entries[0].manifest_id),
                 "3a42e04fd94b33e99e17ec32079d82e8956627fd48d71a7c5619772dd75e9f9a"
             );
             assert_eq!(
-                hex::encode(&entries[1].manifest_id),
+                hex::encode(entries[1].manifest_id),
                 "cfe98abf0b933c5adc59b01dab3c842db38889b0f1b78ce7e03faee8eab9c829"
             );
         }
