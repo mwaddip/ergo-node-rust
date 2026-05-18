@@ -9,6 +9,7 @@ use enr_p2p::types::PeerId;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
+use crate::apply_state_tracker::{record_apply_state_result, ApplyStateFailureTracker};
 use crate::delivery::{DeliveryControl, DeliveryData, DeliveryTracker};
 use enr_chain::{
     StateType, HEADER_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID, EXTENSION_TYPE_ID,
@@ -174,6 +175,13 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     at_tip_request_tx: Option<tokio::sync::oneshot::Sender<u32>>,
     /// At-tip transition: oneshot to receive the rebuilt validator.
     at_tip_validator_rx: Option<tokio::sync::oneshot::Receiver<V>>,
+    /// Tracks consecutive same-height same-kind `apply_state`
+    /// failures. When 5 are seen in a row, the contract
+    /// `validation_stuck` event is emitted so operators (and the
+    /// Doctor adapter) can see the silent retry loop. Reset on any
+    /// Ok outcome or change of `(height, error_kind)`. See
+    /// [`crate::apply_state_tracker`].
+    apply_state_failure_tracker: Option<ApplyStateFailureTracker>,
 }
 
 impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync<T, C, S, V> {
@@ -226,6 +234,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             last_flush_height,
             at_tip_request_tx: None,
             at_tip_validator_rx: None,
+            apply_state_failure_tracker: None,
         }
     }
 
@@ -803,6 +812,13 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
 
             match result {
                 Ok(outcome) => {
+                    // Successful apply ends any stuck-retry window.
+                    record_apply_state_result(
+                        &mut self.apply_state_failure_tracker,
+                        height,
+                        None,
+                    );
+
                     // If this was an epoch-boundary block, apply the new parameters
                     // and proposed-update bytes to chain state atomically. The
                     // validator already verified they match expected.
@@ -893,7 +909,19 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     }
                 }
                 Err(e) => {
-                    tracing::error!(height, error = %e, "apply_state failed");
+                    let err_msg = e.to_string();
+                    // Update the consecutive-failure tracker. Emits the
+                    // contract `validation_stuck` WARN event once the
+                    // same (height, error_kind) has failed 5 times in a
+                    // row — surfaces the silent retry loop that
+                    // otherwise stays buried under ERROR-per-sweep
+                    // noise.
+                    record_apply_state_result(
+                        &mut self.apply_state_failure_tracker,
+                        height,
+                        Some(&err_msg),
+                    );
+                    tracing::error!(height, error = %err_msg, "apply_state failed");
                     break;
                 }
             }

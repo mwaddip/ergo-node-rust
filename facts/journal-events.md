@@ -1,6 +1,6 @@
 # Journal Events Contract
 
-Version: 1.0.0
+Version: 1.1.0
 
 Stable contract for parseable events in the node's structured log
 output. Consumers (e.g. the Ergo Node Doctor adapter) write parsers
@@ -202,6 +202,22 @@ phase's `_started`.
 - **Emitted:** for every block that advances the validated tip. High
   frequency during sync, low frequency at tip. Adapters may sample
   rather than process every line.
+
+#### `validation_stuck`
+- **Level:** WARN
+- **Marker:** `"validation stuck"`
+- **Fields:** `height` (u64), `attempts` (u64), `error_kind` (string),
+  `missing_key` (string: hex, optional — present when `error_kind`
+  is `missing_key`)
+- **Since:** 1.1
+- **Stability:** stable
+- **Emitted:** when `apply_state` fails the same way on the same
+  height for `attempts >= 5` consecutive sweeps. Surfaces the silent
+  retry loop that previously buried this kind of state-DB
+  inconsistency in INFO-level logs. The Doctor adapter treats this
+  as a primary "node stuck" signal. Emitted at most once per height;
+  re-emits when the height changes or after a recovery resets the
+  counter.
 
 #### `deep_reorg_succeeded`
 - **Level:** INFO
