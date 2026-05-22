@@ -452,6 +452,15 @@ Chain owns the live instance; consumers query it via `active_parameters()`.
   `height > 0`. Matches JVM's `(height % votingEpochLength == 0)`.
 - **Pure computation**, no chain access. Used by validator and mining task.
 
+### `voting_length() -> u32`
+- **Postcondition**: Returns the voting epoch length for this network.
+  Mainnet: 1024. Testnet: 128.
+- **Pure accessor** over the chain's `VotingConfig`. Used by sync to
+  align the `blocks_to_keep` prune horizon to voting-epoch boundaries
+  so the current epoch's extensions stay intact for parameter
+  recomputation (the storage pruning feature — see
+  `facts/sync.md` "Block Body Retention").
+
 ### Soft-fork lifecycle
 
 The soft-fork machinery uses three reserved param IDs:
