@@ -6,6 +6,7 @@
 pub mod apply_state_tracker;
 pub mod delivery;
 pub mod light_bootstrap;
+mod retention;
 pub mod snapshot;
 mod state;
 mod traits;

@@ -19,6 +19,7 @@ Key method groups:
 |-------|---------|
 | Generic modifiers | `put`, `put_batch`, `get`, `get_id_at`, `contains`, `tip` |
 | Fork-aware headers | `put_header`, `header_ids_at_height`, `header_score`, `best_header_at`, `best_header_tip` |
+| Pruning / retention | `prune_below_height`, `min_height_present` |
 
 ## Header writes go through the fork-aware tables
 

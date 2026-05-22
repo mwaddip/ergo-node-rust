@@ -433,6 +433,17 @@ impl HeaderChain {
         height > 0 && height.is_multiple_of(self.config.voting.voting_length)
     }
 
+    /// Returns the voting epoch length for this network.
+    ///
+    /// Mainnet: 1024. Testnet: 128. Pure accessor over the chain's
+    /// `VotingConfig`; safe to call on an empty chain. Used by sync to
+    /// align the `blocks_to_keep` prune horizon to voting-epoch
+    /// boundaries so the current epoch's extensions stay intact for
+    /// parameter recomputation.
+    pub fn voting_length(&self) -> u32 {
+        self.config.voting.voting_length
+    }
+
     /// Register a callback for loading raw extension bytes by height.
     ///
     /// Required before [`Self::recompute_active_parameters_from_storage`]

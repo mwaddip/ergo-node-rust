@@ -496,6 +496,12 @@ mod tests {
             *self.installed.lock().unwrap() = Some((suffix_head, suffix_tail));
             Ok(())
         }
+
+        async fn voting_length(&self) -> u32 {
+            // Light bootstrap doesn't drive the prune horizon, but the
+            // trait surface requires this accessor.
+            1024
+        }
     }
 
     fn proof_event(peer: PeerId, body: Vec<u8>) -> ProtocolEvent {
@@ -772,6 +778,7 @@ mod tests {
             async fn install_nipopow_suffix(
                 &self, _h: Header, _t: Vec<Header>,
             ) -> Result<(), ChainError> { unimplemented!() }
+            async fn voting_length(&self) -> u32 { 1024 }
         }
 
         let result = run_light_bootstrap(&mut transport, &PopulatedChain).await;

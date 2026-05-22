@@ -1561,6 +1561,18 @@ mod voting_chain_tests {
     }
 
     #[test]
+    fn voting_length_mainnet() {
+        let chain = HeaderChain::new(ChainConfig::mainnet());
+        assert_eq!(chain.voting_length(), 1024);
+    }
+
+    #[test]
+    fn voting_length_testnet() {
+        let chain = HeaderChain::new(testnet_config());
+        assert_eq!(chain.voting_length(), 128);
+    }
+
+    #[test]
     fn count_votes_in_epoch_uniform_voting() {
         // Build 128 testnet headers each voting [1, 0, 0]
         let chain = build_chain_with_votes(128, [1, 0, 0]);

@@ -150,6 +150,35 @@ pub trait ModifierStore: Send + Sync {
         entries: &[([u8; 32], Vec<u8>)],
     ) -> Result<(), Self::Error>;
 
+    /// Delete all modifier rows of the given `type_ids` at heights strictly
+    /// less than `horizon`. Atomic in a single redb write transaction.
+    /// Idempotent — calling twice with the same horizon is a no-op the
+    /// second time. Returns the count of `(type_id, modifier_id)` pairs
+    /// deleted.
+    ///
+    /// Precondition: `type_ids` is non-empty and contains no 101 (headers
+    /// are never pruned). Returns Err if `type_ids` contains 101.
+    ///
+    /// Used by sync's flush_pair to delete non-header section bodies
+    /// (102 BlockTransactions, 104 ADProofs, 108 Extension) older than
+    /// the `blocks_to_keep`-derived horizon.
+    fn prune_below_height(
+        &self,
+        horizon: u32,
+        type_ids: &[u8],
+    ) -> Result<usize, Self::Error>;
+
+    /// Returns the lowest height present in HEIGHT_INDEX for `type_id`,
+    /// or None if no entries exist for that type. Mirror of `tip(type_id)`.
+    /// Single forward range query, O(log N).
+    ///
+    /// For `type_id == 101` routes to BEST_CHAIN's lowest entry (same
+    /// pattern as `tip(101)` routing to `best_header_tip`).
+    fn min_height_present(
+        &self,
+        type_id: u8,
+    ) -> Result<Option<u32>, Self::Error>;
+
     /// Read a value from the chain_meta table.
     ///
     /// Tiny key-value store inside the modifier store, used for

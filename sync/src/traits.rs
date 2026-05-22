@@ -48,6 +48,34 @@ pub trait SyncStore {
     /// Fsync outstanding modifier writes. Paired with validator flushes so
     /// state and modifier stores advance durably together.
     fn flush(&self) -> impl std::future::Future<Output = ()> + Send;
+
+    /// Delete modifier rows of the given `type_ids` at heights `< horizon`.
+    /// Returns the count of `(type_id, modifier_id)` pairs deleted on
+    /// success, or a stringified error on failure.
+    ///
+    /// PRECONDITION: `type_ids` does not contain 101 (headers are never
+    /// pruned — the store rejects this combination). Pruning is atomic
+    /// within a single redb write transaction; failure leaves the store
+    /// untouched.
+    ///
+    /// Used by sync's flush_pair to enforce `blocks_to_keep` retention.
+    /// See `../facts/sync.md` § "Block Body Retention" and
+    /// `../facts/store.md` for the underlying contract.
+    fn prune_below_height(
+        &self,
+        horizon: u32,
+        type_ids: &[u8],
+    ) -> impl std::future::Future<Output = Result<usize, String>> + Send;
+
+    /// Return the lowest height present in HEIGHT_INDEX for `type_id`, or
+    /// `None` if no entry exists. Wraps a stringified error.
+    ///
+    /// Used by sync's startup WARN to detect when the on-disk archive
+    /// holds bodies older than the configured retention horizon.
+    fn min_height_present(
+        &self,
+        type_id: u8,
+    ) -> impl std::future::Future<Output = Result<Option<u32>, String>> + Send;
 }
 
 /// How the sync machine sends messages and observes the network.
@@ -104,6 +132,13 @@ pub trait SyncChain {
         &self,
         height: u32,
     ) -> impl std::future::Future<Output = bool> + Send;
+
+    /// Voting epoch length for this network (mainnet: 1024, testnet: 128).
+    /// Used by sync to align the `blocks_to_keep` prune horizon to voting-
+    /// epoch boundaries so the current epoch's extensions stay intact for
+    /// `recompute_active_parameters_from_storage`. Pure accessor over the
+    /// chain's `VotingConfig`.
+    fn voting_length(&self) -> impl std::future::Future<Output = u32> + Send;
 
     /// Compute the parameters that the block at `epoch_boundary_height` MUST emit
     /// in its extension. Used by the validator at epoch-boundary blocks to verify

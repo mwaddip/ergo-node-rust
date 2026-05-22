@@ -102,6 +102,55 @@ pub(crate) async fn complete_store_flush_pair<S: SyncStore>(
     store.flush().await;
 }
 
+/// Prune section bodies (102, 104, 108) at heights `< horizon` derived from
+/// `blocks_to_keep` and the just-flushed height. Non-fatal: errors are
+/// logged at WARN and the next flush retries with the same (idempotent)
+/// horizon. No-op when `blocks_to_keep < 0` (archival mode) or when the
+/// computed horizon is 0 (chain hasn't grown past the retention window).
+///
+/// See `../facts/sync.md` § "Pruning at flush time".
+pub(crate) async fn maybe_prune_at_horizon<S: SyncStore, C: SyncChain>(
+    store: &S,
+    chain: &C,
+    flushed_height: u32,
+    blocks_to_keep: i32,
+) {
+    if blocks_to_keep < 0 {
+        return;
+    }
+    let voting_length = chain.voting_length().await;
+    let horizon = crate::retention::compute_prune_horizon(
+        flushed_height,
+        blocks_to_keep as u32,
+        voting_length,
+    );
+    if horizon == 0 {
+        return;
+    }
+    match store
+        .prune_below_height(
+            horizon,
+            &[
+                BLOCK_TRANSACTIONS_TYPE_ID,
+                AD_PROOFS_TYPE_ID,
+                EXTENSION_TYPE_ID,
+            ],
+        )
+        .await
+    {
+        Ok(n) => tracing::debug!(
+            pruned = n,
+            horizon,
+            "pruned modifier rows"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            horizon,
+            "prune failed; next flush will retry"
+        ),
+    }
+}
+
 /// Timing configuration for the sync state machine.
 /// Built from the P2P network config by the main crate.
 pub struct SyncConfig {
@@ -164,6 +213,15 @@ pub struct SyncConfig {
     /// See ../facts/sync.md "Cross-DB Durability Handshake" §
     /// Configuration for the policy this knob controls.
     pub reconciliation_trust_threshold: u32,
+    /// Block-body retention horizon. `-1` (default) means "no pruning, full
+    /// archival." `>= 0` enables pruning of non-header section bodies
+    /// (102 BlockTransactions, 104 ADProofs, 108 Extension) older than the
+    /// retention horizon at each flush_pair, and caps the flush dial's
+    /// min/max guardrails at `blocks_to_keep` so crash recovery never
+    /// needs bodies that pruning has deleted.
+    ///
+    /// See ../facts/sync.md § "Block Body Retention".
+    pub blocks_to_keep: i32,
 }
 
 impl Default for SyncConfig {
@@ -192,6 +250,10 @@ impl Default for SyncConfig {
             synced_flush_min_blocks: None,
             flush_probe: None,
             reconciliation_trust_threshold: 100,
+            // -1 preserves the pre-pruning default (full archival). Main
+            // crate overrides from the node config's `blocks_to_keep` knob
+            // when the operator opts in.
+            blocks_to_keep: -1,
         }
     }
 }
@@ -369,11 +431,19 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     /// 4. If no probe is configured OR threshold is 0, the policy degenerates
     ///    to "flush every `flush_max_blocks`" via rule (1).
     fn should_flush(&self, height: u32) -> bool {
+        // Apply the `blocks_to_keep` cap to the dial's min/max guardrails so
+        // the validated-to-tip gap can never exceed what pruning retains.
+        // See `../facts/sync.md` § "Flush dial cap".
+        let (effective_min, effective_max) = crate::retention::effective_flush_bounds(
+            self.config.blocks_to_keep,
+            self.config.flush_min_blocks,
+            self.config.flush_max_blocks,
+        );
         let since_last = height.saturating_sub(self.last_flush_height);
-        if since_last >= self.config.flush_max_blocks {
+        if since_last >= effective_max {
             return true;
         }
-        if since_last < self.config.flush_min_blocks {
+        if since_last < effective_min {
             return false;
         }
         if self.config.flush_heap_threshold_mb == 0 {
@@ -383,6 +453,54 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         match self.config.flush_probe.as_ref() {
             Some(probe) => probe() >= threshold_bytes,
             None => false,
+        }
+    }
+
+    /// One-shot startup advisory: WARN if the on-disk archive holds
+    /// section bodies older than the `blocks_to_keep`-derived retention
+    /// horizon. Points the operator at `sharpen prune` for explicit
+    /// reclamation. No-op when `blocks_to_keep <= 0` (full archival or
+    /// flush-every-block — nothing to reclaim) or in light mode (no
+    /// validator means no validated_height to anchor against, and no
+    /// bodies on disk to begin with).
+    ///
+    /// See `../facts/sync.md` § "Startup WARN (lazy migration)".
+    ///
+    /// `&mut self` (not `&self`) is load-bearing for the call site in
+    /// `run_inner`: `Validator` holds `Rc<RefCell<…>>` (the AVL prover)
+    /// and is `!Sync`, so any `async fn(&self)` on `HeaderSync` produces
+    /// a non-`Send` future (`&Self: Send` requires `Self: Sync`).
+    /// `tokio::spawn` in the host's main.rs needs `Send`. Mirroring
+    /// `run` / `run_inner`'s `&mut self` keeps the spawned future
+    /// `Send`. The body doesn't actually mutate state.
+    async fn maybe_warn_reclaimable_bodies(&mut self) {
+        if self.config.blocks_to_keep <= 0 {
+            return;
+        }
+        let validator_height = match self.validator.as_ref() {
+            Some(v) => v.validated_height(),
+            None => return,
+        };
+        let Ok(Some(actual_min)) = self
+            .store
+            .min_height_present(BLOCK_TRANSACTIONS_TYPE_ID)
+            .await
+        else {
+            return;
+        };
+        let voting_length = self.chain.voting_length().await;
+        let configured_horizon = crate::retention::compute_prune_horizon(
+            validator_height,
+            self.config.blocks_to_keep as u32,
+            voting_length,
+        );
+        if actual_min < configured_horizon {
+            let reclaimable = configured_horizon - actual_min;
+            let blocks_to_keep = self.config.blocks_to_keep;
+            tracing::warn!(
+                "{reclaimable} historical blocks reclaimable; \
+                 run `sharpen prune --keep={blocks_to_keep}` to free disk"
+            );
         }
     }
 
@@ -481,6 +599,13 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 self.store.flush().await;
             }
         }
+
+        // Startup WARN: surface bodies older than the configured retention
+        // horizon so the operator knows to run `sharpen prune` to reclaim
+        // disk. Self-correcting: after the first prune sweep the gap
+        // closes on its own. Skipped in light mode (no bodies on disk to
+        // begin with). See `../facts/sync.md` § "Startup WARN".
+        self.maybe_warn_reclaimable_bodies().await;
 
         loop {
             // Phase 1: wait for outbound peers (skip if already targeting one)
@@ -593,6 +718,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         tracing::info!(height, "header sync exiting — flushing state");
         let outcome = try_flush_validator(self.validator.as_ref(), height);
         complete_store_flush_pair(outcome, &self.store).await;
+        if let FlushOutcome::Flushed(m) = outcome {
+            maybe_prune_at_horizon(&self.store, &self.chain, m, self.config.blocks_to_keep).await;
+        }
         if outcome.advances_last_flush() {
             self.last_flush_height = height;
         }
@@ -1050,6 +1178,15 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     if self.should_flush(height) {
                         let outcome = try_flush_validator(self.validator.as_ref(), height);
                         complete_store_flush_pair(outcome, &self.store).await;
+                        if let FlushOutcome::Flushed(m) = outcome {
+                            maybe_prune_at_horizon(
+                                &self.store,
+                                &self.chain,
+                                m,
+                                self.config.blocks_to_keep,
+                            )
+                            .await;
+                        }
                         if outcome.advances_last_flush() {
                             self.last_flush_height = height;
                         }
@@ -1115,6 +1252,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         let outcome =
             try_flush_validator(self.validator.as_ref(), self.state_applied_height);
         complete_store_flush_pair(outcome, &self.store).await;
+        if let FlushOutcome::Flushed(m) = outcome {
+            maybe_prune_at_horizon(&self.store, &self.chain, m, self.config.blocks_to_keep).await;
+        }
         if outcome.advances_last_flush() {
             self.last_flush_height = self.state_applied_height;
         }
@@ -1873,6 +2013,20 @@ mod cross_db_flush_tests {
         async fn flush(&self) {
             self.calls.lock().unwrap().push(StoreCall::Flush);
         }
+
+        async fn prune_below_height(
+            &self,
+            _horizon: u32,
+            _type_ids: &[u8],
+        ) -> Result<usize, String> {
+            // Cross-DB flush tests run with blocks_to_keep = -1 (default),
+            // so the prune path is gated off and this is never called.
+            unreachable!("prune_below_height not exercised by cross-DB flush tests")
+        }
+
+        async fn min_height_present(&self, _type_id: u8) -> Result<Option<u32>, String> {
+            unreachable!("min_height_present not exercised by cross-DB flush tests")
+        }
     }
 
     /// Fake BlockValidator with a controllable flush result. Other trait
@@ -2064,6 +2218,20 @@ mod shutdown_flush_tests {
         async fn flush(&self) {
             self.calls.lock().unwrap().push(StoreCall::Flush);
         }
+
+        async fn prune_below_height(
+            &self,
+            _horizon: u32,
+            _type_ids: &[u8],
+        ) -> Result<usize, String> {
+            // Shutdown-flush tests run with default SyncConfig
+            // (blocks_to_keep = -1) so pruning is gated off.
+            unreachable!("prune_below_height not exercised by shutdown-flush tests")
+        }
+
+        async fn min_height_present(&self, _type_id: u8) -> Result<Option<u32>, String> {
+            unreachable!("min_height_present not exercised by shutdown-flush tests")
+        }
     }
 
     /// Tracks `flush()` invocations so the test can assert exactly-once.
@@ -2233,6 +2401,13 @@ mod shutdown_flush_tests {
         ) -> Result<(), ChainError> {
             unreachable!("not called when state_type=Utxo")
         }
+
+        async fn voting_length(&self) -> u32 {
+            // Default SyncConfig has blocks_to_keep = -1 → prune/WARN
+            // gates skip the chain call. Returns a sensible mainnet value
+            // for completeness in case the gating ever shifts.
+            1024
+        }
     }
 
     fn build_sync(
@@ -2339,6 +2514,608 @@ mod shutdown_flush_tests {
             vec![StoreCall::Flush],
             "shutdown without a validator records no validated_height \
              but still flushes the store"
+        );
+    }
+}
+
+#[cfg(test)]
+mod blocks_to_keep_tests {
+    //! Tests for the `blocks_to_keep` retention wiring:
+    //! - `maybe_prune_at_horizon` calls `prune_below_height` with the
+    //!   correct horizon (raw or voting-epoch-aligned) after a flush_pair.
+    //! - Negative `blocks_to_keep` skips pruning entirely.
+    //! - Startup WARN fires once when on-disk bodies precede the
+    //!   configured horizon, and stays silent otherwise.
+    //!
+    //! See `../facts/sync.md` § "Block Body Retention".
+    use super::*;
+    use enr_chain::{ChainError, SyncInfo};
+    use ergo_chain_types::{ADDigest, Header};
+    use ergo_validation::{
+        ApplyStateOutcome, BlockValidator, Parameters, ValidationError,
+    };
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// Mock store recording prune + min_height calls in addition to the
+    /// flush-pair calls. Tests assert on the recorded sequence.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum StoreCall {
+        SetValidatedHeight(u32),
+        Flush,
+        PruneBelowHeight { horizon: u32, type_ids: Vec<u8> },
+    }
+
+    struct MockStore {
+        calls: Mutex<Vec<StoreCall>>,
+        /// Value to return from `min_height_present(102)`.
+        min_block_txs_height: Mutex<Option<u32>>,
+    }
+
+    impl MockStore {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                min_block_txs_height: Mutex::new(None),
+            }
+        }
+
+        fn with_min_block_txs(min_height: u32) -> Self {
+            let s = Self::new();
+            *s.min_block_txs_height.lock().unwrap() = Some(min_height);
+            s
+        }
+
+        fn calls(&self) -> Vec<StoreCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl SyncStore for MockStore {
+        async fn has_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> bool {
+            unreachable!("not called when chain_height=0")
+        }
+
+        async fn get_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> Option<Vec<u8>> {
+            unreachable!("not called in blocks_to_keep tests")
+        }
+
+        async fn script_verified_height(&self) -> Option<u32> {
+            None
+        }
+
+        async fn set_script_verified_height(&self, _height: u32) {
+            unreachable!("not called when script_verified_height returns None")
+        }
+
+        async fn validated_height(&self) -> Option<u32> {
+            None
+        }
+
+        async fn set_validated_height(&self, height: u32) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(StoreCall::SetValidatedHeight(height));
+        }
+
+        async fn flush(&self) {
+            self.calls.lock().unwrap().push(StoreCall::Flush);
+        }
+
+        async fn prune_below_height(
+            &self,
+            horizon: u32,
+            type_ids: &[u8],
+        ) -> Result<usize, String> {
+            self.calls.lock().unwrap().push(StoreCall::PruneBelowHeight {
+                horizon,
+                type_ids: type_ids.to_vec(),
+            });
+            Ok(0)
+        }
+
+        async fn min_height_present(
+            &self,
+            type_id: u8,
+        ) -> Result<Option<u32>, String> {
+            if type_id == BLOCK_TRANSACTIONS_TYPE_ID {
+                Ok(*self.min_block_txs_height.lock().unwrap())
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    struct FakeValidator {
+        validated_height: u32,
+        digest: ADDigest,
+    }
+
+    impl FakeValidator {
+        fn at(height: u32) -> Self {
+            Self {
+                validated_height: height,
+                digest: ADDigest::zero(),
+            }
+        }
+    }
+
+    impl BlockValidator for FakeValidator {
+        fn apply_state(
+            &mut self,
+            _header: &Header,
+            _block_txs: &[u8],
+            _ad_proofs: Option<&[u8]>,
+            _extension: &[u8],
+            _preceding_headers: &[Header],
+            _active_params: &Parameters,
+            _expected_boundary_params: Option<&Parameters>,
+            _expected_proposed_update: Option<&[u8]>,
+        ) -> Result<ApplyStateOutcome, ValidationError> {
+            unreachable!("not called in blocks_to_keep tests")
+        }
+
+        fn validated_height(&self) -> u32 {
+            self.validated_height
+        }
+
+        fn current_digest(&self) -> &ADDigest {
+            &self.digest
+        }
+
+        fn reset_to(&mut self, _height: u32, _digest: ADDigest) {
+            unreachable!("not called in blocks_to_keep tests")
+        }
+
+        fn flush(&self) -> Result<(), ValidationError> {
+            Ok(())
+        }
+    }
+
+    struct HangingTransport;
+
+    impl SyncTransport for HangingTransport {
+        async fn send_to(
+            &self,
+            _peer: PeerId,
+            _message: ProtocolMessage,
+        ) -> Result<(), Box<dyn std::error::Error + Send>> {
+            unreachable!()
+        }
+
+        async fn outbound_peers(&self) -> Vec<PeerId> {
+            Vec::new()
+        }
+
+        async fn next_event(&mut self) -> Option<ProtocolEvent> {
+            std::future::pending().await
+        }
+    }
+
+    /// Chain at height 0 (so the startup tip-scan skips), with a
+    /// configurable voting_length so tests can pick mainnet (1024) or
+    /// small custom values without re-spinning a real `HeaderChain`.
+    struct FixedVotingLengthChain {
+        voting_length: u32,
+    }
+
+    impl SyncChain for FixedVotingLengthChain {
+        async fn chain_height(&self) -> u32 {
+            0
+        }
+
+        async fn build_sync_info(&self) -> Vec<u8> {
+            unreachable!()
+        }
+
+        async fn header_at(&self, _height: u32) -> Option<Header> {
+            unreachable!()
+        }
+
+        async fn header_state_root(&self, _height: u32) -> Option<[u8; 33]> {
+            unreachable!()
+        }
+
+        fn parse_sync_info(&self, _body: &[u8]) -> Result<SyncInfo, ChainError> {
+            unreachable!()
+        }
+
+        async fn active_parameters(&self) -> Parameters {
+            unreachable!()
+        }
+
+        async fn is_epoch_boundary(&self, _height: u32) -> bool {
+            unreachable!()
+        }
+
+        async fn compute_expected_parameters(
+            &self,
+            _epoch_boundary_height: u32,
+            _block_proposed_update: &[u8],
+        ) -> Result<Parameters, ChainError> {
+            unreachable!()
+        }
+
+        async fn apply_epoch_boundary_parameters(
+            &self,
+            _params: Parameters,
+            _proposed_update_bytes: Vec<u8>,
+        ) {
+            unreachable!()
+        }
+
+        async fn active_proposed_update_bytes(&self) -> Vec<u8> {
+            unreachable!()
+        }
+
+        async fn verify_nipopow_envelope(
+            &self,
+            _envelope_body: &[u8],
+        ) -> Result<Vec<Header>, ChainError> {
+            unreachable!()
+        }
+
+        async fn is_better_nipopow(
+            &self,
+            _this: &[u8],
+            _than: &[u8],
+        ) -> Result<bool, ChainError> {
+            unreachable!()
+        }
+
+        async fn install_nipopow_suffix(
+            &self,
+            _suffix_head: Header,
+            _suffix_tail: Vec<Header>,
+        ) -> Result<(), ChainError> {
+            unreachable!()
+        }
+
+        async fn voting_length(&self) -> u32 {
+            self.voting_length
+        }
+    }
+
+    fn build_sync(
+        config: SyncConfig,
+        validator: Option<FakeValidator>,
+        store: MockStore,
+        chain: FixedVotingLengthChain,
+        shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> HeaderSync<HangingTransport, FixedVotingLengthChain, MockStore, FakeValidator> {
+        let (_progress_tx, progress_rx) = mpsc::channel(1);
+        let (_dc_tx, delivery_control_rx) = mpsc::unbounded_channel::<DeliveryControl>();
+        let (_dd_tx, delivery_data_rx) = mpsc::channel::<DeliveryData>(1);
+        HeaderSync::new(
+            config,
+            HangingTransport,
+            chain,
+            store,
+            validator,
+            progress_rx,
+            delivery_control_rx,
+            delivery_data_rx,
+            None,
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(0)),
+            shutdown_rx,
+        )
+    }
+
+    fn config_with_keep(blocks_to_keep: i32) -> SyncConfig {
+        SyncConfig {
+            blocks_to_keep,
+            ..SyncConfig::default()
+        }
+    }
+
+    fn last_prune_call(calls: &[StoreCall]) -> Option<(u32, Vec<u8>)> {
+        calls.iter().rev().find_map(|c| match c {
+            StoreCall::PruneBelowHeight { horizon, type_ids } => {
+                Some((*horizon, type_ids.clone()))
+            }
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn prune_called_with_raw_horizon_when_flushed_below_voting_length() {
+        // blocks_to_keep=50, validator at 1000, voting_length=1024.
+        // raw = 1000 - 50 + 1 = 951; 951 <= 1024 → no alignment.
+        // The shutdown_flush path runs validator.flush() then triggers
+        // prune via maybe_prune_at_horizon.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut sync = build_sync(
+            config_with_keep(50),
+            Some(FakeValidator::at(1000)),
+            MockStore::new(),
+            FixedVotingLengthChain { voting_length: 1024 },
+            shutdown_rx,
+        );
+
+        shutdown_tx.send(()).unwrap();
+        sync.run().await;
+
+        let calls = sync.store.calls();
+        let (horizon, type_ids) =
+            last_prune_call(&calls).expect("prune_below_height should be called once on shutdown");
+        assert_eq!(horizon, 951, "raw horizon = flushed - keep + 1");
+        assert_eq!(
+            type_ids,
+            vec![
+                BLOCK_TRANSACTIONS_TYPE_ID,
+                AD_PROOFS_TYPE_ID,
+                EXTENSION_TYPE_ID,
+            ],
+            "prune MUST target only section bodies — never headers (101)"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_horizon_pulled_back_to_voting_epoch_start_mid_epoch() {
+        // blocks_to_keep=50, validator at 2500, voting_length=1024.
+        // raw = 2451 > 1024 → epoch_start = (2451/1024)*1024 = 2048.
+        // raw.min(epoch_start) = 2048 → retains the current epoch.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut sync = build_sync(
+            config_with_keep(50),
+            Some(FakeValidator::at(2500)),
+            MockStore::new(),
+            FixedVotingLengthChain { voting_length: 1024 },
+            shutdown_rx,
+        );
+
+        shutdown_tx.send(()).unwrap();
+        sync.run().await;
+
+        let calls = sync.store.calls();
+        let (horizon, _) = last_prune_call(&calls).expect("prune should be called");
+        assert_eq!(
+            horizon, 2048,
+            "raw horizon 2451 pulled back to voting-epoch start 2048 so extensions stay intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_prune_when_blocks_to_keep_negative() {
+        // blocks_to_keep=-1 (archival) — pruning gate closed; the prune
+        // call must not appear in the store's call log.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut sync = build_sync(
+            config_with_keep(-1),
+            Some(FakeValidator::at(1000)),
+            MockStore::new(),
+            FixedVotingLengthChain { voting_length: 1024 },
+            shutdown_rx,
+        );
+
+        shutdown_tx.send(()).unwrap();
+        sync.run().await;
+
+        assert!(
+            last_prune_call(&sync.store.calls()).is_none(),
+            "blocks_to_keep < 0 MUST NOT call prune_below_height"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_prune_when_validator_flush_fails() {
+        // Validator.flush() failure → FlushOutcome::Failed → no prune.
+        // Pruning is gated on a successful flush so we never delete bodies
+        // covering the gap between state.redb's persisted height and the
+        // (failed) attempted flush height.
+        struct FailingValidator(FakeValidator);
+
+        impl BlockValidator for FailingValidator {
+            fn apply_state(
+                &mut self,
+                _h: &Header,
+                _bt: &[u8],
+                _ap: Option<&[u8]>,
+                _e: &[u8],
+                _ph: &[Header],
+                _p: &Parameters,
+                _bp: Option<&Parameters>,
+                _pu: Option<&[u8]>,
+            ) -> Result<ApplyStateOutcome, ValidationError> {
+                unreachable!()
+            }
+            fn validated_height(&self) -> u32 {
+                self.0.validated_height
+            }
+            fn current_digest(&self) -> &ADDigest {
+                &self.0.digest
+            }
+            fn reset_to(&mut self, _h: u32, _d: ADDigest) {
+                unreachable!()
+            }
+            fn flush(&self) -> Result<(), ValidationError> {
+                Err(ValidationError::ProofVerificationFailed("nope".into()))
+            }
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (_progress_tx, progress_rx) = mpsc::channel(1);
+        let (_dc_tx, delivery_control_rx) = mpsc::unbounded_channel::<DeliveryControl>();
+        let (_dd_tx, delivery_data_rx) = mpsc::channel::<DeliveryData>(1);
+        let mut sync = HeaderSync::<
+            HangingTransport,
+            FixedVotingLengthChain,
+            MockStore,
+            FailingValidator,
+        >::new(
+            config_with_keep(50),
+            HangingTransport,
+            FixedVotingLengthChain { voting_length: 1024 },
+            MockStore::new(),
+            Some(FailingValidator(FakeValidator::at(1000))),
+            progress_rx,
+            delivery_control_rx,
+            delivery_data_rx,
+            None,
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(0)),
+            shutdown_rx,
+        );
+
+        shutdown_tx.send(()).unwrap();
+        sync.run().await;
+
+        assert!(
+            last_prune_call(&sync.store.calls()).is_none(),
+            "failed validator.flush() MUST NOT trigger prune"
+        );
+    }
+
+    // ----- startup WARN capture -----
+
+    #[derive(Clone, Default)]
+    struct CaptureWriter {
+        buf: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CaptureWriter {
+        fn captured(&self) -> String {
+            String::from_utf8(self.buf.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl io::Write for CaptureWriter {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.buf.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    // Takes the future directly rather than a closure so the caller can
+    // pass `sync.maybe_warn_reclaimable_bodies()` — a future borrowing
+    // `&mut sync` — without wrapping it in `move || async move {…}` to
+    // satisfy capture rules. The subscriber's `_guard` outlives the
+    // `await`, so emits from the future are captured.
+    async fn capture_warn<Fut>(f: Fut) -> String
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
+        let writer = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        f.await;
+        drop(_guard);
+        writer.captured()
+    }
+
+    #[tokio::test]
+    async fn startup_warn_fires_when_archive_predates_horizon() {
+        // blocks_to_keep=100, validator at 1000, voting_length=1024.
+        // configured_horizon = 1000 - 100 + 1 = 901 (raw, no alignment
+        // since 901 <= 1024).
+        // Pre-populate min_height_present(102) = 1, so the archive
+        // extends 900 blocks below the horizon.
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut sync = build_sync(
+            config_with_keep(100),
+            Some(FakeValidator::at(1000)),
+            MockStore::with_min_block_txs(1),
+            FixedVotingLengthChain { voting_length: 1024 },
+            shutdown_rx,
+        );
+
+        let output = capture_warn(sync.maybe_warn_reclaimable_bodies()).await;
+
+        assert!(
+            output.contains("900 historical blocks reclaimable"),
+            "expected reclaimable count = 901 - 1 = 900 in output: {output}"
+        );
+        assert!(
+            output.contains("sharpen prune --keep=100"),
+            "WARN must include sharpen prune invocation: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_warn_silent_when_archive_already_pruned() {
+        // Archive's min is at the horizon already — no reclaimable bodies.
+        // configured_horizon = 1000 - 100 + 1 = 901; min = 901 → silent.
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut sync = build_sync(
+            config_with_keep(100),
+            Some(FakeValidator::at(1000)),
+            MockStore::with_min_block_txs(901),
+            FixedVotingLengthChain { voting_length: 1024 },
+            shutdown_rx,
+        );
+
+        let output = capture_warn(sync.maybe_warn_reclaimable_bodies()).await;
+
+        assert!(
+            !output.contains("reclaimable"),
+            "no WARN expected when archive min equals configured_horizon: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_warn_skipped_when_blocks_to_keep_negative() {
+        // Archival mode (blocks_to_keep = -1) → no advisory; archive is
+        // the intended state.
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut sync = build_sync(
+            config_with_keep(-1),
+            Some(FakeValidator::at(1000)),
+            MockStore::with_min_block_txs(1),
+            FixedVotingLengthChain { voting_length: 1024 },
+            shutdown_rx,
+        );
+
+        let output = capture_warn(sync.maybe_warn_reclaimable_bodies()).await;
+
+        assert!(
+            !output.contains("reclaimable"),
+            "blocks_to_keep < 0 MUST suppress the startup WARN: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_warn_skipped_in_light_mode() {
+        // No validator (light mode) → no validator height to anchor
+        // against, and no bodies on disk to begin with. The advisory is a
+        // no-op.
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut sync = build_sync(
+            config_with_keep(100),
+            None,
+            MockStore::with_min_block_txs(1),
+            FixedVotingLengthChain { voting_length: 1024 },
+            shutdown_rx,
+        );
+
+        let output = capture_warn(sync.maybe_warn_reclaimable_bodies()).await;
+
+        assert!(
+            !output.contains("reclaimable"),
+            "light mode MUST suppress the startup WARN: {output}"
         );
     }
 }

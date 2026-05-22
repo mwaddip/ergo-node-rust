@@ -167,6 +167,10 @@ impl SyncChain for SharedChain {
         }
         Ok(())
     }
+
+    async fn voting_length(&self) -> u32 {
+        self.chain.lock().await.voting_length()
+    }
 }
 
 /// Wraps `Arc<RedbModifierStore>` to implement `SyncStore`.
@@ -320,6 +324,45 @@ impl SyncStore for SharedStore {
         .await
         {
             tracing::error!(?e, height, "spawn_blocking panicked: set_validated_height");
+        }
+    }
+
+    async fn prune_below_height(
+        &self,
+        horizon: u32,
+        type_ids: &[u8],
+    ) -> Result<usize, String> {
+        let store = self.store.clone();
+        let type_ids = type_ids.to_vec();
+        match tokio::task::spawn_blocking(move || {
+            store
+                .prune_below_height(horizon, &type_ids)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(?e, horizon, "spawn_blocking panicked: prune_below_height");
+                Err(format!("spawn_blocking panicked: {e}"))
+            }
+        }
+    }
+
+    async fn min_height_present(&self, type_id: u8) -> Result<Option<u32>, String> {
+        let store = self.store.clone();
+        match tokio::task::spawn_blocking(move || {
+            store
+                .min_height_present(type_id)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(?e, type_id, "spawn_blocking panicked: min_height_present");
+                Err(format!("spawn_blocking panicked: {e}"))
+            }
         }
     }
 }

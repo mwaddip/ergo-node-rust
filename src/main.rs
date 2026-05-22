@@ -2017,6 +2017,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         synced_flush_min_blocks: node_config.synced_flush_min_blocks,
         flush_probe,
         reconciliation_trust_threshold: node_config.reconciliation_trust_threshold,
+        // Mirror the handshake's Light-mode override (line above) — in Light
+        // there are no bodies to prune anyway, so 0 keeps sync/pruning + the
+        // wire advertisement consistent.
+        blocks_to_keep: if state_type == StateType::Light { 0 } else { blocks_to_keep as i32 },
         ..SyncConfig::default()
     };
 

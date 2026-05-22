@@ -104,6 +104,11 @@ pub enum StoreError {
     /// walks BEST_CHAIN, which is invariant-consistent with PRIMARY,
     /// so this signals a caller bug.
     HeaderNotInPrimary([u8; 32]),
+    /// `prune_below_height` was called with `type_ids` containing 101.
+    /// Headers are never pruned — they live in the fork-aware tables
+    /// and their retention is governed by the chain layer, not the
+    /// blocks_to_keep horizon.
+    HeaderPruneForbidden,
 }
 
 impl std::fmt::Display for StoreError {
@@ -129,6 +134,10 @@ impl std::fmt::Display for StoreError {
                 }
                 write!(f, " not present in PRIMARY")
             }
+            Self::HeaderPruneForbidden => write!(
+                f,
+                "prune_below_height: type_ids must not contain 101 (headers are never pruned)"
+            ),
         }
     }
 }
@@ -143,7 +152,8 @@ impl std::error::Error for StoreError {
             Self::Commit(e) => Some(e),
             Self::SingleHeaderPutForbidden
             | Self::ScoreRequiredForHeader
-            | Self::HeaderNotInPrimary(_) => None,
+            | Self::HeaderNotInPrimary(_)
+            | Self::HeaderPruneForbidden => None,
         }
     }
 }
@@ -282,13 +292,8 @@ impl RedbModifierStore {
             Err(e) => return Err(StoreError::Table(e)),
         };
         // Keys are u32 sorted ascending; last entry is the tip.
-        let result = match table.last()? {
-            Some((key_guard, value_guard)) => {
-                Some((key_guard.value(), value_guard.value()))
-            }
-            None => None,
-        };
-        Ok(result)
+        let last = table.last()?;
+        Ok(last.map(|(key_guard, value_guard)| (key_guard.value(), value_guard.value())))
     }
 
     /// Migrates headers from HEIGHT_INDEX (type_id=101) to the new fork-aware tables.
@@ -715,6 +720,110 @@ impl ModifierStore for RedbModifierStore {
         }
         write_txn.commit()?;
         Ok(())
+    }
+
+    fn prune_below_height(
+        &self,
+        horizon: u32,
+        type_ids: &[u8],
+    ) -> Result<usize, Self::Error> {
+        // Headers (type_id=101) are never pruned. They live in the
+        // fork-aware tables and their retention is governed elsewhere;
+        // the blocks_to_keep horizon applies only to non-header section
+        // bodies. Caller bug if 101 slips in — mirrors how
+        // SingleHeaderPutForbidden / ScoreRequiredForHeader / etc. flag
+        // contract violations through a typed Err.
+        if type_ids.contains(&101) {
+            return Err(StoreError::HeaderPruneForbidden);
+        }
+
+        // Empty type_ids or zero horizon: nothing can satisfy the
+        // predicate `t ∈ type_ids ∧ h < horizon`. Skip the write txn
+        // entirely so a fresh DB doesn't get HEIGHT_INDEX/PRIMARY
+        // auto-created by a no-op call.
+        if type_ids.is_empty() || horizon == 0 {
+            return Ok(0);
+        }
+
+        let mut write_txn = self.db.begin_write()?;
+        // See `put_batch` — Durability::None; the sync loop pairs
+        // pruning with the surrounding flush_pair's explicit flush.
+        write_txn
+            .set_durability(Durability::None)
+            .expect("set_durability on fresh txn");
+        write_txn.set_quick_repair(true);
+
+        let count = {
+            let mut height_idx = match write_txn.open_table(HEIGHT_INDEX) {
+                Ok(t) => t,
+                // HEIGHT_INDEX doesn't exist on a brand-new DB and is
+                // auto-created by open_table on a write txn. The Err
+                // arm here is defensive; open_table on a write txn
+                // shouldn't yield TableDoesNotExist in practice.
+                Err(::redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+                Err(e) => return Err(StoreError::Table(e)),
+            };
+            let mut primary = write_txn.open_table(PRIMARY)?;
+
+            // Collect (type_id, height, id) tuples before deleting:
+            // we cannot iterate and remove from the same table reference
+            // simultaneously.
+            let mut to_delete: Vec<(u8, u32, [u8; 32])> = Vec::new();
+            for &t in type_ids {
+                // Exclusive upper bound — heights strictly less than horizon.
+                for entry in height_idx.range((t, 0u32)..(t, horizon))? {
+                    let (key_guard, value_guard) = entry?;
+                    let (_t, h) = key_guard.value();
+                    let id = value_guard.value();
+                    to_delete.push((t, h, id));
+                }
+            }
+
+            for (t, h, id) in &to_delete {
+                primary.remove((*t, *id))?;
+                height_idx.remove((*t, *h))?;
+            }
+
+            to_delete.len()
+        };
+
+        write_txn.commit()?;
+        Ok(count)
+    }
+
+    fn min_height_present(
+        &self,
+        type_id: u8,
+    ) -> Result<Option<u32>, Self::Error> {
+        // Headers (type_id=101) live in the fork-aware tables; the
+        // lowest height is BEST_CHAIN's first entry. Mirrors how
+        // tip(101) routes to best_header_tip.
+        if type_id == 101 {
+            let read_txn = self.db.begin_read()?;
+            let table = match read_txn.open_table(BEST_CHAIN) {
+                Ok(t) => t,
+                Err(::redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(e) => return Err(StoreError::Table(e)),
+            };
+            return Ok(table.first()?.map(|(k, _)| k.value()));
+        }
+
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(HEIGHT_INDEX) {
+            Ok(t) => t,
+            Err(::redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(StoreError::Table(e)),
+        };
+        // Forward range over every height for this type; first entry's
+        // height is the minimum.
+        match table.range((type_id, 0u32)..=(type_id, u32::MAX))?.next() {
+            Some(entry) => {
+                let (key_guard, _value_guard) = entry?;
+                let (_t, height) = key_guard.value();
+                Ok(Some(height))
+            }
+            None => Ok(None),
+        }
     }
 
     fn chain_meta_get(
@@ -2198,5 +2307,201 @@ mod tests {
             "quick-repair commits {qr_on_ms}ms vs baseline {qr_off_ms}ms \
              — surprising slowdown"
         );
+    }
+
+    // --- prune_below_height + min_height_present: pruning support for
+    //     the sync layer's blocks_to_keep horizon. ---
+
+    /// Helper for the prune tests: insert a non-header modifier at the
+    /// given (type_id, height) with a deterministic id derived from the
+    /// pair. Returns the id so callers can re-derive it for assertions.
+    fn put_section(store: &RedbModifierStore, type_id: u8, height: u32) -> [u8; 32] {
+        let mut id = [0u8; 32];
+        id[0] = type_id;
+        id[1..5].copy_from_slice(&height.to_be_bytes());
+        store
+            .put_batch(&[(type_id, id, height, format!("d{type_id}_{height}").into_bytes(), None)])
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn prune_below_height_removes_matching_rows_and_leaves_others() {
+        let (store, _dir) = test_store();
+
+        // Type 102 entries at heights 10, 20, 30, 40.
+        let id_102_10 = put_section(&store, 102, 10);
+        let id_102_20 = put_section(&store, 102, 20);
+        let id_102_30 = put_section(&store, 102, 30);
+        let id_102_40 = put_section(&store, 102, 40);
+        // Type 104 entries at heights 15, 25 — different type, lives or dies
+        // independently from type 102.
+        let id_104_15 = put_section(&store, 104, 15);
+        let id_104_25 = put_section(&store, 104, 25);
+        // Type 108 entry at height 5 — outside the requested type_ids slice,
+        // must NOT be pruned even though height < horizon.
+        let id_108_5 = put_section(&store, 108, 5);
+
+        // Prune types 102 and 104 below height 25. Expected: heights 10, 20
+        // for type 102 and height 15 for type 104 are removed. Higher heights
+        // and type 108 stay.
+        let removed = store.prune_below_height(25, &[102, 104]).unwrap();
+        assert_eq!(removed, 3, "expected 3 deletions (102@10, 102@20, 104@15)");
+
+        // Removed rows: PRIMARY and HEIGHT_INDEX both empty.
+        assert_eq!(store.get(102, &id_102_10).unwrap(), None);
+        assert_eq!(store.get(102, &id_102_20).unwrap(), None);
+        assert_eq!(store.get_id_at(102, 10).unwrap(), None);
+        assert_eq!(store.get_id_at(102, 20).unwrap(), None);
+        assert_eq!(store.get(104, &id_104_15).unwrap(), None);
+        assert_eq!(store.get_id_at(104, 15).unwrap(), None);
+
+        // Boundary: height == horizon is NOT pruned (strict less-than).
+        assert!(store.get(104, &id_104_25).unwrap().is_some());
+        assert_eq!(store.get_id_at(104, 25).unwrap(), Some(id_104_25));
+
+        // Higher heights of the requested types untouched.
+        assert!(store.get(102, &id_102_30).unwrap().is_some());
+        assert!(store.get(102, &id_102_40).unwrap().is_some());
+        assert_eq!(store.get_id_at(102, 30).unwrap(), Some(id_102_30));
+        assert_eq!(store.get_id_at(102, 40).unwrap(), Some(id_102_40));
+
+        // Type 108 — not in type_ids — untouched even though its height (5)
+        // is below the horizon.
+        assert!(store.get(108, &id_108_5).unwrap().is_some());
+        assert_eq!(store.get_id_at(108, 5).unwrap(), Some(id_108_5));
+    }
+
+    #[test]
+    fn prune_below_height_is_idempotent() {
+        let (store, _dir) = test_store();
+
+        put_section(&store, 102, 1);
+        put_section(&store, 102, 2);
+        put_section(&store, 102, 3);
+
+        // First call deletes 1 and 2.
+        let first = store.prune_below_height(3, &[102]).unwrap();
+        assert_eq!(first, 2);
+
+        // Second call: rows already gone, returns 0 with no error.
+        let second = store.prune_below_height(3, &[102]).unwrap();
+        assert_eq!(second, 0);
+
+        // The surviving entry at height 3 is still there.
+        assert!(store.get_id_at(102, 3).unwrap().is_some());
+    }
+
+    #[test]
+    fn prune_below_height_rejects_type_ids_containing_101() {
+        let (store, _dir) = test_store();
+        // Put a header so we can verify it's still here afterwards.
+        let header_id = test_id(1);
+        store
+            .put_batch(&[(101, header_id, 5, b"hdr".to_vec(), s())])
+            .unwrap();
+        // And a non-header so the type_ids slice is non-empty alongside 101.
+        let bt_id = put_section(&store, 102, 3);
+
+        let err = store.prune_below_height(10, &[101, 102]).unwrap_err();
+        assert!(
+            matches!(err, StoreError::HeaderPruneForbidden),
+            "expected HeaderPruneForbidden, got {err:?}"
+        );
+
+        // Nothing was deleted — atomic rejection before any writes.
+        assert_eq!(store.get(101, &header_id).unwrap(), Some(b"hdr".to_vec()));
+        assert_eq!(store.best_header_at(5).unwrap(), Some(header_id));
+        assert!(store.get(102, &bt_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn prune_below_height_on_empty_store_returns_zero() {
+        let (store, _dir) = test_store();
+
+        // Fresh store — HEIGHT_INDEX/PRIMARY tables may not even exist yet.
+        // No entries can possibly satisfy the predicate, so we get Ok(0)
+        // with no error.
+        let removed = store.prune_below_height(100, &[102, 104, 108]).unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn min_height_present_on_empty_store_returns_none() {
+        let (store, _dir) = test_store();
+
+        assert_eq!(store.min_height_present(102).unwrap(), None);
+        assert_eq!(store.min_height_present(104).unwrap(), None);
+        assert_eq!(store.min_height_present(108).unwrap(), None);
+        // Header route: BEST_CHAIN doesn't exist yet either.
+        assert_eq!(store.min_height_present(101).unwrap(), None);
+    }
+
+    #[test]
+    fn min_height_present_on_single_entry_returns_that_height() {
+        let (store, _dir) = test_store();
+
+        put_section(&store, 102, 42);
+        assert_eq!(store.min_height_present(102).unwrap(), Some(42));
+        // Other types still return None.
+        assert_eq!(store.min_height_present(104).unwrap(), None);
+    }
+
+    #[test]
+    fn min_height_present_returns_smallest_with_multiple_entries() {
+        let (store, _dir) = test_store();
+
+        // Insert in non-ascending order to ensure we're querying, not
+        // tracking insert order.
+        put_section(&store, 102, 100);
+        put_section(&store, 102, 5);
+        put_section(&store, 102, 50);
+        put_section(&store, 102, 25);
+
+        assert_eq!(store.min_height_present(102).unwrap(), Some(5));
+    }
+
+    #[test]
+    fn min_height_present_after_prune_returns_new_minimum() {
+        let (store, _dir) = test_store();
+
+        for h in [3u32, 7, 11, 19, 23] {
+            put_section(&store, 102, h);
+        }
+        assert_eq!(store.min_height_present(102).unwrap(), Some(3));
+
+        // Prune below height 12 — removes 3, 7, 11. The remaining minimum is 19.
+        let removed = store.prune_below_height(12, &[102]).unwrap();
+        assert_eq!(removed, 3);
+        assert_eq!(store.min_height_present(102).unwrap(), Some(19));
+
+        // Prune everything: 19 < 24 and 23 < 24 both go. None left.
+        let removed = store.prune_below_height(24, &[102]).unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(store.min_height_present(102).unwrap(), None);
+    }
+
+    #[test]
+    fn min_height_present_101_returns_best_chain_lowest() {
+        let (store, _dir) = test_store();
+
+        // Write three main-chain headers out of order via put_batch.
+        store
+            .put_batch(&[
+                (101, test_id(3), 30, b"h30".to_vec(), s()),
+                (101, test_id(1), 10, b"h10".to_vec(), s()),
+                (101, test_id(2), 20, b"h20".to_vec(), s()),
+            ])
+            .unwrap();
+
+        // BEST_CHAIN's lowest entry is height 10.
+        assert_eq!(store.min_height_present(101).unwrap(), Some(10));
+
+        // Sanity: an out-of-range fork header at height 5 via put_header
+        // (fork=0, first-arrival) lowers the BEST_CHAIN minimum.
+        store
+            .put_header(&test_id(5), 5, 0, &[0x05], b"h5")
+            .unwrap();
+        assert_eq!(store.min_height_present(101).unwrap(), Some(5));
     }
 }
