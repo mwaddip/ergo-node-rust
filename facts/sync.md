@@ -380,6 +380,124 @@ absence at startup is the success signal.
 Doctor and operators get a stable, single-line marker for cross-DB
 drift without parsing free-text log lines.
 
+## Block Body Retention
+
+When `blocks_to_keep >= 0` in the node config, sync prunes non-header
+section bodies (102 BlockTransactions, 104 ADProofs, 108 Extension)
+older than the retention horizon. Headers (101) are never pruned. The
+implementation has three cooperating pieces — pruning at flush time,
+the flush dial cap, and a startup WARN — described below.
+
+`blocks_to_keep = -1` (the default) skips all of this and runs full
+archival.
+
+### Pruning at flush time
+
+The flush_pair's modifier-store write transaction prunes section
+bodies at heights below the retention horizon, in the same atomic
+write transaction as the modifier-store flush bookkeeping:
+
+```rust
+if blocks_to_keep >= 0 {
+    let horizon = compute_prune_horizon(
+        validated_height,
+        blocks_to_keep as u32,
+        chain.voting_length(),
+    );
+    if horizon > 0 {
+        match store.prune_below_height(horizon, &[102, 104, 108]) {
+            Ok(n) => debug!("pruned {n} modifier rows below height {horizon}"),
+            Err(e) => warn!("prune at horizon {horizon} failed: {e}"),
+        }
+    }
+}
+```
+
+Critical detail: horizon is computed against `validated_height`
+(state.redb's just-flushed height), not the chain tip. Bodies in
+`(validated_height, tip]` are always retained, so crash recovery's
+re-apply path is never starved.
+
+`compute_prune_horizon` applies JVM-style voting-epoch alignment: if
+the raw horizon (`flushed - keep + 1`) lands inside a voting epoch,
+it's pulled back to the start of that epoch so the current epoch's
+extensions stay intact for
+`recompute_active_parameters_from_storage`. Matches JVM's
+`FullBlockPruningProcessor.updateBestFullBlock`.
+
+Pruning failure is logged at WARN and does not abort the flush —
+pruning is opportunistic, the next flush retries with the same
+(idempotent) horizon.
+
+### Flush dial cap
+
+When `blocks_to_keep >= 0`, the flush dial's min/max block guardrails
+are capped at `blocks_to_keep`:
+
+```
+effective_min = min(flush_min_blocks_config, blocks_to_keep)
+effective_max = min(flush_max_blocks_config, blocks_to_keep)
+```
+
+This is what makes any `blocks_to_keep` value safe — the
+`validated_height → tip` gap can never exceed `blocks_to_keep`, so
+pruning never deletes bodies still needed by crash recovery.
+
+For `blocks_to_keep = 0`: `effective_max = 0`, meaning every block
+triggers a flush (Durability::Immediate per block, JVM-equivalent
+throughput cost — borne by operators who chose that setting).
+
+The jemalloc memory threshold can still fire flushes earlier — that's
+fine, earlier flush = smaller gap = still within `blocks_to_keep`.
+
+### Startup WARN (lazy migration)
+
+On startup, if `blocks_to_keep > 0` AND the on-disk archive contains
+bodies older than what would be retained going forward, sync emits a
+one-shot WARN pointing at `sharpen prune` for explicit reclamation:
+
+```rust
+if blocks_to_keep > 0 {
+    if let Some(actual_min) = store.min_height_present(102)? {
+        let configured_horizon = compute_prune_horizon(
+            validated_height,
+            blocks_to_keep as u32,
+            chain.voting_length(),
+        );
+        if actual_min < configured_horizon {
+            let reclaimable = configured_horizon - actual_min;
+            warn!(
+                "{reclaimable} historical blocks reclaimable; \
+                 run `sharpen prune --keep={blocks_to_keep}` to free disk"
+            );
+        }
+    }
+}
+```
+
+Self-correcting via derived state: after the first prune sweep,
+`actual_min` advances to `configured_horizon` and the WARN stops
+firing. If the operator later shrinks `blocks_to_keep`, the gap
+re-opens and the WARN fires once on next start.
+
+No `chain_meta` sentinel — source of truth is the store's
+HEIGHT_INDEX (`[[feedback_derive_from_state]]`).
+
+### Reorg interaction
+
+`blocks_to_keep` is independent of reorg safety. Reorgs use peer-
+supplied bodies for the new branch; our archive is never consulted
+during reorg processing. `keep_versions` (state.redb's in-memory
+rollback depth, default 256) remains the relevant rollback constraint
+and is unaffected by pruning.
+
+### Light mode
+
+`state_type = Light` + `blocks_to_keep > 0` is silently ignored.
+Light mode downloads no bodies, so retention is a no-op in that
+mode. No advisory output, no startup warning, no `--checkconfig`
+flag — the operator's knob is in a dead-end code path in that mode.
+
 ## Graceful shutdown
 
 When the host process receives SIGTERM/SIGINT, `HeaderSync::run()` MUST
