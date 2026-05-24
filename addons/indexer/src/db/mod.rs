@@ -48,7 +48,7 @@ pub async fn open_db(url: &str) -> Result<Arc<dyn IndexerDb>> {
     #[cfg(feature = "sqlite")]
     {
         let db = sqlite::SqliteDb::open(url)?;
-        return Ok(Arc::new(db));
+        Ok(Arc::new(db))
     }
     #[cfg(not(feature = "sqlite"))]
     anyhow::bail!("No database backend enabled — build with --features sqlite or --features postgres");

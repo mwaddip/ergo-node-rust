@@ -14,12 +14,14 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::db::IndexerDb;
+use crate::node_client::NodeClient;
 
 #[derive(Clone)]
 pub struct ApiContext {
     pub db: Arc<dyn IndexerDb>,
     pub start_time: Instant,
     pub node_url: String,
+    pub node_client: Arc<NodeClient>,
 }
 
 #[derive(OpenApi)]
@@ -33,6 +35,7 @@ pub struct ApiContext {
         transactions::get_transaction,
         transactions::get_address_transactions,
         boxes::get_box_by_id,
+        boxes::get_box_bytes,
         boxes::get_address_balance,
         boxes::get_address_unspent,
         boxes::get_address_boxes,
@@ -58,6 +61,8 @@ pub struct ApiContext {
         crate::types::NetworkStats,
         crate::types::DailyStats,
         crate::types::IndexerInfo,
+        boxes::BoxBytesResponse,
+        boxes::BoxBytesError,
     ))
 )]
 struct ApiDoc;
@@ -68,10 +73,12 @@ pub async fn serve(
     start_time: Instant,
     node_url: String,
 ) -> anyhow::Result<()> {
+    let node_client = Arc::new(NodeClient::new(&node_url)?);
     let ctx = ApiContext {
         db,
         start_time,
         node_url,
+        node_client,
     };
 
     let app = Router::new()
@@ -105,6 +112,7 @@ fn api_routes() -> Router<ApiContext> {
         )
         // Boxes
         .route("/boxes/{box_id}", get(boxes::get_box_by_id))
+        .route("/boxes/{box_id}/bytes", get(boxes::get_box_bytes))
         .route(
             "/addresses/{address}/balance",
             get(boxes::get_address_balance),

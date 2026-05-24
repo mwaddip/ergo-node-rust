@@ -4,6 +4,7 @@ use serde::Deserialize;
 
 use crate::types::NodeInfo;
 
+#[derive(Clone)]
 pub struct NodeClient {
     client: Client,
     base_url: String,
@@ -30,7 +31,6 @@ pub struct PowSolutions {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockTransactionsJson {
-    pub header_id: String,
     pub transactions: Vec<serde_json::Value>,
 }
 
