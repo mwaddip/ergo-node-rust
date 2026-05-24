@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.6.4 — 2026-05-24
+
+Storage pruning, two new endpoints for external validation
+harnesses, and a sigma-rust pin bump.
+
+### `blocks_to_keep` storage pruning
+
+The `blocks_to_keep` config setting now honors its name. Default
+`-1` skips pruning (full archive, unchanged behavior). With a
+non-negative value, sync prunes non-header block sections (102
+BlockTransactions, 104 ADProofs, 108 Extension) older than the
+retention horizon at flush time. Headers (101) are never pruned.
+The flush dial's min/max guardrails cap at `blocks_to_keep` so the
+`validated_height → tip` gap can never exceed what archived bodies
+cover, making crash recovery safe at any retention setting.
+
+### New endpoint: `GET /blocks/{id}/validation-fragments`
+
+Per-block canonical-byte view returning `headerBytes`,
+`parameters` (from Extension), and per-tx `signingMessage`
+(`Transaction::bytes_to_sign()`). Designed for external tools that
+need byte-exact equivalence with the node's internal representation
+— e.g. cross-validating an independent serializer against the
+reference. Stateless w.r.t. UTXO state; serves any block at any
+node uptime.
+
+### New indexer endpoint: `GET /api/v1/boxes/{box_id}/bytes`
+
+Returns canonical `ErgoBox::sigma_serialize_bytes` for any indexed
+box, spent or unspent. Hash-verified (`blake2b256(bytes) ==
+box_id`) before serving. Counterpart to the node endpoint above —
+together they let an external harness reproduce per-block
+validation client-side, with the indexer owning historical box
+data and the node owning current chain state.
+
+### Indexer service: lenient restart policy
+
+Systemd unit changed from `Restart=always` to
+`Restart=on-failure` with `StartLimitBurst=3` /
+`StartLimitIntervalSec=60`. Deterministic failures (e.g. SQLite
+constraint violations from reorg-handling debt) now stop after 3
+attempts in 60s instead of looping forever and filling the
+journal.
+
+### sigma-rust pin bump
+
+`3aa0832f` → `fbcdc9bd`. Picks up a fix for a latent panic in
+`wrap_spanned_with_src` when `reduce_to_crypto` produces a
+non-Spanned `EvalError` variant. Production-safe (parse-time
+type-checking prevents the triggering variants from real scripts),
+but fuzzers and external reduce-helper code could previously hit
+it.
+
 ## v0.6.3 — 2026-05-18
 
 Graceful shutdown — `systemctl stop` now persists in-memory state

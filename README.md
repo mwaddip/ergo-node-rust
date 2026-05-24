@@ -27,7 +27,7 @@ Optional binaries:
 | Addon | What |
 |-------|------|
 | **fastsync** | Fast bootstrap via JVM peer REST API; parallel multi-peer fetching. Auto-spawns at startup if installed. |
-| **indexer** | SQLite transaction/box indexer with 18 REST endpoints and Swagger UI (port 9054). |
+| **indexer** | SQLite transaction/box indexer with 19 REST endpoints and Swagger UI (port 9054). |
 
 ## Architecture
 
@@ -59,7 +59,7 @@ Optional binaries:
 | `store/` | Persistent storage for headers, blocks, modifiers |
 | `mempool/` | Transaction pool, replace-by-fee, family weighting |
 | `mining/` | Candidate assembly, emission tx, PoW validation |
-| `api/` | REST API (axum), 38 endpoints |
+| `api/` | REST API (axum), 39 endpoints |
 | `facts/` | Per-component contract markdown |
 
 Components communicate through traits — the P2P layer doesn't know what validation means, and the validation layer doesn't know about networking.
