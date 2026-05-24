@@ -223,7 +223,7 @@ is required.
 
 ```jsonc
 {
-  "headerBytes": "<hex>",                        // Header::sigma_serialize
+  "headerBytes": "<hex>",                        // header.scorex_serialize_bytes() — Header impls ScorexSerializable, not SigmaSerializable. Blake2b256 of these bytes IS the header id.
   "parameters": {                                // From Extension parameter encoding
     "maxBlockCost": 1000000
   } | null,                                       // null when Extension parse fails
