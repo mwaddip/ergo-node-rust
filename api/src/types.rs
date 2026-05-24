@@ -167,3 +167,60 @@ pub struct ComponentMemory {
     pub mempool_tx_count: u32,
 }
 
+/// `GET /blocks/{headerId}/validation-fragments` response.
+///
+/// Index-aligned with `/blocks/{headerId}`: `transactions[i]` here pairs
+/// with `transactions[i]` there, and within each tx, `inputs[j]` pairs
+/// with `transactions[i].inputs[j]`. Clients walk both responses in
+/// parallel and pair by index — no id-based lookup required.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidationFragments {
+    /// Canonical block header bytes, hex-encoded. The byte sequence whose
+    /// blake2b256 is the header id.
+    pub header_bytes: String,
+    /// Parameters parsed from the block's extension. `None` (serialized as
+    /// `null`) when the extension's parameter-vote encoding fails to parse —
+    /// most commonly for very early v1 blocks. Never substituted with
+    /// `Parameters::default()`; the client owns the fallback policy.
+    pub parameters: Option<ValidationFragmentsParameters>,
+    pub transactions: Vec<ValidationFragmentsTx>,
+}
+
+/// Parameters subset surfaced by validation-fragments — only the field the
+/// harness compares directly. Add fields here only when an external consumer
+/// needs them, not speculatively.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidationFragmentsParameters {
+    pub max_block_cost: i32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidationFragmentsTx {
+    /// `Transaction::bytes_to_sign()` hex-encoded — inputs without
+    /// proofs/extensions, then data-inputs, then outputs concatenated. NOT
+    /// the full canonical tx bytes. This is what every input's signature
+    /// commits to.
+    pub signing_message: String,
+    pub inputs: Vec<ValidationFragmentsInput>,
+}
+
+/// Per-input oracle (script evaluation) result.
+///
+/// `oracle_cost` is RAW JitCost (the `u64` the interpreter accumulates),
+/// NOT block cost. Block cost is `jit_cost / 10`. The harness compares
+/// `oracle_cost` directly against its own raw JitCost.
+///
+/// `oracle_cost` is populated whether the evaluation succeeded or failed —
+/// sigma-rust preserves accumulated cost through error returns, so a
+/// non-zero cost alongside `oracle_succeeded: false` is normal.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidationFragmentsInput {
+    pub oracle_cost: u64,
+    pub oracle_succeeded: bool,
+    pub oracle_error: Option<String>,
+}
+

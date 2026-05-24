@@ -241,6 +241,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/blocks/{header_id}", get(handlers::get_full_block))
         .route("/blocks/{header_id}/header", get(handlers::get_block_header))
         .route("/blocks/{header_id}/transactions", get(handlers::get_block_transactions))
+        .route(
+            "/blocks/{header_id}/validation-fragments",
+            get(handlers::get_block_validation_fragments),
+        )
         // Transactions
         .route("/transactions", post(handlers::post_transaction))
         .route("/transactions/check", post(handlers::check_transaction))
