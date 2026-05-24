@@ -1486,14 +1486,6 @@ async fn popow_header_response(
 // GET /blocks/{header_id}/validation-fragments
 // ---------------------------------------------------------------------------
 
-/// Per-input box id as `[u8; 32]`, matching the lookup key used by
-/// `UtxoAccess::box_by_id` and the intra-block map below.
-fn box_id_bytes(box_id: &ergo_lib::ergotree_ir::chain::ergo_box::BoxId) -> [u8; 32] {
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(box_id.as_ref());
-    arr
-}
-
 /// Build the validation-fragments JSON error body the contract specifies.
 /// This is NOT the standard JVM `ApiError` shape used elsewhere — the
 /// harness keys off `error` as a short code string, not an HTTP status code.
@@ -1535,11 +1527,9 @@ pub async fn get_block_validation_fragments(
         )
     })?;
 
-    // Canonical header bytes. The contract names this `Header::sigma_serialize`
-    // but the only impl on `Header` is `ScorexSerializable` — that's the same
-    // canonical byte sequence whose blake2b256 IS the header id, which is
-    // what the harness compares against. See completion report for the
-    // contract-wording note.
+    // Canonical header bytes. Header impls ScorexSerializable, not
+    // SigmaSerializable — these are the bytes whose blake2b256 IS the
+    // header id.
     let header_bytes = header.scorex_serialize_bytes().map_err(|e| {
         vf_err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1569,7 +1559,7 @@ pub async fn get_block_validation_fragments(
 
     // Parameters: from the block's extension, NOT current chain parameters.
     // Null on any failure along the path (extension missing, parse error,
-    // no parameter fields, etc.). Per contract pitfall #4.
+    // no parameter fields, etc.). Per contract pitfall #2.
     let ext_modifier_id =
         section_modifier_id(EXTENSION_TYPE, &id, header.extension_root.0.as_ref());
     let parameters = state
@@ -1581,113 +1571,10 @@ pub async fn get_block_validation_fragments(
             max_block_cost: p.max_block_cost(),
         });
 
-    // Build the state context for oracle_cost evaluation. Walk parent_id
-    // backwards for up to 10 preceding headers (matching what
-    // build_state_context expects); contract pitfall #5 mandates the
-    // parent-link walk over direct `header_at` lookups.
-    let mut preceding: Vec<ergo_chain_types::Header> = Vec::with_capacity(10);
-    let mut cur_parent = header.parent_id;
-    for _ in 0..10 {
-        match state.chain.header_by_id(&cur_parent.0.0) {
-            Some(parent) => {
-                cur_parent = parent.parent_id;
-                preceding.push(parent);
-            }
-            None => break,
-        }
-    }
-    if preceding.is_empty() {
-        return Err(vf_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "preceding-headers-unavailable",
-            serde_json::json!({
-                "message": "block has no parent header in chain (cannot build state context)",
-            }),
-        ));
-    }
-
-    // Active parameters for the state context. We use the validator's
-    // CURRENT parameters rather than the queried block's — the validator
-    // exposes only the current ErgoStateContext, and `oracle_cost` only
-    // touches `parameters.max_block_cost()` to cap JIT cost. Parameter
-    // drift between then and now is rare in practice; if a future change
-    // adds historical parameters retrieval, swap it in here.
-    let active_parameters = {
-        let guard = state.state_context.read().await;
-        match guard.as_ref() {
-            Some(ctx) => ctx.parameters.clone(),
-            None => {
-                return Err(vf_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "state-context-unavailable",
-                    serde_json::json!({
-                        "message": "node has not validated any block yet",
-                    }),
-                ));
-            }
-        }
-    };
-
-    let oracle_state_ctx =
-        ergo_validation::build_state_context(&header, &preceding, &active_parameters);
-
-    // Walk transactions: for each tx, collect spent + data-input boxes,
-    // compute signing message, then call oracle_cost per input.
-    //
-    // Intra-block lookups: a later tx in the same block may spend an output
-    // of an earlier tx. We grow a map of outputs-created-so-far and consult
-    // it after the UTXO state misses, mirroring `validate_transactions`.
-    let mut intra_block: std::collections::HashMap<[u8; 32], ergo_validation::ErgoBox> =
-        std::collections::HashMap::new();
+    // Per-tx signing message. Pitfall #1: this is bytes_to_sign(), NOT the
+    // full canonical tx bytes.
     let mut tx_fragments = Vec::with_capacity(parsed_txs.transactions.len());
-
     for tx in &parsed_txs.transactions {
-        // Spent boxes (input order).
-        let mut spent_boxes: Vec<ergo_validation::ErgoBox> = Vec::with_capacity(tx.inputs.len());
-        for input in tx.inputs.iter() {
-            let bid = box_id_bytes(&input.box_id);
-            let bx = state.utxo_reader.box_by_id(&bid).or_else(|| intra_block.get(&bid).cloned());
-            match bx {
-                Some(b) => spent_boxes.push(b),
-                None => {
-                    return Err(vf_err(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "spent-box-unavailable",
-                        serde_json::json!({
-                            "boxId": hex::encode(bid),
-                            "message": "spent box not in current UTXO state and not produced earlier in this block",
-                        }),
-                    ));
-                }
-            }
-        }
-
-        // Data input boxes (if any).
-        let mut data_boxes: Vec<ergo_validation::ErgoBox> = Vec::new();
-        if let Some(data_inputs) = tx.data_inputs.as_ref() {
-            data_boxes.reserve(data_inputs.len());
-            for di in data_inputs.iter() {
-                let bid = box_id_bytes(&di.box_id);
-                let bx =
-                    state.utxo_reader.box_by_id(&bid).or_else(|| intra_block.get(&bid).cloned());
-                match bx {
-                    Some(b) => data_boxes.push(b),
-                    None => {
-                        return Err(vf_err(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "spent-box-unavailable",
-                            serde_json::json!({
-                                "boxId": hex::encode(bid),
-                                "kind": "data-input",
-                                "message": "data-input box not in current UTXO state and not produced earlier in this block",
-                            }),
-                        ));
-                    }
-                }
-            }
-        }
-
-        // signingMessage per contract pitfall #3.
         let signing_message = tx.bytes_to_sign().map_err(|e| {
             vf_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1695,58 +1582,9 @@ pub async fn get_block_validation_fragments(
                 serde_json::json!({ "message": format!("{e}") }),
             )
         })?;
-
-        // Per-input oracle_cost. Pitfalls #1 and #2 are upheld inside the
-        // helper — we pass `cost` through verbatim and always populate
-        // `oracleCost` regardless of the inner Ok/Err.
-        let mut input_fragments = Vec::with_capacity(tx.inputs.len());
-        for idx in 0..tx.inputs.len() {
-            match ergo_validation::oracle_cost(
-                tx,
-                idx,
-                &oracle_state_ctx,
-                &spent_boxes,
-                &data_boxes,
-            ) {
-                Ok((cost, Ok(()))) => input_fragments.push(ValidationFragmentsInput {
-                    oracle_cost: cost,
-                    oracle_succeeded: true,
-                    oracle_error: None,
-                }),
-                Ok((cost, Err(e))) => input_fragments.push(ValidationFragmentsInput {
-                    oracle_cost: cost,
-                    oracle_succeeded: false,
-                    oracle_error: Some(format!("{e}")),
-                }),
-                Err(e) => {
-                    let short = match e {
-                        ergo_validation::OracleCostError::InputIndexOutOfRange { .. } => {
-                            "input-index-out-of-range"
-                        }
-                        ergo_validation::OracleCostError::TransactionContext(_) => {
-                            "tx-context-build-failed"
-                        }
-                    };
-                    return Err(vf_err(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        short,
-                        serde_json::json!({ "message": format!("{e}") }),
-                    ));
-                }
-            }
-        }
-
         tx_fragments.push(ValidationFragmentsTx {
             signing_message: hex::encode(&signing_message),
-            inputs: input_fragments,
         });
-
-        // Record this tx's outputs so a later tx in the same block can
-        // resolve its inputs against them.
-        for output in tx.outputs.iter() {
-            let oid = box_id_bytes(&output.box_id());
-            intra_block.insert(oid, output.clone());
-        }
     }
 
     Ok(Json(ValidationFragments {
@@ -2605,23 +2443,18 @@ mod tests {
     // GET /blocks/{id}/validation-fragments — tests
     //
     // Fixture: a synthetic height-685 block with one P2PK tx (single input).
-    // The P2PK box uses the same constants the validation crate's
-    // oracle_cost helper test uses — bare ProveDlog hits the
-    // EVAL_SIGMA_PROP_CONSTANT fast path (50 raw JitCost).
+    // The endpoint is stateless w.r.t. UTXO state, so the fixture only wires
+    // up chain (target + parent) and a stored block-transactions section.
     // -----------------------------------------------------------------------
 
-    use ergo_validation::ErgoStateContext;
-    use ergo_validation::Parameters as VfParameters;
     use std::collections::HashMap;
 
     /// Bare ProveDlog ErgoTree — same script used by the validation helper's
-    /// inline tests. Reduces via the constant fast path.
+    /// inline tests.
     const VF_P2PK_TREE_HEX: &str =
         "0008cd02d84a11191f434daa5bed70e0e4db4e1563910622ee269f3dc219e0e854e108a5";
     const VF_SRC_TX_HEX: &str =
         "9302a2983d9cc3f2b9e271097aa3128581c6cad8b59f7b6bc3e08fa6cb63ad3f";
-    const VF_MINER_PK_HEX: &str =
-        "02a27f37ca339c25a8ee65cbdb73fe7a7134dd89cd3e7c43e313a92c128859e4f6";
 
     /// Chain mock that resolves multiple headers by id (target + ancestors).
     struct MultiHeaderChain {
@@ -2669,16 +2502,6 @@ mod tests {
         }
     }
 
-    /// UTXO reader mock: returns boxes from a pre-populated map.
-    struct PreloadedUtxo {
-        by_id: HashMap<[u8; 32], ergo_validation::ErgoBox>,
-    }
-    impl UtxoAccess for PreloadedUtxo {
-        fn box_by_id(&self, id: &[u8; 32]) -> Option<ergo_validation::ErgoBox> {
-            self.by_id.get(id).cloned()
-        }
-    }
-
     /// Build a synthetic header at `height` with the given `parent_id`.
     /// Reparses to compute the real `id` from scorex bytes.
     fn make_vf_header(height: u32, parent_id: BlockId) -> Header {
@@ -2709,9 +2532,10 @@ mod tests {
         header
     }
 
-    /// Build a TransactionContext-evaluatable P2PK input box at a stable
-    /// box id derivable from `(src_tx_id, output_index=0)`. Same shape as
-    /// the validation helper's inline tests.
+    /// Build a P2PK input box at a stable box id derivable from
+    /// `(src_tx_id, output_index=0)`. Used to populate the input field of
+    /// the synthetic tx — the box itself doesn't need to live in any UTXO
+    /// store for this endpoint.
     fn make_vf_p2pk_box(value: u64) -> ergo_validation::ErgoBox {
         use ergo_lib::ergotree_ir::chain::ergo_box::{
             box_value::BoxValue, NonMandatoryRegisters,
@@ -2762,36 +2586,16 @@ mod tests {
         ergo_validation::Transaction::new_from_vec(vec![inp], vec![], vec![out]).unwrap()
     }
 
-    /// Build a minimal `ErgoStateContext` with default parameters and a
-    /// throwaway pre-header — only `parameters` is read by the handler.
-    fn make_vf_state_context() -> ErgoStateContext {
-        use ergo_chain_types::PreHeader;
-        let miner_pk = EcPoint::from_base16_str(VF_MINER_PK_HEX.to_string()).unwrap();
-        let pre = PreHeader {
-            version: 1,
-            parent_id: BlockId(Digest32::zero()),
-            timestamp: 1_000_000,
-            n_bits: 100_000,
-            height: 684,
-            miner_pk: Box::new(miner_pk),
-            votes: Votes([0, 0, 0]),
-        };
-        let dummy_header = make_vf_header(684, BlockId(Digest32::zero()));
-        let headers: [Header; 10] = std::array::from_fn(|_| dummy_header.clone());
-        ErgoStateContext::new(pre, headers, VfParameters::default())
-    }
-
-    /// Bundle: returns (state, target_header_id_hex, tx_count, input_count).
-    /// `state` is wired with a target block + parent, single P2PK input box
-    /// preloaded into the UTXO reader, and state_context initialised.
-    fn build_vf_fixture() -> (ApiState, String, usize, usize) {
+    /// Bundle: returns (state, target_header_id_hex, tx_count).
+    /// `state` is wired with a target block + parent and a stored
+    /// block-transactions section containing one P2PK tx.
+    fn build_vf_fixture() -> (ApiState, String, usize) {
         // Parent at h=684, target at h=685 parent_id=parent.id.
         let parent = make_vf_header(684, BlockId(Digest32::zero()));
         let target = make_vf_header(685, parent.id);
 
         let input_box = make_vf_p2pk_box(1_000_000);
         let tx = make_vf_p2pk_tx(&input_box);
-        let input_count = tx.inputs.len();
 
         let txs_bytes = ergo_validation::serialize_block_transactions(
             &target.id.0.0,
@@ -2814,22 +2618,17 @@ mod tests {
         chain_map.insert(target.id.0.0, target.clone());
         chain_map.insert(parent.id.0.0, parent);
 
-        let mut utxo_map = HashMap::new();
-        utxo_map.insert(box_id_bytes(&input_box.box_id()), input_box);
-
         let chain = Arc::new(MultiHeaderChain { by_id: chain_map });
         let mut state = test_state(chain);
         state.store = Arc::new(KeyedStore { by_key: store_map });
-        state.utxo_reader = Arc::new(PreloadedUtxo { by_id: utxo_map });
-        state.state_context = Arc::new(tokio::sync::RwLock::new(Some(make_vf_state_context())));
 
         let target_id_hex = hex::encode(target.id.0.0);
-        (state, target_id_hex, 1, input_count)
+        (state, target_id_hex, 1)
     }
 
     #[test]
     fn validation_fragments_h685() {
-        let (state, target_id_hex, expected_tx_count, expected_input_count) = build_vf_fixture();
+        let (state, target_id_hex, expected_tx_count) = build_vf_fixture();
         let rt = build_runtime();
         let result = rt.block_on(get_block_validation_fragments(
             State(state),
@@ -2841,11 +2640,6 @@ mod tests {
         };
 
         assert_eq!(body.transactions.len(), expected_tx_count, "tx count");
-        assert_eq!(
-            body.transactions[0].inputs.len(),
-            expected_input_count,
-            "input count",
-        );
         // Header bytes hex-encoded — must round-trip back to the same id.
         let header_bytes = hex::decode(&body.header_bytes).expect("hex");
         let reparsed = Header::scorex_parse_bytes(&header_bytes).expect("reparse");
@@ -2855,15 +2649,8 @@ mod tests {
         assert!(!body.transactions[0].signing_message.is_empty());
         hex::decode(&body.transactions[0].signing_message).expect("signingMessage is hex");
 
-        // Pitfall #1/#2: oracleCost is raw JitCost, non-zero, populated
-        // regardless of inner success.
-        let input = &body.transactions[0].inputs[0];
-        assert!(input.oracle_cost > 0, "oracleCost must be > 0, got {}", input.oracle_cost);
-        assert!(input.oracle_succeeded, "P2PK fast path should reduce Ok");
-        assert!(input.oracle_error.is_none());
-
         // parameters is None for this fixture — we never stored an extension
-        // section. Contract pitfall #4 says null on parse failure.
+        // section. Contract pitfall #2 says null on parse failure.
         assert!(body.parameters.is_none());
     }
 
@@ -2889,15 +2676,15 @@ mod tests {
         }
     }
 
-    /// Index alignment: the response's transactions/inputs arity must match
-    /// what would come back from `/blocks/{id}` (= what's actually stored
-    /// in the section). We assert directly against the section we wrote
-    /// rather than spinning a second handler call — the contract is "same
-    /// shape as /blocks/{id}'s transactions", which is parse_block_transactions's
+    /// Index alignment: the response's transactions arity must match what
+    /// would come back from `/blocks/{id}` (= what's actually stored in the
+    /// section). We assert directly against the section we wrote rather
+    /// than spinning a second handler call — the contract is "same length
+    /// as /blocks/{id}'s transactions", which is parse_block_transactions's
     /// output.
     #[test]
     fn validation_fragments_index_alignment() {
-        let (state, target_id_hex, _, _) = build_vf_fixture();
+        let (state, target_id_hex, _) = build_vf_fixture();
         let stored_txs_bytes = state
             .store
             .get(
@@ -2926,12 +2713,5 @@ mod tests {
             parsed.transactions.len(),
             "tx count must match /blocks/{{id}}",
         );
-        for (i, tx) in parsed.transactions.iter().enumerate() {
-            assert_eq!(
-                body.transactions[i].inputs.len(),
-                tx.inputs.len(),
-                "input count for tx {i} must match /blocks/{{id}}",
-            );
-        }
     }
 }

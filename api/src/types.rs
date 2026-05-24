@@ -170,9 +170,8 @@ pub struct ComponentMemory {
 /// `GET /blocks/{headerId}/validation-fragments` response.
 ///
 /// Index-aligned with `/blocks/{headerId}`: `transactions[i]` here pairs
-/// with `transactions[i]` there, and within each tx, `inputs[j]` pairs
-/// with `transactions[i].inputs[j]`. Clients walk both responses in
-/// parallel and pair by index — no id-based lookup required.
+/// with `transactions[i]` there. Clients walk both responses in parallel
+/// and pair by index — no id-based lookup required.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ValidationFragments {
@@ -204,23 +203,5 @@ pub struct ValidationFragmentsTx {
     /// the full canonical tx bytes. This is what every input's signature
     /// commits to.
     pub signing_message: String,
-    pub inputs: Vec<ValidationFragmentsInput>,
-}
-
-/// Per-input oracle (script evaluation) result.
-///
-/// `oracle_cost` is RAW JitCost (the `u64` the interpreter accumulates),
-/// NOT block cost. Block cost is `jit_cost / 10`. The harness compares
-/// `oracle_cost` directly against its own raw JitCost.
-///
-/// `oracle_cost` is populated whether the evaluation succeeded or failed —
-/// sigma-rust preserves accumulated cost through error returns, so a
-/// non-zero cost alongside `oracle_succeeded: false` is normal.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ValidationFragmentsInput {
-    pub oracle_cost: u64,
-    pub oracle_succeeded: bool,
-    pub oracle_error: Option<String>,
 }
 

@@ -206,18 +206,17 @@ Transactions in a block.
 
 #### `GET /blocks/{headerId}/validation-fragments`
 
-Per-block bundle of canonical bytes + sigma-rust-derived costs
-that the existing `/blocks/{headerId}` JSON cannot supply without
-the client re-running serialization. Designed for external
-validation harnesses that need byte-exact equivalence with the
-node's internal representation.
+Per-block bundle of canonical bytes that the existing
+`/blocks/{headerId}` JSON cannot supply without the client
+re-running serialization. Designed for external tools that need
+byte-exact equivalence with the node's internal representation
+(e.g. cross-validating an independent serializer against the
+reference).
 
 The response is index-aligned with the existing `/blocks/{headerId}`
 response — `transactions[i]` in this response pairs with
-`transactions[i]` in `/blocks/{headerId}`, and within each tx,
-`inputs[j]` pairs with `transactions[i].inputs[j]`. Clients walk
-both responses in parallel and pair by index; no id-based lookup
-is required.
+`transactions[i]` in `/blocks/{headerId}`. No id-based lookup is
+required.
 
 **Response 200 (`Content-Type: application/json`):**
 
@@ -229,14 +228,7 @@ is required.
   } | null,                                       // null when Extension parse fails
   "transactions": [
     {
-      "signingMessage": "<hex>",                  // Transaction::bytes_to_sign()
-      "inputs": [
-        {
-          "oracleCost": 50,                        // RAW JitCost; see Pitfalls
-          "oracleSucceeded": true,
-          "oracleError": null                      // string when oracleSucceeded == false
-        }
-      ]
+      "signingMessage": "<hex>"                   // Transaction::bytes_to_sign()
     }
   ]
 }
@@ -248,36 +240,24 @@ is required.
 **Response 410:** block was pruned (`blocks_to_keep` enabled).
 Body: `{"error": "block-pruned", "headerId": "<hex>"}`
 
-**Response 500:** composition failure (e.g., the spent box required
-to evaluate an input cannot be reconstructed). Body:
+**Response 500:** composition failure (e.g., stored transactions
+fail to parse). Body:
 `{"error": "<short-code>", "message": "<diagnostic>"}`
 
-##### Pitfalls (consensus-correctness gates — verify all five)
+##### Pitfalls
 
-1. **`oracleCost` is raw JitCost, NOT block cost.** The value is
-   `ctx.jit_cost_value()` after `reduce_to_crypto` returns. Do NOT
-   substitute `ReductionResult.cost` (which is `jit_cost / 10`).
-   The harness compares this directly against its own raw JitCost.
-
-2. **`oracleCost` is read regardless of Ok/Err return.** sigma-rust
-   preserves the accumulated JitCost through error returns. Read
-   `ctx.jit_cost_value()` after every `reduce_to_crypto`, populate
-   `oracleCost` from it, and only branch on `oracleSucceeded` for
-   `oracleError`. A per-input script failure is a normal bundle
-   field, not an HTTP error.
-
-3. **`signingMessage` is `Transaction::bytes_to_sign()`** — inputs
+1. **`signingMessage` is `Transaction::bytes_to_sign()`** — inputs
    without proofs/extensions, then data-inputs, then outputs,
    concatenated. NOT the full canonical tx bytes. This is what
    every input's signature commits to.
 
-4. **`parameters` is `null` when the Extension's parameter-vote
+2. **`parameters` is `null` when the Extension's parameter-vote
    encoding fails to parse.** Most commonly, very early version-1
    blocks that don't carry the encoding. Do NOT substitute
    `Parameters::default()` server-side; the client knows its own
    fallback policy.
 
-5. **Height resolution must use the parent-link walker.** This
+3. **Height resolution must use the parent-link walker.** This
    endpoint accepts a `headerId`, not a height — but any
    convenience routing that derives a header from a height (e.g.
    `/blocks/at/{h}/validation-fragments` if added later) MUST use
@@ -289,24 +269,30 @@ to evaluate an input cannot be reconstructed). Body:
 
 ##### Source
 
-- `chain` (header bytes, parent_id walk for height resolution)
+- `chain` (header bytes)
 - `store` (block transactions and extension section)
-- `validation` (must expose a per-input `oracle_cost(tx, input_idx,
-  state_ctx) -> (JitCost, Result<(), EvalError>)` helper; the
-  validation crate already runs `reduce_to_crypto` during block
-  validation but does not retain per-input cost — this is a new
-  helper to add as part of implementing this endpoint)
-- `state` (current UTXO state — needed because oracle cost
-  evaluation requires resolving each input's spent box; if the
-  block being queried is older than the validator's resume window,
-  return 500 with `"error": "spent-box-unavailable"`)
+
+This endpoint is stateless with respect to UTXO state — it serves
+purely from chain + stored block sections, so post-restart "no
+validated block yet" conditions never apply.
 
 ##### Companion endpoint (on the indexer addon)
 
-The indexer addon's `GET /api/v1/boxes/{box_id}/bytes` is the
-counterpart to this endpoint — together they provide everything a
-validation harness needs to reproduce node-side block validation
-client-side. See `facts/indexer.md`.
+For tools that also need per-box canonical bytes (e.g. for
+historical input lookups), the indexer addon's
+`GET /api/v1/boxes/{box_id}/bytes` provides those independently.
+See `facts/indexer.md`.
+
+##### History
+
+Initially shipped (commit `73c5153`) with per-input `oracleCost` /
+`oracleSucceeded` / `oracleError` fields powered by per-input
+sigma-rust evaluation against current UTXO state. That design was
+unimplementable: UTXO state doesn't retain spent boxes, so the
+oracle-cost path returned `spent-box-unavailable` for every
+request. Trimmed to the byte-emitting subset which works
+unconditionally. See [[feedback_contract_honor_agreed_splits]] for
+the architectural lesson.
 
 #### `GET /blocks/lastHeaders/{count}`
 
