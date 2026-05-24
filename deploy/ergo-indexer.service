@@ -2,12 +2,14 @@
 Description=Ergo Blockchain Indexer
 After=ergo-node-rust.service
 Wants=ergo-node-rust.service
+StartLimitBurst=3
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple
 User=ergo-node
 ExecStart=/usr/bin/ergo-indexer --node-url http://127.0.0.1:9052 --db /var/lib/ergo-indexer/index.db --bind 0.0.0.0:9054
-Restart=always
+Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=ergo_indexer=info
 
