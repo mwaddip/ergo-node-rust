@@ -1,4 +1,5 @@
 mod digest;
+mod oracle_cost;
 mod sections;
 mod state_changes;
 mod tx_validation;
@@ -10,6 +11,7 @@ use std::collections::HashMap;
 use ergo_chain_types::{ADDigest, Header};
 
 pub use digest::DigestValidator;
+pub use oracle_cost::{oracle_cost, OracleCostError};
 pub use sections::{
     ExtensionField, ParsedAdProofs, ParsedBlockTransactions, ParsedExtension, parse_block_transactions,
     parse_extension, serialize_ad_proofs, serialize_block_transactions, serialize_extension,

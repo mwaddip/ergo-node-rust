@@ -581,7 +581,7 @@ mod block_342964_tests {
                 .unwrap(),
             )
             .unwrap(),
-            tokens: tokens,
+            tokens,
             additional_registers: NonMandatoryRegisters::empty(),
             creation_height: 342_935,
         };
@@ -719,7 +719,7 @@ mod block_342964_tests {
             ergo_tree: ErgoTree::sigma_parse_bytes(&hex::decode(
                 "0008cd02d84a11191f434daa5bed70e0e4db4e1563910622ee269f3dc219e0e854e108a5"
             ).unwrap()).unwrap(),
-            tokens: tokens,
+            tokens,
             additional_registers: NonMandatoryRegisters::empty(),
             creation_height: 342_935,
         };

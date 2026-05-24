@@ -183,6 +183,7 @@ impl UtxoValidator {
     /// state changes to storage. Wrapped by `apply_state` (the trait impl)
     /// to handle rollback-on-failure — call sites should always go through
     /// the trait method.
+    #[allow(clippy::too_many_arguments)]
     fn apply_state_internal(
         &mut self,
         header: &Header,
