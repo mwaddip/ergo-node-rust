@@ -4,8 +4,56 @@ use rusqlite::{params, Connection};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::db::IndexerDb;
+use crate::db::{DbMemoryStats, IndexerDb};
 use crate::types::*;
+
+/// Pragma set applied at connection open. Tuned for an indexer workload
+/// (read-heavy with periodic write bursts during block ingest) against a
+/// multi-GB SQLite file.
+///
+/// - `journal_mode=WAL` — concurrent reader + writer; checkpoint on
+///   commit boundary. Necessary for the writer/reader split below.
+/// - `synchronous=NORMAL` — fsync only at WAL checkpoint, not on every
+///   commit. With WAL this is durable across application crashes (only
+///   power loss can lose the most recent commits). Block-ingest is
+///   idempotent re-runnable, so this is the right tradeoff.
+/// - `foreign_keys=ON` — schema declares FKs; without this they're
+///   silently not enforced.
+/// - `cache_size=-65536` — 64 MiB per connection (negative = KiB). Bumped
+///   from SQLite's 2 MiB default because the hot-path queries
+///   (`get_box_by_id`, `enrich_boxes`) do random-page lookups across a
+///   multi-GB DB; the default cache thrashes under the 100-way fan-out
+///   the validation harness hits the `/boxes/{id}/bytes` endpoint with.
+///   With 2 connections, total in-process cache ceiling is ~128 MiB.
+/// - `mmap_size=268435456` — 256 MiB memory-mapped read window. Reduces
+///   read() syscalls on the hot path. Note: this counts as virtual
+///   address space (`VmSize`), NOT resident memory. Kernel page cache
+///   is shareable across processes — the indexer doesn't carry this
+///   in its own RSS, but tools that read VmSize will see a larger
+///   number. See [[feedback_jemalloc_retained_is_virtual]] for the same
+///   gotcha on the allocator side.
+/// - `temp_store=MEMORY` — temp tables and sort scratch in RAM instead
+///   of /tmp. Helps the `get_balance` / `get_token_holders` joins.
+/// - `busy_timeout=5000` — WAL serializes writers via OS file lock; the
+///   timeout keeps transient `SQLITE_BUSY` from breaking a write when
+///   the checkpoint thread holds the lock briefly. 5 s is conservative;
+///   our writer is single-threaded behind a Mutex so contention is
+///   only from the SQLite checkpointer itself.
+const PRAGMAS_WRITER: &str = "\
+    PRAGMA journal_mode=WAL; \
+    PRAGMA synchronous=NORMAL; \
+    PRAGMA foreign_keys=ON; \
+    PRAGMA cache_size=-65536; \
+    PRAGMA mmap_size=268435456; \
+    PRAGMA temp_store=MEMORY; \
+    PRAGMA busy_timeout=5000;";
+
+const PRAGMAS_READER: &str = "\
+    PRAGMA query_only=ON; \
+    PRAGMA cache_size=-65536; \
+    PRAGMA mmap_size=268435456; \
+    PRAGMA temp_store=MEMORY; \
+    PRAGMA busy_timeout=5000;";
 
 const SCHEMA_VERSION: u32 = 1;
 
@@ -87,9 +135,7 @@ impl SqliteDb {
     pub fn open(path: &str) -> Result<Self> {
         let writer = Connection::open(path)
             .with_context(|| format!("failed to open SQLite at {path}"))?;
-        writer.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
-        )?;
+        writer.execute_batch(PRAGMAS_WRITER)?;
         writer.execute_batch(CREATE_TABLES)?;
 
         writer.execute(
@@ -103,12 +149,27 @@ impl SqliteDb {
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .with_context(|| format!("failed to open read-only SQLite at {path}"))?;
-        reader.execute_batch("PRAGMA query_only=ON;")?;
+        reader.execute_batch(PRAGMAS_READER)?;
 
         Ok(Self {
             writer: Arc::new(Mutex::new(writer)),
             reader: Arc::new(Mutex::new(reader)),
         })
+    }
+
+    /// Read SQLite's view of its own memory footprint via PRAGMAs. Both
+    /// `page_size` and `cache_size` are connection-scoped — values come
+    /// from the reader connection (the writer's are identical post-PRAGMAS).
+    /// On error we return a stats struct with `None` fields rather than
+    /// surface the failure, because this is diagnostic.
+    fn read_sqlite_stats(&self) -> rusqlite::Result<(u64, u64, i64)> {
+        let r = self.reader.try_lock().map_err(|_| {
+            rusqlite::Error::ExecuteReturnedResults
+        })?;
+        let page_size: u64 = r.query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))? as u64;
+        let page_count: u64 = r.query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))? as u64;
+        let cache_size: i64 = r.query_row("PRAGMA cache_size", [], |row| row.get::<_, i64>(0))?;
+        Ok((page_size, page_count, cache_size))
     }
 
     /// Fetch tokens and registers for a list of box rows (enriches the BoxRow).
@@ -335,6 +396,30 @@ impl IndexerDb for SqliteDb {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    async fn memory_stats(&self) -> DbMemoryStats {
+        // Best-effort: failures return zero/None. Don't surface
+        // SQLITE_BUSY noise on the diagnostic endpoint.
+        let (on_disk_bytes, cache_bytes_per_conn) = match self.read_sqlite_stats() {
+            Ok((page_size, page_count, cache_size)) => {
+                let on_disk = page_size.saturating_mul(page_count);
+                // cache_size: negative = absolute KiB, positive = pages.
+                let cache_bytes = if cache_size < 0 {
+                    (cache_size.unsigned_abs()).saturating_mul(1024)
+                } else {
+                    (cache_size as u64).saturating_mul(page_size)
+                };
+                (Some(on_disk), Some(cache_bytes))
+            }
+            Err(_) => (None, None),
+        };
+        DbMemoryStats {
+            backend: "sqlite",
+            on_disk_bytes,
+            cache_bytes_per_conn,
+            connection_count: 2, // writer + reader, see `open`
+        }
     }
 
     async fn rollback_to(&self, height: u64) -> Result<()> {

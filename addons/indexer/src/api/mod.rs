@@ -1,5 +1,6 @@
 pub mod blocks;
 pub mod boxes;
+pub mod debug;
 pub mod stats;
 pub mod tokens;
 pub mod transactions;
@@ -10,6 +11,7 @@ use std::time::Instant;
 
 use axum::Router;
 use serde::Deserialize;
+use tokio::sync::watch;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -47,6 +49,7 @@ pub struct ApiContext {
         stats::get_stats,
         stats::get_daily_stats,
         stats::get_info,
+        debug::get_debug_memory,
     ),
     components(schemas(
         crate::types::BlockRow,
@@ -63,6 +66,10 @@ pub struct ApiContext {
         crate::types::IndexerInfo,
         boxes::BoxBytesResponse,
         boxes::BoxBytesError,
+        debug::DebugMemory,
+        debug::ProcessMemory,
+        debug::JemallocMemory,
+        debug::ComponentMemory,
     ))
 )]
 struct ApiDoc;
@@ -72,6 +79,7 @@ pub async fn serve(
     bind: SocketAddr,
     start_time: Instant,
     node_url: String,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let node_client = Arc::new(NodeClient::new(&node_url)?);
     let ctx = ApiContext {
@@ -88,7 +96,15 @@ pub async fn serve(
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "indexer API listening");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            // `changed()` errors only when the sender is dropped. Either
+            // branch ends the wait — fall through and let axum drain.
+            let _ = shutdown_rx.changed().await;
+            tracing::info!("API shutdown signal received; draining in-flight requests");
+        })
+        .await?;
+    tracing::info!("API stopped");
     Ok(())
 }
 
@@ -138,6 +154,8 @@ fn api_routes() -> Router<ApiContext> {
         .route("/stats", get(stats::get_stats))
         .route("/stats/daily", get(stats::get_daily_stats))
         .route("/info", get(stats::get_info))
+        // Debug
+        .route("/debug/memory", get(debug::get_debug_memory))
 }
 
 #[derive(Deserialize)]

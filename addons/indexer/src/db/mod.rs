@@ -5,6 +5,23 @@ use async_trait::async_trait;
 
 use crate::types::*;
 
+/// Backend-agnostic memory stats surfaced by `/api/v1/debug/memory`.
+///
+/// For SQLite: `cache_bytes` and `on_disk_bytes` are derived from
+/// `PRAGMA cache_size` + `PRAGMA page_size` + `PRAGMA page_count`. For
+/// Postgres: both are `None` because the relevant numbers live server-side.
+pub struct DbMemoryStats {
+    pub backend: &'static str,
+    /// Total file size of the DB on disk. SQLite only.
+    pub on_disk_bytes: Option<u64>,
+    /// Bytes the in-process page cache may hold (per writer connection).
+    /// Indexer holds 2 SQLite connections (writer + reader); double this
+    /// for a worst-case combined cache footprint.
+    pub cache_bytes_per_conn: Option<u64>,
+    /// Number of open DB connections held in-process.
+    pub connection_count: u32,
+}
+
 #[async_trait]
 pub trait IndexerDb: Send + Sync {
     // Write path
@@ -12,6 +29,10 @@ pub trait IndexerDb: Send + Sync {
     async fn get_block_id_at(&self, height: u64) -> Result<Option<Vec<u8>>>;
     async fn insert_block(&self, block: &IndexedBlock) -> Result<()>;
     async fn rollback_to(&self, height: u64) -> Result<()>;
+
+    /// Backend-specific memory footprint snapshot. Best-effort; failure
+    /// falls back to zero/None — this is diagnostic, not load-bearing.
+    async fn memory_stats(&self) -> DbMemoryStats;
 
     // Read path
     async fn get_block_by_height(&self, height: u64) -> Result<Option<BlockRow>>;

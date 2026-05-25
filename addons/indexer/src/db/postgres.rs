@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use sqlx::PgPool;
 
-use crate::db::IndexerDb;
+use crate::db::{DbMemoryStats, IndexerDb};
 use crate::types::*;
 
 type BlockTuple = (i64, Vec<u8>, i64, i64, Vec<u8>, i32, i32);
@@ -472,6 +472,18 @@ impl IndexerDb for PgDb {
         Ok(rows.into_iter().map(|(date, tc, bc, vol)| DailyStats {
             date, tx_count: tc as u64, block_count: bc as u64, volume: vol as u64,
         }).collect())
+    }
+
+    async fn memory_stats(&self) -> DbMemoryStats {
+        // Postgres holds its caches server-side, outside the indexer
+        // process. Surface only what's true at the pool level here;
+        // operators reading the server's `pg_stat_*` views get the rest.
+        DbMemoryStats {
+            backend: "postgres",
+            on_disk_bytes: None,
+            cache_bytes_per_conn: None,
+            connection_count: self.pool.size(),
+        }
     }
 }
 

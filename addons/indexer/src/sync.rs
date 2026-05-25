@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use ergo_lib::ergotree_ir::chain::address::NetworkPrefix;
+use tokio::sync::watch;
 
 use crate::db::IndexerDb;
 use crate::node_client::NodeClient;
@@ -11,6 +12,7 @@ pub async fn run(
     db: Arc<dyn IndexerDb>,
     node_url: &str,
     start_height: Option<u64>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let client = NodeClient::new(node_url)?;
 
@@ -34,19 +36,32 @@ pub async fn run(
 
     // Detect network from node info. The node may be restoring or otherwise
     // unreachable at startup — retry rather than letting systemd respawn us.
+    // Shutdown during startup retry exits immediately; nothing is in flight.
     let max_backoff = std::time::Duration::from_secs(60);
     let mut init_backoff = std::time::Duration::from_secs(5);
     let info = loop {
-        match client.info().await {
-            Ok(info) => break info,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    backoff_secs = init_backoff.as_secs(),
-                    "node unreachable at startup; retrying"
-                );
-                tokio::time::sleep(init_backoff).await;
-                init_backoff = (init_backoff * 2).min(max_backoff);
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                tracing::info!("shutdown during startup; sync exiting");
+                return Ok(());
+            }
+            result = client.info() => match result {
+                Ok(info) => break info,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        backoff_secs = init_backoff.as_secs(),
+                        "node unreachable at startup; retrying"
+                    );
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => {
+                            tracing::info!("shutdown during startup backoff; sync exiting");
+                            return Ok(());
+                        }
+                        _ = tokio::time::sleep(init_backoff) => {}
+                    }
+                    init_backoff = (init_backoff * 2).min(max_backoff);
+                }
             }
         }
     };
@@ -64,6 +79,14 @@ pub async fn run(
     let mut backoff = std::time::Duration::from_secs(1);
 
     loop {
+        // Cheap shutdown check at the top of each outer iteration. Catches
+        // the signal between blocks even if the inner `info_wait` select
+        // arm hasn't fired yet.
+        if *shutdown_rx.borrow() {
+            tracing::info!(last_indexed, "shutdown signal received; sync exiting");
+            return Ok(());
+        }
+
         // Verify our tip is still canonical before waiting for new blocks.
         // Catches reorgs at or below `last_indexed` that the per-target check
         // misses (it only fires on the next height, where `get_block_id_at`
@@ -91,21 +114,44 @@ pub async fn run(
             }
         }
 
-        // Wait for new blocks via long-poll
-        let node_height = match client.info_wait(last_indexed).await {
-            Ok(Some(info)) => info.full_height as u64,
-            Ok(None) => continue, // 204 timeout
-            Err(e) => {
-                tracing::warn!(error = %e, backoff_secs = backoff.as_secs(), "node unreachable");
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(max_backoff);
-                continue;
+        // Wait for new blocks via long-poll. The long-poll is the
+        // longest single await in the loop (~tens of seconds), so it's
+        // also the most important to make cancellable.
+        let node_height = tokio::select! {
+            _ = shutdown_rx.changed() => {
+                tracing::info!(last_indexed, "shutdown during long-poll; sync exiting");
+                return Ok(());
+            }
+            result = client.info_wait(last_indexed) => match result {
+                Ok(Some(info)) => info.full_height as u64,
+                Ok(None) => continue, // 204 timeout
+                Err(e) => {
+                    tracing::warn!(error = %e, backoff_secs = backoff.as_secs(), "node unreachable");
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => {
+                            tracing::info!(last_indexed, "shutdown during backoff; sync exiting");
+                            return Ok(());
+                        }
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff * 2).min(max_backoff);
+                    continue;
+                }
             }
         };
         backoff = std::time::Duration::from_secs(1);
 
         // Index all new blocks
         while last_indexed < node_height {
+            // Check shutdown between each block. We deliberately let any
+            // in-flight `insert_block` finish — its SQLite transaction
+            // is atomic under WAL and rolling back mid-commit would just
+            // re-do the work on next start. Exit before fetching the
+            // next block instead.
+            if *shutdown_rx.borrow() {
+                tracing::info!(last_indexed, "shutdown signal received; sync exiting between blocks");
+                return Ok(());
+            }
             let target = last_indexed + 1;
 
             // Per-target reorg detection — safety net for the `start_height=`
