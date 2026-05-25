@@ -289,6 +289,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/debug/memory", get(handlers::get_debug_memory))
         .route("/debug/p2p-capture/info", get(handlers::get_capture_info))
         .route("/debug/p2p-capture/dump", get(handlers::get_capture_dump))
+        .route("/debug/p2p-capture/reset", post(handlers::post_capture_reset))
         .with_state(state)
 }
 

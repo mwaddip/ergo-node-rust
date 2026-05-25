@@ -1149,6 +1149,43 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+// ---------------------------------------------------------------------------
+// POST /debug/p2p-capture/reset
+// ---------------------------------------------------------------------------
+
+/// Reset the capture ring's write head and bump generation.
+///
+/// 404 when capture is disabled. Returns `{reset, previous_generation,
+/// current_generation}`. We snapshot `generation` via `info()` both
+/// before and after the call so the response shows the exact pair the
+/// trait observed — cheap because post-reset the ring is empty and the
+/// chronological walk inside `info()` exits immediately.
+pub async fn post_capture_reset(State(state): State<ApiState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let capture = match &state.capture {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "capture-disabled" })),
+            )
+                .into_response();
+        }
+    };
+    let previous_generation = capture.info().generation;
+    capture.reset();
+    let current_generation = capture.info().generation;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "reset": true,
+            "previous_generation": previous_generation,
+            "current_generation": current_generation,
+        })),
+    )
+        .into_response()
+}
+
 /// Read anon/file/peak RSS and VmSize from `/proc/self/status`, PSS from
 /// `/proc/self/smaps_rollup`. All fields return 0 on parse failure.
 fn read_proc_memory() -> ProcessMemory {
@@ -2862,15 +2899,17 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use enr_p2p::capture::{CaptureAccess, CaptureInfo, Direction, DumpFilter};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
 
-    /// Test double for `CaptureAccess`. Holds a canned `CaptureInfo` and
-    /// a canned dump byte buffer; counts `reset()` calls and records the
-    /// last `DumpFilter` seen so handler tests can assert query-param
-    /// translation.
+    /// Test double for `CaptureAccess`. The template carries the constant
+    /// fields (path, size, etc.); `generation` is held in an atomic so
+    /// `reset()` can actually advance it — the reset handler verifies
+    /// previous → current and a mock that froze generation would hide
+    /// bugs in the delta logic.
     struct MockCapture {
-        info: CaptureInfo,
+        info_template: CaptureInfo,
+        generation: AtomicU64,
         dump_bytes: Vec<u8>,
         reset_count: AtomicUsize,
         last_filter: StdMutex<Option<DumpFilter>>,
@@ -2879,15 +2918,15 @@ mod tests {
     impl CaptureAccess for MockCapture {
         fn info(&self) -> CaptureInfo {
             CaptureInfo {
-                enabled: self.info.enabled,
-                path: self.info.path.clone(),
-                size_mb: self.info.size_mb,
-                write_head: self.info.write_head,
-                generation: self.info.generation,
-                oldest_ts: self.info.oldest_ts.clone(),
-                newest_ts: self.info.newest_ts.clone(),
-                filter_mode: self.info.filter_mode,
-                filter_count: self.info.filter_count,
+                enabled: self.info_template.enabled,
+                path: self.info_template.path.clone(),
+                size_mb: self.info_template.size_mb,
+                write_head: self.info_template.write_head,
+                generation: self.generation.load(Ordering::SeqCst),
+                oldest_ts: self.info_template.oldest_ts.clone(),
+                newest_ts: self.info_template.newest_ts.clone(),
+                filter_mode: self.info_template.filter_mode,
+                filter_count: self.info_template.filter_count,
             }
         }
         fn dump(&self, filter: &DumpFilter) -> Vec<u8> {
@@ -2896,6 +2935,7 @@ mod tests {
         }
         fn reset(&self) {
             self.reset_count.fetch_add(1, Ordering::SeqCst);
+            self.generation.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -2914,8 +2954,10 @@ mod tests {
     }
 
     fn mock_with_info(info: CaptureInfo) -> Arc<MockCapture> {
+        let gen = info.generation;
         Arc::new(MockCapture {
-            info,
+            info_template: info,
+            generation: AtomicU64::new(gen),
             dump_bytes: Vec::new(),
             reset_count: AtomicUsize::new(0),
             last_filter: StdMutex::new(None),
@@ -2923,8 +2965,11 @@ mod tests {
     }
 
     fn mock_with_dump(dump_bytes: Vec<u8>) -> Arc<MockCapture> {
+        let info = sample_info();
+        let gen = info.generation;
         Arc::new(MockCapture {
-            info: sample_info(),
+            info_template: info,
+            generation: AtomicU64::new(gen),
             dump_bytes,
             reset_count: AtomicUsize::new(0),
             last_filter: StdMutex::new(None),
@@ -3070,5 +3115,41 @@ mod tests {
         let ts = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         // 1_700_000_000 → 2023-11-14T22:13:20 UTC
         assert_eq!(capture_dump_filename(ts), "p2p-capture-20231114T221320Z.pcap");
+    }
+
+    #[test]
+    fn capture_reset_404_when_disabled() {
+        let state = empty_state();
+        let rt = build_runtime();
+        let response = rt.block_on(post_capture_reset(State(state)));
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn capture_reset_calls_reset_and_returns_generations() {
+        let mut state = empty_state();
+        let mock = mock_with_info(CaptureInfo {
+            enabled: true,
+            path: "/tmp/cap.ring".to_string(),
+            size_mb: 1,
+            write_head: 100,
+            generation: 7,
+            oldest_ts: None,
+            newest_ts: None,
+            filter_mode: "none",
+            filter_count: 0,
+        });
+        state.capture = Some(mock.clone());
+        let rt = build_runtime();
+        let response = rt.block_on(post_capture_reset(State(state)));
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(mock.reset_count.load(Ordering::SeqCst), 1);
+
+        let body = read_body_bytes(&rt, response);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["reset"], true);
+        assert_eq!(json["previous_generation"], 7);
+        assert_eq!(json["current_generation"], 8);
     }
 }
