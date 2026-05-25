@@ -210,7 +210,10 @@ mod tests {
         write_record(&mut buf, ts, Direction::Outbound, ip, 9030, frame);
 
         assert_eq!(read_ts_sec(&buf), Some(9001));
-        assert_eq!(read_incl_len(&buf), Some((ERGO_METADATA_LEN + frame.len()) as u32));
+        assert_eq!(
+            read_incl_len(&buf),
+            Some((ERGO_METADATA_LEN + frame.len()) as u32)
+        );
         assert_eq!(read_direction(&buf), Some(Direction::Outbound));
         assert_eq!(read_peer_ip(&buf), Some(ip));
     }

@@ -115,7 +115,10 @@ mod tests {
 
         let head0 = ring.write_head.load(std::sync::atomic::Ordering::Acquire);
         tap.capture_inbound("192.168.1.100:9030".parse().unwrap(), b"dropped");
-        assert_eq!(ring.write_head.load(std::sync::atomic::Ordering::Acquire), head0);
+        assert_eq!(
+            ring.write_head.load(std::sync::atomic::Ordering::Acquire),
+            head0
+        );
 
         tap.capture_inbound("8.8.8.8:9030".parse().unwrap(), b"kept");
         assert!(ring.write_head.load(std::sync::atomic::Ordering::Acquire) > head0);

@@ -12,19 +12,21 @@ use crate::protocol::address_sanity::is_bogus_address;
 use crate::protocol::counters::{self, TrafficCounters, TrafficSnapshot};
 use crate::protocol::messages::ProtocolMessage;
 use crate::protocol::peer::ProtocolEvent;
-use crate::routing::router::{Action, Router};
 use crate::routing::latency::LatencyStats;
+use crate::routing::router::{Action, Router};
 use crate::transport::connection::Connection;
 use crate::transport::frame::Frame;
 use crate::transport::handshake::{self, HandshakeConfig};
-use crate::types::{ConnectionType, Direction, Network, NetworkStatus, PeerEntry, PeerId, ProxyMode, Version};
+use crate::types::{
+    ConnectionType, Direction, Network, NetworkStatus, PeerEntry, PeerId, ProxyMode, Version,
+};
 use crate::upnp::UpnpMapping;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -179,7 +181,9 @@ impl P2pNode {
                     &config.upnp,
                     listener_cfg.address.port(),
                     listener_cfg.address,
-                ).await {
+                )
+                .await
+                {
                     ipv4_declared = Some(mapping.external_addr);
                     upnp_mapping = Some(mapping);
                 }
@@ -196,9 +200,7 @@ impl P2pNode {
             .collect();
 
         let peer_db = PeerDb::new(peer_storage, blacklist.clone(), DEFAULT_CAP, self_addresses)
-            .map_err(|e| -> Box<dyn std::error::Error> {
-                format!("PeerDb init: {}", e).into()
-            })?;
+            .map_err(|e| -> Box<dyn std::error::Error> { format!("PeerDb init: {}", e).into() })?;
         let peer_db = Arc::new(StdMutex::new(peer_db));
         tracing::info!(
             loaded_peers = peer_db.lock().expect("poisoned").count(),
@@ -230,9 +232,19 @@ impl P2pNode {
         if let Some(ref listener_cfg) = config.listen.ipv6 {
             let listener = TcpListener::bind(listener_cfg.address).await?;
             tracing::info!(addr = %listener_cfg.address, mode = ?listener_cfg.mode, declared = ?ipv6_declared, "IPv6 listener started");
-            let hs_config = make_handshake_config(&config.identity, version, network, listener_cfg.mode, mode_config, ipv6_declared);
+            let hs_config = make_handshake_config(
+                &config.identity,
+                version,
+                network,
+                listener_cfg.mode,
+                mode_config,
+                ipv6_declared,
+            );
             tokio::spawn(accept_loop(
-                listener, hs_config, listener_cfg.mode, listener_cfg.max_inbound,
+                listener,
+                hs_config,
+                listener_cfg.mode,
+                listener_cfg.max_inbound,
                 ctx.clone(),
             ));
         }
@@ -240,9 +252,19 @@ impl P2pNode {
         if let Some(ref listener_cfg) = config.listen.ipv4 {
             let listener = TcpListener::bind(listener_cfg.address).await?;
             tracing::info!(addr = %listener_cfg.address, mode = ?listener_cfg.mode, declared = ?ipv4_declared, "IPv4 listener started");
-            let hs_config = make_handshake_config(&config.identity, version, network, listener_cfg.mode, mode_config, ipv4_declared);
+            let hs_config = make_handshake_config(
+                &config.identity,
+                version,
+                network,
+                listener_cfg.mode,
+                mode_config,
+                ipv4_declared,
+            );
             tokio::spawn(accept_loop(
-                listener, hs_config, listener_cfg.mode, listener_cfg.max_inbound,
+                listener,
+                hs_config,
+                listener_cfg.mode,
+                listener_cfg.max_inbound,
                 ctx.clone(),
             ));
         }
@@ -250,7 +272,14 @@ impl P2pNode {
         // Start outbound connections — prefer IPv4 declared address (most peers are IPv4)
         let outbound_declared = ipv4_declared.or(ipv6_declared);
         {
-            let hs_config = make_handshake_config(&config.identity, version, network, ProxyMode::Full, mode_config, outbound_declared);
+            let hs_config = make_handshake_config(
+                &config.identity,
+                version,
+                network,
+                ProxyMode::Full,
+                mode_config,
+                outbound_declared,
+            );
             tokio::spawn(outbound_manager(
                 config.outbound.seed_peers.clone(),
                 config.outbound.min_peers,
@@ -289,7 +318,15 @@ impl P2pNode {
             let subscriber = subscriber.clone();
             let last_incoming_ms = last_incoming_ms.clone();
             tokio::spawn(async move {
-                event_loop(event_rx, router, peer_senders, subscriber, modifier_sink, last_incoming_ms).await;
+                event_loop(
+                    event_rx,
+                    router,
+                    peer_senders,
+                    subscriber,
+                    modifier_sink,
+                    last_incoming_ms,
+                )
+                .await;
             });
         }
 
@@ -343,7 +380,9 @@ impl P2pNode {
         let senders = self.peer_senders.lock().await;
         let tx = senders.get(&peer).ok_or(SendError::UnknownPeer(peer))?;
         let frame = message.to_frame();
-        tx.send(frame).await.map_err(|_| SendError::ChannelClosed(peer))
+        tx.send(frame)
+            .await
+            .map_err(|_| SendError::ChannelClosed(peer))
     }
 
     /// Send a protocol message to all connected outbound peers.
@@ -532,7 +571,10 @@ async fn event_loop(
                 {
                     let dominated_by_modifier_response = matches!(
                         &event,
-                        ProtocolEvent::Message { message: ProtocolMessage::ModifierResponse { .. }, .. }
+                        ProtocolEvent::Message {
+                            message: ProtocolMessage::ModifierResponse { .. },
+                            ..
+                        }
                     );
                     if !dominated_by_modifier_response {
                         let sub = subscriber.lock().await;
@@ -554,10 +596,19 @@ async fn event_loop(
                                 }
                             }
                         }
-                        Action::Validate { modifier_type, id, data, peer_id } => {
+                        Action::Validate {
+                            modifier_type,
+                            id,
+                            data,
+                            peer_id,
+                        } => {
                             if let Some(ref sink) = modifier_sink {
                                 if modifier_type != 101 {
-                                    tracing::debug!(modifier_type, data_len = data.len(), "delivering non-header to pipeline");
+                                    tracing::debug!(
+                                        modifier_type,
+                                        data_len = data.len(),
+                                        "delivering non-header to pipeline"
+                                    );
                                 }
                                 let _ = sink.try_send((modifier_type, id, data, Some(peer_id.0)));
                             }
@@ -594,15 +645,21 @@ async fn run_peer(
     // Register peer in router
     let rest_api_url = spec.rest_api_url();
     let agent_name = Some(spec.agent.clone());
-    ctx.router.lock().await.register_peer(peer_id, direction, mode, addr, rest_api_url, agent_name);
+    ctx.router
+        .lock()
+        .await
+        .register_peer(peer_id, direction, mode, addr, rest_api_url, agent_name);
 
     // Send PeerConnected event
-    let _ = ctx.event_tx.send(ProtocolEvent::PeerConnected {
-        peer_id,
-        spec: spec.clone(),
-        direction,
-        addr,
-    }).await;
+    let _ = ctx
+        .event_tx
+        .send(ProtocolEvent::PeerConnected {
+            peer_id,
+            spec: spec.clone(),
+            direction,
+            addr,
+        })
+        .await;
 
     // Split connection for concurrent read/write
     let (mut reader, mut writer, magic, _, _) = conn.split();
@@ -624,7 +681,9 @@ async fn run_peer(
                 &frame,
                 writer_addr,
                 writer_tap.as_deref(),
-            ).await {
+            )
+            .await
+            {
                 tracing::warn!(peer = %peer_id, error = %e, "Write failed");
                 break;
             }
@@ -640,13 +699,18 @@ async fn run_peer(
             addr,
             &ctx.blacklist,
             ctx.capture_tap.as_deref(),
-        ).await {
+        )
+        .await
+        {
             Ok(frame) => {
                 let wire_bytes = counters::frame_wire_bytes(&frame);
                 match ProtocolMessage::from_frame(&frame) {
                     Ok(msg) => {
                         ctx.counters.record_in_message(&msg, wire_bytes);
-                        let event = ProtocolEvent::Message { peer_id, message: msg };
+                        let event = ProtocolEvent::Message {
+                            peer_id,
+                            message: msg,
+                        };
                         if ctx.event_tx.send(event).await.is_err() {
                             break;
                         }
@@ -672,10 +736,13 @@ async fn run_peer(
     ctx.peer_senders.lock().await.remove(&peer_id);
     write_handle.abort();
 
-    let _ = ctx.event_tx.send(ProtocolEvent::PeerDisconnected {
-        peer_id,
-        reason: "connection closed".into(),
-    }).await;
+    let _ = ctx
+        .event_tx
+        .send(ProtocolEvent::PeerDisconnected {
+            peer_id,
+            reason: "connection closed".into(),
+        })
+        .await;
 
     tracing::info!(peer = %peer_id, "Peer removed");
 }
@@ -811,11 +878,10 @@ async fn outbound_manager(
             floor_backoff = FLOOR_BACKOFF_INITIAL;
             if current_outbound < max_peers {
                 // ---- Fill phase: one PeerDb candidate per tick. ----
-                if let Some(candidate) = pick_fill_candidate(
-                    &ctx,
-                    max_peers.saturating_sub(current_outbound),
-                    &cooldown,
-                ).await {
+                if let Some(candidate) =
+                    pick_fill_candidate(&ctx, max_peers.saturating_sub(current_outbound), &cooldown)
+                        .await
+                {
                     tracing::info!(addr = %candidate, "Outbound fill: dialing PeerDb candidate");
                     spawn_outbound_connect(candidate, &hs_config, mode, ctx.clone()).await;
                     cooldown.insert(candidate, Instant::now() + OUTBOUND_REDIAL_COOLDOWN);
@@ -863,7 +929,10 @@ async fn pick_fill_candidate(
     if fill_slots == 0 {
         return None;
     }
-    let connected: HashSet<SocketAddr> = ctx.router.lock().await
+    let connected: HashSet<SocketAddr> = ctx
+        .router
+        .lock()
+        .await
         .connected_addrs()
         .into_iter()
         .map(|(a, _)| a)
@@ -889,7 +958,8 @@ async fn spawn_outbound_connect(
     let connect = tokio::time::timeout(
         Duration::from_secs(10),
         tokio::net::TcpStream::connect(addr),
-    ).await;
+    )
+    .await;
 
     match connect {
         Ok(Ok(stream)) => {
@@ -952,8 +1022,7 @@ mod tests {
     }
 
     fn shared_peer_db(blacklist: Arc<Blacklist>) -> Arc<StdMutex<PeerDb>> {
-        let storage: Box<dyn PeerStorage> =
-            Box::new(crate::peer_db::MemoryPeerStorage::new());
+        let storage: Box<dyn PeerStorage> = Box::new(crate::peer_db::MemoryPeerStorage::new());
         let db = PeerDb::new(storage, blacklist, DEFAULT_CAP, HashSet::new())
             .expect("MemoryPeerStorage::load_all is infallible");
         Arc::new(StdMutex::new(db))
@@ -963,12 +1032,8 @@ mod tests {
     fn test_node() -> TestHarness {
         let blacklist = Arc::new(Blacklist::new());
         let peer_db = shared_peer_db(blacklist.clone());
-        let router_inner = Router::with_peer_db(
-            peer_db.clone(),
-            blacklist.clone(),
-            64,
-            Network::Mainnet,
-        );
+        let router_inner =
+            Router::with_peer_db(peer_db.clone(), blacklist.clone(), 64, Network::Mainnet);
         let counters = router_inner.counters();
         let router = Arc::new(Mutex::new(router_inner));
         let peer_senders = Arc::new(Mutex::new(HashMap::new()));
@@ -986,12 +1051,20 @@ mod tests {
             outbound_request_tx,
             counters,
         };
-        TestHarness { node, router, peer_senders, blacklist, outbound_request_rx }
+        TestHarness {
+            node,
+            router,
+            peer_senders,
+            blacklist,
+            outbound_request_rx,
+        }
     }
 
     #[tokio::test]
     async fn send_to_delivers_to_correct_peer() {
-        let TestHarness { node, peer_senders, .. } = test_node();
+        let TestHarness {
+            node, peer_senders, ..
+        } = test_node();
         let peer = PeerId(1);
 
         let (tx, mut rx) = mpsc::channel::<Frame>(64);
@@ -1010,12 +1083,17 @@ mod tests {
         let result = node.send_to(PeerId(999), ProtocolMessage::GetPeers).await;
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SendError::UnknownPeer(PeerId(999))));
+        assert!(matches!(
+            result.unwrap_err(),
+            SendError::UnknownPeer(PeerId(999))
+        ));
     }
 
     #[tokio::test]
     async fn send_to_closed_channel_returns_error() {
-        let TestHarness { node, peer_senders, .. } = test_node();
+        let TestHarness {
+            node, peer_senders, ..
+        } = test_node();
         let peer = PeerId(1);
 
         let (tx, rx) = mpsc::channel::<Frame>(64);
@@ -1023,20 +1101,49 @@ mod tests {
         drop(rx); // Close the receiving end
 
         let result = node.send_to(peer, ProtocolMessage::GetPeers).await;
-        assert!(matches!(result.unwrap_err(), SendError::ChannelClosed(PeerId(1))));
+        assert!(matches!(
+            result.unwrap_err(),
+            SendError::ChannelClosed(PeerId(1))
+        ));
     }
 
     #[tokio::test]
     async fn broadcast_outbound_sends_to_all_outbound_peers() {
-        let TestHarness { node, router, peer_senders, .. } = test_node();
+        let TestHarness {
+            node,
+            router,
+            peer_senders,
+            ..
+        } = test_node();
 
         let peer_a = PeerId(1);
         let peer_b = PeerId(2);
         let peer_inbound = PeerId(3);
 
-        router.lock().await.register_peer(peer_a, Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
-        router.lock().await.register_peer(peer_b, Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
-        router.lock().await.register_peer(peer_inbound, Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
+        router.lock().await.register_peer(
+            peer_a,
+            Direction::Outbound,
+            ProxyMode::Full,
+            dummy_addr(),
+            None,
+            None,
+        );
+        router.lock().await.register_peer(
+            peer_b,
+            Direction::Outbound,
+            ProxyMode::Full,
+            dummy_addr(),
+            None,
+            None,
+        );
+        router.lock().await.register_peer(
+            peer_inbound,
+            Direction::Inbound,
+            ProxyMode::Full,
+            dummy_addr(),
+            None,
+            None,
+        );
 
         let (tx_a, mut rx_a) = mpsc::channel::<Frame>(64);
         let (tx_b, mut rx_b) = mpsc::channel::<Frame>(64);
@@ -1059,13 +1166,32 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_outbound_skips_full_channel() {
-        let TestHarness { node, router, peer_senders, .. } = test_node();
+        let TestHarness {
+            node,
+            router,
+            peer_senders,
+            ..
+        } = test_node();
 
         let peer_ok = PeerId(1);
         let peer_full = PeerId(2);
 
-        router.lock().await.register_peer(peer_ok, Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
-        router.lock().await.register_peer(peer_full, Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
+        router.lock().await.register_peer(
+            peer_ok,
+            Direction::Outbound,
+            ProxyMode::Full,
+            dummy_addr(),
+            None,
+            None,
+        );
+        router.lock().await.register_peer(
+            peer_full,
+            Direction::Outbound,
+            ProxyMode::Full,
+            dummy_addr(),
+            None,
+            None,
+        );
 
         let (tx_ok, mut rx_ok) = mpsc::channel::<Frame>(64);
         // Capacity 1: one fill + one broadcast = second is dropped
@@ -1093,12 +1219,8 @@ mod tests {
     async fn subscriber_receives_events() {
         let blacklist = Arc::new(Blacklist::new());
         let peer_db = shared_peer_db(blacklist.clone());
-        let router_inner = Router::with_peer_db(
-            peer_db.clone(),
-            blacklist.clone(),
-            64,
-            Network::Mainnet,
-        );
+        let router_inner =
+            Router::with_peer_db(peer_db.clone(), blacklist.clone(), 64, Network::Mainnet);
         let counters = router_inner.counters();
         let router = Arc::new(Mutex::new(router_inner));
         let peer_senders: Arc<Mutex<HashMap<PeerId, PeerSender>>> =
@@ -1135,17 +1257,33 @@ mod tests {
         });
 
         // Register a peer so the router doesn't choke
-        router.lock().await.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
+        router.lock().await.register_peer(
+            PeerId(1),
+            Direction::Outbound,
+            ProxyMode::Full,
+            dummy_addr(),
+            None,
+            None,
+        );
 
         // Send a protocol event
-        event_tx.send(ProtocolEvent::Message {
-            peer_id: PeerId(1),
-            message: ProtocolMessage::GetPeers,
-        }).await.unwrap();
+        event_tx
+            .send(ProtocolEvent::Message {
+                peer_id: PeerId(1),
+                message: ProtocolMessage::GetPeers,
+            })
+            .await
+            .unwrap();
 
         // Subscriber should see it
         let event = events.recv().await.unwrap();
-        assert!(matches!(event, ProtocolEvent::Message { peer_id: PeerId(1), .. }));
+        assert!(matches!(
+            event,
+            ProtocolEvent::Message {
+                peer_id: PeerId(1),
+                ..
+            }
+        ));
 
         // Cleanup
         drop(event_tx);
@@ -1170,12 +1308,8 @@ mod tests {
         // event loop with a synthetic Message event.
         let blacklist = Arc::new(Blacklist::new());
         let peer_db = shared_peer_db(blacklist.clone());
-        let router_inner = Router::with_peer_db(
-            peer_db.clone(),
-            blacklist.clone(),
-            64,
-            Network::Mainnet,
-        );
+        let router_inner =
+            Router::with_peer_db(peer_db.clone(), blacklist.clone(), 64, Network::Mainnet);
         let counters = router_inner.counters();
         let router = Arc::new(Mutex::new(router_inner));
         let peer_senders: Arc<Mutex<HashMap<PeerId, PeerSender>>> =
@@ -1199,7 +1333,11 @@ mod tests {
         };
 
         // Confirm initial state
-        assert!(node.network_status().await.last_incoming_message_ms.is_none());
+        assert!(node
+            .network_status()
+            .await
+            .last_incoming_message_ms
+            .is_none());
 
         // Drive the event loop
         let (event_tx, event_rx) = mpsc::channel::<ProtocolEvent>(16);
@@ -1211,15 +1349,30 @@ mod tests {
             event_loop(event_rx, r, ps, sub, None, last).await;
         });
 
-        router.lock().await.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
-        event_tx.send(ProtocolEvent::Message {
-            peer_id: PeerId(1),
-            message: ProtocolMessage::GetPeers,
-        }).await.unwrap();
+        router.lock().await.register_peer(
+            PeerId(1),
+            Direction::Outbound,
+            ProxyMode::Full,
+            dummy_addr(),
+            None,
+            None,
+        );
+        event_tx
+            .send(ProtocolEvent::Message {
+                peer_id: PeerId(1),
+                message: ProtocolMessage::GetPeers,
+            })
+            .await
+            .unwrap();
 
         // Give the event loop a tick to drain
         for _ in 0..50 {
-            if node.network_status().await.last_incoming_message_ms.is_some() {
+            if node
+                .network_status()
+                .await
+                .last_incoming_message_ms
+                .is_some()
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -1241,7 +1394,9 @@ mod tests {
 
     #[tokio::test]
     async fn blacklisted_peers_reflects_records() {
-        let TestHarness { node, blacklist, .. } = test_node();
+        let TestHarness {
+            node, blacklist, ..
+        } = test_node();
         blacklist.record_permanent(pub_addr("203.0.113.5:9030"));
         blacklist.record_permanent(pub_addr("198.51.100.7:9030"));
 
@@ -1256,14 +1411,18 @@ mod tests {
     #[tokio::test]
     async fn queue_outbound_rejects_loopback() {
         let TestHarness { node, .. } = test_node();
-        let result = node.queue_outbound_connection(pub_addr("127.0.0.1:9030")).await;
+        let result = node
+            .queue_outbound_connection(pub_addr("127.0.0.1:9030"))
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("loopback"));
     }
 
     #[tokio::test]
     async fn queue_outbound_rejects_blacklisted() {
-        let TestHarness { node, blacklist, .. } = test_node();
+        let TestHarness {
+            node, blacklist, ..
+        } = test_node();
         let addr = pub_addr("203.0.113.10:9030");
         blacklist.record_permanent(addr);
         let result = node.queue_outbound_connection(addr).await;
@@ -1276,7 +1435,12 @@ mod tests {
         let TestHarness { node, router, .. } = test_node();
         let addr = pub_addr("203.0.113.11:9030");
         router.lock().await.register_peer(
-            PeerId(1), Direction::Outbound, ProxyMode::Full, addr, None, None,
+            PeerId(1),
+            Direction::Outbound,
+            ProxyMode::Full,
+            addr,
+            None,
+            None,
         );
         let result = node.queue_outbound_connection(addr).await;
         assert!(result.is_err());
@@ -1285,7 +1449,11 @@ mod tests {
 
     #[tokio::test]
     async fn queue_outbound_ok_pushes_to_channel() {
-        let TestHarness { node, outbound_request_rx: mut orq, .. } = test_node();
+        let TestHarness {
+            node,
+            outbound_request_rx: mut orq,
+            ..
+        } = test_node();
         let addr = pub_addr("203.0.113.20:9030");
         node.queue_outbound_connection(addr).await.unwrap();
         // The address was pushed to the outbound-request channel without
@@ -1316,24 +1484,44 @@ mod tests {
         let TestHarness { node, router, .. } = test_node();
 
         router.lock().await.register_peer(
-            PeerId(1), Direction::Outbound, ProxyMode::Full,
-            pub_addr("203.0.113.40:9030"), None, Some("ergoref".to_string()),
+            PeerId(1),
+            Direction::Outbound,
+            ProxyMode::Full,
+            pub_addr("203.0.113.40:9030"),
+            None,
+            Some("ergoref".to_string()),
         );
         router.lock().await.register_peer(
-            PeerId(2), Direction::Inbound, ProxyMode::Full,
-            pub_addr("203.0.113.41:9030"), None, Some("nautilus".to_string()),
+            PeerId(2),
+            Direction::Inbound,
+            ProxyMode::Full,
+            pub_addr("203.0.113.41:9030"),
+            None,
+            Some("nautilus".to_string()),
         );
 
         let peers = node.all_peers().await;
         assert_eq!(peers.len(), 2);
-        let outbound = peers.iter().find(|p| p.address == pub_addr("203.0.113.40:9030")).unwrap();
+        let outbound = peers
+            .iter()
+            .find(|p| p.address == pub_addr("203.0.113.40:9030"))
+            .unwrap();
         assert_eq!(outbound.agent_name.as_deref(), Some("ergoref"));
-        assert!(matches!(outbound.connection_type, Some(crate::types::ConnectionType::Outgoing)));
+        assert!(matches!(
+            outbound.connection_type,
+            Some(crate::types::ConnectionType::Outgoing)
+        ));
         assert!(outbound.last_seen_ms.is_some());
 
-        let inbound = peers.iter().find(|p| p.address == pub_addr("203.0.113.41:9030")).unwrap();
+        let inbound = peers
+            .iter()
+            .find(|p| p.address == pub_addr("203.0.113.41:9030"))
+            .unwrap();
         assert_eq!(inbound.agent_name.as_deref(), Some("nautilus"));
-        assert!(matches!(inbound.connection_type, Some(crate::types::ConnectionType::Incoming)));
+        assert!(matches!(
+            inbound.connection_type,
+            Some(crate::types::ConnectionType::Incoming)
+        ));
     }
 
     #[tokio::test]
@@ -1342,15 +1530,22 @@ mod tests {
 
         let addr = pub_addr("203.0.113.50:9030");
         router.lock().await.register_peer(
-            PeerId(1), Direction::Outbound, ProxyMode::Full,
-            addr, None, Some("ergoref".to_string()),
+            PeerId(1),
+            Direction::Outbound,
+            ProxyMode::Full,
+            addr,
+            None,
+            Some("ergoref".to_string()),
         );
 
         // Simulate disconnect via the router (the same path the event loop uses).
-        let _ = router.lock().await.handle_event(ProtocolEvent::PeerDisconnected {
-            peer_id: PeerId(1),
-            reason: "test".into(),
-        });
+        let _ = router
+            .lock()
+            .await
+            .handle_event(ProtocolEvent::PeerDisconnected {
+                peer_id: PeerId(1),
+                reason: "test".into(),
+            });
 
         let peers = node.all_peers().await;
         assert_eq!(peers.len(), 1);

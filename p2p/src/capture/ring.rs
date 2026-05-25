@@ -13,9 +13,7 @@
 //! source of truth so lock-free readers (the dump iterator) can snapshot
 //! progress without blocking writes.
 
-use super::pcap::{
-    write_file_header, DEFAULT_SNAPLEN, PCAP_FILE_HEADER_LEN, PCAP_MAGIC,
-};
+use super::pcap::{write_file_header, DEFAULT_SNAPLEN, PCAP_FILE_HEADER_LEN, PCAP_MAGIC};
 use memmap2::MmapMut;
 use std::fs::OpenOptions;
 use std::io;
@@ -101,11 +99,13 @@ impl RingBuffer {
         }
 
         let trailer_offset = (size - TRAILER_LEN as u64) as usize;
-        let trailer_magic_matches =
-            &mmap[trailer_offset..trailer_offset + 8] == TRAILER_MAGIC;
+        let trailer_magic_matches = &mmap[trailer_offset..trailer_offset + 8] == TRAILER_MAGIC;
 
         let (write_head_init, gen_init) = if needs_init || !trailer_magic_matches {
-            init_trailer(&mut mmap[trailer_offset..trailer_offset + TRAILER_LEN], data_region_start);
+            init_trailer(
+                &mut mmap[trailer_offset..trailer_offset + TRAILER_LEN],
+                data_region_start,
+            );
             (data_region_start, 0u64)
         } else {
             let head = u64::from_le_bytes(
@@ -270,7 +270,10 @@ mod tests {
             TRAILER_MAGIC
         );
         // initial write_head = data_region_start
-        assert_eq!(ring.write_head.load(Ordering::Acquire), ring.data_region_start);
+        assert_eq!(
+            ring.write_head.load(Ordering::Acquire),
+            ring.data_region_start
+        );
         assert_eq!(ring.generation.load(Ordering::Acquire), 0);
     }
 
@@ -283,7 +286,10 @@ mod tests {
         assert_eq!(head_after - head_before, 11);
         // Bytes appear in the snapshot at head_before
         let bytes = ring.snapshot();
-        assert_eq!(&bytes[head_before as usize..head_after as usize], b"hello world");
+        assert_eq!(
+            &bytes[head_before as usize..head_after as usize],
+            b"hello world"
+        );
     }
 
     #[test]
@@ -305,9 +311,7 @@ mod tests {
         let size = 4096;
         let (_d, ring) = new_ring(size);
         let chunk = vec![0xAA; 1000];
-        while ring.write_head.load(Ordering::Acquire) + chunk.len() as u64
-            <= ring.data_region_end
-        {
+        while ring.write_head.load(Ordering::Acquire) + chunk.len() as u64 <= ring.data_region_end {
             ring.append(&chunk).unwrap();
         }
         let pre_wrap_head = ring.write_head.load(Ordering::Acquire);
@@ -326,8 +330,7 @@ mod tests {
         }
         // Big record at the start of data region
         assert_eq!(
-            &bytes[ring.data_region_start as usize
-                ..(ring.data_region_start + 500) as usize],
+            &bytes[ring.data_region_start as usize..(ring.data_region_start + 500) as usize],
             &big[..]
         );
     }
@@ -375,7 +378,8 @@ mod tests {
             ring.append(b"second").unwrap();
         }
         let ring2 = RingBuffer::open_or_create(&path, size).unwrap();
-        let expected_head = ring2.data_region_start + (b"first record".len() + b"second".len()) as u64;
+        let expected_head =
+            ring2.data_region_start + (b"first record".len() + b"second".len()) as u64;
         assert_eq!(ring2.write_head.load(Ordering::Acquire), expected_head);
         assert_eq!(ring2.generation.load(Ordering::Acquire), 0);
     }
@@ -390,7 +394,10 @@ mod tests {
         }
         let ring2 = RingBuffer::open_or_create(&path, 2 * 1024 * 1024).unwrap();
         // Re-initialized: head at data_region_start, gen 0
-        assert_eq!(ring2.write_head.load(Ordering::Acquire), ring2.data_region_start);
+        assert_eq!(
+            ring2.write_head.load(Ordering::Acquire),
+            ring2.data_region_start
+        );
         assert_eq!(ring2.generation.load(Ordering::Acquire), 0);
     }
 }

@@ -1,11 +1,11 @@
 pub mod blacklist;
 pub mod capture;
 pub mod config;
-pub mod types;
-pub mod transport;
+pub mod netif;
+pub mod node;
+pub mod peer_db;
 pub mod protocol;
 pub mod routing;
-pub mod netif;
+pub mod transport;
+pub mod types;
 pub mod upnp;
-pub mod peer_db;
-pub mod node;

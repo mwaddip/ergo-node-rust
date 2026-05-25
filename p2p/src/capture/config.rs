@@ -209,6 +209,9 @@ mod tests {
             include_ips: vec![],
             exclude_ips: vec![],
         };
-        assert!(matches!(c.resolve(), Err(CaptureConfigError::SizeTooSmall(0))));
+        assert!(matches!(
+            c.resolve(),
+            Err(CaptureConfigError::SizeTooSmall(0))
+        ));
     }
 }

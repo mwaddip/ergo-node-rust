@@ -53,7 +53,11 @@ pub fn decode(magic: &[u8; 4], data: &[u8]) -> io::Result<Frame> {
     if data.len() < MIN_HEADER_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("Frame too short: {} bytes (need at least {})", data.len(), MIN_HEADER_SIZE),
+            format!(
+                "Frame too short: {} bytes (need at least {})",
+                data.len(),
+                MIN_HEADER_SIZE
+            ),
         ));
     }
 
@@ -83,7 +87,11 @@ pub fn decode(magic: &[u8; 4], data: &[u8]) -> io::Result<Frame> {
     if data.len() < expected_total {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("Frame truncated: have {} bytes, need {}", data.len(), expected_total),
+            format!(
+                "Frame truncated: have {} bytes, need {}",
+                data.len(),
+                expected_total
+            ),
         ));
     }
 
@@ -95,11 +103,20 @@ pub fn decode(magic: &[u8; 4], data: &[u8]) -> io::Result<Frame> {
         tracing::error!(
             code = code,
             body_len = body_len,
-            expected = format!("{:02x}{:02x}{:02x}{:02x}", checksum[0], checksum[1], checksum[2], checksum[3]),
-            computed = format!("{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3]),
+            expected = format!(
+                "{:02x}{:02x}{:02x}{:02x}",
+                checksum[0], checksum[1], checksum[2], checksum[3]
+            ),
+            computed = format!(
+                "{:02x}{:02x}{:02x}{:02x}",
+                hash[0], hash[1], hash[2], hash[3]
+            ),
             "Checksum mismatch (decode)"
         );
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Checksum mismatch"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Checksum mismatch",
+        ));
     }
 
     Ok(Frame {
@@ -135,8 +152,14 @@ pub async fn read_frame(
 
     if &prefix[0..4] != magic {
         tracing::error!(
-            received = format!("{:02x}{:02x}{:02x}{:02x}", prefix[0], prefix[1], prefix[2], prefix[3]),
-            expected = format!("{:02x}{:02x}{:02x}{:02x}", magic[0], magic[1], magic[2], magic[3]),
+            received = format!(
+                "{:02x}{:02x}{:02x}{:02x}",
+                prefix[0], prefix[1], prefix[2], prefix[3]
+            ),
+            expected = format!(
+                "{:02x}{:02x}{:02x}{:02x}",
+                magic[0], magic[1], magic[2], magic[3]
+            ),
             "Frame magic mismatch — stream likely misaligned"
         );
         tracing::warn!(
@@ -188,8 +211,14 @@ pub async fn read_frame(
         tracing::error!(
             code = code,
             body_len = body_len,
-            expected = format!("{:02x}{:02x}{:02x}{:02x}", checksum[0], checksum[1], checksum[2], checksum[3]),
-            computed = format!("{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3]),
+            expected = format!(
+                "{:02x}{:02x}{:02x}{:02x}",
+                checksum[0], checksum[1], checksum[2], checksum[3]
+            ),
+            computed = format!(
+                "{:02x}{:02x}{:02x}{:02x}",
+                hash[0], hash[1], hash[2], hash[3]
+            ),
             "Checksum mismatch"
         );
         tracing::warn!(
@@ -198,7 +227,10 @@ pub async fn read_frame(
             "PENALTY"
         );
         blacklist.record_permanent(peer_addr);
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Checksum mismatch"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Checksum mismatch",
+        ));
     }
 
     if let Some(t) = tap {

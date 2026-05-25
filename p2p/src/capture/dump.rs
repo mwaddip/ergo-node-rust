@@ -11,8 +11,8 @@
 
 use super::config::FilterMode;
 use super::pcap::{
-    read_direction, read_incl_len, read_peer_ip, read_ts_sec, Direction,
-    ERGO_METADATA_LEN, PCAP_RECORD_HEADER_LEN,
+    read_direction, read_incl_len, read_peer_ip, read_ts_sec, Direction, ERGO_METADATA_LEN,
+    PCAP_RECORD_HEADER_LEN,
 };
 use super::ring::{RingBuffer, PAD_BYTE};
 use std::net::IpAddr;
@@ -112,9 +112,7 @@ pub fn collect_chronological(
         // of the data region. Skip the rest of the snapshot.
         if snapshot[pos] == PAD_BYTE {
             // Confirm: pcap ts_sec field would be 0xFFFFFFFF, year 2106.
-            if pos + 4 <= snapshot.len()
-                && snapshot[pos..pos + 4] == [PAD_BYTE; 4]
-            {
+            if pos + 4 <= snapshot.len() && snapshot[pos..pos + 4] == [PAD_BYTE; 4] {
                 break;
             }
         }
@@ -146,14 +144,13 @@ pub fn collect_chronological(
         }
 
         let ts_usec = u32::from_le_bytes(snapshot[pos + 4..pos + 8].try_into().unwrap());
-        let ts = SystemTime::UNIX_EPOCH
-            + Duration::new(ts_sec as u64, ts_usec.saturating_mul(1000));
+        let ts =
+            SystemTime::UNIX_EPOCH + Duration::new(ts_sec as u64, ts_usec.saturating_mul(1000));
 
         let direction = read_direction(&snapshot[pos..pos + total]).unwrap_or(Direction::Inbound);
         let peer_ip =
             read_peer_ip(&snapshot[pos..pos + total]).unwrap_or(IpAddr::V4([0, 0, 0, 0].into()));
-        let peer_port =
-            u16::from_be_bytes(snapshot[pos + 18..pos + 20].try_into().unwrap());
+        let peer_port = u16::from_be_bytes(snapshot[pos + 18..pos + 20].try_into().unwrap());
 
         let frame_off = pos + PCAP_RECORD_HEADER_LEN + ERGO_METADATA_LEN;
         let frame = snapshot[frame_off..pos + total].to_vec();
@@ -197,7 +194,14 @@ mod tests {
     fn append(ring: &RingBuffer, ts_secs: u64, dir: Direction, ip: &str, port: u16, frame: &[u8]) {
         let mut buf = vec![0u8; record_size(frame.len())];
         let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(ts_secs);
-        write_record(&mut buf, ts, dir, IpAddr::from_str(ip).unwrap(), port, frame);
+        write_record(
+            &mut buf,
+            ts,
+            dir,
+            IpAddr::from_str(ip).unwrap(),
+            port,
+            frame,
+        );
         ring.append(&buf).unwrap();
     }
 
@@ -258,7 +262,14 @@ mod tests {
         let (_d, ring) = new_ring(64 * 1024);
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
         append(&ring, 100, Direction::Inbound, "10.0.0.1", 9030, b"old");
-        append(&ring, 9_950, Direction::Inbound, "10.0.0.1", 9030, b"recent");
+        append(
+            &ring,
+            9_950,
+            Direction::Inbound,
+            "10.0.0.1",
+            9030,
+            b"recent",
+        );
 
         let filter = DumpFilter {
             since_secs: Some(100),
@@ -293,7 +304,14 @@ mod tests {
             }
         }
         // Add one more post-wrap record
-        append(&ring, 9_999_999, Direction::Outbound, "10.0.0.2", 9030, b"post-wrap");
+        append(
+            &ring,
+            9_999_999,
+            Direction::Outbound,
+            "10.0.0.2",
+            9030,
+            b"post-wrap",
+        );
 
         let records = collect_chronological(&ring, SystemTime::now(), &DumpFilter::default());
         // The post-wrap record should be present, with the latest timestamp

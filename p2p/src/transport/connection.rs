@@ -15,8 +15,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -61,7 +61,13 @@ impl Connection {
         handshake::validate_peer(&peer_spec, &config.network)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        Ok(Self { reader, writer: write_half, magic, peer_spec, peer_addr })
+        Ok(Self {
+            reader,
+            writer: write_half,
+            magic,
+            peer_spec,
+            peer_addr,
+        })
     }
 
     /// Accept a connection by performing the handshake as responder (inbound).
@@ -90,12 +96,28 @@ impl Connection {
         write_half.flush().await?;
         counters.record_handshake_out(hs_bytes.len() as u64);
 
-        Ok(Self { reader, writer: write_half, magic, peer_spec, peer_addr })
+        Ok(Self {
+            reader,
+            writer: write_half,
+            magic,
+            peer_spec,
+            peer_addr,
+        })
     }
 
     /// Read the next message frame.
-    pub async fn read_frame(&mut self, blacklist: &crate::blacklist::Blacklist) -> io::Result<Frame> {
-        frame::read_frame(&mut self.reader, &self.magic, self.peer_addr, blacklist, None).await
+    pub async fn read_frame(
+        &mut self,
+        blacklist: &crate::blacklist::Blacklist,
+    ) -> io::Result<Frame> {
+        frame::read_frame(
+            &mut self.reader,
+            &self.magic,
+            self.peer_addr,
+            blacklist,
+            None,
+        )
+        .await
     }
 
     /// Write a message frame.
@@ -111,8 +133,22 @@ impl Connection {
         self.peer_addr
     }
 
-    pub fn split(self) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf, [u8; 4], PeerSpec, SocketAddr) {
-        (self.reader, self.writer, self.magic, self.peer_spec, self.peer_addr)
+    pub fn split(
+        self,
+    ) -> (
+        BufReader<OwnedReadHalf>,
+        OwnedWriteHalf,
+        [u8; 4],
+        PeerSpec,
+        SocketAddr,
+    ) {
+        (
+            self.reader,
+            self.writer,
+            self.magic,
+            self.peer_spec,
+            self.peer_addr,
+        )
     }
 }
 
@@ -143,9 +179,15 @@ async fn read_handshake(reader: &mut BufReader<OwnedReadHalf>) -> io::Result<(Pe
         match reader.read(&mut byte).await? {
             0 => {
                 if buf.is_empty() {
-                    return Err(io::Error::new(io::ErrorKind::ConnectionReset, "Empty handshake"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "Empty handshake",
+                    ));
                 }
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Incomplete handshake"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Incomplete handshake",
+                ));
             }
             _ => buf.push(byte[0]),
         }
@@ -159,10 +201,7 @@ async fn read_handshake(reader: &mut BufReader<OwnedReadHalf>) -> io::Result<(Pe
 
         match handshake::parse(&buf) {
             Ok(spec) => {
-                tracing::debug!(
-                    handshake_bytes = buf.len(),
-                    "handshake parsed successfully"
-                );
+                tracing::debug!(handshake_bytes = buf.len(), "handshake parsed successfully");
                 return Ok((spec, buf.len()));
             }
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => continue,

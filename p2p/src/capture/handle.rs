@@ -99,7 +99,7 @@ impl CaptureAccess for CaptureHandle {
         let total: usize =
             PCAP_FILE_HEADER_LEN + records.iter().map(|r| r.raw_record.len()).sum::<usize>();
         let mut out = Vec::with_capacity(total);
-        out.extend(std::iter::repeat(0u8).take(PCAP_FILE_HEADER_LEN));
+        out.resize(PCAP_FILE_HEADER_LEN, 0);
         write_file_header(&mut out[0..PCAP_FILE_HEADER_LEN], DEFAULT_SNAPLEN);
 
         for record in records {
@@ -129,14 +129,20 @@ fn format_ts(ts: SystemTime) -> String {
     // ISO 8601 with microsecond precision. We don't pull in chrono just
     // for this — a hand-built representation suffices for an operator
     // diagnostic value.
-    let dur = ts.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+    let dur = ts
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = dur.as_secs();
     let micros = dur.subsec_micros();
     // Decompose secs into Y-M-D H:M:S using a minimal calendar — to avoid
     // a chrono dep we compute via days-since-epoch.
     let days = (secs / 86400) as i64;
     let time_of_day = secs % 86400;
-    let (h, m, s) = (time_of_day / 3600, (time_of_day / 60) % 60, time_of_day % 60);
+    let (h, m, s) = (
+        time_of_day / 3600,
+        (time_of_day / 60) % 60,
+        time_of_day % 60,
+    );
     let (y, mo, d) = days_to_ymd(days);
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
@@ -164,7 +170,7 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
     use crate::capture::config::CaptureConfig;
-    use crate::capture::pcap::{Direction, PCAP_MAGIC};
+    use crate::capture::pcap::PCAP_MAGIC;
     use std::net::IpAddr;
     use std::path::PathBuf;
     use std::str::FromStr;
@@ -201,16 +207,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let handle = init(small_config(dir.path().join("cap.ring"))).unwrap();
         let tap = handle.tap();
-        tap.capture_inbound(
-            "10.0.0.1:9030".parse().unwrap(),
-            b"frame1",
-        );
+        tap.capture_inbound("10.0.0.1:9030".parse().unwrap(), b"frame1");
         // Tiny sleep so the second timestamp is distinct in microseconds
         std::thread::sleep(std::time::Duration::from_micros(2));
-        tap.capture_outbound(
-            "10.0.0.2:9030".parse().unwrap(),
-            b"frame2",
-        );
+        tap.capture_outbound("10.0.0.2:9030".parse().unwrap(), b"frame2");
         let info = handle.info();
         assert!(info.oldest_ts.is_some());
         assert!(info.newest_ts.is_some());
@@ -223,10 +223,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let handle = init(small_config(dir.path().join("cap.ring"))).unwrap();
         let tap = handle.tap();
-        tap.capture_inbound(
-            "10.0.0.1:9030".parse().unwrap(),
-            b"frame-content",
-        );
+        tap.capture_inbound("10.0.0.1:9030".parse().unwrap(), b"frame-content");
 
         let bytes = handle.dump(&DumpFilter::default());
         // pcap header at front
