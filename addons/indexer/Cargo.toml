@@ -53,3 +53,10 @@ anyhow = "1"
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bin]]
+name = "ergo-indexer-migratedb"
+path = "src/bin/ergo-indexer-migratedb.rs"
+
+[dev-dependencies]
+assert_cmd = "2"
