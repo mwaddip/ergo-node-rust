@@ -10,3 +10,4 @@
 pub mod config;
 pub mod pcap;
 pub mod ring;
+pub mod tap;
