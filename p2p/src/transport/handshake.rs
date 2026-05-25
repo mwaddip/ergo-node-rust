@@ -79,7 +79,10 @@ pub fn build(config: &HandshakeConfig) -> Vec<u8> {
     let mut buf = Vec::with_capacity(128);
 
     // Timestamp
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     vlq::write_vlq(&mut buf, now);
 
     write_peer_entry_from_config(config, &mut buf);
@@ -98,7 +101,10 @@ pub fn serialize_peer_entry(spec: &PeerSpec, buf: &mut Vec<u8>) {
 
     write_declared_address(spec.address.as_ref(), buf);
 
-    debug_assert!(spec.features.len() <= u8::MAX as usize, "feature count overflow");
+    debug_assert!(
+        spec.features.len() <= u8::MAX as usize,
+        "feature count overflow"
+    );
     buf.push(spec.features.len() as u8);
     for feature in &spec.features {
         buf.push(feature.id);
@@ -161,9 +167,9 @@ fn build_mode_body(config: &HandshakeConfig) -> Vec<u8> {
 
     // nipopow: NiPoPoW bootstrap flag
     match config.mode {
-        ProxyMode::Full => body.push(0x00),    // None
+        ProxyMode::Full => body.push(0x00), // None
         ProxyMode::Light => {
-            body.push(0x01);                    // Some
+            body.push(0x01); // Some
             vlq::write_vlq(&mut body, vlq::zigzag_encode_i64(1)); // value=1 (KMZ17)
         }
     }
@@ -194,7 +200,10 @@ fn rand_u64() -> u64 {
     }
     #[cfg(not(unix))]
     {
-        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
         buf = t.to_le_bytes();
     }
     u64::from_le_bytes(buf)
@@ -230,7 +239,13 @@ pub fn parse(data: &[u8]) -> io::Result<PeerSpec> {
     // Features
     let features = parse_features(&mut cursor)?;
 
-    Ok(PeerSpec { agent, version, name, address, features })
+    Ok(PeerSpec {
+        agent,
+        version,
+        name,
+        address,
+        features,
+    })
 }
 
 /// Parse a peer entry from a Peers message body.
@@ -254,7 +269,13 @@ pub fn parse_peer_entry(cursor: &mut Cursor<&[u8]>) -> io::Result<PeerSpec> {
 
     let features = parse_features(cursor)?;
 
-    Ok(PeerSpec { agent, version, name, address, features })
+    Ok(PeerSpec {
+        agent,
+        version,
+        name,
+        address,
+        features,
+    })
 }
 
 fn parse_address<R: Read>(reader: &mut R) -> io::Result<Option<SocketAddr>> {
@@ -268,13 +289,21 @@ fn parse_address<R: Read>(reader: &mut R) -> io::Result<Option<SocketAddr>> {
 
     match ip_len {
         4 => Ok(Some(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3])),
+            IpAddr::V4(Ipv4Addr::new(
+                ip_bytes[0],
+                ip_bytes[1],
+                ip_bytes[2],
+                ip_bytes[3],
+            )),
             port,
         ))),
         16 => {
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&ip_bytes);
-            Ok(Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port)))
+            Ok(Some(SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::from(octets)),
+                port,
+            )))
         }
         _ => Ok(None),
     }
@@ -292,7 +321,10 @@ fn parse_features<R: Read>(reader: &mut R) -> io::Result<Vec<Feature>> {
         let flen = vlq::read_vlq_length(reader)?;
         let mut fbody = vec![0u8; flen];
         reader.read_exact(&mut fbody)?;
-        features.push(Feature { id: fid[0], body: fbody });
+        features.push(Feature {
+            id: fid[0],
+            body: fbody,
+        });
     }
     Ok(features)
 }
@@ -333,15 +365,19 @@ impl PeerSpec {
     /// JVM peers encode this as length-prefixed UTF-8 in the feature body.
     /// Returns `None` if the feature is absent or the body is malformed.
     pub fn rest_api_url(&self) -> Option<String> {
-        self.features.iter()
-            .find(|f| f.id == 4)
-            .and_then(|f| {
-                let body = &f.body;
-                if body.is_empty() { return None; }
-                let len = body[0] as usize;
-                if body.len() < 1 + len { return None; }
-                std::str::from_utf8(&body[1..1 + len]).ok().map(String::from)
-            })
+        self.features.iter().find(|f| f.id == 4).and_then(|f| {
+            let body = &f.body;
+            if body.is_empty() {
+                return None;
+            }
+            let len = body[0] as usize;
+            if body.len() < 1 + len {
+                return None;
+            }
+            std::str::from_utf8(&body[1..1 + len])
+                .ok()
+                .map(String::from)
+        })
     }
 }
 
@@ -414,7 +450,10 @@ mod tests {
 
     #[test]
     fn rest_api_url_empty_body() {
-        let spec = make_spec(vec![Feature { id: 4, body: vec![] }]);
+        let spec = make_spec(vec![Feature {
+            id: 4,
+            body: vec![],
+        }]);
         assert_eq!(spec.rest_api_url(), None);
     }
 
@@ -429,8 +468,10 @@ mod tests {
 
     #[test]
     fn rest_api_url_no_feature() {
-        let spec = make_spec(vec![Feature { id: 16, body: vec![0] }]);
+        let spec = make_spec(vec![Feature {
+            id: 16,
+            body: vec![0],
+        }]);
         assert_eq!(spec.rest_api_url(), None);
     }
 }
-

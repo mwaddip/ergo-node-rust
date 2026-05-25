@@ -48,12 +48,17 @@ pub struct Blacklist {
 
 impl Blacklist {
     pub fn new() -> Self {
-        Self { banned: Mutex::new(HashSet::new()) }
+        Self {
+            banned: Mutex::new(HashSet::new()),
+        }
     }
 
     /// Record a permanent ban for `addr`.
     pub fn record_permanent(&self, addr: SocketAddr) {
-        self.banned.lock().expect("blacklist mutex poisoned").insert(addr);
+        self.banned
+            .lock()
+            .expect("blacklist mutex poisoned")
+            .insert(addr);
     }
 
     /// Return all currently-banned addresses, in unspecified order.

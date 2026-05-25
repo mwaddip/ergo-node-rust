@@ -25,7 +25,11 @@ pub struct UpnpMapping {
 impl UpnpMapping {
     /// Remove the port mapping from the gateway. Best-effort — logs on failure.
     pub async fn remove(&self) {
-        if let Err(e) = self.gateway.remove_port(PortMappingProtocol::TCP, self.mapped_port).await {
+        if let Err(e) = self
+            .gateway
+            .remove_port(PortMappingProtocol::TCP, self.mapped_port)
+            .await
+        {
             tracing::warn!(port = self.mapped_port, error = %e, "UPnP: port mapping removal failed");
         } else {
             tracing::info!(port = self.mapped_port, "UPnP: port mapping removed");
@@ -37,7 +41,11 @@ impl UpnpMapping {
 ///
 /// Returns `Some(UpnpMapping)` on success, `None` on any failure.
 /// Never panics or blocks indefinitely — all steps are timeout-wrapped.
-pub async fn attempt(config: &UpnpConfig, listen_port: u16, local_addr: SocketAddr) -> Option<UpnpMapping> {
+pub async fn attempt(
+    config: &UpnpConfig,
+    listen_port: u16,
+    local_addr: SocketAddr,
+) -> Option<UpnpMapping> {
     // Skip if the listen address is IPv6 — UPnP IGD is IPv4 NAT traversal only
     if local_addr.ip().is_ipv6() {
         tracing::debug!("UPnP: skipping for IPv6 listener");
@@ -52,7 +60,8 @@ pub async fn attempt(config: &UpnpConfig, listen_port: u16, local_addr: SocketAd
         ..Default::default()
     };
 
-    let gateway = match tokio::time::timeout(timeout, igd_tokio::search_gateway(search_opts)).await {
+    let gateway = match tokio::time::timeout(timeout, igd_tokio::search_gateway(search_opts)).await
+    {
         Ok(Ok(gw)) => {
             tracing::info!("UPnP: gateway found at {}", gw.addr);
             gw
@@ -68,13 +77,16 @@ pub async fn attempt(config: &UpnpConfig, listen_port: u16, local_addr: SocketAd
     };
 
     // Step 2: add port mapping
-    if let Err(e) = gateway.add_port(
-        PortMappingProtocol::TCP,
-        listen_port,
-        local_addr,
-        0, // permanent until removed
-        "ergo-node-rust",
-    ).await {
+    if let Err(e) = gateway
+        .add_port(
+            PortMappingProtocol::TCP,
+            listen_port,
+            local_addr,
+            0, // permanent until removed
+            "ergo-node-rust",
+        )
+        .await
+    {
         tracing::info!(port = listen_port, error = %e, "UPnP: port mapping failed");
         return None;
     }
@@ -86,7 +98,9 @@ pub async fn attempt(config: &UpnpConfig, listen_port: u16, local_addr: SocketAd
         Err(e) => {
             tracing::info!(error = %e, "UPnP: external IP query failed");
             // Clean up the mapping we just created since we can't use it
-            let _ = gateway.remove_port(PortMappingProtocol::TCP, listen_port).await;
+            let _ = gateway
+                .remove_port(PortMappingProtocol::TCP, listen_port)
+                .await;
             return None;
         }
     };

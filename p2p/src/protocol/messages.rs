@@ -40,12 +40,28 @@ impl MessageCode {
 #[derive(Debug, Clone)]
 pub enum ProtocolMessage {
     GetPeers,
-    Peers { body: Vec<u8> },
-    Inv { modifier_type: u8, ids: Vec<ModifierId> },
-    ModifierRequest { modifier_type: u8, ids: Vec<ModifierId> },
-    ModifierResponse { modifier_type: u8, modifiers: Vec<(ModifierId, Vec<u8>)> },
-    SyncInfo { body: Vec<u8> },
-    Unknown { code: u8, body: Vec<u8> },
+    Peers {
+        body: Vec<u8>,
+    },
+    Inv {
+        modifier_type: u8,
+        ids: Vec<ModifierId>,
+    },
+    ModifierRequest {
+        modifier_type: u8,
+        ids: Vec<ModifierId>,
+    },
+    ModifierResponse {
+        modifier_type: u8,
+        modifiers: Vec<(ModifierId, Vec<u8>)>,
+    },
+    SyncInfo {
+        body: Vec<u8>,
+    },
+    Unknown {
+        code: u8,
+        body: Vec<u8>,
+    },
 }
 
 impl ProtocolMessage {
@@ -54,9 +70,9 @@ impl ProtocolMessage {
         match frame.code {
             MessageCode::GET_PEERS => Ok(ProtocolMessage::GetPeers),
 
-            MessageCode::PEERS => {
-                Ok(ProtocolMessage::Peers { body: frame.body.clone() })
-            }
+            MessageCode::PEERS => Ok(ProtocolMessage::Peers {
+                body: frame.body.clone(),
+            }),
 
             MessageCode::INV => {
                 let (modifier_type, ids) = parse_inv_body(&frame.body)?;
@@ -70,38 +86,57 @@ impl ProtocolMessage {
 
             MessageCode::MODIFIER_RESPONSE => {
                 let (modifier_type, modifiers) = parse_modifier_response_body(&frame.body)?;
-                Ok(ProtocolMessage::ModifierResponse { modifier_type, modifiers })
+                Ok(ProtocolMessage::ModifierResponse {
+                    modifier_type,
+                    modifiers,
+                })
             }
 
-            MessageCode::SYNC_INFO => {
-                Ok(ProtocolMessage::SyncInfo { body: frame.body.clone() })
-            }
+            MessageCode::SYNC_INFO => Ok(ProtocolMessage::SyncInfo {
+                body: frame.body.clone(),
+            }),
 
-            code => {
-                Ok(ProtocolMessage::Unknown { code, body: frame.body.clone() })
-            }
+            code => Ok(ProtocolMessage::Unknown {
+                code,
+                body: frame.body.clone(),
+            }),
         }
     }
 
     /// Serialize a typed message back into a Frame.
     pub fn to_frame(&self) -> Frame {
         match self {
-            ProtocolMessage::GetPeers => Frame { code: MessageCode::GET_PEERS, body: vec![] },
-            ProtocolMessage::Peers { body } => Frame { code: MessageCode::PEERS, body: body.clone() },
-            ProtocolMessage::Inv { modifier_type, ids } => {
-                Frame { code: MessageCode::INV, body: encode_inv_body(*modifier_type, ids) }
-            }
-            ProtocolMessage::ModifierRequest { modifier_type, ids } => {
-                Frame { code: MessageCode::MODIFIER_REQUEST, body: encode_inv_body(*modifier_type, ids) }
-            }
-            ProtocolMessage::ModifierResponse { modifier_type, modifiers } => {
-                Frame {
-                    code: MessageCode::MODIFIER_RESPONSE,
-                    body: encode_modifier_response_body(*modifier_type, modifiers),
-                }
-            }
-            ProtocolMessage::SyncInfo { body } => Frame { code: MessageCode::SYNC_INFO, body: body.clone() },
-            ProtocolMessage::Unknown { code, body } => Frame { code: *code, body: body.clone() },
+            ProtocolMessage::GetPeers => Frame {
+                code: MessageCode::GET_PEERS,
+                body: vec![],
+            },
+            ProtocolMessage::Peers { body } => Frame {
+                code: MessageCode::PEERS,
+                body: body.clone(),
+            },
+            ProtocolMessage::Inv { modifier_type, ids } => Frame {
+                code: MessageCode::INV,
+                body: encode_inv_body(*modifier_type, ids),
+            },
+            ProtocolMessage::ModifierRequest { modifier_type, ids } => Frame {
+                code: MessageCode::MODIFIER_REQUEST,
+                body: encode_inv_body(*modifier_type, ids),
+            },
+            ProtocolMessage::ModifierResponse {
+                modifier_type,
+                modifiers,
+            } => Frame {
+                code: MessageCode::MODIFIER_RESPONSE,
+                body: encode_modifier_response_body(*modifier_type, modifiers),
+            },
+            ProtocolMessage::SyncInfo { body } => Frame {
+                code: MessageCode::SYNC_INFO,
+                body: body.clone(),
+            },
+            ProtocolMessage::Unknown { code, body } => Frame {
+                code: *code,
+                body: body.clone(),
+            },
         }
     }
 }
@@ -175,7 +210,10 @@ fn parse_modifier_response_body(data: &[u8]) -> io::Result<(u8, ModifierEntries)
     Ok((type_byte[0], modifiers))
 }
 
-fn encode_modifier_response_body(modifier_type: u8, modifiers: &[(ModifierId, Vec<u8>)]) -> Vec<u8> {
+fn encode_modifier_response_body(
+    modifier_type: u8,
+    modifiers: &[(ModifierId, Vec<u8>)],
+) -> Vec<u8> {
     let mut body = Vec::new();
     body.push(modifier_type);
     vlq::write_vlq(&mut body, modifiers.len() as u64);
@@ -273,12 +311,27 @@ mod tests {
 
     #[test]
     fn peers_body_roundtrip_three_mixed() {
-        let s1 = spec(Some("203.0.113.5:9030"), vec![Feature { id: 16, body: vec![0, 1, 0] }]);
+        let s1 = spec(
+            Some("203.0.113.5:9030"),
+            vec![Feature {
+                id: 16,
+                body: vec![0, 1, 0],
+            }],
+        );
         let s2 = spec(Some("[2001:db8::1]:9030"), vec![]);
-        let s3 = spec(None, vec![
-            Feature { id: 16, body: vec![0, 0, 0, 0xFE, 0x01] },
-            Feature { id: 64, body: vec![] },
-        ]);
+        let s3 = spec(
+            None,
+            vec![
+                Feature {
+                    id: 16,
+                    body: vec![0, 0, 0, 0xFE, 0x01],
+                },
+                Feature {
+                    id: 64,
+                    body: vec![],
+                },
+            ],
+        );
         let specs = vec![s1, s2, s3];
         let body = build_peers_body(&specs);
         let parsed = parse_peers_body(&body, 64).unwrap();
@@ -335,13 +388,13 @@ mod tests {
     /// 9030 = 2 bytes), feature count (1 byte = 0).
     #[test]
     fn peers_body_byte_counts() {
-        let v4 = |i: u8| spec(
-            Some(&format!("203.0.113.{}:9030", i)),
-            vec![],
-        );
+        let v4 = |i: u8| spec(Some(&format!("203.0.113.{}:9030", i)), vec![]);
         let v6 = |i: u8| {
             let mut octets = [0u8; 16];
-            octets[0] = 0x20; octets[1] = 0x01; octets[2] = 0x0d; octets[3] = 0xb8;
+            octets[0] = 0x20;
+            octets[1] = 0x01;
+            octets[2] = 0x0d;
+            octets[3] = 0xb8;
             octets[15] = i;
             let addr = std::net::SocketAddr::new(
                 std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)),
@@ -390,8 +443,7 @@ mod tests {
     fn parse_modifier_response_body_rejects_count_above_cap() {
         let mut body = vec![1u8];
         vlq::write_vlq(&mut body, (MAX_INV_OBJECTS as u64) + 1);
-        let err = parse_modifier_response_body(&body)
-            .expect_err("oversized count must error");
+        let err = parse_modifier_response_body(&body).expect_err("oversized count must error");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -401,12 +453,12 @@ mod tests {
         // actually fit in the (declared) body. The check must fire before
         // we allocate `vec![0u8; data_len]`.
         let mut body = vec![1u8];
-        vlq::write_vlq(&mut body, 1);              // count = 1
-        body.extend_from_slice(&[0u8; 32]);        // modifier id
-        vlq::write_vlq(&mut body, 1_000_000);      // declared data_len
-        // body length is far smaller than 1_000_000 — must reject.
-        let err = parse_modifier_response_body(&body)
-            .expect_err("oversized declared payload must error");
+        vlq::write_vlq(&mut body, 1); // count = 1
+        body.extend_from_slice(&[0u8; 32]); // modifier id
+        vlq::write_vlq(&mut body, 1_000_000); // declared data_len
+                                              // body length is far smaller than 1_000_000 — must reject.
+        let err =
+            parse_modifier_response_body(&body).expect_err("oversized declared payload must error");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

@@ -91,7 +91,13 @@ impl PeerDb {
             }
             entries.insert(rec.address, rec);
         }
-        Ok(Self { entries, cap, blacklist, storage, self_addresses })
+        Ok(Self {
+            entries,
+            cap,
+            blacklist,
+            storage,
+            self_addresses,
+        })
     }
 
     /// Insert or update a record.
@@ -133,15 +139,12 @@ impl PeerDb {
 
     /// Top `limit` most-recently-seen peers, excluding addresses in
     /// `exclude_addrs` and any blacklisted address.
-    pub fn recent(
-        &self,
-        limit: usize,
-        exclude_addrs: &HashSet<SocketAddr>,
-    ) -> Vec<PeerRecord> {
+    pub fn recent(&self, limit: usize, exclude_addrs: &HashSet<SocketAddr>) -> Vec<PeerRecord> {
         if limit == 0 {
             return Vec::new();
         }
-        let mut candidates: Vec<&PeerRecord> = self.entries
+        let mut candidates: Vec<&PeerRecord> = self
+            .entries
             .values()
             .filter(|r| !exclude_addrs.contains(&r.address))
             .filter(|r| !self.blacklist.contains(r.address))
@@ -165,7 +168,8 @@ impl PeerDb {
     }
 
     fn evict_oldest(&mut self) {
-        if let Some(addr) = self.entries
+        if let Some(addr) = self
+            .entries
             .values()
             .min_by_key(|r| r.last_seen_ms)
             .map(|r| r.address)
@@ -230,7 +234,14 @@ impl Default for MemoryPeerStorage {
 
 impl PeerStorage for MemoryPeerStorage {
     fn load_all(&self) -> Result<Vec<PeerRecord>, PeerStorageError> {
-        Ok(self.inner.lock().expect("poisoned").entries.values().cloned().collect())
+        Ok(self
+            .inner
+            .lock()
+            .expect("poisoned")
+            .entries
+            .values()
+            .cloned()
+            .collect())
     }
 
     fn put(&self, record: &PeerRecord) -> Result<(), PeerStorageError> {
@@ -390,7 +401,8 @@ mod tests {
             bl,
             10,
             HashSet::new(),
-        ).unwrap();
+        )
+        .unwrap();
         db.record(record("1.2.3.4:9030", 1000));
         let ops = storage.ops();
         assert_eq!(ops.len(), 1);
@@ -406,11 +418,14 @@ mod tests {
             bl,
             10,
             HashSet::new(),
-        ).unwrap();
+        )
+        .unwrap();
         db.record(record("1.2.3.4:9030", 1000));
         db.forget(addr("1.2.3.4:9030"));
         let ops = storage.ops();
-        assert!(ops.iter().any(|op| matches!(op, MemoryStorageOp::Delete(_))));
+        assert!(ops
+            .iter()
+            .any(|op| matches!(op, MemoryStorageOp::Delete(_))));
     }
 
     #[test]
@@ -422,12 +437,16 @@ mod tests {
             bl,
             2,
             HashSet::new(),
-        ).unwrap();
+        )
+        .unwrap();
         db.record(record("1.0.0.1:9030", 100));
         db.record(record("1.0.0.2:9030", 200));
         db.record(record("1.0.0.3:9030", 300)); // evicts 1.0.0.1
         let ops = storage.ops();
-        let delete_count = ops.iter().filter(|op| matches!(op, MemoryStorageOp::Delete(_))).count();
+        let delete_count = ops
+            .iter()
+            .filter(|op| matches!(op, MemoryStorageOp::Delete(_)))
+            .count();
         assert_eq!(delete_count, 1, "exactly one delete from eviction");
     }
 
@@ -441,7 +460,8 @@ mod tests {
             Arc::new(Blacklist::new()),
             10,
             HashSet::new(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(db.count(), 2);
     }
 
@@ -456,7 +476,8 @@ mod tests {
             bl,
             10,
             self_addresses,
-        ).unwrap();
+        )
+        .unwrap();
         db.record(record("1.2.3.4:9030", 1000));
         assert_eq!(db.count(), 0);
         let ops = storage.ops();
@@ -478,7 +499,8 @@ mod tests {
             Arc::new(Blacklist::new()),
             10,
             self_addresses,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(db.count(), 1);
         assert!(db.get(addr("1.2.3.4:9030")).is_none());
         assert!(db.get(addr("5.6.7.8:9030")).is_some());
@@ -486,12 +508,14 @@ mod tests {
         // directly must still return both rows. PeerDb::new never calls
         // storage.delete on filtered self-addresses.
         let persisted = storage.load_all().expect("infallible");
-        let persisted_addrs: HashSet<SocketAddr> =
-            persisted.iter().map(|r| r.address).collect();
+        let persisted_addrs: HashSet<SocketAddr> = persisted.iter().map(|r| r.address).collect();
         assert!(persisted_addrs.contains(&addr("1.2.3.4:9030")));
         assert!(persisted_addrs.contains(&addr("5.6.7.8:9030")));
         assert!(
-            !storage.ops().iter().any(|op| matches!(op, MemoryStorageOp::Delete(_))),
+            !storage
+                .ops()
+                .iter()
+                .any(|op| matches!(op, MemoryStorageOp::Delete(_))),
             "PeerDb::new must not delete filtered self-addresses from disk"
         );
     }

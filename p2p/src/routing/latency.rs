@@ -57,10 +57,13 @@ impl LatencyTracker {
 
     /// Record that we forwarded a request to a target peer.
     pub fn record_request(&mut self, modifier_id: ModifierId, target_peer: PeerId) {
-        self.pending.insert(modifier_id, PendingTiming {
-            target_peer,
-            sent_at: Instant::now(),
-        });
+        self.pending.insert(
+            modifier_id,
+            PendingTiming {
+                target_peer,
+                sent_at: Instant::now(),
+            },
+        );
     }
 
     /// Record that a response arrived. Returns the RTT in milliseconds if timing was tracked.
@@ -129,7 +132,8 @@ impl LatencyTracker {
 
     /// Pick the fastest peer from a set of candidates.
     pub fn fastest_peer(&self, candidates: &[PeerId]) -> Option<PeerId> {
-        candidates.iter()
+        candidates
+            .iter()
             .filter_map(|p| self.peer_latency(p).map(|lat| (*p, lat)))
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(p, _)| p)

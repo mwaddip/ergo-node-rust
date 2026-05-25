@@ -284,10 +284,7 @@ not32hex 02 40 00 00 wlo1
         let temp: Ipv6Addr = "2a02:a46d:9a6:0:c406:a62c:632f:1472".parse().unwrap();
         let stable: Ipv6Addr = "2a02:a46d:9a6:0:3b37:6ed8:db91:9e84".parse().unwrap();
         // Temporary first — it would win the unfiltered "first global unicast" race.
-        let candidates = vec![
-            (temp, "wlo1".to_string()),
-            (stable, "wlo1".to_string()),
-        ];
+        let candidates = vec![(temp, "wlo1".to_string()), (stable, "wlo1".to_string())];
         let mut flags = HashMap::new();
         flags.insert(temp, IFA_F_TEMPORARY);
         flags.insert(stable, 0);
@@ -301,10 +298,7 @@ not32hex 02 40 00 00 wlo1
         let plain: Ipv6Addr = "2a02:a46d:9a6:0:1::1".parse().unwrap();
         let mngtmp: Ipv6Addr = "2a02:a46d:9a6:0:2::2".parse().unwrap();
         // plain first — would win the simple "first stable" tiebreak.
-        let candidates = vec![
-            (plain, "wlo1".to_string()),
-            (mngtmp, "wlo1".to_string()),
-        ];
+        let candidates = vec![(plain, "wlo1".to_string()), (mngtmp, "wlo1".to_string())];
         let mut flags = HashMap::new();
         flags.insert(plain, 0);
         flags.insert(mngtmp, IFA_F_MANAGETEMPADDR);
@@ -317,16 +311,16 @@ not32hex 02 40 00 00 wlo1
     fn select_address_falls_back_when_all_temporary() {
         let temp1: Ipv6Addr = "2a02:a46d:9a6:0:c406:a62c:632f:1472".parse().unwrap();
         let temp2: Ipv6Addr = "2a02:a46d:9a6:0:c407::1".parse().unwrap();
-        let candidates = vec![
-            (temp1, "wlo1".to_string()),
-            (temp2, "wlo1".to_string()),
-        ];
+        let candidates = vec![(temp1, "wlo1".to_string()), (temp2, "wlo1".to_string())];
         let mut flags = HashMap::new();
         flags.insert(temp1, IFA_F_TEMPORARY);
         flags.insert(temp2, IFA_F_TEMPORARY);
 
         let (chosen, _) = select_address(&candidates, Some(&flags));
-        assert_eq!(chosen, temp1, "should fall back to first candidate when none stable");
+        assert_eq!(
+            chosen, temp1,
+            "should fall back to first candidate when none stable"
+        );
     }
 
     #[test]

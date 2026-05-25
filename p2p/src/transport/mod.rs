@@ -1,4 +1,4 @@
-pub mod vlq;
+pub mod connection;
 pub mod frame;
 pub mod handshake;
-pub mod connection;
+pub mod vlq;

@@ -267,9 +267,7 @@ impl Router {
                 vec![]
             }
 
-            ProtocolEvent::Message { peer_id, message } => {
-                self.route_message(peer_id, message)
-            }
+            ProtocolEvent::Message { peer_id, message } => self.route_message(peer_id, message),
         }
     }
 
@@ -288,7 +286,11 @@ impl Router {
             agent_name: spec.agent.clone(),
             node_name: spec.name.clone(),
             version: (spec.version.major, spec.version.minor, spec.version.patch),
-            features: spec.features.iter().map(|f| (f.id, f.body.clone())).collect(),
+            features: spec
+                .features
+                .iter()
+                .map(|f| (f.id, f.body.clone()))
+                .collect(),
         });
     }
 
@@ -329,13 +331,18 @@ impl Router {
                 let mut actions = Vec::new();
                 for id in &ids {
                     let target = if let Some(inv_target) = self.inv_table.lookup(id) {
-                        if inv_target == source { continue; }
+                        if inv_target == source {
+                            continue;
+                        }
                         Some(inv_target)
                     } else {
                         // Fallback: pick any outbound peer that isn't the source.
                         // Enables chain sync where modifier IDs come from SyncInfo, not Inv.
-                        self.peers.iter()
-                            .find(|(pid, entry)| **pid != source && entry.direction == Direction::Outbound)
+                        self.peers
+                            .iter()
+                            .find(|(pid, entry)| {
+                                **pid != source && entry.direction == Direction::Outbound
+                            })
                             .map(|(pid, _)| *pid)
                     };
 
@@ -354,9 +361,16 @@ impl Router {
                 actions
             }
 
-            ProtocolMessage::ModifierResponse { modifier_type, modifiers } => {
+            ProtocolMessage::ModifierResponse {
+                modifier_type,
+                modifiers,
+            } => {
                 if modifier_type != 101 {
-                    tracing::debug!(modifier_type, count = modifiers.len(), "routing non-header ModifierResponse");
+                    tracing::debug!(
+                        modifier_type,
+                        count = modifiers.len(),
+                        "routing non-header ModifierResponse"
+                    );
                 }
                 let mut actions = Vec::new();
                 for (id, data) in &modifiers {
@@ -387,12 +401,10 @@ impl Router {
 
                 match source_direction {
                     Direction::Inbound => {
-                        if let Some((&outbound_id, _)) = self.peers.iter()
-                            .find(|(pid, entry)| {
-                                entry.direction == Direction::Outbound
-                                    && self.sync_tracker.inbound_for(pid).is_none()
-                            })
-                        {
+                        if let Some((&outbound_id, _)) = self.peers.iter().find(|(pid, entry)| {
+                            entry.direction == Direction::Outbound
+                                && self.sync_tracker.inbound_for(pid).is_none()
+                        }) {
                             self.sync_tracker.pair(source, outbound_id);
                             vec![Action::Send {
                                 target: outbound_id,
@@ -452,7 +464,9 @@ impl Router {
                                     }
                                     continue;
                                 }
-                                if self.blacklist.contains(addr) { continue; }
+                                if self.blacklist.contains(addr) {
+                                    continue;
+                                }
                                 db.record(PeerRecord {
                                     address: addr,
                                     last_seen_ms: now_ms(),
@@ -463,7 +477,11 @@ impl Router {
                                         spec.version.minor,
                                         spec.version.patch,
                                     ),
-                                    features: spec.features.iter().map(|f| (f.id, f.body.clone())).collect(),
+                                    features: spec
+                                        .features
+                                        .iter()
+                                        .map(|f| (f.id, f.body.clone()))
+                                        .collect(),
                                 });
                             }
                         }
@@ -508,11 +526,15 @@ impl Router {
                     Direction::Inbound => Direction::Outbound,
                 };
 
-                self.peers.iter()
+                self.peers
+                    .iter()
                     .filter(|(pid, entry)| **pid != source && entry.direction == target_direction)
                     .map(|(pid, _)| Action::Send {
                         target: *pid,
-                        message: ProtocolMessage::Unknown { code, body: body.clone() },
+                        message: ProtocolMessage::Unknown {
+                            code,
+                            body: body.clone(),
+                        },
                     })
                     .collect()
             }
@@ -520,14 +542,16 @@ impl Router {
     }
 
     pub fn outbound_peers(&self) -> Vec<PeerId> {
-        self.peers.iter()
+        self.peers
+            .iter()
             .filter(|(_, e)| e.direction == Direction::Outbound)
             .map(|(pid, _)| *pid)
             .collect()
     }
 
     pub fn inbound_peers(&self) -> Vec<PeerId> {
-        self.peers.iter()
+        self.peers
+            .iter()
             .filter(|(_, e)| e.direction == Direction::Inbound)
             .map(|(pid, _)| *pid)
             .collect()
@@ -560,7 +584,8 @@ fn record_to_spec(rec: PeerRecord) -> PeerSpec {
         version: Version::new(rec.version.0, rec.version.1, rec.version.2),
         name: rec.node_name,
         address: Some(rec.address),
-        features: rec.features
+        features: rec
+            .features
             .into_iter()
             .map(|(id, body)| Feature { id, body })
             .collect(),
@@ -609,7 +634,14 @@ mod tests {
         // Register a single connected outbound peer that will issue GetPeers.
         let source = PeerId(1);
         let source_addr = pub_addr("78.46.10.3:9030"); // also in the DB
-        router.register_peer(source, Direction::Outbound, ProxyMode::Full, source_addr, None, None);
+        router.register_peer(
+            source,
+            Direction::Outbound,
+            ProxyMode::Full,
+            source_addr,
+            None,
+            None,
+        );
 
         let actions = router.handle_event(ProtocolEvent::Message {
             peer_id: source,
@@ -617,7 +649,10 @@ mod tests {
         });
         assert_eq!(actions.len(), 1);
         let body = match &actions[0] {
-            Action::Send { target, message: ProtocolMessage::Peers { body } } => {
+            Action::Send {
+                target,
+                message: ProtocolMessage::Peers { body },
+            } => {
                 assert_eq!(*target, source);
                 body.clone()
             }
@@ -636,18 +671,32 @@ mod tests {
     fn get_peers_empty_db_returns_zero_count_body() {
         let mut router = Router::new(Network::Mainnet);
         let source = PeerId(1);
-        router.register_peer(source, Direction::Outbound, ProxyMode::Full, pub_addr("198.51.100.1:9030"), None, None);
+        router.register_peer(
+            source,
+            Direction::Outbound,
+            ProxyMode::Full,
+            pub_addr("198.51.100.1:9030"),
+            None,
+            None,
+        );
 
         // Forget the stub PeerDb entry that register_peer just wrote so
         // we exercise the genuinely-empty case.
-        router.peer_db.lock().unwrap().forget(pub_addr("198.51.100.1:9030"));
+        router
+            .peer_db
+            .lock()
+            .unwrap()
+            .forget(pub_addr("198.51.100.1:9030"));
 
         let actions = router.handle_event(ProtocolEvent::Message {
             peer_id: source,
             message: ProtocolMessage::GetPeers,
         });
         match &actions[0] {
-            Action::Send { message: ProtocolMessage::Peers { body }, .. } => {
+            Action::Send {
+                message: ProtocolMessage::Peers { body },
+                ..
+            } => {
                 assert_eq!(body, &vec![0x00]);
             }
             _ => panic!("expected Peers reply"),
@@ -661,7 +710,14 @@ mod tests {
         // 198.51.100/24 and 203.0.113/24 are documentation ranges and
         // would now trigger the bogus-address ban path. Use a public
         // range so this test still exercises the happy path.
-        router.register_peer(source, Direction::Outbound, ProxyMode::Full, pub_addr("78.46.20.1:9030"), None, None);
+        router.register_peer(
+            source,
+            Direction::Outbound,
+            ProxyMode::Full,
+            pub_addr("78.46.20.1:9030"),
+            None,
+            None,
+        );
 
         let specs = vec![
             spec_for("ergoref", pub_addr("78.46.20.10:9030")),
@@ -690,7 +746,14 @@ mod tests {
         let mut router = Router::new(Network::Mainnet);
         let source = PeerId(7);
         let source_addr = pub_addr("198.51.100.7:9030");
-        router.register_peer(source, Direction::Outbound, ProxyMode::Full, source_addr, None, None);
+        router.register_peer(
+            source,
+            Direction::Outbound,
+            ProxyMode::Full,
+            source_addr,
+            None,
+            None,
+        );
 
         // Body declares a count above cap.
         let mut body = vec![];
@@ -715,7 +778,10 @@ mod tests {
                 version: Version::new(5, 0, 25),
                 name: "node20".into(),
                 address: Some(declared),
-                features: vec![Feature { id: 16, body: vec![0, 1, 0] }],
+                features: vec![Feature {
+                    id: 16,
+                    body: vec![0, 1, 0],
+                }],
             },
             direction: Direction::Outbound,
             addr: observed,
@@ -755,17 +821,21 @@ mod tests {
         let mut router = Router::new(Network::Mainnet);
         let source = PeerId(1);
         let source_addr = pub_addr("198.51.100.50:9030");
-        router.register_peer(source, Direction::Outbound, ProxyMode::Full, source_addr, None, None);
+        router.register_peer(
+            source,
+            Direction::Outbound,
+            ProxyMode::Full,
+            source_addr,
+            None,
+            None,
+        );
 
         // 198.51.100/24 and 203.0.113/24 are documentation ranges and
         // thus bogus — use a public-looking address (Hetzner-ish) for
         // the "good" entry.
         let good = pub_addr("78.46.1.50:9030");
         let bogus = pub_addr("169.254.0.2:9030"); // link-local APIPA
-        let specs = vec![
-            spec_for("ergoref", good),
-            spec_for("ergoref", bogus),
-        ];
+        let specs = vec![spec_for("ergoref", good), spec_for("ergoref", bogus)];
         let body = build_peers_body(&specs);
         let actions = router.handle_event(ProtocolEvent::Message {
             peer_id: source,
@@ -788,17 +858,30 @@ mod tests {
         let mut router = Router::new(Network::Mainnet);
         let source = PeerId(2);
         let source_addr = pub_addr("78.46.1.51:9030");
-        router.register_peer(source, Direction::Outbound, ProxyMode::Full, source_addr, None, None);
+        router.register_peer(
+            source,
+            Direction::Outbound,
+            ProxyMode::Full,
+            source_addr,
+            None,
+            None,
+        );
         // register_peer seeded the source's own address into PeerDb (as
         // an outbound stub). Capture the snapshot of addresses BEFORE
         // the bogus Peers message so we can assert no new entries land.
-        let before: HashSet<SocketAddr> =
-            router.peer_db.lock().unwrap().all().into_iter().map(|r| r.address).collect();
+        let before: HashSet<SocketAddr> = router
+            .peer_db
+            .lock()
+            .unwrap()
+            .all()
+            .into_iter()
+            .map(|r| r.address)
+            .collect();
 
         let bogus_specs = vec![
-            spec_for("ergoref", pub_addr("169.254.0.2:9030")),    // link-local
-            spec_for("ergoref", pub_addr("10.0.0.1:9030")),       // RFC 1918
-            spec_for("ergoref", pub_addr("127.0.0.1:9030")),      // loopback
+            spec_for("ergoref", pub_addr("169.254.0.2:9030")), // link-local
+            spec_for("ergoref", pub_addr("10.0.0.1:9030")),    // RFC 1918
+            spec_for("ergoref", pub_addr("127.0.0.1:9030")),   // loopback
         ];
         let body = build_peers_body(&bogus_specs);
         let actions = router.handle_event(ProtocolEvent::Message {
@@ -807,8 +890,14 @@ mod tests {
         });
         assert!(actions.is_empty());
 
-        let after: HashSet<SocketAddr> =
-            router.peer_db.lock().unwrap().all().into_iter().map(|r| r.address).collect();
+        let after: HashSet<SocketAddr> = router
+            .peer_db
+            .lock()
+            .unwrap()
+            .all()
+            .into_iter()
+            .map(|r| r.address)
+            .collect();
         assert_eq!(before, after, "PeerDb unchanged after all-bogus Peers body");
 
         assert!(router.blacklist.contains(source_addr));
@@ -819,7 +908,14 @@ mod tests {
         let mut router = Router::new(Network::Mainnet);
         let source = PeerId(3);
         let source_addr = pub_addr("78.46.1.52:9030");
-        router.register_peer(source, Direction::Outbound, ProxyMode::Full, source_addr, None, None);
+        router.register_peer(
+            source,
+            Direction::Outbound,
+            ProxyMode::Full,
+            source_addr,
+            None,
+            None,
+        );
 
         let clean_specs = vec![
             spec_for("ergoref", pub_addr("78.46.2.10:9030")),
@@ -838,7 +934,10 @@ mod tests {
             assert!(db.get(s.address.unwrap()).is_some());
         }
         drop(db);
-        assert!(!router.blacklist.contains(source_addr), "source not banned for clean Peers");
+        assert!(
+            !router.blacklist.contains(source_addr),
+            "source not banned for clean Peers"
+        );
     }
 
     #[test]
@@ -846,7 +945,14 @@ mod tests {
         let mut router = Router::new(Network::Mainnet);
         let source = PeerId(4);
         let source_addr = pub_addr("78.46.1.53:9030");
-        router.register_peer(source, Direction::Outbound, ProxyMode::Full, source_addr, None, None);
+        router.register_peer(
+            source,
+            Direction::Outbound,
+            ProxyMode::Full,
+            source_addr,
+            None,
+            None,
+        );
 
         // Preload PeerDb with one bogus + one good entry (bypass the
         // Peers-arm filter so we exercise the defensive egress path).
@@ -877,13 +983,19 @@ mod tests {
             message: ProtocolMessage::GetPeers,
         });
         let body = match &actions[0] {
-            Action::Send { message: ProtocolMessage::Peers { body }, .. } => body.clone(),
+            Action::Send {
+                message: ProtocolMessage::Peers { body },
+                ..
+            } => body.clone(),
             _ => panic!("expected Peers reply"),
         };
         let specs = parse_peers_body(&body, 64).unwrap();
         let addrs: Vec<SocketAddr> = specs.iter().filter_map(|s| s.address).collect();
         assert!(addrs.contains(&good), "good address present in response");
-        assert!(!addrs.contains(&bogus), "bogus address absent from response");
+        assert!(
+            !addrs.contains(&bogus),
+            "bogus address absent from response"
+        );
     }
 
     #[test]
@@ -893,11 +1005,25 @@ mod tests {
         // 203.0.113/24 are now stripped by the bogus-address filter.
         let source = PeerId(1);
         let source_addr = pub_addr("78.46.30.40:9030");
-        router.register_peer(source, Direction::Outbound, ProxyMode::Full, source_addr, None, None);
+        router.register_peer(
+            source,
+            Direction::Outbound,
+            ProxyMode::Full,
+            source_addr,
+            None,
+            None,
+        );
         // Another connected peer at a different address.
         let other = PeerId(2);
         let other_addr = pub_addr("78.46.30.41:9030");
-        router.register_peer(other, Direction::Outbound, ProxyMode::Full, other_addr, None, None);
+        router.register_peer(
+            other,
+            Direction::Outbound,
+            ProxyMode::Full,
+            other_addr,
+            None,
+            None,
+        );
         // A non-connected gossiped entry.
         let gossiped = pub_addr("78.46.30.42:9030");
         {
@@ -917,7 +1043,10 @@ mod tests {
             message: ProtocolMessage::GetPeers,
         });
         let body = match &actions[0] {
-            Action::Send { message: ProtocolMessage::Peers { body }, .. } => body.clone(),
+            Action::Send {
+                message: ProtocolMessage::Peers { body },
+                ..
+            } => body.clone(),
             _ => panic!(),
         };
         let specs = parse_peers_body(&body, 64).unwrap();
@@ -941,7 +1070,14 @@ mod tests {
         let mut router = Router::new(Network::Testnet);
         let source = PeerId(1);
         let source_addr = pub_addr("192.168.50.1:9030");
-        router.register_peer(source, Direction::Outbound, ProxyMode::Full, source_addr, None, None);
+        router.register_peer(
+            source,
+            Direction::Outbound,
+            ProxyMode::Full,
+            source_addr,
+            None,
+            None,
+        );
 
         let private = pub_addr("192.168.1.1:9030");
         let specs = vec![spec_for("ergoref", private)];
@@ -954,7 +1090,10 @@ mod tests {
 
         // Private address recorded on testnet, source not banned.
         let db = router.peer_db.lock().unwrap();
-        assert!(db.get(private).is_some(), "private address recorded on testnet");
+        assert!(
+            db.get(private).is_some(),
+            "private address recorded on testnet"
+        );
         drop(db);
         assert!(
             !router.blacklist.contains(source_addr),

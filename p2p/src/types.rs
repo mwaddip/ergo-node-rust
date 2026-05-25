@@ -23,10 +23,18 @@ pub struct Version {
 }
 
 impl Version {
-    pub const EIP37_MIN: Version = Version { major: 4, minor: 0, patch: 100 };
+    pub const EIP37_MIN: Version = Version {
+        major: 4,
+        minor: 0,
+        patch: 100,
+    };
 
     pub const fn new(major: u8, minor: u8, patch: u8) -> Self {
-        Self { major, minor, patch }
+        Self {
+            major,
+            minor,
+            patch,
+        }
     }
 }
 

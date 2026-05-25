@@ -144,30 +144,54 @@ mod tests {
     fn v4_loopback_is_bogus_both_networks() {
         assert!(is_bogus_address(sa("127.0.0.1:9030"), Network::Mainnet));
         assert!(is_bogus_address(sa("127.0.0.1:9030"), Network::Testnet));
-        assert!(is_bogus_address(sa("127.255.255.254:9030"), Network::Mainnet));
-        assert!(is_bogus_address(sa("127.255.255.254:9030"), Network::Testnet));
+        assert!(is_bogus_address(
+            sa("127.255.255.254:9030"),
+            Network::Mainnet
+        ));
+        assert!(is_bogus_address(
+            sa("127.255.255.254:9030"),
+            Network::Testnet
+        ));
     }
 
     #[test]
     fn v4_link_local_is_bogus_both_networks() {
         assert!(is_bogus_address(sa("169.254.0.2:9030"), Network::Mainnet));
         assert!(is_bogus_address(sa("169.254.0.2:9030"), Network::Testnet));
-        assert!(is_bogus_address(sa("169.254.255.254:9030"), Network::Mainnet));
-        assert!(is_bogus_address(sa("169.254.255.254:9030"), Network::Testnet));
+        assert!(is_bogus_address(
+            sa("169.254.255.254:9030"),
+            Network::Mainnet
+        ));
+        assert!(is_bogus_address(
+            sa("169.254.255.254:9030"),
+            Network::Testnet
+        ));
     }
 
     #[test]
     fn v4_multicast_is_bogus_both_networks() {
         assert!(is_bogus_address(sa("224.0.0.1:9030"), Network::Mainnet));
         assert!(is_bogus_address(sa("224.0.0.1:9030"), Network::Testnet));
-        assert!(is_bogus_address(sa("239.255.255.255:9030"), Network::Mainnet));
-        assert!(is_bogus_address(sa("239.255.255.255:9030"), Network::Testnet));
+        assert!(is_bogus_address(
+            sa("239.255.255.255:9030"),
+            Network::Mainnet
+        ));
+        assert!(is_bogus_address(
+            sa("239.255.255.255:9030"),
+            Network::Testnet
+        ));
     }
 
     #[test]
     fn v4_broadcast_is_bogus_both_networks() {
-        assert!(is_bogus_address(sa("255.255.255.255:9030"), Network::Mainnet));
-        assert!(is_bogus_address(sa("255.255.255.255:9030"), Network::Testnet));
+        assert!(is_bogus_address(
+            sa("255.255.255.255:9030"),
+            Network::Mainnet
+        ));
+        assert!(is_bogus_address(
+            sa("255.255.255.255:9030"),
+            Network::Testnet
+        ));
     }
 
     #[test]
@@ -180,8 +204,14 @@ mod tests {
     fn v4_benchmark_is_bogus_both_networks() {
         assert!(is_bogus_address(sa("198.18.0.1:9030"), Network::Mainnet));
         assert!(is_bogus_address(sa("198.18.0.1:9030"), Network::Testnet));
-        assert!(is_bogus_address(sa("198.19.255.254:9030"), Network::Mainnet));
-        assert!(is_bogus_address(sa("198.19.255.254:9030"), Network::Testnet));
+        assert!(is_bogus_address(
+            sa("198.19.255.254:9030"),
+            Network::Mainnet
+        ));
+        assert!(is_bogus_address(
+            sa("198.19.255.254:9030"),
+            Network::Testnet
+        ));
         // Just outside: 198.20/* is not benchmark.
         assert!(!is_bogus_address(sa("198.20.0.1:9030"), Network::Mainnet));
         assert!(!is_bogus_address(sa("198.20.0.1:9030"), Network::Testnet));
@@ -199,9 +229,20 @@ mod tests {
 
     #[test]
     fn v4_private_rfc1918_is_bogus_mainnet_only() {
-        for s in ["10.0.0.1:9030", "172.16.0.1:9030", "172.31.255.254:9030", "192.168.1.1:9030"] {
-            assert!(is_bogus_address(sa(s), Network::Mainnet), "{s} should be bogus on mainnet");
-            assert!(!is_bogus_address(sa(s), Network::Testnet), "{s} should not be bogus on testnet");
+        for s in [
+            "10.0.0.1:9030",
+            "172.16.0.1:9030",
+            "172.31.255.254:9030",
+            "192.168.1.1:9030",
+        ] {
+            assert!(
+                is_bogus_address(sa(s), Network::Mainnet),
+                "{s} should be bogus on mainnet"
+            );
+            assert!(
+                !is_bogus_address(sa(s), Network::Testnet),
+                "{s} should not be bogus on testnet"
+            );
         }
     }
 
@@ -209,18 +250,33 @@ mod tests {
     fn v4_cgn_is_bogus_mainnet_only() {
         assert!(is_bogus_address(sa("100.64.0.1:9030"), Network::Mainnet));
         assert!(!is_bogus_address(sa("100.64.0.1:9030"), Network::Testnet));
-        assert!(is_bogus_address(sa("100.127.255.254:9030"), Network::Mainnet));
-        assert!(!is_bogus_address(sa("100.127.255.254:9030"), Network::Testnet));
+        assert!(is_bogus_address(
+            sa("100.127.255.254:9030"),
+            Network::Mainnet
+        ));
+        assert!(!is_bogus_address(
+            sa("100.127.255.254:9030"),
+            Network::Testnet
+        ));
         // Just outside CGN: routable on both.
-        assert!(!is_bogus_address(sa("100.63.255.255:9030"), Network::Mainnet));
+        assert!(!is_bogus_address(
+            sa("100.63.255.255:9030"),
+            Network::Mainnet
+        ));
         assert!(!is_bogus_address(sa("100.128.0.0:9030"), Network::Mainnet));
     }
 
     #[test]
     fn v4_documentation_is_bogus_mainnet_only() {
         for s in ["192.0.2.1:9030", "198.51.100.1:9030", "203.0.113.1:9030"] {
-            assert!(is_bogus_address(sa(s), Network::Mainnet), "{s} should be bogus on mainnet");
-            assert!(!is_bogus_address(sa(s), Network::Testnet), "{s} should not be bogus on testnet");
+            assert!(
+                is_bogus_address(sa(s), Network::Mainnet),
+                "{s} should be bogus on mainnet"
+            );
+            assert!(
+                !is_bogus_address(sa(s), Network::Testnet),
+                "{s} should not be bogus on testnet"
+            );
         }
     }
 
@@ -228,8 +284,14 @@ mod tests {
     fn v4_public_is_not_bogus_either_network() {
         // Hetzner-ish + Google DNS — routable public addresses.
         for s in ["78.46.1.2:9030", "8.8.8.8:9030"] {
-            assert!(!is_bogus_address(sa(s), Network::Mainnet), "{s} should be fine on mainnet");
-            assert!(!is_bogus_address(sa(s), Network::Testnet), "{s} should be fine on testnet");
+            assert!(
+                !is_bogus_address(sa(s), Network::Mainnet),
+                "{s} should be fine on mainnet"
+            );
+            assert!(
+                !is_bogus_address(sa(s), Network::Testnet),
+                "{s} should be fine on testnet"
+            );
         }
     }
 
@@ -259,8 +321,14 @@ mod tests {
     fn v6_link_local_is_bogus_both_networks() {
         assert!(is_bogus_address(sa("[fe80::1]:9030"), Network::Mainnet));
         assert!(is_bogus_address(sa("[fe80::1]:9030"), Network::Testnet));
-        assert!(is_bogus_address(sa("[febf:ffff::1]:9030"), Network::Mainnet));
-        assert!(is_bogus_address(sa("[febf:ffff::1]:9030"), Network::Testnet));
+        assert!(is_bogus_address(
+            sa("[febf:ffff::1]:9030"),
+            Network::Mainnet
+        ));
+        assert!(is_bogus_address(
+            sa("[febf:ffff::1]:9030"),
+            Network::Testnet
+        ));
         // fec0::/10 — site-local, deprecated; falls outside fe80::/10.
         assert!(!is_bogus_address(sa("[fec0::1]:9030"), Network::Mainnet));
         assert!(!is_bogus_address(sa("[fec0::1]:9030"), Network::Testnet));
@@ -270,9 +338,19 @@ mod tests {
     fn v6_v4_mapped_is_bogus_both_networks() {
         // The whole ::ffff:0:0/96 range is bogus as a class, regardless
         // of the underlying v4.
-        for s in ["[::ffff:10.0.0.1]:9030", "[::ffff:127.0.0.1]:9030", "[::ffff:8.8.8.8]:9030"] {
-            assert!(is_bogus_address(sa(s), Network::Mainnet), "{s} should be bogus on mainnet");
-            assert!(is_bogus_address(sa(s), Network::Testnet), "{s} should be bogus on testnet");
+        for s in [
+            "[::ffff:10.0.0.1]:9030",
+            "[::ffff:127.0.0.1]:9030",
+            "[::ffff:8.8.8.8]:9030",
+        ] {
+            assert!(
+                is_bogus_address(sa(s), Network::Mainnet),
+                "{s} should be bogus on mainnet"
+            );
+            assert!(
+                is_bogus_address(sa(s), Network::Testnet),
+                "{s} should be bogus on testnet"
+            );
         }
     }
 
@@ -280,21 +358,43 @@ mod tests {
 
     #[test]
     fn v6_ula_is_bogus_mainnet_only() {
-        for s in ["[fc00::1]:9030", "[fd12:3456:789a::1]:9030", "[fdff:ffff:ffff:ffff::1]:9030"] {
-            assert!(is_bogus_address(sa(s), Network::Mainnet), "{s} should be bogus on mainnet");
-            assert!(!is_bogus_address(sa(s), Network::Testnet), "{s} should not be bogus on testnet");
+        for s in [
+            "[fc00::1]:9030",
+            "[fd12:3456:789a::1]:9030",
+            "[fdff:ffff:ffff:ffff::1]:9030",
+        ] {
+            assert!(
+                is_bogus_address(sa(s), Network::Mainnet),
+                "{s} should be bogus on mainnet"
+            );
+            assert!(
+                !is_bogus_address(sa(s), Network::Testnet),
+                "{s} should not be bogus on testnet"
+            );
         }
     }
 
     #[test]
     fn v6_documentation_is_bogus_mainnet_only() {
         for s in ["[2001:db8::1]:9030", "[2001:db8:dead:beef::1]:9030"] {
-            assert!(is_bogus_address(sa(s), Network::Mainnet), "{s} should be bogus on mainnet");
-            assert!(!is_bogus_address(sa(s), Network::Testnet), "{s} should not be bogus on testnet");
+            assert!(
+                is_bogus_address(sa(s), Network::Mainnet),
+                "{s} should be bogus on mainnet"
+            );
+            assert!(
+                !is_bogus_address(sa(s), Network::Testnet),
+                "{s} should not be bogus on testnet"
+            );
         }
         // Just outside: 2001:db9 is not documentation.
-        assert!(!is_bogus_address(sa("[2001:db9::1]:9030"), Network::Mainnet));
-        assert!(!is_bogus_address(sa("[2001:db9::1]:9030"), Network::Testnet));
+        assert!(!is_bogus_address(
+            sa("[2001:db9::1]:9030"),
+            Network::Mainnet
+        ));
+        assert!(!is_bogus_address(
+            sa("[2001:db9::1]:9030"),
+            Network::Testnet
+        ));
     }
 
     #[test]
@@ -302,8 +402,14 @@ mod tests {
         // Hurricane Electric 2001:470::/32 and Cloudflare 2606:4700::/32 —
         // real routable v6 ranges.
         for s in ["[2001:470:1f0b:1234::1]:9030", "[2606:4700::1111]:9030"] {
-            assert!(!is_bogus_address(sa(s), Network::Mainnet), "{s} should be fine on mainnet");
-            assert!(!is_bogus_address(sa(s), Network::Testnet), "{s} should be fine on testnet");
+            assert!(
+                !is_bogus_address(sa(s), Network::Mainnet),
+                "{s} should be fine on mainnet"
+            );
+            assert!(
+                !is_bogus_address(sa(s), Network::Testnet),
+                "{s} should be fine on testnet"
+            );
         }
     }
 }

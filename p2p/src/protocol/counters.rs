@@ -199,14 +199,12 @@ impl TrafficCounters {
             ProtocolMessage::Inv { modifier_type, .. } => {
                 self.inv_by_modifier.record_in(*modifier_type, wire_bytes)
             }
-            ProtocolMessage::ModifierRequest { modifier_type, .. } => {
-                self.modifier_request_by_modifier
-                    .record_in(*modifier_type, wire_bytes)
-            }
-            ProtocolMessage::ModifierResponse { modifier_type, .. } => {
-                self.modifier_response_by_modifier
-                    .record_in(*modifier_type, wire_bytes)
-            }
+            ProtocolMessage::ModifierRequest { modifier_type, .. } => self
+                .modifier_request_by_modifier
+                .record_in(*modifier_type, wire_bytes),
+            ProtocolMessage::ModifierResponse { modifier_type, .. } => self
+                .modifier_response_by_modifier
+                .record_in(*modifier_type, wire_bytes),
             ProtocolMessage::Unknown { code, .. } => {
                 if (SNAPSHOT_CODE_MIN..=SNAPSHOT_CODE_MAX).contains(code) {
                     self.snapshot_by_code.record_in(*code, wire_bytes)
@@ -316,9 +314,16 @@ mod tests {
         let c = TrafficCounters::new();
 
         c.record_in_message(&ProtocolMessage::GetPeers, 9);
-        c.record_in_message(&ProtocolMessage::Peers { body: vec![0u8; 10] }, 23);
         c.record_in_message(
-            &ProtocolMessage::SyncInfo { body: vec![0u8; 32] },
+            &ProtocolMessage::Peers {
+                body: vec![0u8; 10],
+            },
+            23,
+        );
+        c.record_in_message(
+            &ProtocolMessage::SyncInfo {
+                body: vec![0u8; 32],
+            },
             45,
         );
         c.record_in_message(
@@ -371,7 +376,11 @@ mod tests {
         assert_eq!(inv_header.in_count, 1);
         assert_eq!(inv_header.in_bytes, 13 + 1 + 1 + 32);
 
-        let req_tx = s.modifier_request_by_modifier.get(&2).copied().unwrap_or_default();
+        let req_tx = s
+            .modifier_request_by_modifier
+            .get(&2)
+            .copied()
+            .unwrap_or_default();
         assert_eq!(req_tx.in_count, 1);
         assert_eq!(req_tx.in_bytes, 13 + 1 + 1 + 64);
 
@@ -400,14 +409,8 @@ mod tests {
         let c = TrafficCounters::new();
 
         c.record_out_frame(&empty_frame(MessageCode::GET_PEERS), 9);
-        c.record_out_frame(
-            &frame_with_body(MessageCode::PEERS, vec![0u8; 10]),
-            23,
-        );
-        c.record_out_frame(
-            &frame_with_body(MessageCode::SYNC_INFO, vec![0u8; 32]),
-            45,
-        );
+        c.record_out_frame(&frame_with_body(MessageCode::PEERS, vec![0u8; 10]), 23);
+        c.record_out_frame(&frame_with_body(MessageCode::SYNC_INFO, vec![0u8; 32]), 45);
 
         // INV body starts with modifier_type byte.
         let mut inv_body = vec![1u8]; // modifier_type = 1 (Header)
@@ -417,7 +420,10 @@ mod tests {
 
         let mut req_body = vec![2u8];
         req_body.extend_from_slice(&[0u8; 33]);
-        let req_wire = frame_wire_bytes(&frame_with_body(MessageCode::MODIFIER_REQUEST, req_body.clone()));
+        let req_wire = frame_wire_bytes(&frame_with_body(
+            MessageCode::MODIFIER_REQUEST,
+            req_body.clone(),
+        ));
         c.record_out_frame(
             &frame_with_body(MessageCode::MODIFIER_REQUEST, req_body),
             req_wire,
@@ -426,7 +432,10 @@ mod tests {
         let mut resp_body = vec![3u8];
         resp_body.extend_from_slice(&[0u8; 33]);
         resp_body.push(0); // data_len VLQ
-        let resp_wire = frame_wire_bytes(&frame_with_body(MessageCode::MODIFIER_RESPONSE, resp_body.clone()));
+        let resp_wire = frame_wire_bytes(&frame_with_body(
+            MessageCode::MODIFIER_RESPONSE,
+            resp_body.clone(),
+        ));
         c.record_out_frame(
             &frame_with_body(MessageCode::MODIFIER_RESPONSE, resp_body),
             resp_wire,
@@ -450,7 +459,11 @@ mod tests {
         assert_eq!(inv_header.out_count, 1);
         assert_eq!(inv_header.out_bytes, inv_wire);
 
-        let req_tx = s.modifier_request_by_modifier.get(&2).copied().unwrap_or_default();
+        let req_tx = s
+            .modifier_request_by_modifier
+            .get(&2)
+            .copied()
+            .unwrap_or_default();
         assert_eq!(req_tx.out_count, 1);
         assert_eq!(req_tx.out_bytes, req_wire);
 

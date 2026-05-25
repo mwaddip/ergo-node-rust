@@ -102,7 +102,11 @@ pub fn zigzag_decode_i64(value: u64) -> i64 {
 /// # Postcondition
 /// - `buf` is extended by `1 + s.len()` bytes.
 pub fn write_short_string(buf: &mut Vec<u8>, s: &str) {
-    debug_assert!(s.len() <= 255, "String too long for short string encoding: {}", s.len());
+    debug_assert!(
+        s.len() <= 255,
+        "String too long for short string encoding: {}",
+        s.len()
+    );
     buf.push(s.len() as u8);
     buf.extend_from_slice(s.as_bytes());
 }

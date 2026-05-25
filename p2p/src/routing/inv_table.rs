@@ -30,7 +30,9 @@ impl Default for InvTable {
 
 impl InvTable {
     pub fn new() -> Self {
-        Self { entries: HashMap::new() }
+        Self {
+            entries: HashMap::new(),
+        }
     }
 
     pub fn record(&mut self, modifier_id: ModifierId, peer: PeerId) {

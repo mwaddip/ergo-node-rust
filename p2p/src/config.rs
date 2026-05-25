@@ -55,7 +55,9 @@ pub struct UpnpConfig {
     pub discover_timeout_secs: u64,
 }
 
-fn default_discover_timeout() -> u64 { 5 }
+fn default_discover_timeout() -> u64 {
+    5
+}
 
 impl Default for UpnpConfig {
     fn default() -> Self {
@@ -66,14 +68,30 @@ impl Default for UpnpConfig {
     }
 }
 
-fn default_get_peers_interval() -> u64 { 120 }
-fn default_delivery_timeout() -> u64 { 10 }
-fn default_max_delivery_checks() -> u32 { 100 }
-fn default_desired_inv_objects() -> u32 { 400 }
-fn default_max_peer_spec_objects() -> u32 { 64 }
-fn default_handshake_timeout() -> u64 { 30 }
-fn default_inactive_connection_deadline() -> u64 { 600 }
-fn default_temporal_ban_duration() -> u64 { 60 }
+fn default_get_peers_interval() -> u64 {
+    120
+}
+fn default_delivery_timeout() -> u64 {
+    10
+}
+fn default_max_delivery_checks() -> u32 {
+    100
+}
+fn default_desired_inv_objects() -> u32 {
+    400
+}
+fn default_max_peer_spec_objects() -> u32 {
+    64
+}
+fn default_handshake_timeout() -> u64 {
+    30
+}
+fn default_inactive_connection_deadline() -> u64 {
+    600
+}
+fn default_temporal_ban_duration() -> u64 {
+    60
+}
 
 impl Default for NetworkConfig {
     fn default() -> Self {
@@ -201,7 +219,10 @@ protocol_version = "5.0.25"
 
     #[test]
     fn upnp_enabled_from_toml() {
-        let toml_str = format!("{}\n[upnp]\nenabled = true\ndiscover_timeout_secs = 10\n", MINIMAL_TOML);
+        let toml_str = format!(
+            "{}\n[upnp]\nenabled = true\ndiscover_timeout_secs = 10\n",
+            MINIMAL_TOML
+        );
         let config: Config = toml::from_str(&toml_str).unwrap();
         assert!(config.upnp.enabled);
         assert_eq!(config.upnp.discover_timeout_secs, 10);

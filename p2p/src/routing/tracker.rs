@@ -36,11 +36,17 @@ impl Default for RequestTracker {
 
 impl RequestTracker {
     pub fn new() -> Self {
-        Self { pending: HashMap::new(), max_pending: MAX_PENDING }
+        Self {
+            pending: HashMap::new(),
+            max_pending: MAX_PENDING,
+        }
     }
 
     pub fn with_capacity(cap: usize) -> Self {
-        Self { pending: HashMap::new(), max_pending: cap }
+        Self {
+            pending: HashMap::new(),
+            max_pending: cap,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -55,7 +61,8 @@ impl RequestTracker {
         if self.pending.len() >= self.max_pending {
             self.evict();
         }
-        self.pending.insert(modifier_id, (requester, Instant::now()));
+        self.pending
+            .insert(modifier_id, (requester, Instant::now()));
     }
 
     /// Bulk-evict ~25% of entries. Evicted requests will never be fulfilled
@@ -142,7 +149,8 @@ impl SyncTracker {
                 self.outbound_to_inbound.get(&outb),
                 Some(&inb),
                 "SyncTracker invariant violated: inbound {} → outbound {} but reverse missing",
-                inb, outb
+                inb,
+                outb
             );
         }
         for (&outb, &inb) in &self.outbound_to_inbound {
@@ -150,7 +158,8 @@ impl SyncTracker {
                 self.inbound_to_outbound.get(&inb),
                 Some(&outb),
                 "SyncTracker invariant violated: outbound {} → inbound {} but reverse missing",
-                outb, inb
+                outb,
+                inb
             );
         }
     }
