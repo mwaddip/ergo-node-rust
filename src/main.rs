@@ -2851,6 +2851,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             }),
             stats_enabled: stats_config.is_some(),
+            // capture: None disables the /debug/p2p-capture/* endpoints per
+            // facts/p2p-capture.md. Wire the real CaptureAccess via
+            // Arc::new(handle) once the [debug.p2p_capture] config plumbing lands.
+            capture: None,
         };
 
         let api_stats_config = stats_config.as_ref().map(|c| ergo_api::stats::StatsConfig {
