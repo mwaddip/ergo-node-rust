@@ -1,3 +1,4 @@
+pub mod config_update;
 pub mod cursor;
 pub mod hash;
 pub mod liveness;
