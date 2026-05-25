@@ -1,6 +1,7 @@
 pub mod cursor;
 pub mod hash;
 pub mod liveness;
+pub mod progress;
 pub mod resume;
 pub mod runner;
 
