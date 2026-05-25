@@ -8,6 +8,7 @@
 //! See `facts/p2p-capture.md` for the contract.
 
 pub mod config;
+pub mod dump;
 pub mod pcap;
 pub mod ring;
 pub mod tap;
