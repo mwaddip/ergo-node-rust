@@ -1,6 +1,6 @@
 # Indexer Addon Contract
 
-Version: 1.1.0
+Version: 1.2.0
 
 ## Component: `addons/indexer/` (standalone crate)
 
@@ -96,20 +96,104 @@ migrations across versions.
 
 ## Configuration
 
-CLI flags only (no config file):
+The indexer reads configuration from three sources in increasing
+precedence order: built-in defaults < TOML config file < env vars
+< CLI flags. Each key resolves independently — setting `--db` on
+the CLI does not require setting the others; unset keys fall
+through to lower-precedence sources.
 
-```
-ergo-indexer
-  --node-url   http://127.0.0.1:9052     # default
-  --db         ./indexer.db              # SQLite path or postgres://... URL
-  --bind       127.0.0.1:8080            # CLI default; systemd unit overrides
-  --start-height N                       # optional, default = resume from DB
-  [sync|serve]                            # optional mode subcommand; default = both
+### Config file location
+
+Default: **`/etc/ergo-node/indexer.toml`** (sibling to the node's
+`ergo.toml` — related services share the directory).
+
+Override via `--config <path>` on the CLI. When the file does not
+exist at the resolved path, the indexer logs an info-level line
+(`config file not found at <path>, using defaults`) and continues
+with built-in defaults + env vars + CLI flags. No hard error —
+operators who run all-CLI today continue to work without a config
+file.
+
+When the file exists but fails to parse, the indexer exits with a
+non-zero status and a diagnostic. Don't silently fall back from a
+malformed file — it almost certainly indicates a typo the
+operator wants surfaced.
+
+### Schema
+
+```toml
+# /etc/ergo-node/indexer.toml
+
+[node]
+# URL of the local ergo-node-rust REST API.
+url = "http://127.0.0.1:9052"
+
+[storage]
+# SQLite path: "sqlite:///var/lib/ergo-indexer/index.db" or a
+# bare path treated as SQLite.
+# PostgreSQL URL: "postgres://user@host:5432/dbname". Password
+# comes from env (PGPASSWORD) or ~/.pgpass — never the config
+# file.
+db = "sqlite:///var/lib/ergo-indexer/index.db"
+
+[api]
+# Bind address for the indexer's HTTP API. Default
+# 127.0.0.1:8080 (loopback). The installed systemd unit's
+# default sets 0.0.0.0:9054 — non-loopback grants network-wide
+# read access to indexed data.
+bind = "127.0.0.1:8080"
+
+[sync]
+# Optional. When set, sync resumes from this height instead of
+# the DB's last-committed height. Used for diagnostics + recovery.
+# start_height = 1782320
 ```
 
-The installed systemd unit at `/usr/lib/systemd/system/ergo-indexer.service`
-sets `--bind 0.0.0.0:9054`. Operators who want loopback-only access
-should override via a drop-in or edit the unit.
+Section names and keys above are stable across minor versions per
+the Stability table; additive changes (new optional keys, new
+sections) do not bump the major.
+
+### Env vars
+
+- `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`,
+  `PGSSLMODE` — standard libpq env vars. Honored when
+  `storage.db` resolves to a PostgreSQL backend. `PGPASSWORD` is
+  the canonical password source; the config file does NOT carry
+  passwords.
+- `INDEXER_CONFIG` — alternative to `--config <path>`. CLI
+  overrides this if both are set.
+
+### CLI flag → config key mapping
+
+| CLI flag | Config key | Notes |
+|---|---|---|
+| `--config <path>` | n/a | Path to TOML file; default `/etc/ergo-node/indexer.toml` |
+| `--node-url <url>` | `node.url` | |
+| `--db <url-or-path>` | `storage.db` | URL form preferred; bare path = SQLite |
+| `--bind <addr:port>` | `api.bind` | |
+| `--start-height <N>` | `sync.start_height` | Optional in both |
+| `sync \| serve` (subcommand) | n/a | Mode is CLI-only |
+
+CLI flags override the config file on a per-key basis. Operators
+running the systemd unit can leave `ExecStart` minimal
+(`/usr/bin/ergo-indexer --config /etc/ergo-node/indexer.toml`)
+and put everything else in the TOML file, or keep CLI flags for
+specific overrides during ad-hoc runs.
+
+### Reload behavior
+
+Configuration is loaded once at startup. Changes to the config
+file are NOT live-reloaded; restart the service to apply
+(`systemctl restart ergo-indexer`). `SIGHUP` is explicitly
+ignored — the indexer does not terminate on receipt.
+
+### Behavior when no config exists
+
+Operators upgrading from a pre-config-file indexer can continue
+to pass every flag via `ExecStart` — built-in defaults are still
+applied first, CLI flags override them, and the missing
+`/etc/ergo-node/indexer.toml` produces only a one-line info
+log. The pre-config-file deploy is functionally unchanged.
 
 ## Storage Schema
 
