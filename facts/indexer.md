@@ -1,8 +1,8 @@
 # Indexer Addon Contract
 
-Version: 1.0.0
+Version: 1.1.0
 
-## Component: `addons/indexer/` (workspace addon)
+## Component: `addons/indexer/` (standalone crate)
 
 Out-of-process blockchain indexer for `ergo-node-rust`. Polls the
 node's REST API, walks blocks forward, persists a queryable mirror
@@ -19,6 +19,10 @@ Distinct from the node:
   node's 9052).
 - Failures here never compromise consensus or the node's own
   storage.
+- Excluded from the workspace via `[workspace].exclude` in the
+  repo-root `Cargo.toml`. Built/tested with
+  `cargo … --manifest-path addons/indexer/Cargo.toml` and carries
+  its own `Cargo.lock`.
 
 Primary consumers: block explorers, wallets needing spent-box
 history, validation harnesses that need historical box bytes the
@@ -65,13 +69,23 @@ migrations across versions.
 
 - `axum` — HTTP framework, matches the node's choice for the same
   reasons (tokio-native, tower middleware, minimal).
-- `sqlx` — async SQL access, supports both SQLite and PostgreSQL
-  backends with the same query surface.
+- `rusqlite` — synchronous SQLite access for the default SQLite
+  backend.
+- `sqlx` — async SQL access for the PostgreSQL backend only.
 - `reqwest` — outbound HTTP to the node's REST API.
+- `tikv-jemallocator` — global allocator (default-on via the
+  `jemalloc` feature). Daemon-style workloads with sustained
+  allocation churn benefit substantially from jemalloc's decommit
+  behavior vs glibc malloc; observed 21.8 GB peak RSS under
+  harness load was the motivation. Opt out with
+  `--no-default-features --features sqlite`.
 
 ## Dependencies
 
-- `axum`, `sqlx`, `reqwest`, `serde`, `serde_json`, `clap`, `anyhow`
+- `axum`, `rusqlite`, `sqlx`, `reqwest`, `serde`, `serde_json`,
+  `clap`, `anyhow`
+- `tikv-jemallocator` + `tikv-jemalloc-ctl` (gated by `jemalloc`
+  feature, default-on)
 - **No** dependency on `enr-store`, `ergo-validation`, `ergo-mempool`,
   `ergo-p2p`, or any other node-internal crate. The indexer talks to
   the node only via HTTP.
@@ -177,6 +191,23 @@ INSERT OR REPLACE INTO indexer_state (key, value) VALUES ('height', '<H>');
 The cascade is the authoritative truncation procedure. `sharpen.rs`
 contains the canonical SQL; any future migration must update both.
 
+### SQLite pragmas
+
+Applied at connection initialization on both writer and reader
+connections:
+
+```
+PRAGMA cache_size = -65536;     -- 64 MiB per connection (negative = KiB form)
+PRAGMA mmap_size = 268435456;   -- 256 MiB
+PRAGMA temp_store = MEMORY;
+PRAGMA busy_timeout = 5000;     -- ms
+```
+
+`journal_mode=WAL` remains enabled. The `cache_size` negative form
+is rusqlite/SQLite's KiB shorthand (positive values are page
+count). `mmap_size` enables read-side mmap to reduce contention
+between the writer transaction and parallel-fetch read traffic.
+
 ## Sync Semantics
 
 The sync loop polls `GET /info` on the node to learn `fullHeight`,
@@ -232,6 +263,27 @@ stores to `<H>` in lockstep. For repairs that don't require
 walking the node back (the more common case — node is fine, only
 the indexer is stuck), run the cascade SQL directly.
 
+## Shutdown Semantics
+
+`SIGTERM` and `SIGINT` both trigger graceful shutdown via a
+`tokio::sync::watch` channel:
+
+1. The signal handler fires the watch sender.
+2. The sync task's `info_wait` long-poll is wrapped in a
+   `tokio::select!` against the watch receiver. On signal, sync
+   exits *between* blocks — any in-flight `insert_block`
+   transaction commits atomically under WAL before the loop
+   exits. No half-validated block is observable post-shutdown.
+3. The API task uses `axum`'s `with_graceful_shutdown` to drain
+   in-flight requests.
+4. `main()` awaits both task handles with a 30 s bounded timeout,
+   matching the node's `SHUTDOWN_GRACE`.
+
+Measured: ~4 ms clean exit in combined-mode locally after a
+1543-block ingest run. Partial writes are impossible at the SQL
+level (block commits are atomic), and the watch + select pattern
+guarantees no straddled state across the signal.
+
 ## Endpoints
 
 All endpoints live under `/api/v1/`. The path prefix is part of the
@@ -250,6 +302,7 @@ each endpoint is reviewed).
 GET  /api/v1/info                              → indexer + node-tip status
 GET  /api/v1/stats                             → totals (blocks, txs, boxes, tokens)
 GET  /api/v1/stats/daily                       → time-bucketed activity
+GET  /api/v1/debug/memory                      → process RSS + jemalloc stats + component breakdown
 
 GET  /api/v1/blocks                            → list, by height descending
 GET  /api/v1/blocks/height/{height}            → block by height
@@ -331,6 +384,42 @@ into this endpoint. The harness MUST issue them in parallel; the
 server holds no per-request state and SQLite + HTTP/1.1 keep-alive
 will handle ~1k concurrent reads against a single SQLite file
 without contention.
+
+### `GET /api/v1/debug/memory`
+
+Operator-facing memory diagnostics. Mirrors the node's
+`/debug/memory` endpoint shape, with indexer-specific components.
+
+**Response 200 (`Content-Type: application/json`):**
+
+```jsonc
+{
+  "process": {
+    "rss_bytes": N,                       // resident set size from /proc
+    "...": "..."                           // node-mirror fields
+  },
+  "jemalloc": {                            // present when feature `jemalloc` is enabled
+    "allocated": N,
+    "resident": N,
+    "...": "..."                           // standard jemalloc.stats keys
+  },
+  "components": {
+    "indexedHeight":         N,
+    "dbBackend":             "sqlite" | "postgres",
+    "dbOnDiskBytes":         N,            // SQLite file size; postgres reports N/A
+    "dbCacheBytesPerConn":   N,            // SQLite cache_size derived; postgres N/A
+    "dbConnections":         N
+  }
+}
+```
+
+**Response 200 with `jemalloc` absent**: build was
+`--no-default-features --features sqlite`. The `jemalloc` block
+is omitted; consumers must tolerate its absence.
+
+**No 4xx/5xx responses expected** in normal operation. Failure
+to read `/proc/self/status` for RSS produces 500 with a
+diagnostic body.
 
 ## Stability
 
