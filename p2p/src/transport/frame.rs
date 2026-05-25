@@ -117,11 +117,16 @@ pub fn decode(magic: &[u8; 4], data: &[u8]) -> io::Result<Frame> {
 ///   `bad_checksum`) the peer's address is recorded in `blacklist` in
 ///   addition to emitting the `peer_penalised` log line (`facts/journal-events.md`)
 ///   that fail2ban consumes.
+/// - When `tap` is `Some`, the raw wire bytes of a successfully-parsed
+///   frame are passed to it via `capture_inbound` before this function
+///   returns. Frames rejected at the parse layer (bad magic / oversize /
+///   bad checksum) are NOT captured in v1.
 pub async fn read_frame(
     reader: &mut (impl tokio::io::AsyncReadExt + Unpin),
     magic: &[u8; 4],
     peer_addr: SocketAddr,
     blacklist: &crate::blacklist::Blacklist,
+    tap: Option<&crate::capture::tap::Tap>,
 ) -> io::Result<Frame> {
     // Read fixed prefix: magic(4) + code(1) + length(4) = 9 bytes.
     // Checksum(4) follows only when body length > 0 (JVM omits it for empty bodies).
@@ -165,6 +170,9 @@ pub async fn read_frame(
 
     // Empty body — no checksum on wire
     if body_len == 0 {
+        if let Some(t) = tap {
+            t.capture_inbound(peer_addr, &prefix);
+        }
         return Ok(Frame { code, body: vec![] });
     }
 
@@ -193,6 +201,14 @@ pub async fn read_frame(
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Checksum mismatch"));
     }
 
+    if let Some(t) = tap {
+        let mut wire = Vec::with_capacity(prefix.len() + checksum.len() + body.len());
+        wire.extend_from_slice(&prefix);
+        wire.extend_from_slice(&checksum);
+        wire.extend_from_slice(&body);
+        t.capture_inbound(peer_addr, &wire);
+    }
+
     tracing::debug!(code = code, body_len = body_len, "frame received");
     Ok(Frame { code, body })
 }
@@ -201,12 +217,19 @@ pub async fn read_frame(
 ///
 /// # Contract
 /// - **Postcondition**: the full encoded frame is written and flushed.
+/// - When `tap` is `Some`, the raw wire bytes are passed to it via
+///   `capture_outbound` before being written.
 pub async fn write_frame(
     writer: &mut (impl tokio::io::AsyncWriteExt + Unpin),
     magic: &[u8; 4],
     frame: &Frame,
+    peer_addr: SocketAddr,
+    tap: Option<&crate::capture::tap::Tap>,
 ) -> io::Result<()> {
     let bytes = encode(magic, frame);
+    if let Some(t) = tap {
+        t.capture_outbound(peer_addr, &bytes);
+    }
     writer.write_all(&bytes).await?;
     writer.flush().await
 }

@@ -95,12 +95,12 @@ impl Connection {
 
     /// Read the next message frame.
     pub async fn read_frame(&mut self, blacklist: &crate::blacklist::Blacklist) -> io::Result<Frame> {
-        frame::read_frame(&mut self.reader, &self.magic, self.peer_addr, blacklist).await
+        frame::read_frame(&mut self.reader, &self.magic, self.peer_addr, blacklist, None).await
     }
 
     /// Write a message frame.
     pub async fn write_frame(&mut self, f: &Frame) -> io::Result<()> {
-        frame::write_frame(&mut self.writer, &self.magic, f).await
+        frame::write_frame(&mut self.writer, &self.magic, f, self.peer_addr, None).await
     }
 
     pub fn peer_spec(&self) -> &PeerSpec {

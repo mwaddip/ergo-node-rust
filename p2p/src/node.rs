@@ -64,6 +64,11 @@ struct BackgroundCtx {
     peer_db: Arc<StdMutex<PeerDb>>,
     network: Network,
     counters: Arc<TrafficCounters>,
+    /// Optional capture tap. `Some` when `[debug.p2p_capture]` is enabled
+    /// in the operator's config. Wired into the frame I/O hot path in
+    /// `peer_handler` so every successfully parsed inbound and every
+    /// outbound frame is captured.
+    capture_tap: Option<Arc<crate::capture::tap::Tap>>,
 }
 
 fn now_ms() -> u64 {
@@ -139,6 +144,7 @@ impl P2pNode {
         modifier_sink: Option<ModifierSink>,
         mode_config: handshake::ModeConfig,
         peer_storage: Box<dyn PeerStorage>,
+        capture_tap: Option<Arc<crate::capture::tap::Tap>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (ver_major, ver_minor, ver_patch) = config.version_bytes()?;
         let version = Version::new(ver_major, ver_minor, ver_patch);
@@ -217,6 +223,7 @@ impl P2pNode {
             peer_db: peer_db.clone(),
             network,
             counters: counters.clone(),
+            capture_tap,
         };
 
         // Start listeners
@@ -606,10 +613,18 @@ async fn run_peer(
 
     // Writer task
     let writer_counters = ctx.counters.clone();
+    let writer_tap = ctx.capture_tap.clone();
+    let writer_addr = addr;
     let write_handle = tokio::spawn(async move {
         while let Some(frame) = write_rx.recv().await {
             let wire_bytes = counters::frame_wire_bytes(&frame);
-            if let Err(e) = crate::transport::frame::write_frame(&mut writer, &magic, &frame).await {
+            if let Err(e) = crate::transport::frame::write_frame(
+                &mut writer,
+                &magic,
+                &frame,
+                writer_addr,
+                writer_tap.as_deref(),
+            ).await {
                 tracing::warn!(peer = %peer_id, error = %e, "Write failed");
                 break;
             }
@@ -619,7 +634,13 @@ async fn run_peer(
 
     // Reader loop
     loop {
-        match crate::transport::frame::read_frame(&mut reader, &magic, addr, &ctx.blacklist).await {
+        match crate::transport::frame::read_frame(
+            &mut reader,
+            &magic,
+            addr,
+            &ctx.blacklist,
+            ctx.capture_tap.as_deref(),
+        ).await {
             Ok(frame) => {
                 let wire_bytes = counters::frame_wire_bytes(&frame);
                 match ProtocolMessage::from_frame(&frame) {
