@@ -2,6 +2,7 @@ pub mod cursor;
 pub mod hash;
 pub mod liveness;
 pub mod resume;
+pub mod runner;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;

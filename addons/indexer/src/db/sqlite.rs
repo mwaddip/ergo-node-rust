@@ -865,3 +865,809 @@ impl IndexerDb for SqliteDb {
         Ok(items)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Migration backend
+// ---------------------------------------------------------------------------
+//
+// `SqliteBackend` implements `crate::migrate::Backend` and is used ONLY by the
+// `ergo-indexer-migratedb` binary. It is intentionally a different struct from
+// `SqliteDb` above — the running indexer's connection-init path stays untouched.
+//
+// Differences from `SqliteDb::open`:
+//   * single connection (writer-only — the migrator never reads concurrently)
+//   * `foreign_keys=OFF` for the entire migration (per facts/indexer-migration.md
+//     § Per-block migration unit). FK ordering inside each block is correct, but
+//     belt-and-suspenders against any future ordering surprise.
+//   * wraps the rusqlite connection in `std::sync::Mutex` (not tokio's), because
+//     every method dispatches to `tokio::task::spawn_blocking` which is sync.
+
+use std::sync::Mutex as StdMutex;
+
+use crate::migrate::{
+    Backend, BlockData, BlockRow as MBlockRow, BoxRegisterRow as MBoxRegisterRow,
+    BoxRow as MBoxRow, BoxSpentUpdate, BoxTokenRow as MBoxTokenRow, Cursor,
+    TokenRow as MTokenRow, TransactionRow as MTransactionRow,
+};
+
+const PRAGMAS_MIGRATION: &str = "\
+    PRAGMA journal_mode=WAL; \
+    PRAGMA synchronous=NORMAL; \
+    PRAGMA foreign_keys=OFF; \
+    PRAGMA cache_size=-65536; \
+    PRAGMA mmap_size=268435456; \
+    PRAGMA temp_store=MEMORY; \
+    PRAGMA busy_timeout=5000;";
+
+pub struct SqliteBackend {
+    conn: Arc<StdMutex<Connection>>,
+}
+
+impl SqliteBackend {
+    /// Open a SQLite database for migration. Creates the file if absent.
+    ///
+    /// This constructor is intentionally separate from `SqliteDb::open` — the
+    /// migrator wants `foreign_keys=OFF` and a single connection. The running
+    /// indexer's two-connection (writer+reader) path is untouched.
+    pub async fn new_for_migration(path: &std::path::Path) -> Result<Self> {
+        let path = path.to_owned();
+        let conn = tokio::task::spawn_blocking(move || -> Result<Connection> {
+            let conn = Connection::open(&path)
+                .with_context(|| format!("failed to open SQLite at {}", path.display()))?;
+            conn.execute_batch(PRAGMAS_MIGRATION)?;
+            Ok(conn)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+        Ok(Self {
+            conn: Arc::new(StdMutex::new(conn)),
+        })
+    }
+}
+
+/// Convert `Vec<u8>` from a BLOB column into `[u8; 32]`. SQLite has no
+/// fixed-width binary type, so length is asserted at read time.
+fn vec_to_id32(v: Vec<u8>, col: &str) -> Result<[u8; 32]> {
+    let len = v.len();
+    v.try_into()
+        .map_err(|_| anyhow::anyhow!("column {col}: expected 32 bytes, got {len}"))
+}
+
+#[async_trait]
+impl Backend for SqliteBackend {
+    async fn schema_version(&mut self) -> Result<Option<u32>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<u32>> {
+            let conn = conn.lock().expect("sqlite migration mutex poisoned");
+            // Table may not exist on a freshly-created DB; treat that as "no
+            // schema_version yet". sqlite_master is the canonical check.
+            let table_exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='indexer_state'",
+                    [],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if !table_exists {
+                return Ok(None);
+            }
+            let v: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM indexer_state WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(v.and_then(|s| s.parse().ok()))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?
+    }
+
+    async fn init_schema(&mut self, version: u32) -> Result<()> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = conn.lock().expect("sqlite migration mutex poisoned");
+            conn.execute_batch(CREATE_TABLES)?;
+            conn.execute(
+                "INSERT OR REPLACE INTO indexer_state (key, value) VALUES ('schema_version', ?1)",
+                params![version.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?
+    }
+
+    async fn read_cursor(&mut self) -> Result<Option<Cursor>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<Cursor>> {
+            let conn = conn.lock().expect("sqlite migration mutex poisoned");
+            // indexer_state may not exist yet (fresh DB pre-init_schema).
+            let table_exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='indexer_state'",
+                    [],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if !table_exists {
+                return Ok(None);
+            }
+            let cursor_v: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM indexer_state WHERE key = 'migration_cursor'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let source_v: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM indexer_state WHERE key = 'migration_source'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let fp_v: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM indexer_state WHERE key = 'migration_source_fingerprint'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            match (cursor_v, source_v, fp_v) {
+                (None, None, None) => Ok(None),
+                (Some(c), Some(s), Some(f)) => {
+                    let last_height: u32 = c
+                        .parse()
+                        .with_context(|| format!("migration_cursor not a u32: {c}"))?;
+                    let fp_bytes = hex::decode(&f)
+                        .with_context(|| "migration_source_fingerprint is not hex")?;
+                    let fp: [u8; 32] = fp_bytes.try_into().map_err(|v: Vec<u8>| {
+                        anyhow::anyhow!(
+                            "migration_source_fingerprint must be 32 bytes, got {}",
+                            v.len()
+                        )
+                    })?;
+                    Ok(Some(Cursor {
+                        last_height,
+                        source_url: s,
+                        source_fingerprint: fp,
+                    }))
+                }
+                _ => Err(anyhow::anyhow!(
+                    "indexer_state has a partial migration cursor — the 3 keys must all be present or all absent"
+                )),
+            }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?
+    }
+
+    async fn write_cursor(&mut self, cursor: &Cursor) -> Result<()> {
+        let conn = self.conn.clone();
+        let cursor = cursor.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = conn.lock().expect("sqlite migration mutex poisoned");
+            let tx = conn.unchecked_transaction()?;
+            write_cursor_inline(&tx, &cursor)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?
+    }
+
+    async fn max_height(&mut self) -> Result<Option<u32>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<u32>> {
+            let conn = conn.lock().expect("sqlite migration mutex poisoned");
+            // SELECT MAX returns one row of NULL when the table is empty.
+            let v: Option<i64> = conn
+                .query_row("SELECT MAX(height) FROM blocks", [], |row| row.get(0))
+                .optional()?
+                .flatten();
+            Ok(v.map(|h| h as u32))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?
+    }
+
+    async fn read_block_data(&mut self, height: u32) -> Result<BlockData> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<BlockData> {
+            let conn = conn.lock().expect("sqlite migration mutex poisoned");
+            let h = height as i64;
+
+            // blocks row at H — exactly one
+            let block: MBlockRow = conn.query_row(
+                "SELECT height, header_id, timestamp, difficulty, miner_pk, block_size, tx_count \
+                 FROM blocks WHERE height = ?1",
+                params![h],
+                |row| {
+                    let hid: Vec<u8> = row.get(1)?;
+                    let mpk: Vec<u8> = row.get(4)?;
+                    Ok((
+                        row.get::<_, i64>(0)? as u32,
+                        hid,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        mpk,
+                        row.get::<_, i64>(5)? as u32,
+                        row.get::<_, i64>(6)? as u32,
+                    ))
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("blocks row missing at height {height}: {e}"))
+            .and_then(|(height, hid, ts, diff, mpk, bs, tc)| {
+                Ok(MBlockRow {
+                    height,
+                    header_id: vec_to_id32(hid, "blocks.header_id")?,
+                    timestamp: ts,
+                    difficulty: diff,
+                    miner_pk: mpk,
+                    block_size: bs,
+                    tx_count: tc,
+                })
+            })?;
+
+            // transactions WHERE height = H
+            let mut stmt = conn.prepare_cached(
+                "SELECT tx_id, header_id, height, tx_index, size \
+                 FROM transactions WHERE height = ?1 ORDER BY tx_index",
+            )?;
+            let transactions: Vec<MTransactionRow> = stmt
+                .query_map(params![h], |row| {
+                    let tid: Vec<u8> = row.get(0)?;
+                    let hid: Vec<u8> = row.get(1)?;
+                    Ok((tid, hid, row.get::<_, i64>(2)? as u32, row.get::<_, i64>(3)? as u32, row.get::<_, i64>(4)? as u32))
+                })?
+                .map(|r| {
+                    let (tid, hid, height, tx_index, size) = r?;
+                    Ok(MTransactionRow {
+                        tx_id: vec_to_id32(tid, "transactions.tx_id")?,
+                        header_id: vec_to_id32(hid, "transactions.header_id")?,
+                        height,
+                        tx_index,
+                        size,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            drop(stmt);
+
+            // boxes WHERE height = H (created-at-H)
+            let mut stmt = conn.prepare_cached(
+                "SELECT box_id, tx_id, header_id, height, output_index, ergo_tree, \
+                        ergo_tree_hash, address, value, spent_tx_id, spent_height \
+                 FROM boxes WHERE height = ?1 ORDER BY box_id",
+            )?;
+            let created_boxes: Vec<MBoxRow> = stmt
+                .query_map(params![h], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, Vec<u8>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, Option<Vec<u8>>>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
+                    ))
+                })?
+                .map(|r| {
+                    let (bid, tid, hid, height, oi, et, eth, addr, val, stid, sh) = r?;
+                    Ok(MBoxRow {
+                        box_id: vec_to_id32(bid, "boxes.box_id")?,
+                        tx_id: vec_to_id32(tid, "boxes.tx_id")?,
+                        header_id: vec_to_id32(hid, "boxes.header_id")?,
+                        height: height as u32,
+                        output_index: oi as u32,
+                        ergo_tree: et,
+                        ergo_tree_hash: vec_to_id32(eth, "boxes.ergo_tree_hash")?,
+                        address: addr,
+                        value: val,
+                        spent_tx_id: stid
+                            .map(|v| vec_to_id32(v, "boxes.spent_tx_id"))
+                            .transpose()?,
+                        spent_height: sh.map(|s| s as u32),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            drop(stmt);
+
+            // box_registers / box_tokens for the just-created boxes
+            let mut box_registers: Vec<MBoxRegisterRow> = Vec::new();
+            let mut box_tokens: Vec<MBoxTokenRow> = Vec::new();
+            for bx in &created_boxes {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT box_id, register_id, serialized FROM box_registers WHERE box_id = ?1 ORDER BY register_id",
+                )?;
+                let regs: Vec<MBoxRegisterRow> = stmt
+                    .query_map(params![bx.box_id.as_slice()], |row| {
+                        let bid: Vec<u8> = row.get(0)?;
+                        let rid: i64 = row.get(1)?;
+                        let ser: Vec<u8> = row.get(2)?;
+                        Ok((bid, rid, ser))
+                    })?
+                    .map(|r| {
+                        let (bid, rid, ser) = r?;
+                        Ok(MBoxRegisterRow {
+                            box_id: vec_to_id32(bid, "box_registers.box_id")?,
+                            register_id: rid as u8,
+                            serialized: ser,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                box_registers.extend(regs);
+
+                let mut stmt = conn.prepare_cached(
+                    "SELECT box_id, token_id, amount FROM box_tokens WHERE box_id = ?1 ORDER BY token_id",
+                )?;
+                let toks: Vec<MBoxTokenRow> = stmt
+                    .query_map(params![bx.box_id.as_slice()], |row| {
+                        let bid: Vec<u8> = row.get(0)?;
+                        let tid: Vec<u8> = row.get(1)?;
+                        let amt: i64 = row.get(2)?;
+                        Ok((bid, tid, amt))
+                    })?
+                    .map(|r| {
+                        let (bid, tid, amt) = r?;
+                        Ok(MBoxTokenRow {
+                            box_id: vec_to_id32(bid, "box_tokens.box_id")?,
+                            token_id: vec_to_id32(tid, "box_tokens.token_id")?,
+                            amount: amt,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                box_tokens.extend(toks);
+            }
+
+            // tokens WHERE minting_height = H
+            let mut stmt = conn.prepare_cached(
+                "SELECT token_id, minting_tx_id, minting_height, name, description, decimals \
+                 FROM tokens WHERE minting_height = ?1 ORDER BY token_id",
+            )?;
+            let minted_tokens: Vec<MTokenRow> = stmt
+                .query_map(params![h], |row| {
+                    let tid: Vec<u8> = row.get(0)?;
+                    let mtid: Vec<u8> = row.get(1)?;
+                    Ok((
+                        tid,
+                        mtid,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                    ))
+                })?
+                .map(|r| {
+                    let (tid, mtid, mh, name, desc, dec) = r?;
+                    Ok(MTokenRow {
+                        token_id: vec_to_id32(tid, "tokens.token_id")?,
+                        minting_tx_id: vec_to_id32(mtid, "tokens.minting_tx_id")?,
+                        minting_height: mh as u32,
+                        name,
+                        description: desc,
+                        decimals: dec.map(|d| d as i32),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            drop(stmt);
+
+            // boxes WHERE spent_height = H → spent updates
+            let mut stmt = conn.prepare_cached(
+                "SELECT box_id, spent_tx_id, spent_height FROM boxes \
+                 WHERE spent_height = ?1 ORDER BY box_id",
+            )?;
+            let spent_box_updates: Vec<BoxSpentUpdate> = stmt
+                .query_map(params![h], |row| {
+                    let bid: Vec<u8> = row.get(0)?;
+                    let stid: Vec<u8> = row.get(1)?;
+                    let sh: i64 = row.get(2)?;
+                    Ok((bid, stid, sh))
+                })?
+                .map(|r| {
+                    let (bid, stid, sh) = r?;
+                    Ok(BoxSpentUpdate {
+                        box_id: vec_to_id32(bid, "boxes.box_id")?,
+                        spent_tx_id: vec_to_id32(stid, "boxes.spent_tx_id")?,
+                        spent_height: sh as u32,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            drop(stmt);
+
+            Ok(BlockData {
+                block,
+                transactions,
+                created_boxes,
+                box_registers,
+                box_tokens,
+                minted_tokens,
+                spent_box_updates,
+            })
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?
+    }
+
+    async fn apply_block(&mut self, data: &BlockData, cursor: &Cursor) -> Result<()> {
+        let conn = self.conn.clone();
+        let data = data.clone();
+        let cursor = cursor.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = conn.lock().expect("sqlite migration mutex poisoned");
+            let tx = conn.unchecked_transaction()?;
+
+            // 1. blocks
+            tx.execute(
+                "INSERT INTO blocks (height, header_id, timestamp, difficulty, miner_pk, \
+                                     block_size, tx_count) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    data.block.height as i64,
+                    data.block.header_id.as_slice(),
+                    data.block.timestamp,
+                    data.block.difficulty,
+                    data.block.miner_pk.as_slice(),
+                    data.block.block_size as i64,
+                    data.block.tx_count as i64,
+                ],
+            )?;
+
+            // 2. transactions
+            for t in &data.transactions {
+                tx.execute(
+                    "INSERT INTO transactions (tx_id, header_id, height, tx_index, size) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        t.tx_id.as_slice(),
+                        t.header_id.as_slice(),
+                        t.height as i64,
+                        t.tx_index as i64,
+                        t.size as i64,
+                    ],
+                )?;
+            }
+
+            // 3. boxes (created)
+            for b in &data.created_boxes {
+                tx.execute(
+                    "INSERT INTO boxes (box_id, tx_id, header_id, height, output_index, \
+                                        ergo_tree, ergo_tree_hash, address, value, \
+                                        spent_tx_id, spent_height) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![
+                        b.box_id.as_slice(),
+                        b.tx_id.as_slice(),
+                        b.header_id.as_slice(),
+                        b.height as i64,
+                        b.output_index as i64,
+                        b.ergo_tree.as_slice(),
+                        b.ergo_tree_hash.as_slice(),
+                        b.address,
+                        b.value,
+                        b.spent_tx_id.as_ref().map(|s| s.as_slice()),
+                        b.spent_height.map(|h| h as i64),
+                    ],
+                )?;
+            }
+
+            // 4. box_registers
+            for r in &data.box_registers {
+                tx.execute(
+                    "INSERT INTO box_registers (box_id, register_id, serialized) \
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        r.box_id.as_slice(),
+                        r.register_id as i64,
+                        r.serialized.as_slice(),
+                    ],
+                )?;
+            }
+
+            // 5. box_tokens
+            for t in &data.box_tokens {
+                tx.execute(
+                    "INSERT INTO box_tokens (box_id, token_id, amount) \
+                     VALUES (?1, ?2, ?3)",
+                    params![t.box_id.as_slice(), t.token_id.as_slice(), t.amount],
+                )?;
+            }
+
+            // 6. tokens (minted at H)
+            for t in &data.minted_tokens {
+                tx.execute(
+                    "INSERT INTO tokens (token_id, minting_tx_id, minting_height, name, description, decimals) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        t.token_id.as_slice(),
+                        t.minting_tx_id.as_slice(),
+                        t.minting_height as i64,
+                        t.name,
+                        t.description,
+                        t.decimals.map(|d| d as i64),
+                    ],
+                )?;
+            }
+
+            // 7. boxes spent updates
+            for s in &data.spent_box_updates {
+                tx.execute(
+                    "UPDATE boxes SET spent_tx_id = ?1, spent_height = ?2 WHERE box_id = ?3",
+                    params![
+                        s.spent_tx_id.as_slice(),
+                        s.spent_height as i64,
+                        s.box_id.as_slice(),
+                    ],
+                )?;
+            }
+
+            // 8. cursor
+            write_cursor_inline(&tx, &cursor)?;
+
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?
+    }
+}
+
+/// Inline the 3-key cursor write inside a caller-controlled transaction.
+/// Shared by `write_cursor` (its own short-lived tx) and `apply_block` (the
+/// per-block tx). Per facts/indexer-migration.md § Resume Semantics: the 3
+/// keys are `migration_cursor`, `migration_source`, `migration_source_fingerprint`.
+fn write_cursor_inline(tx: &rusqlite::Transaction<'_>, cursor: &Cursor) -> Result<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO indexer_state (key, value) VALUES ('migration_cursor', ?1)",
+        params![cursor.last_height.to_string()],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO indexer_state (key, value) VALUES ('migration_source', ?1)",
+        params![cursor.source_url],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO indexer_state (key, value) VALUES ('migration_source_fingerprint', ?1)",
+        params![hex::encode(cursor.source_fingerprint)],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod migration_backend_tests {
+    use super::*;
+    use crate::migrate::hash::hash_block;
+
+    /// Deterministic synthetic block data for a given height + seed. Used by
+    /// the apply→read round-trip test. Mirrors the fixture from migrate/hash.rs
+    /// tests so encoding/sort semantics stay consistent across modules.
+    fn build_synth_block_data(height: u32, seed: u8) -> BlockData {
+        let header_id = [seed; 32];
+
+        let block = MBlockRow {
+            height,
+            header_id,
+            timestamp: 1_700_000_000_000i64 + seed as i64,
+            difficulty: 1_000_000i64 + seed as i64,
+            miner_pk: (0u8..33).map(|i| seed.wrapping_add(i)).collect(),
+            block_size: 1000u32 + seed as u32,
+            tx_count: 2,
+        };
+
+        let mut transactions = Vec::with_capacity(2);
+        for i in 0u32..2 {
+            transactions.push(MTransactionRow {
+                tx_id: [seed.wrapping_add(i as u8); 32],
+                header_id,
+                height,
+                tx_index: i,
+                size: 200u32 + i + seed as u32,
+            });
+        }
+
+        let mut created_boxes = Vec::with_capacity(2);
+        for i in 0u32..2 {
+            created_boxes.push(MBoxRow {
+                box_id: [seed.wrapping_mul(2).wrapping_add(i as u8); 32],
+                tx_id: transactions[i as usize].tx_id,
+                header_id,
+                height,
+                output_index: i,
+                ergo_tree: vec![0x10u8, 0x01, 0x04, seed],
+                ergo_tree_hash: [seed.wrapping_add(99); 32],
+                address: format!("9addr_{seed}_{i}"),
+                value: 1_000_000i64 + i as i64 + seed as i64,
+                // Created-this-block rows are unspent at creation. The spent
+                // state for a box created here would arrive at a future
+                // height as a `BoxSpentUpdate`; the spent-at-prior-height
+                // updates this block performs live in spent_box_updates.
+                spent_tx_id: None,
+                spent_height: None,
+            });
+        }
+
+        let box_registers = created_boxes
+            .iter()
+            .map(|b| MBoxRegisterRow {
+                box_id: b.box_id,
+                register_id: 4,
+                serialized: vec![0x05u8, seed, 0x42],
+            })
+            .collect();
+
+        let box_tokens = created_boxes
+            .iter()
+            .map(|b| MBoxTokenRow {
+                box_id: b.box_id,
+                token_id: [seed.wrapping_add(50); 32],
+                amount: 100i64 + seed as i64,
+            })
+            .collect();
+
+        let minted_tokens = vec![MTokenRow {
+            token_id: [seed.wrapping_add(77); 32],
+            minting_tx_id: transactions[0].tx_id,
+            minting_height: height,
+            name: Some(format!("token_{seed}")),
+            description: None,
+            decimals: Some(seed as i32),
+        }];
+
+        // Spent-update: a box from a PRIOR height (we use a synthetic
+        // box_id that doesn't collide with `created_boxes`) was spent at
+        // this height.
+        let spent_box_updates = vec![BoxSpentUpdate {
+            box_id: [seed.wrapping_add(200); 32],
+            spent_tx_id: transactions[1].tx_id,
+            spent_height: height,
+        }];
+
+        BlockData {
+            block,
+            transactions,
+            created_boxes,
+            box_registers,
+            box_tokens,
+            minted_tokens,
+            spent_box_updates,
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_backend_schema_version_roundtrip() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let mut b = SqliteBackend::new_for_migration(db.path()).await.unwrap();
+        assert!(b.schema_version().await.unwrap().is_none());
+        b.init_schema(1).await.unwrap();
+        assert_eq!(b.schema_version().await.unwrap(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn sqlite_backend_cursor_roundtrip() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let mut b = SqliteBackend::new_for_migration(db.path()).await.unwrap();
+        b.init_schema(1).await.unwrap();
+        assert!(b.read_cursor().await.unwrap().is_none());
+        let c = Cursor {
+            last_height: 42,
+            source_url: "sqlite:///source".into(),
+            source_fingerprint: [0xAB; 32],
+        };
+        b.write_cursor(&c).await.unwrap();
+        assert_eq!(b.read_cursor().await.unwrap(), Some(c));
+    }
+
+    /// Pre-seed a target box row at a prior height so the `spent_box_updates`
+    /// path of `apply_block` has a row to UPDATE. In production migration the
+    /// prior-height block carrying the soon-to-be-spent box is copied first;
+    /// in a single-block unit test we have to plant the box manually.
+    async fn seed_prior_height_box(
+        backend: &mut SqliteBackend,
+        box_id: [u8; 32],
+        prior_height: u32,
+        cursor_after_seed: &Cursor,
+    ) {
+        let tx_id = [0xEEu8; 32];
+        let header_id = [0xDDu8; 32];
+
+        let prior_block = MBlockRow {
+            height: prior_height,
+            header_id,
+            timestamp: 1_699_000_000_000,
+            difficulty: 999_999,
+            miner_pk: vec![0u8; 33],
+            block_size: 100,
+            tx_count: 1,
+        };
+        let prior_tx = MTransactionRow {
+            tx_id,
+            header_id,
+            height: prior_height,
+            tx_index: 0,
+            size: 100,
+        };
+        let prior_box = MBoxRow {
+            box_id,
+            tx_id,
+            header_id,
+            height: prior_height,
+            output_index: 0,
+            ergo_tree: vec![0u8; 4],
+            ergo_tree_hash: [0u8; 32],
+            address: "9addr_prior".to_string(),
+            value: 1,
+            spent_tx_id: None,
+            spent_height: None,
+        };
+        let prior_data = BlockData {
+            block: prior_block,
+            transactions: vec![prior_tx],
+            created_boxes: vec![prior_box],
+            box_registers: vec![],
+            box_tokens: vec![],
+            minted_tokens: vec![],
+            spent_box_updates: vec![],
+        };
+        backend
+            .apply_block(&prior_data, cursor_after_seed)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_backend_apply_block_then_read_back() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let mut b = SqliteBackend::new_for_migration(db.path()).await.unwrap();
+        b.init_schema(1).await.unwrap();
+
+        let data = build_synth_block_data(100, 0x33);
+
+        // Pre-seed: the spent_box_updates row references a box created at a
+        // prior height (the migrator would have copied that height first in
+        // real usage). Plant it now.
+        let prior_cursor = Cursor {
+            last_height: 50,
+            source_url: "sqlite:///fake".into(),
+            source_fingerprint: [0u8; 32],
+        };
+        let spent_target = data.spent_box_updates[0].box_id;
+        seed_prior_height_box(&mut b, spent_target, 50, &prior_cursor).await;
+
+        let cursor = Cursor {
+            last_height: 100,
+            source_url: "sqlite:///fake".into(),
+            source_fingerprint: [0u8; 32],
+        };
+
+        b.apply_block(&data, &cursor).await.unwrap();
+        let read_back = b.read_block_data(100).await.unwrap();
+
+        // Structural equality per vector (the hash test below would catch any
+        // mismatch, but field-level asserts give a sharper diagnostic).
+        assert_eq!(read_back.block, data.block);
+        assert_eq!(read_back.transactions, data.transactions);
+        assert_eq!(read_back.created_boxes, data.created_boxes);
+        assert_eq!(read_back.box_registers, data.box_registers);
+        assert_eq!(read_back.box_tokens, data.box_tokens);
+        assert_eq!(read_back.minted_tokens, data.minted_tokens);
+        assert_eq!(read_back.spent_box_updates, data.spent_box_updates);
+
+        // The cross-backend acceptance test: hash of round-tripped data MUST
+        // equal hash of input. If this breaks, T5's hash will report false
+        // mismatches for every block of every migration.
+        assert_eq!(hash_block(&read_back), hash_block(&data));
+
+        // Cursor was committed atomically with the block data.
+        assert_eq!(b.read_cursor().await.unwrap(), Some(cursor));
+
+        // max_height reflects the inserted block.
+        assert_eq!(b.max_height().await.unwrap(), Some(100));
+    }
+}

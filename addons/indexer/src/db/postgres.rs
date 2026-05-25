@@ -669,3 +669,788 @@ mod tests {
         assert_eq!(opts.get_database(), Some("db"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Migration backend
+// ---------------------------------------------------------------------------
+//
+// `PostgresBackend` implements `crate::migrate::Backend` and is used ONLY by
+// the `ergo-indexer-migratedb` binary. Separate from `PgDb` above — the
+// running indexer's pool init path stays untouched.
+//
+// Per facts/indexer-migration.md § Per-block migration unit: each `apply_block`
+// runs `SET CONSTRAINTS ALL DEFERRED` then INSERTs/UPDATEs the block's tables
+// inside one transaction. The CREATE TABLE schema declares FKs as the default
+// (NOT DEFERRABLE), so this is belt-and-suspenders against future schema
+// changes that flip them to DEFERRABLE — today the ordering inside the apply
+// block (blocks → transactions → boxes → registers/tokens) satisfies FK
+// ordering directly.
+
+use crate::migrate::{
+    Backend as MigrateBackend, BlockData as MBlockData, BlockRow as MBlockRow,
+    BoxRegisterRow as MBoxRegisterRow, BoxRow as MBoxRow, BoxSpentUpdate,
+    BoxTokenRow as MBoxTokenRow, Cursor, TokenRow as MTokenRow,
+    TransactionRow as MTransactionRow,
+};
+
+pub struct PostgresBackend {
+    pool: PgPool,
+}
+
+impl PostgresBackend {
+    /// Open a PostgreSQL pool for migration.
+    ///
+    /// Intentionally separate from `PgDb::connect` — the migrator does NOT
+    /// auto-create the schema on open; the migrator calls `init_schema` only
+    /// when starting a fresh migration. The running indexer's startup path
+    /// (which DOES create on open) is untouched.
+    pub async fn new_for_migration(url: &str) -> Result<Self> {
+        let opts = PgConnectOptions::from_str(url)
+            .with_context(|| format!("invalid PostgreSQL URL: {url}"))?;
+        let opts = apply_libpq_env(opts, |k| std::env::var(k).ok())?;
+        let pool = PgPool::connect_with(opts)
+            .await
+            .context("failed to connect to PostgreSQL")?;
+        Ok(Self { pool })
+    }
+}
+
+/// Convert `Vec<u8>` from a BYTEA column into `[u8; 32]`. Postgres BYTEA has
+/// no fixed-width subtype declared in the schema, so length is asserted at
+/// read time — identical strategy to the SQLite side.
+fn pg_vec_to_id32(v: Vec<u8>, col: &str) -> Result<[u8; 32]> {
+    let len = v.len();
+    v.try_into()
+        .map_err(|_| anyhow::anyhow!("column {col}: expected 32 bytes, got {len}"))
+}
+
+#[async_trait]
+impl MigrateBackend for PostgresBackend {
+    async fn schema_version(&mut self) -> Result<Option<u32>> {
+        // information_schema is the portable existence check — handles the
+        // "freshly created database" case where indexer_state hasn't been
+        // CREATEd yet.
+        let exists: (bool,) = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+             WHERE table_name = 'indexer_state')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if !exists.0 {
+            return Ok(None);
+        }
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT value FROM indexer_state WHERE key = 'schema_version'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(s,)| s.parse().ok()))
+    }
+
+    async fn init_schema(&mut self, version: u32) -> Result<()> {
+        for stmt in CREATE_TABLES_PG.split(';') {
+            let stmt = stmt.trim();
+            if stmt.is_empty() {
+                continue;
+            }
+            sqlx::query(stmt)
+                .execute(&self.pool)
+                .await
+                .with_context(|| {
+                    format!("migration init failed: {}", &stmt[..stmt.len().min(80)])
+                })?;
+        }
+        sqlx::query(
+            "INSERT INTO indexer_state (key, value) VALUES ('schema_version', $1) \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(version.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn read_cursor(&mut self) -> Result<Option<Cursor>> {
+        // Guard against the table not existing on a fresh DB.
+        let exists: (bool,) = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+             WHERE table_name = 'indexer_state')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if !exists.0 {
+            return Ok(None);
+        }
+        let cursor_v: Option<(String,)> = sqlx::query_as(
+            "SELECT value FROM indexer_state WHERE key = 'migration_cursor'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        let source_v: Option<(String,)> = sqlx::query_as(
+            "SELECT value FROM indexer_state WHERE key = 'migration_source'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        let fp_v: Option<(String,)> = sqlx::query_as(
+            "SELECT value FROM indexer_state WHERE key = 'migration_source_fingerprint'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match (cursor_v, source_v, fp_v) {
+            (None, None, None) => Ok(None),
+            (Some((c,)), Some((s,)), Some((f,))) => {
+                let last_height: u32 = c
+                    .parse()
+                    .with_context(|| format!("migration_cursor not a u32: {c}"))?;
+                let fp_bytes = hex::decode(&f)
+                    .with_context(|| "migration_source_fingerprint is not hex")?;
+                let fp: [u8; 32] = fp_bytes.try_into().map_err(|v: Vec<u8>| {
+                    anyhow::anyhow!(
+                        "migration_source_fingerprint must be 32 bytes, got {}",
+                        v.len()
+                    )
+                })?;
+                Ok(Some(Cursor {
+                    last_height,
+                    source_url: s,
+                    source_fingerprint: fp,
+                }))
+            }
+            _ => Err(anyhow::anyhow!(
+                "indexer_state has a partial migration cursor — the 3 keys must all be present or all absent"
+            )),
+        }
+    }
+
+    async fn write_cursor(&mut self, cursor: &Cursor) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        write_cursor_pg(&mut tx, cursor).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn max_height(&mut self) -> Result<Option<u32>> {
+        let row: (Option<i64>,) = sqlx::query_as("SELECT MAX(height) FROM blocks")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0.map(|h| h as u32))
+    }
+
+    async fn read_block_data(&mut self, height: u32) -> Result<MBlockData> {
+        let h = height as i64;
+
+        // blocks
+        let block_tup: BlockTuple = sqlx::query_as(
+            "SELECT height, header_id, timestamp, difficulty, miner_pk, block_size, tx_count \
+             FROM blocks WHERE height = $1",
+        )
+        .bind(h)
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("blocks row missing at height {height}"))?;
+        let block = MBlockRow {
+            height: block_tup.0 as u32,
+            header_id: pg_vec_to_id32(block_tup.1, "blocks.header_id")?,
+            timestamp: block_tup.2,
+            difficulty: block_tup.3,
+            miner_pk: block_tup.4,
+            block_size: block_tup.5 as u32,
+            tx_count: block_tup.6 as u32,
+        };
+
+        // transactions
+        let tx_rows: Vec<TxTuple> = sqlx::query_as(
+            "SELECT tx_id, header_id, height, tx_index, size \
+             FROM transactions WHERE height = $1 ORDER BY tx_index",
+        )
+        .bind(h)
+        .fetch_all(&self.pool)
+        .await?;
+        let transactions: Vec<MTransactionRow> = tx_rows
+            .into_iter()
+            .map(|(tid, hid, h, ti, sz)| {
+                Ok::<_, anyhow::Error>(MTransactionRow {
+                    tx_id: pg_vec_to_id32(tid, "transactions.tx_id")?,
+                    header_id: pg_vec_to_id32(hid, "transactions.header_id")?,
+                    height: h as u32,
+                    tx_index: ti as u32,
+                    size: sz as u32,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // boxes WHERE height = H
+        let box_rows: Vec<BoxTuple> = sqlx::query_as(
+            "SELECT box_id, tx_id, header_id, height, output_index, ergo_tree, \
+                    ergo_tree_hash, address, value, spent_tx_id, spent_height \
+             FROM boxes WHERE height = $1 ORDER BY box_id",
+        )
+        .bind(h)
+        .fetch_all(&self.pool)
+        .await?;
+        let created_boxes: Vec<MBoxRow> = box_rows
+            .into_iter()
+            .map(|(bid, tid, hid, h, oi, et, eth, addr, val, stid, sh)| {
+                Ok::<_, anyhow::Error>(MBoxRow {
+                    box_id: pg_vec_to_id32(bid, "boxes.box_id")?,
+                    tx_id: pg_vec_to_id32(tid, "boxes.tx_id")?,
+                    header_id: pg_vec_to_id32(hid, "boxes.header_id")?,
+                    height: h as u32,
+                    output_index: oi as u32,
+                    ergo_tree: et,
+                    ergo_tree_hash: pg_vec_to_id32(eth, "boxes.ergo_tree_hash")?,
+                    address: addr,
+                    value: val,
+                    spent_tx_id: stid
+                        .map(|v| pg_vec_to_id32(v, "boxes.spent_tx_id"))
+                        .transpose()?,
+                    spent_height: sh.map(|s| s as u32),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // box_registers / box_tokens for the just-created boxes
+        let mut box_registers: Vec<MBoxRegisterRow> = Vec::new();
+        let mut box_tokens: Vec<MBoxTokenRow> = Vec::new();
+        for bx in &created_boxes {
+            let reg_rows: Vec<(Vec<u8>, i16, Vec<u8>)> = sqlx::query_as(
+                "SELECT box_id, register_id, serialized FROM box_registers \
+                 WHERE box_id = $1 ORDER BY register_id",
+            )
+            .bind(bx.box_id.as_slice())
+            .fetch_all(&self.pool)
+            .await?;
+            for (bid, rid, ser) in reg_rows {
+                box_registers.push(MBoxRegisterRow {
+                    box_id: pg_vec_to_id32(bid, "box_registers.box_id")?,
+                    register_id: rid as u8,
+                    serialized: ser,
+                });
+            }
+
+            let tok_rows: Vec<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+                "SELECT box_id, token_id, amount FROM box_tokens \
+                 WHERE box_id = $1 ORDER BY token_id",
+            )
+            .bind(bx.box_id.as_slice())
+            .fetch_all(&self.pool)
+            .await?;
+            for (bid, tid, amt) in tok_rows {
+                box_tokens.push(MBoxTokenRow {
+                    box_id: pg_vec_to_id32(bid, "box_tokens.box_id")?,
+                    token_id: pg_vec_to_id32(tid, "box_tokens.token_id")?,
+                    amount: amt,
+                });
+            }
+        }
+
+        // tokens WHERE minting_height = H
+        let token_rows: Vec<TokenTuple> = sqlx::query_as(
+            "SELECT token_id, minting_tx_id, minting_height, name, description, decimals \
+             FROM tokens WHERE minting_height = $1 ORDER BY token_id",
+        )
+        .bind(h)
+        .fetch_all(&self.pool)
+        .await?;
+        let minted_tokens: Vec<MTokenRow> = token_rows
+            .into_iter()
+            .map(|(tid, mtid, mh, n, d, dec)| {
+                Ok::<_, anyhow::Error>(MTokenRow {
+                    token_id: pg_vec_to_id32(tid, "tokens.token_id")?,
+                    minting_tx_id: pg_vec_to_id32(mtid, "tokens.minting_tx_id")?,
+                    minting_height: mh as u32,
+                    name: n,
+                    description: d,
+                    decimals: dec,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // boxes WHERE spent_height = H → spent updates
+        let spent_rows: Vec<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT box_id, spent_tx_id, spent_height FROM boxes \
+             WHERE spent_height = $1 ORDER BY box_id",
+        )
+        .bind(h)
+        .fetch_all(&self.pool)
+        .await?;
+        let spent_box_updates: Vec<BoxSpentUpdate> = spent_rows
+            .into_iter()
+            .map(|(bid, stid, sh)| {
+                Ok::<_, anyhow::Error>(BoxSpentUpdate {
+                    box_id: pg_vec_to_id32(bid, "boxes.box_id")?,
+                    spent_tx_id: pg_vec_to_id32(stid, "boxes.spent_tx_id")?,
+                    spent_height: sh as u32,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(MBlockData {
+            block,
+            transactions,
+            created_boxes,
+            box_registers,
+            box_tokens,
+            minted_tokens,
+            spent_box_updates,
+        })
+    }
+
+    async fn apply_block(&mut self, data: &MBlockData, cursor: &Cursor) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        // Per facts/indexer-migration.md § Per-block migration unit: defer FK
+        // checks to commit time. No-op if FKs aren't declared deferrable —
+        // CREATE TABLE here uses the default (NOT DEFERRABLE) so the only
+        // protection at present is the ordering below, but the spec requires
+        // the statement.
+        sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+            .execute(&mut *tx)
+            .await?;
+
+        // 1. blocks
+        sqlx::query(
+            "INSERT INTO blocks (height, header_id, timestamp, difficulty, miner_pk, \
+                                 block_size, tx_count) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(data.block.height as i64)
+        .bind(data.block.header_id.as_slice())
+        .bind(data.block.timestamp)
+        .bind(data.block.difficulty)
+        .bind(data.block.miner_pk.as_slice())
+        .bind(data.block.block_size as i32)
+        .bind(data.block.tx_count as i32)
+        .execute(&mut *tx)
+        .await?;
+
+        // 2. transactions
+        for t in &data.transactions {
+            sqlx::query(
+                "INSERT INTO transactions (tx_id, header_id, height, tx_index, size) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(t.tx_id.as_slice())
+            .bind(t.header_id.as_slice())
+            .bind(t.height as i64)
+            .bind(t.tx_index as i32)
+            .bind(t.size as i32)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 3. boxes (created)
+        for b in &data.created_boxes {
+            sqlx::query(
+                "INSERT INTO boxes (box_id, tx_id, header_id, height, output_index, \
+                                    ergo_tree, ergo_tree_hash, address, value, \
+                                    spent_tx_id, spent_height) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            )
+            .bind(b.box_id.as_slice())
+            .bind(b.tx_id.as_slice())
+            .bind(b.header_id.as_slice())
+            .bind(b.height as i64)
+            .bind(b.output_index as i32)
+            .bind(b.ergo_tree.as_slice())
+            .bind(b.ergo_tree_hash.as_slice())
+            .bind(&b.address)
+            .bind(b.value)
+            .bind(b.spent_tx_id.as_ref().map(|s| s.as_slice()))
+            .bind(b.spent_height.map(|h| h as i64))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 4. box_registers
+        for r in &data.box_registers {
+            sqlx::query(
+                "INSERT INTO box_registers (box_id, register_id, serialized) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(r.box_id.as_slice())
+            .bind(r.register_id as i16)
+            .bind(r.serialized.as_slice())
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 5. box_tokens
+        for tk in &data.box_tokens {
+            sqlx::query(
+                "INSERT INTO box_tokens (box_id, token_id, amount) VALUES ($1, $2, $3)",
+            )
+            .bind(tk.box_id.as_slice())
+            .bind(tk.token_id.as_slice())
+            .bind(tk.amount)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 6. tokens (minted at H)
+        for t in &data.minted_tokens {
+            sqlx::query(
+                "INSERT INTO tokens (token_id, minting_tx_id, minting_height, name, description, decimals) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(t.token_id.as_slice())
+            .bind(t.minting_tx_id.as_slice())
+            .bind(t.minting_height as i64)
+            .bind(&t.name)
+            .bind(&t.description)
+            .bind(t.decimals)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 7. boxes spent updates
+        for s in &data.spent_box_updates {
+            sqlx::query(
+                "UPDATE boxes SET spent_tx_id = $1, spent_height = $2 WHERE box_id = $3",
+            )
+            .bind(s.spent_tx_id.as_slice())
+            .bind(s.spent_height as i64)
+            .bind(s.box_id.as_slice())
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 8. cursor (atomic with the block data)
+        write_cursor_pg(&mut tx, cursor).await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+/// Inline 3-key cursor write inside a caller-controlled PG transaction.
+/// Shared by `write_cursor` and `apply_block`.
+async fn write_cursor_pg(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    cursor: &Cursor,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO indexer_state (key, value) VALUES ('migration_cursor', $1) \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(cursor.last_height.to_string())
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO indexer_state (key, value) VALUES ('migration_source', $1) \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(&cursor.source_url)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO indexer_state (key, value) VALUES ('migration_source_fingerprint', $1) \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(hex::encode(cursor.source_fingerprint))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod migration_backend_tests {
+    use super::*;
+    use crate::migrate::hash::hash_block;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Test-helper: a temporary, per-test PG database. Drops on `Drop`.
+    ///
+    /// The libpq env (~/.pgpass) supplies password for the `mwaddip` role on
+    /// the local 5432 instance, per the laptop's standing setup. Each test
+    /// CREATEs a randomly-named DB, runs against it, then DROPs.
+    ///
+    /// `Drop` cleanup is `tokio::spawn`'d into the current runtime — if the
+    /// test panics, the runtime still drives the cleanup task before the
+    /// process exits. Worst case (process kill before cleanup runs) leaves
+    /// a `test_migrate_<rand>_<pid>` DB behind; manual `DROP DATABASE` is
+    /// the recovery.
+    struct PgTestDb {
+        name: String,
+        url: String,
+    }
+
+    impl PgTestDb {
+        /// CREATE DATABASE <unique>. The admin connection to `postgres` is
+        /// opened, used, and closed inside this call.
+        async fn create() -> Self {
+            let admin_url = Self::admin_url();
+            let name = Self::unique_name();
+
+            let admin_pool = PgPool::connect(&admin_url)
+                .await
+                .expect("admin connect to `postgres` DB");
+            sqlx::query(&format!("CREATE DATABASE {name}"))
+                .execute(&admin_pool)
+                .await
+                .expect("CREATE DATABASE");
+            admin_pool.close().await;
+
+            let url = format!("postgres://mwaddip@127.0.0.1:5432/{name}");
+            Self { name, url }
+        }
+
+        fn admin_url() -> String {
+            "postgres://mwaddip@127.0.0.1:5432/postgres".to_string()
+        }
+
+        /// `test_migrate_<unix_nanos>_<pid>_<counter>` — unique per CREATE call
+        /// within one process AND across parallel runs (nanos + pid). Avoids
+        /// adding a uuid dep just for tests.
+        fn unique_name() -> String {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            let pid = std::process::id();
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            format!("test_migrate_{nanos}_{pid}_{n}")
+        }
+    }
+
+    impl Drop for PgTestDb {
+        fn drop(&mut self) {
+            // Cleanup MUST be synchronous-blocking so that tests don't leak
+            // databases when the parent tokio runtime exits before a spawned
+            // cleanup task can run. Run in a fresh thread + fresh runtime —
+            // independent of whatever runtime called Drop. Joining the thread
+            // makes Drop block until DROP DATABASE returns.
+            let name = self.name.clone();
+            let admin_url = Self::admin_url();
+            let handle = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("PgTestDb cleanup runtime");
+                rt.block_on(async {
+                    let admin = match PgPool::connect(&admin_url).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("PgTestDb cleanup admin-connect failed for {name}: {e}");
+                            return;
+                        }
+                    };
+                    // pg_terminate_backend kicks any leftover sessions off
+                    // the test DB — sqlx pool Drop ought to have closed them
+                    // already, but DROP DATABASE refuses with a non-empty
+                    // backend list, so belt-and-suspenders.
+                    let _ = sqlx::query(&format!(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                         WHERE datname = '{name}' AND pid <> pg_backend_pid()"
+                    ))
+                    .execute(&admin)
+                    .await;
+                    if let Err(e) = sqlx::query(&format!("DROP DATABASE IF EXISTS {name}"))
+                        .execute(&admin)
+                        .await
+                    {
+                        eprintln!("PgTestDb cleanup DROP DATABASE {name} failed: {e}");
+                    }
+                    admin.close().await;
+                });
+            });
+            if let Err(e) = handle.join() {
+                eprintln!("PgTestDb cleanup thread panicked: {e:?}");
+            }
+        }
+    }
+
+    /// Same fixture shape as the SQLite-side `build_synth_block_data` (kept
+    /// independent to avoid cross-module test dependencies — both use the
+    /// same seed → same hash invariant since the encoding is backend-agnostic).
+    fn build_synth_block_data(height: u32, seed: u8) -> MBlockData {
+        let header_id = [seed; 32];
+        let block = MBlockRow {
+            height,
+            header_id,
+            timestamp: 1_700_000_000_000i64 + seed as i64,
+            difficulty: 1_000_000i64 + seed as i64,
+            miner_pk: (0u8..33).map(|i| seed.wrapping_add(i)).collect(),
+            block_size: 1000u32 + seed as u32,
+            tx_count: 2,
+        };
+        let mut transactions = Vec::with_capacity(2);
+        for i in 0u32..2 {
+            transactions.push(MTransactionRow {
+                tx_id: [seed.wrapping_add(i as u8); 32],
+                header_id,
+                height,
+                tx_index: i,
+                size: 200u32 + i + seed as u32,
+            });
+        }
+        let mut created_boxes = Vec::with_capacity(2);
+        for i in 0u32..2 {
+            created_boxes.push(MBoxRow {
+                box_id: [seed.wrapping_mul(2).wrapping_add(i as u8); 32],
+                tx_id: transactions[i as usize].tx_id,
+                header_id,
+                height,
+                output_index: i,
+                ergo_tree: vec![0x10u8, 0x01, 0x04, seed],
+                ergo_tree_hash: [seed.wrapping_add(99); 32],
+                address: format!("9addr_{seed}_{i}"),
+                value: 1_000_000i64 + i as i64 + seed as i64,
+                spent_tx_id: None,
+                spent_height: None,
+            });
+        }
+        let box_registers = created_boxes
+            .iter()
+            .map(|b| MBoxRegisterRow {
+                box_id: b.box_id,
+                register_id: 4,
+                serialized: vec![0x05u8, seed, 0x42],
+            })
+            .collect();
+        let box_tokens = created_boxes
+            .iter()
+            .map(|b| MBoxTokenRow {
+                box_id: b.box_id,
+                token_id: [seed.wrapping_add(50); 32],
+                amount: 100i64 + seed as i64,
+            })
+            .collect();
+        let minted_tokens = vec![MTokenRow {
+            token_id: [seed.wrapping_add(77); 32],
+            minting_tx_id: transactions[0].tx_id,
+            minting_height: height,
+            name: Some(format!("token_{seed}")),
+            description: None,
+            decimals: Some(seed as i32),
+        }];
+        let spent_box_updates = vec![BoxSpentUpdate {
+            box_id: [seed.wrapping_add(200); 32],
+            spent_tx_id: transactions[1].tx_id,
+            spent_height: height,
+        }];
+        MBlockData {
+            block,
+            transactions,
+            created_boxes,
+            box_registers,
+            box_tokens,
+            minted_tokens,
+            spent_box_updates,
+        }
+    }
+
+    /// See sqlite::migration_backend_tests::seed_prior_height_box — same
+    /// rationale: the spent_box_updates UPDATE needs a row to hit.
+    async fn seed_prior_height_box(
+        backend: &mut PostgresBackend,
+        box_id: [u8; 32],
+        prior_height: u32,
+        cursor: &Cursor,
+    ) {
+        let tx_id = [0xEEu8; 32];
+        let header_id = [0xDDu8; 32];
+        let data = MBlockData {
+            block: MBlockRow {
+                height: prior_height,
+                header_id,
+                timestamp: 1_699_000_000_000,
+                difficulty: 999_999,
+                miner_pk: vec![0u8; 33],
+                block_size: 100,
+                tx_count: 1,
+            },
+            transactions: vec![MTransactionRow {
+                tx_id,
+                header_id,
+                height: prior_height,
+                tx_index: 0,
+                size: 100,
+            }],
+            created_boxes: vec![MBoxRow {
+                box_id,
+                tx_id,
+                header_id,
+                height: prior_height,
+                output_index: 0,
+                ergo_tree: vec![0u8; 4],
+                ergo_tree_hash: [0u8; 32],
+                address: "9addr_prior".to_string(),
+                value: 1,
+                spent_tx_id: None,
+                spent_height: None,
+            }],
+            box_registers: vec![],
+            box_tokens: vec![],
+            minted_tokens: vec![],
+            spent_box_updates: vec![],
+        };
+        backend.apply_block(&data, cursor).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_backend_schema_version_roundtrip() {
+        let db = PgTestDb::create().await;
+        let mut b = PostgresBackend::new_for_migration(&db.url).await.unwrap();
+        assert!(b.schema_version().await.unwrap().is_none());
+        b.init_schema(1).await.unwrap();
+        assert_eq!(b.schema_version().await.unwrap(), Some(1));
+        b.pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_backend_cursor_roundtrip() {
+        let db = PgTestDb::create().await;
+        let mut b = PostgresBackend::new_for_migration(&db.url).await.unwrap();
+        b.init_schema(1).await.unwrap();
+        assert!(b.read_cursor().await.unwrap().is_none());
+        let c = Cursor {
+            last_height: 42,
+            source_url: "sqlite:///source".into(),
+            source_fingerprint: [0xAB; 32],
+        };
+        b.write_cursor(&c).await.unwrap();
+        assert_eq!(b.read_cursor().await.unwrap(), Some(c));
+        b.pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_backend_apply_block_then_read_back() {
+        let db = PgTestDb::create().await;
+        let mut b = PostgresBackend::new_for_migration(&db.url).await.unwrap();
+        b.init_schema(1).await.unwrap();
+
+        let data = build_synth_block_data(100, 0x33);
+        let prior_cursor = Cursor {
+            last_height: 50,
+            source_url: "sqlite:///fake".into(),
+            source_fingerprint: [0u8; 32],
+        };
+        seed_prior_height_box(&mut b, data.spent_box_updates[0].box_id, 50, &prior_cursor).await;
+
+        let cursor = Cursor {
+            last_height: 100,
+            source_url: "sqlite:///fake".into(),
+            source_fingerprint: [0u8; 32],
+        };
+        b.apply_block(&data, &cursor).await.unwrap();
+        let read_back = b.read_block_data(100).await.unwrap();
+
+        assert_eq!(read_back.block, data.block);
+        assert_eq!(read_back.transactions, data.transactions);
+        assert_eq!(read_back.created_boxes, data.created_boxes);
+        assert_eq!(read_back.box_registers, data.box_registers);
+        assert_eq!(read_back.box_tokens, data.box_tokens);
+        assert_eq!(read_back.minted_tokens, data.minted_tokens);
+        assert_eq!(read_back.spent_box_updates, data.spent_box_updates);
+
+        assert_eq!(hash_block(&read_back), hash_block(&data));
+        assert_eq!(b.read_cursor().await.unwrap(), Some(cursor));
+        assert_eq!(b.max_height().await.unwrap(), Some(100));
+
+        b.pool.close().await;
+    }
+}
