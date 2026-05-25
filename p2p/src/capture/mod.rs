@@ -9,6 +9,13 @@
 
 pub mod config;
 pub mod dump;
+pub mod handle;
 pub mod pcap;
 pub mod ring;
 pub mod tap;
+
+pub use config::{CaptureConfig, CaptureConfigError, FilterMode, ResolvedCaptureConfig};
+pub use dump::{collect_chronological, DumpFilter, DumpRecord};
+pub use handle::{init, CaptureAccess, CaptureHandle, CaptureInfo};
+pub use pcap::Direction;
+pub use tap::Tap;

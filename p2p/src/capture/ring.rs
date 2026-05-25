@@ -180,10 +180,26 @@ impl RingBuffer {
 
     /// Reset write_head to data_region_start and increment generation.
     /// Used by `POST /debug/p2p-capture/reset` for clean repro captures.
+    ///
+    /// The data region is filled with `0xFF` padding so the dump iterator
+    /// returns zero records until new captures land. Without this, the
+    /// pre-reset bytes would still parse as valid records (walker treats
+    /// gen>0 as "whole region has content") and operators would see
+    /// stale frames in their post-reset dump.
+    ///
+    /// Cost: one O(data_region_size) memset, held under the write mutex.
+    /// For a 1 GB ring this blocks captures for ~50-100ms — acceptable
+    /// for an explicit operator action.
     pub fn reset(&self) {
         let mut guard = self.mmap.lock().unwrap();
         let new_gen = self.generation.load(Ordering::Acquire).wrapping_add(1);
         let new_head = self.data_region_start;
+
+        let drs = self.data_region_start as usize;
+        let dre = self.data_region_end as usize;
+        for b in &mut guard[drs..dre] {
+            *b = PAD_BYTE;
+        }
 
         let trailer_off = (self.size - TRAILER_LEN as u64) as usize;
         guard[trailer_off + 16..trailer_off + 24].copy_from_slice(&new_head.to_le_bytes());
