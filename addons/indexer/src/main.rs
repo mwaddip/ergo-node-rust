@@ -5,6 +5,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 mod api;
 mod config;
 mod db;
+pub mod migrate;
 mod node_client;
 mod parser;
 mod sync;
