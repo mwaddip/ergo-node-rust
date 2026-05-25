@@ -39,7 +39,29 @@ pub fn rewrite_storage_db(config_path: &Path, new_db: &str) -> anyhow::Result<()
             .set_prefix(format!("\n# previous: {prev}\n"));
     }
 
-    std::fs::write(config_path, doc.to_string())?;
+    // Atomic write: write to <path>.tmp then rename. On Linux, fs::rename is atomic
+    // when source and target are on the same filesystem (always true here since the
+    // temp lives in the same directory as the original).
+    let tmp_path = {
+        let mut p = config_path.to_path_buf();
+        let file_name = p
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("config path has no filename: {}", p.display()))?
+            .to_os_string();
+        let mut tmp_name = file_name;
+        tmp_name.push(".tmp");
+        p.set_file_name(tmp_name);
+        p
+    };
+    std::fs::write(&tmp_path, doc.to_string())
+        .map_err(|e| anyhow::anyhow!("failed to write temporary file {}: {e}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to rename {} to {}: {e}",
+            tmp_path.display(),
+            config_path.display()
+        )
+    })?;
     Ok(())
 }
 
