@@ -18,13 +18,25 @@ use crate::ApiState;
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
 fn err<T>(status: StatusCode, reason: impl Into<String>) -> ApiResult<T> {
-    Err((status, Json(ApiError { error: status.as_u16(), reason: reason.into(), detail: None })))
+    Err((
+        status,
+        Json(ApiError {
+            error: status.as_u16(),
+            reason: reason.into(),
+            detail: None,
+        }),
+    ))
 }
 
 fn mining_err() -> (StatusCode, Json<ApiError>) {
-    (StatusCode::SERVICE_UNAVAILABLE, Json(ApiError {
-        error: 503, reason: "mining not configured".into(), detail: None,
-    }))
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError {
+            error: 503,
+            reason: "mining not configured".into(),
+            detail: None,
+        }),
+    )
 }
 
 /// Parse the inner proof_bytes out of a raw AD proofs section.
@@ -61,10 +73,24 @@ fn section_modifier_id(type_id: u8, header_id: &[u8; 32], root: &[u8]) -> [u8; 3
 
 fn hex_to_id(hex_str: &str) -> Result<[u8; 32], (StatusCode, Json<ApiError>)> {
     let bytes = hex::decode(hex_str).map_err(|_| {
-        (StatusCode::BAD_REQUEST, Json(ApiError { error: 400, reason: "invalid hex ID".into(), detail: None }))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: 400,
+                reason: "invalid hex ID".into(),
+                detail: None,
+            }),
+        )
     })?;
     let arr: [u8; 32] = bytes.try_into().map_err(|_| {
-        (StatusCode::BAD_REQUEST, Json(ApiError { error: 400, reason: "ID must be 32 bytes".into(), detail: None }))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: 400,
+                reason: "ID must be 32 bytes".into(),
+                detail: None,
+            }),
+        )
     })?;
     Ok(arr)
 }
@@ -87,7 +113,11 @@ fn check_api_key(
     if provided.is_empty() {
         return Err((
             StatusCode::FORBIDDEN,
-            Json(ApiError { error: 403, reason: "api_key required".into(), detail: None }),
+            Json(ApiError {
+                error: 403,
+                reason: "api_key required".into(),
+                detail: None,
+            }),
         ));
     }
     use blake2::digest::consts::U32;
@@ -102,7 +132,11 @@ fn check_api_key(
     } else {
         Err((
             StatusCode::FORBIDDEN,
-            Json(ApiError { error: 403, reason: "invalid api_key".into(), detail: None }),
+            Json(ApiError {
+                error: 403,
+                reason: "invalid api_key".into(),
+                detail: None,
+            }),
         ))
     }
 }
@@ -122,7 +156,9 @@ fn subtle_constant_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 
 pub async fn get_info(State(state): State<ApiState>) -> Json<NodeInfo> {
     let headers_height = state.chain.height();
-    let full_height = state.validated_height.load(std::sync::atomic::Ordering::Relaxed);
+    let full_height = state
+        .validated_height
+        .load(std::sync::atomic::Ordering::Relaxed);
     let (tip_id, state_root) = match state.chain.tip() {
         Some(tip) => (
             hex::encode(tip.id.0.as_ref()),
@@ -145,7 +181,9 @@ pub async fn get_info(State(state): State<ApiState>) -> Json<NodeInfo> {
         network: state.node_info.network.clone(),
         full_height,
         headers_height,
-        downloaded_height: state.downloaded_height.load(std::sync::atomic::Ordering::Relaxed),
+        downloaded_height: state
+            .downloaded_height
+            .load(std::sync::atomic::Ordering::Relaxed),
         best_full_header_id: tip_id.clone(),
         best_header_id: tip_id,
         state_root,
@@ -204,22 +242,26 @@ pub async fn get_block_transactions(
     let id = hex_to_id(&header_id)?;
     // Block transactions are keyed by modifier ID = blake2b256(type_id || header_id || tx_root),
     // not by header ID. Compute the modifier ID from the header.
-    let header = state.chain.header_by_id(&id)
+    let header = state
+        .chain
+        .header_by_id(&id)
         .ok_or_else(|| err::<()>(StatusCode::NOT_FOUND, "header not found").unwrap_err())?;
-    let modifier_id = section_modifier_id(BLOCK_TRANSACTIONS_TYPE, &id, header.transaction_root.0.as_ref());
+    let modifier_id = section_modifier_id(
+        BLOCK_TRANSACTIONS_TYPE,
+        &id,
+        header.transaction_root.0.as_ref(),
+    );
     match state.store.get(BLOCK_TRANSACTIONS_TYPE, &modifier_id) {
-        Some(data) => {
-            match ergo_validation::parse_block_transactions(&data) {
-                Ok(parsed) => Ok(Json(serde_json::json!({
-                    "headerId": header_id,
-                    "transactions": parsed.transactions,
-                }))),
-                Err(e) => err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to parse stored transactions: {e}"),
-                ),
-            }
-        }
+        Some(data) => match ergo_validation::parse_block_transactions(&data) {
+            Ok(parsed) => Ok(Json(serde_json::json!({
+                "headerId": header_id,
+                "transactions": parsed.transactions,
+            }))),
+            Err(e) => err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to parse stored transactions: {e}"),
+            ),
+        },
         None => err(StatusCode::NOT_FOUND, "transactions not found"),
     }
 }
@@ -273,10 +315,12 @@ async fn process_transaction(
     let ctx_guard = state.state_context.read().await;
     let ctx = match ctx_guard.as_ref() {
         Some(c) => c,
-        None => return err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "node is syncing, cannot validate transactions yet",
-        ),
+        None => {
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "node is syncing, cannot validate transactions yet",
+            )
+        }
     };
 
     // Compute tx_id hex string
@@ -285,10 +329,12 @@ async fn process_transaction(
     // Sigma-serialize for mempool storage (P2P wire format)
     let tx_bytes = match tx.sigma_serialize_bytes() {
         Ok(b) => b,
-        Err(e) => return err(
-            StatusCode::BAD_REQUEST,
-            format!("transaction serialization failed: {e}"),
-        ),
+        Err(e) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("transaction serialization failed: {e}"),
+            )
+        }
     };
 
     if !add_to_pool {
@@ -296,37 +342,53 @@ async fn process_transaction(
         let mut input_boxes = Vec::with_capacity(tx.inputs.len());
         for input in tx.inputs.iter() {
             let box_id_bytes: [u8; 32] = input.box_id.as_ref().try_into().map_err(|_| {
-                (StatusCode::BAD_REQUEST, Json(ApiError {
-                    error: 400, reason: "input box_id must be 32 bytes".into(), detail: None,
-                }))
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiError {
+                        error: 400,
+                        reason: "input box_id must be 32 bytes".into(),
+                        detail: None,
+                    }),
+                )
             })?;
             match state.utxo_reader.box_by_id(&box_id_bytes) {
                 Some(b) => input_boxes.push(b),
-                None => return err(
-                    StatusCode::BAD_REQUEST,
-                    format!("input box not found: {}", hex::encode(box_id_bytes)),
-                ),
+                None => {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        format!("input box not found: {}", hex::encode(box_id_bytes)),
+                    )
+                }
             }
         }
         let mut data_boxes = Vec::new();
         if let Some(ref data_inputs) = tx.data_inputs {
             for di in data_inputs.iter() {
                 let box_id_bytes: [u8; 32] = di.box_id.as_ref().try_into().map_err(|_| {
-                    (StatusCode::BAD_REQUEST, Json(ApiError {
-                        error: 400, reason: "data-input box_id must be 32 bytes".into(), detail: None,
-                    }))
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiError {
+                            error: 400,
+                            reason: "data-input box_id must be 32 bytes".into(),
+                            detail: None,
+                        }),
+                    )
                 })?;
                 match state.utxo_reader.box_by_id(&box_id_bytes) {
                     Some(b) => data_boxes.push(b),
-                    None => return err(
-                        StatusCode::BAD_REQUEST,
-                        format!("data-input box not found: {}", hex::encode(box_id_bytes)),
-                    ),
+                    None => {
+                        return err(
+                            StatusCode::BAD_REQUEST,
+                            format!("data-input box not found: {}", hex::encode(box_id_bytes)),
+                        )
+                    }
                 }
             }
         }
 
-        if let Err(e) = ergo_validation::validate_single_transaction(&tx, input_boxes, data_boxes, ctx) {
+        if let Err(e) =
+            ergo_validation::validate_single_transaction(&tx, input_boxes, data_boxes, ctx)
+        {
             return err(StatusCode::BAD_REQUEST, format!("{e}"));
         }
         drop(ctx_guard);
@@ -338,7 +400,9 @@ async fn process_transaction(
     let outcome = pool.process(
         tx,
         tx_bytes,
-        &UtxoReaderAdapter { utxo_reader: &*state.utxo_reader },
+        &UtxoReaderAdapter {
+            utxo_reader: &*state.utxo_reader,
+        },
         ctx,
         None, // local submission — bypass rate limiting
     );
@@ -347,18 +411,17 @@ async fn process_transaction(
     match outcome {
         ergo_mempool::types::ProcessingOutcome::Accepted { .. }
         | ergo_mempool::types::ProcessingOutcome::Replaced { .. }
-        | ergo_mempool::types::ProcessingOutcome::AlreadyInPool => {
-            Ok(Json(tx_id_hex))
-        }
+        | ergo_mempool::types::ProcessingOutcome::AlreadyInPool => Ok(Json(tx_id_hex)),
         ergo_mempool::types::ProcessingOutcome::Invalidated { reason } => {
             err(StatusCode::BAD_REQUEST, reason)
         }
         ergo_mempool::types::ProcessingOutcome::Declined { reason } => {
             err(StatusCode::BAD_REQUEST, reason)
         }
-        ergo_mempool::types::ProcessingOutcome::DoubleSpendLoser { .. } => {
-            err(StatusCode::BAD_REQUEST, "double-spend conflict with higher-fee transaction")
-        }
+        ergo_mempool::types::ProcessingOutcome::DoubleSpendLoser { .. } => err(
+            StatusCode::BAD_REQUEST,
+            "double-spend conflict with higher-fee transaction",
+        ),
     }
 }
 
@@ -385,7 +448,9 @@ pub struct PaginationParams {
     limit: usize,
 }
 
-fn default_limit() -> usize { 50 }
+fn default_limit() -> usize {
+    50
+}
 
 pub async fn get_unconfirmed(
     State(state): State<ApiState>,
@@ -433,7 +498,10 @@ pub async fn get_unconfirmed_by_id(
     match pool.get(&id) {
         Some(utx) => match serde_json::to_value(&utx.tx) {
             Ok(v) => Ok(Json(v)),
-            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("serialization failed: {e}")),
+            Err(e) => err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("serialization failed: {e}"),
+            ),
         },
         None => err(StatusCode::NOT_FOUND, "transaction not in mempool"),
     }
@@ -453,8 +521,12 @@ pub struct FeeParams {
     tx_size: usize,
 }
 
-fn default_wait_time() -> u64 { 1 }
-fn default_tx_size() -> usize { 100 }
+fn default_wait_time() -> u64 {
+    1
+}
+fn default_tx_size() -> usize {
+    100
+}
 
 pub async fn get_recommended_fee(
     State(state): State<ApiState>,
@@ -482,7 +554,9 @@ pub struct HistogramParams {
     bins: usize,
 }
 
-fn default_bins() -> usize { 10 }
+fn default_bins() -> usize {
+    10
+}
 
 pub async fn get_pool_histogram(
     State(state): State<ApiState>,
@@ -566,12 +640,18 @@ pub async fn get_peer_api_urls(State(state): State<ApiState>) -> Json<Vec<PeerAp
 /// Rejects peers that advertise URLs pointing to a different host.
 fn url_host_matches_addr(url: &str, addr: &std::net::SocketAddr) -> bool {
     // Parse "http://1.2.3.4:9053" or "http://[::1]:9053" — extract host between :// and next : or /
-    let Some(after_scheme) = url.split("://").nth(1) else { return false };
+    let Some(after_scheme) = url.split("://").nth(1) else {
+        return false;
+    };
     let host_part = after_scheme.split('/').next().unwrap_or(after_scheme);
 
     // Handle IPv6 bracket notation: [::1]:9053
     let host = if host_part.starts_with('[') {
-        host_part.split(']').next().unwrap_or("").trim_start_matches('[')
+        host_part
+            .split(']')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('[')
     } else {
         // IPv4: strip port
         host_part.split(':').next().unwrap_or(host_part)
@@ -598,7 +678,10 @@ pub async fn post_ingest_modifiers(
     }
 
     let Some(ref tx) = state.modifier_tx else {
-        return err(StatusCode::SERVICE_UNAVAILABLE, "modifier pipeline not available");
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "modifier pipeline not available",
+        );
     };
 
     // Parse body: sequence of (type_id: u8, modifier_id: [u8; 32], data_len: u32 BE, data: [u8])
@@ -607,9 +690,10 @@ pub async fn post_ingest_modifiers(
     while cursor < body.len() {
         // type_id (1) + modifier_id (32) + data_len (4) = 37 bytes minimum
         if cursor + 37 > body.len() {
-            return err(StatusCode::BAD_REQUEST, format!(
-                "truncated modifier header at offset {cursor}"
-            ));
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("truncated modifier header at offset {cursor}"),
+            );
         }
 
         let type_id = body[cursor];
@@ -619,15 +703,14 @@ pub async fn post_ingest_modifiers(
         id.copy_from_slice(&body[cursor..cursor + 32]);
         cursor += 32;
 
-        let data_len = u32::from_be_bytes(
-            body[cursor..cursor + 4].try_into().unwrap()
-        ) as usize;
+        let data_len = u32::from_be_bytes(body[cursor..cursor + 4].try_into().unwrap()) as usize;
         cursor += 4;
 
         if cursor + data_len > body.len() {
-            return err(StatusCode::BAD_REQUEST, format!(
-                "truncated modifier data at offset {cursor}: need {data_len} bytes"
-            ));
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("truncated modifier data at offset {cursor}: need {data_len} bytes"),
+            );
         }
 
         let data = body[cursor..cursor + data_len].to_vec();
@@ -655,7 +738,10 @@ pub async fn get_emission_at(Path(height): Path<u32>) -> ApiResult<EmissionInfo>
     use ergo_lib::chain::emission::{EmissionRules, MonetarySettings};
 
     if height > MAX_EMISSION_HEIGHT {
-        return err(StatusCode::BAD_REQUEST, format!("height exceeds max ({MAX_EMISSION_HEIGHT})"));
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("height exceeds max ({MAX_EMISSION_HEIGHT})"),
+        );
     }
 
     let settings = MonetarySettings::default();
@@ -711,20 +797,18 @@ async fn nipopow_proof_response(
 ) -> ApiResult<serde_json::Value> {
     // Proof construction walks the interlink hierarchy and can take tens of
     // ms on a long chain. Move it off the async runtime.
-    let bytes = match tokio::task::spawn_blocking(move || {
-        chain.build_nipopow_proof(m, k, header_id)
-    })
-    .await
-    {
-        Ok(Ok(b)) => b,
-        Ok(Err(reason)) => return err(StatusCode::BAD_REQUEST, reason),
-        Err(join_err) => {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("nipopow build task panicked: {join_err}"),
-            )
-        }
-    };
+    let bytes =
+        match tokio::task::spawn_blocking(move || chain.build_nipopow_proof(m, k, header_id)).await
+        {
+            Ok(Ok(b)) => b,
+            Ok(Err(reason)) => return err(StatusCode::BAD_REQUEST, reason),
+            Err(join_err) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("nipopow build task panicked: {join_err}"),
+                )
+            }
+        };
 
     let proof = ergo_nipopow::NipopowProof::scorex_parse_bytes(&bytes).map_err(|e| {
         (
@@ -780,7 +864,10 @@ pub async fn get_mining_candidate(
     let tip_height = state.chain.height();
     match mining.cached_work(tip_height) {
         Some(work) => Ok(Json(work)),
-        None => err(StatusCode::SERVICE_UNAVAILABLE, "no candidate available — node may still be syncing"),
+        None => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no candidate available — node may still be syncing",
+        ),
     }
 }
 
@@ -820,11 +907,14 @@ pub async fn post_mining_solution(
 
     // Parse nonce
     let nonce = hex::decode(&submission.n).map_err(|_| {
-        (StatusCode::BAD_REQUEST, Json(ApiError {
-            error: 400,
-            reason: "invalid nonce hex".into(),
-            detail: None,
-        }))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: 400,
+                reason: "invalid nonce hex".into(),
+                detail: None,
+            }),
+        )
     })?;
     if nonce.len() != 8 {
         return err(StatusCode::BAD_REQUEST, "nonce must be exactly 8 bytes");
@@ -840,7 +930,10 @@ pub async fn post_mining_solution(
         candidates.push(p);
     }
     if candidates.is_empty() {
-        return err(StatusCode::BAD_REQUEST, "no current candidate — fetch /mining/candidate first");
+        return err(
+            StatusCode::BAD_REQUEST,
+            "no current candidate — fetch /mining/candidate first",
+        );
     }
 
     // Build Autolykos v2 solution (miner_pk not used in PoW calc, use configured pk)
@@ -856,27 +949,36 @@ pub async fn post_mining_solution(
     let mut matched = None;
     for candidate in candidates {
         match ergo_mining::solution::validate_solution(&candidate, solution.clone()) {
-            Ok(h) => { matched = Some((h, candidate)); break; }
-            Err(e) => { last_err = Some(e); }
+            Ok(h) => {
+                matched = Some((h, candidate));
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+            }
         }
     }
     let (header, candidate) = matched.ok_or_else(|| {
         let e = last_err.unwrap();
         match e {
-            ergo_mining::MiningError::InvalidSolution(msg) => {
-                (StatusCode::BAD_REQUEST, Json(ApiError {
+            ergo_mining::MiningError::InvalidSolution(msg) => (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
                     error: 400,
                     reason: format!("invalid solution: {msg}"),
                     detail: None,
-                }))
-            }
+                }),
+            ),
             other => {
                 tracing::error!("solution validation error: {other}");
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
-                    error: 500,
-                    reason: "solution validation failed".into(),
-                    detail: Some(other.to_string()),
-                }))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError {
+                        error: 500,
+                        reason: "solution validation failed".into(),
+                        detail: Some(other.to_string()),
+                    }),
+                )
             }
         }
     })?;
@@ -890,38 +992,53 @@ pub async fn post_mining_solution(
         candidate.version as u32,
         &candidate.transactions,
     )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
-        error: 500,
-        reason: format!("block transactions serialize: {e}"),
-        detail: None,
-    })))?;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: 500,
+                reason: format!("block transactions serialize: {e}"),
+                detail: None,
+            }),
+        )
+    })?;
 
-    let ad_proofs_bytes = ergo_validation::serialize_ad_proofs(
-        &header_id,
-        &candidate.ad_proof_bytes,
-    );
+    let ad_proofs_bytes =
+        ergo_validation::serialize_ad_proofs(&header_id, &candidate.ad_proof_bytes);
 
-    let extension_bytes = ergo_validation::serialize_extension(
-        &header_id,
-        &candidate.extension.fields,
-    )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
-        error: 500,
-        reason: format!("extension serialize: {e}"),
-        detail: None,
-    })))?;
+    let extension_bytes =
+        ergo_validation::serialize_extension(&header_id, &candidate.extension.fields).map_err(
+            |e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError {
+                        error: 500,
+                        reason: format!("extension serialize: {e}"),
+                        detail: None,
+                    }),
+                )
+            },
+        )?;
 
     // Submit to the local pipeline + P2P broadcast (if submitter configured)
     if let Some(ref submitter) = state.block_submitter {
         submitter
             .submit(header, block_txs_bytes, ad_proofs_bytes, extension_bytes)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
-                error: 500,
-                reason: format!("block submission failed: {e}"),
-                detail: None,
-            })))?;
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError {
+                        error: 500,
+                        reason: format!("block submission failed: {e}"),
+                        detail: None,
+                    }),
+                )
+            })?;
     } else {
-        return err(StatusCode::SERVICE_UNAVAILABLE, "block submitter not configured");
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "block submitter not configured",
+        );
     }
 
     // Invalidate the cached candidate so the next poll generates a fresh one
@@ -944,7 +1061,9 @@ pub async fn info_wait(
     State(state): State<ApiState>,
     Query(params): Query<WaitQuery>,
 ) -> Result<Json<crate::types::NodeInfo>, StatusCode> {
-    let current = state.validated_height.load(std::sync::atomic::Ordering::Relaxed);
+    let current = state
+        .validated_height
+        .load(std::sync::atomic::Ordering::Relaxed);
     if current > params.after {
         return Ok(get_info(State(state)).await);
     }
@@ -1005,7 +1124,11 @@ pub async fn get_debug_memory(State(state): State<ApiState>) -> Json<DebugMemory
         mempool_tx_count,
     };
 
-    Json(DebugMemory { process, jemalloc, components })
+    Json(DebugMemory {
+        process,
+        jemalloc,
+        components,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,7 +1145,9 @@ pub async fn get_debug_memory(State(state): State<ApiState>) -> Json<DebugMemory
 /// a 404 that suggests the endpoint doesn't exist.
 pub async fn get_capture_info(State(state): State<ApiState>) -> Json<serde_json::Value> {
     match &state.capture {
-        Some(c) => Json(serde_json::to_value(c.info()).expect("CaptureInfo Serialize is infallible")),
+        Some(c) => {
+            Json(serde_json::to_value(c.info()).expect("CaptureInfo Serialize is infallible"))
+        }
         None => Json(serde_json::json!({ "enabled": false })),
     }
 }
@@ -1200,7 +1325,9 @@ fn read_proc_memory() -> ProcessMemory {
             Some(p) => p,
             None => continue,
         };
-        let kb = rest.split_whitespace().next()
+        let kb = rest
+            .split_whitespace()
+            .next()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
         let bytes = kb * 1024;
@@ -1272,16 +1399,22 @@ pub async fn get_full_block(
     let header_id_hex = hex::encode(id);
 
     // Block transactions: keyed by blake2b256(102 || header_id || transaction_root).
-    let txs_modifier_id =
-        section_modifier_id(BLOCK_TRANSACTIONS_TYPE, &id, header.transaction_root.0.as_ref());
+    let txs_modifier_id = section_modifier_id(
+        BLOCK_TRANSACTIONS_TYPE,
+        &id,
+        header.transaction_root.0.as_ref(),
+    );
     let txs_value = match state.store.get(BLOCK_TRANSACTIONS_TYPE, &txs_modifier_id) {
         Some(data) => {
             let parsed = ergo_validation::parse_block_transactions(&data).map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
-                    error: 500,
-                    reason: format!("failed to parse stored transactions: {e}"),
-                    detail: None,
-                }))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError {
+                        error: 500,
+                        reason: format!("failed to parse stored transactions: {e}"),
+                        detail: None,
+                    }),
+                )
             })?;
             serde_json::json!({
                 "headerId": header_id_hex,
@@ -1295,17 +1428,19 @@ pub async fn get_full_block(
 
     // AD proofs (optional in JVM): keyed by blake2b256(104 || header_id || ad_proofs_root).
     // Stored format: [header_id: 32B] [proof_size: VLQ u32] [proof_bytes: proof_size B].
-    let ad_modifier_id =
-        section_modifier_id(AD_PROOFS_TYPE, &id, header.ad_proofs_root.0.as_ref());
-    let ad_proofs_value = state.store.get(AD_PROOFS_TYPE, &ad_modifier_id).and_then(|data| {
-        let proof_bytes = inline_ad_proof_bytes(&data)?;
-        Some(serde_json::json!({
-            "headerId": header_id_hex,
-            "proofBytes": hex::encode(proof_bytes),
-            "digest": hex::encode(header.ad_proofs_root.0.as_ref()),
-            "size": data.len(),
-        }))
-    });
+    let ad_modifier_id = section_modifier_id(AD_PROOFS_TYPE, &id, header.ad_proofs_root.0.as_ref());
+    let ad_proofs_value = state
+        .store
+        .get(AD_PROOFS_TYPE, &ad_modifier_id)
+        .and_then(|data| {
+            let proof_bytes = inline_ad_proof_bytes(&data)?;
+            Some(serde_json::json!({
+                "headerId": header_id_hex,
+                "proofBytes": hex::encode(proof_bytes),
+                "digest": hex::encode(header.ad_proofs_root.0.as_ref()),
+                "size": data.len(),
+            }))
+        });
 
     // Extension: keyed by blake2b256(108 || header_id || extension_root).
     let ext_modifier_id =
@@ -1313,11 +1448,14 @@ pub async fn get_full_block(
     let extension_value = match state.store.get(EXTENSION_TYPE, &ext_modifier_id) {
         Some(data) => {
             let parsed = ergo_validation::parse_extension(&data).map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
-                    error: 500,
-                    reason: format!("failed to parse stored extension: {e}"),
-                    detail: None,
-                }))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError {
+                        error: 500,
+                        reason: format!("failed to parse stored extension: {e}"),
+                        detail: None,
+                    }),
+                )
             })?;
             let fields: Vec<[String; 2]> = parsed
                 .fields
@@ -1334,14 +1472,25 @@ pub async fn get_full_block(
     };
 
     let mut full = serde_json::Map::new();
-    full.insert("header".into(), serde_json::to_value(&header).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
-            error: 500, reason: format!("header serialization failed: {e}"), detail: None,
-        }))
-    })?);
+    full.insert(
+        "header".into(),
+        serde_json::to_value(&header).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: 500,
+                    reason: format!("header serialization failed: {e}"),
+                    detail: None,
+                }),
+            )
+        })?,
+    );
     full.insert("blockTransactions".into(), txs_value);
     full.insert("extension".into(), extension_value);
-    full.insert("adProofs".into(), ad_proofs_value.unwrap_or(serde_json::Value::Null));
+    full.insert(
+        "adProofs".into(),
+        ad_proofs_value.unwrap_or(serde_json::Value::Null),
+    );
     Ok(Json(serde_json::Value::Object(full)))
 }
 
@@ -1354,26 +1503,45 @@ pub async fn get_block_modifier(
     Path(modifier_id): Path<String>,
 ) -> ApiResult<serde_json::Value> {
     let id = hex_to_id(&modifier_id)?;
-    for &type_id in &[HEADER_TYPE, BLOCK_TRANSACTIONS_TYPE, AD_PROOFS_TYPE, EXTENSION_TYPE] {
-        let Some(data) = state.store.get(type_id, &id) else { continue };
+    for &type_id in &[
+        HEADER_TYPE,
+        BLOCK_TRANSACTIONS_TYPE,
+        AD_PROOFS_TYPE,
+        EXTENSION_TYPE,
+    ] {
+        let Some(data) = state.store.get(type_id, &id) else {
+            continue;
+        };
         let id_hex = hex::encode(id);
         let value = match type_id {
             HEADER_TYPE => {
                 // Headers stored by header ID, so id IS the header ID.
                 match state.chain.header_by_id(&id) {
                     Some(h) => serde_json::to_value(&h).map_err(|e| {
-                        (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
-                            error: 500, reason: format!("header serialization failed: {e}"), detail: None,
-                        }))
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ApiError {
+                                error: 500,
+                                reason: format!("header serialization failed: {e}"),
+                                detail: None,
+                            }),
+                        )
                     })?,
-                    None => serde_json::json!({ "type": "header", "id": id_hex, "size": data.len() }),
+                    None => {
+                        serde_json::json!({ "type": "header", "id": id_hex, "size": data.len() })
+                    }
                 }
             }
             BLOCK_TRANSACTIONS_TYPE => {
                 let parsed = ergo_validation::parse_block_transactions(&data).map_err(|e| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
-                        error: 500, reason: format!("parse failed: {e}"), detail: None,
-                    }))
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiError {
+                            error: 500,
+                            reason: format!("parse failed: {e}"),
+                            detail: None,
+                        }),
+                    )
                 })?;
                 serde_json::json!({
                     "headerId": hex::encode(parsed.header_id),
@@ -1400,9 +1568,14 @@ pub async fn get_block_modifier(
             }
             EXTENSION_TYPE => {
                 let parsed = ergo_validation::parse_extension(&data).map_err(|e| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
-                        error: 500, reason: format!("parse failed: {e}"), detail: None,
-                    }))
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiError {
+                            error: 500,
+                            reason: format!("parse failed: {e}"),
+                            detail: None,
+                        }),
+                    )
                 })?;
                 let fields: Vec<[String; 2]> = parsed
                     .fields
@@ -1499,7 +1672,9 @@ pub async fn post_utxo_with_pool_by_ids(
     let mut results: Vec<Option<ergo_validation::ErgoBox>> = Vec::with_capacity(ids.len());
     let pool = state.mempool.lock().await;
     for hex_id in &ids {
-        let parsed = hex::decode(hex_id).ok().and_then(|b| <[u8; 32]>::try_from(b).ok());
+        let parsed = hex::decode(hex_id)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok());
         match parsed {
             Some(id) => {
                 let found = state
@@ -1527,7 +1702,9 @@ pub async fn get_snapshots_info(State(state): State<ApiState>) -> Json<Snapshots
             digest: hex::encode(e.digest),
         })
         .collect();
-    Json(SnapshotsInfo { available_manifests })
+    Json(SnapshotsInfo {
+        available_manifests,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1588,11 +1765,14 @@ pub async fn post_peers_connect(
         .and_then(|s| s.strip_suffix('"'))
         .unwrap_or(trimmed);
     let addr: std::net::SocketAddr = addr_str.parse().map_err(|e| {
-        (StatusCode::BAD_REQUEST, Json(ApiError {
-            error: 400,
-            reason: format!("malformed socket address: {e}"),
-            detail: None,
-        }))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: 400,
+                reason: format!("malformed socket address: {e}"),
+                detail: None,
+            }),
+        )
     })?;
     match (state.peer_connect)(addr) {
         Ok(()) => Ok(Json(serde_json::json!({ "status": "queued" }))),
@@ -1613,9 +1793,7 @@ pub async fn get_popow_header_by_id(
     popow_header_response(&state, id).await
 }
 
-pub async fn get_popow_header_last(
-    State(state): State<ApiState>,
-) -> ApiResult<serde_json::Value> {
+pub async fn get_popow_header_last(State(state): State<ApiState>) -> ApiResult<serde_json::Value> {
     let tip = match state.chain.tip() {
         Some(t) => t,
         None => return err(StatusCode::NOT_FOUND, "chain is empty"),
@@ -1633,11 +1811,14 @@ async fn popow_header_response(
     let result = tokio::task::spawn_blocking(move || chain.popow_header_by_id(&header_id))
         .await
         .map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
-                error: 500,
-                reason: format!("popow_header task panicked: {e}"),
-                detail: None,
-            }))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: 500,
+                    reason: format!("popow_header task panicked: {e}"),
+                    detail: None,
+                }),
+            )
         })?;
     let bytes = match result {
         Ok(Some(b)) => b,
@@ -1645,18 +1826,24 @@ async fn popow_header_response(
         Err(reason) => return err(StatusCode::INTERNAL_SERVER_ERROR, reason),
     };
     let header = ergo_nipopow::PoPowHeader::scorex_parse_bytes(&bytes).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
-            error: 500,
-            reason: "failed to parse popow header bytes".into(),
-            detail: Some(format!("{e:?}")),
-        }))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: 500,
+                reason: "failed to parse popow header bytes".into(),
+                detail: Some(format!("{e:?}")),
+            }),
+        )
     })?;
     serde_json::to_value(&header).map(Json).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError {
-            error: 500,
-            reason: format!("popow header serialization failed: {e}"),
-            detail: None,
-        }))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: 500,
+                reason: format!("popow header serialization failed: {e}"),
+                detail: None,
+            }),
+        )
     })
 }
 
@@ -1673,7 +1860,10 @@ fn vf_err(
     fields: serde_json::Value,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let mut obj = serde_json::Map::new();
-    obj.insert("error".to_string(), serde_json::Value::String(code.to_string()));
+    obj.insert(
+        "error".to_string(),
+        serde_json::Value::String(code.to_string()),
+    );
     if let serde_json::Value::Object(extra) = fields {
         for (k, v) in extra {
             obj.insert(k, v);
@@ -1689,13 +1879,16 @@ pub async fn get_block_validation_fragments(
     // Echo whatever the client sent (preserving case) when surfacing it in
     // the error body — matches how `block-pruned` / `block-not-found` get
     // diff'd by clients.
-    let id = hex::decode(&header_id).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()).ok_or_else(|| {
-        vf_err(
-            StatusCode::BAD_REQUEST,
-            "invalid-header-id",
-            serde_json::json!({ "headerId": header_id }),
-        )
-    })?;
+    let id = hex::decode(&header_id)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .ok_or_else(|| {
+            vf_err(
+                StatusCode::BAD_REQUEST,
+                "invalid-header-id",
+                serde_json::json!({ "headerId": header_id }),
+            )
+        })?;
 
     let header = state.chain.header_by_id(&id).ok_or_else(|| {
         vf_err(
@@ -1718,15 +1911,21 @@ pub async fn get_block_validation_fragments(
 
     // Block transactions section. Stored under blake2b256(102 || header_id || transaction_root).
     // Absent here = pruned (or never had — but at a known header, "never had" implies prune).
-    let txs_modifier_id =
-        section_modifier_id(BLOCK_TRANSACTIONS_TYPE, &id, header.transaction_root.0.as_ref());
-    let txs_data = state.store.get(BLOCK_TRANSACTIONS_TYPE, &txs_modifier_id).ok_or_else(|| {
-        vf_err(
-            StatusCode::GONE,
-            "block-pruned",
-            serde_json::json!({ "headerId": header_id }),
-        )
-    })?;
+    let txs_modifier_id = section_modifier_id(
+        BLOCK_TRANSACTIONS_TYPE,
+        &id,
+        header.transaction_root.0.as_ref(),
+    );
+    let txs_data = state
+        .store
+        .get(BLOCK_TRANSACTIONS_TYPE, &txs_modifier_id)
+        .ok_or_else(|| {
+            vf_err(
+                StatusCode::GONE,
+                "block-pruned",
+                serde_json::json!({ "headerId": header_id }),
+            )
+        })?;
     let parsed_txs = ergo_validation::parse_block_transactions(&txs_data).map_err(|e| {
         vf_err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1917,8 +2116,12 @@ mod tests {
             proof_result: Err("m and k must be >= 1".into()),
         });
         let rt = build_runtime();
-        let result =
-            rt.block_on(nipopow_proof_response(chain as Arc<dyn ChainAccess>, 0, 2, None));
+        let result = rt.block_on(nipopow_proof_response(
+            chain as Arc<dyn ChainAccess>,
+            0,
+            2,
+            None,
+        ));
         match result {
             Err((status, body)) => {
                 assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1936,8 +2139,12 @@ mod tests {
             proof_result: Err("m and k must be >= 1".into()),
         });
         let rt = build_runtime();
-        let result =
-            rt.block_on(nipopow_proof_response(chain as Arc<dyn ChainAccess>, 2, 0, None));
+        let result = rt.block_on(nipopow_proof_response(
+            chain as Arc<dyn ChainAccess>,
+            2,
+            0,
+            None,
+        ));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::BAD_REQUEST),
             Ok(_) => panic!("expected 400, got 200"),
@@ -1953,8 +2160,12 @@ mod tests {
             proof_result: Err("prove_with_reader failed: ChainTooShort".into()),
         });
         let rt = build_runtime();
-        let result =
-            rt.block_on(nipopow_proof_response(chain as Arc<dyn ChainAccess>, 6, 10, None));
+        let result = rt.block_on(nipopow_proof_response(
+            chain as Arc<dyn ChainAccess>,
+            6,
+            10,
+            None,
+        ));
         match result {
             Err((status, body)) => {
                 assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1972,8 +2183,12 @@ mod tests {
             proof_result: Ok(make_test_proof_bytes()),
         });
         let rt = build_runtime();
-        let result =
-            rt.block_on(nipopow_proof_response(chain as Arc<dyn ChainAccess>, 1, 1, None));
+        let result = rt.block_on(nipopow_proof_response(
+            chain as Arc<dyn ChainAccess>,
+            1,
+            1,
+            None,
+        ));
         let Json(value) = match result {
             Ok(v) => v,
             Err((status, body)) => panic!("expected 200, got {status} / {}", body.reason),
@@ -2070,8 +2285,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::{
-        BlockSubmitter, NodeMeta, PeerCounts, PeerInfo, PeerRestInfo,
-        PeerStatusSummary, SnapshotInfoEntry, StoreAccess, UtxoAccess,
+        BlockSubmitter, NodeMeta, PeerCounts, PeerInfo, PeerRestInfo, PeerStatusSummary,
+        SnapshotInfoEntry, StoreAccess, UtxoAccess,
     };
     use std::sync::atomic::AtomicU32;
 
@@ -2096,13 +2311,7 @@ mod tests {
 
     struct UnusedSubmitter;
     impl BlockSubmitter for UnusedSubmitter {
-        fn submit(
-            &self,
-            _h: Header,
-            _b: Vec<u8>,
-            _a: Vec<u8>,
-            _e: Vec<u8>,
-        ) -> Result<(), String> {
+        fn submit(&self, _h: Header, _b: Vec<u8>, _a: Vec<u8>, _e: Vec<u8>) -> Result<(), String> {
             Err("unused".into())
         }
     }
@@ -2194,7 +2403,10 @@ mod tests {
         let rt = build_runtime();
         let Json(result) = rt.block_on(get_blocks(
             State(state),
-            Query(PaginationParams { offset: 0, limit: 2 }),
+            Query(PaginationParams {
+                offset: 0,
+                limit: 2,
+            }),
         ));
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], hex::encode(ids[0]));
@@ -2209,7 +2421,10 @@ mod tests {
         let Json(result) = rt.block_on(get_blocks(
             State(state),
             // Request 500, hard cap is 100.
-            Query(PaginationParams { offset: 0, limit: 500 }),
+            Query(PaginationParams {
+                offset: 0,
+                limit: 500,
+            }),
         ));
         assert_eq!(result.len(), 100);
     }
@@ -2223,10 +2438,7 @@ mod tests {
         });
         let state = test_state(chain);
         let rt = build_runtime();
-        let status = rt.block_on(head_unconfirmed(
-            State(state),
-            Path("00".repeat(32)),
-        ));
+        let status = rt.block_on(head_unconfirmed(State(state), Path("00".repeat(32))));
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -2255,7 +2467,10 @@ mod tests {
         let rt = build_runtime();
         let result = rt.block_on(get_wait_time(
             State(state),
-            Query(WaitTimeParams { fee: 1_000_000, tx_size: 100 }),
+            Query(WaitTimeParams {
+                fee: 1_000_000,
+                tx_size: 100,
+            }),
         ));
         match result {
             Err((status, body)) => {
@@ -2324,7 +2539,10 @@ mod tests {
         });
         let mut state = test_state(chain);
         state.snapshots_info = Arc::new(|| {
-            vec![SnapshotInfoEntry { height: 1_700_000, digest: [0xAB; 32] }]
+            vec![SnapshotInfoEntry {
+                height: 1_700_000,
+                digest: [0xAB; 32],
+            }]
         });
         let rt = build_runtime();
         let Json(info) = rt.block_on(get_snapshots_info(State(state)));
@@ -2554,8 +2772,7 @@ mod tests {
         });
         let state = test_state(chain);
         let rt = build_runtime();
-        let result =
-            rt.block_on(get_popow_header_by_id(State(state), Path("aa".repeat(32))));
+        let result = rt.block_on(get_popow_header_by_id(State(state), Path("aa".repeat(32))));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::NOT_FOUND),
             Ok(_) => panic!("expected 404"),
@@ -2587,8 +2804,7 @@ mod tests {
         });
         let state = test_state(chain);
         let rt = build_runtime();
-        let result =
-            rt.block_on(get_full_block(State(state), Path("aa".repeat(32))));
+        let result = rt.block_on(get_full_block(State(state), Path("aa".repeat(32))));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::NOT_FOUND),
             Ok(_) => panic!("expected 404"),
@@ -2632,8 +2848,7 @@ mod tests {
     /// inline tests.
     const VF_P2PK_TREE_HEX: &str =
         "0008cd02d84a11191f434daa5bed70e0e4db4e1563910622ee269f3dc219e0e854e108a5";
-    const VF_SRC_TX_HEX: &str =
-        "9302a2983d9cc3f2b9e271097aa3128581c6cad8b59f7b6bc3e08fa6cb63ad3f";
+    const VF_SRC_TX_HEX: &str = "9302a2983d9cc3f2b9e271097aa3128581c6cad8b59f7b6bc3e08fa6cb63ad3f";
 
     /// Chain mock that resolves multiple headers by id (target + ancestors).
     struct MultiHeaderChain {
@@ -2716,9 +2931,7 @@ mod tests {
     /// the synthetic tx — the box itself doesn't need to live in any UTXO
     /// store for this endpoint.
     fn make_vf_p2pk_box(value: u64) -> ergo_validation::ErgoBox {
-        use ergo_lib::ergotree_ir::chain::ergo_box::{
-            box_value::BoxValue, NonMandatoryRegisters,
-        };
+        use ergo_lib::ergotree_ir::chain::ergo_box::{box_value::BoxValue, NonMandatoryRegisters};
         use ergo_lib::ergotree_ir::chain::tx_id::TxId;
         use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
         use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
@@ -2742,11 +2955,11 @@ mod tests {
     fn make_vf_p2pk_tx(input_box: &ergo_validation::ErgoBox) -> ergo_validation::Transaction {
         use ergo_lib::chain::transaction::input::prover_result::ProverResult as ChainProverResult;
         use ergo_lib::chain::transaction::input::Input;
+        use ergo_lib::ergotree_interpreter::sigma_protocol::prover::ProofBytes;
+        use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
         use ergo_lib::ergotree_ir::chain::ergo_box::{
             box_value::BoxValue, ErgoBoxCandidate, NonMandatoryRegisters,
         };
-        use ergo_lib::ergotree_interpreter::sigma_protocol::prover::ProofBytes;
-        use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
 
         let inp = Input::new(
             input_box.box_id(),
@@ -2777,7 +2990,7 @@ mod tests {
         let tx = make_vf_p2pk_tx(&input_box);
 
         let txs_bytes = ergo_validation::serialize_block_transactions(
-            &target.id.0.0,
+            &target.id.0 .0,
             2,
             std::slice::from_ref(&tx),
         )
@@ -2786,7 +2999,7 @@ mod tests {
         // Modifier id the handler will look up.
         let txs_modifier_id = section_modifier_id(
             BLOCK_TRANSACTIONS_TYPE,
-            &target.id.0.0,
+            &target.id.0 .0,
             target.transaction_root.0.as_ref(),
         );
 
@@ -2794,14 +3007,14 @@ mod tests {
         store_map.insert((BLOCK_TRANSACTIONS_TYPE, txs_modifier_id), txs_bytes);
 
         let mut chain_map = HashMap::new();
-        chain_map.insert(target.id.0.0, target.clone());
-        chain_map.insert(parent.id.0.0, parent);
+        chain_map.insert(target.id.0 .0, target.clone());
+        chain_map.insert(parent.id.0 .0, parent);
 
         let chain = Arc::new(MultiHeaderChain { by_id: chain_map });
         let mut state = test_state(chain);
         state.store = Arc::new(KeyedStore { by_key: store_map });
 
-        let target_id_hex = hex::encode(target.id.0.0);
+        let target_id_hex = hex::encode(target.id.0 .0);
         (state, target_id_hex, 1)
     }
 
@@ -2822,7 +3035,7 @@ mod tests {
         // Header bytes hex-encoded — must round-trip back to the same id.
         let header_bytes = hex::decode(&body.header_bytes).expect("hex");
         let reparsed = Header::scorex_parse_bytes(&header_bytes).expect("reparse");
-        assert_eq!(hex::encode(reparsed.id.0.0), target_id_hex);
+        assert_eq!(hex::encode(reparsed.id.0 .0), target_id_hex);
 
         // signingMessage is hex.
         assert!(!body.transactions[0].signing_message.is_empty());
@@ -2835,7 +3048,9 @@ mod tests {
 
     #[test]
     fn validation_fragments_unknown_id() {
-        let chain = Arc::new(MultiHeaderChain { by_id: HashMap::new() });
+        let chain = Arc::new(MultiHeaderChain {
+            by_id: HashMap::new(),
+        });
         let state = test_state(chain);
         let rt = build_runtime();
         let result = rt.block_on(get_block_validation_fragments(
@@ -2845,7 +3060,10 @@ mod tests {
         match result {
             Err((status, Json(body))) => {
                 assert_eq!(status, StatusCode::NOT_FOUND);
-                assert_eq!(body.get("error").and_then(|v| v.as_str()), Some("block-not-found"));
+                assert_eq!(
+                    body.get("error").and_then(|v| v.as_str()),
+                    Some("block-not-found")
+                );
                 assert_eq!(
                     body.get("headerId").and_then(|v| v.as_str()),
                     Some("aa".repeat(32).as_str()),
@@ -2871,7 +3089,9 @@ mod tests {
                 &section_modifier_id(
                     BLOCK_TRANSACTIONS_TYPE,
                     &hex::decode(&target_id_hex).unwrap().try_into().unwrap(),
-                    state.chain.header_by_id(&hex::decode(&target_id_hex).unwrap().try_into().unwrap())
+                    state
+                        .chain
+                        .header_by_id(&hex::decode(&target_id_hex).unwrap().try_into().unwrap())
                         .unwrap()
                         .transaction_root
                         .0
@@ -2977,7 +3197,9 @@ mod tests {
     }
 
     fn empty_state() -> ApiState {
-        let chain = Arc::new(MultiHeaderChain { by_id: HashMap::new() });
+        let chain = Arc::new(MultiHeaderChain {
+            by_id: HashMap::new(),
+        });
         test_state(chain)
     }
 
@@ -3006,7 +3228,10 @@ mod tests {
         assert_eq!(body["newest_ts"], "2026-05-25T11:00:00.000000Z");
     }
 
-    fn read_body_bytes(rt: &tokio::runtime::Runtime, response: axum::response::Response) -> Vec<u8> {
+    fn read_body_bytes(
+        rt: &tokio::runtime::Runtime,
+        response: axum::response::Response,
+    ) -> Vec<u8> {
         let bytes = rt
             .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
             .unwrap();
@@ -3072,7 +3297,12 @@ mod tests {
         ));
         assert_eq!(response.status(), StatusCode::OK);
 
-        let filter = mock.last_filter.lock().unwrap().clone().expect("dump called");
+        let filter = mock
+            .last_filter
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("dump called");
         assert_eq!(filter.peer, Some("10.0.0.7".parse().unwrap()));
         assert_eq!(filter.since_secs, Some(120));
         assert_eq!(filter.direction, Some(Direction::Outbound));
@@ -3114,7 +3344,10 @@ mod tests {
     fn capture_dump_filename_known_epoch() {
         let ts = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         // 1_700_000_000 → 2023-11-14T22:13:20 UTC
-        assert_eq!(capture_dump_filename(ts), "p2p-capture-20231114T221320Z.pcap");
+        assert_eq!(
+            capture_dump_filename(ts),
+            "p2p-capture-20231114T221320Z.pcap"
+        );
     }
 
     #[test]

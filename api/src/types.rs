@@ -204,4 +204,3 @@ pub struct ValidationFragmentsTx {
     /// commits to.
     pub signing_message: String,
 }
-

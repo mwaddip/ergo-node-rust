@@ -240,12 +240,27 @@ pub fn router(state: ApiState) -> Router {
         .route("/info/wait", get(handlers::info_wait))
         // Blocks
         .route("/blocks", get(handlers::get_blocks))
-        .route("/blocks/at/{height}", get(handlers::get_block_ids_at_height))
-        .route("/blocks/modifier/{modifier_id}", get(handlers::get_block_modifier))
-        .route("/blocks/lastHeaders/{count}", get(handlers::get_last_headers))
+        .route(
+            "/blocks/at/{height}",
+            get(handlers::get_block_ids_at_height),
+        )
+        .route(
+            "/blocks/modifier/{modifier_id}",
+            get(handlers::get_block_modifier),
+        )
+        .route(
+            "/blocks/lastHeaders/{count}",
+            get(handlers::get_last_headers),
+        )
         .route("/blocks/{header_id}", get(handlers::get_full_block))
-        .route("/blocks/{header_id}/header", get(handlers::get_block_header))
-        .route("/blocks/{header_id}/transactions", get(handlers::get_block_transactions))
+        .route(
+            "/blocks/{header_id}/header",
+            get(handlers::get_block_header),
+        )
+        .route(
+            "/blocks/{header_id}/transactions",
+            get(handlers::get_block_transactions),
+        )
         .route(
             "/blocks/{header_id}/validation-fragments",
             get(handlers::get_block_validation_fragments),
@@ -254,16 +269,34 @@ pub fn router(state: ApiState) -> Router {
         .route("/transactions", post(handlers::post_transaction))
         .route("/transactions/check", post(handlers::check_transaction))
         .route("/transactions/unconfirmed", get(handlers::get_unconfirmed))
-        .route("/transactions/unconfirmed/{tx_id}", head(handlers::head_unconfirmed))
-        .route("/transactions/unconfirmed/transactionIds", get(handlers::get_unconfirmed_ids))
-        .route("/transactions/unconfirmed/byTransactionId/{tx_id}", get(handlers::get_unconfirmed_by_id))
+        .route(
+            "/transactions/unconfirmed/{tx_id}",
+            head(handlers::head_unconfirmed),
+        )
+        .route(
+            "/transactions/unconfirmed/transactionIds",
+            get(handlers::get_unconfirmed_ids),
+        )
+        .route(
+            "/transactions/unconfirmed/byTransactionId/{tx_id}",
+            get(handlers::get_unconfirmed_by_id),
+        )
         .route("/transactions/getFee", get(handlers::get_recommended_fee))
         .route("/transactions/waitTime", get(handlers::get_wait_time))
-        .route("/transactions/poolHistogram", get(handlers::get_pool_histogram))
+        .route(
+            "/transactions/poolHistogram",
+            get(handlers::get_pool_histogram),
+        )
         // UTXO
         .route("/utxo/byId/{box_id}", get(handlers::get_utxo_by_id))
-        .route("/utxo/withPool/byId/{box_id}", get(handlers::get_utxo_with_pool))
-        .route("/utxo/withPool/byIds", post(handlers::post_utxo_with_pool_by_ids))
+        .route(
+            "/utxo/withPool/byId/{box_id}",
+            get(handlers::get_utxo_with_pool),
+        )
+        .route(
+            "/utxo/withPool/byIds",
+            post(handlers::post_utxo_with_pool_by_ids),
+        )
         .route("/utxo/getSnapshotsInfo", get(handlers::get_snapshots_info))
         // Peers
         .route("/peers/all", get(handlers::get_all_peers))
@@ -278,18 +311,33 @@ pub fn router(state: ApiState) -> Router {
         .route("/emission/at/{height}", get(handlers::get_emission_at))
         // NiPoPoW
         .route("/nipopow/proof/{m}/{k}", get(handlers::get_nipopow_proof))
-        .route("/nipopow/proof/{m}/{k}/{header_id}", get(handlers::get_nipopow_proof_by_header))
-        .route("/nipopow/popowHeader/last", get(handlers::get_popow_header_last))
-        .route("/nipopow/popowHeader/{header_id}", get(handlers::get_popow_header_by_id))
+        .route(
+            "/nipopow/proof/{m}/{k}/{header_id}",
+            get(handlers::get_nipopow_proof_by_header),
+        )
+        .route(
+            "/nipopow/popowHeader/last",
+            get(handlers::get_popow_header_last),
+        )
+        .route(
+            "/nipopow/popowHeader/{header_id}",
+            get(handlers::get_popow_header_by_id),
+        )
         // Mining
         .route("/mining/candidate", get(handlers::get_mining_candidate))
         .route("/mining/solution", post(handlers::post_mining_solution))
-        .route("/mining/rewardAddress", get(handlers::get_mining_reward_address))
+        .route(
+            "/mining/rewardAddress",
+            get(handlers::get_mining_reward_address),
+        )
         // Debug
         .route("/debug/memory", get(handlers::get_debug_memory))
         .route("/debug/p2p-capture/info", get(handlers::get_capture_info))
         .route("/debug/p2p-capture/dump", get(handlers::get_capture_dump))
-        .route("/debug/p2p-capture/reset", post(handlers::post_capture_reset))
+        .route(
+            "/debug/p2p-capture/reset",
+            post(handlers::post_capture_reset),
+        )
         .with_state(state)
 }
 

@@ -235,8 +235,14 @@ struct DirectionJson {
 impl From<DirectionalCounter> for DirectionalJson {
     fn from(c: DirectionalCounter) -> Self {
         Self {
-            inbound: DirectionJson { count: c.in_count, bytes: c.in_bytes },
-            outbound: DirectionJson { count: c.out_count, bytes: c.out_bytes },
+            inbound: DirectionJson {
+                count: c.in_count,
+                bytes: c.in_bytes,
+            },
+            outbound: DirectionJson {
+                count: c.out_count,
+                bytes: c.out_bytes,
+            },
         }
     }
 }
@@ -329,8 +335,8 @@ pub async fn serve_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{JOURNAL_EVENTS_VERSION, STATS_VERSION};
     use crate::types::NodeInfo;
+    use crate::{JOURNAL_EVENTS_VERSION, STATS_VERSION};
     use std::sync::Mutex;
 
     // -----------------------------------------------------------------------
@@ -409,7 +415,10 @@ mod tests {
 
         assert_eq!(body["statsVersion"], STATS_VERSION);
         let since = body["since"].as_u64().expect("since is u64");
-        assert!(since > 0, "since must be populated with process-start unix seconds");
+        assert!(
+            since > 0,
+            "since must be populated with process-start unix seconds"
+        );
 
         let messages = &body["messages"];
         for top in ["handshake", "get_peers", "peers", "sync_info", "unknown"] {
