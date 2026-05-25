@@ -34,8 +34,10 @@ impl<W: Write> Progress<W> {
     /// - `total_blocks`: total number of source blocks to migrate.
     /// - `starting_from`: number of blocks already migrated (resume case).
     ///   Pass `0` for a fresh migration.
-    /// - `is_tty`: whether `out` is a TTY. Currently passed through;
-    ///   behavior is identical in both modes (spec allows this).
+    /// - `is_tty`: whether `out` is a TTY. Controls flush behavior — per
+    ///   contract § Progress output, TTY flushes after every dot (real-time
+    ///   movement); non-TTY relies on line buffering (one line per 1%
+    ///   boundary).
     pub fn new(mut out: W, total_blocks: u32, starting_from: u32, is_tty: bool) -> Self {
         // Percentage already done at resume start.
         let resume_pct: u8 = if total_blocks > 0 {
@@ -74,7 +76,11 @@ impl<W: Write> Progress<W> {
         if self.dot_counter >= 1000 {
             self.dot_counter = 0;
             let _ = write!(self.out, ".");
-            let _ = self.out.flush();
+            // Only flush under TTY — non-TTY (journald, piped to a file)
+            // relies on line buffering and ships output at newlines.
+            if self.is_tty {
+                let _ = self.out.flush();
+            }
         }
 
         let current_pct: u8 =
@@ -83,6 +89,8 @@ impl<W: Write> Progress<W> {
         if current_pct > self.last_percent_emitted {
             self.last_percent_emitted = current_pct;
             let _ = writeln!(self.out, " ({current_pct}%)");
+            // Always flush on percent boundaries — even under non-TTY, the
+            // operator wants to see progress markers as they happen.
             let _ = self.out.flush();
         }
     }

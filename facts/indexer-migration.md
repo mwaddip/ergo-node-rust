@@ -1,6 +1,6 @@
 # Indexer DB Migration Contract
 
-Version: 1.0.0
+Version: 1.1.0
 
 ## Component: `addons/indexer/src/bin/ergo-indexer-migratedb.rs`
 
@@ -241,12 +241,28 @@ sentinel byte; row boundary marked by a different sentinel byte.
 Detailed encoding is the implementation's choice as long as it
 is fully deterministic and identical on both sides.
 
-If hashes disagree at any height, the migrator aborts: rolls
-back the current block's transaction, prints a diagnostic
-identifying the height and direction of the mismatch, exits
-non-zero. The target's `migration_cursor` is one less than the
-failing height — the operator can investigate and re-run with
-`--resume` after fixing the source.
+If hashes disagree at any height, the migrator aborts: prints a
+diagnostic identifying the height and direction of the mismatch,
+exits non-zero. The current block's transaction has already
+committed (see implementation note below), so the target's
+`migration_cursor` equals the failing height. The operator
+investigates and re-runs with `--resume`; the resume precondition
+check #6 (spot-check the cursor-height block) will then fail at
+the same height, surfacing the divergence cleanly.
+
+**Implementation note** — the per-block transaction commits BEFORE
+the hash comparison. The original spec called for rollback on
+mismatch, but the read-back step that supplies the target's row
+content for hashing operates on committed data. Rolling back
+would require either (a) reading rows back inside the still-open
+transaction (changes the Backend API significantly), or (b)
+double-buffering the writes (significant memory cost on large
+blocks). The chosen behavior — commit then hash then error —
+preserves diagnostic state on disk for inspection, and the
+spot-check re-run on `--resume` re-detects the divergence
+deterministically. Worst-case waste on hash mismatch: one
+committed block of incorrect data the operator can investigate
+in-place before re-running.
 
 ## `--update-config` behavior
 
