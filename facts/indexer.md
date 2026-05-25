@@ -547,3 +547,11 @@ diagnostic body.
   tx. Behavior here is TBD; if the harness needs them, this contract
   should explicitly add them to the `boxes` table at height 1 with
   a synthetic `creation_tx_id` sentinel.
+
+## See also
+
+- `facts/indexer-migration.md` — contract for the
+  `ergo-indexer-migratedb` one-shot migrator between the SQLite
+  and PostgreSQL backends. Operators scaling up (or down) between
+  backends use this; the contract there depends on the schema and
+  config-file shape documented here.
