@@ -968,6 +968,15 @@ struct RootConfig {
     node: Option<NodeConfig>,
     #[serde(default)]
     stats: Option<StatsConfig>,
+    #[serde(default)]
+    debug: Option<DebugConfig>,
+}
+
+/// `[debug]` toml section — opt-in container for diagnostic subsystems.
+#[derive(Debug, Deserialize, Clone, Default)]
+struct DebugConfig {
+    #[serde(default)]
+    p2p_capture: Option<enr_p2p::capture::CaptureConfig>,
 }
 
 /// `[stats]` toml section — opt-in. See `facts/stats.md`.
@@ -1267,7 +1276,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_content = std::fs::read_to_string(&config_path)?;
     let root_config: RootConfig = toml::from_str(&config_content)?;
     let stats_config = root_config.stats.clone();
+    let capture_config = root_config.debug.clone().and_then(|d| d.p2p_capture);
     let node_config = root_config.node.unwrap_or_default();
+
+    // Initialize the P2P wire-traffic capture ring per facts/p2p-capture.md.
+    // `None` when no [debug.p2p_capture] section, or when enabled=false.
+    let capture_handle: Option<Arc<enr_p2p::capture::CaptureHandle>> = match capture_config {
+        Some(cfg) => match cfg.resolve()? {
+            Some(resolved) => {
+                let h = enr_p2p::capture::init(resolved)?;
+                tracing::info!("p2p_capture enabled");
+                Some(Arc::new(h))
+            }
+            None => None,
+        },
+        None => None,
+    };
+    let capture_tap = capture_handle.as_ref().map(|h| h.tap());
+    let capture_access: Option<Arc<dyn enr_p2p::capture::CaptureAccess>> =
+        capture_handle.as_ref().map(|h| h.clone() as Arc<dyn enr_p2p::capture::CaptureAccess>);
     let state_type = match node_config.state_type.as_str() {
         "utxo" => StateType::Utxo,
         "digest" => StateType::Digest,
@@ -1542,10 +1569,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start P2P with modifier sink (no validator)
     let peer_storage = Box::new(PeerStorageAdapter::new(store.clone()));
-    // capture_tap: None disables the P2P wire-traffic capture ring per
-    // facts/p2p-capture.md. Wire the real tap via enr_p2p::capture::init(...)
-    // once the [debug.p2p_capture] config plumbing lands.
-    let p2p = Arc::new(enr_p2p::node::P2pNode::start(config, Some(modifier_tx), mode_config, peer_storage, None).await?);
+    // capture_tap from [debug.p2p_capture] in ergo.toml — None when the
+    // section is absent or `enabled = false`. See facts/p2p-capture.md.
+    let p2p = Arc::new(enr_p2p::node::P2pNode::start(config, Some(modifier_tx), mode_config, peer_storage, capture_tap).await?);
 
     // Register message codes consumed by the main crate's event stream so
     // the router doesn't blindly forward them to all peers.
@@ -2851,10 +2877,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             }),
             stats_enabled: stats_config.is_some(),
-            // capture: None disables the /debug/p2p-capture/* endpoints per
-            // facts/p2p-capture.md. Wire the real CaptureAccess via
-            // Arc::new(handle) once the [debug.p2p_capture] config plumbing lands.
-            capture: None,
+            // capture is Some(...) when [debug.p2p_capture] is configured
+            // with enabled=true; None otherwise. See facts/p2p-capture.md.
+            capture: capture_access.clone(),
         };
 
         let api_stats_config = stats_config.as_ref().map(|c| ergo_api::stats::StatsConfig {
