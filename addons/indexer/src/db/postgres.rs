@@ -1,5 +1,8 @@
+use std::str::FromStr;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use sqlx::PgPool;
 
 use crate::db::{DbMemoryStats, IndexerDb};
@@ -137,7 +140,10 @@ pub struct PgDb {
 
 impl PgDb {
     pub async fn connect(url: &str) -> Result<Self> {
-        let pool = PgPool::connect(url)
+        let opts = PgConnectOptions::from_str(url)
+            .with_context(|| format!("invalid PostgreSQL URL: {url}"))?;
+        let opts = apply_libpq_env(opts, |k| std::env::var(k).ok())?;
+        let pool = PgPool::connect_with(opts)
             .await
             .context("failed to connect to PostgreSQL")?;
         let db = Self { pool };
@@ -518,5 +524,148 @@ impl PgDb {
             bx.registers = self.fetch_box_registers(&bid).await?;
         }
         Ok(items)
+    }
+}
+
+/// Layer libpq env vars on top of URL-parsed `PgConnectOptions`.
+///
+/// Precedence per `facts/indexer.md` v1.2.0 § Configuration: env vars > file.
+/// sqlx's `PgConnectOptions::from_str(url)` parses URL components into
+/// the options but does NOT consult env vars (only the no-URL `new()` path
+/// does). This helper re-applies the libpq env vars on top so the contract's
+/// ladder holds.
+///
+/// `~/.pgpass` is honored by sqlx natively inside `PgConnectOptions::from_str`
+/// (`apply_pgpass()`). If `PGPASSWORD` is set, it overrides whatever
+/// `.pgpass` filled in.
+///
+/// `getenv` is parameterized so tests can supply a synthetic environment
+/// without mutating process-global state (Rust tests run in parallel).
+pub(crate) fn apply_libpq_env<F>(
+    mut opts: PgConnectOptions,
+    getenv: F,
+) -> Result<PgConnectOptions>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(host) = getenv("PGHOST") {
+        opts = opts.host(&host);
+    }
+    if let Some(port) = getenv("PGPORT") {
+        let port: u16 = port
+            .parse()
+            .with_context(|| format!("PGPORT is not a valid port number: {port}"))?;
+        opts = opts.port(port);
+    }
+    if let Some(user) = getenv("PGUSER") {
+        opts = opts.username(&user);
+    }
+    if let Some(password) = getenv("PGPASSWORD") {
+        opts = opts.password(&password);
+    }
+    if let Some(dbname) = getenv("PGDATABASE") {
+        opts = opts.database(&dbname);
+    }
+    if let Some(mode) = getenv("PGSSLMODE") {
+        let mode = parse_ssl_mode(&mode)
+            .with_context(|| format!("PGSSLMODE is not a recognized value: {mode}"))?;
+        opts = opts.ssl_mode(mode);
+    }
+    Ok(opts)
+}
+
+fn parse_ssl_mode(s: &str) -> Result<PgSslMode> {
+    // Match libpq's documented values; case-insensitive.
+    match s.to_ascii_lowercase().as_str() {
+        "disable" => Ok(PgSslMode::Disable),
+        "allow" => Ok(PgSslMode::Allow),
+        "prefer" => Ok(PgSslMode::Prefer),
+        "require" => Ok(PgSslMode::Require),
+        "verify-ca" => Ok(PgSslMode::VerifyCa),
+        "verify-full" => Ok(PgSslMode::VerifyFull),
+        other => anyhow::bail!("unknown PGSSLMODE value: {other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn base_opts() -> PgConnectOptions {
+        // URL with no password — file URLs do not carry passwords per contract.
+        PgConnectOptions::from_str("postgres://user@host:5432/db").expect("static URL parses")
+    }
+
+    fn mkenv(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |k: &str| map.get(k).cloned()
+    }
+
+    /// `env_overrides_file_pg_creds` — file URL has no password; PGPASSWORD
+    /// env supplies it. `PgConnectOptions` exposes no `get_password()`, so we
+    /// match the Debug repr (sqlx's derive includes the field).
+    #[test]
+    fn env_overrides_file_pg_creds() {
+        let env = mkenv(&[("PGPASSWORD", "secret")]);
+        let opts = apply_libpq_env(base_opts(), env).expect("env layering succeeds");
+        let dbg = format!("{opts:?}");
+        assert!(
+            dbg.contains("secret"),
+            "PGPASSWORD env did not land in resolved options; dbg={dbg}"
+        );
+    }
+
+    #[test]
+    fn env_overrides_host_port_user_db() {
+        let env = mkenv(&[
+            ("PGHOST", "envhost"),
+            ("PGPORT", "6543"),
+            ("PGUSER", "envuser"),
+            ("PGDATABASE", "envdb"),
+        ]);
+        let opts = apply_libpq_env(base_opts(), env).expect("env layering succeeds");
+        assert_eq!(opts.get_host(), "envhost", "PGHOST not applied");
+        assert_eq!(opts.get_port(), 6543, "PGPORT not applied");
+        assert_eq!(opts.get_username(), "envuser", "PGUSER not applied");
+        assert_eq!(opts.get_database(), Some("envdb"), "PGDATABASE not applied");
+    }
+
+    #[test]
+    fn env_pgport_invalid_errors() {
+        let env = mkenv(&[("PGPORT", "not-a-port")]);
+        let err = apply_libpq_env(base_opts(), env).expect_err("bad PGPORT must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("PGPORT"), "diagnostic: {msg}");
+    }
+
+    #[test]
+    fn env_pgsslmode_recognized_values() {
+        for v in ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"] {
+            let env = mkenv(&[("PGSSLMODE", v)]);
+            apply_libpq_env(base_opts(), env)
+                .unwrap_or_else(|e| panic!("PGSSLMODE={v} failed: {e:#}"));
+        }
+    }
+
+    #[test]
+    fn env_pgsslmode_bad_value_errors() {
+        let env = mkenv(&[("PGSSLMODE", "nonsense")]);
+        let err = apply_libpq_env(base_opts(), env).expect_err("bad PGSSLMODE must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("PGSSLMODE"), "diagnostic: {msg}");
+    }
+
+    #[test]
+    fn empty_env_is_identity() {
+        let env = mkenv(&[]);
+        let opts = apply_libpq_env(base_opts(), env).expect("identity case");
+        assert_eq!(opts.get_host(), "host");
+        assert_eq!(opts.get_port(), 5432);
+        assert_eq!(opts.get_username(), "user");
+        assert_eq!(opts.get_database(), Some("db"));
     }
 }

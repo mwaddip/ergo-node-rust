@@ -3,6 +3,7 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod api;
+mod config;
 mod db;
 mod node_client;
 mod parser;
@@ -10,6 +11,7 @@ mod sync;
 pub mod types;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
@@ -26,19 +28,26 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 #[derive(Parser)]
 #[command(name = "ergo-indexer", version, about = "Blockchain indexer for ergo-node-rust")]
 struct Cli {
-    /// Node REST API URL.
-    #[arg(long, default_value = "http://127.0.0.1:9052")]
-    node_url: String,
+    /// Path to TOML config file. Falls back to $INDEXER_CONFIG, then
+    /// `/etc/ergo-node/indexer.toml`. A missing file is not an error.
+    #[arg(long)]
+    config: Option<PathBuf>,
 
-    /// Database path (SQLite) or URL (postgres://...).
-    #[arg(long, default_value = "./indexer.db")]
-    db: String,
+    /// Node REST API URL. Overrides `[node].url` from the config file.
+    #[arg(long)]
+    node_url: Option<String>,
 
-    /// Query API bind address.
-    #[arg(long, default_value = "127.0.0.1:8080")]
-    bind: SocketAddr,
+    /// Database path (SQLite) or URL (postgres://...). Overrides
+    /// `[storage].db` from the config file.
+    #[arg(long)]
+    db: Option<String>,
+
+    /// Query API bind address. Overrides `[api].bind` from the config file.
+    #[arg(long)]
+    bind: Option<SocketAddr>,
 
     /// Resume from specific height (default: auto-detect from DB).
+    /// Overrides `[sync].start_height` from the config file.
     #[arg(long)]
     start_height: Option<u64>,
 
@@ -67,38 +76,60 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let start = Instant::now();
 
-    let db = db::open_db(&cli.db).await?;
+    let config_path = config::resolve_config_path(cli.config.clone());
+    let file = config::load_file(&config_path)?;
+    if file.is_none() {
+        tracing::info!(
+            path = %config_path.display(),
+            "config file not found, using defaults"
+        );
+    }
+    let cfg = config::resolve(
+        config::CliInput {
+            node_url: cli.node_url,
+            db: cli.db,
+            bind: cli.bind,
+            start_height: cli.start_height,
+        },
+        file,
+    )?;
+
+    let db = db::open_db(&cfg.db).await?;
 
     // Shutdown signal — watch over oneshot because sync and api both need to
     // receive it independently in combined mode. SIGTERM (systemd stop) and
     // SIGINT (Ctrl-C) both flip the flag; consumers wait on `changed()`.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(install_signal_handler(shutdown_tx));
+    // SIGHUP is explicitly ignored — without an explicit handler the default
+    // action terminates the process, which would surprise operators expecting
+    // libpq-style "reload on HUP." The contract specifies no live reload.
+    tokio::spawn(ignore_sighup());
 
     match cli.mode {
         Some(Mode::Sync) => {
             tracing::info!("starting in sync-only mode");
-            sync::run(db, &cli.node_url, cli.start_height, shutdown_rx).await
+            sync::run(db, &cfg.node_url, cfg.start_height, shutdown_rx).await
         }
         Some(Mode::Serve) => {
-            tracing::info!(%cli.bind, "starting in serve-only mode");
-            api::serve(db, cli.bind, start, cli.node_url.clone(), shutdown_rx).await
+            tracing::info!(bind = %cfg.bind, "starting in serve-only mode");
+            api::serve(db, cfg.bind, start, cfg.node_url.clone(), shutdown_rx).await
         }
         None => {
-            tracing::info!(%cli.bind, "starting in combined mode (sync + serve)");
-            let db2 = db::open_db(&cli.db).await?;
+            tracing::info!(bind = %cfg.bind, "starting in combined mode (sync + serve)");
+            let db2 = db::open_db(&cfg.db).await?;
             let sync_shutdown_rx = shutdown_rx.clone();
             let api_shutdown_rx = shutdown_rx.clone();
             let mut sync_handle = tokio::spawn({
-                let node_url = cli.node_url.clone();
-                let start_height = cli.start_height;
+                let node_url = cfg.node_url.clone();
+                let start_height = cfg.start_height;
                 async move { sync::run(db, &node_url, start_height, sync_shutdown_rx).await }
             });
             let mut api_handle = tokio::spawn(api::serve(
                 db2,
-                cli.bind,
+                cfg.bind,
                 start,
-                cli.node_url.clone(),
+                cfg.node_url.clone(),
                 api_shutdown_rx,
             ));
 
@@ -183,4 +214,25 @@ async fn install_signal_handler(shutdown_tx: watch::Sender<bool>) {
     };
     tracing::info!(signal = signal_name, "shutdown signal received");
     let _ = shutdown_tx.send(true);
+}
+
+/// SIGHUP handler that drains and discards the signal.
+///
+/// Without an explicit handler the default action terminates the process —
+/// surprising for operators who expect HUP to mean "reload config." The
+/// indexer's contract specifies that config is read once at startup and
+/// `systemctl restart` is the supported reload path; HUP is therefore a no-op.
+async fn ignore_sighup() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sighup = match signal(SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to register SIGHUP handler — default action (terminate) will apply");
+            return;
+        }
+    };
+    while sighup.recv().await.is_some() {
+        tracing::info!("received SIGHUP — ignored (restart required to reload config)");
+    }
 }

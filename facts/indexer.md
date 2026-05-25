@@ -1,6 +1,6 @@
 # Indexer Addon Contract
 
-Version: 1.2.0
+Version: 1.2.1
 
 ## Component: `addons/indexer/` (standalone crate)
 
@@ -101,6 +101,20 @@ precedence order: built-in defaults < TOML config file < env vars
 < CLI flags. Each key resolves independently — setting `--db` on
 the CLI does not require setting the others; unset keys fall
 through to lower-precedence sources.
+
+### Required keys
+
+`storage.db` is REQUIRED. There is no built-in default. If
+neither the config file nor a `--db` CLI flag sets it, the
+indexer exits non-zero at startup with a clear diagnostic
+(`storage.db not configured — set [storage].db in the config
+file or pass --db <url-or-path>`). The database location is too
+operationally important to silently default to a relative path
+that depends on the process's working directory.
+
+All other keys have safe defaults: `node.url =
+http://127.0.0.1:9052`, `api.bind = 127.0.0.1:8080`,
+`sync.start_height` unset (resume from DB).
 
 ### Config file location
 
