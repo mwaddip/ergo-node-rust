@@ -85,8 +85,13 @@ async fn main() -> Result<()> {
 
     // 3. Liveness gate: refuse to proceed if the indexer is running, or if
     //    the source SQLite file is locked by another process.
-    let indexer_bind =
-        std::env::var("INDEXER_BIND").unwrap_or_else(|_| DEFAULT_INDEXER_BIND.to_string());
+    //
+    //    Bind address precedence: INDEXER_BIND env var (explicit override) >
+    //    [api].bind from /etc/ergo-node/indexer.toml > hardcoded default.
+    let indexer_bind = std::env::var("INDEXER_BIND")
+        .ok()
+        .or_else(load_config_api_bind_from_indexer_toml)
+        .unwrap_or_else(|| DEFAULT_INDEXER_BIND.to_string());
     liveness::assert_safe_to_proceed(&plan, &indexer_bind).await?;
 
     // 4. Confirmation prompt — refuses in non-TTY contexts without -y.
@@ -239,6 +244,21 @@ fn load_config_db_from_indexer_toml() -> Option<String> {
     parsed
         .get("storage")?
         .get("db")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// Best-effort read of `[api].bind` from `/etc/ergo-node/indexer.toml`.
+///
+/// Returns `None` for any error (file missing, parse error, missing keys) —
+/// the caller falls back to `DEFAULT_INDEXER_BIND` when `None` is returned.
+fn load_config_api_bind_from_indexer_toml() -> Option<String> {
+    let path = Path::new(INDEXER_CONFIG_PATH);
+    let content = std::fs::read_to_string(path).ok()?;
+    let parsed: toml::Value = toml::from_str(&content).ok()?;
+    parsed
+        .get("api")?
+        .get("bind")?
         .as_str()
         .map(|s| s.to_string())
 }

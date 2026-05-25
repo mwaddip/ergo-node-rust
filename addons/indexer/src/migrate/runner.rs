@@ -95,6 +95,19 @@ pub async fn run<W: Write>(
     progress: &mut Progress<W>,
     cancel: watch::Receiver<bool>,
 ) -> Result<u32> {
+    // Fix 3: Verify source is a valid indexer DB at the expected schema version
+    // before any work (resume or fresh).
+    let src_ver = source
+        .schema_version()
+        .await?
+        .ok_or_else(|| anyhow!("source database is uninitialized or empty; expected an indexer DB with schema_version row"))?;
+    if src_ver != resume::EXPECTED_SCHEMA_VERSION {
+        anyhow::bail!(
+            "source schema_version is {src_ver}, expected {}",
+            resume::EXPECTED_SCHEMA_VERSION
+        );
+    }
+
     // Determine start height.
     //
     // Resume: re-validate all 6 preconditions (T6) and resume at cursor+1.
@@ -106,6 +119,15 @@ pub async fn run<W: Write>(
     } else {
         if target.schema_version().await?.is_none() {
             target.init_schema(resume::EXPECTED_SCHEMA_VERSION).await?;
+        }
+        // Fix 2: Reject if target already has block data (operator should pass
+        // --resume or delete the target DB before starting fresh).
+        if target.max_height().await?.is_some() {
+            anyhow::bail!(
+                "target already exists at {}; pass --resume to continue an interrupted migration, \
+                 or move/delete the existing target",
+                plan.target.url
+            );
         }
         1
     };
@@ -437,5 +459,75 @@ mod tests {
             );
         }
         assert_eq!(target.cursor.as_ref().map(|c| c.last_height), Some(5));
+    }
+
+    /// Fix 3: run() errors when source schema_version doesn't match expected.
+    /// Source has schema = Some(2), target is empty. The guard fires before
+    /// any work (even before touching the target).
+    #[tokio::test]
+    async fn run_errors_if_source_schema_version_mismatch() {
+        let blocks: Vec<(u32, BlockData)> = (1u32..=3u32)
+            .map(|h| (h, synth_block(h, h as u8)))
+            .collect();
+
+        // Override schema to a wrong version after with_source_blocks sets it to 1.
+        let mut source = FakeBackend::empty().with_source_blocks(blocks);
+        source.schema = Some(2); // wrong — expected is 1
+
+        let mut target = FakeBackend::empty();
+        let mut buf = Vec::new();
+        let mut progress = Progress::new(&mut buf, 3, 0, false);
+        let (_tx, rx) = watch::channel(false);
+
+        let err = run(&mut source, &mut target, &fresh_plan(), &mut progress, rx)
+            .await
+            .expect_err("expected schema_version mismatch error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("schema_version is 2"),
+            "expected 'schema_version is 2' in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("expected 1"),
+            "expected 'expected 1' in error, got: {msg}"
+        );
+        // Target should be untouched (no schema init, no blocks).
+        assert_eq!(target.schema, None);
+        assert!(target.block_data_by_height.is_empty());
+    }
+
+    /// Fix 2: run() errors on a fresh migration when the target already has
+    /// block data. Operator must pass --resume or delete the target.
+    #[tokio::test]
+    async fn run_errors_if_target_populated_without_resume() {
+        let blocks: Vec<(u32, BlockData)> = (1u32..=3u32)
+            .map(|h| (h, synth_block(h, h as u8)))
+            .collect();
+
+        let mut source = FakeBackend::empty().with_source_blocks(blocks.clone());
+
+        // Target already has schema + at least one block (as if a prior
+        // migration ran to h=1 but the operator forgot --resume).
+        let mut target = FakeBackend::empty();
+        target.schema = Some(resume::EXPECTED_SCHEMA_VERSION);
+        target.block_data_by_height.insert(1, synth_block(1, 1));
+        target.max_height_override = Some(1);
+
+        let mut buf = Vec::new();
+        let mut progress = Progress::new(&mut buf, 3, 0, false);
+        let (_tx, rx) = watch::channel(false);
+
+        let err = run(&mut source, &mut target, &fresh_plan(), &mut progress, rx)
+            .await
+            .expect_err("expected target-already-exists error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("target already exists at"),
+            "expected 'target already exists at' in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("--resume"),
+            "expected '--resume' hint in error, got: {msg}"
+        );
     }
 }
