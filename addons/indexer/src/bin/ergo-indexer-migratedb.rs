@@ -123,9 +123,8 @@ async fn main() -> Result<()> {
     } else {
         0
     };
-    let total_blocks = max.saturating_sub(starting_from);
     let is_tty = std::io::stdout().is_terminal();
-    let mut progress = Progress::new(std::io::stdout(), total_blocks, starting_from, is_tty);
+    let mut progress = Progress::new(std::io::stdout(), max, starting_from, is_tty);
 
     // 7. Signal handling — watch channel flipped by SIGINT or SIGTERM.
     let (cancel_tx, cancel_rx) = watch::channel(false);
