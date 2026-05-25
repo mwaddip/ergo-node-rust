@@ -1,4 +1,5 @@
 pub mod cursor;
+pub mod hash;
 pub mod liveness;
 
 use anyhow::{anyhow, Result};
