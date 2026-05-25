@@ -1542,7 +1542,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start P2P with modifier sink (no validator)
     let peer_storage = Box::new(PeerStorageAdapter::new(store.clone()));
-    let p2p = Arc::new(enr_p2p::node::P2pNode::start(config, Some(modifier_tx), mode_config, peer_storage).await?);
+    // capture_tap: None disables the P2P wire-traffic capture ring per
+    // facts/p2p-capture.md. Wire the real tap via enr_p2p::capture::init(...)
+    // once the [debug.p2p_capture] config plumbing lands.
+    let p2p = Arc::new(enr_p2p::node::P2pNode::start(config, Some(modifier_tx), mode_config, peer_storage, None).await?);
 
     // Register message codes consumed by the main crate's event stream so
     // the router doesn't blindly forward them to all peers.
