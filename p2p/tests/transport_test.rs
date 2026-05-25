@@ -33,7 +33,18 @@ fn vlq_encode_large_value() {
 
 #[test]
 fn vlq_roundtrip() {
-    let values = [0u64, 1, 127, 128, 255, 256, 16383, 16384, 1_000_000, u64::MAX >> 1];
+    let values = [
+        0u64,
+        1,
+        127,
+        128,
+        255,
+        256,
+        16383,
+        16384,
+        1_000_000,
+        u64::MAX >> 1,
+    ];
     for &val in &values {
         let mut buf = Vec::new();
         vlq::write_vlq(&mut buf, val);
@@ -96,7 +107,10 @@ use enr_p2p::types::Network;
 #[test]
 fn frame_encode_decode_roundtrip() {
     let magic = Network::Testnet.magic();
-    let original = Frame { code: 55, body: vec![2, 0, 1, 2, 3] };
+    let original = Frame {
+        code: 55,
+        body: vec![2, 0, 1, 2, 3],
+    };
     let bytes = frame::encode(&magic, &original);
     assert_eq!(bytes.len(), 13 + original.body.len());
     let decoded = frame::decode(&magic, &bytes).unwrap();
@@ -107,7 +121,10 @@ fn frame_encode_decode_roundtrip() {
 #[test]
 fn frame_decode_bad_magic_returns_error() {
     let magic = Network::Testnet.magic();
-    let f = Frame { code: 1, body: vec![] };
+    let f = Frame {
+        code: 1,
+        body: vec![],
+    };
     let mut bytes = frame::encode(&magic, &f);
     bytes[0] = 0xff;
     assert!(frame::decode(&magic, &bytes).is_err());
@@ -116,7 +133,10 @@ fn frame_decode_bad_magic_returns_error() {
 #[test]
 fn frame_decode_bad_checksum_returns_error() {
     let magic = Network::Testnet.magic();
-    let f = Frame { code: 1, body: vec![1, 2, 3] };
+    let f = Frame {
+        code: 1,
+        body: vec![1, 2, 3],
+    };
     let mut bytes = frame::encode(&magic, &f);
     let last = bytes.len() - 1;
     bytes[last] ^= 0xff;
@@ -126,7 +146,10 @@ fn frame_decode_bad_checksum_returns_error() {
 #[test]
 fn frame_decode_empty_body() {
     let magic = Network::Testnet.magic();
-    let f = Frame { code: 1, body: vec![] };
+    let f = Frame {
+        code: 1,
+        body: vec![],
+    };
     let bytes = frame::encode(&magic, &f);
     let decoded = frame::decode(&magic, &bytes).unwrap();
     assert_eq!(decoded.code, 1);
@@ -141,7 +164,10 @@ fn frame_encode_checksum_is_blake2b256_prefix() {
 
     let magic = Network::Testnet.magic();
     let body = vec![0xde, 0xad, 0xbe, 0xef];
-    let f = Frame { code: 55, body: body.clone() };
+    let f = Frame {
+        code: 55,
+        body: body.clone(),
+    };
     let bytes = frame::encode(&magic, &f);
     let expected_checksum = &Blake2b256::digest(&body)[..4];
     assert_eq!(&bytes[9..13], expected_checksum);
@@ -150,7 +176,7 @@ fn frame_encode_checksum_is_blake2b256_prefix() {
 // --- Handshake tests ---
 
 use enr_p2p::transport::handshake::{self, HandshakeConfig};
-use enr_p2p::types::{Version, ProxyMode};
+use enr_p2p::types::{ProxyMode, Version};
 
 #[test]
 fn handshake_build_parse_roundtrip() {

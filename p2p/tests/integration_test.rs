@@ -13,8 +13,22 @@ fn full_tx_relay_scenario() {
     let mut router = Router::new(Network::Mainnet);
     let outbound = PeerId(1);
     let inbound = PeerId(2);
-    router.register_peer(outbound, Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
-    router.register_peer(inbound, Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
+    router.register_peer(
+        outbound,
+        Direction::Outbound,
+        ProxyMode::Full,
+        dummy_addr(),
+        None,
+        None,
+    );
+    router.register_peer(
+        inbound,
+        Direction::Inbound,
+        ProxyMode::Full,
+        dummy_addr(),
+        None,
+        None,
+    );
 
     let tx_id = [0x42; 32];
 
@@ -23,7 +37,10 @@ fn full_tx_relay_scenario() {
     // announcement. Peers are expected to talk to each other directly.
     let actions = router.handle_event(ProtocolEvent::Message {
         peer_id: outbound,
-        message: ProtocolMessage::Inv { modifier_type: 2, ids: vec![tx_id] },
+        message: ProtocolMessage::Inv {
+            modifier_type: 2,
+            ids: vec![tx_id],
+        },
     });
     assert!(actions.is_empty(), "Inv must not be relayed to other peers");
 
@@ -31,7 +48,10 @@ fn full_tx_relay_scenario() {
     // the inv_table to the source peer — the record path stays intact.
     let actions = router.handle_event(ProtocolEvent::Message {
         peer_id: inbound,
-        message: ProtocolMessage::ModifierRequest { modifier_type: 2, ids: vec![tx_id] },
+        message: ProtocolMessage::ModifierRequest {
+            modifier_type: 2,
+            ids: vec![tx_id],
+        },
     });
     assert_eq!(actions.len(), 1);
     assert!(matches!(&actions[0], Action::Send { target, .. } if *target == outbound));
@@ -47,7 +67,9 @@ fn full_tx_relay_scenario() {
     });
     assert_eq!(actions.len(), 2); // Validate + Send
     assert!(actions.iter().any(|a| matches!(a, Action::Validate { .. })));
-    assert!(actions.iter().any(|a| matches!(a, Action::Send { target, .. } if *target == inbound)));
+    assert!(actions
+        .iter()
+        .any(|a| matches!(a, Action::Send { target, .. } if *target == inbound)));
 }
 
 #[test]
@@ -56,15 +78,39 @@ fn disconnect_cleanup_scenario() {
     let out1 = PeerId(1);
     let out2 = PeerId(2);
     let inb = PeerId(3);
-    router.register_peer(out1, Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
-    router.register_peer(out2, Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
-    router.register_peer(inb, Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
+    router.register_peer(
+        out1,
+        Direction::Outbound,
+        ProxyMode::Full,
+        dummy_addr(),
+        None,
+        None,
+    );
+    router.register_peer(
+        out2,
+        Direction::Outbound,
+        ProxyMode::Full,
+        dummy_addr(),
+        None,
+        None,
+    );
+    router.register_peer(
+        inb,
+        Direction::Inbound,
+        ProxyMode::Full,
+        dummy_addr(),
+        None,
+        None,
+    );
 
     let tx_id = [0x55; 32];
 
     router.handle_event(ProtocolEvent::Message {
         peer_id: out1,
-        message: ProtocolMessage::Inv { modifier_type: 2, ids: vec![tx_id] },
+        message: ProtocolMessage::Inv {
+            modifier_type: 2,
+            ids: vec![tx_id],
+        },
     });
 
     router.handle_event(ProtocolEvent::PeerDisconnected {
@@ -76,7 +122,10 @@ fn disconnect_cleanup_scenario() {
     // the request goes to out2 (the remaining outbound peer).
     let actions = router.handle_event(ProtocolEvent::Message {
         peer_id: inb,
-        message: ProtocolMessage::ModifierRequest { modifier_type: 2, ids: vec![tx_id] },
+        message: ProtocolMessage::ModifierRequest {
+            modifier_type: 2,
+            ids: vec![tx_id],
+        },
     });
     assert_eq!(actions.len(), 1);
     assert!(matches!(&actions[0], Action::Send { target, .. } if *target == out2));
@@ -92,16 +141,33 @@ fn inv_does_not_fanout() {
     // directly, and relayed Invs can exceed the 400-modifier cap).
     let mut router = Router::new(Network::Mainnet);
     let outbound = PeerId(1);
-    router.register_peer(outbound, Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
+    router.register_peer(
+        outbound,
+        Direction::Outbound,
+        ProxyMode::Full,
+        dummy_addr(),
+        None,
+        None,
+    );
 
     for i in 2..=5 {
-        router.register_peer(PeerId(i), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
+        router.register_peer(
+            PeerId(i),
+            Direction::Inbound,
+            ProxyMode::Full,
+            dummy_addr(),
+            None,
+            None,
+        );
     }
 
     let tx_id = [0xaa; 32];
     let actions = router.handle_event(ProtocolEvent::Message {
         peer_id: outbound,
-        message: ProtocolMessage::Inv { modifier_type: 2, ids: vec![tx_id] },
+        message: ProtocolMessage::Inv {
+            modifier_type: 2,
+            ids: vec![tx_id],
+        },
     });
 
     assert!(actions.is_empty(), "Inv must not fanout to other peers");
@@ -110,7 +176,10 @@ fn inv_does_not_fanout() {
     // routes to the announcing outbound peer via the inv_table lookup.
     let actions = router.handle_event(ProtocolEvent::Message {
         peer_id: PeerId(2),
-        message: ProtocolMessage::ModifierRequest { modifier_type: 2, ids: vec![tx_id] },
+        message: ProtocolMessage::ModifierRequest {
+            modifier_type: 2,
+            ids: vec![tx_id],
+        },
     });
     assert_eq!(actions.len(), 1);
     assert!(matches!(&actions[0], Action::Send { target, .. } if *target == outbound));
@@ -119,12 +188,28 @@ fn inv_does_not_fanout() {
 #[test]
 fn light_mode_blocks_sync() {
     let mut router = Router::new(Network::Mainnet);
-    router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
-    router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Light, dummy_addr(), None, None);
+    router.register_peer(
+        PeerId(1),
+        Direction::Outbound,
+        ProxyMode::Full,
+        dummy_addr(),
+        None,
+        None,
+    );
+    router.register_peer(
+        PeerId(2),
+        Direction::Inbound,
+        ProxyMode::Light,
+        dummy_addr(),
+        None,
+        None,
+    );
 
     let actions = router.handle_event(ProtocolEvent::Message {
         peer_id: PeerId(2),
-        message: ProtocolMessage::SyncInfo { body: vec![1, 2, 3] },
+        message: ProtocolMessage::SyncInfo {
+            body: vec![1, 2, 3],
+        },
     });
     assert!(actions.is_empty());
 }
@@ -132,19 +217,37 @@ fn light_mode_blocks_sync() {
 #[test]
 fn full_mode_sync_flow() {
     let mut router = Router::new(Network::Mainnet);
-    router.register_peer(PeerId(1), Direction::Outbound, ProxyMode::Full, dummy_addr(), None, None);
-    router.register_peer(PeerId(2), Direction::Inbound, ProxyMode::Full, dummy_addr(), None, None);
+    router.register_peer(
+        PeerId(1),
+        Direction::Outbound,
+        ProxyMode::Full,
+        dummy_addr(),
+        None,
+        None,
+    );
+    router.register_peer(
+        PeerId(2),
+        Direction::Inbound,
+        ProxyMode::Full,
+        dummy_addr(),
+        None,
+        None,
+    );
 
     let actions = router.handle_event(ProtocolEvent::Message {
         peer_id: PeerId(2),
-        message: ProtocolMessage::SyncInfo { body: vec![1, 2, 3] },
+        message: ProtocolMessage::SyncInfo {
+            body: vec![1, 2, 3],
+        },
     });
     assert_eq!(actions.len(), 1);
     assert!(matches!(&actions[0], Action::Send { target, .. } if *target == PeerId(1)));
 
     let actions = router.handle_event(ProtocolEvent::Message {
         peer_id: PeerId(1),
-        message: ProtocolMessage::SyncInfo { body: vec![4, 5, 6] },
+        message: ProtocolMessage::SyncInfo {
+            body: vec![4, 5, 6],
+        },
     });
     assert_eq!(actions.len(), 1);
     assert!(matches!(&actions[0], Action::Send { target, .. } if *target == PeerId(2)));

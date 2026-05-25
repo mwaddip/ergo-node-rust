@@ -1,4 +1,4 @@
-use enr_p2p::protocol::messages::{ProtocolMessage, MessageCode};
+use enr_p2p::protocol::messages::{MessageCode, ProtocolMessage};
 use enr_p2p::transport::frame::Frame;
 use enr_p2p::transport::vlq;
 
@@ -9,7 +9,10 @@ fn parse_inv_message() {
     vlq::write_vlq(&mut body, 1);
     body.extend_from_slice(&[0xaa; 32]);
 
-    let frame = Frame { code: MessageCode::INV, body };
+    let frame = Frame {
+        code: MessageCode::INV,
+        body,
+    };
     let msg = ProtocolMessage::from_frame(&frame).unwrap();
 
     match msg {
@@ -30,7 +33,10 @@ fn parse_modifier_request() {
     body.extend_from_slice(&[0xbb; 32]);
     body.extend_from_slice(&[0xcc; 32]);
 
-    let frame = Frame { code: MessageCode::MODIFIER_REQUEST, body };
+    let frame = Frame {
+        code: MessageCode::MODIFIER_REQUEST,
+        body,
+    };
     let msg = ProtocolMessage::from_frame(&frame).unwrap();
 
     match msg {
@@ -51,11 +57,17 @@ fn parse_modifier_response() {
     vlq::write_vlq(&mut body, 4);
     body.extend_from_slice(&[1, 2, 3, 4]);
 
-    let frame = Frame { code: MessageCode::MODIFIER_RESPONSE, body };
+    let frame = Frame {
+        code: MessageCode::MODIFIER_RESPONSE,
+        body,
+    };
     let msg = ProtocolMessage::from_frame(&frame).unwrap();
 
     match msg {
-        ProtocolMessage::ModifierResponse { modifier_type, modifiers } => {
+        ProtocolMessage::ModifierResponse {
+            modifier_type,
+            modifiers,
+        } => {
             assert_eq!(modifier_type, 2);
             assert_eq!(modifiers.len(), 1);
             assert_eq!(modifiers[0].0, [0xdd; 32]);
@@ -67,7 +79,10 @@ fn parse_modifier_response() {
 
 #[test]
 fn parse_get_peers() {
-    let frame = Frame { code: MessageCode::GET_PEERS, body: vec![] };
+    let frame = Frame {
+        code: MessageCode::GET_PEERS,
+        body: vec![],
+    };
     let msg = ProtocolMessage::from_frame(&frame).unwrap();
     assert!(matches!(msg, ProtocolMessage::GetPeers));
 }
@@ -75,7 +90,10 @@ fn parse_get_peers() {
 #[test]
 fn parse_sync_info_is_opaque() {
     let body = vec![0x01, 0x02, 0x03, 0x04, 0x05];
-    let frame = Frame { code: MessageCode::SYNC_INFO, body: body.clone() };
+    let frame = Frame {
+        code: MessageCode::SYNC_INFO,
+        body: body.clone(),
+    };
     let msg = ProtocolMessage::from_frame(&frame).unwrap();
     match msg {
         ProtocolMessage::SyncInfo { body: b } => assert_eq!(b, body),
@@ -85,7 +103,10 @@ fn parse_sync_info_is_opaque() {
 
 #[test]
 fn parse_unknown_code_preserved() {
-    let frame = Frame { code: 99, body: vec![0xff] };
+    let frame = Frame {
+        code: 99,
+        body: vec![0xff],
+    };
     let msg = ProtocolMessage::from_frame(&frame).unwrap();
     match msg {
         ProtocolMessage::Unknown { code, body } => {
@@ -103,7 +124,10 @@ fn inv_to_frame_roundtrip() {
     vlq::write_vlq(&mut ids_body, 1);
     ids_body.extend_from_slice(&[0xee; 32]);
 
-    let frame = Frame { code: MessageCode::INV, body: ids_body };
+    let frame = Frame {
+        code: MessageCode::INV,
+        body: ids_body,
+    };
     let msg = ProtocolMessage::from_frame(&frame).unwrap();
     let back = msg.to_frame();
     assert_eq!(back.code, frame.code);
@@ -113,8 +137,8 @@ fn inv_to_frame_roundtrip() {
 // --- Peer state machine tests ---
 
 use enr_p2p::protocol::peer::{PeerState, PeerStateMachine, ProtocolEvent};
-use enr_p2p::types::{PeerId, Direction, Version};
 use enr_p2p::transport::handshake::PeerSpec;
+use enr_p2p::types::{Direction, PeerId, Version};
 use std::net::SocketAddr;
 
 fn dummy_addr() -> SocketAddr {
@@ -148,7 +172,9 @@ fn peer_transitions_to_active() {
     let event = peer.set_active(spec, dummy_addr());
     assert_eq!(peer.state(), PeerState::Active);
     match event {
-        ProtocolEvent::PeerConnected { peer_id, direction, .. } => {
+        ProtocolEvent::PeerConnected {
+            peer_id, direction, ..
+        } => {
             assert_eq!(peer_id, PeerId(1));
             assert_eq!(direction, Direction::Outbound);
         }

@@ -114,7 +114,10 @@ fn penalty_emit_with_detail_includes_reason() {
         output.contains("kind=\"message_parse_failed\""),
         "missing quoted kind: {output}"
     );
-    assert!(output.contains("detail=") && output.contains("bad VLQ"), "missing detail: {output}");
+    assert!(
+        output.contains("detail=") && output.contains("bad VLQ"),
+        "missing detail: {output}"
+    );
 }
 
 /// The deploy/fail2ban/ergo-proxy.conf regex is the load-bearing
