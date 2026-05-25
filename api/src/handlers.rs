@@ -1008,6 +1008,25 @@ pub async fn get_debug_memory(State(state): State<ApiState>) -> Json<DebugMemory
     Json(DebugMemory { process, jemalloc, components })
 }
 
+// ---------------------------------------------------------------------------
+// GET /debug/p2p-capture/info
+// ---------------------------------------------------------------------------
+
+/// Inspect the p2p capture ring without dumping it.
+///
+/// Returns the full `CaptureInfo` JSON when capture is enabled; returns
+/// `{"enabled": false}` (200 OK) when the operator has not configured
+/// `[debug.p2p_capture]`. The 200-when-disabled shape is deliberate:
+/// `/info` is a status probe, so an operator running it on a node that
+/// happens to have the feature off should get a clear "off" answer, not
+/// a 404 that suggests the endpoint doesn't exist.
+pub async fn get_capture_info(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    match &state.capture {
+        Some(c) => Json(serde_json::to_value(c.info()).expect("CaptureInfo Serialize is infallible")),
+        None => Json(serde_json::json!({ "enabled": false })),
+    }
+}
+
 /// Read anon/file/peak RSS and VmSize from `/proc/self/status`, PSS from
 /// `/proc/self/smaps_rollup`. All fields return 0 on parse failure.
 fn read_proc_memory() -> ProcessMemory {
@@ -2714,5 +2733,95 @@ mod tests {
             parsed.transactions.len(),
             "tx count must match /blocks/{{id}}",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // P2P capture handler tests
+    // -----------------------------------------------------------------------
+
+    use enr_p2p::capture::{CaptureAccess, CaptureInfo, DumpFilter};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Test double for `CaptureAccess`. Holds a canned `CaptureInfo` and
+    /// a canned dump byte buffer; counts `reset()` calls so the reset
+    /// handler test can assert it actually called through.
+    struct MockCapture {
+        info: CaptureInfo,
+        dump_bytes: Vec<u8>,
+        reset_count: AtomicUsize,
+    }
+
+    impl CaptureAccess for MockCapture {
+        fn info(&self) -> CaptureInfo {
+            CaptureInfo {
+                enabled: self.info.enabled,
+                path: self.info.path.clone(),
+                size_mb: self.info.size_mb,
+                write_head: self.info.write_head,
+                generation: self.info.generation,
+                oldest_ts: self.info.oldest_ts.clone(),
+                newest_ts: self.info.newest_ts.clone(),
+                filter_mode: self.info.filter_mode,
+                filter_count: self.info.filter_count,
+            }
+        }
+        fn dump(&self, _filter: &DumpFilter) -> Vec<u8> {
+            self.dump_bytes.clone()
+        }
+        fn reset(&self) {
+            self.reset_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn sample_info() -> CaptureInfo {
+        CaptureInfo {
+            enabled: true,
+            path: "/tmp/cap.ring".to_string(),
+            size_mb: 1024,
+            write_head: 12_345,
+            generation: 2,
+            oldest_ts: Some("2026-05-25T10:00:00.000000Z".to_string()),
+            newest_ts: Some("2026-05-25T11:00:00.000000Z".to_string()),
+            filter_mode: "none",
+            filter_count: 0,
+        }
+    }
+
+    fn mock_with_info(info: CaptureInfo) -> Arc<MockCapture> {
+        Arc::new(MockCapture {
+            info,
+            dump_bytes: Vec::new(),
+            reset_count: AtomicUsize::new(0),
+        })
+    }
+
+    fn empty_state() -> ApiState {
+        let chain = Arc::new(MultiHeaderChain { by_id: HashMap::new() });
+        test_state(chain)
+    }
+
+    #[test]
+    fn capture_info_returns_disabled_when_no_capture() {
+        let state = empty_state();
+        let rt = build_runtime();
+        let Json(body) = rt.block_on(get_capture_info(State(state)));
+        assert_eq!(body, serde_json::json!({ "enabled": false }));
+    }
+
+    #[test]
+    fn capture_info_returns_full_info_when_enabled() {
+        let mut state = empty_state();
+        state.capture = Some(mock_with_info(sample_info()));
+        let rt = build_runtime();
+        let Json(body) = rt.block_on(get_capture_info(State(state)));
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["path"], "/tmp/cap.ring");
+        assert_eq!(body["size_mb"], 1024);
+        assert_eq!(body["write_head"], 12_345);
+        assert_eq!(body["generation"], 2);
+        assert_eq!(body["filter_mode"], "none");
+        assert_eq!(body["filter_count"], 0);
+        assert_eq!(body["oldest_ts"], "2026-05-25T10:00:00.000000Z");
+        assert_eq!(body["newest_ts"], "2026-05-25T11:00:00.000000Z");
     }
 }

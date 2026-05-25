@@ -287,6 +287,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/mining/rewardAddress", get(handlers::get_mining_reward_address))
         // Debug
         .route("/debug/memory", get(handlers::get_debug_memory))
+        .route("/debug/p2p-capture/info", get(handlers::get_capture_info))
         .with_state(state)
 }
 
