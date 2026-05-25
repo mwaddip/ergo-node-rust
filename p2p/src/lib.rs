@@ -1,4 +1,5 @@
 pub mod blacklist;
+pub mod capture;
 pub mod config;
 pub mod types;
 pub mod transport;
