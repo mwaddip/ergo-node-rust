@@ -1027,6 +1027,128 @@ pub async fn get_capture_info(State(state): State<ApiState>) -> Json<serde_json:
     }
 }
 
+// ---------------------------------------------------------------------------
+// GET /debug/p2p-capture/dump
+// ---------------------------------------------------------------------------
+
+/// Query params for `/debug/p2p-capture/dump`. All optional, combine
+/// with AND semantics in the underlying `DumpFilter`.
+#[derive(Debug, Default, Deserialize)]
+pub struct CaptureDumpQuery {
+    /// IPv4 or IPv6 literal. Bad parse → 400.
+    pub peer: Option<String>,
+    /// Keep records with `ts_sec` within the last N seconds.
+    pub since_secs: Option<u64>,
+    /// "inbound" or "outbound"; anything else → 400.
+    pub direction: Option<String>,
+}
+
+/// Stream the capture ring as a pcap file (chronological, full snapshot).
+///
+/// 404 when capture is disabled — `/dump` is an operation that requires the
+/// subsystem to be on, in contrast to `/info`'s probe-friendly 200.
+pub async fn get_capture_dump(
+    State(state): State<ApiState>,
+    Query(query): Query<CaptureDumpQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let capture = match &state.capture {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "capture-disabled" })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut filter = enr_p2p::capture::DumpFilter::default();
+    if let Some(peer_str) = &query.peer {
+        match peer_str.parse::<std::net::IpAddr>() {
+            Ok(ip) => filter.peer = Some(ip),
+            Err(_) => return capture_bad_request("peer must be a valid IP address"),
+        }
+    }
+    filter.since_secs = query.since_secs;
+    filter.direction = match query.direction.as_deref() {
+        None => None,
+        Some("inbound") => Some(enr_p2p::capture::Direction::Inbound),
+        Some("outbound") => Some(enr_p2p::capture::Direction::Outbound),
+        Some(other) => {
+            return capture_bad_request(&format!(
+                "direction must be inbound|outbound (got {})",
+                other
+            ));
+        }
+    };
+
+    let pcap_bytes = capture.dump(&filter);
+    let filename = capture_dump_filename(std::time::SystemTime::now());
+
+    (
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/vnd.tcpdump.pcap".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        pcap_bytes,
+    )
+        .into_response()
+}
+
+fn capture_bad_request(message: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": "bad-request", "message": message })),
+    )
+        .into_response()
+}
+
+/// Build `p2p-capture-YYYYMMDDTHHMMSSZ.pcap` from `now`.
+///
+/// Inline Y-M-D math to avoid pulling chrono just for a filename
+/// stamp; same Howard Hinnant calendar algorithm `enr_p2p::capture::handle`
+/// uses for its ISO formatting.
+fn capture_dump_filename(now: std::time::SystemTime) -> String {
+    let dur = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs();
+    let days = secs / 86400;
+    let tod = secs % 86400;
+    let h = tod / 3600;
+    let m = (tod / 60) % 60;
+    let s = tod % 60;
+    let (y, mo, d) = days_to_ymd(days as i64);
+    format!(
+        "p2p-capture-{:04}{:02}{:02}T{:02}{:02}{:02}Z.pcap",
+        y, mo, d, h, m, s
+    )
+}
+
+fn days_to_ymd(days: i64) -> (i64, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
 /// Read anon/file/peak RSS and VmSize from `/proc/self/status`, PSS from
 /// `/proc/self/smaps_rollup`. All fields return 0 on parse failure.
 fn read_proc_memory() -> ProcessMemory {
@@ -2739,16 +2861,19 @@ mod tests {
     // P2P capture handler tests
     // -----------------------------------------------------------------------
 
-    use enr_p2p::capture::{CaptureAccess, CaptureInfo, DumpFilter};
+    use enr_p2p::capture::{CaptureAccess, CaptureInfo, Direction, DumpFilter};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
 
     /// Test double for `CaptureAccess`. Holds a canned `CaptureInfo` and
-    /// a canned dump byte buffer; counts `reset()` calls so the reset
-    /// handler test can assert it actually called through.
+    /// a canned dump byte buffer; counts `reset()` calls and records the
+    /// last `DumpFilter` seen so handler tests can assert query-param
+    /// translation.
     struct MockCapture {
         info: CaptureInfo,
         dump_bytes: Vec<u8>,
         reset_count: AtomicUsize,
+        last_filter: StdMutex<Option<DumpFilter>>,
     }
 
     impl CaptureAccess for MockCapture {
@@ -2765,7 +2890,8 @@ mod tests {
                 filter_count: self.info.filter_count,
             }
         }
-        fn dump(&self, _filter: &DumpFilter) -> Vec<u8> {
+        fn dump(&self, filter: &DumpFilter) -> Vec<u8> {
+            *self.last_filter.lock().unwrap() = Some(filter.clone());
             self.dump_bytes.clone()
         }
         fn reset(&self) {
@@ -2792,6 +2918,16 @@ mod tests {
             info,
             dump_bytes: Vec::new(),
             reset_count: AtomicUsize::new(0),
+            last_filter: StdMutex::new(None),
+        })
+    }
+
+    fn mock_with_dump(dump_bytes: Vec<u8>) -> Arc<MockCapture> {
+        Arc::new(MockCapture {
+            info: sample_info(),
+            dump_bytes,
+            reset_count: AtomicUsize::new(0),
+            last_filter: StdMutex::new(None),
         })
     }
 
@@ -2823,5 +2959,116 @@ mod tests {
         assert_eq!(body["filter_count"], 0);
         assert_eq!(body["oldest_ts"], "2026-05-25T10:00:00.000000Z");
         assert_eq!(body["newest_ts"], "2026-05-25T11:00:00.000000Z");
+    }
+
+    fn read_body_bytes(rt: &tokio::runtime::Runtime, response: axum::response::Response) -> Vec<u8> {
+        let bytes = rt
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        bytes.to_vec()
+    }
+
+    #[test]
+    fn capture_dump_404_when_disabled() {
+        let state = empty_state();
+        let rt = build_runtime();
+        let response = rt.block_on(get_capture_dump(
+            State(state),
+            Query(CaptureDumpQuery::default()),
+        ));
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn capture_dump_returns_pcap_bytes_with_headers() {
+        let mut state = empty_state();
+        let canned = vec![0xA1, 0xB2, 0xC3, 0xD4, 0xDE, 0xAD, 0xBE, 0xEF];
+        state.capture = Some(mock_with_dump(canned.clone()));
+        let rt = build_runtime();
+        let response = rt.block_on(get_capture_dump(
+            State(state),
+            Query(CaptureDumpQuery::default()),
+        ));
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let headers = response.headers().clone();
+        assert_eq!(
+            headers.get("content-type").unwrap(),
+            "application/vnd.tcpdump.pcap"
+        );
+        let disposition = headers
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            disposition.starts_with("attachment; filename=\"p2p-capture-"),
+            "got: {disposition}"
+        );
+        assert!(disposition.ends_with(".pcap\""), "got: {disposition}");
+
+        let body = read_body_bytes(&rt, response);
+        assert_eq!(body, canned);
+    }
+
+    #[test]
+    fn capture_dump_passes_filters_through() {
+        let mut state = empty_state();
+        let mock = mock_with_dump(vec![]);
+        state.capture = Some(mock.clone());
+        let rt = build_runtime();
+        let response = rt.block_on(get_capture_dump(
+            State(state),
+            Query(CaptureDumpQuery {
+                peer: Some("10.0.0.7".to_string()),
+                since_secs: Some(120),
+                direction: Some("outbound".to_string()),
+            }),
+        ));
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let filter = mock.last_filter.lock().unwrap().clone().expect("dump called");
+        assert_eq!(filter.peer, Some("10.0.0.7".parse().unwrap()));
+        assert_eq!(filter.since_secs, Some(120));
+        assert_eq!(filter.direction, Some(Direction::Outbound));
+    }
+
+    #[test]
+    fn capture_dump_400_on_invalid_direction() {
+        let mut state = empty_state();
+        state.capture = Some(mock_with_dump(vec![]));
+        let rt = build_runtime();
+        let response = rt.block_on(get_capture_dump(
+            State(state),
+            Query(CaptureDumpQuery {
+                peer: None,
+                since_secs: None,
+                direction: Some("sideways".to_string()),
+            }),
+        ));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn capture_dump_400_on_invalid_peer() {
+        let mut state = empty_state();
+        state.capture = Some(mock_with_dump(vec![]));
+        let rt = build_runtime();
+        let response = rt.block_on(get_capture_dump(
+            State(state),
+            Query(CaptureDumpQuery {
+                peer: Some("not-an-ip".to_string()),
+                since_secs: None,
+                direction: None,
+            }),
+        ));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn capture_dump_filename_known_epoch() {
+        let ts = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        // 1_700_000_000 → 2023-11-14T22:13:20 UTC
+        assert_eq!(capture_dump_filename(ts), "p2p-capture-20231114T221320Z.pcap");
     }
 }
