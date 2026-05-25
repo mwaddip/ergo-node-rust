@@ -7,9 +7,7 @@ use super::ApiContext;
 use crate::types::*;
 
 #[utoipa::path(get, path = "/api/v1/stats", responses((status = 200, body = NetworkStats)))]
-pub async fn get_stats(
-    State(ctx): State<ApiContext>,
-) -> Result<Json<NetworkStats>, StatusCode> {
+pub async fn get_stats(State(ctx): State<ApiContext>) -> Result<Json<NetworkStats>, StatusCode> {
     ctx.db
         .get_stats()
         .await
@@ -42,9 +40,7 @@ pub async fn get_daily_stats(
 }
 
 #[utoipa::path(get, path = "/api/v1/info", responses((status = 200, body = IndexerInfo)))]
-pub async fn get_info(
-    State(ctx): State<ApiContext>,
-) -> Result<Json<IndexerInfo>, StatusCode> {
+pub async fn get_info(State(ctx): State<ApiContext>) -> Result<Json<IndexerInfo>, StatusCode> {
     let indexed_height = ctx
         .db
         .get_stats()

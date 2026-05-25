@@ -5,9 +5,7 @@ const API_PING_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub async fn api_responds(bind: &str) -> bool {
     let url = format!("http://{bind}/api/v1/info");
-    let client = match reqwest::Client::builder()
-        .timeout(API_PING_TIMEOUT)
-        .build() {
+    let client = match reqwest::Client::builder().timeout(API_PING_TIMEOUT).build() {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -55,9 +53,7 @@ pub async fn assert_safe_to_proceed(plan: &MigrationPlan, indexer_bind: &str) ->
 }
 
 fn sqlite_url_to_path(url: &str) -> std::path::PathBuf {
-    url.strip_prefix("sqlite://")
-        .unwrap_or(url)
-        .into()
+    url.strip_prefix("sqlite://").unwrap_or(url).into()
 }
 
 #[cfg(test)]
@@ -78,12 +74,9 @@ mod tests {
             get(|| async { Json(json!({"indexedHeight": 1, "nodeHeight": 1})) }),
         );
         tokio::spawn(async move {
-            axum::serve(
-                tokio::net::TcpListener::from_std(listener).unwrap(),
-                app,
-            )
-            .await
-            .unwrap();
+            axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                .await
+                .unwrap();
         });
         // Give the server a moment to bind.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -116,10 +109,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x.db");
         let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute_batch("BEGIN EXCLUSIVE; CREATE TABLE t (x INT);").unwrap();
+        conn.execute_batch("BEGIN EXCLUSIVE; CREATE TABLE t (x INT);")
+            .unwrap();
         // While the transaction is open (holds the lock), our attempt must fail.
         let err = try_exclusive_sqlite_lock(&path).unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("busy") || err.to_string().to_lowercase().contains("lock"));
+        assert!(
+            err.to_string().to_lowercase().contains("busy")
+                || err.to_string().to_lowercase().contains("lock")
+        );
     }
 
     #[tokio::test]
@@ -127,8 +124,14 @@ mod tests {
         use super::super::{DbSpec, DbType, MigrationPlan};
         let bind = spawn_mock_indexer().await;
         let plan = MigrationPlan {
-            source: DbSpec { url: "sqlite:///tmp/x.db".into(), kind: DbType::Sqlite },
-            target: DbSpec { url: "postgres://x@h/d".into(), kind: DbType::Postgres },
+            source: DbSpec {
+                url: "sqlite:///tmp/x.db".into(),
+                kind: DbType::Sqlite,
+            },
+            target: DbSpec {
+                url: "postgres://x@h/d".into(),
+                kind: DbType::Postgres,
+            },
             update_config: false,
             resume: false,
             yes: false,

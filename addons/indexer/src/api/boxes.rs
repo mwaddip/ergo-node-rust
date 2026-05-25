@@ -128,10 +128,7 @@ pub struct BoxBytesError {
 pub(crate) enum BoxBytesOutcome {
     Found(Vec<u8>),
     NotFound,
-    Internal {
-        code: &'static str,
-        message: String,
-    },
+    Internal { code: &'static str, message: String },
 }
 
 /// Compose canonical ErgoBox bytes for an already-indexed box_id.
@@ -179,10 +176,7 @@ pub(crate) async fn compose_box_bytes(
         None => {
             return BoxBytesOutcome::Internal {
                 code: "tx-not-in-block",
-                message: format!(
-                    "tx {} not present in block {}",
-                    target_tx_id, row.header_id
-                ),
+                message: format!("tx {} not present in block {}", target_tx_id, row.header_id),
             };
         }
     };
@@ -325,10 +319,8 @@ mod tests {
     // Fixture: known-good box from sigma-rust's own JSON round-trip tests.
     // box_id == blake2b256(canonical_bytes), so the invariant check passes
     // when the row + JSON are consistent.
-    const FIXTURE_BOX_ID: &str =
-        "dd4e69ae683d7c2d1de2b3174182e6c443fd68abbcc24002ddc99adb599e0193";
-    const FIXTURE_TX_ID: &str =
-        "8204d2bbaabf946f89a27b366d1356eb10241dc1619a70b4e4a4a38b520926ce";
+    const FIXTURE_BOX_ID: &str = "dd4e69ae683d7c2d1de2b3174182e6c443fd68abbcc24002ddc99adb599e0193";
+    const FIXTURE_TX_ID: &str = "8204d2bbaabf946f89a27b366d1356eb10241dc1619a70b4e4a4a38b520926ce";
     const FIXTURE_HEADER_ID: &str =
         "0000000000000000000000000000000000000000000000000000000000000001";
     const FIXTURE_ERGO_TREE: &str =
@@ -398,18 +390,9 @@ mod tests {
     /// header_id/tx_id pulled from FIXTURE constants. Output 0 carries the
     /// fixture box; later outputs are zero-id placeholders.
     async fn seed_fixture(db: &SqliteDb, spent: bool, n_outputs: usize) {
-        let header_id_bytes: [u8; 32] = hex::decode(FIXTURE_HEADER_ID)
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let tx_id_bytes: [u8; 32] = hex::decode(FIXTURE_TX_ID)
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let box_id_bytes: [u8; 32] = hex::decode(FIXTURE_BOX_ID)
-            .unwrap()
-            .try_into()
-            .unwrap();
+        let header_id_bytes: [u8; 32] = hex::decode(FIXTURE_HEADER_ID).unwrap().try_into().unwrap();
+        let tx_id_bytes: [u8; 32] = hex::decode(FIXTURE_TX_ID).unwrap().try_into().unwrap();
+        let box_id_bytes: [u8; 32] = hex::decode(FIXTURE_BOX_ID).unwrap().try_into().unwrap();
         let ergo_tree_bytes = hex::decode(FIXTURE_ERGO_TREE).unwrap();
 
         let mut outputs = Vec::with_capacity(n_outputs);
@@ -564,7 +547,10 @@ mod tests {
 
         // Confirm row reflects spent state.
         let row = db.get_box(&box_id_arr()).await.unwrap().unwrap();
-        assert!(row.spent_tx_id.is_some(), "fixture box must be marked spent");
+        assert!(
+            row.spent_tx_id.is_some(),
+            "fixture box must be marked spent"
+        );
 
         let tx_json = json!({
             "headerId": FIXTURE_HEADER_ID,

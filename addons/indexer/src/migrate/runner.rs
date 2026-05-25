@@ -165,6 +165,12 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
+    // Named alias to keep the FakeBackend struct field readable. The full type
+    // is Arc<Mutex<Option<Box<dyn FnMut() + Send>>>> which trips clippy's
+    // type_complexity lint; extracting it here satisfies the lint without
+    // obscuring what the type actually is.
+    type OnApplyHook = Arc<Mutex<Option<Box<dyn FnMut() + Send>>>>;
+
     /// Writable in-memory backend for runner tests. Models:
     ///   - schema_version (Option<u32>)
     ///   - cursor (Option<Cursor>)
@@ -184,7 +190,7 @@ mod tests {
         cursor: Option<Cursor>,
         block_data_by_height: HashMap<u32, BlockData>,
         max_height_override: Option<u32>,
-        on_apply: Arc<Mutex<Option<Box<dyn FnMut() + Send>>>>,
+        on_apply: OnApplyHook,
     }
 
     impl FakeBackend {
@@ -316,8 +322,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_migrates_all_blocks_when_no_cancel() {
-        let blocks: Vec<(u32, BlockData)> =
-            (1u32..=5u32).map(|h| (h, synth_block(h, h as u8))).collect();
+        let blocks: Vec<(u32, BlockData)> = (1u32..=5u32)
+            .map(|h| (h, synth_block(h, h as u8)))
+            .collect();
 
         let mut source = FakeBackend::empty().with_source_blocks(blocks.clone());
         let mut target = FakeBackend::empty();
@@ -342,8 +349,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_stops_between_blocks_on_cancel_no_partial_commit() {
-        let blocks: Vec<(u32, BlockData)> =
-            (1u32..=5u32).map(|h| (h, synth_block(h, h as u8))).collect();
+        let blocks: Vec<(u32, BlockData)> = (1u32..=5u32)
+            .map(|h| (h, synth_block(h, h as u8)))
+            .collect();
 
         let (tx, rx) = watch::channel(false);
         // The cancel-firing hook needs to run AFTER the first block commits.
@@ -389,8 +397,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_resume_starts_at_cursor_plus_one() {
-        let blocks: Vec<(u32, BlockData)> =
-            (1u32..=5u32).map(|h| (h, synth_block(h, h as u8))).collect();
+        let blocks: Vec<(u32, BlockData)> = (1u32..=5u32)
+            .map(|h| (h, synth_block(h, h as u8)))
+            .collect();
 
         // Source has all 5 blocks.
         let mut source = FakeBackend::empty().with_source_blocks(blocks.clone());
@@ -405,9 +414,7 @@ mod tests {
             source_url: "sqlite:///source.db".into(),
             source_fingerprint: fingerprint,
         });
-        target
-            .block_data_by_height
-            .insert(2, synth_block(2, 2));
+        target.block_data_by_height.insert(2, synth_block(2, 2));
 
         let mut buf = Vec::new();
         let mut progress = Progress::new(&mut buf, 5, 2, false);

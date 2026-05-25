@@ -145,10 +145,7 @@ fn api_routes() -> Router<ApiContext> {
         // Tokens
         .route("/tokens", get(tokens::get_tokens))
         .route("/tokens/{token_id}", get(tokens::get_token))
-        .route(
-            "/tokens/{token_id}/holders",
-            get(tokens::get_token_holders),
-        )
+        .route("/tokens/{token_id}/holders", get(tokens::get_token_holders))
         .route("/tokens/{token_id}/boxes", get(tokens::get_token_boxes))
         // Stats
         .route("/stats", get(stats::get_stats))

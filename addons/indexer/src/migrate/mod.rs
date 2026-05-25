@@ -38,8 +38,8 @@ pub struct PlanInputs {
     pub update_config: bool,
     pub resume: bool,
     pub yes: bool,
-    pub config_db: Option<String>,           // [storage].db from indexer.toml
-    pub pg_env: PgEnv,                       // libpq env vars
+    pub config_db: Option<String>, // [storage].db from indexer.toml
+    pub pg_env: PgEnv,             // libpq env vars
 }
 
 #[derive(Debug, Clone, Default)]
@@ -88,8 +88,14 @@ pub fn resolve(inputs: PlanInputs) -> Result<MigrationPlan> {
     }
 
     Ok(MigrationPlan {
-        source: DbSpec { url: src_url, kind: src_kind },
-        target: DbSpec { url: tgt_url, kind: tgt_kind },
+        source: DbSpec {
+            url: src_url,
+            kind: src_kind,
+        },
+        target: DbSpec {
+            url: tgt_url,
+            kind: tgt_kind,
+        },
         update_config: inputs.update_config,
         resume: inputs.resume,
         yes: inputs.yes,
@@ -315,7 +321,8 @@ mod tests {
             cli_in: Some("sqlite:///a.db".into()),
             cli_out: Some("postgres://x@h/d".into()),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(p.source.kind, DbType::Sqlite);
         assert_eq!(p.target.kind, DbType::Postgres);
     }
@@ -327,7 +334,8 @@ mod tests {
             cli_out: Some("postgres://x@h/d".into()),
             config_db: Some("sqlite:///cfg.db".into()),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(p.source.url, "sqlite:///cfg.db");
     }
 
@@ -338,7 +346,8 @@ mod tests {
             cli_out: Some("postgres://x@h/d".into()),
             config_db: None,
             ..Default::default()
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert!(err.to_string().contains("storage.db not configured"));
     }
 
@@ -355,7 +364,8 @@ mod tests {
                 ..Default::default()
             },
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(p.target.kind, DbType::Postgres);
         assert!(p.target.url.contains("h"));
         assert!(p.target.url.contains("d"));
@@ -368,7 +378,8 @@ mod tests {
             cli_out: None,
             pg_env: PgEnv::default(),
             ..Default::default()
-        }).unwrap_err();
+        })
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("PGHOST") || msg.contains("missing"));
     }
@@ -379,7 +390,8 @@ mod tests {
             cli_in: Some("postgres://x@h/d".into()),
             cli_out: None,
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(p.target.kind, DbType::Sqlite);
         assert_eq!(p.target.url, "/var/lib/ergo-indexer/index.db");
     }
@@ -390,7 +402,8 @@ mod tests {
             cli_in: Some("sqlite:///a.db".into()),
             cli_out: Some("sqlite:///b.db".into()),
             ..Default::default()
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert!(err.to_string().contains("same backend"));
     }
 }

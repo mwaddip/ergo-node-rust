@@ -111,10 +111,8 @@ pub fn load_file(path: &Path) -> Result<Option<FileConfig>> {
             Ok(Some(cfg))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => {
-            Err(anyhow::Error::from(e))
-                .with_context(|| format!("failed to read config file {}", path.display()))
-        }
+        Err(e) => Err(anyhow::Error::from(e))
+            .with_context(|| format!("failed to read config file {}", path.display())),
     }
 }
 
@@ -244,11 +242,7 @@ mod tests {
     fn config_unknown_keys_rejected() {
         let dir = tempdir();
         let path = dir.join("unknown-key.toml");
-        std::fs::write(
-            &path,
-            b"[node]\nurl = \"http://x\"\nbogus_key = 42\n",
-        )
-        .unwrap();
+        std::fs::write(&path, b"[node]\nurl = \"http://x\"\nbogus_key = 42\n").unwrap();
 
         let err = load_file(&path).expect_err("unknown key must error");
         let msg = format!("{err:#}");
@@ -292,8 +286,7 @@ mod tests {
                 start_height: Some(1_782_320),
             },
         };
-        let cfg = resolve(CliInput::default(), Some(file))
-            .expect("file supplies storage.db");
+        let cfg = resolve(CliInput::default(), Some(file)).expect("file supplies storage.db");
         assert_eq!(cfg.node_url, "http://from-file:1234");
         assert_eq!(cfg.bind.to_string(), "0.0.0.0:9054");
         assert_eq!(cfg.start_height, Some(1_782_320));

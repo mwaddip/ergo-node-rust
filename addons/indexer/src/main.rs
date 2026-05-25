@@ -27,7 +27,11 @@ use tokio::sync::watch;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
-#[command(name = "ergo-indexer", version, about = "Blockchain indexer for ergo-node-rust")]
+#[command(
+    name = "ergo-indexer",
+    version,
+    about = "Blockchain indexer for ergo-node-rust"
+)]
 struct Cli {
     /// Path to TOML config file. Falls back to $INDEXER_CONFIG, then
     /// `/etc/ergo-node/indexer.toml`. A missing file is not an error.
@@ -155,8 +159,7 @@ async fn main() -> anyhow::Result<()> {
             // within the grace period. Anything not done by then gets
             // aborted by the runtime when this function returns.
             let drain = async {
-                let (sync_r, api_r) =
-                    tokio::join!(&mut sync_handle, &mut api_handle);
+                let (sync_r, api_r) = tokio::join!(&mut sync_handle, &mut api_handle);
                 (flatten_join(sync_r), flatten_join(api_r))
             };
             match tokio::time::timeout(SHUTDOWN_GRACE, drain).await {
@@ -177,9 +180,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Collapse a `JoinHandle` result + inner `anyhow::Result` into one.
-fn flatten_join(
-    r: Result<anyhow::Result<()>, tokio::task::JoinError>,
-) -> anyhow::Result<()> {
+fn flatten_join(r: Result<anyhow::Result<()>, tokio::task::JoinError>) -> anyhow::Result<()> {
     match r {
         Ok(inner) => inner,
         Err(e) => Err(anyhow::anyhow!("task panicked: {e}")),

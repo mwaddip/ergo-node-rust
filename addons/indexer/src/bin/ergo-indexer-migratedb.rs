@@ -166,10 +166,7 @@ async fn main() -> Result<()> {
                 );
             }
             Err(e) => {
-                eprintln!(
-                    "WARNING: failed to rewrite {}: {e}",
-                    config_path.display()
-                );
+                eprintln!("WARNING: failed to rewrite {}: {e}", config_path.display());
             }
         }
     } else {
@@ -188,8 +185,16 @@ async fn main() -> Result<()> {
 /// prompt is visible before `user_confirms()` reads stdin.
 fn print_confirmation_prompt(plan: &MigrationPlan) {
     println!("Migration plan:");
-    println!("  Source:        {} ({})", plan.source.url, dbtype_label(plan.source.kind));
-    println!("  Target:        {} ({})", plan.target.url, dbtype_label(plan.target.kind));
+    println!(
+        "  Source:        {} ({})",
+        plan.source.url,
+        dbtype_label(plan.source.kind)
+    );
+    println!(
+        "  Target:        {} ({})",
+        plan.target.url,
+        dbtype_label(plan.target.kind)
+    );
     println!(
         "  Update config: {}",
         if plan.update_config { "yes" } else { "no" }

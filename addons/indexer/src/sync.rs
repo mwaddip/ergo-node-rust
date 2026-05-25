@@ -149,7 +149,10 @@ pub async fn run(
             // re-do the work on next start. Exit before fetching the
             // next block instead.
             if *shutdown_rx.borrow() {
-                tracing::info!(last_indexed, "shutdown signal received; sync exiting between blocks");
+                tracing::info!(
+                    last_indexed,
+                    "shutdown signal received; sync exiting between blocks"
+                );
                 return Ok(());
             }
             let target = last_indexed + 1;
@@ -158,7 +161,11 @@ pub async fn run(
             // re-run case where target is already in the DB. Tip-level reorgs
             // are caught earlier by the outer check above.
             if let Some(fork) = check_canonical_or_rollback(&db, &client, target).await? {
-                tracing::warn!(height = target, fork_point = fork, "reorg detected at target — rolled back");
+                tracing::warn!(
+                    height = target,
+                    fork_point = fork,
+                    "reorg detected at target — rolled back"
+                );
                 last_indexed = fork;
                 continue;
             }

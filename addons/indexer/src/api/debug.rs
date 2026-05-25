@@ -78,7 +78,11 @@ pub async fn get_debug_memory(State(ctx): State<ApiContext>) -> Json<DebugMemory
         db_connections: db_stats.connection_count,
     };
 
-    Json(DebugMemory { process, jemalloc, components })
+    Json(DebugMemory {
+        process,
+        jemalloc,
+        components,
+    })
 }
 
 /// Read anon/file/peak RSS and VmSize from `/proc/self/status`, PSS from

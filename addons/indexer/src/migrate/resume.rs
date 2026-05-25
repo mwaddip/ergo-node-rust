@@ -11,33 +11,33 @@ pub async fn check_resume_preconditions(
     source_url: &str,
 ) -> Result<Cursor> {
     // Check 1: target schema_version match
-    let tgt_ver = target.schema_version().await?
+    let tgt_ver = target
+        .schema_version()
+        .await?
         .ok_or_else(|| anyhow!("resume: target has no schema_version row"))?;
     if tgt_ver != EXPECTED_SCHEMA_VERSION {
         bail!("resume: target schema_version is {tgt_ver}, expected {EXPECTED_SCHEMA_VERSION}");
     }
 
     // Checks 2/3: cursor + source URL
-    let cursor = target.read_cursor().await?
-        .ok_or_else(|| anyhow!(
-            "resume: target has no migration_cursor row — was it created by this tool?"
-        ))?;
+    let cursor = target.read_cursor().await?.ok_or_else(|| {
+        anyhow!("resume: target has no migration_cursor row — was it created by this tool?")
+    })?;
 
     let normalized_src = normalize_url(source_url);
     let normalized_stored = normalize_url(&cursor.source_url);
     if normalized_src != normalized_stored {
         bail!(
             "resume: stored migration_source ({}) does not match current --in ({})",
-            cursor.source_url, source_url
+            cursor.source_url,
+            source_url
         );
     }
 
     // Check 4: source fingerprint
     let now_fingerprint = compute_source_fingerprint(source).await?;
     if now_fingerprint != cursor.source_fingerprint {
-        bail!(
-            "resume: source data fingerprint changed between runs — refusing to continue"
-        );
+        bail!("resume: source data fingerprint changed between runs — refusing to continue");
     }
 
     // Check 5: spot-check the cursor-height block hash
@@ -197,8 +197,7 @@ mod tests {
             .with_block(500, cursor_h500.clone());
 
         // Target has wrong schema version (2 instead of 1)
-        let mut target = FakeBackend::new(Some(2), Some(cursor))
-            .with_block(500, cursor_h500);
+        let mut target = FakeBackend::new(Some(2), Some(cursor)).with_block(500, cursor_h500);
 
         let err = check_resume_preconditions(&mut source, &mut target, SRC_URL)
             .await
@@ -212,8 +211,8 @@ mod tests {
     async fn resume_fails_if_cursor_missing() {
         let h1_data = synth_block_data(1, 1);
 
-        let mut source = FakeBackend::new(Some(EXPECTED_SCHEMA_VERSION), None)
-            .with_block(1, h1_data);
+        let mut source =
+            FakeBackend::new(Some(EXPECTED_SCHEMA_VERSION), None).with_block(1, h1_data);
 
         // Target has correct schema but no cursor row
         let mut target = FakeBackend::new(Some(EXPECTED_SCHEMA_VERSION), None);
@@ -260,7 +259,7 @@ mod tests {
         let h1_data_changed = synth_block_data(99, 1);
 
         let mut source = FakeBackend::new(Some(EXPECTED_SCHEMA_VERSION), None)
-            .with_block(1, h1_data_changed)      // different from original
+            .with_block(1, h1_data_changed) // different from original
             .with_block(500, cursor_h500.clone());
         let mut target = FakeBackend::new(Some(EXPECTED_SCHEMA_VERSION), Some(cursor))
             .with_block(500, cursor_h500);
@@ -288,14 +287,17 @@ mod tests {
         let mut source = FakeBackend::new(Some(EXPECTED_SCHEMA_VERSION), None)
             .with_block(1, h1_data.clone())
             .with_block(500, src_h500);
-        let mut target = FakeBackend::new(Some(EXPECTED_SCHEMA_VERSION), Some(cursor))
-            .with_block(500, tgt_h500);
+        let mut target =
+            FakeBackend::new(Some(EXPECTED_SCHEMA_VERSION), Some(cursor)).with_block(500, tgt_h500);
 
         let err = check_resume_preconditions(&mut source, &mut target, SRC_URL)
             .await
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("spot-check failed at height 500"), "got: {msg}");
+        assert!(
+            msg.contains("spot-check failed at height 500"),
+            "got: {msg}"
+        );
         assert!(msg.contains("source and target diverge"), "got: {msg}");
     }
 

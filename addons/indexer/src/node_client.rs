@@ -118,8 +118,6 @@ impl NodeClient {
             .context("GET transactions failed")?
             .error_for_status()
             .context("GET transactions error")?;
-        resp.json()
-            .await
-            .context("GET transactions parse failed")
+        resp.json().await.context("GET transactions parse failed")
     }
 }

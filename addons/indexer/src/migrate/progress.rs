@@ -170,7 +170,10 @@ mod tests {
         }
         p.finalize(std::time::Duration::from_secs(60));
         let s = String::from_utf8_lossy(&buf);
-        assert!(s.contains("Migration complete"), "missing 'Migration complete': {s}");
+        assert!(
+            s.contains("Migration complete"),
+            "missing 'Migration complete': {s}"
+        );
         assert!(s.contains("1000 blocks"), "missing '1000 blocks': {s}");
     }
 

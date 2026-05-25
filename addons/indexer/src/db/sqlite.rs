@@ -133,8 +133,8 @@ pub struct SqliteDb {
 
 impl SqliteDb {
     pub fn open(path: &str) -> Result<Self> {
-        let writer = Connection::open(path)
-            .with_context(|| format!("failed to open SQLite at {path}"))?;
+        let writer =
+            Connection::open(path).with_context(|| format!("failed to open SQLite at {path}"))?;
         writer.execute_batch(PRAGMAS_WRITER)?;
         writer.execute_batch(CREATE_TABLES)?;
 
@@ -145,8 +145,7 @@ impl SqliteDb {
 
         let reader = Connection::open_with_flags(
             path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .with_context(|| format!("failed to open read-only SQLite at {path}"))?;
         reader.execute_batch(PRAGMAS_READER)?;
@@ -163,11 +162,14 @@ impl SqliteDb {
     /// On error we return a stats struct with `None` fields rather than
     /// surface the failure, because this is diagnostic.
     fn read_sqlite_stats(&self) -> rusqlite::Result<(u64, u64, i64)> {
-        let r = self.reader.try_lock().map_err(|_| {
-            rusqlite::Error::ExecuteReturnedResults
-        })?;
-        let page_size: u64 = r.query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))? as u64;
-        let page_count: u64 = r.query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))? as u64;
+        let r = self
+            .reader
+            .try_lock()
+            .map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
+        let page_size: u64 =
+            r.query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))? as u64;
+        let page_count: u64 =
+            r.query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))? as u64;
         let cache_size: i64 = r.query_row("PRAGMA cache_size", [], |row| row.get::<_, i64>(0))?;
         Ok((page_size, page_count, cache_size))
     }
@@ -177,9 +179,8 @@ impl SqliteDb {
         for bx in boxes.iter_mut() {
             let box_id_bytes = hex::decode(&bx.box_id)?;
             // Tokens
-            let mut stmt = conn.prepare_cached(
-                "SELECT token_id, amount FROM box_tokens WHERE box_id = ?1",
-            )?;
+            let mut stmt =
+                conn.prepare_cached("SELECT token_id, amount FROM box_tokens WHERE box_id = ?1")?;
             bx.tokens = stmt
                 .query_map(params![box_id_bytes.as_slice()], |row| {
                     let tid: Vec<u8> = row.get(0)?;
@@ -441,10 +442,7 @@ impl IndexerDb for SqliteDb {
         )?;
         tx.execute("DELETE FROM boxes WHERE height > ?1", params![h])?;
         tx.execute("DELETE FROM tokens WHERE minting_height > ?1", params![h])?;
-        tx.execute(
-            "DELETE FROM transactions WHERE height > ?1",
-            params![h],
-        )?;
+        tx.execute("DELETE FROM transactions WHERE height > ?1", params![h])?;
         tx.execute("DELETE FROM blocks WHERE height > ?1", params![h])?;
 
         tx.execute(
@@ -485,15 +483,11 @@ impl IndexerDb for SqliteDb {
 
     async fn get_blocks(&self, offset: u64, limit: u64) -> Result<Page<BlockRow>> {
         let r = self.reader.lock().await;
-        let total: u64 = r.query_row(
-            "SELECT COUNT(*) FROM blocks",
-            [],
-            |r| r.get::<_, i64>(0),
-        )? as u64;
+        let total: u64 =
+            r.query_row("SELECT COUNT(*) FROM blocks", [], |r| r.get::<_, i64>(0))? as u64;
 
-        let mut stmt = r.prepare_cached(
-            "SELECT * FROM blocks ORDER BY height DESC LIMIT ?1 OFFSET ?2",
-        )?;
+        let mut stmt =
+            r.prepare_cached("SELECT * FROM blocks ORDER BY height DESC LIMIT ?1 OFFSET ?2")?;
         let items = stmt
             .query_map(params![limit as i64, offset as i64], Self::row_to_block)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -503,9 +497,8 @@ impl IndexerDb for SqliteDb {
 
     async fn get_transactions_for_block(&self, header_id: &[u8]) -> Result<Vec<TxRow>> {
         let r = self.reader.lock().await;
-        let mut stmt = r.prepare_cached(
-            "SELECT * FROM transactions WHERE header_id = ?1 ORDER BY tx_index",
-        )?;
+        let mut stmt =
+            r.prepare_cached("SELECT * FROM transactions WHERE header_id = ?1 ORDER BY tx_index")?;
         let items = stmt
             .query_map(params![header_id], Self::row_to_tx)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -537,7 +530,7 @@ impl IndexerDb for SqliteDb {
             Some(b) => b,
             None => return Ok(None),
         };
-        Self::enrich_boxes(&r,std::slice::from_mut(&mut bx))?;
+        Self::enrich_boxes(&r, std::slice::from_mut(&mut bx))?;
         Ok(Some(bx))
     }
 
@@ -558,12 +551,9 @@ impl IndexerDb for SqliteDb {
             "SELECT * FROM boxes WHERE address = ?1 AND spent_tx_id IS NULL ORDER BY height DESC LIMIT ?2 OFFSET ?3",
         )?;
         let mut items = stmt
-            .query_map(
-                params![addr, limit as i64, offset as i64],
-                Self::row_to_box,
-            )?
+            .query_map(params![addr, limit as i64, offset as i64], Self::row_to_box)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Self::enrich_boxes(&r,&mut items)?;
+        Self::enrich_boxes(&r, &mut items)?;
         Ok(Page { items, total })
     }
 
@@ -584,23 +574,19 @@ impl IndexerDb for SqliteDb {
             "SELECT * FROM boxes WHERE address = ?1 ORDER BY height DESC LIMIT ?2 OFFSET ?3",
         )?;
         let mut items = stmt
-            .query_map(
-                params![addr, limit as i64, offset as i64],
-                Self::row_to_box,
-            )?
+            .query_map(params![addr, limit as i64, offset as i64], Self::row_to_box)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Self::enrich_boxes(&r,&mut items)?;
+        Self::enrich_boxes(&r, &mut items)?;
         Ok(Page { items, total })
     }
 
     async fn get_balance(&self, addr: &str) -> Result<Balance> {
         let r = self.reader.lock().await;
-        let nano_ergs: u64 = r
-            .query_row(
-                "SELECT COALESCE(SUM(value), 0) FROM boxes WHERE address = ?1 AND spent_tx_id IS NULL",
-                params![addr],
-                |r| r.get::<_, i64>(0),
-            )? as u64;
+        let nano_ergs: u64 = r.query_row(
+            "SELECT COALESCE(SUM(value), 0) FROM boxes WHERE address = ?1 AND spent_tx_id IS NULL",
+            params![addr],
+            |r| r.get::<_, i64>(0),
+        )? as u64;
 
         let mut stmt = r.prepare_cached(
             "SELECT bt.token_id, SUM(bt.amount) as total, t.name, t.decimals
@@ -628,12 +614,7 @@ impl IndexerDb for SqliteDb {
         Ok(Balance { nano_ergs, tokens })
     }
 
-    async fn get_txs_by_address(
-        &self,
-        addr: &str,
-        offset: u64,
-        limit: u64,
-    ) -> Result<Page<TxRow>> {
+    async fn get_txs_by_address(&self, addr: &str, offset: u64, limit: u64) -> Result<Page<TxRow>> {
         let r = self.reader.lock().await;
         let total: u64 = r.query_row(
             "SELECT COUNT(DISTINCT t.tx_id) FROM transactions t
@@ -651,10 +632,7 @@ impl IndexerDb for SqliteDb {
              LIMIT ?2 OFFSET ?3",
         )?;
         let items = stmt
-            .query_map(
-                params![addr, limit as i64, offset as i64],
-                Self::row_to_tx,
-            )?
+            .query_map(params![addr, limit as i64, offset as i64], Self::row_to_tx)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Page { items, total })
     }
@@ -676,12 +654,9 @@ impl IndexerDb for SqliteDb {
             "SELECT * FROM boxes WHERE ergo_tree_hash = ?1 AND spent_tx_id IS NULL ORDER BY height DESC LIMIT ?2 OFFSET ?3",
         )?;
         let mut items = stmt
-            .query_map(
-                params![hash, limit as i64, offset as i64],
-                Self::row_to_box,
-            )?
+            .query_map(params![hash, limit as i64, offset as i64], Self::row_to_box)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Self::enrich_boxes(&r,&mut items)?;
+        Self::enrich_boxes(&r, &mut items)?;
         Ok(Page { items, total })
     }
 
@@ -730,15 +705,12 @@ impl IndexerDb for SqliteDb {
              GROUP BY b.address ORDER BY total DESC LIMIT ?2 OFFSET ?3",
         )?;
         let items = stmt
-            .query_map(
-                params![token_id, limit as i64, offset as i64],
-                |row| {
-                    Ok(HolderRow {
-                        address: row.get(0)?,
-                        amount: row.get::<_, i64>(1)? as u64,
-                    })
-                },
-            )?
+            .query_map(params![token_id, limit as i64, offset as i64], |row| {
+                Ok(HolderRow {
+                    address: row.get(0)?,
+                    amount: row.get::<_, i64>(1)? as u64,
+                })
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Page { items, total })
     }
@@ -769,17 +741,14 @@ impl IndexerDb for SqliteDb {
                 Self::row_to_box,
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Self::enrich_boxes(&r,&mut items)?;
+        Self::enrich_boxes(&r, &mut items)?;
         Ok(Page { items, total })
     }
 
     async fn get_tokens(&self, offset: u64, limit: u64) -> Result<Page<TokenRow>> {
         let r = self.reader.lock().await;
-        let total: u64 = r.query_row(
-            "SELECT COUNT(*) FROM tokens",
-            [],
-            |r| r.get::<_, i64>(0),
-        )? as u64;
+        let total: u64 =
+            r.query_row("SELECT COUNT(*) FROM tokens", [], |r| r.get::<_, i64>(0))? as u64;
 
         let mut stmt = r.prepare_cached(
             "SELECT * FROM tokens ORDER BY minting_height DESC LIMIT ?1 OFFSET ?2",
@@ -803,32 +772,19 @@ impl IndexerDb for SqliteDb {
 
     async fn get_stats(&self) -> Result<NetworkStats> {
         let r = self.reader.lock().await;
-        let indexed_height: u64 = r
-            .query_row(
-                "SELECT COALESCE(MAX(height), 0) FROM blocks",
-                [],
-                |r| r.get::<_, i64>(0),
-            )? as u64;
-        let total_blocks: u64 = r.query_row(
-            "SELECT COUNT(*) FROM blocks",
-            [],
-            |r| r.get::<_, i64>(0),
-        )? as u64;
-        let total_transactions: u64 = r.query_row(
-            "SELECT COUNT(*) FROM transactions",
-            [],
-            |r| r.get::<_, i64>(0),
-        )? as u64;
-        let total_boxes: u64 = r.query_row(
-            "SELECT COUNT(*) FROM boxes",
-            [],
-            |r| r.get::<_, i64>(0),
-        )? as u64;
-        let total_tokens: u64 = r.query_row(
-            "SELECT COUNT(*) FROM tokens",
-            [],
-            |r| r.get::<_, i64>(0),
-        )? as u64;
+        let indexed_height: u64 =
+            r.query_row("SELECT COALESCE(MAX(height), 0) FROM blocks", [], |r| {
+                r.get::<_, i64>(0)
+            })? as u64;
+        let total_blocks: u64 =
+            r.query_row("SELECT COUNT(*) FROM blocks", [], |r| r.get::<_, i64>(0))? as u64;
+        let total_transactions: u64 = r.query_row("SELECT COUNT(*) FROM transactions", [], |r| {
+            r.get::<_, i64>(0)
+        })? as u64;
+        let total_boxes: u64 =
+            r.query_row("SELECT COUNT(*) FROM boxes", [], |r| r.get::<_, i64>(0))? as u64;
+        let total_tokens: u64 =
+            r.query_row("SELECT COUNT(*) FROM tokens", [], |r| r.get::<_, i64>(0))? as u64;
 
         Ok(NetworkStats {
             indexed_height,
@@ -886,10 +842,14 @@ use std::sync::Mutex as StdMutex;
 
 use crate::migrate::{
     Backend, BlockData, BlockRow as MBlockRow, BoxRegisterRow as MBoxRegisterRow,
-    BoxRow as MBoxRow, BoxSpentUpdate, BoxTokenRow as MBoxTokenRow, Cursor,
-    TokenRow as MTokenRow, TransactionRow as MTransactionRow,
+    BoxRow as MBoxRow, BoxSpentUpdate, BoxTokenRow as MBoxTokenRow, Cursor, TokenRow as MTokenRow,
+    TransactionRow as MTransactionRow,
 };
 
+// Used by the migratedb bin (via lib.rs) but not by the daemon bin — the
+// daemon has its own open path. Suppress the dead_code lint that fires when
+// compiling the `ergo-indexer` binary's compilation unit.
+#[allow(dead_code)]
 const PRAGMAS_MIGRATION: &str = "\
     PRAGMA journal_mode=WAL; \
     PRAGMA synchronous=NORMAL; \
@@ -899,10 +859,13 @@ const PRAGMAS_MIGRATION: &str = "\
     PRAGMA temp_store=MEMORY; \
     PRAGMA busy_timeout=5000;";
 
+// Used by ergo-indexer-migratedb only; not constructed by the daemon bin.
+#[allow(dead_code)]
 pub struct SqliteBackend {
     conn: Arc<StdMutex<Connection>>,
 }
 
+#[allow(dead_code)] // ergo-indexer-migratedb calls this; daemon bin does not
 impl SqliteBackend {
     /// Open a SQLite database for migration. Creates the file if absent.
     ///
@@ -927,6 +890,7 @@ impl SqliteBackend {
 
 /// Convert `Vec<u8>` from a BLOB column into `[u8; 32]`. SQLite has no
 /// fixed-width binary type, so length is asserted at read time.
+#[allow(dead_code)] // called only by SqliteBackend impl; daemon bin doesn't use that path
 fn vec_to_id32(v: Vec<u8>, col: &str) -> Result<[u8; 32]> {
     let len = v.len();
     v.try_into()
@@ -1424,6 +1388,7 @@ impl Backend for SqliteBackend {
 /// Shared by `write_cursor` (its own short-lived tx) and `apply_block` (the
 /// per-block tx). Per facts/indexer-migration.md § Resume Semantics: the 3
 /// keys are `migration_cursor`, `migration_source`, `migration_source_fingerprint`.
+#[allow(dead_code)] // called only via SqliteBackend; daemon bin doesn't construct SqliteBackend
 fn write_cursor_inline(tx: &rusqlite::Transaction<'_>, cursor: &Cursor) -> Result<()> {
     tx.execute(
         "INSERT OR REPLACE INTO indexer_state (key, value) VALUES ('migration_cursor', ?1)",

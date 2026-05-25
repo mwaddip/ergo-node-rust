@@ -13,10 +13,7 @@ pub fn rewrite_storage_db(config_path: &Path, new_db: &str) -> anyhow::Result<()
         .get_mut("storage")
         .and_then(|s| s.as_table_mut())
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "[storage] section not found in {}",
-                config_path.display()
-            )
+            anyhow::anyhow!("[storage] section not found in {}", config_path.display())
         })?;
 
     let prev = storage
@@ -53,8 +50,9 @@ pub fn rewrite_storage_db(config_path: &Path, new_db: &str) -> anyhow::Result<()
         p.set_file_name(tmp_name);
         p
     };
-    std::fs::write(&tmp_path, doc.to_string())
-        .map_err(|e| anyhow::anyhow!("failed to write temporary file {}: {e}", tmp_path.display()))?;
+    std::fs::write(&tmp_path, doc.to_string()).map_err(|e| {
+        anyhow::anyhow!("failed to write temporary file {}: {e}", tmp_path.display())
+    })?;
     std::fs::rename(&tmp_path, config_path).map_err(|e| {
         anyhow::anyhow!(
             "failed to rename {} to {}: {e}",

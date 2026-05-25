@@ -63,10 +63,7 @@ pub fn parse_block(
             })
             .collect::<Result<_>>()?;
 
-        let first_input_id = inputs
-            .first()
-            .context("transaction has no inputs")?
-            .box_id;
+        let first_input_id = inputs.first().context("transaction has no inputs")?.box_id;
 
         let outputs_arr = tx_val
             .get("outputs")
@@ -85,8 +82,9 @@ pub fn parse_block(
                 .get("ergoTree")
                 .and_then(|v| v.as_str())
                 .with_context(|| format!("missing ergoTree at tx {tx_index} output {out_idx}"))?;
-            let ergo_tree_bytes = hex::decode(ergo_tree_hex)
-                .with_context(|| format!("invalid ergoTree hex at tx {tx_index} output {out_idx}"))?;
+            let ergo_tree_bytes = hex::decode(ergo_tree_hex).with_context(|| {
+                format!("invalid ergoTree hex at tx {tx_index} output {out_idx}")
+            })?;
             let ergo_tree_hash = blake2b256(&ergo_tree_bytes);
 
             let address = match ErgoTree::sigma_parse_bytes(&ergo_tree_bytes) {
@@ -197,7 +195,10 @@ fn estimate_tx_size(inputs: &[InputRef], outputs: &[IndexedBox]) -> u32 {
         .map(|o| {
             o.ergo_tree.len()
                 + o.tokens.len() * 40
-                + o.registers.iter().map(|r| r.serialized.len()).sum::<usize>()
+                + o.registers
+                    .iter()
+                    .map(|r| r.serialized.len())
+                    .sum::<usize>()
                 + 20 // value + creation_height + VLQ overhead
         })
         .sum();
@@ -206,23 +207,24 @@ fn estimate_tx_size(inputs: &[InputRef], outputs: &[IndexedBox]) -> u32 {
 
 /// Decode a register's hex string and parse it as a sigma Constant.
 fn parse_register_constant(out_val: &serde_json::Value, reg_key: &str) -> Option<Constant> {
-    let hex_str = out_val
-        .get("additionalRegisters")?
-        .get(reg_key)?
-        .as_str()?;
+    let hex_str = out_val.get("additionalRegisters")?.get(reg_key)?.as_str()?;
     let bytes = hex::decode(hex_str).ok()?;
     Constant::sigma_parse_bytes(&bytes).ok()
 }
 
 /// Try to extract a UTF-8 string from a register (expects Coll[Byte]).
 fn extract_register_string(out_val: &serde_json::Value, reg_key: &str) -> Option<String> {
-    let data: Vec<u8> = parse_register_constant(out_val, reg_key)?.try_extract_into().ok()?;
+    let data: Vec<u8> = parse_register_constant(out_val, reg_key)?
+        .try_extract_into()
+        .ok()?;
     String::from_utf8(data).ok()
 }
 
 /// Try to extract an i32 from a register.
 fn extract_register_int(out_val: &serde_json::Value, reg_key: &str) -> Option<i32> {
-    parse_register_constant(out_val, reg_key)?.try_extract_into::<i32>().ok()
+    parse_register_constant(out_val, reg_key)?
+        .try_extract_into::<i32>()
+        .ok()
 }
 
 /// Extract non-empty registers R4-R9 as their original serialized bytes.

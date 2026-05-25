@@ -40,7 +40,10 @@ mod tests {
 
     #[tokio::test]
     async fn cursor_roundtrip() {
-        let mut b = FakeBackend { schema: None, cursor: None };
+        let mut b = FakeBackend {
+            schema: None,
+            cursor: None,
+        };
         assert!(b.read_cursor().await.unwrap().is_none());
         let c = Cursor {
             last_height: 1000,
