@@ -708,6 +708,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "blake2",
+ "enr-p2p",
  "ergo-chain-types",
  "ergo-lib",
  "ergo-mempool",

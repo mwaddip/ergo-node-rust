@@ -87,6 +87,11 @@ pub struct ApiState {
     /// callers should leave this `false`. When `true`, `/info` emits
     /// `statsVersion`.
     pub stats_enabled: bool,
+    /// Optional p2p capture access. `None` when `[debug.p2p_capture]` is
+    /// disabled in the operator config; in that case the
+    /// `/debug/p2p-capture/*` handlers return a disabled-shaped response
+    /// (200 `{"enabled": false}` for `/info`, 404 for `/dump` and `/reset`).
+    pub capture: Option<Arc<dyn enr_p2p::capture::CaptureAccess>>,
 }
 
 /// Snapshot of jemalloc stats at a moment in time. The probe calls

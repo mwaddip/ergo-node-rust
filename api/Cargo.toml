@@ -13,6 +13,7 @@ sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "fbcdc9bd
 ergo-mempool = { path = "../mempool" }
 ergo-mining = { path = "../mining" }
 ergo-validation = { path = "../validation" }
+enr-p2p = { path = "../p2p" }
 axum = "0.8"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }

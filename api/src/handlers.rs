@@ -1966,6 +1966,7 @@ mod tests {
             height_watch: rx,
             jemalloc_probe: None,
             stats_enabled: false,
+            capture: None,
         }
     }
 
