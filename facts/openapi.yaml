@@ -353,10 +353,12 @@ paths:
         canonical transaction bytes. This is what every input signature
         commits to.
 
-        Uses a different error body shape than the standard `ApiError`: an
-        object with a short `error` code string plus context fields
-        (`headerId` / `message`), matching the cross-validator harness's
-        parser.
+        Errors use the standard `ApiError` shape with the short code
+        string carried in `reason` and any context (echoed `headerId`,
+        underlying error message) in `detail`. Reason values:
+        `invalid-header-id`, `block-not-found`, `block-pruned`,
+        `header-serialize-failed`, `block-transactions-parse-failed`,
+        `tx-bytes-to-sign-failed`.
       operationId: getBlockValidationFragments
       x-rust-only: true
       parameters:
@@ -373,25 +375,25 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ValidationFragmentsError'
+                $ref: '#/components/schemas/ApiError'
         '404':
           description: Header not in chain.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ValidationFragmentsError'
+                $ref: '#/components/schemas/ApiError'
         '410':
           description: Block was pruned (`blocks_to_keep` enabled).
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ValidationFragmentsError'
+                $ref: '#/components/schemas/ApiError'
         '500':
           description: Stored sections failed to parse or serialize.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ValidationFragmentsError'
+                $ref: '#/components/schemas/ApiError'
 
   # -------------------------------------------------------------------------
   # Transactions
@@ -1359,13 +1361,13 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/CaptureError'
+                $ref: '#/components/schemas/ApiError'
         '404':
           description: Capture subsystem disabled.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/CaptureError'
+                $ref: '#/components/schemas/ApiError'
 
   /debug/p2p-capture/reset:
     post:
@@ -1399,7 +1401,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/CaptureError'
+                $ref: '#/components/schemas/ApiError'
 
   # -------------------------------------------------------------------------
   # Stats (rust-only — separate listener)
@@ -1804,30 +1806,6 @@ components:
             `Transaction::bytes_to_sign()` — inputs without proofs/extensions,
             then data-inputs, then outputs, concatenated. NOT the full
             canonical tx bytes. This is what every input signature commits to.
-
-    ValidationFragmentsError:
-      type: object
-      description: |
-        Validation-fragments uses a different error body shape than the
-        standard `ApiError`. `error` is a short code string (not a numeric
-        HTTP status); context fields vary by error code.
-      required: [error]
-      properties:
-        error:
-          type: string
-          enum:
-            - invalid-header-id
-            - block-not-found
-            - block-pruned
-            - header-serialize-failed
-            - block-transactions-parse-failed
-            - tx-bytes-to-sign-failed
-        headerId:
-          type: string
-          description: Echo of the requested header ID (preserves case).
-        message:
-          type: string
-          description: Internal diagnostic, present on serialize/parse failures.
 
     # ---- Transactions ----
     Transaction:
@@ -2270,17 +2248,6 @@ components:
           type: integer
           format: int64
           description: Bumped on every reset.
-
-    CaptureError:
-      type: object
-      description: Alternative error shape used by `/debug/p2p-capture/*`.
-      required: [error]
-      properties:
-        error:
-          type: string
-          enum: [capture-disabled, bad-request]
-        message:
-          type: string
 
     # ---- Stats ----
     StatsP2p:

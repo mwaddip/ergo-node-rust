@@ -160,22 +160,12 @@ The `reason` field is safe to show to users. The `detail` field may contain
 internal information (stack traces, component errors) and should be omitted
 in production or restricted to authenticated requests.
 
-### Endpoint-specific error shapes
-
-A small number of Rust-only endpoints intentionally use a different error
-body. `openapi.yaml` documents these per endpoint; they share the contract
-that `error` is a short code string rather than a numeric HTTP status:
-
-- `/blocks/{id}/validation-fragments` — `{ error: "<code>", headerId?, message? }`,
-  keyed off short codes (`invalid-header-id`, `block-not-found`, `block-pruned`,
-  `header-serialize-failed`, `block-transactions-parse-failed`,
-  `tx-bytes-to-sign-failed`) so the cross-validator harness can dispatch on
-  them programmatically.
-- `/debug/p2p-capture/*` — `{ error: "capture-disabled" | "bad-request",
-  message? }` for the same reason.
-
-These are not retrofitted onto the JVM-compat path; existing consumers of
-the JVM API never see them.
+All endpoints, including Rust-only ones, return errors via the standard
+`ApiError` shape above. Endpoints that need to expose a programmatic
+dispatch key (the cross-validator harness keying off
+`/blocks/{id}/validation-fragments`, the capture endpoints' on/off probe)
+carry a short code string in `reason` and any context in `detail`. See
+each endpoint's `openapi.yaml` entry for the codes it emits.
 
 ## Authentication
 

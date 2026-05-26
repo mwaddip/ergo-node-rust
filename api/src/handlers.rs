@@ -18,14 +18,25 @@ use crate::ApiState;
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
 fn err<T>(status: StatusCode, reason: impl Into<String>) -> ApiResult<T> {
-    Err((
+    Err(api_error(status, reason, None))
+}
+
+/// Build an `(StatusCode, Json<ApiError>)` tuple ready for `Err(...)`, `ok_or_else`,
+/// or `map_err`. The `error` field mirrors the HTTP status code, matching the JVM
+/// node's `ApiError` shape.
+fn api_error(
+    status: StatusCode,
+    reason: impl Into<String>,
+    detail: Option<String>,
+) -> (StatusCode, Json<ApiError>) {
+    (
         status,
         Json(ApiError {
             error: status.as_u16(),
             reason: reason.into(),
-            detail: None,
+            detail,
         }),
-    ))
+    )
 }
 
 fn mining_err() -> (StatusCode, Json<ApiError>) {
@@ -1218,20 +1229,20 @@ pub async fn get_capture_dump(
 
     let capture = match &state.capture {
         Some(c) => c,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "capture-disabled" })),
-            )
-                .into_response();
-        }
+        None => return capture_error_response(StatusCode::NOT_FOUND, "capture-disabled", None),
     };
 
     let mut filter = enr_p2p::capture::DumpFilter::default();
     if let Some(peer_str) = &query.peer {
         match peer_str.parse::<std::net::IpAddr>() {
             Ok(ip) => filter.peer = Some(ip),
-            Err(_) => return capture_bad_request("peer must be a valid IP address"),
+            Err(_) => {
+                return capture_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid-peer",
+                    Some("peer must be a valid IP address".into()),
+                );
+            }
         }
     }
     filter.since_secs = query.since_secs;
@@ -1240,10 +1251,11 @@ pub async fn get_capture_dump(
         Some("inbound") => Some(enr_p2p::capture::Direction::Inbound),
         Some("outbound") => Some(enr_p2p::capture::Direction::Outbound),
         Some(other) => {
-            return capture_bad_request(&format!(
-                "direction must be inbound|outbound (got {})",
-                other
-            ));
+            return capture_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid-direction",
+                Some(format!("direction must be inbound|outbound (got {other})")),
+            );
         }
     };
 
@@ -1267,13 +1279,13 @@ pub async fn get_capture_dump(
         .into_response()
 }
 
-fn capture_bad_request(message: &str) -> axum::response::Response {
+fn capture_error_response(
+    status: StatusCode,
+    reason: &str,
+    detail: Option<String>,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
-    (
-        StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({ "error": "bad-request", "message": message })),
-    )
-        .into_response()
+    api_error(status, reason, detail).into_response()
 }
 
 /// Build `p2p-capture-YYYYMMDDTHHMMSSZ.pcap` from `now`.
@@ -1327,13 +1339,7 @@ pub async fn post_capture_reset(State(state): State<ApiState>) -> axum::response
     use axum::response::IntoResponse;
     let capture = match &state.capture {
         Some(c) => c,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "capture-disabled" })),
-            )
-                .into_response();
-        }
+        None => return capture_error_response(StatusCode::NOT_FOUND, "capture-disabled", None),
     };
     let previous_generation = capture.info().generation;
     capture.reset();
@@ -1889,50 +1895,28 @@ async fn popow_header_response(
 // GET /blocks/{header_id}/validation-fragments
 // ---------------------------------------------------------------------------
 
-/// Build the validation-fragments JSON error body the contract specifies.
-/// This is NOT the standard JVM `ApiError` shape used elsewhere — the
-/// harness keys off `error` as a short code string, not an HTTP status code.
-fn vf_err(
-    status: StatusCode,
-    code: &str,
-    fields: serde_json::Value,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let mut obj = serde_json::Map::new();
-    obj.insert(
-        "error".to_string(),
-        serde_json::Value::String(code.to_string()),
-    );
-    if let serde_json::Value::Object(extra) = fields {
-        for (k, v) in extra {
-            obj.insert(k, v);
-        }
-    }
-    (status, Json(serde_json::Value::Object(obj)))
-}
-
 pub async fn get_block_validation_fragments(
     State(state): State<ApiState>,
     Path(header_id): Path<String>,
-) -> Result<Json<ValidationFragments>, (StatusCode, Json<serde_json::Value>)> {
+) -> ApiResult<ValidationFragments> {
     // Echo whatever the client sent (preserving case) when surfacing it in
-    // the error body — matches how `block-pruned` / `block-not-found` get
-    // diff'd by clients.
+    // the `detail` field — clients dispatch on `reason`, not on the echo.
     let id = hex::decode(&header_id)
         .ok()
         .and_then(|b| <[u8; 32]>::try_from(b).ok())
         .ok_or_else(|| {
-            vf_err(
+            api_error(
                 StatusCode::BAD_REQUEST,
                 "invalid-header-id",
-                serde_json::json!({ "headerId": header_id }),
+                Some(format!("headerId={header_id}")),
             )
         })?;
 
     let header = state.chain.header_by_id(&id).ok_or_else(|| {
-        vf_err(
+        api_error(
             StatusCode::NOT_FOUND,
             "block-not-found",
-            serde_json::json!({ "headerId": header_id }),
+            Some(format!("headerId={header_id}")),
         )
     })?;
 
@@ -1940,10 +1924,10 @@ pub async fn get_block_validation_fragments(
     // SigmaSerializable — these are the bytes whose blake2b256 IS the
     // header id.
     let header_bytes = header.scorex_serialize_bytes().map_err(|e| {
-        vf_err(
+        api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "header-serialize-failed",
-            serde_json::json!({ "message": format!("{e}") }),
+            Some(format!("{e}")),
         )
     })?;
 
@@ -1958,17 +1942,17 @@ pub async fn get_block_validation_fragments(
         .store
         .get(BLOCK_TRANSACTIONS_TYPE, &txs_modifier_id)
         .ok_or_else(|| {
-            vf_err(
+            api_error(
                 StatusCode::GONE,
                 "block-pruned",
-                serde_json::json!({ "headerId": header_id }),
+                Some(format!("headerId={header_id}")),
             )
         })?;
     let parsed_txs = ergo_validation::parse_block_transactions(&txs_data).map_err(|e| {
-        vf_err(
+        api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "block-transactions-parse-failed",
-            serde_json::json!({ "message": format!("{e}") }),
+            Some(format!("{e}")),
         )
     })?;
 
@@ -1991,10 +1975,10 @@ pub async fn get_block_validation_fragments(
     let mut tx_fragments = Vec::with_capacity(parsed_txs.transactions.len());
     for tx in &parsed_txs.transactions {
         let signing_message = tx.bytes_to_sign().map_err(|e| {
-            vf_err(
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "tx-bytes-to-sign-failed",
-                serde_json::json!({ "message": format!("{e}") }),
+                Some(format!("{e}")),
             )
         })?;
         tx_fragments.push(ValidationFragmentsTx {
@@ -3098,14 +3082,9 @@ mod tests {
         match result {
             Err((status, Json(body))) => {
                 assert_eq!(status, StatusCode::NOT_FOUND);
-                assert_eq!(
-                    body.get("error").and_then(|v| v.as_str()),
-                    Some("block-not-found")
-                );
-                assert_eq!(
-                    body.get("headerId").and_then(|v| v.as_str()),
-                    Some("aa".repeat(32).as_str()),
-                );
+                assert_eq!(body.error, 404);
+                assert_eq!(body.reason, "block-not-found");
+                assert_eq!(body.detail.as_deref(), Some(format!("headerId={}", "aa".repeat(32)).as_str()));
             }
             Ok(_) => panic!("expected 404 for unknown headerId"),
         }

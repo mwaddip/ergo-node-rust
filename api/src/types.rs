@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 /// Standard error response matching the JVM node's format.
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct ApiError {
     pub error: u16,
     pub reason: String,
