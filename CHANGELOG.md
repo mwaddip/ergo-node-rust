@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.6.5 — 2026-05-26
+
+Tarball install path is now first-class. The binary auto-finds a
+config across pwd, `~/.config/ergo-node/`, and `/etc/ergo-node/`,
+and cold-bootstraps a default `./ergo.toml` + `./ergo-node-data/`
+when none is found. Interactive `install.sh` scripts ship in both
+the node and indexer tarballs. The indexer tarball also now
+includes the `ergo-indexer-migratedb` binary, which was missing
+from v0.6.4.
+
+### Config search + cold bootstrap
+
+`./ergo-node-rust` with no arguments now searches for a config in
+this order, first match wins:
+
+1. `./ergo.toml` (current working directory)
+2. `~/.config/ergo-node/ergo.toml` (user-scoped)
+3. `/etc/ergo-node/ergo.toml` (system-wide, via .deb)
+
+An explicit positional path overrides the search. When nothing is
+found, the binary writes a minimal default `./ergo.toml` (testnet,
+full archival, IPv6 listener), logs a `tracing::warn!` pointing
+operators at `install.sh` for customization, and starts. The
+compiled-in `data_dir` default moves from `/var/lib/ergo-node/data`
+to `./ergo-node-data` — the .deb's new `deploy/ergo.toml` now sets
+the system path explicitly. Existing .deb operators get the usual
+dpkg conffile prompt on upgrade; their `data_dir` customization is
+preserved.
+
+### Interactive `install.sh` (node + indexer)
+
+Both tarballs ship a bash script that asks a handful of questions
+(network, state type, storage path, memory limits, API bind for
+the node; backend, DB URL, API bind for the indexer) and writes a
+working `./ergo.toml` or `./indexer.toml`. Refuses to overwrite an
+existing config without confirmation.
+
+### Annotated example configs
+
+`ergo.toml.example` (272 lines) documents every supported node
+option with its default commented in — `[node]` (30 fields),
+`[node.mining]` (4), `[network]` (8), `[upnp]`, `[stats]`,
+`[debug.p2p_capture]`. The .deb ships it at
+`/usr/share/doc/ergo-node-rust/examples/`. The indexer's
+`ergo-indexer.toml.example` covers the 4-field schema with SQLite
+and PostgreSQL examples.
+
+### Indexer tarball: migrator binary included
+
+`build-addons-tar` was missing the `ergo-indexer-migratedb` binary
+added in v0.6.4. The new bundle ships both binaries plus the
+example config and the install script.
+
 ## v0.6.4 — 2026-05-24
 
 Storage pruning, two new endpoints for external validation
