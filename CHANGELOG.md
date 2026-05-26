@@ -47,11 +47,13 @@ option with its default commented in — `[node]` (30 fields),
 `ergo-indexer.toml.example` covers the 4-field schema with SQLite
 and PostgreSQL examples.
 
-### Indexer tarball: migrator binary included
+### Indexer packaging: migrator binary included
 
-`build-addons-tar` was missing the `ergo-indexer-migratedb` binary
-added in v0.6.4. The new bundle ships both binaries plus the
-example config and the install script.
+The `ergo-indexer-migratedb` binary added in v0.6.4 is now
+included in both the tarball and the .deb. (`build-addons-tar`
+and `build-addons-deb` were both missing it.) The .deb's stale
+"Rich query API over SQLite" description is also updated to
+acknowledge PostgreSQL support that landed in indexer v0.2.0.
 
 ## v0.6.4 — 2026-05-24
 

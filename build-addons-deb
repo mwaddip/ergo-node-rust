@@ -28,7 +28,9 @@ build_indexer() {
     mkdir -p "target/${pkg}/var/lib/ergo-indexer"
 
     cp addons/indexer/target/release/ergo-indexer "target/${pkg}/usr/bin/"
+    cp addons/indexer/target/release/ergo-indexer-migratedb "target/${pkg}/usr/bin/"
     strip "target/${pkg}/usr/bin/ergo-indexer"
+    strip "target/${pkg}/usr/bin/ergo-indexer-migratedb"
     cp deploy/ergo-indexer.service "target/${pkg}/usr/lib/systemd/system/"
 
     cat > "target/${pkg}/DEBIAN/control" <<CTRL
@@ -38,9 +40,11 @@ Architecture: ${ARCH}
 Depends: ergo-node-rust
 Maintainer: mwaddip
 Description: Blockchain indexer addon for ergo-node-rust
- Rich query API over SQLite — box lookup by address, transaction history,
- token metadata, and network statistics. Runs as a sidecar to the main
- ergo-node-rust service.
+ Rich query API over SQLite or PostgreSQL — box lookup by address,
+ transaction history, token metadata, and network statistics. Runs
+ as a sidecar to the main ergo-node-rust service. Includes
+ ergo-indexer-migratedb for bidirectional SQLite <-> PostgreSQL
+ schema migration.
 CTRL
     local size
     size=$(du -sk "target/${pkg}" | cut -f1)
