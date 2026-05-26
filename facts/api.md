@@ -111,10 +111,10 @@ Per-endpoint compatibility level is annotated in `openapi.yaml` as one of:
 
 The overall posture: every endpoint that exists on both sides aims for `full`.
 Where it can't, the gap is documented inline in `openapi.yaml`. Rust-only
-endpoints (`/info/wait`, `/blocks/{id}/validation-fragments`, `/debug/*`,
-`/stats/p2p`, `/ingest/modifiers`) are also flagged in `openapi.yaml` via both
-a `rust-only` tag and an `x-rust-only: true` extension so generated client
-libraries can filter them out for portability.
+endpoints (`/info/wait`, `/blocks/{id}/validation-fragments`, `/peers/api-urls`,
+`/debug/*`, `/stats/p2p`, `/ingest/modifiers`) are also flagged in `openapi.yaml`
+via both a `rust-only` tag and an `x-rust-only: true` extension so generated
+client libraries can filter them out for portability.
 
 Known structural deviations:
 
@@ -122,9 +122,6 @@ Known structural deviations:
   `GET /peers/all`, filtered to connected peers. JVM additionally emits
   `lastHandshake` and `restApiUrl` per entry; the latter is surfaced via
   `GET /peers/api-urls` instead.
-- `GET /peers/api-urls` — Rust-only endpoint that publishes per-peer REST
-  URLs, filtered so peers can only advertise URLs whose host matches the
-  socket-level peer IP (defeats advertisement poisoning).
 - `GET /mining/rewardAddress` — returns the miner PK hex string rather than
   a derived P2S address. Clients that need the address derive locally.
 

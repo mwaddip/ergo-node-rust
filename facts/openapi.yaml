@@ -886,15 +886,16 @@ paths:
 
   /peers/api-urls:
     get:
-      tags: [peers]
+      tags: [peers, rust-only]
       summary: Connected peers' REST URLs (security-filtered).
       description: |
-        Compatibility: `deviation`. Returns the `restApiUrl` advertised by
-        each connected peer in its handshake, but ONLY when the URL's host
-        component matches the peer's connecting socket IP. DNS-name URLs
-        and host-mismatch URLs are dropped to defeat advertisement
-        poisoning.
+        Rust-only — no JVM counterpart. Returns the `restApiUrl`
+        advertised by each connected peer in its handshake, but ONLY when
+        the URL's host component matches the peer's connecting socket IP.
+        DNS-name URLs and host-mismatch URLs are dropped to defeat
+        advertisement poisoning.
       operationId: getPeerApiUrls
+      x-rust-only: true
       responses:
         '200':
           description: Per-peer REST URLs.
