@@ -122,8 +122,6 @@ Known structural deviations:
   `GET /peers/all`, filtered to connected peers. JVM additionally emits
   `lastHandshake` and `restApiUrl` per entry; the latter is surfaced via
   `GET /peers/api-urls` instead.
-- `GET /mining/rewardAddress` — returns the miner PK hex string rather than
-  a derived P2S address. Clients that need the address derive locally.
 
 ## Endpoints NOT Implemented (First Release)
 

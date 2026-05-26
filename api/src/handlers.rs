@@ -882,12 +882,46 @@ pub async fn get_mining_candidate(
 pub async fn get_mining_reward_address(
     State(state): State<ApiState>,
 ) -> ApiResult<serde_json::Value> {
+    use ergo_lib::chain::ergo_tree_predef;
+    use ergo_lib::ergotree_ir::chain::address::{Address, AddressEncoder, NetworkPrefix};
+
     let mining = state.mining.as_ref().ok_or_else(mining_err)?;
 
-    // Derive P2S address from miner PK
-    let pk_hex: String = (*mining.config.miner_pk.h).into();
+    // JVM Pay2SAddress(rewardOutputScript(minerRewardDelay, pk)).
+    // The miner reward is locked behind a time-delay script, not a bare P2PK —
+    // so the surfaced address is P2S over that script, not P2PK over the PK.
+    let tree = ergo_tree_predef::reward_output_script(
+        mining.config.reward_delay,
+        mining.config.miner_pk.clone(),
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: 500,
+                reason: format!("failed to build reward output script: {e}"),
+                detail: None,
+            }),
+        )
+    })?;
+    let tree_bytes = tree.sigma_serialize_bytes().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: 500,
+                reason: format!("failed to serialize reward output script: {e}"),
+                detail: None,
+            }),
+        )
+    })?;
+    let prefix = match state.node_info.network.as_str() {
+        "testnet" => NetworkPrefix::Testnet,
+        _ => NetworkPrefix::Mainnet,
+    };
+    let address_str = AddressEncoder::new(prefix).address_to_str(&Address::P2S(tree_bytes));
+
     Ok(Json(serde_json::json!({
-        "rewardAddress": pk_hex,
+        "rewardAddress": address_str,
     })))
 }
 

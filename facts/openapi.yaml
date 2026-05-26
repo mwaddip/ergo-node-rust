@@ -1232,9 +1232,10 @@ paths:
       tags: [mining]
       summary: Miner's reward address.
       description: |
-        Compatibility: `partial`. Currently returns the miner's public-key
-        hex string rather than a P2S address; clients that compare against
-        JVM should derive the P2S equivalent locally if needed.
+        Compatibility: `full`. Returns the Base58-encoded P2S address
+        wrapping `rewardOutputScript(minerRewardDelay, minerPk)`. The
+        miner reward is locked behind a height-delay script (default 720
+        blocks), so the address is Pay-to-Script — not Pay-to-PublicKey.
       operationId: getMiningRewardAddress
       responses:
         '200':
@@ -1247,7 +1248,13 @@ paths:
                 properties:
                   rewardAddress:
                     type: string
-                    description: Currently the miner PK hex string.
+                    description: Base58-encoded P2S address.
+        '500':
+          description: Failed to construct or encode the reward script.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '503':
           description: Mining not configured.
           content:
