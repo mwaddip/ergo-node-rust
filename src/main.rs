@@ -913,7 +913,7 @@ impl Default for NodeConfig {
 }
 
 fn default_data_dir() -> String {
-    "/var/lib/ergo-node/data".to_string()
+    "./ergo-node-data".to_string()
 }
 fn default_state_type() -> String {
     "utxo".to_string()
@@ -1216,6 +1216,78 @@ async fn open_state_with_retry(
     None
 }
 
+/// Locate the config path, in this order:
+///   1. First non-flag positional arg (skips argv[0] and any `--foo` flags).
+///   2. `./ergo.toml` (current working directory).
+///   3. `$XDG_CONFIG_HOME/ergo-node/ergo.toml` or `$HOME/.config/ergo-node/ergo.toml`.
+///   4. `/etc/ergo-node/ergo.toml` (system-wide, .deb install).
+///
+/// Returns `None` if no path was supplied and nothing exists in any of the
+/// search locations. The caller decides what to do with `None` — the daemon
+/// path cold-bootstraps a default; maintenance subcommands fail clearly.
+fn locate_config(args: &[String]) -> Option<String> {
+    if let Some(p) = args.iter().skip(1).find(|a| !a.starts_with("--")).cloned() {
+        return Some(p);
+    }
+    let pwd = std::path::Path::new("./ergo.toml");
+    if pwd.exists() {
+        return Some("./ergo.toml".to_string());
+    }
+    let xdg_dir = std::env::var("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .ok()
+        .or_else(|| {
+            std::env::var("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".config"))
+                .ok()
+        });
+    if let Some(d) = xdg_dir {
+        let candidate = d.join("ergo-node/ergo.toml");
+        if candidate.exists() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    let etc = std::path::Path::new("/etc/ergo-node/ergo.toml");
+    if etc.exists() {
+        return Some("/etc/ergo-node/ergo.toml".to_string());
+    }
+    None
+}
+
+/// Minimal config written to `./ergo.toml` on first run when no config file
+/// was found in any search location. Testnet, full archival node, IPv6
+/// listener — data_dir falls through to the in-pwd `./ergo-node-data`
+/// default. For the full annotated reference see `ergo.toml.example`.
+const COLD_BOOTSTRAP_CONFIG: &str = r#"# Ergo Node Rust — cold-bootstrap config
+#
+# Auto-written on first run when no config file was found. Safe to edit.
+# For the full annotated reference (every option, with defaults), see
+# ergo.toml.example shipped with the tarball, or at
+# /usr/share/doc/ergo-node-rust/examples/ on a .deb install.
+
+[proxy]
+network = "testnet"
+
+[listen.ipv6]
+address = "[::]:9030"
+mode = "full"
+max_inbound = 20
+
+[outbound]
+min_peers = 3
+max_peers = 10
+seed_peers = [
+    "213.239.193.208:9023",
+    "128.253.41.110:9020",
+    "176.9.15.237:9021",
+]
+
+[identity]
+agent_name = "ergo-node-rust"
+peer_name = "ergo-node-rust"
+protocol_version = "6.0.3"
+"#;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -1236,9 +1308,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // hidden from --help. Takes the same config path arg as the daemon so
     // the data_dir is resolved consistently.
     if args.iter().any(|a| a == "--reset-scores-migration") {
-        let config_path = args.iter().find(|a| !a.starts_with("--") && !a.ends_with("ergo-node-rust"))
-            .cloned()
-            .unwrap_or_else(|| "ergo.toml".to_string());
+        let config_path = locate_config(&args).ok_or_else(|| -> Box<dyn std::error::Error> {
+            "no config found (pass an explicit path, or place one at ./ergo.toml, \
+             ~/.config/ergo-node/ergo.toml, or /etc/ergo-node/ergo.toml)".into()
+        })?;
         let config_content = std::fs::read_to_string(&config_path)?;
         let root_config: RootConfig = toml::from_str(&config_content)?;
         let node_config = root_config.node.unwrap_or_default();
@@ -1250,9 +1323,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let config_path = args.get(1)
-        .cloned()
-        .unwrap_or_else(|| "ergo.toml".to_string());
+    let config_path = match locate_config(&args) {
+        Some(p) => p,
+        None => {
+            std::fs::write("./ergo.toml", COLD_BOOTSTRAP_CONFIG)?;
+            tracing::warn!(
+                written = "./ergo.toml",
+                search_paths = "./ergo.toml, ~/.config/ergo-node/ergo.toml, /etc/ergo-node/ergo.toml",
+                "no config found — wrote a default (testnet, full archival, state in ./ergo-node-data). \
+                 Edit ./ergo.toml or run ./install.sh for interactive setup."
+            );
+            "./ergo.toml".to_string()
+        }
+    };
 
     let config = enr_p2p::config::Config::load(&config_path)?;
 

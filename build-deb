@@ -20,7 +20,7 @@ cp target/release/sharpen "target/${PKG}/usr/bin/"
 strip "target/${PKG}/usr/bin/ergo-node-rust"
 strip "target/${PKG}/usr/bin/sharpen"
 
-cp ergo.toml "target/${PKG}/etc/ergo-node/ergo.toml"
+cp deploy/ergo.toml "target/${PKG}/etc/ergo-node/ergo.toml"
 
 cp deploy/ergo-node-rust.service "target/${PKG}/usr/lib/systemd/system/"
 
@@ -35,9 +35,11 @@ cp man/ergo-node-rust.conf.5.gz "target/${PKG}/usr/share/man/man5/"
 cp man/ergo-node-rust.8.gz "target/${PKG}/usr/share/man/man8/"
 cp man/sharpen.8.gz "target/${PKG}/usr/share/man/man8/"
 
-# RRD harness scripts ship as examples — operator-editable reference
-# tooling, not part of the active system. Suggests rrdtool.
+# Reference materials shipped under /usr/share/doc/ergo-node-rust/examples/:
+# the full annotated config (every supported option, commented with its
+# default) and the RRD harness scripts for operator-editable monitoring.
 mkdir -p "target/${PKG}/usr/share/doc/ergo-node-rust/examples"
+cp ergo.toml.example "target/${PKG}/usr/share/doc/ergo-node-rust/examples/"
 cp tools/rrd-create.sh tools/rrd-update.sh tools/rrd-graph.sh tools/rrd-demo-fill.sh \
     "target/${PKG}/usr/share/doc/ergo-node-rust/examples/"
 

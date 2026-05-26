@@ -1,0 +1,272 @@
+# Ergo Node Rust — Example configuration
+#
+# This is the documented reference for every supported option. To use it,
+# copy to ./ergo.toml in the directory you run the binary from, or to one
+# of the search paths:
+#
+#   ./ergo.toml                       (current working directory)
+#   ~/.config/ergo-node/ergo.toml     (user-scoped)
+#   /etc/ergo-node/ergo.toml          (system-wide, via .deb)
+#
+# The binary picks the first one it finds, in that order. The `.deb`
+# package ships its own minimal /etc/ergo-node/ergo.toml that overrides
+# only what the system-install path needs and inherits the defaults
+# below for everything else.
+#
+# Alternatively, run `./install.sh` (shipped in the tarball) for an
+# interactive setup that writes a working ./ergo.toml.
+#
+# Settings map to the JVM reference node's application.conf where
+# applicable. Commented-out values show the built-in default.
+
+[proxy]
+# Network: "testnet" or "mainnet". Switching requires reconfiguring
+# `seed_peers` below to peers on the same network.
+network = "testnet"
+
+# ── Listeners ───────────────────────────────────────────────────────────
+#
+# At least one of [listen.ipv4] or [listen.ipv6] is required. IPv6 is
+# preferred where the operator has a routable address.
+#
+# mode = "full" advertises the node as a full archival peer and forwards
+# all messages. mode = "light" advertises as NiPoPoW-bootstrapped and
+# gossips a reduced subset. Light mode pairs with state_type = "light".
+
+[listen.ipv6]
+address = "[::]:9030"
+mode = "full"
+max_inbound = 20
+
+# [listen.ipv4]
+# address = "0.0.0.0:9030"
+# mode = "full"
+# max_inbound = 20
+
+[outbound]
+min_peers = 3
+max_peers = 10
+seed_peers = [
+    # Testnet:
+    "213.239.193.208:9023",
+    "128.253.41.110:9020",
+    "176.9.15.237:9021",
+    # Mainnet (uncomment if `network = "mainnet"` above):
+    # "213.239.193.208:9030",
+    # "159.65.11.55:9030",
+    # "165.227.26.175:9030",
+    # "159.89.116.15:9030",
+    # "136.244.110.145:9030",
+    # "94.130.108.35:9030",
+    # "221.165.214.185:9030",
+    # "217.182.197.196:9030",
+    # "173.212.220.9:9030",
+    # "213.152.106.56:9030",
+    # "[2001:41d0:700:6662::]:29031",
+]
+
+[identity]
+agent_name = "ergo-node-rust"
+peer_name = "ergo-node-rust"
+protocol_version = "6.0.3"
+
+# ── Node behavior ───────────────────────────────────────────────────────
+#
+# All [node] options are optional. Defaults shown after the `=`.
+
+[node]
+# Persistent storage directory. Holds the redb databases (modifiers.redb,
+# state.redb) and per-component subdirectories. Created on first run if
+# it doesn't exist.
+# data_dir = "./ergo-node-data"
+
+# State type:
+#   "utxo"   — full UTXO set, can mine and validate everything (default)
+#   "digest" — state root hash only, smaller footprint, can't mine
+#   "light"  — NiPoPoW-bootstrapped, headers + sliding window
+# state_type = "utxo"
+
+# Validate transactions during sync. Requires state_type = "utxo".
+# verify_transactions = true
+
+# Block history retention:
+#   -1 = keep all blocks from genesis (full archival)
+#    0 = keep only the at-tip working set (pruned)
+#  >=1 = keep the last N blocks (pruned with a retention window)
+# blocks_to_keep = -1
+
+# Re-validate all stored blocks from genesis on startup. Keeps headers
+# and sections — no re-download.
+# revalidate = false
+
+# ErgoScript validation checkpoint. Blocks at or below this height skip
+# script evaluation (AD proof verification alone is sufficient). 0 =
+# validate everything. Default (when unset): tip - 100.
+# checkpoint_height =
+
+# Bootstrap UTXO state from a peer snapshot instead of replaying blocks.
+# utxo_bootstrap = false
+
+# Minimum peers announcing the same snapshot before downloading.
+# min_snapshot_peers = 2
+
+# How many UTXO snapshots to keep for serving (0 = disabled).
+# storing_snapshots = 0
+
+# Blocks between snapshot creation points (52224 ≈ 72 days).
+# snapshot_interval = 52224
+
+# Maximum transactions in the mempool.
+# mempool_capacity = 1000
+
+# Minimum fee in nanoERG to enter the mempool (1,000,000 = 0.001 ERG).
+# min_fee = 1000000
+
+# REST API bind address. Defaults depend on network:
+#   mainnet → 0.0.0.0:9052
+#   testnet → 0.0.0.0:9053
+# api_address = "0.0.0.0:9053"
+
+# Auto-spawn `ergo-fastsync` on startup if the binary is in PATH.
+# Fastsync downloads headers/blocks over HTTP from JVM peers — typically
+# 5–10× faster than P2P for cold-start sync.
+# fastsync = true
+
+# Override peer URL for fastsync instead of auto-discovering via
+# /peers/api-urls.
+# fastsync_peer = "http://213.239.193.208:9053"
+
+# Minimum gap (peer_tip − local_height) that triggers fastsync. Below
+# this, boot proceeds directly to P2P sync.
+# fastsync_threshold_blocks = 25000
+
+# How long to wait at boot for the first peer SyncInfo before deciding
+# whether to fastsync.
+# fastsync_peer_wait_timeout_sec = 30
+
+# ── Cold-sync memory (in use until chain reaches tip) ───────────────────
+
+# redb cache size in megabytes.
+# cache_mb = 256
+
+# Live-heap threshold (MB) above which the validation sweep commits the
+# redb write transaction mid-sweep. 0 disables the memory trigger and
+# falls back to flush_max_blocks alone. Default tuned to ~4 GB — the
+# point where redb's dirty-page cache starts dominating live heap.
+# flush_heap_threshold_mb = 4096
+
+# Upper bound on blocks between flushes (bounds crash-recovery work).
+# flush_max_blocks = 100
+
+# Lower bound on blocks between flushes (prevents storm-flushing).
+# flush_min_blocks = 5
+
+# ── At-tip memory mirrors (in use once chain reaches tip) ───────────────
+#
+# Once synced, per-block updates are tiny (~1 block / 2 min on mainnet).
+# These knobs allow a much smaller steady-state working set. If unset,
+# each mirror inherits its cold-sync parent (= no-op).
+
+# redb cache size at tip. Smaller = lower RSS, more disk reads on cold
+# restart while the cache rewarms.
+# synced_cache_mb =
+
+# Live-heap flush threshold at tip.
+# synced_flush_heap_threshold_mb =
+
+# Upper bound on blocks between flushes at tip.
+# synced_flush_max_blocks =
+
+# Lower bound on blocks between flushes at tip. KEEP AT 5+: lower values
+# can leak nodes across the prover's dirty-page tracking. See
+# state/src/lib.rs::update_internal.
+# synced_flush_min_blocks =
+
+# Maximum gap between state.META_BLOCK_HEIGHT and the modifier store's
+# recorded validated_height that the startup reconciliation trusts
+# without rolling state back. Larger gaps trigger a state rollback to
+# the store's recorded value. Bounded above by state.keep_versions
+# (currently 256). See facts/sync.md "Cross-DB Durability Handshake".
+# reconciliation_trust_threshold = 100
+
+# ── Mining ──────────────────────────────────────────────────────────────
+#
+# Empty miner_pk disables mining (default). Requires state_type = "utxo".
+
+# [node.mining]
+# Miner public key, hex-encoded compressed EC point (33 bytes).
+# miner_pk = ""
+#
+# Voting preferences: 3 bytes as hex. "000000" = no votes.
+# Bit positions match JVM Ergo's votes table.
+# votes = "000000"
+#
+# Reward maturity delay in blocks.
+# reward_delay = 720
+#
+# Maximum candidate lifetime before forced regeneration (seconds).
+# candidate_ttl_secs = 15
+
+# ── P2P network tuning ──────────────────────────────────────────────────
+#
+# Defaults match the JVM reference node's scorex.network values.
+
+# [network]
+# Interval between GetPeers keepalive messages.
+# get_peers_interval_secs = 120
+#
+# Timeout for modifier delivery.
+# delivery_timeout_secs = 10
+#
+# Max re-request attempts before abandoning a modifier.
+# max_delivery_checks = 100
+#
+# Desired number of modifier IDs per Inv/Request batch.
+# desired_inv_objects = 400
+#
+# Maximum PeerSpec objects in one Peers message.
+# max_peer_spec_objects = 64
+#
+# Handshake timeout.
+# handshake_timeout_secs = 30
+#
+# Drop connections inactive for this duration.
+# inactive_connection_deadline_secs = 600
+#
+# Default temporary ban duration in minutes.
+# temporal_ban_duration_mins = 60
+
+# ── UPnP port mapping (IPv4 only — IPv6 is globally routable) ───────────
+
+# [upnp]
+# enabled = false
+# discover_timeout_secs = 5
+
+# ── Operator stats endpoint (opt-in) ────────────────────────────────────
+#
+# Cumulative P2P traffic counters at /stats/p2p, separate from the public
+# REST API. Loopback-only by default; no authentication. Consumed by
+# external tooling (e.g. the Ergo Node Doctor adapter) and the RRD
+# harness under tools/. Schema in facts/stats.md.
+#
+# Uncomment the section header to enable. The listener doesn't start
+# while the section is absent.
+
+# [stats]
+# bind_address = "127.0.0.1:9055"
+
+# ── P2P wire capture (opt-in, diagnostic) ───────────────────────────────
+#
+# File-backed mmap ring of pcap-formatted P2P frames. Three HTTP
+# endpoints under /debug/p2p-capture/ expose info/dump/reset. Off by
+# default. When enabled, `path` is required — pick a filesystem with
+# enough free space. Include/exclude IP filters are mutually exclusive;
+# leave both empty for no filter. See facts/p2p-capture.md.
+
+# [debug.p2p_capture]
+# enabled = true
+# path = "./capture.ring"
+# size_mb = 1024
+# sync_interval_secs = 60
+# include_ips = []
+# exclude_ips = []

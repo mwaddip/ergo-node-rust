@@ -70,5 +70,93 @@ EOF
     ls -lh "target/${pkg}.tar.gz"
 }
 
-build_addon "indexer" "ergo-indexer"
+# Indexer bundle: two binaries (ergo-indexer + ergo-indexer-migratedb),
+# the annotated config example, and the interactive setup script. Diverges
+# enough from the generic addon shape to warrant its own function.
+build_indexer_bundle() {
+    local version pkg
+    version=$(grep '^version' "addons/indexer/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+    pkg="ergo-indexer-${version}-linux-${TARGET_ARCH}"
+
+    echo ""
+    echo "=== Building ${pkg}.tar.gz ==="
+    (cd "addons/indexer" && cargo build --release)
+
+    rm -rf "target/${pkg}"
+    mkdir -p "target/${pkg}"
+
+    cp "addons/indexer/target/release/ergo-indexer" "target/${pkg}/ergo-indexer"
+    cp "addons/indexer/target/release/ergo-indexer-migratedb" "target/${pkg}/ergo-indexer-migratedb"
+    strip "target/${pkg}/ergo-indexer"
+    strip "target/${pkg}/ergo-indexer-migratedb"
+
+    cp ergo-indexer.toml.example "target/${pkg}/ergo-indexer.toml.example"
+    cp indexer-install.sh "target/${pkg}/indexer-install.sh"
+
+    cat > "target/${pkg}/INSTALL.md" <<'EOF'
+# ergo-indexer — manual install
+
+Portable Linux build of the `ergo-indexer` blockchain indexer for
+`ergo-node-rust`. Runs alongside a node — pulls blocks via the
+node's HTTP API and exposes a rich query API over SQLite or
+PostgreSQL.
+
+## Quick start (interactive)
+
+```sh
+./indexer-install.sh
+./ergo-indexer --config indexer.toml
+```
+
+`indexer-install.sh` asks a handful of questions (node URL, backend,
+DB path or connection URL, API bind) and writes a working
+`./indexer.toml`.
+
+## Full option reference
+
+`ergo-indexer.toml.example` documents every supported option with
+its default. `storage.db` is required — the indexer refuses to
+start without it.
+
+## Schema migration
+
+`ergo-indexer-migratedb` is a bidirectional SQLite ↔ PostgreSQL
+migrator with hash-verified per-block writes, `--resume` support,
+and `--update-config` to rewrite the config file's `storage.db`
+after a successful migration.
+
+```sh
+./ergo-indexer-migratedb \
+    --source sqlite:///var/lib/ergo-indexer/indexer.db \
+    --target postgres://localhost/ergo_indexer
+```
+
+See `./ergo-indexer-migratedb --help` for the full flag set.
+
+## System install
+
+```sh
+sudo install -m 755 ergo-indexer /usr/bin/ergo-indexer
+sudo install -m 755 ergo-indexer-migratedb /usr/bin/ergo-indexer-migratedb
+```
+
+Run under the same systemd unit pattern as the main node if you
+want the indexer supervised — see the main `ergo-node-rust` service
+file for a template.
+
+## See also
+
+The `.deb` package automates the systemd install. See
+<https://github.com/mwaddip/ergo-node-rust/tree/main/addons/indexer>
+for project documentation.
+EOF
+
+    tar -czf "target/${pkg}.tar.gz" -C target "${pkg}"
+    rm -rf "target/${pkg}"
+
+    echo "Built: target/${pkg}.tar.gz"
+    ls -lh "target/${pkg}.tar.gz"
+}
+
+build_indexer_bundle
 build_addon "fastsync" "ergo-fastsync"

@@ -1,0 +1,49 @@
+# Ergo Node Rust Indexer — Example configuration
+#
+# Copy or rename to indexer.toml (or use `--config <path>`) and start the
+# indexer with `./ergo-indexer --config indexer.toml`.
+#
+# The .deb package installs to /etc/ergo-node/indexer.toml. The binary
+# also honors INDEXER_CONFIG=<path> as an env override. Precedence:
+# `--config` CLI > INDEXER_CONFIG env > /etc/ergo-node/indexer.toml.
+#
+# Per-key precedence (low → high): defaults < this file < CLI flags.
+# Libpq env vars (PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE,
+# PGSSLMODE) layer on top of the resolved Postgres URL at connection
+# time.
+#
+# `storage.db` is REQUIRED — there is no built-in default. The indexer
+# refuses to start if neither this file nor the CLI sets it.
+#
+# Run `./indexer-install.sh` (shipped in the tarball) for an interactive
+# setup that writes a working ./indexer.toml.
+
+[node]
+# URL of the running ergo-node-rust HTTP API. The indexer pulls blocks
+# from this endpoint; an unreachable node is a fatal startup error.
+# url = "http://127.0.0.1:9052"
+
+[storage]
+# Database target. REQUIRED.
+#
+# SQLite (local file, single-writer):
+#   db = "sqlite:///var/lib/ergo-indexer/indexer.db"
+#   db = "sqlite://./ergo-indexer-data/indexer.db"
+#
+# PostgreSQL (libpq env vars override matching components at connect time):
+#   db = "postgres://user:pass@host:5432/dbname"
+#   db = "postgres://localhost/ergo_indexer"          # libpq env fills in
+db = "sqlite://./ergo-indexer-data/indexer.db"
+
+[api]
+# REST API bind address. Default 127.0.0.1:8080 (loopback). Operators
+# fronting it with nginx/Caddy typically keep this loopback; direct
+# exposure should use 0.0.0.0 and a firewall.
+# bind = "127.0.0.1:8080"
+
+[sync]
+# Override the starting block height for backfill. Default: resume from
+# the highest indexed block, or 1 if none. Setting this lower will
+# re-index already-indexed blocks (idempotent but slow). Setting it
+# higher skips early blocks — only do this if you're sure.
+# start_height =
