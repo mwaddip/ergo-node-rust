@@ -144,12 +144,32 @@ flush_heap_threshold_mb = 2048
 # with the smaller cache (~ms pause). Omit to keep cold-sync values.
 synced_cache_mb = 256
 synced_flush_heap_threshold_mb = 512
-synced_flush_max_blocks = 5
-synced_flush_min_blocks = 1
+synced_flush_max_blocks = 10
+synced_flush_min_blocks = 5
 ```
 
-See `mainnet.toml` for a full annotated example, or
-`man ergo-node-rust.conf` for every key with its default.
+See `ergo.toml.example` for the full annotated reference (every
+supported option with its default), or `man ergo-node-rust.conf` for
+the per-key syntax.
+
+## Documentation
+
+Operator-facing documentation lives under `docs/`:
+
+- [`docs/operator-guide.md`](docs/operator-guide.md) — install,
+  configure, first run, verify, common tasks, indexer/mining,
+  troubleshooting (task-oriented)
+- [`docs/operations-manual.md`](docs/operations-manual.md) —
+  networking, memory tuning, storage and retention, logging,
+  monitoring, recovery, snapshots, voting, upgrades, security,
+  backups (topic-oriented reference)
+- [`facts/openapi.yaml`](facts/openapi.yaml) — full REST API
+  schema (OpenAPI 3.1, 43 endpoints). View via Swagger Editor,
+  Redoc, or any OpenAPI viewer.
+- [`facts/api.md`](facts/api.md) — cross-cutting API rationale
+  (auth surface, JVM compatibility, error model, naming)
+- `man ergo-node-rust(8)`, `man ergo-node-rust.conf(5)`,
+  `man sharpen(8)` — installed by the `.deb` package
 
 ## Upstream dependencies
 
