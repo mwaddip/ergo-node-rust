@@ -1,0 +1,2387 @@
+openapi: 3.1.0
+info:
+  title: Ergo Node Rust REST API
+  version: 0.6.5
+  description: |
+    REST surface exposed by the `api/` crate. Most endpoints aim for byte- or
+    shape-compatibility with the JVM reference node (`ergoplatform/ergo`) so
+    existing wallets, miners, and explorer tooling work without modification.
+    Cross-cutting rationale (auth model, JVM compatibility levels, error model,
+    naming conventions) lives in `facts/api.md`. This document specifies the
+    per-endpoint contract: paths, parameters, request and response bodies, and
+    documented status codes.
+
+    Compatibility levels used in endpoint descriptions:
+    - `full`     — byte-equivalent with the JVM node.
+    - `partial`  — response shape matches the JVM node; minor edge cases may
+      differ (typically because the underlying component returns slightly
+      different metadata).
+    - `deviation`— Rust-specific behavior; the description names what differs.
+
+    Endpoints with `x-rust-only: true` have no JVM counterpart at all and are
+    specific to this implementation (memory diagnostics, p2p capture, operator
+    stats, canonical-byte fragments for cross-validators, REST modifier ingest).
+  license:
+    name: CC0-1.0
+  contact:
+    name: ergo-node-rust
+    url: https://github.com/mwaddip/ergo-node-rust
+
+servers:
+  - url: http://127.0.0.1:9053
+    description: |
+      Default public REST API bind on mainnet. Configured via
+      `[node.api].bind_address`. Holds every path except `/stats/p2p`.
+  - url: http://127.0.0.1:9055
+    description: |
+      Default operator stats listener bind. Separate process-level listener,
+      loopback-only by default. Holds `/stats/p2p` only. Started only when the
+      operator config includes a `[stats]` section.
+
+tags:
+  - name: info
+    description: Node status and synchronous probes.
+  - name: blocks
+    description: Block headers, full blocks, block sections, modifier lookups.
+  - name: transactions
+    description: Mempool submission and unconfirmed-pool queries.
+  - name: utxo
+    description: Box lookups against the confirmed UTXO set and mempool outputs.
+  - name: peers
+    description: Connected and known peer state, manual peer-connect.
+  - name: emission
+    description: Emission-schedule computations.
+  - name: nipopow
+    description: NiPoPoW proofs and per-header PoPoW views.
+  - name: mining
+    description: Mining-candidate polling and solution submission.
+  - name: debug
+    description: Operator diagnostics (memory, p2p capture). Rust-specific.
+  - name: stats
+    description: Operator stats endpoint (separate listener, loopback by default).
+  - name: ingest
+    description: Localhost-only modifier ingest path. Rust-specific.
+  - name: rust-only
+    description: Marks endpoints with no JVM counterpart.
+
+paths:
+  # -------------------------------------------------------------------------
+  # Node information
+  # -------------------------------------------------------------------------
+  /info:
+    get:
+      tags: [info]
+      summary: Node status and chain state.
+      description: |
+        Compatibility: `partial`. Field set is JVM-compatible with the
+        additions `downloadedHeight`, `journalEventsVersion`, and (when the
+        operator stats endpoint is enabled) `statsVersion`.
+
+        `downloadedHeight` is the highest height for which all required block
+        sections are present in the store; distinct from `fullHeight`
+        (validated). Used by fastsync to avoid re-fetching sections after a
+        state wipe.
+      operationId: getInfo
+      responses:
+        '200':
+          description: Node info.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeInfo'
+
+  /info/wait:
+    get:
+      tags: [info, rust-only]
+      summary: Long-poll until validated height exceeds the threshold.
+      description: |
+        Compatibility: `deviation`. JVM does not provide a long-poll variant
+        of `/info`. Returns when `fullHeight > after`, or 204 No Content when
+        the 30-second deadline fires first.
+      operationId: getInfoWait
+      x-rust-only: true
+      parameters:
+        - name: after
+          in: query
+          required: true
+          description: Wait until validated height strictly exceeds this value.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        '200':
+          description: Node info (same shape as `GET /info`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeInfo'
+        '204':
+          description: Deadline (30s) fired before `fullHeight > after`.
+
+  # -------------------------------------------------------------------------
+  # Blocks
+  # -------------------------------------------------------------------------
+  /blocks:
+    get:
+      tags: [blocks]
+      summary: List block header IDs from the tip, newest first.
+      description: |
+        Compatibility: `full`. Returns an array of hex-encoded header IDs.
+      operationId: getBlocks
+      parameters:
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Header IDs, newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/HexId32'
+
+  /blocks/at/{height}:
+    get:
+      tags: [blocks]
+      summary: Block header IDs at a specific height.
+      description: |
+        Compatibility: `partial`. JVM may return multiple IDs during a
+        temporary fork; this implementation returns at most one (the
+        canonical chain header at that height) wrapped in a single-element
+        array for shape compatibility.
+      operationId: getBlockIdsAtHeight
+      parameters:
+        - name: height
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        '200':
+          description: Single-element array of header IDs.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/HexId32'
+        '404':
+          description: No block at this height.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /blocks/modifier/{modifier_id}:
+    get:
+      tags: [blocks]
+      summary: Fetch any modifier by ID across types (101 / 102 / 104 / 108).
+      description: |
+        Compatibility: `full`. Resolves the modifier by iterating header,
+        block transactions, AD proofs, and extension type tables; returns
+        the first match. Useful for forensics and generic explorer tooling.
+      operationId: getBlockModifier
+      parameters:
+        - name: modifier_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/HexId32'
+      responses:
+        '200':
+          description: Modifier as JSON; shape depends on the underlying type.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/Header'
+                  - $ref: '#/components/schemas/BlockTransactionsSection'
+                  - $ref: '#/components/schemas/AdProofsSection'
+                  - $ref: '#/components/schemas/ExtensionSection'
+        '404':
+          description: Modifier not found in any of the four type tables.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '500':
+          description: Stored modifier failed to parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /blocks/lastHeaders/{count}:
+    get:
+      tags: [blocks]
+      summary: Last N block headers, newest first.
+      description: |
+        Compatibility: `full`. `count` is capped at 100.
+      operationId: getLastHeaders
+      parameters:
+        - name: count
+          in: path
+          required: true
+          description: Maximum number of headers to return (capped at 100).
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            maximum: 100
+      responses:
+        '200':
+          description: Headers from the tip descending.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Header'
+
+  /blocks/{header_id}:
+    get:
+      tags: [blocks]
+      summary: Full block (header + transactions + adProofs + extension).
+      description: |
+        Compatibility: `full`. JVM-compatible `ErgoFullBlock` shape. `adProofs`
+        is `null` when not stored (digest-mode peers may omit AD proofs).
+      operationId: getFullBlock
+      parameters:
+        - $ref: '#/components/parameters/HeaderIdPath'
+      responses:
+        '200':
+          description: Full block.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FullBlock'
+        '404':
+          description: Header or transactions or extension not found in store.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '500':
+          description: A stored section failed to parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /blocks/{header_id}/header:
+    get:
+      tags: [blocks]
+      summary: Block header only.
+      description: |
+        Compatibility: `full`.
+      operationId: getBlockHeader
+      parameters:
+        - $ref: '#/components/parameters/HeaderIdPath'
+      responses:
+        '200':
+          description: Header.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Header'
+        '404':
+          description: Header not in chain.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /blocks/{header_id}/transactions:
+    get:
+      tags: [blocks]
+      summary: Transactions in a block.
+      description: |
+        Compatibility: `full`. Returns `{ headerId, transactions }`.
+      operationId: getBlockTransactions
+      parameters:
+        - $ref: '#/components/parameters/HeaderIdPath'
+      responses:
+        '200':
+          description: Block transactions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [headerId, transactions]
+                properties:
+                  headerId:
+                    $ref: '#/components/schemas/HexId32'
+                  transactions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Transaction'
+        '404':
+          description: Header not found or transactions section not stored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '500':
+          description: Stored transactions failed to parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /blocks/{header_id}/validation-fragments:
+    get:
+      tags: [blocks, rust-only]
+      summary: Per-block canonical byte fragments for cross-validators.
+      description: |
+        Compatibility: `deviation`. No JVM counterpart. Designed for external
+        tools (independent serializers, validation harnesses) that need
+        byte-exact pairing with the node's internal representation.
+
+        Response is index-aligned with `GET /blocks/{header_id}`:
+        `transactions[i]` here pairs with `transactions[i]` there.
+
+        `parameters` is `null` when the block's extension's parameter-vote
+        encoding fails to parse (most commonly for very early version-1
+        blocks). The node does NOT substitute `Parameters::default()` —
+        the client owns the fallback policy.
+
+        `signingMessage` is `Transaction::bytes_to_sign()`, NOT the full
+        canonical transaction bytes. This is what every input signature
+        commits to.
+
+        Uses a different error body shape than the standard `ApiError`: an
+        object with a short `error` code string plus context fields
+        (`headerId` / `message`), matching the cross-validator harness's
+        parser.
+      operationId: getBlockValidationFragments
+      x-rust-only: true
+      parameters:
+        - $ref: '#/components/parameters/HeaderIdPath'
+      responses:
+        '200':
+          description: Canonical byte fragments.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationFragments'
+        '400':
+          description: Header ID not parseable as 32-byte hex.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationFragmentsError'
+        '404':
+          description: Header not in chain.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationFragmentsError'
+        '410':
+          description: Block was pruned (`blocks_to_keep` enabled).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationFragmentsError'
+        '500':
+          description: Stored sections failed to parse or serialize.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationFragmentsError'
+
+  # -------------------------------------------------------------------------
+  # Transactions
+  # -------------------------------------------------------------------------
+  /transactions:
+    post:
+      tags: [transactions]
+      summary: Submit a transaction to the mempool and broadcast to peers.
+      description: |
+        Compatibility: `full`. Local submissions bypass mempool rate limiting.
+        HTTP-level rate limiting (per-IP) is a deployment concern, not
+        enforced by the node.
+      operationId: postTransaction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Transaction'
+      responses:
+        '200':
+          description: Accepted. Body is the hex-encoded transaction ID (JSON string).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HexId32'
+        '400':
+          description: Validation failure (invalid script, double-spend conflict, declined, etc.).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '503':
+          description: Node still syncing — cannot validate transactions yet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /transactions/check:
+    post:
+      tags: [transactions]
+      summary: Validate a transaction without adding to mempool or broadcasting.
+      description: |
+        Compatibility: `full`. Same validation as `POST /transactions`,
+        discards the result.
+      operationId: checkTransaction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Transaction'
+      responses:
+        '200':
+          description: Transaction is valid. Body is the hex-encoded ID.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HexId32'
+        '400':
+          description: Validation failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '503':
+          description: Node still syncing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /transactions/unconfirmed:
+    get:
+      tags: [transactions]
+      summary: List unconfirmed transactions from the mempool.
+      description: |
+        Compatibility: `partial`. Ordered by priority (highest fee weight
+        first). `limit` capped at 100; `offset` capped at 100,000.
+      operationId: getUnconfirmed
+      parameters:
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Mempool transactions.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Transaction'
+
+  /transactions/unconfirmed/transactionIds:
+    get:
+      tags: [transactions]
+      summary: All unconfirmed transaction IDs.
+      description: 'Compatibility: `full`.'
+      operationId: getUnconfirmedIds
+      responses:
+        '200':
+          description: Transaction IDs.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/HexId32'
+
+  /transactions/unconfirmed/{tx_id}:
+    head:
+      tags: [transactions]
+      summary: Check if a transaction is in the mempool.
+      description: |
+        Compatibility: `full`. HEAD returns status only (no body). Malformed
+        hex IDs are mapped to 404 (HEAD has no body for a reason field).
+      operationId: headUnconfirmed
+      parameters:
+        - name: tx_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/HexId32'
+      responses:
+        '200':
+          description: Transaction is in the mempool.
+        '404':
+          description: Transaction not in the mempool (or malformed hex).
+
+  /transactions/unconfirmed/byTransactionId/{tx_id}:
+    get:
+      tags: [transactions]
+      summary: Single unconfirmed transaction by ID.
+      description: 'Compatibility: `full`.'
+      operationId: getUnconfirmedById
+      parameters:
+        - name: tx_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/HexId32'
+      responses:
+        '200':
+          description: Transaction.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        '404':
+          description: Not in mempool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '500':
+          description: Serialization failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /transactions/getFee:
+    get:
+      tags: [transactions]
+      summary: Recommended fee for a target confirmation time.
+      description: |
+        Compatibility: `full`. `waitTime` is in blocks (capped at 100);
+        `txSize` is in bytes (capped at 1,000,000). Returns the recommended
+        fee in nanoERG. Internal conversion uses a target block time of
+        ~2 minutes.
+      operationId: getRecommendedFee
+      parameters:
+        - name: waitTime
+          in: query
+          description: Target wait time in blocks.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            maximum: 100
+            default: 1
+        - name: txSize
+          in: query
+          description: Transaction size in bytes.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            maximum: 1000000
+            default: 100
+      responses:
+        '200':
+          description: Recommended fee (nanoERG).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FeeResponse'
+        '400':
+          description: Insufficient fee history to compute a recommendation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /transactions/waitTime:
+    get:
+      tags: [transactions]
+      summary: Expected confirmation wait time for a given fee.
+      description: |
+        Compatibility: `full`. `fee` is in nanoERG; `txSize` is in bytes
+        (capped at 1,000,000). Returns the expected wait time in blocks
+        (target block time ~2 minutes used for ms→blocks conversion).
+      operationId: getWaitTime
+      parameters:
+        - name: fee
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+        - name: txSize
+          in: query
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            maximum: 1000000
+            default: 100
+      responses:
+        '200':
+          description: Expected wait time (blocks).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WaitTimeResponse'
+        '400':
+          description: Insufficient fee history.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /transactions/poolHistogram:
+    get:
+      tags: [transactions]
+      summary: Fee distribution histogram of the mempool.
+      description: |
+        Compatibility: `partial`. `bins` is the number of histogram buckets
+        (default 10, capped at 50). Each entry has a min/max fee range and
+        a count.
+      operationId: getPoolHistogram
+      parameters:
+        - name: bins
+          in: query
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            maximum: 50
+            default: 10
+      responses:
+        '200':
+          description: Fee histogram.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/FeeHistogramBin'
+
+  # -------------------------------------------------------------------------
+  # UTXO
+  # -------------------------------------------------------------------------
+  /utxo/byId/{box_id}:
+    get:
+      tags: [utxo]
+      summary: Look up a box in the confirmed UTXO set.
+      description: 'Compatibility: `full`.'
+      operationId: getUtxoById
+      parameters:
+        - $ref: '#/components/parameters/BoxIdPath'
+      responses:
+        '200':
+          description: Found box.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErgoBox'
+        '404':
+          description: Box not in the UTXO set (spent or never existed).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /utxo/withPool/byId/{box_id}:
+    get:
+      tags: [utxo]
+      summary: Look up a box in the UTXO set OR mempool outputs.
+      description: |
+        Compatibility: `full`. Confirmed UTXO set is checked first; on miss,
+        mempool unconfirmed outputs are checked.
+      operationId: getUtxoWithPool
+      parameters:
+        - $ref: '#/components/parameters/BoxIdPath'
+      responses:
+        '200':
+          description: Found box.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErgoBox'
+        '404':
+          description: Not found in either source.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /utxo/withPool/byIds:
+    post:
+      tags: [utxo]
+      summary: Batch lookup of boxes from UTXO set + mempool.
+      description: |
+        Compatibility: `full`. Max 100 IDs per request. Response is positional
+        — entries that are missing or whose ID is malformed are returned as
+        `null` at the same index (the whole batch is not rejected for one bad
+        ID).
+      operationId: postUtxoWithPoolByIds
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              maxItems: 100
+              items:
+                $ref: '#/components/schemas/HexId32'
+      responses:
+        '200':
+          description: Positional results, `null` for missing.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  oneOf:
+                    - $ref: '#/components/schemas/ErgoBox'
+                    - type: 'null'
+        '400':
+          description: More than 100 IDs supplied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /utxo/getSnapshotsInfo:
+    get:
+      tags: [utxo]
+      summary: UTXO snapshot manifests available on this node.
+      description: |
+        Compatibility: `full`. Discovery endpoint for non-P2P consumers
+        (the same inventory is served over P2P codes 76–81).
+      operationId: getSnapshotsInfo
+      responses:
+        '200':
+          description: Available manifests (possibly empty).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SnapshotsInfo'
+
+  # -------------------------------------------------------------------------
+  # Peers
+  # -------------------------------------------------------------------------
+  /peers/all:
+    get:
+      tags: [peers]
+      summary: All known peers (connected + disconnected).
+      description: 'Compatibility: `full`.'
+      operationId: getAllPeers
+      responses:
+        '200':
+          description: Peer list.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PeerInfoEntry'
+
+  /peers/connected:
+    get:
+      tags: [peers]
+      summary: Connected peers count.
+      description: |
+        Compatibility: `deviation`. JVM returns the list of connected peer
+        objects; this implementation returns only the count
+        (`{ "connectedPeers": N }`). Operators needing per-peer detail
+        should use `GET /peers/all` and filter where
+        `connectionType != null`.
+      operationId: getConnectedPeers
+      responses:
+        '200':
+          description: Connected peer count.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [connectedPeers]
+                properties:
+                  connectedPeers:
+                    type: integer
+                    format: int64
+                    minimum: 0
+
+  /peers/status:
+    get:
+      tags: [peers]
+      summary: Network status summary.
+      description: |
+        Compatibility: `full`. Both timestamps are Unix epoch milliseconds.
+        `lastIncomingMessage` is `null` if the node has not yet received a
+        peer message.
+      operationId: getPeersStatus
+      responses:
+        '200':
+          description: Status summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PeerStatus'
+
+  /peers/blacklisted:
+    get:
+      tags: [peers]
+      summary: Currently penalty-banned peers.
+      description: |
+        Compatibility: `full`. Wraps the penalty store; surfaces the
+        misbehavior tracker to operators.
+      operationId: getBlacklistedPeers
+      responses:
+        '200':
+          description: Banned peer addresses (`host:port`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PeersBlacklisted'
+
+  /peers/connect:
+    post:
+      tags: [peers]
+      summary: Manually initiate an outbound connection to a peer.
+      description: |
+        Compatibility: `full`. Authenticated when `api_key` is configured.
+        Request body is a JSON string `"host:port"` (raw text without quotes
+        also accepted). Fire-and-forget — success means "queued"; the
+        outbound manager performs the actual connect attempt asynchronously.
+      operationId: postPeersConnect
+      security:
+        - apiKeyHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: string
+              description: Socket address as `"host:port"`.
+              example: '"1.2.3.4:9030"'
+      responses:
+        '200':
+          description: Connection attempt queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [queued]
+        '400':
+          description: Malformed address or peer-manager rejection (already connecting, banned, etc.).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: API key required or invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /peers/api-urls:
+    get:
+      tags: [peers]
+      summary: Connected peers' REST URLs (security-filtered).
+      description: |
+        Compatibility: `deviation`. Returns the `restApiUrl` advertised by
+        each connected peer in its handshake, but ONLY when the URL's host
+        component matches the peer's connecting socket IP. DNS-name URLs
+        and host-mismatch URLs are dropped to defeat advertisement
+        poisoning.
+      operationId: getPeerApiUrls
+      responses:
+        '200':
+          description: Per-peer REST URLs.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PeerApiUrl'
+
+  # -------------------------------------------------------------------------
+  # Modifier ingest (rust-only)
+  # -------------------------------------------------------------------------
+  /ingest/modifiers:
+    post:
+      tags: [ingest, rust-only]
+      summary: Localhost-only modifier ingest.
+      description: |
+        Compatibility: `deviation`. No JVM counterpart. Accepts a custom
+        binary stream of modifiers from a co-located process (e.g., fastsync
+        loader) and feeds them into the validation pipeline.
+
+        Wire format (concatenated, repeats until the body ends):
+        `[type_id: u8][modifier_id: 32B][data_len: u32 BE][data: data_len B]`.
+
+        Rejected with 403 when the request comes from any non-loopback
+        address.
+      operationId: postIngestModifiers
+      x-rust-only: true
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              description: Custom binary stream — see the wire format above.
+      responses:
+        '200':
+          description: All modifiers queued for the pipeline.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [accepted]
+                properties:
+                  accepted:
+                    type: integer
+                    format: int64
+                    minimum: 0
+        '400':
+          description: Truncated header or truncated payload at the named offset.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Request originated from a non-loopback address.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '503':
+          description: Pipeline channel full or modifier sender not wired in.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  # -------------------------------------------------------------------------
+  # Emission
+  # -------------------------------------------------------------------------
+  /emission/at/{height}:
+    get:
+      tags: [emission]
+      summary: Emission schedule data at a given height.
+      description: |
+        Compatibility: `full`. Pure calculation against `EmissionRules`; no
+        chain or state access. Height is capped at 2,100,000 (slightly past
+        the protocol's emission end) to defend the O(height) summing loop
+        against DoS.
+      operationId: getEmissionAt
+      parameters:
+        - name: height
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            maximum: 2100000
+      responses:
+        '200':
+          description: Emission data.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmissionInfo'
+        '400':
+          description: Height exceeds the maximum.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  # -------------------------------------------------------------------------
+  # NiPoPoW
+  # -------------------------------------------------------------------------
+  /nipopow/proof/{m}/{k}:
+    get:
+      tags: [nipopow]
+      summary: NiPoPoW proof anchored at the chain tip.
+      description: |
+        Compatibility: `full`. `m` and `k` are bounded by the chain-side
+        limit (256). The Rust response also carries a `continuous: false`
+        field which the JVM emits but the Rust `NipopowProof` struct does
+        not internally carry — flattened in by the handler. The chain
+        currently never produces continuous-mode proofs.
+      operationId: getNipopowProof
+      parameters:
+        - $ref: '#/components/parameters/NipopowM'
+        - $ref: '#/components/parameters/NipopowK'
+      responses:
+        '200':
+          description: NiPoPoW proof.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NipopowProof'
+        '400':
+          description: '`m` or `k` out of range, or chain too short.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '500':
+          description: Chain failed to build the proof.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /nipopow/proof/{m}/{k}/{header_id}:
+    get:
+      tags: [nipopow]
+      summary: NiPoPoW proof anchored at a specific header.
+      description: |
+        Compatibility: `full`. Same as `/nipopow/proof/{m}/{k}` but anchored
+        at the given header instead of the tip. Header-id existence is
+        checked before the (potentially expensive) proof construction.
+      operationId: getNipopowProofByHeader
+      parameters:
+        - $ref: '#/components/parameters/NipopowM'
+        - $ref: '#/components/parameters/NipopowK'
+        - $ref: '#/components/parameters/HeaderIdPath'
+      responses:
+        '200':
+          description: NiPoPoW proof.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NipopowProof'
+        '400':
+          description: '`m` or `k` out of range, malformed `header_id`, or chain too short.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '404':
+          description: '`header_id` not in chain.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '500':
+          description: Chain failed to build the proof.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /nipopow/popowHeader/last:
+    get:
+      tags: [nipopow]
+      summary: PoPowHeader for the chain tip.
+      description: 'Compatibility: `full`.'
+      operationId: getPopowHeaderLast
+      responses:
+        '200':
+          description: PoPowHeader.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PoPowHeader'
+        '404':
+          description: Chain is empty (no tip).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '500':
+          description: Internal failure constructing or parsing the header.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /nipopow/popowHeader/{header_id}:
+    get:
+      tags: [nipopow]
+      summary: PoPowHeader for a specific header.
+      description: 'Compatibility: `full`.'
+      operationId: getPopowHeaderById
+      parameters:
+        - $ref: '#/components/parameters/HeaderIdPath'
+      responses:
+        '200':
+          description: PoPowHeader.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PoPowHeader'
+        '400':
+          description: Malformed header ID.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '404':
+          description: Header not in chain.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '500':
+          description: Internal failure constructing or parsing the header.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  # -------------------------------------------------------------------------
+  # Mining
+  # -------------------------------------------------------------------------
+  /mining/candidate:
+    get:
+      tags: [mining]
+      summary: Get the current mining candidate (block template).
+      description: |
+        Compatibility: `full`. Miners poll this endpoint to get work, then
+        submit solutions via `POST /mining/solution`. Cached candidate is
+        served when the chain tip is unchanged and the TTL has not expired;
+        regenerated on tip change or TTL expiry.
+      operationId: getMiningCandidate
+      responses:
+        '200':
+          description: Mining candidate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MiningCandidate'
+        '503':
+          description: |
+            Mining not configured, digest mode, or no candidate available
+            (still syncing).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /mining/solution:
+    post:
+      tags: [mining]
+      summary: Submit a mining solution (Autolykos v2 PoW).
+      description: |
+        Compatibility: `full`. Authenticated when `api_key` is configured.
+        For Autolykos v2 only the 8-byte nonce `n` is required; `pk`, `w`,
+        `d` are optional and default to the configured miner key.
+
+        Tries the solution against both the current and previous cached
+        candidates so a GPU still solving the previous template after a
+        regen still wins.
+      operationId: postMiningSolution
+      security:
+        - apiKeyHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SolutionSubmission'
+      responses:
+        '200':
+          description: Solution accepted, block submitted and broadcast.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [accepted]
+        '400':
+          description: |
+            Invalid nonce hex, wrong length, no cached candidate, or PoW
+            check failed against every available candidate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: API key required or invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '500':
+          description: |
+            Block submission, serialization, or validation pipeline error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '503':
+          description: Mining not configured or block submitter not wired in.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /mining/rewardAddress:
+    get:
+      tags: [mining]
+      summary: Miner's reward address.
+      description: |
+        Compatibility: `partial`. Currently returns the miner's public-key
+        hex string rather than a P2S address; clients that compare against
+        JVM should derive the P2S equivalent locally if needed.
+      operationId: getMiningRewardAddress
+      responses:
+        '200':
+          description: Reward address.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [rewardAddress]
+                properties:
+                  rewardAddress:
+                    type: string
+                    description: Currently the miner PK hex string.
+        '503':
+          description: Mining not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  # -------------------------------------------------------------------------
+  # Debug (rust-only)
+  # -------------------------------------------------------------------------
+  /debug/memory:
+    get:
+      tags: [debug, rust-only]
+      summary: Memory diagnostics (process + jemalloc + components).
+      description: |
+        Compatibility: `deviation`. No JVM counterpart. Combines process-level
+        counters from `/proc/self/status` + `smaps_rollup` with jemalloc
+        stats (when built with the `jemalloc` feature) and coarse component
+        breakdowns (chain header count, mempool tx count). Linux-only — on
+        other systems the process block reports zeros.
+      operationId: getDebugMemory
+      x-rust-only: true
+      responses:
+        '200':
+          description: Memory snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebugMemory'
+
+  /debug/p2p-capture/info:
+    get:
+      tags: [debug, rust-only]
+      summary: Inspect the p2p capture ring without dumping it.
+      description: |
+        Compatibility: `deviation`. No JVM counterpart. Returns the full
+        `CaptureInfo` JSON when capture is enabled; returns
+        `{"enabled": false}` (200 OK, deliberately not 404) when the
+        operator has not configured `[debug.p2p_capture]`. The 200-when-disabled
+        shape lets operators probe the feature with a single call.
+      operationId: getCaptureInfo
+      x-rust-only: true
+      responses:
+        '200':
+          description: |
+            Capture info, OR `{"enabled": false}` when the subsystem is off.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/CaptureInfo'
+                  - type: object
+                    required: [enabled]
+                    properties:
+                      enabled:
+                        type: boolean
+                        enum: [false]
+
+  /debug/p2p-capture/dump:
+    get:
+      tags: [debug, rust-only]
+      summary: Stream the capture ring as a pcap file.
+      description: |
+        Compatibility: `deviation`. No JVM counterpart. Returns a
+        chronological pcap snapshot. Filters combine with AND semantics.
+        Unlike `/info`, this returns 404 when capture is disabled — `/dump`
+        is an operation that requires the subsystem to be on.
+
+        Response carries `Content-Disposition: attachment;
+        filename="p2p-capture-YYYYMMDDTHHMMSSZ.pcap"`.
+      operationId: getCaptureDump
+      x-rust-only: true
+      parameters:
+        - name: peer
+          in: query
+          description: IPv4 or IPv6 literal; keep only records to/from this peer.
+          schema:
+            type: string
+        - name: since_secs
+          in: query
+          description: Keep only records with `ts_sec` within the last N seconds.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+        - name: direction
+          in: query
+          description: Keep only records in this direction.
+          schema:
+            type: string
+            enum: [inbound, outbound]
+      responses:
+        '200':
+          description: pcap snapshot.
+          content:
+            application/vnd.tcpdump.pcap:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Malformed `peer`, or `direction` not in {inbound, outbound}.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaptureError'
+        '404':
+          description: Capture subsystem disabled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaptureError'
+
+  /debug/p2p-capture/reset:
+    post:
+      tags: [debug, rust-only]
+      summary: Reset the capture ring (write head + generation).
+      description: |
+        Compatibility: `deviation`. No JVM counterpart. Snapshots the
+        generation counter both before and after the reset.
+      operationId: postCaptureReset
+      x-rust-only: true
+      responses:
+        '200':
+          description: Capture reset; previous and current generation.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [reset, previous_generation, current_generation]
+                properties:
+                  reset:
+                    type: boolean
+                    enum: [true]
+                  previous_generation:
+                    type: integer
+                    format: int64
+                  current_generation:
+                    type: integer
+                    format: int64
+        '404':
+          description: Capture subsystem disabled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaptureError'
+
+  # -------------------------------------------------------------------------
+  # Stats (rust-only — separate listener)
+  # -------------------------------------------------------------------------
+  /stats/p2p:
+    get:
+      tags: [stats, rust-only]
+      summary: Cumulative P2P traffic counters since process start.
+      description: |
+        Compatibility: `deviation`. No JVM counterpart. Hosted on a SEPARATE
+        listener (default `127.0.0.1:9055`) that is started only when the
+        operator config includes a `[stats]` section. Loopback-only by
+        default; a non-loopback bind logs a startup WARN. No authentication
+        — the bind address is the security boundary.
+
+        Counters are cumulative; consumers compute deltas across samples.
+        Resets are detectable via the `since` field (Unix seconds at which
+        counters started accruing — process-start time).
+
+        Spec: `facts/stats.md`.
+      operationId: getStatsP2p
+      x-rust-only: true
+      responses:
+        '200':
+          description: Counter snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatsP2p'
+
+components:
+  parameters:
+    Offset:
+      name: offset
+      in: query
+      description: Pagination skip count.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+        default: 0
+
+    Limit:
+      name: limit
+      in: query
+      description: Pagination max-results (hard cap 100 even if a larger value is supplied).
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+        maximum: 100
+        default: 50
+
+    HeaderIdPath:
+      name: header_id
+      in: path
+      required: true
+      description: 32-byte hex-encoded header ID.
+      schema:
+        $ref: '#/components/schemas/HexId32'
+
+    BoxIdPath:
+      name: box_id
+      in: path
+      required: true
+      description: 32-byte hex-encoded box ID.
+      schema:
+        $ref: '#/components/schemas/HexId32'
+
+    NipopowM:
+      name: m
+      in: path
+      required: true
+      description: Minimum chain length (range enforced by the chain crate; current max 256).
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+        maximum: 256
+
+    NipopowK:
+      name: k
+      in: path
+      required: true
+      description: Suffix length (range enforced by the chain crate; current max 256).
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+        maximum: 256
+
+  securitySchemes:
+    apiKeyHeader:
+      type: apiKey
+      in: header
+      name: api_key
+      description: |
+        Optional API key. Required only when the operator has configured
+        `api_key_hash`. The supplied value is Blake2b256-hashed and
+        constant-time compared against the configured hash. Compatibility
+        accepts both `api_key` and `api-key` header names; the canonical
+        spelling is `api_key`.
+
+  schemas:
+    # ---- Primitives ----
+    HexId32:
+      type: string
+      description: 32-byte identifier, lowercase hex (64 chars).
+      pattern: '^[0-9a-fA-F]{64}$'
+      example: '0000000000000000000000000000000000000000000000000000000000000000'
+
+    HexString:
+      type: string
+      description: Arbitrary-length lowercase hex.
+      pattern: '^[0-9a-fA-F]*$'
+
+    # ---- Standard error ----
+    ApiError:
+      type: object
+      description: |
+        JVM-compatible error body. `detail` is optional and may contain
+        internal information — operators are expected to strip it for
+        public-facing deployments.
+      required: [error, reason]
+      properties:
+        error:
+          type: integer
+          description: Numeric mirror of the HTTP status code.
+          minimum: 100
+          maximum: 599
+        reason:
+          type: string
+          description: Short, user-safe explanation.
+        detail:
+          type: string
+          description: Optional technical detail; may carry stack traces or component errors.
+
+    # ---- /info ----
+    NodeInfo:
+      type: object
+      required:
+        - name
+        - appVersion
+        - network
+        - fullHeight
+        - headersHeight
+        - downloadedHeight
+        - bestFullHeaderId
+        - bestHeaderId
+        - stateRoot
+        - stateType
+        - peersCount
+        - unconfirmedCount
+        - isMining
+        - currentTime
+        - journalEventsVersion
+      properties:
+        name:
+          type: string
+          example: ergo-node-rust
+        appVersion:
+          type: string
+          example: '0.6.5'
+        network:
+          type: string
+          example: mainnet
+        fullHeight:
+          type: integer
+          format: int64
+          description: Highest fully validated height.
+        headersHeight:
+          type: integer
+          format: int64
+          description: Highest known header height.
+        downloadedHeight:
+          type: integer
+          format: int64
+          description: |
+            Highest height for which all required block sections are stored.
+            Rust-specific addition; used by fastsync.
+        bestFullHeaderId:
+          $ref: '#/components/schemas/HexId32'
+        bestHeaderId:
+          $ref: '#/components/schemas/HexId32'
+        stateRoot:
+          type: string
+          description: Hex-encoded current state root.
+        stateType:
+          type: string
+          enum: [utxo, digest]
+        peersCount:
+          type: integer
+          format: int64
+          minimum: 0
+        unconfirmedCount:
+          type: integer
+          format: int64
+          minimum: 0
+        isMining:
+          type: boolean
+        currentTime:
+          type: integer
+          format: int64
+          description: Local clock in Unix epoch milliseconds.
+        journalEventsVersion:
+          type: string
+          description: |
+            Version of the journal-events contract this build emits — see
+            `facts/journal-events.md`.
+          example: '1.0'
+        statsVersion:
+          type: string
+          description: |
+            Version of the `/stats/p2p` schema — present only when the stats
+            endpoint is enabled (`[stats]` section in `ergo.toml`). See
+            `facts/stats.md`.
+          example: '1.0'
+
+    # ---- Headers and blocks ----
+    Header:
+      type: object
+      description: |
+        Ergo block header. Field names match the `ergo-chain-types::Header`
+        serde shape (also matches the JVM JSON shape).
+      required:
+        - id
+        - parentId
+        - version
+        - height
+        - timestamp
+        - nBits
+        - stateRoot
+        - adProofsRoot
+        - transactionsRoot
+        - extensionRoot
+        - powSolutions
+      properties:
+        id:
+          $ref: '#/components/schemas/HexId32'
+        parentId:
+          $ref: '#/components/schemas/HexId32'
+        version:
+          type: integer
+          minimum: 0
+        height:
+          type: integer
+          format: int64
+          minimum: 0
+        timestamp:
+          type: integer
+          format: int64
+          description: Block timestamp (Unix epoch milliseconds).
+        nBits:
+          type: integer
+          format: int64
+          description: Difficulty in compact (nBits) form.
+        stateRoot:
+          type: string
+          description: Hex-encoded ADDigest (33 bytes — 32-byte AVL+ root + 1-byte height marker).
+        adProofsRoot:
+          $ref: '#/components/schemas/HexId32'
+        transactionsRoot:
+          $ref: '#/components/schemas/HexId32'
+        extensionRoot:
+          $ref: '#/components/schemas/HexId32'
+        votes:
+          type: string
+          description: 3-byte voting vector, hex-encoded.
+        powSolutions:
+          $ref: '#/components/schemas/AutolykosSolution'
+
+    AutolykosSolution:
+      type: object
+      description: Autolykos v2 PoW solution carried in the header.
+      required: [pk, n]
+      properties:
+        pk:
+          type: string
+          description: Miner public key (33-byte compressed EC point), hex.
+        w:
+          type: string
+          description: v1 commitment point; unused for v2, present for shape compatibility.
+        n:
+          type: string
+          description: 8-byte nonce, hex.
+        d:
+          type: string
+          description: v1 distance scalar; unused for v2.
+
+    BlockTransactionsSection:
+      type: object
+      required: [headerId, transactions, blockVersion, size]
+      properties:
+        headerId:
+          $ref: '#/components/schemas/HexId32'
+        transactions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Transaction'
+        blockVersion:
+          type: integer
+          minimum: 0
+        size:
+          type: integer
+          format: int64
+          minimum: 0
+
+    AdProofsSection:
+      type: object
+      required: [headerId, proofBytes, size]
+      properties:
+        headerId:
+          $ref: '#/components/schemas/HexId32'
+        proofBytes:
+          $ref: '#/components/schemas/HexString'
+        digest:
+          $ref: '#/components/schemas/HexId32'
+        size:
+          type: integer
+          format: int64
+          minimum: 0
+
+    ExtensionSection:
+      type: object
+      required: [headerId, fields]
+      properties:
+        headerId:
+          $ref: '#/components/schemas/HexId32'
+        digest:
+          $ref: '#/components/schemas/HexId32'
+        fields:
+          type: array
+          description: |
+            Key-value pairs, each rendered as a 2-element array
+            `[keyHex, valueHex]`. The key is always 2 bytes; the value is
+            arbitrary length.
+          items:
+            type: array
+            minItems: 2
+            maxItems: 2
+            items:
+              $ref: '#/components/schemas/HexString'
+
+    FullBlock:
+      type: object
+      required: [header, blockTransactions, extension, adProofs]
+      properties:
+        header:
+          $ref: '#/components/schemas/Header'
+        blockTransactions:
+          $ref: '#/components/schemas/BlockTransactionsSection'
+        extension:
+          $ref: '#/components/schemas/ExtensionSection'
+        adProofs:
+          description: '`null` when not stored (e.g., received from a digest-mode peer).'
+          oneOf:
+            - $ref: '#/components/schemas/AdProofsSection'
+            - type: 'null'
+
+    # ---- Validation fragments ----
+    ValidationFragments:
+      type: object
+      required: [headerBytes, parameters, transactions]
+      properties:
+        headerBytes:
+          $ref: '#/components/schemas/HexString'
+          description: |
+            Canonical block header bytes — `header.scorex_serialize_bytes()`.
+            blake2b256 of these bytes IS the header id.
+        parameters:
+          description: |
+            Subset of parameters extracted from the block's extension. `null`
+            on any failure along the path (extension missing, parse failure,
+            no parameter fields). The node never substitutes a default.
+          oneOf:
+            - $ref: '#/components/schemas/ValidationFragmentsParameters'
+            - type: 'null'
+        transactions:
+          type: array
+          description: Index-aligned with `GET /blocks/{header_id}` transactions.
+          items:
+            $ref: '#/components/schemas/ValidationFragmentsTx'
+
+    ValidationFragmentsParameters:
+      type: object
+      required: [maxBlockCost]
+      description: |
+        Parameters subset surfaced by validation-fragments. Add fields only
+        when an external consumer needs them, not speculatively.
+      properties:
+        maxBlockCost:
+          type: integer
+          format: int32
+
+    ValidationFragmentsTx:
+      type: object
+      required: [signingMessage]
+      properties:
+        signingMessage:
+          $ref: '#/components/schemas/HexString'
+          description: |
+            `Transaction::bytes_to_sign()` — inputs without proofs/extensions,
+            then data-inputs, then outputs, concatenated. NOT the full
+            canonical tx bytes. This is what every input signature commits to.
+
+    ValidationFragmentsError:
+      type: object
+      description: |
+        Validation-fragments uses a different error body shape than the
+        standard `ApiError`. `error` is a short code string (not a numeric
+        HTTP status); context fields vary by error code.
+      required: [error]
+      properties:
+        error:
+          type: string
+          enum:
+            - invalid-header-id
+            - block-not-found
+            - block-pruned
+            - header-serialize-failed
+            - block-transactions-parse-failed
+            - tx-bytes-to-sign-failed
+        headerId:
+          type: string
+          description: Echo of the requested header ID (preserves case).
+        message:
+          type: string
+          description: Internal diagnostic, present on serialize/parse failures.
+
+    # ---- Transactions ----
+    Transaction:
+      type: object
+      description: |
+        Ergo transaction. Field names and shape follow `ergo-lib`'s serde
+        output (and the JVM `ErgoTransaction` shape).
+      required: [id, inputs, outputs]
+      properties:
+        id:
+          $ref: '#/components/schemas/HexId32'
+        inputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Input'
+        dataInputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/DataInput'
+        outputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/ErgoBox'
+        size:
+          type: integer
+          format: int64
+          minimum: 0
+
+    Input:
+      type: object
+      required: [boxId, spendingProof]
+      properties:
+        boxId:
+          $ref: '#/components/schemas/HexId32'
+        spendingProof:
+          type: object
+          required: [proofBytes, extension]
+          properties:
+            proofBytes:
+              $ref: '#/components/schemas/HexString'
+            extension:
+              type: object
+              additionalProperties:
+                type: string
+              description: Context-extension map (index → hex-encoded sigma value).
+
+    DataInput:
+      type: object
+      required: [boxId]
+      properties:
+        boxId:
+          $ref: '#/components/schemas/HexId32'
+
+    ErgoBox:
+      type: object
+      description: |
+        Ergo box (UTXO). Field names and shape follow `ergo-lib`'s serde
+        output. The exact field set is delegated to the upstream
+        `ergo-lib::ErgoBox` schema; consumers should not hard-code field
+        order. Reproduced here as a deliberately partial shape — additive
+        registers and tokens may appear.
+      required: [boxId, value, ergoTree, creationHeight]
+      properties:
+        boxId:
+          $ref: '#/components/schemas/HexId32'
+        value:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Value in nanoERG.
+        ergoTree:
+          $ref: '#/components/schemas/HexString'
+        creationHeight:
+          type: integer
+          format: int64
+          minimum: 0
+        assets:
+          type: array
+          items:
+            type: object
+            required: [tokenId, amount]
+            properties:
+              tokenId:
+                $ref: '#/components/schemas/HexId32'
+              amount:
+                type: integer
+                format: int64
+                minimum: 0
+        additionalRegisters:
+          type: object
+          description: 'R4..R9 as `{ "R4": "<hex>", ... }`. Optional registers may be absent.'
+          additionalProperties:
+            type: string
+        transactionId:
+          $ref: '#/components/schemas/HexId32'
+        index:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Output index of the box within its creating transaction.
+
+    # ---- Fees ----
+    FeeResponse:
+      type: object
+      required: [fee]
+      properties:
+        fee:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Fee in nanoERG.
+
+    WaitTimeResponse:
+      type: object
+      required: [waitTime]
+      properties:
+        waitTime:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Expected wait in blocks.
+
+    FeeHistogramBin:
+      type: object
+      required: [minFee, maxFee, count]
+      properties:
+        minFee:
+          type: integer
+          format: int64
+          minimum: 0
+        maxFee:
+          type: integer
+          format: int64
+          minimum: 0
+        count:
+          type: integer
+          format: int64
+          minimum: 0
+
+    # ---- UTXO snapshots ----
+    SnapshotsInfo:
+      type: object
+      required: [availableManifests]
+      properties:
+        availableManifests:
+          type: array
+          items:
+            $ref: '#/components/schemas/SnapshotManifestEntry'
+
+    SnapshotManifestEntry:
+      type: object
+      required: [height, digest]
+      properties:
+        height:
+          type: integer
+          format: int64
+          minimum: 0
+        digest:
+          type: string
+          description: Hex-encoded Blake2b256 manifest digest.
+
+    # ---- Peers ----
+    PeerInfoEntry:
+      type: object
+      required: [address, connectionType]
+      properties:
+        address:
+          type: string
+          description: '`host:port`. IPv6 uses bracketed form `[addr]:port`.'
+          example: '1.2.3.4:9030'
+        name:
+          type: string
+          description: Advertised agent string (`null` if never handshaked).
+        lastSeen:
+          type: integer
+          format: int64
+          description: Unix epoch ms (`null` if never connected).
+        connectionType:
+          description: '`"Outgoing"` / `"Incoming"` for connected peers, `null` for known-but-disconnected.'
+          oneOf:
+            - type: string
+              enum: [Outgoing, Incoming]
+            - type: 'null'
+
+    PeerStatus:
+      type: object
+      required: [lastIncomingMessage, currentNetworkTime]
+      properties:
+        lastIncomingMessage:
+          description: Unix epoch ms of the last incoming P2P message; `null` if none yet.
+          oneOf:
+            - type: integer
+              format: int64
+            - type: 'null'
+        currentNetworkTime:
+          type: integer
+          format: int64
+          description: Local clock in Unix epoch milliseconds.
+
+    PeersBlacklisted:
+      type: object
+      required: [addresses]
+      properties:
+        addresses:
+          type: array
+          items:
+            type: string
+            description: Peer address `host:port`.
+
+    PeerApiUrl:
+      type: object
+      required: [peerId, url]
+      properties:
+        peerId:
+          type: integer
+          format: int64
+        url:
+          type: string
+          format: uri
+
+    # ---- Emission ----
+    EmissionInfo:
+      type: object
+      required: [minerReward, totalCoinsIssued, totalRemainCoins]
+      properties:
+        minerReward:
+          type: integer
+          format: int64
+          minimum: 0
+          description: nanoERG.
+        totalCoinsIssued:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Cumulative nanoERG issued up to and including the height.
+        totalRemainCoins:
+          type: integer
+          format: int64
+          minimum: 0
+          description: nanoERG remaining in the emission schedule.
+
+    # ---- NiPoPoW ----
+    NipopowProof:
+      type: object
+      description: |
+        NiPoPoW proof. Shape follows the JVM `NipopowProof` JSON encoder
+        (the Rust struct's serde shape plus a `continuous` field flattened
+        in by the handler for JVM-compat). The chain currently never
+        produces continuous-mode proofs.
+      required: [m, k, prefix, suffixHead, suffixTail, continuous]
+      properties:
+        m:
+          type: integer
+          format: int64
+        k:
+          type: integer
+          format: int64
+        prefix:
+          type: array
+          items:
+            $ref: '#/components/schemas/PoPowHeader'
+        suffixHead:
+          $ref: '#/components/schemas/PoPowHeader'
+        suffixTail:
+          type: array
+          items:
+            $ref: '#/components/schemas/Header'
+        continuous:
+          type: boolean
+          enum: [false]
+
+    PoPowHeader:
+      type: object
+      description: Header plus its interlinks vector and the interlinks Merkle proof.
+      required: [header, interlinks, interlinksProof]
+      properties:
+        header:
+          $ref: '#/components/schemas/Header'
+        interlinks:
+          type: array
+          items:
+            $ref: '#/components/schemas/HexId32'
+        interlinksProof:
+          type: object
+          description: |
+            BatchMerkleProof shape from `ergo-merkle-tree`. Field set
+            delegated to the upstream serde schema.
+
+    # ---- Mining ----
+    MiningCandidate:
+      type: object
+      description: |
+        Block-template fields the miner needs. Field shape mirrors JVM's
+        `WorkMessage`.
+      required: [msg, b, h, pk]
+      properties:
+        msg:
+          $ref: '#/components/schemas/HexString'
+          description: Pre-image bytes the miner hashes against.
+        b:
+          type: string
+          description: Difficulty target as decimal big-int string.
+        h:
+          type: integer
+          format: int64
+          description: Candidate block height.
+        pk:
+          type: string
+          description: Miner public key (hex-encoded).
+        proof:
+          type: object
+          description: Optional sigma-proof fields when the candidate requires them.
+
+    SolutionSubmission:
+      type: object
+      description: Mining-solution submission. For Autolykos v2 only `n` is required.
+      required: [n]
+      properties:
+        n:
+          type: string
+          description: 8-byte nonce as hex (16 characters).
+          pattern: '^[0-9a-fA-F]{16}$'
+        pk:
+          type: string
+        w:
+          type: string
+        d:
+          type: string
+
+    # ---- Debug ----
+    DebugMemory:
+      type: object
+      required: [process, components]
+      properties:
+        process:
+          $ref: '#/components/schemas/ProcessMemory'
+        jemalloc:
+          description: '`null` when not built with the `jemalloc` feature.'
+          oneOf:
+            - $ref: '#/components/schemas/JemallocMemory'
+            - type: 'null'
+        components:
+          $ref: '#/components/schemas/ComponentMemory'
+
+    ProcessMemory:
+      type: object
+      required:
+        - rssAnonBytes
+        - rssFileBytes
+        - rssTotalBytes
+        - rssPeakBytes
+        - vmSizeBytes
+      properties:
+        rssAnonBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        rssFileBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        rssTotalBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        rssPeakBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        vmSizeBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        pssBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Proportional set size. Absent on systems where `smaps_rollup` is
+            not readable.
+
+    JemallocMemory:
+      type: object
+      required: [allocatedBytes, activeBytes, residentBytes, retainedBytes, metadataBytes]
+      properties:
+        allocatedBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        activeBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        residentBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        retainedBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Virtual address space jemalloc has munmap'd-but-kept-for-reuse.
+            NOT physical RAM; trust RSS for memory pressure.
+        metadataBytes:
+          type: integer
+          format: int64
+          minimum: 0
+
+    ComponentMemory:
+      type: object
+      required: [chainHeaderEstimateBytes, chainHeaderCount, mempoolTxCount]
+      properties:
+        chainHeaderEstimateBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        chainHeaderCount:
+          type: integer
+          format: int64
+          minimum: 0
+        mempoolTxCount:
+          type: integer
+          format: int64
+          minimum: 0
+
+    CaptureInfo:
+      type: object
+      description: |
+        Capture-ring status. Field set delegated to
+        `enr_p2p::capture::CaptureInfo`; the table below names the keys this
+        endpoint surfaces. Additive only — operators should not break on new
+        fields.
+      additionalProperties: true
+      properties:
+        enabled:
+          type: boolean
+          enum: [true]
+        generation:
+          type: integer
+          format: int64
+          description: Bumped on every reset.
+
+    CaptureError:
+      type: object
+      description: Alternative error shape used by `/debug/p2p-capture/*`.
+      required: [error]
+      properties:
+        error:
+          type: string
+          enum: [capture-disabled, bad-request]
+        message:
+          type: string
+
+    # ---- Stats ----
+    StatsP2p:
+      type: object
+      required: [statsVersion, since, messages]
+      properties:
+        statsVersion:
+          type: string
+          example: '1.0'
+        since:
+          type: integer
+          format: int64
+          description: Unix seconds at which counters started accruing (process start).
+        messages:
+          type: object
+          required:
+            - handshake
+            - get_peers
+            - peers
+            - sync_info
+            - inv
+            - modifier_request
+            - modifier_response
+            - snapshot
+            - unknown
+          properties:
+            handshake:
+              $ref: '#/components/schemas/DirectionalCounter'
+            get_peers:
+              $ref: '#/components/schemas/DirectionalCounter'
+            peers:
+              $ref: '#/components/schemas/DirectionalCounter'
+            sync_info:
+              $ref: '#/components/schemas/DirectionalCounter'
+            inv:
+              $ref: '#/components/schemas/CountersByModifier'
+            modifier_request:
+              $ref: '#/components/schemas/CountersByModifier'
+            modifier_response:
+              $ref: '#/components/schemas/CountersByModifier'
+            snapshot:
+              $ref: '#/components/schemas/CountersBySnapshotCode'
+            unknown:
+              $ref: '#/components/schemas/DirectionalCounter'
+
+    DirectionalCounter:
+      type: object
+      required: [in, out]
+      properties:
+        in:
+          $ref: '#/components/schemas/DirectionCounter'
+        out:
+          $ref: '#/components/schemas/DirectionCounter'
+
+    DirectionCounter:
+      type: object
+      required: [count, bytes]
+      properties:
+        count:
+          type: integer
+          format: int64
+          minimum: 0
+        bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Total wire bytes including framing (magic + code + length +
+            checksum + body) — operators graph real link utilization, not
+            payload-only.
+
+    CountersByModifier:
+      type: object
+      required: [header, transaction, block_transactions, ad_proofs, extension]
+      properties:
+        header:
+          $ref: '#/components/schemas/DirectionalCounter'
+        transaction:
+          $ref: '#/components/schemas/DirectionalCounter'
+        block_transactions:
+          $ref: '#/components/schemas/DirectionalCounter'
+        ad_proofs:
+          $ref: '#/components/schemas/DirectionalCounter'
+        extension:
+          $ref: '#/components/schemas/DirectionalCounter'
+
+    CountersBySnapshotCode:
+      type: object
+      required:
+        - request_manifest
+        - manifest
+        - request_subtree
+        - subtree
+        - request_utxo_chunk
+        - utxo_chunk
+      properties:
+        request_manifest:
+          $ref: '#/components/schemas/DirectionalCounter'
+        manifest:
+          $ref: '#/components/schemas/DirectionalCounter'
+        request_subtree:
+          $ref: '#/components/schemas/DirectionalCounter'
+        subtree:
+          $ref: '#/components/schemas/DirectionalCounter'
+        request_utxo_chunk:
+          $ref: '#/components/schemas/DirectionalCounter'
+        utxo_chunk:
+          $ref: '#/components/schemas/DirectionalCounter'

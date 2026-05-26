@@ -1,5 +1,9 @@
 # REST API Contract
 
+> Per-endpoint structural detail (paths, params, request and response
+> bodies, status codes) lives in [`openapi.yaml`](openapi.yaml).
+> This document covers cross-cutting rationale only.
+
 ## Component: `api/` (workspace crate)
 
 External-facing HTTP interface for wallets, dApps, miners, and monitoring tools.
@@ -63,740 +67,66 @@ passed at construction.
 
 ## Shared State
 
-The API server receives shared handles at construction. These are the same
-handles used by the sync/validation pipeline — no duplication of state.
+The API server receives shared handles at construction — the same handles used
+by the sync/validation pipeline, with no duplication of state. The full struct
+lives at `api/src/lib.rs::ApiState`. The roles, summarized:
 
-```rust
-pub struct ApiState {
-    /// Read access to the header chain (tip, headers by height/hash).
-    pub chain: Arc<RwLock<HeaderChain>>,
-    /// Read access to block storage (full blocks, transactions, extensions).
-    pub store: Arc<BlockStore>,
-    /// Read/write access to the mempool (submit txs, query pool).
-    pub mempool: Arc<Mutex<Mempool>>,
-    /// Read access to UTXO state (box lookups by ID).
-    pub utxo_state: Arc<SnapshotReader>,
-    /// Read access to P2P peer state (connected peers, known peers).
-    pub peers: Arc<RwLock<PeerManager>>,
-    /// Current blockchain parameters (from extension voting).
-    pub parameters: Arc<RwLock<Parameters>>,
-    /// Node configuration (network type, version string, features).
-    pub node_config: NodeConfig,
-    /// Optional API key hash (Blake2b256). None = no auth required.
-    pub api_key_hash: Option<[u8; 32]>,
-    /// Builder for ErgoStateContext (tip header + preceding + params).
-    /// Rebuilt on each new block; cached for mempool validation.
-    pub state_context: Arc<RwLock<ErgoStateContext>>,
-}
-```
+- Chain read access (header lookups, tip, header IDs)
+- Block store read access (full block sections by header ID)
+- Mempool read/write (the only mutable state the API touches, via `process()`)
+- UTXO snapshot reader (box lookups by ID)
+- Peer state (counts, list, blacklist, manual connect trigger)
+- Current parameters (from extension voting)
+- Node metadata (network, name, version, state type)
+- Optional API key hash (`None` = no auth required)
+- `ErgoStateContext` for transaction validation
+- Validated and downloaded block heights (atomic, watched)
+- Modifier-pipeline sender (for the rust-only `/ingest/modifiers` endpoint)
+- Optional jemalloc probe (`None` with mimalloc or system allocator)
+- Optional P2P-capture handle (`None` when `[debug.p2p_capture]` is off)
+- Mining state and block submitter (`None` outside UTXO mode with a miner PK)
 
 ### State Context Lifecycle
 
 `state_context` is rebuilt whenever the validated tip advances:
 1. Validator confirms block at height H
 2. Main crate builds `ErgoStateContext` from header H + 10 preceding headers + current parameters
-3. Stores in `Arc<RwLock<ErgoStateContext>>`
+3. Stores in the shared lock
 4. Mempool task and API both read from this same handle
 
 This means mempool validation always uses the state context of the latest
 validated block. During sync (tip advancing rapidly), this is rebuilt
-frequently — the `RwLock` ensures readers see a consistent snapshot.
-
-## Endpoints
-
-### Node Information
-
-#### `GET /info`
-
-Node status and chain state. No authentication.
-
-**Response 200:**
-```json
-{
-  "name": "ergo-node-rust",
-  "appVersion": "0.1.0",
-  "network": "testnet",
-  "fullHeight": 271234,
-  "headersHeight": 271240,
-  "downloadedHeight": 271238,
-  "bestFullHeaderId": "0000abcd...",
-  "bestHeaderId": "0000efgh...",
-  "stateRoot": "01abcdef...",
-  "stateType": "utxo",
-  "peersCount": 8,
-  "unconfirmedCount": 42,
-  "isMining": false,
-  "currentTime": 1712400000000,
-  "journalEventsVersion": "1.0",
-  "statsVersion": "1.0"
-}
-```
-
-`journalEventsVersion` advertises the contract version of stable
-events the node emits to its journal — see `facts/journal-events.md`.
-Tooling that parses node logs (e.g. the Ergo Node Doctor adapter)
-keys off this. Absent when running a binary that predates the
-contract.
-
-`statsVersion` advertises the schema version of the operator stats
-endpoint — see `facts/stats.md`. Absent when the stats endpoint is
-not enabled (no `[stats]` section in config).
-
-**Source:** chain (heights, header IDs), mempool (unconfirmed count),
-peers (peer count), node_config (name, version, network, state type),
-sync layer (downloaded_height via shared atomic).
-
-`downloadedHeight` is the highest height where all required block sections
-are in the store. Used by fastsync to avoid re-fetching sections that
-already exist. Distinct from `fullHeight` (validated) — after a state wipe,
-`fullHeight` resets to 0 but `downloadedHeight` reflects what's still in the
-modifiers store.
-
----
-
-### Blocks
-
-#### `GET /blocks?offset=0&limit=50`
-
-List block header IDs from chain tip, newest first.
-
-**Query params:**
-- `offset`: skip count (default 0)
-- `limit`: max results (default 50, max 100)
-
-**Response 200:** `["headerId1", "headerId2", ...]`
-
-**Source:** chain (header IDs by descending height).
-
-#### `GET /blocks/at/{height}`
-
-Block header IDs at a specific height. Returns array (multiple possible during temporary forks in JVM; we return single-element array for compatibility).
-
-**Response 200:** `["headerId"]`
-**Response 404:** height beyond chain tip.
-
-**Source:** chain (header at height).
-
-#### `GET /blocks/{headerId}`
-
-Full block: header + transactions + AD proofs + extension.
-
-**Response 200:** Full block JSON (JVM-compatible `ErgoFullBlock` shape).
-**Response 404:** header not found.
-
-**Source:** store (block sections by header ID).
-
-#### `GET /blocks/{headerId}/header`
-
-Block header only.
-
-**Response 200:** Header JSON.
-**Response 404:** header not found.
-
-**Source:** chain (header by ID) or store.
-
-#### `GET /blocks/{headerId}/transactions`
-
-Transactions in a block.
-
-**Response 200:** `{ "headerId": "...", "transactions": [...] }`
-**Response 404:** header not found or transactions not stored.
-
-**Source:** store (block transactions by header ID).
-
-#### `GET /blocks/{headerId}/validation-fragments`
-
-Per-block bundle of canonical bytes that the existing
-`/blocks/{headerId}` JSON cannot supply without the client
-re-running serialization. Designed for external tools that need
-byte-exact equivalence with the node's internal representation
-(e.g. cross-validating an independent serializer against the
-reference).
-
-The response is index-aligned with the existing `/blocks/{headerId}`
-response — `transactions[i]` in this response pairs with
-`transactions[i]` in `/blocks/{headerId}`. No id-based lookup is
-required.
-
-**Response 200 (`Content-Type: application/json`):**
-
-```jsonc
-{
-  "headerBytes": "<hex>",                        // header.scorex_serialize_bytes() — Header impls ScorexSerializable, not SigmaSerializable. Blake2b256 of these bytes IS the header id.
-  "parameters": {                                // From Extension parameter encoding
-    "maxBlockCost": 1000000
-  } | null,                                       // null when Extension parse fails
-  "transactions": [
-    {
-      "signingMessage": "<hex>"                   // Transaction::bytes_to_sign()
-    }
-  ]
-}
-```
-
-**Response 404:** `headerId` not in the chain. Body:
-`{"error": "block-not-found", "headerId": "<hex>"}`
-
-**Response 410:** block was pruned (`blocks_to_keep` enabled).
-Body: `{"error": "block-pruned", "headerId": "<hex>"}`
-
-**Response 500:** composition failure (e.g., stored transactions
-fail to parse). Body:
-`{"error": "<short-code>", "message": "<diagnostic>"}`
-
-##### Pitfalls
-
-1. **`signingMessage` is `Transaction::bytes_to_sign()`** — inputs
-   without proofs/extensions, then data-inputs, then outputs,
-   concatenated. NOT the full canonical tx bytes. This is what
-   every input's signature commits to.
-
-2. **`parameters` is `null` when the Extension's parameter-vote
-   encoding fails to parse.** Most commonly, very early version-1
-   blocks that don't carry the encoding. Do NOT substitute
-   `Parameters::default()` server-side; the client knows its own
-   fallback policy.
-
-3. **Height resolution must use the parent-link walker.** This
-   endpoint accepts a `headerId`, not a height — but any
-   convenience routing that derives a header from a height (e.g.
-   `/blocks/at/{h}/validation-fragments` if added later) MUST use
-   the same parent-link walk the main crate uses for chain
-   restoration (commit `97e588f`). Direct calls into
-   `enr-store::best_header_at` are forbidden — BEST_CHAIN can
-   develop holes and the validator's tolerance for that lives in
-   the main crate, not the store.
-
-##### Source
-
-- `chain` (header bytes)
-- `store` (block transactions and extension section)
-
-This endpoint is stateless with respect to UTXO state — it serves
-purely from chain + stored block sections, so post-restart "no
-validated block yet" conditions never apply.
-
-##### Companion endpoint (on the indexer addon)
-
-For tools that also need per-box canonical bytes (e.g. for
-historical input lookups), the indexer addon's
-`GET /api/v1/boxes/{box_id}/bytes` provides those independently.
-See `facts/indexer.md`.
-
-##### History
-
-Initially shipped (commit `73c5153`) with per-input `oracleCost` /
-`oracleSucceeded` / `oracleError` fields powered by per-input
-sigma-rust evaluation against current UTXO state. That design was
-unimplementable: UTXO state doesn't retain spent boxes, so the
-oracle-cost path returned `spent-box-unavailable` for every
-request. Trimmed to the byte-emitting subset which works
-unconditionally. See [[feedback_contract_honor_agreed_splits]] for
-the architectural lesson.
-
-#### `GET /blocks/lastHeaders/{count}`
-
-Last N block headers, newest first.
-
-**Query params:**
-- `count`: path param (max 100)
-
-**Response 200:** `[header1, header2, ...]`
-
-**Source:** chain (headers from tip descending).
-
-#### `GET /blocks/modifier/{modifierId}`
-
-Fetch any modifier (header, block transactions, AD proofs, extension)
-by its modifier ID, without specifying type. Useful for forensics and
-generic explorer tooling — REST surface for what the `inspect-modifier`
-local tool does.
-
-**Response 200:** modifier as JSON (shape depends on type). Type
-indicated via a `type` field or by JSON shape.
-**Response 404:** modifier not found across any type.
-
-**Source:** store. The handler iterates the four modifier types
-(Header=101, BlockTransactions=102, ADProofs=104, Extension=108) and
-returns the first match. Performance is acceptable because each lookup
-is a single redb key probe.
-
----
-
-### Transactions
-
-#### `POST /transactions`
-
-Submit a transaction to the mempool and broadcast to peers.
-
-**Request body:** JSON `ErgoTransaction` (JVM-compatible format).
-
-**Response 200:** `"txId"` (hex-encoded transaction ID).
-**Response 400:** Validation failure — includes reason.
-
-**Processing:**
-1. Deserialize and validate JSON structure
-2. Compute tx_bytes (sigma serialization for P2P)
-3. Acquire mempool lock
-4. Read current `state_context`
-5. Call `mempool.process(tx, tx_bytes, &utxo_reader, &state_context, None)`
-6. Return tx_id or error reason
-
-P2P broadcast of accepted transactions is handled by the mempool task in the
-main crate, not by the API. The mempool task broadcasts Inv messages for all
-accepted transactions regardless of source (P2P or API).
-
-**Rate limiting:** Local submissions (`source: None`) bypass mempool rate limits.
-HTTP-level rate limiting (per-IP) is a deployment concern (reverse proxy), not
-implemented in the API crate.
-
-#### `POST /transactions/check`
-
-Validate a transaction without adding to mempool or broadcasting.
-Same validation as `POST /transactions` but discards the result.
-
-**Request body:** JSON `ErgoTransaction`.
-**Response 200:** `"txId"` (valid).
-**Response 400:** Validation failure — includes reason.
-
-#### `GET /transactions/unconfirmed?offset=0&limit=50`
-
-List unconfirmed transactions from mempool, ordered by priority (highest fee weight first).
-
-**Query params:**
-- `offset`: skip count (default 0)
-- `limit`: max results (default 50, max 100)
-
-**Response 200:** `[ErgoTransaction, ...]`
-
-**Source:** mempool (`all_prioritized()`, sliced).
-
-#### `GET /transactions/unconfirmed/transactionIds`
-
-All unconfirmed transaction IDs.
-
-**Response 200:** `["txId1", "txId2", ...]`
-
-**Source:** mempool (`tx_ids()`).
-
-#### `GET /transactions/unconfirmed/byTransactionId/{txId}`
-
-Single unconfirmed transaction by ID.
-
-**Response 200:** `ErgoTransaction`
-**Response 404:** not in mempool.
-
-**Source:** mempool (`get(tx_id)`).
-
-#### `HEAD /transactions/unconfirmed/{txId}`
-
-Check if transaction is in mempool. Returns HTTP status only.
-
-**Response 200:** in mempool.
-**Response 404:** not in mempool.
-
-#### `GET /transactions/getFee?waitTime=1&txSize=100`
-
-Recommended fee for target confirmation time.
-
-**Query params:**
-- `waitTime`: target wait in blocks (default 1)
-- `txSize`: transaction size in bytes (default 100)
-
-**Response 200:** `{ "fee": 1100000 }` (nanoERG)
-
-**Source:** mempool (`recommended_fee()`). Returns 400 if insufficient history.
-
-#### `GET /transactions/waitTime?fee=1000000&txSize=100`
-
-Expected confirmation wait time for a given fee.
-
-**Query params:**
-- `fee`: fee in nanoERG
-- `txSize`: transaction size in bytes
-
-**Response 200:** `{ "waitTime": 2 }` (blocks)
-
-**Source:** mempool (`expected_wait_time()`).
-
-#### `GET /transactions/poolHistogram?bins=10`
-
-Fee distribution histogram of mempool contents.
-
-**Query params:**
-- `bins`: number of histogram buckets (default 10, max 50)
-
-**Response 200:** `[{ "minFee": 1000000, "maxFee": 2000000, "count": 15 }, ...]`
-
-**Source:** mempool (`fee_histogram()`).
-
----
-
-### UTXO
-
-#### `GET /utxo/byId/{boxId}`
-
-Look up a box in the confirmed UTXO set only.
-
-**Response 200:** `ErgoBox` JSON.
-**Response 404:** box not found (spent or never existed).
-
-**Source:** utxo_state (`box_by_id()`). Deserialize AVL+ value to `ErgoBox`.
-
-#### `GET /utxo/withPool/byId/{boxId}`
-
-Look up a box in confirmed UTXO set OR unconfirmed mempool outputs.
-
-**Response 200:** `ErgoBox` JSON.
-**Response 404:** not found in either.
-
-**Source:** utxo_state first, then mempool (`unconfirmed_box()`).
-
-#### `POST /utxo/withPool/byIds`
-
-Batch lookup of boxes from UTXO set + mempool.
-
-**Request body:** `["boxId1", "boxId2", ...]` (max 100).
-**Response 200:** `[ErgoBox | null, ...]` (positional, null for missing).
-
-**Source:** utxo_state + mempool, per box.
-
-#### `GET /utxo/getSnapshotsInfo`
-
-Discovery endpoint for UTXO snapshots this node has available. Used by
-external tools that want to know whether snapshot-based bootstrap is
-possible from this node, and at which heights snapshots are anchored.
-
-**Response 200:**
-```json
-{
-  "availableManifests": [
-    {"height": 1700000, "digest": "01abcdef..."}
-  ]
-}
-```
-
-**Response 200 empty:** `{ "availableManifests": [] }` when no snapshots
-are stored.
-
-**Source:** state/snapshot subsystem. The chain knows which heights have
-snapshot manifests stored locally (via `state` crate's snapshot inventory).
-The implementation may need a new `ChainAccess::snapshots_info()` or
-similar trait method — surface to main session if so.
-
-**Note:** snapshot serving over P2P is already implemented (codes 76-81).
-This REST endpoint exposes the same inventory to non-P2P consumers.
-
----
-
-### Mining
-
-Full specification: `facts/mining.md`. The mining module is the most complex
-piece of the API — block candidate assembly, state root computation, emission
-transactions, and PoW validation. Requires UTXO mode and a configured miner
-public key. Returns 503 when mining is not available.
-
-#### `GET /mining/candidate`
-
-Get current mining candidate (block template). The miner polls this endpoint
-to get work, then submits solutions via `POST /mining/solution`.
-
-**Response 200:**
-```json
-{
-  "msg": "0102abcd...",
-  "b": "1234567890",
-  "h": 271235,
-  "pk": "02abcdef...",
-  "proof": {
-    "msgPreimage": "...",
-    "txProofs": []
-  }
-}
-```
-
-**Response 503:** mining not configured, digest mode, or still syncing.
-
-**Source:** chain (tip header, difficulty), mempool (tx selection), validator
-(state root via `proofs_for_transactions()`), parameters (nBits, version),
-ergo-nipopow (interlinks for extension).
-
-**Caching:** Returns cached candidate if chain tip is unchanged and TTL has
-not expired. Regenerates on tip change or TTL expiry. See `facts/mining.md`
-for the full 9-step candidate assembly flow.
-
-#### `POST /mining/solution`
-
-Submit a mining solution (Autolykos v2 PoW).
-
-**Request body:**
-```json
-{
-  "pk": "02abcdef...",
-  "w": "0256...",
-  "n": "00000123...",
-  "d": "12345..."
-}
-```
-
-For Autolykos v2, only `n` (8-byte nonce) is required. `pk`, `w`, `d`
-are optional and use protocol defaults.
-
-**Response 200:** solution accepted, block assembled and broadcast to peers.
-**Response 400:** invalid solution, stale candidate, or no cached candidate.
-
-**Authentication:** Required when `api_key_hash` is configured.
-
-**Processing:**
-1. Validate and deserialize solution fields
-2. Assemble full header from cached candidate + solution
-3. Verify PoW: `pow_hit(header) < target(nBits)`
-4. Assemble full block (header + transactions + extension + AD proofs)
-5. Validate block via normal validation pipeline
-6. Apply block (advance validator state)
-7. Broadcast to P2P network
-8. Invalidate cached candidate
-
-#### `GET /mining/rewardAddress`
-
-Miner's reward address derived from the configured public key.
-
-**Response 200:**
-```json
-{ "rewardAddress": "3WwbzW..." }
-```
-
-**Response 503:** mining not configured (no miner PK).
-
-**Source:** `MinerConfig.miner_pk` → P2S address derivation.
-
----
-
-### Peers
-
-#### `GET /peers/all`
-
-All known peers (connected + disconnected).
-
-**Response 200:**
-```json
-[
-  {
-    "address": "1.2.3.4:9030",
-    "name": "ergo-mainnet-6.0.3",
-    "lastSeen": 1712400000000,
-    "connectionType": null
-  }
-]
-```
-
-**Source:** peers (known peer list).
-
-#### `GET /peers/connected`
-
-Currently connected peers.
-
-**Response 200:**
-```json
-[
-  {
-    "address": "1.2.3.4:9030",
-    "name": "ergo-mainnet-6.0.3",
-    "lastSeen": 1712400000000,
-    "connectionType": "Outgoing"
-  }
-]
-```
-
-**Source:** peers (connected peer list).
-
-#### `GET /peers/status`
-
-Network status summary.
-
-**Response 200:**
-```json
-{
-  "lastIncomingMessage": 1712400000000,
-  "currentNetworkTime": 1712400001000
-}
-```
-
-#### `GET /peers/blacklisted`
-
-Peers currently penalty-banned by this node. Surfaces the penalty
-system (already implemented for misbehavior tracking) to operators
-and monitoring.
-
-**Response 200:**
-```json
-{
-  "addresses": ["1.2.3.4:9030", "5.6.7.8:9030"]
-}
-```
-
-**Source:** peer manager (penalty store). May require a new closure
-in `ApiState` (e.g. `peer_blacklisted: Arc<dyn Fn() -> Vec<SocketAddr>>`)
-following the existing `peer_count` / `peer_api_urls` pattern, OR a new
-`PeerAccess` trait if the closure list grows large. Implementation choice
-is up to the dispatched session.
-
-#### `POST /peers/connect`
-
-Manually initiate an outbound connection to a peer. Operationally useful
-for testing or recovery.
-
-**Request body:** `"1.2.3.4:9030"` (string socket address).
-**Response 200:** connection attempt queued.
-**Response 400:** malformed address.
-
-**Authentication:** Required when `api_key_hash` is configured (write
-operation that affects networking state).
-
-**Source:** peer manager (outbound connection initiator). Needs a new
-trigger — likely a callback `peer_connect: Arc<dyn Fn(SocketAddr) -> Result<(), String>>`
-or a method on a new `PeerAccess` trait. Implementation does not need to
-wait for the connection to succeed — the call is fire-and-forget, success
-means "queued, the outbound manager will attempt it."
-
----
-
-### Emission
-
-#### `GET /emission/at/{height}`
-
-Emission schedule data at a given height.
-
-**Response 200:**
-```json
-{
-  "minerReward": 67500000000,
-  "totalCoinsIssued": 97739925000000000,
-  "totalRemainCoins": 2260075000000000
-}
-```
-
-**Source:** Computed from `EmissionRules` (already ported to sigma-rust).
-Pure calculation, no state access.
-
----
-
-### NiPoPoW
-
-Non-interactive proofs of proof-of-work. Light clients use these to bootstrap
-from a synced node without downloading the full chain. The proof builder is
-shared with the P2P serve path (`facts/nipopow.md`) — both REST and P2P go
-through `chain.build_nipopow_proof(m, k, header_id_opt)`.
-
-#### `GET /nipopow/proof/{m}/{k}`
-
-NiPoPoW proof anchored at the chain tip.
-
-**Path params:**
-- `m`: minimum chain length, `1..=MAX_M_K` (chain-side: 256)
-- `k`: suffix length, `1..=MAX_M_K` (chain-side: 256)
-
-Bounds are enforced by `chain::build_nipopow_proof`; the API handler
-propagates the chain's bounds error as `400`.
-
-**Response 200:** JVM-compatible `NipopowProof` JSON.
-**Response 400:** `m` or `k` out of range.
-**Response 500:** chain failed to build proof (e.g., chain shorter than `m+k`).
-
-**Source:** chain (`build_nipopow_proof(m, k, None)`). The returned wire
-bytes are deserialized via `ergo-nipopow` and re-serialized as JSON to match
-JVM's `/nipopow/proof/{m}/{k}` response shape.
-
-#### `GET /nipopow/proof/{m}/{k}/{headerId}`
-
-NiPoPoW proof anchored at a specific header instead of the tip.
-
-**Path params:**
-- `m`: minimum chain length (same bounds as above)
-- `k`: suffix length (same bounds as above)
-- `headerId`: hex-encoded modifier ID of the anchor header
-
-**Response 200:** JVM-compatible `NipopowProof` JSON.
-**Response 400:** `m`/`k` out of range or `headerId` malformed hex.
-**Response 404:** `headerId` not in chain.
-**Response 500:** chain failed to build proof.
-
-**Source:** chain (`build_nipopow_proof(m, k, Some(header_id))`). Same
-deserialization path as the no-anchor variant.
-
-#### `GET /nipopow/popowHeader/{headerId}`
-
-Per-header NiPoPoW view — the header plus its interlinks vector and
-the interlinks Merkle proof. Used by light clients that want to verify
-a specific header's PoPoW properties without pulling a full proof.
-
-**Path params:**
-- `headerId`: hex-encoded modifier ID of the header
-
-**Response 200:** JVM-compatible `PoPowHeader` JSON (header +
-interlinks array + interlinksProof).
-**Response 400:** malformed `headerId` hex.
-**Response 404:** header not in chain.
-
-**Source:** chain — needs a new method or use of existing popow header
-construction (see `enr_chain::nipopow_proof` internals, the
-`ChainPopowReader::popow_header_at(height)` machinery already builds
-these for the proof code path). Likely a new `ChainAccess::popow_header_by_id`
-trait method.
-
-#### `GET /nipopow/popowHeader/last`
-
-`PoPowHeader` for the current chain tip.
-
-**Response 200:** same shape as the byId variant.
-**Response 404:** chain is empty (no tip).
-
-**Source:** chain. Convenience over the byId variant — internally
-resolves the tip header ID, then delegates to the byId path.
-
----
-
-### Debug
-
-#### `GET /debug/memory`
-
-Memory diagnostics for ops. Process-level (RSS, peak, anon vs file)
-+ jemalloc stats (allocated, active, resident, retained, metadata) +
-component-level estimates (chain header count and rough size,
-mempool tx count). Useful for tracking RSS vs allocated divergence
-(THP retention, fragmentation, etc.).
-
-**Response 200:**
-```json
-{
-  "process": {
-    "rssAnonBytes": 882192384,
-    "rssFileBytes": 15355904,
-    "rssTotalBytes": 897548288,
-    "rssPeakBytes": 1730408448,
-    "vmSizeBytes": 2587922432,
-    "pssBytes": 895396864
-  },
-  "jemalloc": {
-    "allocatedBytes": 411834448,
-    "activeBytes": 446201856,
-    "residentBytes": 477978624,
-    "retainedBytes": 1441718272,
-    "metadataBytes": 18261136
-  },
-  "components": {
-    "chainHeaderEstimateBytes": 1417688800,
-    "chainHeaderCount": 1772111,
-    "mempoolTxCount": 0
-  }
-}
-```
-
-**Notes:** `jemalloc` block is `null` when not built with the
-`jemalloc` feature. `process.*` reads `/proc/self/status` and
-`/proc/self/smaps_rollup` — Linux-only.
-
----
+frequently — the lock ensures readers see a consistent snapshot.
+
+During initial sync the context may be `None`; transaction submission
+endpoints return 503 in that state.
+
+## JVM Compatibility
+
+Per-endpoint compatibility level is annotated in `openapi.yaml` as one of:
+
+- `full` — byte-equivalent with JVM.
+- `partial` — same shape, edge-case behavior may differ.
+- `deviation` — Rust-specific behavior; the openapi description names what.
+
+The overall posture: every endpoint that exists on both sides aims for `full`.
+Where it can't, the gap is documented inline in `openapi.yaml`. Rust-only
+endpoints (`/info/wait`, `/blocks/{id}/validation-fragments`, `/debug/*`,
+`/stats/p2p`, `/ingest/modifiers`) are also flagged in `openapi.yaml` via both
+a `rust-only` tag and an `x-rust-only: true` extension so generated client
+libraries can filter them out for portability.
+
+Known structural deviations:
+
+- `GET /peers/connected` — JVM returns the list of connected peer objects;
+  this implementation returns the count only (`{ "connectedPeers": N }`).
+  Operators who need per-peer detail filter `GET /peers/all` where
+  `connectionType != null`.
+- `GET /peers/api-urls` — Rust-only endpoint that publishes per-peer REST
+  URLs, filtered so peers can only advertise URLs whose host matches the
+  socket-level peer IP (defeats advertisement poisoning).
+- `GET /mining/rewardAddress` — returns the miner PK hex string rather than
+  a derived P2S address. Clients that need the address derive locally.
 
 ## Endpoints NOT Implemented (First Release)
 
@@ -810,9 +140,9 @@ mempool tx count). Useful for tracking RSS vs allocated divergence
 | `/utils/*` | Utility functions. Add later if wallets need them. |
 | `POST /blocks` | Block submission via API (miners use `/mining/solution`). |
 
-## Error Handling
+## Error Model
 
-All errors return a JSON body matching the JVM format:
+All errors on the main listener return a JSON body matching the JVM format:
 
 ```json
 {
@@ -824,18 +154,38 @@ All errors return a JSON body matching the JVM format:
 
 **Error codes:**
 - `400` — bad request (malformed JSON, invalid tx, missing params)
-- `404` — resource not found (unknown header ID, box ID, tx ID)
 - `403` — authentication required but missing or invalid
-- `429` — rate limited (if HTTP-level rate limiting is added)
+- `404` — resource not found (unknown header ID, box ID, tx ID)
+- `410` — resource was pruned (e.g., `/blocks/{id}/validation-fragments` after `blocks_to_keep` clipped the section)
+- `429` — rate limited (if HTTP-level rate limiting is added at a reverse proxy)
 - `500` — internal error (component failure, should not happen)
+- `503` — node is syncing or a required subsystem (mining, modifier pipeline, state context) is not yet available
 
 The `reason` field is safe to show to users. The `detail` field may contain
 internal information (stack traces, component errors) and should be omitted
 in production or restricted to authenticated requests.
 
+### Endpoint-specific error shapes
+
+A small number of Rust-only endpoints intentionally use a different error
+body. `openapi.yaml` documents these per endpoint; they share the contract
+that `error` is a short code string rather than a numeric HTTP status:
+
+- `/blocks/{id}/validation-fragments` — `{ error: "<code>", headerId?, message? }`,
+  keyed off short codes (`invalid-header-id`, `block-not-found`, `block-pruned`,
+  `header-serialize-failed`, `block-transactions-parse-failed`,
+  `tx-bytes-to-sign-failed`) so the cross-validator harness can dispatch on
+  them programmatically.
+- `/debug/p2p-capture/*` — `{ error: "capture-disabled" | "bad-request",
+  message? }` for the same reason.
+
+These are not retrofitted onto the JVM-compat path; existing consumers of
+the JVM API never see them.
+
 ## Authentication
 
-Optional API key via `api_key` header. When `api_key_hash` is configured:
+Optional API key via `api_key` header (the alias `api-key` is also accepted
+for compatibility). When `api_key_hash` is configured:
 
 1. Extract `api_key` header value
 2. Compute `Blake2b256(api_key_bytes)`
@@ -844,10 +194,23 @@ Optional API key via `api_key` header. When `api_key_hash` is configured:
 
 **Authenticated endpoints:**
 - `POST /mining/solution`
+- `POST /peers/connect`
 - Any future admin/control endpoints
 
 **Unauthenticated endpoints:** everything else. Read-only queries and
 transaction submission are always open (matching JVM behavior).
+
+### Loopback-bound listeners
+
+Two listeners are loopback-only by design and depend on the bind address as
+their security boundary, not on an API key:
+
+- `POST /ingest/modifiers` (on the main listener) — rejects any request from
+  a non-loopback peer with 403, regardless of API-key state. This protects
+  the modifier-pipeline shortcut used by co-located fastsync tooling.
+- `GET /stats/p2p` (on a separate listener, default `127.0.0.1:9055`) —
+  starts only when the operator config includes a `[stats]` section. A
+  non-loopback bind logs a startup WARN; there is no auth.
 
 ## Configuration
 
@@ -857,7 +220,61 @@ bind_address = "0.0.0.0:9052"    # Listen address (JVM default: 9052 mainnet, 90
 api_key_hash = ""                 # Blake2b256 hex of API key (empty = no auth)
 request_timeout_ms = 5000         # Per-request timeout
 max_body_bytes = 2_097_152        # Max request body (2 MB)
+
+[stats]                           # Optional; absent = stats listener not started
+bind_address = "127.0.0.1:9055"   # Loopback-only by default
+
+[debug.p2p_capture]               # Optional; absent = capture handle is None
+# See facts/p2p-capture.md for the full schema.
 ```
+
+## Naming Conventions
+
+- **Paths** use kebab-case multi-word segments (`validation-fragments`,
+  `api-urls`) and lowerCamelCase for JVM-aligned segments (`lastHeaders`,
+  `byTransactionId`, `getSnapshotsInfo`, `popowHeader`). JVM-aligned segments
+  keep the JVM spelling exactly so existing tooling works; new Rust-only
+  paths use kebab-case.
+- **JSON keys** use camelCase. The `serde(rename_all = "camelCase")`
+  attribute is applied uniformly to response structs.
+- **IDs** in responses are lowercase hex; 32-byte modifier / header / box /
+  transaction IDs render as 64-char hex strings without `0x` prefix.
+- **Amounts** are nanoERG (1 ERG = 10^9 nanoERG), signed-or-unsigned 64-bit
+  integers matching the underlying domain type. JVM compatibility forces
+  integer encoding rather than decimal-string encoding even when the value
+  approaches `i64::MAX`.
+
+## Cross-cutting Concerns
+
+### Pagination
+
+List endpoints accept `offset` (default 0) and `limit` (default 50, hard
+cap 100). Out-of-range `offset` returns an empty array rather than 404.
+`limit` is silently clamped to the maximum; clients that need to know they
+hit the cap must check the returned length against the requested limit.
+
+### Ordering
+
+- Block listings: descending by height (newest first).
+- Mempool listings: descending by priority (highest fee weight first).
+- Peer listings: insertion / observation order; not stable across restarts.
+
+### Synced-state semantics
+
+`/info` reports several height fields that diverge during sync:
+
+- `fullHeight` — last fully validated height. Most consumers should key
+  off this; a wallet that submits a transaction needs `fullHeight` to be
+  current, not just `headersHeight`.
+- `headersHeight` — highest header in the chain regardless of full-block
+  validation. Equal to `fullHeight` at the tip.
+- `downloadedHeight` — highest height for which all required block sections
+  exist in the store. Rust-specific addition used by fastsync; after a state
+  wipe `fullHeight` resets to 0 while `downloadedHeight` reflects what is
+  still on disk.
+
+`/info/wait?after=H` long-polls until `fullHeight > H` (30s deadline, then
+204).
 
 ## Invariants
 
@@ -869,7 +286,7 @@ max_body_bytes = 2_097_152        # Max request body (2 MB)
 - All ERG amounts are in nanoERG (1 ERG = 10^9 nanoERG).
 - Request body size is bounded by `max_body_bytes`.
 - List endpoints are bounded by hard `limit` maximums.
-- No endpoint blocks indefinitely — all have timeouts.
+- No endpoint blocks indefinitely — all have timeouts (`/info/wait` caps at 30s).
 
 ## Transaction Submission Flow (Full Path)
 
@@ -888,7 +305,7 @@ mempool.process(tx, tx_bytes, &utxo_reader, &state_context, None)
   │ ... 13-step validation (see mempool contract) ...
   ▼
 ProcessingOutcome
-  │ Accepted / Replaced → return 200 "txId"
+  │ Accepted / Replaced / AlreadyInPool → return 200 "txId"
   │ DoubleSpendLoser / Declined / Invalidated → return 400 with reason
   ▼
 Response: 200 "txId" or 400 { error, reason }
