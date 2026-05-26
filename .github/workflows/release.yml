@@ -73,6 +73,12 @@ jobs:
           # emits the auto-changelog link when commits land directly on
           # main (no PRs to summarize), which leaves the release body
           # empty. Sourcing from the tag annotation guarantees substance.
+          #
+          # actions/checkout on a tag-push trigger sometimes lands the
+          # ref as a lightweight tag, in which case `%(contents)` falls
+          # back to the commit message. Re-fetch tags explicitly so the
+          # annotated object is present locally.
+          git fetch --tags --force
           {
             echo 'body<<EOF_TAG_BODY'
             git tag -l --format='%(contents)' "${GITHUB_REF_NAME}"
