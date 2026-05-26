@@ -65,6 +65,20 @@ jobs:
           echo "fastsync_deb=${fastsync_deb}" >> "$GITHUB_OUTPUT"
           ls -lh "${deb}" "${tar}" "${indexer_tar}" "${fastsync_tar}" "${indexer_deb}" "${fastsync_deb}"
 
+      - name: Extract tag annotation
+        id: tagbody
+        run: |
+          # Pipe the annotated tag's message into $GITHUB_OUTPUT as a
+          # multi-line value. `generate_release_notes: true` alone only
+          # emits the auto-changelog link when commits land directly on
+          # main (no PRs to summarize), which leaves the release body
+          # empty. Sourcing from the tag annotation guarantees substance.
+          {
+            echo 'body<<EOF_TAG_BODY'
+            git tag -l --format='%(contents)' "${GITHUB_REF_NAME}"
+            echo 'EOF_TAG_BODY'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -75,5 +89,6 @@ jobs:
             ${{ steps.artifacts.outputs.fastsync_tar }}
             ${{ steps.artifacts.outputs.indexer_deb }}
             ${{ steps.artifacts.outputs.fastsync_deb }}
+          body: ${{ steps.tagbody.outputs.body }}
           generate_release_notes: true
           fail_on_unmatched_files: true
