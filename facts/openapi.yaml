@@ -788,27 +788,23 @@ paths:
   /peers/connected:
     get:
       tags: [peers]
-      summary: Connected peers count.
+      summary: Currently connected peers.
       description: |
-        Compatibility: `deviation`. JVM returns the list of connected peer
-        objects; this implementation returns only the count
-        (`{ "connectedPeers": N }`). Operators needing per-peer detail
-        should use `GET /peers/all` and filter where
-        `connectionType != null`.
+        Compatibility: `partial`. Returns the subset of `GET /peers/all`
+        where `connectionType` is non-null. The entry shape matches
+        `PeerInfoEntry`, which lacks the `lastHandshake` and `restApiUrl`
+        fields JVM emits — those are exposed via `GET /peers/api-urls`
+        instead.
       operationId: getConnectedPeers
       responses:
         '200':
-          description: Connected peer count.
+          description: Connected peer list.
           content:
             application/json:
               schema:
-                type: object
-                required: [connectedPeers]
-                properties:
-                  connectedPeers:
-                    type: integer
-                    format: int64
-                    minimum: 0
+                type: array
+                items:
+                  $ref: '#/components/schemas/PeerInfoEntry'
 
   /peers/status:
     get:

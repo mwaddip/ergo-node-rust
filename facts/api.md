@@ -118,10 +118,10 @@ libraries can filter them out for portability.
 
 Known structural deviations:
 
-- `GET /peers/connected` — JVM returns the list of connected peer objects;
-  this implementation returns the count only (`{ "connectedPeers": N }`).
-  Operators who need per-peer detail filter `GET /peers/all` where
-  `connectionType != null`.
+- `GET /peers/connected` — returns the same `PeerInfoEntry` shape as
+  `GET /peers/all`, filtered to connected peers. JVM additionally emits
+  `lastHandshake` and `restApiUrl` per entry; the latter is surfaced via
+  `GET /peers/api-urls` instead.
 - `GET /peers/api-urls` — Rust-only endpoint that publishes per-peer REST
   URLs, filtered so peers can only advertise URLs whose host matches the
   socket-level peer IP (defeats advertisement poisoning).

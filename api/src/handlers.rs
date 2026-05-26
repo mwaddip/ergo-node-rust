@@ -608,11 +608,15 @@ pub async fn get_utxo_with_pool(
 // GET /peers/connected
 // ---------------------------------------------------------------------------
 
-pub async fn get_connected_peers(State(state): State<ApiState>) -> Json<serde_json::Value> {
-    let counts = (state.peer_count)();
-    Json(serde_json::json!({
-        "connectedPeers": counts.connected,
-    }))
+pub async fn get_connected_peers(State(state): State<ApiState>) -> Json<Vec<PeerInfoEntry>> {
+    let peers = (state.peer_all)();
+    Json(
+        peers
+            .into_iter()
+            .filter(|p| p.connection_type.is_some())
+            .map(peer_info_to_entry)
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
