@@ -26,18 +26,22 @@ Full Ergo blockchain node in Rust. Not a port of the JVM node — a ground-up im
 
 **Main session does not edit crate-internal source files.** All work
 inside `sync/`, `validation/`, `state/`, `store/`, `mempool/`, `api/`,
-`mining/`, `p2p/`, `chain/`, `facts/`, or `addons/*/` is dispatched to
-a per-crate Claude session via the `dispatching-prompts` skill. Main
+`mining/`, `p2p/`, `chain/`, or `addons/*/` is dispatched to a
+per-crate Claude session via the `dispatching-prompts` skill. Main
 session edits are limited to top-level orchestration: `Cargo.toml`
 (workspace), `README.md`, `CHANGELOG.md`, `LICENSE`, `build-deb`,
-`deploy/`, `man/`, top-level docs, scripts under repo root, and the
-prompt files in `prompts/`.
+`deploy/`, `man/`, top-level docs, scripts under repo root, the
+prompt files in `prompts/`, **and the `facts/` directory** — the
+contracts are main session's responsibility. Dispatched sessions
+read contracts via `../facts/` and deliver code that conforms to
+them; they do not edit those contracts. When a contract needs
+updating, main session writes the update first, then dispatches
+the implementation.
 
 The dispatched session runs in `cd <crate>` and operates within that
 directory's boundary — it does not edit parent or sibling
 directories. The repo-root `facts/` directory is the single source
-of truth for cross-crate contracts; per-crate sessions read it via
-`../facts/`.
+of truth for cross-crate contracts.
 
 ## Skill Ownership (PERSISTENT RULE)
 
