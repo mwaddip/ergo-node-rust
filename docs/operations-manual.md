@@ -515,6 +515,35 @@ Recommended: keep your version (`N`), then diff the new version
 new options manually. Do NOT blindly accept the new file — you'll
 lose your customizations.
 
+#### Non-interactive upgrades
+
+`apt install` and `dpkg -i` are interactive by default — the
+conffile prompt waits on stdin. In non-interactive contexts (CI,
+remote provisioning, scripted deploys, or just `apt install`
+called without a controlling terminal), this hangs the upgrade
+and dpkg eventually aborts with `end of file on stdin at conffile
+prompt`, leaving the package half-configured.
+
+To upgrade non-interactively while keeping your existing config:
+
+```sh
+sudo DEBIAN_FRONTEND=noninteractive apt install -y \
+    -o Dpkg::Options::="--force-confold" \
+    ./ergo-node-rust_<version>_<arch>.deb
+```
+
+Or, if you've already hit the half-configured state:
+
+```sh
+sudo DEBIAN_FRONTEND=noninteractive dpkg --configure -a \
+    --force-confold
+```
+
+`--force-confold` accepts the user's existing config (equivalent
+to answering `N` at the prompt). `--force-confnew` accepts the
+packaged default (`Y`) — almost never what you want for this
+config file.
+
 ### Downgrade
 
 `apt` won't downgrade automatically. Force with:
