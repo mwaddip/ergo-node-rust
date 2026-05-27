@@ -4,7 +4,7 @@ exclude = ["addons/fastsync", "addons/indexer"]
 
 [package]
 name = "ergo-node-rust"
-version = "0.6.5"
+version = "0.6.6"
 edition = "2021"
 license = "MIT"
 description = "Full Ergo blockchain node in Rust"

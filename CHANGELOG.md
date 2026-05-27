@@ -1,5 +1,80 @@
 # Changelog
 
+## v0.6.6 — 2026-05-27
+
+JVM-compatibility fixes across four REST endpoints surfaced by
+the v0.6.5 OpenAPI conversion, plus a fix for the indexer's
+mid-sync reorg-detection blind spot.
+
+### REST API: JVM-compatibility fixes
+
+Four endpoints documented in `facts/openapi.yaml` as
+"Rust-specific deviations" during the v0.6.5 conversion are now
+aligned with JVM:
+
+- **`/peers/connected`** returns an array of peer objects rather
+  than a `{connectedPeers: N}` count wrapper. The wrapper shape
+  broke any consumer iterating `.length` or expecting the
+  per-peer detail JVM provides.
+- **`/peers/api-urls`** verified as a Rust-only endpoint with no
+  JVM counterpart; its host-IP filter (peers whose advertised
+  api-url host doesn't match their connection IP are dropped) is
+  kept as intentional anti-spoofing and documented in the openapi.
+- **`/mining/rewardAddress`** returns a Base58-encoded P2S
+  address rather than raw 33-byte EC public key hex. Notable:
+  JVM uses `Pay2SAddress(rewardOutputScript(delay, pk))` rather
+  than `P2PKAddress`; the script encodes the reward maturity
+  delay (default 720 blocks).
+- **Error response shape** unified across the API surface.
+  `/blocks/{id}/validation-fragments` and `/debug/p2p-capture/*`
+  now emit errors as `{error, reason, detail}` matching every
+  other endpoint, instead of their custom `{errorCode, ...}`
+  shape.
+
+### Indexer: mid-sync reorg detection
+
+The pre-fix `check_canonical_or_rollback` was a no-op during the
+inner sync loop — it checked the *target* height, which is always
+empty pre-insert. Reorgs that fired between block inserts went
+undetected until the indexer crashed with a
+`UNIQUE constraint failed: transactions.tx_id` violation
+(witnessed on the laptop validator at mainnet height 1794422,
+where canonical block re-included transactions from a one-block
+orphan the indexer had already indexed).
+
+Fix: parent-linkage verification on every block. The indexer
+compares `target.parent_id` (from the fetched header) against its
+stored `header_id` at `last_indexed`. Mismatch triggers walk-back
+via canonical-id comparison to find the fork point, rolls back
+the DB, and resumes from there. Operators see the recovery as a
+`WARN parent linkage mismatch — rolled back` log line; no manual
+intervention required.
+
+Catches both single-block reorgs (the common case) and multi-block
+reorgs (walk-back handles arbitrary depth). One DB lookup per
+indexed block — no extra HTTP cost.
+
+### CI: release notes sourced from tag annotation
+
+`actions/checkout@v4` on a tag-push trigger sometimes leaves the
+checked-out ref as a lightweight tag, and
+`git tag -l --format='%(contents)'` then falls back to the
+underlying commit message. v0.6.5's release body initially showed
+the commit message instead of the tag annotation; fixed at the
+workflow level via an explicit `git fetch --tags --force` before
+extraction.
+
+### Documentation
+
+- `facts/openapi.yaml` updated alongside each API fix; the
+  "Rust-specific deviation" notes for the four fixed endpoints
+  are removed.
+- `facts/indexer.md` "Known gap: reorg handling" section
+  rewritten to describe the new behavior; stability table updated
+  from "Future minor" to "Shipped".
+- `CLAUDE.md` clarified — `facts/` belongs to main session's
+  edit surface, not the per-crate dispatch list.
+
 ## v0.6.5 — 2026-05-26
 
 Tarball install path is now first-class. The binary auto-finds a
