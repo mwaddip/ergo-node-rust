@@ -313,27 +313,42 @@ then walks forward block by block via `GET /blocks/at/{h}` →
 `GET /blocks/{id}` → batch-insert in a single SQLite transaction →
 update `indexer_state.height`.
 
-### Known gap: reorg handling
+### Reorg handling
 
-**The indexer does not detect reorgs.** On every block-insert, it
-trusts that the canonical header_id at `height = indexer.height + 1`
-hasn't changed since it was first committed. If the node reorgs
-across a height the indexer has already written, the indexer keeps
-its old (now-fork) `header_id` row and never reconciles.
+The indexer detects reorgs via **parent-linkage verification** on
+every block it indexes. After fetching the target block's header
+but before inserting its data, the indexer compares the target's
+`parent_id` against the stored `header_id` at `last_indexed`. If
+they match, indexing proceeds. If they don't, the indexer's chain
+has been orphaned at or before `last_indexed`; it walks back via
+canonical-id comparison to find the actual fork point and rolls
+back the DB to that height.
 
-In practice this surfaces as a `UNIQUE constraint failed:
-transactions.tx_id` on a future block, because some tx_ids
-in the canonical block are already in the table under the fork's
-header_id. The recovery path today is operator-driven:
+This catches both single-block reorgs (the common case — the
+indexer briefly indexed the orphan tip and the chain reorged a
+moment later) and multi-block reorgs (the walk-back finds the
+deeper fork point).
 
-1. Diagnose with `sqlite3 ... "SELECT lower(hex(header_id)) FROM
-   blocks WHERE height = X"` vs `GET /blocks/at/X` from the node.
-2. Truncate above the last matching height via the cascade above.
-3. Restart the indexer.
+Operators see this as a WARN-level log line:
 
-A proper fix (reorg detection on the indexer side) is a future
-contract change. Until then, this contract documents the gap so
-operators expect it.
+```
+WARN parent linkage mismatch — rolled back
+     prev_tip=<orphaned-height> fork_point=<rollback-target>
+     target=<height-being-indexed>
+     target_parent_id=<canonical-parent>
+```
+
+After the rollback, the indexer re-indexes from `fork_point + 1`
+upward against the canonical chain. No operator intervention is
+required — the recovery is automatic.
+
+**The pre-fix failure mode**, preserved here for historical
+diagnosis: indexers running v0.2.0 and earlier did not perform
+this check, and would crash with `UNIQUE constraint failed:
+transactions.tx_id` when a canonical block re-included
+transactions from an orphaned predecessor. Recovery for those
+versions required manually deleting the orphaned rows and rolling
+back `indexer_state.height`.
 
 ## Crash Recovery
 
@@ -528,7 +543,7 @@ diagnostic body.
 | `bytes` field is hex (not base64, base16-prefixed, etc.) | Stable across major versions |
 | `Restart=on-failure` + StartLimit policy | Stable; tuning may change |
 | SQLite schema column adds | Additive only; removals bump major |
-| Reorg detection added | Future minor — clients must not depend on its absence |
+| Reorg detection | Shipped via parent-linkage check; clients should not depend on a specific reorg-window depth |
 | PostgreSQL backend parity with SQLite | Stable across major versions |
 
 ## Out of scope
