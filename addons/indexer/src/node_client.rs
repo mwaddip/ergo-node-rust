@@ -15,6 +15,7 @@ pub struct NodeClient {
 #[serde(rename_all = "camelCase")]
 pub struct HeaderJson {
     pub id: String,
+    pub parent_id: String,
     pub height: u64,
     pub timestamp: u64,
     #[serde(alias = "nBits")]

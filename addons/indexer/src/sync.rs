@@ -183,6 +183,28 @@ pub async fn run(
                 .header(header_id)
                 .await
                 .with_context(|| format!("failed to fetch header {header_id}"))?;
+
+            // Parent-linkage check: target's parent_id must match the
+            // header_id stored at `last_indexed`. Catches mid-loop reorgs
+            // that the outer `last_indexed` canonical check misses (it only
+            // runs at the top of the outer loop, before info_wait). Without
+            // this, the indexer happily stacks canonical blocks on top of an
+            // orphaned ancestor and crashes later on a UNIQUE constraint when
+            // a mempool-re-included tx_id collides.
+            if let Some(fork) =
+                check_parent_linkage(&db, &client, last_indexed, target, &header.parent_id).await?
+            {
+                tracing::warn!(
+                    prev_tip = last_indexed,
+                    target,
+                    fork_point = fork,
+                    target_parent_id = %header.parent_id,
+                    "parent linkage mismatch — rolled back"
+                );
+                last_indexed = fork;
+                continue;
+            }
+
             let txs = match client.transactions(header_id).await {
                 Ok(t) => t,
                 Err(e) => {
@@ -207,6 +229,45 @@ pub async fn run(
             }
         }
     }
+}
+
+/// Verify that the next block's parent matches the indexer's stored
+/// header_id at `last_indexed`. If they agree, returns `Ok(None)`. If they
+/// differ, the indexer's chain has been orphaned at or before `last_indexed`;
+/// walk back via `check_canonical_or_rollback` to find the fork point, roll
+/// back, and return `Ok(Some(fork))`. Returns `Ok(None)` when there's nothing
+/// to compare yet (`last_indexed == 0`, the fresh-genesis case).
+///
+/// If the parent comparison disagrees but the canonical check at
+/// `last_indexed` does NOT detect a reorg, the indexer's stored state and the
+/// node's view have an unresolvable disagreement (very fast race, node bug,
+/// or DB corruption). Bail rather than silently proceed.
+async fn check_parent_linkage(
+    db: &Arc<dyn IndexerDb>,
+    client: &NodeClient,
+    last_indexed: u64,
+    target: u64,
+    target_parent_id: &str,
+) -> Result<Option<u64>> {
+    if last_indexed == 0 {
+        return Ok(None);
+    }
+    let stored_parent = db.get_block_id_at(last_indexed).await?;
+    let target_parent_bytes = hex::decode(target_parent_id).with_context(|| {
+        format!("invalid parent_id hex on block {target}: {target_parent_id}")
+    })?;
+    if stored_parent.as_deref() == Some(target_parent_bytes.as_slice()) {
+        return Ok(None);
+    }
+    if let Some(fork) = check_canonical_or_rollback(db, client, last_indexed).await? {
+        return Ok(Some(fork));
+    }
+    anyhow::bail!(
+        "parent linkage mismatch at height {target}: target.parent_id = {} but \
+         stored block at {last_indexed} = {:?} — and canonical check disagrees",
+        target_parent_id,
+        stored_parent.as_ref().map(hex::encode),
+    );
 }
 
 /// Compare the stored block ID at `height` against the canonical chain.
@@ -248,4 +309,165 @@ async fn check_canonical_or_rollback(
     tracing::info!(fork_point = fork, "rolling back to fork point");
     db.rollback_to(fork).await?;
     Ok(Some(fork))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::sqlite::SqliteDb;
+    use crate::types::IndexedBlock;
+    use axum::{
+        extract::{Path as AxumPath, State as AxumState},
+        response::Json as AxumJson,
+        routing::get,
+        Router,
+    };
+    use std::collections::HashMap;
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex as TokioMutex;
+
+    /// Mock-node response state, exposed via two routes (`/blocks/at/{height}`
+    /// and `/blocks/{header_id}/header`). Held behind a TokioMutex so test
+    /// setup can populate it before the server starts serving.
+    #[derive(Default)]
+    struct MockNode {
+        canonical_at_height: HashMap<u64, String>,
+        headers: HashMap<String, MockHeader>,
+    }
+
+    #[derive(Clone)]
+    struct MockHeader {
+        id: String,
+        parent_id: String,
+        height: u64,
+    }
+
+    async fn start_mock_node(state: Arc<TokioMutex<MockNode>>) -> String {
+        let app = Router::new()
+            .route("/blocks/at/{height}", get(handle_blocks_at))
+            .route("/blocks/{header_id}/header", get(handle_header))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn handle_blocks_at(
+        AxumPath(height): AxumPath<u64>,
+        AxumState(state): AxumState<Arc<TokioMutex<MockNode>>>,
+    ) -> AxumJson<Vec<String>> {
+        let s = state.lock().await;
+        AxumJson(s.canonical_at_height.get(&height).cloned().into_iter().collect())
+    }
+
+    async fn handle_header(
+        AxumPath(header_id): AxumPath<String>,
+        AxumState(state): AxumState<Arc<TokioMutex<MockNode>>>,
+    ) -> AxumJson<serde_json::Value> {
+        let s = state.lock().await;
+        let h = s.headers.get(&header_id).expect("mock missing header");
+        AxumJson(serde_json::json!({
+            "id": h.id,
+            "parentId": h.parent_id,
+            "height": h.height,
+            "timestamp": 0,
+            "nBits": 0,
+            "powSolutions": { "pk": "00" },
+        }))
+    }
+
+    fn empty_block(header_id: [u8; 32], height: u64) -> IndexedBlock {
+        IndexedBlock {
+            height,
+            header_id,
+            timestamp: 0,
+            difficulty: 0,
+            miner_pk: vec![],
+            block_size: 0,
+            transactions: vec![],
+        }
+    }
+
+    fn open_test_db() -> (Arc<dyn IndexerDb>, tempfile::TempDir) {
+        // Tempdir + nested file path keeps the SQLite WAL/SHM siblings out of
+        // any shared scratch dir. SqliteDb opens two connections; a real
+        // filesystem path makes them share state, where `:memory:` does not.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = Arc::new(SqliteDb::open(path.to_str().unwrap()).unwrap()) as Arc<dyn IndexerDb>;
+        (db, dir)
+    }
+
+    #[tokio::test]
+    async fn parent_linkage_at_genesis_is_noop() {
+        let (db, _td) = open_test_db();
+        // last_indexed == 0 short-circuits before any DB or HTTP work, so
+        // pointing the client at an unreachable URL is fine.
+        let client = NodeClient::new("http://127.0.0.1:1").unwrap();
+        let result = check_parent_linkage(&db, &client, 0, 1, &"00".repeat(32))
+            .await
+            .unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn parent_linkage_match_is_noop() {
+        let (db, _td) = open_test_db();
+        let header_at_100 = [0xaa; 32];
+        db.insert_block(&empty_block(header_at_100, 100)).await.unwrap();
+
+        // Match path returns early — the NodeClient is never touched.
+        let client = NodeClient::new("http://127.0.0.1:1").unwrap();
+        let result = check_parent_linkage(&db, &client, 100, 101, &hex::encode(header_at_100))
+            .await
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(db.get_indexed_height().await.unwrap(), Some(100));
+        assert_eq!(
+            db.get_block_id_at(100).await.unwrap(),
+            Some(header_at_100.to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_linkage_mismatch_walks_back_to_fork() {
+        // Production scenario (mainnet 1794419 reorg, scaled down):
+        //   DB has canonical ancestor at 100, ORPHAN at 101.
+        //   Node now reports a different canonical header at 101.
+        //   Indexer fetches target=102's header; its parent_id is the
+        //   canonical 101, which does NOT match the orphan stored at 101.
+        //   Expect: walk back to 100 (last matching ancestor), rollback DB.
+        let (db, _td) = open_test_db();
+        let canonical_100 = [0xaa; 32];
+        let orphan_101 = [0xbb; 32];
+        let canonical_101 = [0xcc; 32];
+        db.insert_block(&empty_block(canonical_100, 100)).await.unwrap();
+        db.insert_block(&empty_block(orphan_101, 101)).await.unwrap();
+
+        let mock_state = Arc::new(TokioMutex::new(MockNode::default()));
+        {
+            let mut s = mock_state.lock().await;
+            s.canonical_at_height
+                .insert(100, hex::encode(canonical_100));
+            s.canonical_at_height
+                .insert(101, hex::encode(canonical_101));
+        }
+        let url = start_mock_node(mock_state).await;
+        let client = NodeClient::new(&url).unwrap();
+
+        let result =
+            check_parent_linkage(&db, &client, 101, 102, &hex::encode(canonical_101))
+                .await
+                .unwrap();
+        assert_eq!(result, Some(100));
+        assert_eq!(db.get_indexed_height().await.unwrap(), Some(100));
+        assert_eq!(db.get_block_id_at(101).await.unwrap(), None);
+        assert_eq!(
+            db.get_block_id_at(100).await.unwrap(),
+            Some(canonical_100.to_vec())
+        );
+    }
 }
