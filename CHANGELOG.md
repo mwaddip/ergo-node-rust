@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.6.7 — 2026-05-28
+
+Stability fixes for the REST API under concurrent load and a
+peer-filtering correctness fix, both surfaced by running the
+external validation harness against the live mainnet validator.
+
+### API: `/blocks/{id}/transactions` no longer starves the reactor
+
+Under concurrent load on fat blocks (the ~900k–1M region has
+transactions whose deserialization dominates), this endpoint ran
+its CPU-bound parse + serialize **synchronously on the async
+worker threads**. The validation harness — fetching a block's
+transactions once per box, 64-wide, with retries — saturated all
+async workers, so requests queued past the client timeout, the
+retries piled into a thundering-herd, and the node fell behind on
+consensus block application (multi-minute gaps) while burning
+~29 cores in gridlock.
+
+Fix: the parse + serialize now run on the blocking thread pool
+(`spawn_blocking`), keeping the async reactor free for
+consensus-critical P2P work. Request latency stays bounded under
+concurrency, so the retry storm can't form. Single-request wall
+time is unchanged (~0.5s for a fat block) — the floor is
+sigma-rust's `Transaction` deserialization (~76% of the time),
+left as a separate future optimization. Response byte-shape is
+unchanged.
+
+### P2P: bogus-address filtering no longer penalizes the gossiper
+
+The v0.5.3 address-sanity filter permanent-banned any peer that
+gossiped a peer list containing a CGNAT/RFC1918/link-local
+address. On a NAT'd network that's normal behavior, not
+misbehavior — the filter was blacklisting legitimate mainnet seed
+nodes. Now matches JVM 6.0.3: bogus addresses are filtered out of
+intake but the gossiper is not penalized. Filtering is gated
+behind the new `[network].filter_bogus_addresses` (default
+`true`); set `false` to ingest every syntactically-valid address.
+The malformed-`Peers` ban (a genuine protocol violation) is
+unchanged.
+
+### Packaging / docs
+
+- `deploy/fail2ban/ergo-node.conf`: retired the now-dead
+  `address_sanity` penalty kind from the failregex (five
+  permanent-ban kinds, not six).
+- Operations manual: added a non-interactive-upgrade section
+  (`Dpkg::Options::="--force-confold"`) covering the conffile
+  prompt that aborts scripted `apt install`.
+
 ## v0.6.6 — 2026-05-27
 
 JVM-compatibility fixes across four REST endpoints surfaced by
