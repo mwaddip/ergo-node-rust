@@ -42,6 +42,14 @@ pub struct NetworkConfig {
     /// Default temporary ban duration in minutes.
     #[serde(default = "default_temporal_ban_duration")]
     pub temporal_ban_duration_mins: u64,
+    /// Filter bogus peer addresses (CGNAT, RFC1918, link-local, loopback,
+    /// etc.) out of `Peers` intake and `GetPeers` responses. Default `true`
+    /// = JVM 6.0.3 parity (filter, no penalty). When `false`, every
+    /// syntactically-valid address is ingested, eligible for outbound fill,
+    /// and gossiped onward. Never affects the malformed-Peers ban or the
+    /// self-address filter.
+    #[serde(default = "default_filter_bogus_addresses")]
+    pub filter_bogus_addresses: bool,
 }
 
 /// UPnP configuration. IPv4 only — IPv6 addresses are globally routable.
@@ -92,6 +100,9 @@ fn default_inactive_connection_deadline() -> u64 {
 fn default_temporal_ban_duration() -> u64 {
     60
 }
+fn default_filter_bogus_addresses() -> bool {
+    true
+}
 
 impl Default for NetworkConfig {
     fn default() -> Self {
@@ -104,6 +115,7 @@ impl Default for NetworkConfig {
             handshake_timeout_secs: default_handshake_timeout(),
             inactive_connection_deadline_secs: default_inactive_connection_deadline(),
             temporal_ban_duration_mins: default_temporal_ban_duration(),
+            filter_bogus_addresses: default_filter_bogus_addresses(),
         }
     }
 }

@@ -97,6 +97,13 @@ pub struct Router {
     /// classes in `is_bogus_address` (private/CGN/ULA/documentation ranges
     /// are filtered on mainnet but allowed on testnet for LAN setups).
     network: Network,
+    /// When `true`, bogus addresses are dropped from `Peers` intake and
+    /// `GetPeers` response selection (JVM 6.0.3 parity). When `false`, no
+    /// address-sanity filtering: every syntactically-valid address is
+    /// ingested and gossiped onward. Never affects the malformed-Peers ban
+    /// (a real protocol violation) or the self-address filter. See
+    /// `facts/p2p-routing.md`.
+    filter_bogus_addresses: bool,
     /// Cumulative traffic counters shared with peer tasks. Incremented
     /// at the framing boundary on every inbound parsed message and every
     /// outbound serialized frame. Exposed to operators via
@@ -125,16 +132,19 @@ impl Router {
             HashSet::new(),
         )
         .expect("MemoryPeerStorage::load_all is infallible");
-        Self::with_peer_db(Arc::new(StdMutex::new(peer_db)), blacklist, 64, network)
+        Self::with_peer_db(Arc::new(StdMutex::new(peer_db)), blacklist, 64, network, true)
     }
 
     /// Construct a router with an externally-owned PeerDb + Blacklist.
     /// `max_peer_spec_objects` caps inbound `Peers` bodies.
+    /// `filter_bogus_addresses` gates address-sanity filtering on `Peers`
+    /// intake and `GetPeers` responses (see `facts/p2p-routing.md`).
     pub fn with_peer_db(
         peer_db: Arc<StdMutex<PeerDb>>,
         blacklist: Arc<Blacklist>,
         max_peer_spec_objects: usize,
         network: Network,
+        filter_bogus_addresses: bool,
     ) -> Self {
         Self {
             peers: HashMap::new(),
@@ -147,6 +157,7 @@ impl Router {
             blacklist,
             max_peer_spec_objects,
             network,
+            filter_bogus_addresses,
             counters: Arc::new(TrafficCounters::new()),
         }
     }
@@ -437,7 +448,10 @@ impl Router {
                     let db = self.peer_db.lock().expect("peer_db poisoned");
                     db.recent(limit, &exclude)
                         .into_iter()
-                        .filter(|r| !is_bogus_address(r.address, self.network))
+                        .filter(|r| {
+                            !(self.filter_bogus_addresses
+                                && is_bogus_address(r.address, self.network))
+                        })
                         .map(record_to_spec)
                         .collect()
                 };
@@ -451,59 +465,50 @@ impl Router {
             ProtocolMessage::Peers { body } => {
                 match parse_peers_body(&body, self.max_peer_spec_objects) {
                     Ok(specs) => {
-                        let mut any_bogus = false;
-                        let mut bogus_examples: Vec<SocketAddr> = Vec::new();
-                        {
-                            let mut db = self.peer_db.lock().expect("peer_db poisoned");
-                            for spec in specs {
-                                let Some(addr) = spec.address else { continue };
-                                if is_bogus_address(addr, self.network) {
-                                    any_bogus = true;
-                                    if bogus_examples.len() < 3 {
-                                        bogus_examples.push(addr);
-                                    }
-                                    continue;
-                                }
-                                if self.blacklist.contains(addr) {
-                                    continue;
-                                }
-                                db.record(PeerRecord {
-                                    address: addr,
-                                    last_seen_ms: now_ms(),
-                                    agent_name: spec.agent.clone(),
-                                    node_name: spec.name.clone(),
-                                    version: (
-                                        spec.version.major,
-                                        spec.version.minor,
-                                        spec.version.patch,
-                                    ),
-                                    features: spec
-                                        .features
-                                        .iter()
-                                        .map(|f| (f.id, f.body.clone()))
-                                        .collect(),
-                                });
+                        let mut db = self.peer_db.lock().expect("peer_db poisoned");
+                        for spec in specs {
+                            let Some(addr) = spec.address else { continue };
+                            // Bogus addresses are silently dropped when
+                            // filtering is enabled (JVM 6.0.3 parity) — the
+                            // gossiper is NOT penalized. Relaying a peer list
+                            // that contains CGNAT/private addresses is normal
+                            // on a NAT'd network, not misbehavior. JVM
+                            // PeerSynchronizer.addNewPeers → AddPeerIfEmpty
+                            // never penalizes here. Non-bogus entries from the
+                            // same body are recorded regardless.
+                            if self.filter_bogus_addresses
+                                && is_bogus_address(addr, self.network)
+                            {
+                                continue;
                             }
-                        }
-
-                        if any_bogus {
-                            // Same shape as the malformed-Peers ban.
-                            // Legitimate entries from the same body were
-                            // recorded above; we punish the gossiper,
-                            // not the gossiped peers.
-                            tracing::warn!(
-                                peer = %source_addr.ip(),
-                                kind = "address_sanity",
-                                detail = format!("{:?}", bogus_examples),
-                                "PENALTY"
-                            );
-                            self.blacklist.record_permanent(source_addr);
+                            if self.blacklist.contains(addr) {
+                                continue;
+                            }
+                            db.record(PeerRecord {
+                                address: addr,
+                                last_seen_ms: now_ms(),
+                                agent_name: spec.agent.clone(),
+                                node_name: spec.name.clone(),
+                                version: (
+                                    spec.version.major,
+                                    spec.version.minor,
+                                    spec.version.patch,
+                                ),
+                                features: spec
+                                    .features
+                                    .iter()
+                                    .map(|f| (f.id, f.body.clone()))
+                                    .collect(),
+                            });
                         }
                         vec![]
                     }
                     Err(e) => {
-                        // JVM PeerSynchronizer.penalizeMaliciousPeer →
-                        // PermanentPenalty.
+                        // A truncated/oversized/invalid Peers body is a real
+                        // protocol violation. JVM penalizes it via
+                        // PeerSynchronizer.penalizeMaliciousPeer →
+                        // PermanentPenalty (the Synchronizer parse-failure
+                        // path), so we permanently ban the source.
                         tracing::warn!(
                             peer = %source_addr.ip(),
                             kind = "malformed_peers",
@@ -610,6 +615,27 @@ mod tests {
             address: Some(declared),
             features: vec![],
         }
+    }
+
+    /// Build a router with bogus-address filtering disabled, mirroring
+    /// `Router::new` but with `filter_bogus_addresses = false`.
+    fn router_no_filter(network: Network) -> Router {
+        let blacklist = Arc::new(Blacklist::new());
+        let storage: Box<dyn PeerStorage> = Box::new(MemoryPeerStorage::new());
+        let peer_db = PeerDb::new(
+            storage,
+            blacklist.clone(),
+            crate::peer_db::DEFAULT_CAP,
+            HashSet::new(),
+        )
+        .expect("MemoryPeerStorage::load_all is infallible");
+        Router::with_peer_db(
+            Arc::new(StdMutex::new(peer_db)),
+            blacklist,
+            64,
+            network,
+            false,
+        )
     }
 
     #[test]
@@ -817,7 +843,7 @@ mod tests {
     }
 
     #[test]
-    fn peers_with_bogus_entry_bans_source() {
+    fn peers_with_bogus_entry_drops_bogus_no_ban() {
         let mut router = Router::new(Network::Mainnet);
         let source = PeerId(1);
         let source_addr = pub_addr("198.51.100.50:9030");
@@ -830,9 +856,6 @@ mod tests {
             None,
         );
 
-        // 198.51.100/24 and 203.0.113/24 are documentation ranges and
-        // thus bogus — use a public-looking address (Hetzner-ish) for
-        // the "good" entry.
         let good = pub_addr("78.46.1.50:9030");
         let bogus = pub_addr("169.254.0.2:9030"); // link-local APIPA
         let specs = vec![spec_for("ergoref", good), spec_for("ergoref", bogus)];
@@ -843,18 +866,23 @@ mod tests {
         });
         assert!(actions.is_empty(), "Peers ingest emits no Send actions");
 
-        // Good entry recorded; bogus entry not recorded.
+        // With filtering on (default), the good entry is recorded and the
+        // bogus entry is silently dropped.
         let db = router.peer_db.lock().unwrap();
         assert!(db.get(good).is_some(), "good address recorded");
-        assert!(db.get(bogus).is_none(), "bogus address skipped");
+        assert!(db.get(bogus).is_none(), "bogus address dropped");
         drop(db);
 
-        // Source permanently banned.
-        assert!(router.blacklist.contains(source_addr));
+        // Source is NOT banned — gossiping a bogus address is normal on a
+        // NAT'd network, not misbehavior (JVM 6.0.3 parity).
+        assert!(
+            !router.blacklist.contains(source_addr),
+            "source not banned for gossiping a bogus address"
+        );
     }
 
     #[test]
-    fn peers_all_bogus_bans_source() {
+    fn peers_all_bogus_drops_all_no_ban() {
         let mut router = Router::new(Network::Mainnet);
         let source = PeerId(2);
         let source_addr = pub_addr("78.46.1.51:9030");
@@ -900,7 +928,97 @@ mod tests {
             .collect();
         assert_eq!(before, after, "PeerDb unchanged after all-bogus Peers body");
 
-        assert!(router.blacklist.contains(source_addr));
+        // No penalty — an all-bogus body is filtered, not punished.
+        assert!(
+            !router.blacklist.contains(source_addr),
+            "source not banned for an all-bogus Peers body"
+        );
+    }
+
+    #[test]
+    fn peers_bogus_ingested_when_filter_disabled() {
+        let mut router = router_no_filter(Network::Mainnet);
+        let source = PeerId(1);
+        let source_addr = pub_addr("78.46.1.60:9030");
+        router.register_peer(
+            source,
+            Direction::Outbound,
+            ProxyMode::Full,
+            source_addr,
+            None,
+            None,
+        );
+
+        // RFC 1918 — mainnet-bogus by classification, but filtering is off,
+        // so it must be ingested rather than dropped.
+        let private = pub_addr("10.1.2.3:9030");
+        let specs = vec![spec_for("ergoref", private)];
+        let body = build_peers_body(&specs);
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::Peers { body },
+        });
+        assert!(actions.is_empty(), "Peers ingest emits no Send actions");
+
+        let db = router.peer_db.lock().unwrap();
+        assert!(
+            db.get(private).is_some(),
+            "bogus address ingested when filter disabled"
+        );
+        drop(db);
+        assert!(
+            !router.blacklist.contains(source_addr),
+            "source never banned for bogus gossip"
+        );
+    }
+
+    #[test]
+    fn getpeers_includes_bogus_when_filter_disabled() {
+        let mut router = router_no_filter(Network::Mainnet);
+        let source = PeerId(4);
+        let source_addr = pub_addr("78.46.1.61:9030");
+        router.register_peer(
+            source,
+            Direction::Outbound,
+            ProxyMode::Full,
+            source_addr,
+            None,
+            None,
+        );
+
+        // A bogus address that reached PeerDb (e.g. ingested while the
+        // filter was off, or a legacy row). With filtering disabled the
+        // defensive egress filter is also off, so it is gossiped onward.
+        let bogus = pub_addr("192.168.1.42:9030"); // RFC 1918
+        {
+            let mut db = router.peer_db.lock().unwrap();
+            db.record(PeerRecord {
+                address: bogus,
+                last_seen_ms: 3000,
+                agent_name: "ergoref".into(),
+                node_name: "".into(),
+                version: (5, 0, 25),
+                features: vec![],
+            });
+        }
+
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::GetPeers,
+        });
+        let body = match &actions[0] {
+            Action::Send {
+                message: ProtocolMessage::Peers { body },
+                ..
+            } => body.clone(),
+            _ => panic!("expected Peers reply"),
+        };
+        let specs = parse_peers_body(&body, 64).unwrap();
+        let addrs: Vec<SocketAddr> = specs.iter().filter_map(|s| s.address).collect();
+        assert!(
+            addrs.contains(&bogus),
+            "bogus address gossiped when filter disabled"
+        );
     }
 
     #[test]

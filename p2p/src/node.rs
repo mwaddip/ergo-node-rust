@@ -65,6 +65,11 @@ struct BackgroundCtx {
     blacklist: Arc<Blacklist>,
     peer_db: Arc<StdMutex<PeerDb>>,
     network: Network,
+    /// Gates address-sanity filtering in the outbound fill-phase candidate
+    /// selection (`pick_fill_candidate`). Mirrors the router's flag so the
+    /// `[network].filter_bogus_addresses = false` case can dial addresses
+    /// that bypass the bogus classifier. See `facts/p2p-routing.md`.
+    filter_bogus_addresses: bool,
     counters: Arc<TrafficCounters>,
     /// Optional capture tap. `Some` when `[debug.p2p_capture]` is enabled
     /// in the operator's config. Wired into the frame I/O hot path in
@@ -212,6 +217,7 @@ impl P2pNode {
             blacklist.clone(),
             max_peer_spec_objects,
             network,
+            network_settings.filter_bogus_addresses,
         );
         let counters = router_inner.counters();
         let router = Arc::new(Mutex::new(router_inner));
@@ -224,6 +230,7 @@ impl P2pNode {
             blacklist: blacklist.clone(),
             peer_db: peer_db.clone(),
             network,
+            filter_bogus_addresses: network_settings.filter_bogus_addresses,
             counters: counters.clone(),
             capture_tap,
         };
@@ -943,7 +950,7 @@ async fn pick_fill_candidate(
     let db = ctx.peer_db.lock().expect("peer_db poisoned");
     db.recent(fill_slots, &exclude)
         .into_iter()
-        .filter(|r| !is_bogus_address(r.address, ctx.network))
+        .filter(|r| !(ctx.filter_bogus_addresses && is_bogus_address(r.address, ctx.network)))
         .map(|r| r.address)
         .next()
 }
@@ -1033,7 +1040,7 @@ mod tests {
         let blacklist = Arc::new(Blacklist::new());
         let peer_db = shared_peer_db(blacklist.clone());
         let router_inner =
-            Router::with_peer_db(peer_db.clone(), blacklist.clone(), 64, Network::Mainnet);
+            Router::with_peer_db(peer_db.clone(), blacklist.clone(), 64, Network::Mainnet, true);
         let counters = router_inner.counters();
         let router = Arc::new(Mutex::new(router_inner));
         let peer_senders = Arc::new(Mutex::new(HashMap::new()));
@@ -1220,7 +1227,7 @@ mod tests {
         let blacklist = Arc::new(Blacklist::new());
         let peer_db = shared_peer_db(blacklist.clone());
         let router_inner =
-            Router::with_peer_db(peer_db.clone(), blacklist.clone(), 64, Network::Mainnet);
+            Router::with_peer_db(peer_db.clone(), blacklist.clone(), 64, Network::Mainnet, true);
         let counters = router_inner.counters();
         let router = Arc::new(Mutex::new(router_inner));
         let peer_senders: Arc<Mutex<HashMap<PeerId, PeerSender>>> =
@@ -1309,7 +1316,7 @@ mod tests {
         let blacklist = Arc::new(Blacklist::new());
         let peer_db = shared_peer_db(blacklist.clone());
         let router_inner =
-            Router::with_peer_db(peer_db.clone(), blacklist.clone(), 64, Network::Mainnet);
+            Router::with_peer_db(peer_db.clone(), blacklist.clone(), 64, Network::Mainnet, true);
         let counters = router_inner.counters();
         let router = Arc::new(Mutex::new(router_inner));
         let peer_senders: Arc<Mutex<HashMap<PeerId, PeerSender>>> =
