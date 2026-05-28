@@ -47,20 +47,33 @@
   with VLQ count = 0 (one byte: `0x00`).
 - Peers: body parsed per `p2p-protocol.md::Peers wire format`. For
   each entry, if the entry's declared address is present and not
-  blacklisted and is not bogus (see below), it is recorded into
-  PeerDb with `last_seen_ms = now`.
+  blacklisted — and, when bogus-address filtering is enabled (see
+  `[network].filter_bogus_addresses` below), not bogus — it is
+  recorded into PeerDb with `last_seen_ms = now`.
   Malformed Peers (cap exceeded, truncated body, invalid shortString)
-  triggers a permanent ban of the source via the blacklist module.
-  **A `Peers` body containing one or more bogus addresses also
-  triggers a permanent ban of the source** — there is no legitimate
-  reason to gossip an unroutable address to other peers; doing so
-  is either a buggy implementation or deliberate spam. Non-bogus
-  entries from the same body are still recorded (we don't punish
-  the gossiped peers, only the gossiper).
+  triggers a permanent ban of the source via the blacklist module —
+  a genuine protocol violation, mirroring JVM
+  `PeerSynchronizer.penalizeMaliciousPeer → PermanentPenalty`.
+  **Bogus addresses in a `Peers` body do NOT penalize the source.**
+  JVM 6.0.3 filters bogus addresses out of intake but does not ban
+  the gossiper — relaying a peer list that contains CGNAT/private
+  addresses is normal on a NAT'd network, not misbehavior. When
+  filtering is enabled, bogus entries are silently dropped; non-bogus
+  entries from the same body are recorded regardless.
+- Bogus-address filtering is governed by
+  `[network].filter_bogus_addresses` (default `true`). When `true`,
+  bogus addresses (per the network-conditional classification below)
+  are dropped from `Peers` intake and from GetPeers response
+  selection — JVM 6.0.3 parity. When `false`, no address-sanity
+  filtering is applied: every syntactically-valid address is ingested,
+  may be selected for outbound fill, and is gossiped onward. The flag
+  does not affect the malformed-Peers ban (unconditional) or the
+  self-address filter (separate; the node never records or dials its
+  own declared addresses).
 - GetPeers response selection (the producer side) drops bogus
-  addresses defensively before serialization — we never gossip a
-  bogus address even if it ended up in our PeerDb somehow (legacy
-  rows from before the filter, or a future regression).
+  addresses defensively before serialization when filtering is
+  enabled — we never gossip a bogus address that ended up in PeerDb
+  (legacy rows, or addresses ingested while the filter was off).
 
 ### Bogus address classification
 

@@ -235,6 +235,16 @@ protocol_version = "6.0.3"
 #
 # Default temporary ban duration in minutes.
 # temporal_ban_duration_mins = 60
+#
+# Filter bogus peer addresses (CGNAT, RFC1918 private, link-local,
+# loopback, multicast, documentation ranges) out of gossiped peer
+# lists. Default true, matching JVM 6.0.3 — bogus addresses are
+# dropped from intake but the peer that gossiped them is NOT
+# penalized. Set false to ingest every syntactically-valid address
+# (e.g. a private testnet where RFC1918 peers are legitimate; note
+# mainnet/testnet classification already treats private ranges as
+# routable on testnet). Does not affect the malformed-message ban.
+# filter_bogus_addresses = true
 
 # ── UPnP port mapping (IPv4 only — IPv6 is globally routable) ───────────
 

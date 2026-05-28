@@ -294,7 +294,7 @@ phase's `_started`.
 - **Level:** WARN
 - **Marker:** `"PENALTY"`
 - **Fields:** `peer` (string), `kind` (string: short identifier such
-  as `header_parse_failed`, `invalid_pow`, `address_sanity`), `detail`
+  as `header_parse_failed`, `invalid_pow`, `malformed_peers`), `detail`
   (string, optional)
 - **Since:** 1.0
 - **Stability:** stable
