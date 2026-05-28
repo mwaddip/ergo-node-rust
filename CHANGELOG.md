@@ -2,9 +2,12 @@
 
 ## v0.6.7 — 2026-05-28
 
-Stability fixes for the REST API under concurrent load and a
-peer-filtering correctness fix, both surfaced by running the
-external validation harness against the live mainnet validator.
+Resolves a gridlock where the external validation harness melted
+the live mainnet validator to ~27 cores while making no progress.
+The fix spans the indexer (the real request amplifier), the REST
+API (reactor protection), and a peer-filtering correctness fix —
+all surfaced by running the harness against the node. Indexer crate
+bumped to 0.2.1.
 
 ### API: `/blocks/{id}/transactions` no longer starves the reactor
 
@@ -26,6 +29,24 @@ time is unchanged (~0.5s for a fat block) — the floor is
 sigma-rust's `Transaction` deserialization (~76% of the time),
 left as a separate future optimization. Response byte-shape is
 unchanged.
+
+### Indexer: per-box block fetches coalesced (the actual gridlock fix)
+
+`compose_box_bytes` fetched and deserialized the *entire block*
+from the node once per box. The harness fetches boxes 64-wide, so
+when those boxes shared a block (the common case), the indexer
+fired 64 concurrent identical `/blocks/{id}/transactions` at the
+node — each a full fat-block deserialize — plus retries. That was
+the real amplifier behind the gridlock; the API `spawn_blocking`
+change above protects the reactor but doesn't cut the volume.
+
+Fix: a bounded LRU (16 entries) of `tokio::OnceCell` keyed by
+header id, with `get_or_try_init` single-flight. N concurrent box
+requests for one block now collapse to a single node fetch;
+sequential requests for the same block hit the cache. Failed
+fetches aren't cached (next caller retries, no poisoning).
+Verified under full 64-wide harness load: node ~1 core (was ~27),
+load ~2 (was ~70), harness ~6 blk/s (was gridlocked at ~0.5).
 
 ### P2P: bogus-address filtering no longer penalizes the gossiper
 
