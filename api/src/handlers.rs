@@ -249,31 +249,59 @@ const BLOCK_TRANSACTIONS_TYPE: u8 = 102;
 pub async fn get_block_transactions(
     State(state): State<ApiState>,
     Path(header_id): Path<String>,
-) -> ApiResult<serde_json::Value> {
-    let id = hex_to_id(&header_id)?;
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let id = match hex_to_id(&header_id) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
     // Block transactions are keyed by modifier ID = blake2b256(type_id || header_id || tx_root),
     // not by header ID. Compute the modifier ID from the header.
-    let header = state
-        .chain
-        .header_by_id(&id)
-        .ok_or_else(|| err::<()>(StatusCode::NOT_FOUND, "header not found").unwrap_err())?;
+    let Some(header) = state.chain.header_by_id(&id) else {
+        return api_error(StatusCode::NOT_FOUND, "header not found", None).into_response();
+    };
     let modifier_id = section_modifier_id(
         BLOCK_TRANSACTIONS_TYPE,
         &id,
         header.transaction_root.0.as_ref(),
     );
-    match state.store.get(BLOCK_TRANSACTIONS_TYPE, &modifier_id) {
-        Some(data) => match ergo_validation::parse_block_transactions(&data) {
-            Ok(parsed) => Ok(Json(serde_json::json!({
-                "headerId": header_id,
-                "transactions": parsed.transactions,
-            }))),
-            Err(e) => err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to parse stored transactions: {e}"),
-            ),
-        },
-        None => err(StatusCode::NOT_FOUND, "transactions not found"),
+    let Some(data) = state.store.get(BLOCK_TRANSACTIONS_TYPE, &modifier_id) else {
+        return api_error(StatusCode::NOT_FOUND, "transactions not found", None).into_response();
+    };
+
+    // A fat block costs ~0.5s of CPU to render, ~75% of it sigma-rust's
+    // Transaction::sigma_parse. Running that on the async reactor starved block
+    // application under concurrent load (the 2026-05 reactor-starvation
+    // incident), so parse+serialize go on the blocking pool. Keep rendering via
+    // serde_json::Value so object keys stay byte-for-byte sorted as before.
+    let rendered = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let parsed = ergo_validation::parse_block_transactions(&data)
+            .map_err(|e| format!("failed to parse stored transactions: {e}"))?;
+        let value = serde_json::json!({
+            "headerId": header_id,
+            "transactions": parsed.transactions,
+        });
+        serde_json::to_vec(&value).map_err(|e| format!("failed to serialize transactions: {e}"))
+    })
+    .await;
+
+    match rendered {
+        Ok(Ok(bytes)) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            bytes,
+        )
+            .into_response(),
+        Ok(Err(reason)) => {
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, reason, None).into_response()
+        }
+        Err(join_err) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("transaction rendering task failed: {join_err}"),
+            None,
+        )
+        .into_response(),
     }
 }
 
@@ -3129,6 +3157,67 @@ mod tests {
             parsed.transactions.len(),
             "tx count must match /blocks/{{id}}",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /blocks/{id}/transactions
+    // -----------------------------------------------------------------------
+
+    /// Guards the byte-shape of the response. The handler renders through
+    /// `serde_json::Value`, so every object's keys come out alphabetically
+    /// sorted. Re-canonicalizing the body must therefore be a no-op. A future
+    /// "optimization" to a typed/`derive(Serialize)` struct would emit fields in
+    /// impl order (e.g. `id` before `dataInputs`) and silently change the bytes
+    /// every external consumer sees — this test fails loudly if that happens.
+    #[test]
+    fn block_transactions_response_is_canonical_sorted_json() {
+        let (state, target_id_hex, expected_tx_count) = build_vf_fixture();
+        let rt = build_runtime();
+        let (status, content_type, body_bytes) = rt.block_on(async {
+            let resp = get_block_transactions(State(state), Path(target_id_hex.clone())).await;
+            let status = resp.status();
+            let content_type = resp
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, content_type, bytes)
+        });
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some("application/json"));
+
+        let value: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(value["headerId"], serde_json::Value::String(target_id_hex));
+        assert_eq!(
+            value["transactions"].as_array().map(Vec::len),
+            Some(expected_tx_count)
+        );
+
+        let recanonical = serde_json::to_vec(&value).unwrap();
+        assert_eq!(
+            body_bytes.as_ref(),
+            recanonical.as_slice(),
+            "response must already be canonical sorted-key JSON; a direct serializer would reorder keys"
+        );
+    }
+
+    #[test]
+    fn block_transactions_unknown_id_is_404() {
+        let chain = Arc::new(MultiHeaderChain {
+            by_id: HashMap::new(),
+        });
+        let state = test_state(chain);
+        let rt = build_runtime();
+        let status = rt.block_on(async {
+            get_block_transactions(State(state), Path("aa".repeat(32)))
+                .await
+                .status()
+        });
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     // -----------------------------------------------------------------------
