@@ -1,3 +1,4 @@
+pub mod block_tx_cache;
 pub mod blocks;
 pub mod boxes;
 pub mod debug;
@@ -15,6 +16,7 @@ use tokio::sync::watch;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
+use crate::api::block_tx_cache::BlockTxCache;
 use crate::db::IndexerDb;
 use crate::node_client::NodeClient;
 
@@ -24,6 +26,10 @@ pub struct ApiContext {
     pub start_time: Instant,
     pub node_url: String,
     pub node_client: Arc<NodeClient>,
+    /// Single-flight + cache for per-block transaction fetches, shared across
+    /// all `/boxes/{id}/bytes` requests. Collapses the harness's wide
+    /// concurrent box-fetch burst into one node fetch per block.
+    pub block_tx_cache: Arc<BlockTxCache>,
 }
 
 #[derive(OpenApi)]
@@ -87,6 +93,7 @@ pub async fn serve(
         start_time,
         node_url,
         node_client,
+        block_tx_cache: Arc::new(BlockTxCache::new()),
     };
 
     let app = Router::new()

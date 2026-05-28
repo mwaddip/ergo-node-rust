@@ -9,6 +9,7 @@ use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use serde::Serialize;
 use utoipa::ToSchema;
 
+use super::block_tx_cache::BlockTxCache;
 use super::{ApiContext, Pagination};
 use crate::db::IndexerDb;
 use crate::node_client::NodeClient;
@@ -135,7 +136,9 @@ pub(crate) enum BoxBytesOutcome {
 ///
 /// Steps:
 /// 1. Look up the indexer row for `box_id` (404 if absent).
-/// 2. Fetch the creating block's transactions from the node.
+/// 2. Fetch the creating block's transactions from the node, via the
+///    single-flight cache so that a wide concurrent burst of box requests for
+///    the same block collapses to one node fetch.
 /// 3. Locate the creating tx by id, extract the output at the recorded index.
 /// 4. Deserialize as an `ErgoBox` and `sigma_serialize` it.
 /// 5. Verify `blake2b256(bytes) == box_id` — never serve bytes whose hash
@@ -143,6 +146,7 @@ pub(crate) enum BoxBytesOutcome {
 pub(crate) async fn compose_box_bytes(
     db: &dyn IndexerDb,
     client: &NodeClient,
+    block_tx_cache: &BlockTxCache,
     box_id: &[u8; 32],
 ) -> BoxBytesOutcome {
     let row = match db.get_box(box_id).await {
@@ -156,7 +160,10 @@ pub(crate) async fn compose_box_bytes(
         }
     };
 
-    let txs = match client.transactions(&row.header_id).await {
+    let txs = match block_tx_cache
+        .get_or_fetch(&row.header_id, || client.transactions(&row.header_id))
+        .await
+    {
         Ok(t) => t,
         Err(e) => {
             return BoxBytesOutcome::Internal {
@@ -274,7 +281,7 @@ pub async fn get_box_bytes(
         }
     };
 
-    match compose_box_bytes(&*ctx.db, &ctx.node_client, &box_id).await {
+    match compose_box_bytes(&*ctx.db, &ctx.node_client, &ctx.block_tx_cache, &box_id).await {
         BoxBytesOutcome::Found(b) => Json(BoxBytesResponse {
             bytes: hex::encode(b),
         })
@@ -303,6 +310,7 @@ pub async fn get_box_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -384,6 +392,48 @@ mod tests {
                 .unwrap();
         });
         (format!("http://{addr}"), tx)
+    }
+
+    /// Like `spawn_mock_node`, but also returns an atomic counter incremented
+    /// once per `/blocks/{id}/transactions` request — lets a test assert how
+    /// many times the node was actually hit.
+    async fn spawn_counting_mock_node(
+        response: Value,
+    ) -> (String, oneshot::Sender<()>, Arc<AtomicUsize>) {
+        let body = Arc::new(response);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/blocks/{id}/transactions",
+            axum_get({
+                let body = body.clone();
+                let hits = hits.clone();
+                move |AxPath(id): AxPath<String>| {
+                    let body = body.clone();
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let mut cloned = (*body).clone();
+                        if let Some(obj) = cloned.as_object_mut() {
+                            obj.insert("headerId".into(), Value::String(id));
+                        }
+                        axum::Json(cloned)
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
+                .await
+                .unwrap();
+        });
+        (format!("http://{addr}"), tx, hits)
     }
 
     /// Insert a single block carrying one tx with `n_outputs` outputs at
@@ -524,8 +574,9 @@ mod tests {
         });
         let (base_url, _shutdown) = spawn_mock_node(tx_json).await;
         let client = NodeClient::new(&base_url).unwrap();
+        let cache = BlockTxCache::new();
 
-        let outcome = compose_box_bytes(&db, &client, &box_id_arr()).await;
+        let outcome = compose_box_bytes(&db, &client, &cache, &box_id_arr()).await;
         match outcome {
             BoxBytesOutcome::Found(bytes) => {
                 assert_eq!(hex::encode(blake2b256(&bytes)), FIXTURE_BOX_ID);
@@ -564,8 +615,9 @@ mod tests {
         });
         let (base_url, _shutdown) = spawn_mock_node(tx_json).await;
         let client = NodeClient::new(&base_url).unwrap();
+        let cache = BlockTxCache::new();
 
-        let outcome = compose_box_bytes(&db, &client, &box_id_arr()).await;
+        let outcome = compose_box_bytes(&db, &client, &cache, &box_id_arr()).await;
         match outcome {
             BoxBytesOutcome::Found(bytes) => {
                 assert_eq!(hex::encode(blake2b256(&bytes)), FIXTURE_BOX_ID);
@@ -588,8 +640,9 @@ mod tests {
         let tx_json = json!({ "headerId": "", "transactions": [] });
         let (base_url, _shutdown) = spawn_mock_node(tx_json).await;
         let client = NodeClient::new(&base_url).unwrap();
+        let cache = BlockTxCache::new();
 
-        let outcome = compose_box_bytes(&db, &client, &box_id_arr()).await;
+        let outcome = compose_box_bytes(&db, &client, &cache, &box_id_arr()).await;
         assert!(
             matches!(outcome, BoxBytesOutcome::NotFound),
             "expected NotFound"
@@ -634,8 +687,9 @@ mod tests {
         });
         let (base_url, _shutdown) = spawn_mock_node(tx_json).await;
         let client = NodeClient::new(&base_url).unwrap();
+        let cache = BlockTxCache::new();
 
-        let outcome = compose_box_bytes(&db, &client, &box_id_arr()).await;
+        let outcome = compose_box_bytes(&db, &client, &cache, &box_id_arr()).await;
         match outcome {
             BoxBytesOutcome::Internal { code, .. } => {
                 assert_eq!(code, "id-byte-mismatch", "expected id-byte-mismatch");
@@ -649,6 +703,61 @@ mod tests {
                 }
             ),
         }
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// The production regression: many concurrent box requests for the SAME
+    /// block must collapse to ONE node fetch (was N + retries, melting the node
+    /// on fat blocks), while every caller still gets correct box bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn boxes_bytes_concurrent_same_block_one_node_fetch() {
+        let db_path = temp_db_path();
+        let db = Arc::new(SqliteDb::open(&db_path).unwrap());
+        seed_fixture(&db, false, 1).await;
+
+        let tx_json = json!({
+            "headerId": FIXTURE_HEADER_ID,
+            "transactions": [
+                {
+                    "id": FIXTURE_TX_ID,
+                    "inputs": [],
+                    "outputs": [fixture_output_json(FIXTURE_BOX_ID, FIXTURE_TX_ID, 0)],
+                }
+            ]
+        });
+        let (base_url, _shutdown, hits) = spawn_counting_mock_node(tx_json).await;
+        let client = Arc::new(NodeClient::new(&base_url).unwrap());
+        let cache = Arc::new(BlockTxCache::new());
+
+        const N: usize = 64;
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let db = db.clone();
+            let client = client.clone();
+            let cache = cache.clone();
+            handles.push(tokio::spawn(async move {
+                compose_box_bytes(&*db, &client, &cache, &box_id_arr()).await
+            }));
+        }
+
+        for h in handles {
+            match h.await.unwrap() {
+                BoxBytesOutcome::Found(bytes) => {
+                    assert_eq!(hex::encode(blake2b256(&bytes)), FIXTURE_BOX_ID);
+                }
+                BoxBytesOutcome::NotFound => panic!("expected Found, got NotFound"),
+                BoxBytesOutcome::Internal { code, message } => {
+                    panic!("expected Found, got Internal({code}, {message})")
+                }
+            }
+        }
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "N concurrent box requests for one block must hit the node exactly once"
+        );
 
         let _ = std::fs::remove_file(&db_path);
     }
