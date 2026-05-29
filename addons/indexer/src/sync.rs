@@ -5,6 +5,7 @@ use ergo_lib::ergotree_ir::chain::address::NetworkPrefix;
 use tokio::sync::watch;
 
 use crate::db::IndexerDb;
+use crate::health::HealthState;
 use crate::node_client::NodeClient;
 use crate::parser;
 
@@ -12,6 +13,7 @@ pub async fn run(
     db: Arc<dyn IndexerDb>,
     node_url: &str,
     start_height: Option<u64>,
+    health: Arc<HealthState>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let client = NodeClient::new(node_url)?;
@@ -53,6 +55,7 @@ pub async fn run(
                         backoff_secs = init_backoff.as_secs(),
                         "node unreachable at startup; retrying"
                     );
+                    health.set_node_reachable(false);
                     tokio::select! {
                         _ = shutdown_rx.changed() => {
                             tracing::info!("shutdown during startup backoff; sync exiting");
@@ -76,6 +79,12 @@ pub async fn run(
         "sync starting"
     );
 
+    // Seed shared health state from the startup info so `/health` reports
+    // sensible numbers before the first long-poll completes.
+    health.set_node_reachable(true);
+    health.record_node_height(info.full_height as u64);
+    health.record_indexed_height(last_indexed);
+
     let mut backoff = std::time::Duration::from_secs(1);
 
     loop {
@@ -86,6 +95,11 @@ pub async fn run(
             tracing::info!(last_indexed, "shutdown signal received; sync exiting");
             return Ok(());
         }
+
+        // Publish the current indexed height. Catches rollbacks applied at the
+        // bottom of the previous iteration and the post-catch-up tip, before
+        // we block on the long-poll below.
+        health.record_indexed_height(last_indexed);
 
         // Verify our tip is still canonical before waiting for new blocks.
         // Catches reorgs at or below `last_indexed` that the per-target check
@@ -124,9 +138,14 @@ pub async fn run(
             }
             result = client.info_wait(last_indexed) => match result {
                 Ok(Some(info)) => info.full_height as u64,
-                Ok(None) => continue, // 204 timeout
+                Ok(None) => {
+                    // 204 timeout — node is reachable, just no new block yet.
+                    health.set_node_reachable(true);
+                    continue;
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, backoff_secs = backoff.as_secs(), "node unreachable");
+                    health.set_node_reachable(false);
                     tokio::select! {
                         _ = shutdown_rx.changed() => {
                             tracing::info!(last_indexed, "shutdown during backoff; sync exiting");
@@ -140,6 +159,9 @@ pub async fn run(
             }
         };
         backoff = std::time::Duration::from_secs(1);
+        // info_wait returned a fresh tip — publish it for `/health`.
+        health.set_node_reachable(true);
+        health.record_node_height(node_height);
 
         // Index all new blocks
         while last_indexed < node_height {
@@ -155,6 +177,12 @@ pub async fn run(
                 );
                 return Ok(());
             }
+
+            // Publish progress every inner iteration so `indexedHeight` stays
+            // fresh during bulk catch-up — the inner loop can run for thousands
+            // of blocks without returning to the outer loop top.
+            health.record_indexed_height(last_indexed);
+
             let target = last_indexed + 1;
 
             // Per-target reorg detection — safety net for the `start_height=`

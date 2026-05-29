@@ -5,6 +5,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 mod api;
 mod config;
 mod db;
+mod health;
 pub mod migrate;
 mod node_client;
 mod parser;
@@ -13,6 +14,7 @@ pub mod types;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
@@ -101,6 +103,15 @@ async fn main() -> anyhow::Result<()> {
 
     let db = db::open_db(&cfg.db).await?;
 
+    // Shared in-memory liveness/sync-progress state. The sync loop writes it
+    // as it advances; the `/health` handler reads it without ever touching the
+    // DB. In combined mode both tasks hold a clone of the same `Arc`. In
+    // serve-only mode there is no local sync loop here, so `status` reports
+    // `"serve-only"` and the progress fields sit at startup defaults (the sync
+    // process is elsewhere). `sync_present` is false only for serve-only mode.
+    let sync_present = !matches!(&cli.mode, Some(Mode::Serve));
+    let health = Arc::new(health::HealthState::new(sync_present));
+
     // Shutdown signal — watch over oneshot because sync and api both need to
     // receive it independently in combined mode. SIGTERM (systemd stop) and
     // SIGINT (Ctrl-C) both flip the flag; consumers wait on `changed()`.
@@ -114,11 +125,11 @@ async fn main() -> anyhow::Result<()> {
     match cli.mode {
         Some(Mode::Sync) => {
             tracing::info!("starting in sync-only mode");
-            sync::run(db, &cfg.node_url, cfg.start_height, shutdown_rx).await
+            sync::run(db, &cfg.node_url, cfg.start_height, health, shutdown_rx).await
         }
         Some(Mode::Serve) => {
             tracing::info!(bind = %cfg.bind, "starting in serve-only mode");
-            api::serve(db, cfg.bind, start, cfg.node_url.clone(), shutdown_rx).await
+            api::serve(db, cfg.bind, start, cfg.node_url.clone(), health, shutdown_rx).await
         }
         None => {
             tracing::info!(bind = %cfg.bind, "starting in combined mode (sync + serve)");
@@ -128,13 +139,15 @@ async fn main() -> anyhow::Result<()> {
             let mut sync_handle = tokio::spawn({
                 let node_url = cfg.node_url.clone();
                 let start_height = cfg.start_height;
-                async move { sync::run(db, &node_url, start_height, sync_shutdown_rx).await }
+                let health = health.clone();
+                async move { sync::run(db, &node_url, start_height, health, sync_shutdown_rx).await }
             });
             let mut api_handle = tokio::spawn(api::serve(
                 db2,
                 cfg.bind,
                 start,
                 cfg.node_url.clone(),
+                health,
                 api_shutdown_rx,
             ));
 

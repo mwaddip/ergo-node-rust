@@ -416,6 +416,7 @@ GET  /api/v1/info                              → indexer + node-tip status
 GET  /api/v1/stats                             → totals (blocks, txs, boxes, tokens)
 GET  /api/v1/stats/daily                       → time-bucketed activity
 GET  /api/v1/debug/memory                      → process RSS + jemalloc stats + component breakdown
+GET  /api/v1/health                            → liveness + sync-progress (in-memory, no DB)
 
 GET  /api/v1/blocks                            → list, by height descending
 GET  /api/v1/blocks/height/{height}            → block by height
@@ -533,6 +534,59 @@ is omitted; consumers must tolerate its absence.
 **No 4xx/5xx responses expected** in normal operation. Failure
 to read `/proc/self/status` for RSS produces 500 with a
 diagnostic body.
+
+### `GET /api/v1/health`
+
+Cheap liveness + sync-progress probe. Unlike `/api/v1/info` — which
+reads `indexed_height` via a DB query and is therefore slow and
+contends with reorg-rollback write transactions — `/health` reads
+ONLY in-memory state shared from the sync loop. It MUST NOT query the
+DB, call the node, or take any lock the sync write-path can hold, and
+MUST answer in single-digit milliseconds even mid-rollback, so it is
+safe to poll as a heartbeat.
+
+Purpose — distinguish the indexer's real failure modes:
+- **dead/wedged** → no response at all (the prober times out);
+- **alive but stalled** → responds, but `lastAdvanceSecsAgo` climbs;
+- **alive but falling behind** → `behindBy` grows.
+
+A bare `200` only proves the first is false; the progress fields catch
+the other two (the failure modes a plain liveness check is blind to).
+
+**Response 200 (`Content-Type: application/json`):**
+
+```json
+{
+  "status": "ok",
+  "indexedHeight": 1796007,
+  "nodeHeight": 1796007,
+  "behindBy": 0,
+  "lastAdvanceSecsAgo": 41,
+  "node": "reachable",
+  "version": "0.2.2"
+}
+```
+
+**Field sources (all in-memory; NONE may touch the DB):**
+- `status` — `"ok"` in combined (sync+serve) mode; `"serve-only"` when the indexer runs without a sync loop. In serve-only mode the progress fields below sit at startup defaults and are NOT meaningful; `"serve-only"` is the signal that a prober must not read `indexedHeight`/`behindBy`/`lastAdvanceSecsAgo` as a stalled combined indexer.
+- `indexedHeight` — the sync loop's current `last_indexed`.
+- `nodeHeight` — the node tip the sync loop last observed (`info.full_height`).
+- `behindBy` — `max(0, nodeHeight − indexedHeight)`.
+- `lastAdvanceSecsAgo` — wall-clock seconds since `indexedHeight` last increased.
+- `node` — `"reachable"` / `"unreachable"` / `"unknown"` from the last node-poll result (NOT a fresh probe). `"unknown"` is the pre-first-poll default: never report `"unreachable"` before a poll has actually been attempted (do not assert an unobserved failure); it resolves to reachable/unreachable within seconds of the first poll.
+- `version` — the crate version constant.
+
+**Invariants:**
+- No DB query, no node call, no lock contended by the sync write path.
+  Read shared atomics / a lightweight shared struct the sync loop
+  updates as it progresses.
+- Always returns `200` while the HTTP server is alive. Health
+  *judgment* — thresholds on `behindBy` and `lastAdvanceSecsAgo` — is
+  the caller's job. Do NOT `503` on lag; report the numbers. (Serving
+  thresholds here just rebuilds the trigger-happy probe one layer in.)
+- `lastAdvanceSecsAgo` resets on each forward step; during normal
+  tip-reorg churn it may briefly sit at a few minutes — that is not
+  unhealthy.
 
 ## Stability
 

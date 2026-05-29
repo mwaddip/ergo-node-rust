@@ -134,6 +134,32 @@ pub struct IndexerInfo {
     pub uptime_secs: u64,
 }
 
+/// `GET /api/v1/health` response. Every field is sourced from in-memory sync
+/// state ([`crate::health::HealthState`]); none touch the database or call the
+/// node. See `facts/indexer.md` → `GET /api/v1/health`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthResponse {
+    /// `"ok"` in combined (sync+serve) mode; `"serve-only"` when no sync loop
+    /// drives this process, signalling the progress fields below are at startup
+    /// defaults and not meaningful. Health *judgment* — thresholds on the
+    /// numeric fields — is the caller's job, not the server's.
+    pub status: String,
+    /// Sync loop's current `last_indexed`.
+    pub indexed_height: u64,
+    /// Node tip the sync loop last observed.
+    pub node_height: u64,
+    /// `max(0, nodeHeight − indexedHeight)`.
+    pub behind_by: u64,
+    /// Wall-clock seconds since `indexedHeight` last increased.
+    pub last_advance_secs_ago: u64,
+    /// `"unknown"` (pre-first-poll) / `"reachable"` / `"unreachable"` from the
+    /// last node-poll result.
+    pub node: String,
+    /// The crate version constant.
+    pub version: String,
+}
+
 /// Paginated response wrapper.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Page<T: Serialize> {

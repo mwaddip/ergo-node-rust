@@ -18,6 +18,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::api::block_tx_cache::BlockTxCache;
 use crate::db::IndexerDb;
+use crate::health::HealthState;
 use crate::node_client::NodeClient;
 
 #[derive(Clone)]
@@ -30,6 +31,10 @@ pub struct ApiContext {
     /// all `/boxes/{id}/bytes` requests. Collapses the harness's wide
     /// concurrent box-fetch burst into one node fetch per block.
     pub block_tx_cache: Arc<BlockTxCache>,
+    /// In-memory liveness + sync-progress state the sync loop updates and the
+    /// `/health` handler reads. Lock-free so `/health` never contends with the
+    /// sync write-path.
+    pub health: Arc<HealthState>,
 }
 
 #[derive(OpenApi)]
@@ -55,6 +60,7 @@ pub struct ApiContext {
         stats::get_stats,
         stats::get_daily_stats,
         stats::get_info,
+        stats::get_health,
         debug::get_debug_memory,
     ),
     components(schemas(
@@ -70,6 +76,7 @@ pub struct ApiContext {
         crate::types::NetworkStats,
         crate::types::DailyStats,
         crate::types::IndexerInfo,
+        crate::types::HealthResponse,
         boxes::BoxBytesResponse,
         boxes::BoxBytesError,
         debug::DebugMemory,
@@ -85,6 +92,7 @@ pub async fn serve(
     bind: SocketAddr,
     start_time: Instant,
     node_url: String,
+    health: Arc<HealthState>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let node_client = Arc::new(NodeClient::new(&node_url)?);
@@ -94,6 +102,7 @@ pub async fn serve(
         node_url,
         node_client,
         block_tx_cache: Arc::new(BlockTxCache::new()),
+        health,
     };
 
     let app = Router::new()
@@ -158,6 +167,7 @@ fn api_routes() -> Router<ApiContext> {
         .route("/stats", get(stats::get_stats))
         .route("/stats/daily", get(stats::get_daily_stats))
         .route("/info", get(stats::get_info))
+        .route("/health", get(stats::get_health))
         // Debug
         .route("/debug/memory", get(debug::get_debug_memory))
 }
