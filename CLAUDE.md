@@ -43,6 +43,17 @@ directory's boundary — it does not edit parent or sibling
 directories. The repo-root `facts/` directory is the single source
 of truth for cross-crate contracts.
 
+**Exception — mechanical housekeeping crosses boundaries.** Uniform,
+cross-cutting metadata edits applied identically across the workspace —
+dependency pin/rev bumps (e.g. bumping the sigma-rust git rev in every
+crate's `Cargo.toml`), workspace version bumps, and similar workspace-wide
+find-replace — are release orchestration and are done directly by the main
+session, **without** dispatch. Verify completeness (grep the old string
+across all `Cargo.toml`s; `cargo build` hard-fails on a missed file via a
+conflicting-rev error). This is distinct from editing a single crate's
+content — logic, source, a doc-comment typo, or that one crate's own
+dependency decision — which still dispatches.
+
 ## Skill Ownership (PERSISTENT RULE)
 
 **You own the `ergo-node-development` skill.** Maintain it when new patterns emerge. When the user gives instructions that conflict with the skill, call it out — don't silently override. The skill is the accumulated wisdom of the project; it should be updated, not bypassed.

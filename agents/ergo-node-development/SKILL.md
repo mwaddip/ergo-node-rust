@@ -102,7 +102,9 @@ Detect via your working directory:
   coordinate, edit `facts/` + top-level docs + `prompts/`, and dispatch
   per-crate work via the `dispatching-prompts` skill (kitty
   `--type=window` + `ac` + send-text "use the receiving-prompts
-  skill..."). You do not edit crate-internal source.
+  skill..."). You do not edit crate-internal source — except uniform
+  cross-cutting housekeeping (e.g. a workspace-wide dependency pin/version
+  bump), which you do directly and verify.
 - **Per-crate dispatched session**: `pwd` is a crate subdirectory
   (`…/ergo-node-rust/<crate>`). You edit files in your crate. You do
   NOT dispatch further. The canonical mechanism for executor identity
@@ -119,7 +121,10 @@ Detect via your working directory:
 - Writes prompts for per-crate sessions and dispatches them via the
   `dispatching-prompts` skill (kitty `--type=window` + `ac`)
 - Pulls and integrates work from dispatched sessions
-- **Never edits crate-internal source code directly**
+- **Never edits crate-internal source code directly** — the one exception is
+  uniform cross-cutting housekeeping (workspace-wide dependency pin/version
+  bumps, global find-replace), which is release orchestration: done directly
+  and verified, not dispatched
 
 **Per-crate dispatched sessions** (cwd = a crate subdirectory):
 - Receive a prompt file path as their first instruction
