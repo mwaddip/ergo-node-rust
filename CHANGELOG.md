@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.6.8 — 2026-05-31
+
+Tighter JIT cost accounting. Two cost-model divergences from the JVM
+reference (sigma-state 6.0.3) were found and fixed in the bundled
+sigma-rust evaluator, both at the empty/packed-collection boundary:
+
+- Empty-collection per-item costs (n=0) charged only the base cost;
+  the JVM charges base + one chunk. Corrected at the chunks formula,
+  so it fixes every per-item op at once (collection equality,
+  Fold/ForAll/Filter/Map/Slice, hashes, sigma ops — ~29 call sites).
+- Packed boolean-collection literals skipped the per-element constant
+  cost (5*N) that generic collections already paid. Now aligned.
+
+Both were sub-MaxBlockCost undercharges — never broke sync — but a real
+deviation from consensus cost; the node now matches the JVM. sigma-rust
+bump fbcdc9bd -> a43e54f1.
+
+Also: indexer `GET /api/v1/health` — an in-memory liveness + sync-progress
+probe (no DB), so liveness reports correctly when the DB-bound `/info`
+would falsely read as down.
+
 ## v0.6.7 — 2026-05-28
 
 Resolves a gridlock where the external validation harness melted
