@@ -18,7 +18,7 @@ jobs:
 
     steps:
       - name: Checkout (with submodules)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # Top-level submodules only — fetches chain, p2p, state, store,
           # facts but NOT their nested facts/ pointers. The nested
@@ -86,7 +86,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             ${{ steps.artifacts.outputs.deb }}
