@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.6.9 — 2026-05-31
+
+Two behavioral consensus divergences from the JVM reference
+(sigma-state 6.0.3), found and fixed in the bundled sigma-rust
+evaluator. Neither is reachable on the happy path — each needs a
+crafted, type-mismatched or malformed script input, so no mainnet
+block has triggered either — but both are craftable, and each fails
+in a consensus-breaking direction.
+
+- Numeric arithmetic over mismatched operand widths (e.g. `Int + Long`)
+  was rejected; the JVM coerces to the wider type and evaluates. Our
+  node would have stalled on a block the network had accepted (a
+  liveness break). Now it coerces to the wider type
+  (Byte < Short < Int < Long < BigInt), computes checked in that type,
+  and rejects only on genuine wider-type overflow — matching the JVM in
+  value, accept/reject, and cost across the full differential sweep.
+- A flat N-ary `Tuple` node (arity > 2) was accepted; the JVM rejects
+  it at deserialization, where tuples are strictly nested pairs. Our
+  node would have accepted a block the network rejects (a fork). Now
+  rejected to match; legitimate nested-pair tuples (arity 2 at every
+  level) are untouched.
+
+sigma-rust bump a43e54f1 -> 99a6cfeb. Standalone upstream PRs track each
+fix: arith #869, tuple #868 (atop the prior cost work, #854).
+
 ## v0.6.8 — 2026-05-31
 
 Tighter JIT cost accounting. Two cost-model divergences from the JVM
