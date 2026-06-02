@@ -14,8 +14,8 @@ jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 
 [dependencies]
 # Ergo types — address derivation, register decoding
-ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "99a6cfeb" }
-ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "99a6cfeb" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "c3ee4a6a" }
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "c3ee4a6a" }
 
 # HTTP client — rustls for static binary
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

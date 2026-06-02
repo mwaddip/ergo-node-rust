@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.6.10 — 2026-06-02
+
+The only change is the bundled sigma-rust evaluator, bumped to bring its
+JIT cost accounting to full parity with the JVM reference (sigma-state
+6.0.3) — closing the last of the collection-operation cost gaps. The bump
+also carries two minor behavioral value fixes (MIN_VALUE negation wrap;
+substConstants out-of-range no-op + version-gated tree-size slot). Neither
+is reachable on the happy path and no mainnet block has triggered them.
+
+sigma-rust 99a6cfeb -> c3ee4a6a.
+
 ## v0.6.9 — 2026-05-31
 
 Two behavioral consensus divergences from the JVM reference
