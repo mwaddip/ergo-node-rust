@@ -194,6 +194,52 @@ running the systemd unit can leave `ExecStart` minimal
 and put everything else in the TOML file, or keep CLI flags for
 specific overrides during ad-hoc runs.
 
+### `.start-height` dotfile (one-shot resume)
+
+For operational recovery without editing the unit or hand-writing
+SQL, the indexer checks for a `.start-height` dotfile in the **SQLite
+database's directory** (`<dirname(storage.db)>/.start-height` — e.g.
+`/var/lib/ergo-indexer/.start-height`) at startup, in any mode that
+runs the sync loop (`sync` or combined; **ignored in `serve`-only
+mode**, which has no sync loop to consume it).
+
+When the dotfile is present and **no `--start-height` flag** was
+passed, the indexer:
+
+1. Reads it (expects a single base-10 height).
+2. **Deletes it, then** applies the value as `sync.start_height`.
+
+The delete lands *before* the value is applied, so the resume is
+strictly one-shot: a crash mid-re-index leaves no dotfile, the next
+restart auto-detects the DB's committed height and continues, and the
+rollback is never replayed. This is the decisive difference from a
+persistent `sync.start_height` (which re-triggers on every restart and
+will UNIQUE-conflict once the target height is already re-indexed).
+
+- **Precedence:** `--start-height` flag > `.start-height` dotfile >
+  `sync.start_height` (config) > DB-resume. An explicit flag wins and
+  the dotfile is **left untouched** (consumed only when actually used).
+- **Unparseable content:** WARN, delete, proceed as if absent — a
+  fat-fingered file never bricks the service.
+- **Delete failure** (e.g. the directory isn't writable by the service
+  user): the value is **not** applied and an ERROR is logged — the
+  indexer refuses to enter a state it can't make one-shot, rather than
+  replaying the rollback on every restart. The default DB directory is
+  writable by the service user; this guards misconfigured deployments.
+- **SQLite only.** A PostgreSQL `storage.db` has no local directory to
+  anchor the dotfile, so it is not checked on Postgres backends — use
+  `--start-height` or `sync.start_height` there.
+
+Typical use — a one-shot re-index from height `H`, which makes the
+indexer's own reorg check roll its tip back to the fork point at/below
+`H` and re-index forward against the read-only node:
+
+```
+systemctl stop ergo-indexer
+echo H > /var/lib/ergo-indexer/.start-height
+systemctl start ergo-indexer
+```
+
 ### Reload behavior
 
 Configuration is loaded once at startup. Changes to the config
@@ -365,16 +411,22 @@ Recovery procedure for the deterministic-failure case:
 ```
 systemctl stop ergo-indexer
 sharpen <H> --indexer            # node-coupled; rolls state.redb too
-# OR for indexer-only truncation:
-sqlite3 /var/lib/ergo-indexer/index.db < <cascade-SQL-above>
+# OR for indexer-only truncation (node stays put):
+echo <H> > /var/lib/ergo-indexer/.start-height
 systemctl reset-failed ergo-indexer
 systemctl start ergo-indexer
 ```
 
 `sharpen --indexer` always rolls the node's state and modifier
-stores to `<H>` in lockstep. For repairs that don't require
-walking the node back (the more common case — node is fine, only
-the indexer is stuck), run the cascade SQL directly.
+stores to `<H>` in lockstep. For repairs that don't require walking
+the node back (the more common case — node is fine, only the indexer
+is stuck), drop a `.start-height` dotfile (see Configuration): on
+restart the indexer rolls its own tip back to the fork at/below `<H>`
+and re-indexes forward, consuming the dotfile so the resume is
+one-shot. The raw cascade SQL (`DELETE … WHERE height > <H>` across
+the box/tx/block tables, then `INSERT OR REPLACE … indexer_state`
+height) remains the surgical fallback when the indexer can't start at
+all.
 
 ## Shutdown Semantics
 
