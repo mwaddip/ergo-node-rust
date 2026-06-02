@@ -32,7 +32,7 @@ use crate::types::{LocalNodeInfo, PeerApiUrl};
 #[command(name = "ergo-fastsync", version)]
 struct Cli {
     /// Local node REST API URL.
-    #[arg(long, default_value = "http://127.0.0.1:9052")]
+    #[arg(long, default_value = "http://127.0.0.1:9053")]
     node_url: String,
 
     /// Override peer URL instead of discovering via /peers/api-urls.

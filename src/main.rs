@@ -797,7 +797,7 @@ struct NodeConfig {
     /// Minimum fee in nanoERG to enter the mempool (default: 1,000,000 = 0.001 ERG).
     #[serde(default = "default_min_fee")]
     min_fee: u64,
-    /// REST API bind address (default: 0.0.0.0:9053 testnet, 0.0.0.0:9052 mainnet).
+    /// REST API bind address (default: 0.0.0.0:9053 mainnet, 0.0.0.0:9052 testnet).
     #[serde(default)]
     api_address: Option<String>,
     /// Auto-spawn `ergo-fastsync` on startup if the binary is in PATH.
@@ -2668,8 +2668,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let api_bind_addr: std::net::SocketAddr = node_config.api_address
             .as_deref()
             .unwrap_or(match network {
-                enr_p2p::types::Network::Testnet => "0.0.0.0:9053",
-                enr_p2p::types::Network::Mainnet => "0.0.0.0:9052",
+                enr_p2p::types::Network::Testnet => "0.0.0.0:9052",
+                enr_p2p::types::Network::Mainnet => "0.0.0.0:9053",
             })
             .parse()
             .expect("invalid api_address");

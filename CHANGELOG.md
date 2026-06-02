@@ -2,7 +2,7 @@
 
 ## v0.6.10 — 2026-06-02
 
-The only change is the bundled sigma-rust evaluator, bumped to bring its
+The main change is the bundled sigma-rust evaluator, bumped to bring its
 JIT cost accounting to full parity with the JVM reference (sigma-state
 6.0.3) — closing the last of the collection-operation cost gaps. The bump
 also carries two minor behavioral value fixes (MIN_VALUE negation wrap;
@@ -10,6 +10,11 @@ substConstants out-of-range no-op + version-gated tree-size slot). Neither
 is reachable on the happy path and no mainnet block has triggered them.
 
 sigma-rust 99a6cfeb -> c3ee4a6a.
+
+Also corrected: the REST API default ports were inverted relative to the
+JVM. Mainnet now defaults to 9053 and testnet to 9052 (previously 9052 and
+9053). If you relied on the default mainnet port, set `api_address`
+explicitly or point your client at 9053.
 
 ## v0.6.9 — 2026-05-31
 

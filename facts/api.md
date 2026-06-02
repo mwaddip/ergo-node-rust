@@ -201,7 +201,7 @@ their security boundary, not on an API key:
 
 ```toml
 [node.api]
-bind_address = "0.0.0.0:9052"    # Listen address (JVM default: 9052 mainnet, 9053 testnet)
+bind_address = "0.0.0.0:9053"    # Listen address (JVM default: 9053 mainnet, 9052 testnet)
 api_key_hash = ""                 # Blake2b256 hex of API key (empty = no auth)
 request_timeout_ms = 5000         # Per-request timeout
 max_body_bytes = 2_097_152        # Max request body (2 MB)

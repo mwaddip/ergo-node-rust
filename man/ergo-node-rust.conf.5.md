@@ -181,8 +181,8 @@ reference node and are appropriate for mainnet.
 ## REST API
 
 **api_address** = *"host:port"*
-:   Bind address for the REST API. Unset defaults to **0.0.0.0:9052**
-    on mainnet and **0.0.0.0:9053** on testnet.
+:   Bind address for the REST API. Unset defaults to **0.0.0.0:9053**
+    on mainnet and **0.0.0.0:9052** on testnet.
 
 # [stats] (optional)
 

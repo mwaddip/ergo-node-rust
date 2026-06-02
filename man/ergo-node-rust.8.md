@@ -72,8 +72,8 @@ package invokes the daemon with **/etc/ergo-node/ergo.toml**.
 
 # REST API
 
-The node exposes a JVM-compatible REST API on **0.0.0.0:9052** (mainnet)
-or **0.0.0.0:9053** (testnet) by default. Override via **api_address**
+The node exposes a JVM-compatible REST API on **0.0.0.0:9053** (mainnet)
+or **0.0.0.0:9052** (testnet) by default. Override via **api_address**
 in the config.
 
 The endpoint set largely mirrors the JVM reference node's documented

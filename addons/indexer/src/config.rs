@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-const DEFAULT_NODE_URL: &str = "http://127.0.0.1:9052";
+const DEFAULT_NODE_URL: &str = "http://127.0.0.1:9053";
 const DEFAULT_BIND: &str = "127.0.0.1:8080";
 
 /// Diagnostic emitted when neither config file nor CLI supplies `storage.db`.

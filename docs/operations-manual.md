@@ -30,8 +30,8 @@ you're trying to do. For first-install and day-to-day tasks, see
 |---|---|---|
 | 9030 | Mainnet P2P (Rust default) | Both IPv4 and IPv6 connect to mainnet peers on `:9030`. |
 | 9023 | Testnet P2P | Magic bytes `[2,3,2,3]` since the Feb 2026 testnet reset. |
-| 9052 | Mainnet REST API | Default for `api_address` on mainnet. |
-| 9053 | Testnet REST API | Default for `api_address` on testnet. |
+| 9053 | Mainnet REST API | Default for `api_address` on mainnet. |
+| 9052 | Testnet REST API | Default for `api_address` on testnet. |
 | 9054 | Indexer REST API | Default; configurable in `indexer.toml`. |
 | 9055 | Operator stats (`/stats/p2p`) | Loopback-only by default, opt-in via `[stats]` section. |
 
@@ -306,9 +306,9 @@ exclude_ips = []
 Three HTTP endpoints expose the captured data:
 
 ```sh
-curl localhost:9052/debug/p2p-capture/info
-curl localhost:9052/debug/p2p-capture/dump > capture.pcap
-curl -X POST localhost:9052/debug/p2p-capture/reset
+curl localhost:9053/debug/p2p-capture/info
+curl localhost:9053/debug/p2p-capture/dump > capture.pcap
+curl -X POST localhost:9053/debug/p2p-capture/reset
 ```
 
 See [`facts/p2p-capture.md`](../facts/p2p-capture.md) for the full
@@ -565,7 +565,7 @@ deployments NOT meant to expose a public API:
 
 ```toml
 [node]
-api_address = "127.0.0.1:9052"
+api_address = "127.0.0.1:9053"
 ```
 
 Or front the API with a reverse proxy (nginx, Caddy) and an

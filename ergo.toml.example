@@ -123,8 +123,8 @@ protocol_version = "6.0.3"
 # min_fee = 1000000
 
 # REST API bind address. Defaults depend on network:
-#   mainnet → 0.0.0.0:9052
-#   testnet → 0.0.0.0:9053
+#   mainnet → 0.0.0.0:9053
+#   testnet → 0.0.0.0:9052
 # api_address = "0.0.0.0:9053"
 
 # Auto-spawn `ergo-fastsync` on startup if the binary is in PATH.

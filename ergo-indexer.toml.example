@@ -21,7 +21,7 @@
 [node]
 # URL of the running ergo-node-rust HTTP API. The indexer pulls blocks
 # from this endpoint; an unreachable node is a fatal startup error.
-# url = "http://127.0.0.1:9052"
+# url = "http://127.0.0.1:9053"
 
 [storage]
 # Database target. REQUIRED.

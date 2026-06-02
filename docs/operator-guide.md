@@ -129,7 +129,7 @@ installs find it next to the binary.
 | `[node].cache_mb` | `256` | redb cache during cold sync. Bump on machines with plenty of RAM for faster sync. |
 | `[node].flush_heap_threshold_mb` | `4096` | Live-heap threshold that triggers a redb flush. Tune down on memory-constrained hosts. |
 | `[node].fastsync` | `true` | Auto-spawn `ergo-fastsync` on startup if the binary is in PATH. Skip with `false` for pure-P2P sync. |
-| `[node].api_address` | `0.0.0.0:9052` mainnet / `:9053` testnet | REST API bind. Keep on loopback (`127.0.0.1:9052`) if you don't want external access. |
+| `[node].api_address` | `0.0.0.0:9053` mainnet / `:9052` testnet | REST API bind. Keep on loopback (`127.0.0.1:9053`) if you don't want external access. |
 
 ## First run
 
@@ -183,21 +183,21 @@ via systemd). Key things to watch:
 
 ### Quick health endpoints
 
-Replace `9052` with `9053` for testnet, or whatever you set as
+Replace `9053` with `9052` for testnet, or whatever you set as
 `api_address`.
 
 ```sh
 # Is the node up, what version, what network, what height?
-curl -s localhost:9052/info | jq '.appVersion, .network, .fullHeight'
+curl -s localhost:9053/info | jq '.appVersion, .network, .fullHeight'
 
 # How many peers do we have connected?
-curl -s localhost:9052/peers/connected | jq '. | length'
+curl -s localhost:9053/peers/connected | jq '. | length'
 
 # Are we at the chain tip or still catching up?
-curl -s localhost:9052/info | jq '.headersHeight, .fullHeight'
+curl -s localhost:9053/info | jq '.headersHeight, .fullHeight'
 
 # Detailed peer state (penalty scores, last seen)
-curl -s localhost:9052/peers/all | jq
+curl -s localhost:9053/peers/all | jq
 ```
 
 If `headersHeight == fullHeight` and that number matches what other
@@ -209,14 +209,14 @@ nodes are reporting, you're at tip.
 
 ```sh
 # By box ID (hex string)
-curl -s localhost:9052/utxo/byId/<box_id> | jq
+curl -s localhost:9053/utxo/byId/<box_id> | jq
 ```
 
 ### Look up a transaction
 
 ```sh
 # Unconfirmed (in mempool)
-curl -s localhost:9052/transactions/unconfirmed | jq '.[] | .id' | head
+curl -s localhost:9053/transactions/unconfirmed | jq '.[] | .id' | head
 
 # By ID via the indexer (the node itself does not currently expose
 # direct tx-by-id lookup outside of /blocks/{id})
@@ -227,7 +227,7 @@ curl -s localhost:9054/api/v1/transactions/<tx_id> | jq
 
 ```sh
 curl -s -X POST -H 'Content-Type: application/json' \
-    -d @signed-tx.json localhost:9052/transactions
+    -d @signed-tx.json localhost:9053/transactions
 ```
 
 A successful submission returns the transaction ID. Failures return
@@ -237,14 +237,14 @@ transaction.
 ### Get a block by ID
 
 ```sh
-curl -s localhost:9052/blocks/<header_id> | jq
+curl -s localhost:9053/blocks/<header_id> | jq
 ```
 
 ### Check the fee curve
 
 ```sh
 # What fee should I pay for a tx of <bytes> bytes to confirm soon?
-curl -s "localhost:9052/transactions/getFee?bytes=<bytes>&waitTime=<seconds>"
+curl -s "localhost:9053/transactions/getFee?bytes=<bytes>&waitTime=<seconds>"
 ```
 
 ### Pull a mining candidate
@@ -252,14 +252,14 @@ curl -s "localhost:9052/transactions/getFee?bytes=<bytes>&waitTime=<seconds>"
 Only works if mining is configured (`[node.mining].miner_pk` set).
 
 ```sh
-curl -s localhost:9052/mining/candidate | jq
+curl -s localhost:9053/mining/candidate | jq
 ```
 
 ### NiPoPoW proof for a light client
 
 ```sh
 # Proof of length-k with security parameter m
-curl -s "localhost:9052/nipopow/proof/12/6" | jq
+curl -s "localhost:9053/nipopow/proof/12/6" | jq
 ```
 
 ## Running with the indexer
@@ -278,7 +278,7 @@ its own port (default `:9054`).
 ```
 
 The indexer needs a running node. Default config points at
-`http://127.0.0.1:9052`; change in `indexer.toml` if your node is on a
+`http://127.0.0.1:9053`; change in `indexer.toml` if your node is on a
 different host or port.
 
 ### .deb setup
@@ -336,7 +336,7 @@ yes-vote) is in the [operations manual](operations-manual.md#soft-fork-voting).
 ### Few or no peers
 
 ```sh
-curl -s localhost:9052/peers/connected | jq '. | length'
+curl -s localhost:9053/peers/connected | jq '. | length'
 ```
 
 If under 3 after a few minutes:
