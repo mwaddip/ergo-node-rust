@@ -6,10 +6,10 @@ license = "MIT"
 description = "REST API for ergo-node-rust"
 
 [dependencies]
-ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "c3ee4a6a" }
-ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "c3ee4a6a" }
-ergo-nipopow = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "c3ee4a6a" }
-sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "c3ee4a6a" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "6b3ce5ed" }
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "6b3ce5ed" }
+ergo-nipopow = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "6b3ce5ed" }
+sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "6b3ce5ed" }
 ergo-mempool = { path = "../mempool" }
 ergo-mining = { path = "../mining" }
 ergo-validation = { path = "../validation" }
@@ -23,6 +23,6 @@ tracing = "0.1"
 blake2 = "0.10"
 
 [dev-dependencies]
-ergo-merkle-tree = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "c3ee4a6a" }
+ergo-merkle-tree = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "6b3ce5ed" }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

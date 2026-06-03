@@ -1,6 +1,6 @@
 # Journal Events Contract
 
-Version: 1.2.0
+Version: 1.3.0
 
 Stable contract for parseable events in the node's structured log
 output. Consumers (e.g. the Ergo Node Doctor adapter) write parsers
@@ -35,9 +35,11 @@ human-readable subscriber. The line carries:
 - A **marker prefix**: the leading string literal that identifies the
   event. Stable across versions for a given event name.
 - Zero or more **fields**: `key=value` pairs appended via tracing's
-  named-field syntax. Keys are snake_case ASCII. Values that contain
-  whitespace are surrounded by double quotes in the default
-  formatter.
+  named-field syntax. Keys are snake_case ASCII. String-recorded values
+  are surrounded by double quotes in the default formatter (e.g.
+  `error_kind="script_eval"`); numeric and `Display`-formatted values
+  are not. Parsers MUST tolerate optional surrounding quotes on any
+  value.
 - Optional **free-text suffix** after the marker, for human
   readability. Parsers MUST tolerate arbitrary suffix content.
 
@@ -228,15 +230,23 @@ phase's `_started`.
 - **Fields:** `height` (u64), `attempts` (u64), `error_kind` (string),
   `missing_key` (string: hex, optional — present when `error_kind`
   is `missing_key`)
-- **Since:** 1.1
+- **Since:** 1.1 (precondition broadened in 1.3 — see Emitted)
 - **Stability:** stable
-- **Emitted:** when `apply_state` fails the same way on the same
-  height for `attempts >= 5` consecutive sweeps. Surfaces the silent
-  retry loop that previously buried this kind of state-DB
-  inconsistency in INFO-level logs. The Doctor adapter treats this
-  as a primary "node stuck" signal. Emitted at most once per height;
-  re-emits when the height changes or after a recovery resets the
-  counter.
+- **Emitted:** when the validated frontier (`validated_height`) fails
+  to advance past the same height for `attempts >= 5` consecutive
+  sweeps — the next block is failing deterministically. Covers both
+  failure modes: an `apply_state` error (state-DB inconsistency such
+  as `missing_key`) and a deferred script-eval rejection (the
+  evaluator refusing a transaction). `error_kind` names the mode — an
+  `apply_state` error kind, or `script_eval` for an eval-failure
+  stall; `missing_key` is present only for the `apply_state`
+  `missing_key` case. Surfaces the silent retry loop that previously
+  buried a stuck frontier in INFO-level logs. The Doctor adapter
+  treats this as a primary "node stuck" signal. Emitted at most once
+  per height; re-emits when the height changes or after real progress
+  resets the counter. **Before 1.3** this fired only on the
+  `apply_state` path — a deferred eval-failure stall (the loop that
+  hammered on a wrongly-rejected script) did not emit it.
 
 #### `deep_reorg_succeeded`
 - **Level:** INFO

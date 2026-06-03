@@ -18,7 +18,7 @@ pub use stats::{
 
 /// Version of the journal-events contract this build promises.
 /// Bumped atomically with `facts/journal-events.md`.
-pub const JOURNAL_EVENTS_VERSION: &str = "1.0";
+pub const JOURNAL_EVENTS_VERSION: &str = "1.3";
 
 /// Version of the operator stats endpoint schema this build promises.
 /// Bumped atomically with `facts/stats.md`.

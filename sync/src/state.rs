@@ -9,8 +9,9 @@ use enr_p2p::types::PeerId;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
-use crate::apply_state_tracker::{record_apply_state_result, ApplyStateFailureTracker};
+use crate::apply_state_error::classify_apply_state_error;
 use crate::delivery::{DeliveryControl, DeliveryData, DeliveryTracker};
+use crate::sweep_backoff::StallDetail;
 use enr_chain::{
     StateType, HEADER_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID, EXTENSION_TYPE_ID,
     TRANSACTION_TYPE_ID,
@@ -323,13 +324,17 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     at_tip_request_tx: Option<tokio::sync::oneshot::Sender<u32>>,
     /// At-tip transition: oneshot to receive the rebuilt validator.
     at_tip_validator_rx: Option<tokio::sync::oneshot::Receiver<V>>,
-    /// Tracks consecutive same-height same-kind `apply_state`
-    /// failures. When 5 are seen in a row, the contract
-    /// `validation_stuck` event is emitted so operators (and the
-    /// Doctor adapter) can see the silent retry loop. Reset on any
-    /// Ok outcome or change of `(height, error_kind)`. See
-    /// [`crate::apply_state_tracker`].
-    apply_state_failure_tracker: Option<ApplyStateFailureTracker>,
+    /// Exponential backoff gating the validation sweep when the applied
+    /// tip fails to advance — a deterministic block failure (apply_state
+    /// error OR a deferred-eval rollback; both leave `validated_height()`
+    /// pinned). Derived purely from the validator's applied tip, so its
+    /// stall detection is blind to which subsystem rejected the block. Also
+    /// the single emitter of the contract `validation_stuck` event, fired
+    /// once a frontier has stalled 5 sweeps in a row (the caller hands in
+    /// the `error_kind`/`missing_key` label). Resets on real progress or a
+    /// frontier change. In-memory — a restart is a legitimate reset. See
+    /// [`crate::sweep_backoff`].
+    sweep_backoff: crate::sweep_backoff::SweepBackoff,
     /// Explicit shutdown signal from the host. `run()` selects against
     /// this alongside `run_inner()`; the signal cancels the loop and
     /// falls through to `shutdown_flush`. An explicit channel is
@@ -396,7 +401,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             last_flush_height,
             at_tip_request_tx: None,
             at_tip_validator_rx: None,
-            apply_state_failure_tracker: None,
+            sweep_backoff: crate::sweep_backoff::SweepBackoff::default(),
             shutdown_rx,
         }
     }
@@ -975,16 +980,41 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     /// Advance the validated height by running the block validator on
     /// downloaded-but-not-yet-validated blocks.
     async fn advance_state_applied_height(&mut self) {
-        if self.validator.is_none() {
-            return; // No validator yet (snapshot bootstrap pending)
-        }
-        if self.state_applied_height >= self.downloaded_height {
+        // The applied tip is the validator's own `validated_height()` — it
+        // advances inside `apply_state` and retreats inside `reset_to`
+        // atomically with the AVL prover, so it is the single source of
+        // truth for what state has actually been applied. The sweep MUST
+        // resume from there, never from `state_applied_height`, which is a
+        // cache that a mid-sweep deferred-eval rollback can leave stale
+        // (ahead of the real tip). Deriving the start from the prover tip
+        // makes it impossible to feed `apply_state` a non-consecutive block
+        // — that was the wedge where the sweep skipped on-disk blocks and
+        // looped forever on a `HeightMismatch`. See `../facts/sync.md`.
+        let Some(applied_tip) = self.validator.as_ref().map(|v| v.validated_height()) else {
+            return; // No validator yet (snapshot bootstrap pending / light mode)
+        };
+        if applied_tip >= self.downloaded_height {
+            // Caught up — nothing on disk past the applied tip. Re-sync the
+            // cache in case a prior sweep left it drifted above the tip.
+            self.state_applied_height = applied_tip;
             return;
         }
 
-        let sweep_from = self.state_applied_height + 1;
+        // Backoff gate. A prior sweep that could not advance the tip past
+        // `applied_tip` arms an exponential delay; until it elapses, defer
+        // this retry so a deterministic block failure cannot peg a core.
+        // Gates ONLY the sweep: the caller's select! loop — header download,
+        // peer handling, request servicing — keeps running. The block is
+        // still retried once the delay lapses, so the node self-heals the
+        // moment a fix / restart / reorg changes things. See
+        // [`crate::sweep_backoff`].
+        if self.sweep_backoff.should_defer(applied_tip, Instant::now()) {
+            return;
+        }
+
+        let sweep_from = applied_tip + 1;
         let sweep_to = self.downloaded_height;
-        let sweep_size = sweep_to - self.state_applied_height;
+        let sweep_size = sweep_to - applied_tip;
         let sweep_start = Instant::now();
 
         if sweep_size > 100 {
@@ -996,7 +1026,12 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             );
         }
 
-        let mut validated_to = self.state_applied_height;
+        let mut validated_to = applied_tip;
+        // Label handed to the backoff if this sweep stalls, so a
+        // `validation_stuck` emission names the mode. Overwritten at the
+        // apply_state-error and eval-rollback break points; the `other`
+        // default covers the rarer header/epoch-boundary breaks.
+        let mut stall_detail = StallDetail::other();
 
         for height in sweep_from..=sweep_to {
             let header = match self.chain.header_at(height).await {
@@ -1097,13 +1132,6 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
 
             match result {
                 Ok(outcome) => {
-                    // Successful apply ends any stuck-retry window.
-                    record_apply_state_result(
-                        &mut self.apply_state_failure_tracker,
-                        height,
-                        None,
-                    );
-
                     // If this was an epoch-boundary block, apply the new parameters
                     // and proposed-update bytes to chain state atomically. The
                     // validator already verified they match expected.
@@ -1134,26 +1162,39 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         });
                     }
 
-                    // Non-blocking drain of completed eval results.
-                    // Save state_applied_height before drain — handle_eval_failure
-                    // may lower it if a deferred eval failed. Note: state_applied_height
-                    // is NOT updated during the sweep loop (only in the post-loop code),
-                    // so any decrease means a rollback happened inside drain.
-                    let pre_drain_height = self.state_applied_height;
+                    // Non-blocking drain of completed eval results. A
+                    // deferred-eval failure inside the drain rolls the
+                    // validator back (and lowers `state_applied_height`).
+                    // Detect it by the validator's own tip moving backwards
+                    // across the drain — NOT by `state_applied_height` dipping
+                    // below its pre-sweep value, which misses a rollback that
+                    // lands exactly on the pre-sweep tip (the common case: the
+                    // failing block was applied earlier in THIS sweep). On any
+                    // backwards move, abort: continuing would feed `apply_state`
+                    // a block past the rolled-back tip and surface a misleading
+                    // `HeightMismatch`.
+                    let pre_drain_tip =
+                        self.validator.as_ref().map_or(validated_to, |v| v.validated_height());
                     self.drain_eval_results(false).await;
+                    let post_drain_tip =
+                        self.validator.as_ref().map_or(pre_drain_tip, |v| v.validated_height());
 
-                    if self.state_applied_height < pre_drain_height {
+                    if post_drain_tip < pre_drain_tip {
                         tracing::warn!(
                             validated_to,
-                            rolled_back_to = self.state_applied_height,
+                            rolled_back_to = post_drain_tip,
                             "eval failure rolled back state during sweep — aborting"
                         );
-                        validated_to = self.state_applied_height;
+                        validated_to = post_drain_tip;
+                        // If this rollback pins the frontier, the backoff's
+                        // validation_stuck must name the deferred-eval mode —
+                        // the path the retired apply_state tracker never saw.
+                        stall_detail = StallDetail::script_eval();
                         break;
                     }
 
                     // Progress report every 1000 blocks during large sweeps
-                    let done = height - self.state_applied_height;
+                    let done = height - applied_tip;
                     if done.is_multiple_of(1000) && sweep_size > 100 {
                         let elapsed = sweep_start.elapsed().as_secs().max(1);
                         let rate = done as f64 / elapsed as f64;
@@ -1194,48 +1235,85 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 }
                 Err(e) => {
                     let err_msg = e.to_string();
-                    // Update the consecutive-failure tracker. Emits the
-                    // contract `validation_stuck` WARN event once the
-                    // same (height, error_kind) has failed 5 times in a
-                    // row — surfaces the silent retry loop that
-                    // otherwise stays buried under ERROR-per-sweep
-                    // noise.
-                    record_apply_state_result(
-                        &mut self.apply_state_failure_tracker,
-                        height,
-                        Some(&err_msg),
-                    );
+                    // Label the stall so the backoff's validation_stuck — if
+                    // this frontier wedges for 5 sweeps — names the apply_state
+                    // error kind and, for the AVL missing-key case, the key.
+                    let (error_kind, missing_key) = classify_apply_state_error(&err_msg);
+                    stall_detail = StallDetail { error_kind, missing_key };
                     tracing::error!(height, error = %err_msg, "apply_state failed");
                     break;
                 }
             }
         }
 
-        if validated_to > self.state_applied_height {
-            let advanced = validated_to - self.state_applied_height;
-            self.state_applied_height = validated_to;
-            // validator height is now persisted atomically inside state.redb
-            // by UtxoValidator::apply_state via storage.update_with_height —
-            // no separate hint write needed.
+        // Reconcile the cache to the validator's own tip — the ground truth
+        // after every apply AND every mid-sweep rollback. Committing the
+        // loop-local `validated_to` here instead would let a rollback that
+        // fired after the last successful apply leave `state_applied_height`
+        // ahead of the prover, which then feeds the next sweep a
+        // non-consecutive start (the wedge). `validated_height()` can only be
+        // what the prover actually holds; the cache must mirror it in both
+        // directions. Persistence is handled atomically inside state.redb by
+        // `UtxoValidator::apply_state` — no separate hint write needed.
+        let true_tip = self.validator.as_ref().map_or(validated_to, |v| v.validated_height());
 
-            if sweep_size > 100 {
-                let elapsed = sweep_start.elapsed();
-                let secs = elapsed.as_secs().max(1);
-                let rate = advanced as f64 / secs as f64;
-                tracing::info!(
-                    from = sweep_from as u64,
-                    to = validated_to as u64,
-                    blocks = advanced as u64,
-                    elapsed = format!("{}m{}s", secs / 60, secs % 60),
-                    rate = format!("{rate:.0}/s"),
-                    "VALIDATION SWEEP COMPLETE"
-                );
+        // Drive the sweep backoff off the authoritative applied tip. If the
+        // sweep moved the tip past where it started, that is real progress —
+        // clear any backoff. If it did not, the frontier is failing
+        // deterministically (apply_state error, or an eval rollback that
+        // pulled the tip back to where it began); arm/escalate the
+        // exponential delay so the next retry is throttled, and — once the
+        // frontier has stalled 5 sweeps in a row — emit the contract
+        // `validation_stuck` event, labelled by `stall_detail`. The backoff
+        // owns that emission for BOTH modes now (apply_state and the
+        // deferred-eval rollback the retired tracker never saw). This
+        // per-engage WARN is the finer-grained signal — once per actual retry,
+        // distinct from `validation_stuck` and deliberately not doubling it.
+        if let Some(stall) =
+            self.sweep_backoff
+                .record(applied_tip, true_tip, Instant::now(), stall_detail)
+        {
+            tracing::warn!(
+                height = applied_tip as u64,
+                attempt = stall.attempt,
+                delay_secs = stall.delay.as_secs(),
+                "validation sweep stalled at frontier; backing off retry"
+            );
+        }
+
+        if true_tip != self.state_applied_height {
+            let prev = self.state_applied_height;
+            self.state_applied_height = true_tip;
+
+            if true_tip > prev {
+                let advanced = true_tip - prev;
+                if sweep_size > 100 {
+                    let elapsed = sweep_start.elapsed();
+                    let secs = elapsed.as_secs().max(1);
+                    let rate = advanced as f64 / secs as f64;
+                    tracing::info!(
+                        from = sweep_from as u64,
+                        to = true_tip as u64,
+                        blocks = advanced as u64,
+                        elapsed = format!("{}m{}s", secs / 60, secs % 60),
+                        rate = format!("{rate:.0}/s"),
+                        "VALIDATION SWEEP COMPLETE"
+                    );
+                } else {
+                    tracing::debug!(
+                        state_applied_height = true_tip,
+                        advanced,
+                        downloaded_height = self.downloaded_height,
+                        "state applied height advanced"
+                    );
+                }
             } else {
+                // Cache was stale-ahead of the prover (e.g. a mid-sweep eval
+                // rollback) — pulled back down to the truth.
                 tracing::debug!(
-                    state_applied_height = validated_to,
-                    advanced,
-                    downloaded_height = self.downloaded_height,
-                    "state applied height advanced"
+                    state_applied_height = true_tip,
+                    previous = prev,
+                    "state applied height reconciled down to validator tip"
                 );
             }
         }
@@ -3117,5 +3195,398 @@ mod blocks_to_keep_tests {
             !output.contains("reclaimable"),
             "light mode MUST suppress the startup WARN: {output}"
         );
+    }
+}
+
+#[cfg(test)]
+mod sweep_resume_tests {
+    //! Regression tests for the validation-sweep resume wedge.
+    //!
+    //! The bug: the sweep derived its start height from
+    //! `state_applied_height` (a cache) instead of the validator's true
+    //! applied tip (`validated_height()`). A mid-sweep deferred-eval
+    //! rollback could leave the cache ahead of the prover; every later
+    //! sweep then fed `apply_state` a non-consecutive block, which the
+    //! validator's consecutiveness guard correctly rejected
+    //! (`expected N, got N+k`), looping forever even though the skipped
+    //! blocks were on disk.
+    //!
+    //! The fix anchors both the sweep start AND the post-sweep cache on
+    //! `validated_height()`. These tests construct the desynced state
+    //! directly and assert the sweep resumes at `applied_tip + 1` and
+    //! applies the intervening on-disk blocks instead of wedging.
+    use super::*;
+    use enr_chain::{ChainError, SyncInfo};
+    use ergo_chain_types::{ADDigest, Header};
+    use ergo_validation::{ApplyStateOutcome, BlockValidator, Parameters, ValidationError};
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::sync::Arc;
+
+    fn fake_header(height: u32) -> Header {
+        use ergo_chain_types::*;
+        Header {
+            version: 2,
+            id: BlockId(Digest32::from([height as u8; 32])),
+            parent_id: BlockId(Digest32::zero()),
+            ad_proofs_root: Digest32::zero(),
+            state_root: ADDigest::zero(),
+            transaction_root: Digest32::zero(),
+            timestamp: 1_000_000 + height as u64,
+            n_bits: 100_000,
+            height,
+            extension_root: Digest32::zero(),
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce: vec![0; 8],
+                pow_distance: None,
+            },
+            votes: Votes([0, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        }
+    }
+
+    /// Validator that enforces the real consecutiveness guard: it accepts
+    /// only `validated_height + 1` and advances on success, mirroring
+    /// `UtxoValidator::apply_state_internal`'s `HeightMismatch`. `reset_to`
+    /// lowers the height as a successful storage rollback would. Records the
+    /// exact sequence of heights it actually applied so a test can prove the
+    /// sweep resumed at the right block.
+    struct SweepValidator {
+        validated_height: u32,
+        digest: ADDigest,
+        applied: Vec<u32>,
+        /// When `Some(h)`, `apply_state` rejects height `h` every time with a
+        /// `StateRootMismatch`, modelling a deterministic divergence that
+        /// never advances the tip past `h - 1`. The backoff keys on the tip
+        /// stall, not the error kind, so this stands in equally for an
+        /// `apply_state` error and a deferred-eval rollback.
+        fail_at: Option<u32>,
+        /// Every `apply_state` call, success or failure — lets a test prove
+        /// the gate actually suppressed a retry.
+        attempts: u32,
+    }
+
+    impl SweepValidator {
+        fn at(height: u32) -> Self {
+            Self {
+                validated_height: height,
+                digest: ADDigest::zero(),
+                applied: Vec::new(),
+                fail_at: None,
+                attempts: 0,
+            }
+        }
+
+        fn failing_at(mut self, height: u32) -> Self {
+            self.fail_at = Some(height);
+            self
+        }
+    }
+
+    impl BlockValidator for SweepValidator {
+        fn apply_state(
+            &mut self,
+            header: &Header,
+            _block_txs: &[u8],
+            _ad_proofs: Option<&[u8]>,
+            _extension: &[u8],
+            _preceding_headers: &[Header],
+            _active_params: &Parameters,
+            _expected_boundary_params: Option<&Parameters>,
+            _expected_proposed_update: Option<&[u8]>,
+        ) -> Result<ApplyStateOutcome, ValidationError> {
+            self.attempts += 1;
+            if self.fail_at == Some(header.height) {
+                return Err(ValidationError::StateRootMismatch {
+                    expected: Vec::new(),
+                    got: Vec::new(),
+                });
+            }
+            let expected = self.validated_height + 1;
+            if header.height != expected {
+                return Err(ValidationError::HeightMismatch { expected, got: header.height });
+            }
+            self.validated_height = header.height;
+            self.applied.push(header.height);
+            Ok(ApplyStateOutcome {
+                epoch_boundary_params: None,
+                epoch_boundary_proposed_update: None,
+                deferred_eval: None,
+            })
+        }
+
+        fn validated_height(&self) -> u32 {
+            self.validated_height
+        }
+
+        fn current_digest(&self) -> &ADDigest {
+            &self.digest
+        }
+
+        fn reset_to(&mut self, height: u32, _digest: ADDigest) {
+            self.validated_height = height;
+        }
+    }
+
+    /// Chain that hands out a header for every height and is never at an
+    /// epoch boundary, so the sweep takes its plain (non-voting) path.
+    struct SweepChain;
+
+    impl SyncChain for SweepChain {
+        async fn chain_height(&self) -> u32 {
+            1_000_000
+        }
+        async fn build_sync_info(&self) -> Vec<u8> {
+            unreachable!()
+        }
+        async fn header_at(&self, height: u32) -> Option<Header> {
+            (height >= 1).then(|| fake_header(height))
+        }
+        async fn header_state_root(&self, _height: u32) -> Option<[u8; 33]> {
+            Some([0u8; 33])
+        }
+        fn parse_sync_info(&self, _body: &[u8]) -> Result<SyncInfo, ChainError> {
+            unreachable!()
+        }
+        async fn active_parameters(&self) -> Parameters {
+            Parameters::default()
+        }
+        async fn is_epoch_boundary(&self, _height: u32) -> bool {
+            false
+        }
+        async fn compute_expected_parameters(
+            &self,
+            _epoch_boundary_height: u32,
+            _block_proposed_update: &[u8],
+        ) -> Result<Parameters, ChainError> {
+            unreachable!()
+        }
+        async fn apply_epoch_boundary_parameters(
+            &self,
+            _params: Parameters,
+            _proposed_update_bytes: Vec<u8>,
+        ) {
+            unreachable!()
+        }
+        async fn active_proposed_update_bytes(&self) -> Vec<u8> {
+            unreachable!()
+        }
+        async fn verify_nipopow_envelope(
+            &self,
+            _envelope_body: &[u8],
+        ) -> Result<Vec<Header>, ChainError> {
+            unreachable!()
+        }
+        async fn is_better_nipopow(&self, _this: &[u8], _than: &[u8]) -> Result<bool, ChainError> {
+            unreachable!()
+        }
+        async fn install_nipopow_suffix(
+            &self,
+            _suffix_head: Header,
+            _suffix_tail: Vec<Header>,
+        ) -> Result<(), ChainError> {
+            unreachable!()
+        }
+        async fn voting_length(&self) -> u32 {
+            1024
+        }
+    }
+
+    /// Store where every requested section is "on disk".
+    struct SweepStore;
+
+    impl SyncStore for SweepStore {
+        async fn has_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> bool {
+            true
+        }
+        async fn get_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> Option<Vec<u8>> {
+            Some(vec![0])
+        }
+        async fn script_verified_height(&self) -> Option<u32> {
+            None
+        }
+        async fn set_script_verified_height(&self, _height: u32) {}
+        async fn validated_height(&self) -> Option<u32> {
+            None
+        }
+        async fn set_validated_height(&self, _height: u32) {}
+        async fn flush(&self) {}
+        async fn prune_below_height(
+            &self,
+            _horizon: u32,
+            _type_ids: &[u8],
+        ) -> Result<usize, String> {
+            Ok(0)
+        }
+        async fn min_height_present(&self, _type_id: u8) -> Result<Option<u32>, String> {
+            Ok(None)
+        }
+    }
+
+    struct SweepTransport;
+
+    impl SyncTransport for SweepTransport {
+        async fn send_to(
+            &self,
+            _peer: PeerId,
+            _message: ProtocolMessage,
+        ) -> Result<(), Box<dyn std::error::Error + Send>> {
+            unreachable!()
+        }
+        async fn outbound_peers(&self) -> Vec<PeerId> {
+            Vec::new()
+        }
+        async fn next_event(&mut self) -> Option<ProtocolEvent> {
+            std::future::pending().await
+        }
+    }
+
+    fn build_sync(
+        validator: SweepValidator,
+    ) -> HeaderSync<SweepTransport, SweepChain, SweepStore, SweepValidator> {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (_progress_tx, progress_rx) = mpsc::channel(1);
+        let (_dc_tx, delivery_control_rx) = mpsc::unbounded_channel::<DeliveryControl>();
+        let (_dd_tx, delivery_data_rx) = mpsc::channel::<DeliveryData>(1);
+        HeaderSync::new(
+            SyncConfig::default(),
+            SweepTransport,
+            SweepChain,
+            SweepStore,
+            Some(validator),
+            progress_rx,
+            delivery_control_rx,
+            delivery_data_rx,
+            None,
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(0)),
+            shutdown_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn sweep_resumes_at_applied_tip_when_cache_ran_ahead() {
+        // The exact wedge shape: applied tip 2665, cache desynced two ahead
+        // at 2667, blocks 2666..=2670 all on disk. The OLD code computed
+        // `from = state_applied_height + 1 = 2668`, fed the validator a
+        // non-consecutive block, and looped forever on
+        // `expected 2666, got 2668`. The fix must resume at
+        // `validated_height() + 1 = 2666`.
+        let mut sync = build_sync(SweepValidator::at(2665));
+        sync.state_applied_height = 2667; // cache ran ahead of the prover
+        sync.downloaded_height = 2670; // 2666..=2670 are downloaded
+
+        sync.advance_state_applied_height().await;
+
+        let v = sync.validator.as_ref().unwrap();
+        assert_eq!(
+            v.applied,
+            vec![2666, 2667, 2668, 2669, 2670],
+            "sweep MUST resume at applied_tip+1 (2666) and apply consecutively, \
+             not skip to the stale cache height"
+        );
+        assert_eq!(v.validated_height(), 2670, "validator advanced to the downloaded tip");
+        assert_eq!(
+            sync.state_applied_height, 2670,
+            "cache reconciled to the validator's true tip — no lingering desync"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_ahead_cache_is_pulled_back_when_nothing_to_apply() {
+        // Cache ahead of the prover but nothing new on disk (downloaded ==
+        // applied tip). The sweep has no work, but it must still pull the
+        // stale cache back down to the truth so the desync cannot persist.
+        let mut sync = build_sync(SweepValidator::at(2665));
+        sync.state_applied_height = 2667;
+        sync.downloaded_height = 2665;
+
+        sync.advance_state_applied_height().await;
+
+        let v = sync.validator.as_ref().unwrap();
+        assert!(v.applied.is_empty(), "no blocks past the applied tip — nothing to apply");
+        assert_eq!(
+            sync.state_applied_height, 2665,
+            "stale-ahead cache reconciled down to the validator tip"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_via_reset_keeps_cache_in_sync_next_sweep() {
+        // After a reorg/eval rollback lowers the validator below the cache,
+        // the very next sweep must re-anchor on the prover and re-apply the
+        // demoted blocks from the fork point — never feed a block past the
+        // rolled-back tip.
+        let mut sync = build_sync(SweepValidator::at(2670));
+        sync.state_applied_height = 2670;
+        sync.downloaded_height = 2670;
+        // Simulate a rollback to 2667 (validator only — cache left stale,
+        // exactly the hazardous state the fix must tolerate).
+        sync.validator.as_mut().unwrap().reset_to(2667, ADDigest::zero());
+
+        sync.advance_state_applied_height().await;
+
+        let v = sync.validator.as_ref().unwrap();
+        assert_eq!(
+            v.applied,
+            vec![2668, 2669, 2670],
+            "sweep re-applies from the rolled-back tip + 1, not from the stale cache"
+        );
+        assert_eq!(sync.state_applied_height, 2670, "cache back in sync with the prover");
+    }
+
+    #[tokio::test]
+    async fn stalled_sweep_arms_backoff_and_gate_suppresses_retry() {
+        // Frontier 2665 is wedged: block 2666 fails apply_state every attempt
+        // (modelling a deterministic divergence — equally an eval rollback,
+        // since the backoff keys on the tip stall, not the error). Blocks
+        // 2666..=2670 are all on disk, so without the gate the sweep would
+        // re-run at full tilt.
+        let mut sync = build_sync(SweepValidator::at(2665).failing_at(2666));
+        sync.downloaded_height = 2670;
+
+        // First sweep: one attempt at 2666, it stalls, the tip stays pinned,
+        // and the backoff arms at attempt 1.
+        sync.advance_state_applied_height().await;
+        assert_eq!(sync.validator.as_ref().unwrap().attempts, 1, "sweep made one attempt");
+        assert_eq!(
+            sync.validator.as_ref().unwrap().validated_height(),
+            2665,
+            "deterministic failure left the tip pinned"
+        );
+        assert_eq!(sync.sweep_backoff.consecutive(), 1, "non-advancing sweep armed the backoff");
+
+        // Immediate re-entry, well inside the backoff window: the gate must
+        // short-circuit the sweep — no second apply_state attempt, no
+        // escalation. This is the core of the fix: the deterministic failure
+        // can no longer peg a core.
+        sync.advance_state_applied_height().await;
+        assert_eq!(
+            sync.validator.as_ref().unwrap().attempts,
+            1,
+            "gate suppressed the retry inside the backoff window"
+        );
+        assert_eq!(sync.sweep_backoff.consecutive(), 1, "still attempt 1 — no fresh stall recorded");
+    }
+
+    #[tokio::test]
+    async fn advancing_sweep_never_arms_backoff() {
+        // A clean sweep that advances the tip must leave the backoff idle —
+        // the end-of-sweep bookkeeping records progress, not a stall. Guards
+        // against a false-positive that would throttle a healthy node.
+        let mut sync = build_sync(SweepValidator::at(2665));
+        sync.downloaded_height = 2670;
+
+        sync.advance_state_applied_height().await;
+
+        assert_eq!(
+            sync.validator.as_ref().unwrap().validated_height(),
+            2670,
+            "healthy sweep caught up to the downloaded tip"
+        );
+        assert_eq!(sync.sweep_backoff.consecutive(), 0, "progress arms no backoff");
     }
 }

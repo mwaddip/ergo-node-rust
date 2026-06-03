@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.6.11 — 2026-06-03
+
+A consensus fix in the bundled sigma-rust evaluator, two sync
+reliability fixes, and a journal-events contract broadening.
+
+- **Consensus fix — sigma-rust c3ee4a6a -> 6b3ce5ed.** `reduce_to_crypto`
+  now sets the eval context's tree version from the evaluated ErgoTree,
+  mirroring the JVM. It previously defaulted to V0 in the verify path, so
+  version-gated ops (e.g. `BigInt.toLong`) were wrongly rejected on V3
+  scripts — a fork-direction divergence that wedged sync at the first
+  such transaction. The bump also carries the sigma-rust costing and
+  serialization conformance fixes landed since c3ee4a6a.
+- **sync — validation sweep resume fix.** The sweep could start past the
+  applied tip and skip on-disk blocks, wedging sync permanently. It now
+  resumes from the real applied tip.
+- **sync — validation sweep backoff.** A deterministic apply/eval failure
+  no longer tight-loops at full speed: exponential backoff (1s -> 5min)
+  gated on the validated frontier failing to advance, covering both the
+  `apply_state` and deferred script-eval paths.
+- **journal-events contract 1.3.** `validation_stuck` now also fires on
+  deferred script-eval stalls (previously `apply_state`-only), so the
+  operator "node stuck" alarm covers eval wedges, not just state-DB
+  inconsistencies.
+
 ## v0.6.10 — 2026-06-02
 
 The main change is the bundled sigma-rust evaluator, bumped to bring its
