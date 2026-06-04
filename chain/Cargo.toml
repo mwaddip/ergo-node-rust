@@ -8,10 +8,10 @@ description = "Header chain validation for the Ergo Rust node"
 # Using fork with gen_indexes zero-modulo fix (PR pending: ergoplatform/sigma-rust).
 # AutolykosPowScheme not exported in published 0.15.0 — need git version.
 # When upstream merges, switch back to ergoplatform remote + new rev.
-ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "6b3ce5ed" }
-ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "6b3ce5ed" }
-ergo-nipopow = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "6b3ce5ed" }
-sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "6b3ce5ed" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "97afea86" }
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "97afea86" }
+ergo-nipopow = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "97afea86" }
+sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "97afea86" }
 hashbrown = "0.16"
 lru = "0.16"
 num-bigint = "0.4"

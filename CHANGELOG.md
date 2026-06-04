@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.6.12 — 2026-06-04
+
+A five-layer cascade of sigma-rust consensus divergences, all surfaced by
+re-syncing testnet — a v6.0-heavy chain that exercises script-evaluation
+edges mainnet's conservative history never did (this node is sigma-rust's
+first full-node consumer). Every layer was fork-direction: the JVM reference
+accepts the script, our stricter eval wrongly rejected it, wedging sync at
+the offending block. All five are fixed; testnet now validates clean from
+genesis to the live tip.
+
+sigma-rust 6b3ce5ed -> 97afea86.
+
+- **powHit return type (96367193).** `Global.powHit` was typed `Boolean`
+  not `UnsignedBigInt`, breaking the collection HOFs (`exists`/`filter`/
+  `forall`) that consume it with an "Invalid condition tpe" error. (Block 28,474.)
+- **UnsignedBigInt numeric cast (95248548 + cost c86fb9ce).** `Upcast(Int ->
+  UnsignedBigInt)` eval was unimplemented ("expected numeric value, got Int");
+  now implemented and cost-charged like BigInt.
+- **gen_indexes panic (16e6c4b9).** Panic when an index modulo N equals zero.
+- **DeserializeContext tolerance (0dd91453 + 46df20c0).** Eager substitution
+  errored on an absent context var, then on a non-bytearray var; the JVM
+  tolerates both. (Block 111,927.)
+- **AtLeast degenerate bound (97afea86).** `atLeast` with `bound > input.size`
+  errored instead of reducing to a false sigma proposition as the JVM does —
+  on a V0 tree, so not v6-specific. (Block 184,137.)
+- **SigmaProp equality cost (87758b85).** Charge `SigmaProp` equality per the
+  Scala `equalSigmaBoolean` reference.
+
 ## v0.6.11 — 2026-06-03
 
 A consensus fix in the bundled sigma-rust evaluator, two sync
