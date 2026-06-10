@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "879545c" }
+ergo_avltree_rust = "0.1.1"
 redb = "4"
 bytes = "1"
 anyhow = "1"

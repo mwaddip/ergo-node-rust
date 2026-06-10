@@ -269,7 +269,7 @@ impl RedbAVLStorage {
                 Ok(Some(data)) => {
                     let bytes: &[u8] = data.value();
                     let dummy: Resolver = Arc::new(|_| panic!("resolver called during unpack"));
-                    let tree = AVLTree::new(dummy, key_length, value_length);
+                    let tree = AVLTree::with_resolver(dummy, key_length, value_length);
                     let node_id = tree.unpack(&Bytes::copy_from_slice(bytes));
                     let node = node_id.borrow().clone();
                     node
@@ -370,7 +370,7 @@ impl RedbAVLStorage {
     /// Create a lightweight AVLTree for pack/unpack only (no real resolver).
     fn make_tree(&self) -> AVLTree {
         let dummy: Resolver = Arc::new(|_| panic!("dummy resolver"));
-        AVLTree::new(dummy, self.tree_params.key_length, self.tree_params.value_length)
+        AVLTree::with_resolver(dummy, self.tree_params.key_length, self.tree_params.value_length)
     }
 
     fn serialize_version_chain(chain: &VecDeque<(u64, ADDigest)>) -> Vec<u8> {

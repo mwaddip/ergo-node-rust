@@ -679,7 +679,7 @@ dependencies = [
  "anyhow",
  "blake2",
  "bytes",
- "ergo_avltree_rust 0.1.1 (git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=879545c)",
+ "ergo_avltree_rust",
  "redb",
  "tempfile",
  "tracing",
@@ -728,7 +728,7 @@ dependencies = [
 [[package]]
 name = "ergo-chain-types"
 version = "0.15.0"
-source = "git+https://github.com/mwaddip/sigma-rust.git?rev=97afea86#97afea86669d8498c37f5da8032da048d1a4bb10"
+source = "git+https://github.com/mwaddip/sigma-rust.git?rev=a4ee7442#a4ee74427fa9b93507e14768e01abb9f02abebb3"
 dependencies = [
  "base16",
  "base64",
@@ -751,7 +751,7 @@ dependencies = [
 [[package]]
 name = "ergo-lib"
 version = "0.28.0"
-source = "git+https://github.com/mwaddip/sigma-rust.git?rev=97afea86#97afea86669d8498c37f5da8032da048d1a4bb10"
+source = "git+https://github.com/mwaddip/sigma-rust.git?rev=a4ee7442#a4ee74427fa9b93507e14768e01abb9f02abebb3"
 dependencies = [
  "base16",
  "bounded-vec",
@@ -794,7 +794,7 @@ dependencies = [
 [[package]]
 name = "ergo-merkle-tree"
 version = "0.15.0"
-source = "git+https://github.com/mwaddip/sigma-rust.git?rev=97afea86#97afea86669d8498c37f5da8032da048d1a4bb10"
+source = "git+https://github.com/mwaddip/sigma-rust.git?rev=a4ee7442#a4ee74427fa9b93507e14768e01abb9f02abebb3"
 dependencies = [
  "base16",
  "blake2",
@@ -821,6 +821,7 @@ dependencies = [
  "hex",
  "num-bigint",
  "serde",
+ "serde_json",
  "sigma-ser",
  "thiserror",
  "tokio",
@@ -831,7 +832,7 @@ dependencies = [
 [[package]]
 name = "ergo-nipopow"
 version = "0.15.0"
-source = "git+https://github.com/mwaddip/sigma-rust.git?rev=97afea86#97afea86669d8498c37f5da8032da048d1a4bb10"
+source = "git+https://github.com/mwaddip/sigma-rust.git?rev=a4ee7442#a4ee74427fa9b93507e14768e01abb9f02abebb3"
 dependencies = [
  "base16",
  "bounded-integer",
@@ -866,7 +867,7 @@ dependencies = [
  "ergo-mining",
  "ergo-sync",
  "ergo-validation",
- "ergo_avltree_rust 0.1.1 (git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=879545c)",
+ "ergo_avltree_rust",
  "hex",
  "k256",
  "lru",
@@ -898,7 +899,7 @@ dependencies = [
  "enr-p2p",
  "ergo-chain-types",
  "ergo-validation",
- "ergo_avltree_rust 0.1.1 (git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=879545c)",
+ "ergo_avltree_rust",
  "hex",
  "rayon",
  "redb",
@@ -918,7 +919,7 @@ dependencies = [
  "enr-state",
  "ergo-chain-types",
  "ergo-lib",
- "ergo_avltree_rust 0.1.1 (git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=879545c)",
+ "ergo_avltree_rust",
  "ergotree-interpreter",
  "ergotree-ir",
  "hex",
@@ -931,22 +932,7 @@ dependencies = [
 [[package]]
 name = "ergo_avltree_rust"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "040e68223ab3775e54463c0f97b340d8fe6b4080acc5236fb4c19da477650668"
-dependencies = [
- "anyhow",
- "base16",
- "blake2",
- "byteorder",
- "bytes",
- "rand 0.8.5",
- "sha2 0.9.9",
-]
-
-[[package]]
-name = "ergo_avltree_rust"
-version = "0.1.1"
-source = "git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=879545c#879545c8bde6dfd7853b66f799f4b29b1e241571"
+source = "git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=2fc88d83#2fc88d8356fb6dbd453277c54cbaea07eef0d667"
 dependencies = [
  "anyhow",
  "base16",
@@ -960,7 +946,7 @@ dependencies = [
 [[package]]
 name = "ergotree-interpreter"
 version = "0.28.0"
-source = "git+https://github.com/mwaddip/sigma-rust.git?rev=97afea86#97afea86669d8498c37f5da8032da048d1a4bb10"
+source = "git+https://github.com/mwaddip/sigma-rust.git?rev=a4ee7442#a4ee74427fa9b93507e14768e01abb9f02abebb3"
 dependencies = [
  "base16",
  "blake2",
@@ -970,7 +956,7 @@ dependencies = [
  "derive_more",
  "elliptic-curve",
  "ergo-chain-types",
- "ergo_avltree_rust 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "ergo_avltree_rust",
  "ergotree-ir",
  "generic-array",
  "gf2_192",
@@ -993,7 +979,7 @@ dependencies = [
 [[package]]
 name = "ergotree-ir"
 version = "0.28.0"
-source = "git+https://github.com/mwaddip/sigma-rust.git?rev=97afea86#97afea86669d8498c37f5da8032da048d1a4bb10"
+source = "git+https://github.com/mwaddip/sigma-rust.git?rev=a4ee7442#a4ee74427fa9b93507e14768e01abb9f02abebb3"
 dependencies = [
  "base16",
  "bnum",
@@ -1216,7 +1202,7 @@ dependencies = [
 [[package]]
 name = "gf2_192"
 version = "0.28.0"
-source = "git+https://github.com/mwaddip/sigma-rust.git?rev=97afea86#97afea86669d8498c37f5da8032da048d1a4bb10"
+source = "git+https://github.com/mwaddip/sigma-rust.git?rev=a4ee7442#a4ee74427fa9b93507e14768e01abb9f02abebb3"
 dependencies = [
  "derive_more",
  "thiserror",
@@ -2327,7 +2313,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 [[package]]
 name = "sigma-ser"
 version = "0.19.0"
-source = "git+https://github.com/mwaddip/sigma-rust.git?rev=97afea86#97afea86669d8498c37f5da8032da048d1a4bb10"
+source = "git+https://github.com/mwaddip/sigma-rust.git?rev=a4ee7442#a4ee74427fa9b93507e14768e01abb9f02abebb3"
 dependencies = [
  "bitvec",
  "bounded-vec",
@@ -2338,7 +2324,7 @@ dependencies = [
 [[package]]
 name = "sigma-util"
 version = "0.18.0"
-source = "git+https://github.com/mwaddip/sigma-rust.git?rev=97afea86#97afea86669d8498c37f5da8032da048d1a4bb10"
+source = "git+https://github.com/mwaddip/sigma-rust.git?rev=a4ee7442#a4ee74427fa9b93507e14768e01abb9f02abebb3"
 dependencies = [
  "blake2",
  "sha2 0.10.9",

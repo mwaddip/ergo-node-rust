@@ -83,7 +83,7 @@ fn reopen_with_committed_state_emits_digest_hex() {
         let mut storage =
             RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
         let resolver = storage.resolver();
-        let tree = AVLTree::new(resolver, KEY_LEN, None);
+        let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
         let mut prover = BatchAVLProver::new(tree, true);
         prover
             .perform_one_operation(&Operation::Insert(KeyValue {

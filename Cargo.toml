@@ -29,9 +29,9 @@ enr-state = { path = "state" }
 enr-store = { path = "store" }
 ergo-api = { path = "api" }
 ergo-sync = { path = "sync" }
-ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "879545c" }
-ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "97afea86" }
-ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "97afea86" }
+ergo_avltree_rust = "0.1.1"
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "a4ee7442" }
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "a4ee7442" }
 ergo-mempool = { path = "mempool" }
 ergo-mining = { path = "mining" }
 ergo-validation = { path = "validation" }
@@ -39,7 +39,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
-sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "97afea86" }
+sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "a4ee7442" }
 toml = "0.8"
 tracing = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
@@ -51,8 +51,28 @@ redb = "4"
 thiserror = "2"
 
 [dev-dependencies]
-sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "97afea86" }
+sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "a4ee7442" }
 serde_json = "1"
 tempfile = "3"
 k256 = { version = "0.13.1", features = ["arithmetic"] }
 secp256k1 = "0.29"
+
+# Route EVERY ergo_avltree_rust reference — our store/persistence deps AND
+# sigma-rust's transitive dep in ergotree-interpreter (the consensus AvlTree
+# script-op eval path) — to our fork. [patch] at the build root covers
+# transitive deps, so interpreter and store both run the fork: one copy.
+#
+# Payoff: crates.io 0.1.1's AVL verifier PANICS on degenerate/malformed proofs
+# (bad bytes, negative keyLength, wrong value length) — a crafted block's
+# degenerate proof would panic block/digest validation instead of cleanly
+# rejecting (consensus-robustness / DoS). The fork returns Err there; this puts
+# Err-not-panic on the eval path, not just the store.
+#
+# Rev 2fc88d83 = PR #16: AVLTree::new keeps `impl Fn` (interpreter's bare
+# closures compile UNCHANGED — no sigma edit) and adds with_resolver(Resolver)
+# for our pre-built Arc resolvers. Node-side cost: our Arc call sites switch
+# new → with_resolver (closure sites stay on new). Single source of the fork
+# rev: bump HERE (members declare the plain "0.1.1"). Coordinate rev with the
+# sigma-rust session (fork main / PR #16).
+[patch.crates-io]
+ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "2fc88d83" }

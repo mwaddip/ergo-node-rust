@@ -133,7 +133,7 @@ fn main() {
 
     println!("\n=== PersistentBatchAVLProver digest ===");
     let resolver = storage.resolver();
-    let tree = AVLTree::new(resolver, 32, None);
+    let tree = AVLTree::with_resolver(resolver, 32, None);
     let prover = BatchAVLProver::new(tree, true);
     let persistent_prover = PersistentBatchAVLProver::new(prover, Box::new(storage), vec![])
         .expect("construct persistent prover");

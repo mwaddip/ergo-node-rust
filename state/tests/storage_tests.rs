@@ -37,7 +37,7 @@ fn setup(keep_versions: u32) -> (RedbAVLStorage, BatchAVLProver, tempfile::TempD
     let mut storage = RedbAVLStorage::open(&path, params(), keep_versions, CacheSize::default()).unwrap();
 
     let resolver = storage.resolver();
-    let tree = AVLTree::new(resolver, KEY_LEN, None);
+    let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
     let mut prover = BatchAVLProver::new(tree, true);
 
     // Initial commit with one key — can't have an empty-tree commit because
@@ -282,7 +282,7 @@ fn load_snapshot_sets_state() {
 
     // Build a small tree to extract its nodes.
     let resolver = storage.resolver();
-    let tree = AVLTree::new(resolver, KEY_LEN, None);
+    let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
     let mut prover = BatchAVLProver::new(tree, true);
 
     let key = make_key(60);
@@ -322,7 +322,7 @@ fn reopen_preserves_state() {
     {
         let mut storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
         let resolver = storage.resolver();
-        let tree = AVLTree::new(resolver, KEY_LEN, None);
+        let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
         let mut prover = BatchAVLProver::new(tree, true);
 
         prover
@@ -349,7 +349,7 @@ fn reopen_preserves_rollback_chain() {
     {
         let mut storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
         let resolver = storage.resolver();
-        let tree = AVLTree::new(resolver, KEY_LEN, None);
+        let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
         let mut prover = BatchAVLProver::new(tree, true);
 
         // Version 1.
@@ -388,7 +388,7 @@ fn reopen_preserves_rollback_chain() {
 
     // Verify the root unpacks correctly.
     let resolver = storage.resolver();
-    let mut tree = AVLTree::new(resolver, KEY_LEN, None);
+    let mut tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
     tree.root = Some(root);
     tree.height = height;
     let prover = BatchAVLProver::new(tree, false);
@@ -410,7 +410,7 @@ fn flush_persists_state_across_reopen() {
         let mut storage =
             RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
         let resolver = storage.resolver();
-        let tree = AVLTree::new(resolver, KEY_LEN, None);
+        let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
         let mut prover = BatchAVLProver::new(tree, true);
 
         prover
@@ -551,7 +551,7 @@ fn dump_snapshot_round_trip() {
     let reader: SnapshotReader = storage.snapshot_reader();
 
     let resolver = storage.resolver();
-    let tree = AVLTree::new(resolver, KEY_LEN, None);
+    let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
     let mut prover = BatchAVLProver::new(tree, true);
 
     // 2. Insert 100 keys.
@@ -699,7 +699,7 @@ fn update_persists_block_height() {
         let mut storage =
             RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
         let resolver = storage.resolver();
-        let tree = AVLTree::new(resolver, KEY_LEN, None);
+        let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
         let mut prover = BatchAVLProver::new(tree, true);
 
         // Apply 5 updates with ascending block heights.
@@ -734,7 +734,7 @@ fn rollback_restores_block_height() {
     let mut storage =
         RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
     let resolver = storage.resolver();
-    let tree = AVLTree::new(resolver, KEY_LEN, None);
+    let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
     let mut prover = BatchAVLProver::new(tree, true);
 
     // First update at height 100.
@@ -790,7 +790,7 @@ fn load_snapshot_sets_block_height() {
             RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
 
         let resolver = storage.resolver();
-        let tree = AVLTree::new(resolver, KEY_LEN, None);
+        let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
         let mut prover = BatchAVLProver::new(tree, true);
 
         prover
@@ -840,7 +840,7 @@ fn crash_simulation_preserves_pre_update_block_height() {
         let mut storage =
             RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
         let resolver = storage.resolver();
-        let tree = AVLTree::new(resolver, KEY_LEN, None);
+        let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
         let mut prover = BatchAVLProver::new(tree, true);
 
         prover

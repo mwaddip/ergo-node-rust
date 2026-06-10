@@ -31,7 +31,7 @@ fn dump_serve_receive_round_trip() {
 
     let resolver: Resolver =
         Arc::new(|digest: &[u8; 32]| Node::LabelOnly(NodeHeader::new(Some(*digest), None)));
-    let tree = AVLTree::new(resolver, 32, None);
+    let tree = AVLTree::with_resolver(resolver, 32, None);
     let mut prover = BatchAVLProver::new(tree, true);
 
     // Insert enough entries to have a non-trivial tree.
