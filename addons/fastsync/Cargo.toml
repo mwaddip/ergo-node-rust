@@ -2,7 +2,7 @@
 
 [package]
 name = "ergo-fastsync"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Fast bootstrap for ergo-node-rust via peer REST API — based on Arkadia Network's fast header sync (https://github.com/arkadianet/ergo)"
 

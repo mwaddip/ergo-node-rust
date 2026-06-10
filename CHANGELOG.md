@@ -1,5 +1,62 @@
 # Changelog
 
+## v0.7.0 — 2026-06-10
+
+The conformance release. Building **donner** — the SANTA block-tier runner
+that drives this node's digest validation against externally-blessed vectors
+(github.com/mwaddip/santa-donner) — surfaced three consensus-grade gaps the
+node's own test suite structurally could not see, because the suite verified
+the node's functions against themselves. All three are fixed here, alongside
+the rust-to-rust serve work, the candidate lifecycle arc, and UTXO-mode
+revalidate. Donner debuted red-0 over the full 4+6 vector corpus.
+
+- **maxBlockCost was never enforced as a block-level sum.** Every transaction
+  independently received the full block budget (sigma-rust's per-tx
+  `jit_cost_limit = maxBlockCost × 10`); the JVM threads accumulated cost
+  across the block and rejects when the SUM crosses the limit. A block with
+  every tx under budget but the total over: JVM rejects, we accepted — fork
+  direction, adversarial-miner reachable. `evaluate_scripts` /
+  `validate_transactions` now return the block-accumulated cost (Σ per-tx,
+  checked arithmetic) and reject with `BlockCostExceeded`. The sum is
+  verdict-equivalent to the JVM's threaded check; parallel evaluation stays.
+- **Mining committed the v1 transactionsRoot on v2+ networks.** JVM blocks
+  v2+ commit `txIds ++ witnessIds` (witness id = blake2b256 of the
+  concatenated input proofs, first byte dropped — 31-byte leaves); our
+  candidate assembly hashed tx IDs only. Every block mined on mainnet or
+  testnet would have carried a root no JVM peer accepts — orphaned
+  network-wide. Found by donner recomputing roots over real testnet blocks;
+  `transactions_root(txs, block_version)` now implements both rules, pinned
+  by a block-2666 fixture reproducing the on-chain root byte-identical.
+- **The exBlockVersion gate now exists — at epoch boundaries only.** A
+  boundary block whose `header.version` disagrees with the chain-computed
+  parameters' blockVersion is rejected (`BlockVersionMismatch`), matching
+  JVM `ErgoStateContext.processExtension`. The first draft enforced it on
+  every block; a JVM cross-reference caught that as stricter-than-reference
+  (mid-epoch the JVM ignores `header.version` entirely) and the gate was
+  narrowed the same day — an inverted test now pins the mid-epoch leniency
+  as an executable assertion.
+- **Rust-to-rust sync serve** (#13, #14, #15): continuation header Invs for
+  behind/forked peers, store-first local modifier serve in the router, and
+  SyncInfo responses routed to the requesting peer. First surfaced by
+  running a second node instance as a sync consumer.
+- **Candidate lifecycle arc** — JVM PR2291 parity for candidate
+  generation/refresh and the mining API.
+- **UTXO-mode revalidate** — `revalidate = true` now rebuilds state in UTXO
+  mode via a state-aside genesis replay (was digest-only).
+- **ADProof regeneration** — `ENR_DUMP_ADPROOFS_AT=<heights>` captures the
+  apply-time proofs as type-104 sections during replay (gated diagnostic,
+  zero hot-path cost). Produced the SANTA captured vectors, including the
+  epoch-boundary seed.
+- **avltree fork unification** — a root `[patch.crates-io]` routes every
+  `ergo_avltree_rust` reference, including sigma-rust's transitive
+  interpreter dependency, to the fork (rev `2fc88d83`): Err-not-panic on
+  degenerate proofs now reaches the script-eval path, not just the store.
+- **Unpadded header window** — `CONTEXT.headers` near genesis now carries
+  the real variable-length window (the JVM's `headerChainBack` semantics)
+  instead of padding to 10 by repeating the oldest header.
+- sigma-rust pin `97afea86` → `a4ee7442`. Addons re-pinned with lockfiles
+  re-synced: indexer 0.2.4, fastsync 0.1.2.
+
 ## v0.6.12 — 2026-06-04
 
 A five-layer cascade of sigma-rust consensus divergences, all surfaced by
