@@ -144,6 +144,9 @@ struct MiningCtx {
     config: ergo_mining::MinerConfig,
     proof_cache: MiningProofCache,
     snapshot_reader: Arc<SnapshotReader>,
+    /// Candidate lifecycle handle — the post-apply hook calls
+    /// `on_block_applied` for every applied block (facts/mining.md).
+    generator: Arc<ergo_mining::CandidateGenerator>,
 }
 
 fn build_miner_config(
@@ -318,6 +321,14 @@ impl BlockValidator for Validator {
             // Send confirmed transactions to the mempool task for apply_block().
             if let Ok(parsed) = ergo_validation::parse_block_transactions(block_txs) {
                 let _ = self.block_applied_tx.try_send(parsed.transactions);
+            }
+
+            // Candidate lifecycle: drop candidates that no longer build on
+            // the new tip; clear the solved latch when reached
+            // (facts/mining.md, Lifecycle API). Runs for EVERY applied
+            // block — own or peer.
+            if let Some(m) = &self.mining {
+                m.generator.on_block_applied(&header.id, header.height);
             }
 
             // Pre-compute mining proofs for the next block.
@@ -1081,10 +1092,7 @@ async fn at_tip_storage_reopen(
     swap_reader: Arc<ergo_node_rust::SwappableReader>,
     chain: Arc<Mutex<HeaderChain>>,
     mining_proof_cache: MiningProofCache,
-    miner_pk_opt: Option<ProveDlog>,
-    mining_cfg: MiningConfig,
-    miner_votes: [u8; 3],
-    network: enr_p2p::types::Network,
+    mining_generator: Option<Arc<ergo_mining::CandidateGenerator>>,
     shared_validated_height: Arc<std::sync::atomic::AtomicU32>,
     shared_state_context: Arc<tokio::sync::RwLock<Option<ergo_validation::ErgoStateContext>>>,
     block_applied_tx: tokio::sync::mpsc::Sender<Vec<ergo_validation::Transaction>>,
@@ -1144,7 +1152,7 @@ async fn at_tip_storage_reopen(
     swap_reader.install(new_sr.clone());
 
     let resolver = storage.resolver();
-    let tree = AVLTree::new(resolver, 32, None);
+    let tree = AVLTree::with_resolver(resolver, 32, None);
     let mut prover = BatchAVLProver::new(tree, true);
     let (root, tree_height) = match storage.rollback(&current_version) {
         Ok(rh) => rh,
@@ -1158,10 +1166,11 @@ async fn at_tip_storage_reopen(
     // load-bearing — see memory/feedback_avl_prover_flush_reset.md
     prover.base.tree.reset();
 
-    let mining_ctx = miner_pk_opt.as_ref().map(|pk| MiningCtx {
-        config: build_miner_config(pk, &mining_cfg, miner_votes, network),
+    let mining_ctx = mining_generator.as_ref().map(|g| MiningCtx {
+        config: g.config.clone(),
         proof_cache: mining_proof_cache,
         snapshot_reader: Arc::new(new_sr),
+        generator: g.clone(),
     });
 
     let validator = Validator::new(
@@ -1390,6 +1399,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let blocks_to_keep = node_config.blocks_to_keep;
     let revalidate = node_config.revalidate;
     let configured_checkpoint = node_config.checkpoint_height;
+    if revalidate && node_config.utxo_bootstrap {
+        // Contradictory intent: replay-from-genesis vs skip-to-snapshot.
+        return Err("config error: revalidate and utxo_bootstrap are mutually exclusive".into());
+    }
     tracing::info!(
         state_type = ?state_type, verify_transactions, blocks_to_keep, revalidate,
         checkpoint_height = ?configured_checkpoint,
@@ -1662,6 +1675,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         p2p.register_consumed_code(code).await;
     }
 
+    // Local-serve hook: answer ModifierRequest from our own store before the
+    // router's relay fallback (facts/p2p-routing.md § Local serve hook).
+    // Store-blind router, store-aware closure. redb reads are sync + cheap.
+    {
+        let serve_store = store.clone();
+        p2p.set_local_serve(std::sync::Arc::new(move |modifier_type: u8, id: &[u8; 32]| {
+            serve_store.get(modifier_type, id).ok().flatten()
+        }))
+        .await;
+    }
+
     // Validation pipeline — progress channel feeds sync, delivery channel feeds tracker
     let pipeline_chain = chain.clone();
     let api_store = store.clone(); // for REST API block queries
@@ -1803,6 +1827,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let genesis_digest = ADDigest::try_from(genesis_bytes.as_slice())
         .expect("invalid genesis digest length");
 
+    // Candidate generator — constructed before the validator so the
+    // post-apply lifecycle hook (CandidateGenerator::on_block_applied) can
+    // hold a handle. Shared with the mining task and the API layer below.
+    let mining_generator: Option<Arc<ergo_mining::CandidateGenerator>> =
+        if let Some(ref pk) = miner_pk_opt {
+            if state_type == StateType::Utxo {
+                Some(Arc::new(ergo_mining::CandidateGenerator::new(
+                    build_miner_config(pk, &node_config.mining, miner_votes, network),
+                )))
+            } else {
+                tracing::warn!("mining configured but node is in digest mode — mining disabled");
+                None
+            }
+        } else {
+            None
+        };
+
     let utxo_bootstrap = node_config.utxo_bootstrap;
     let min_snapshot_peers = node_config.min_snapshot_peers;
     let shared_state_context: Arc<tokio::sync::RwLock<Option<ergo_validation::ErgoStateContext>>> =
@@ -1827,6 +1868,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut storage = RedbAVLStorage::open(&state_path, params, keep_versions, CacheSize::Bytes(node_config.cache_mb as usize * 1024 * 1024))
                 .expect("failed to open UTXO state storage");
 
+            // `revalidate` in UTXO mode: the state tree cannot be rolled back
+            // to genesis in place (the undo log holds keep_versions, not the
+            // whole chain), so a replay means discarding the state file and
+            // rebuilding through the genesis-bootstrap branch below. Stored
+            // headers and sections are untouched — sync re-applies them
+            // through full validation; nothing is re-downloaded.
+            if revalidate && storage.version().is_some() {
+                tracing::info!(
+                    path = %state_path.display(),
+                    "revalidate: discarding UTXO state, rebuilding from genesis"
+                );
+                drop(storage);
+                std::fs::remove_file(&state_path)
+                    .expect("revalidate: failed to remove UTXO state file");
+                storage = RedbAVLStorage::open(
+                    &state_path,
+                    AVLTreeParams { key_length: 32, value_length: None },
+                    keep_versions,
+                    CacheSize::Bytes(node_config.cache_mb as usize * 1024 * 1024),
+                )
+                .expect("revalidate: failed to re-open UTXO state storage");
+            }
+
             let checkpoint = configured_checkpoint.unwrap_or(0);
 
             if let Some(current_version) = storage.version() {
@@ -1835,7 +1899,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let sr = storage.snapshot_reader();
                 swap_reader.install(sr.clone());
                 let resolver = storage.resolver();
-                let tree = AVLTree::new(resolver, 32, None);
+                let tree = AVLTree::with_resolver(resolver, 32, None);
                 let mut prover = BatchAVLProver::new(tree, true);
 
                 // Install the current version's root into the prover's
@@ -1934,10 +1998,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // between binary restart and the first new block being
                 // processed.
                 shared_validated_height.store(height, std::sync::atomic::Ordering::Relaxed);
-                let mining_ctx = miner_pk_opt.as_ref().map(|pk| MiningCtx {
-                    config: build_miner_config(pk, &node_config.mining, miner_votes, network),
+                let mining_ctx = mining_generator.as_ref().map(|g| MiningCtx {
+                    config: g.config.clone(),
                     proof_cache: mining_proof_cache.clone(),
                     snapshot_reader: Arc::new(sr),
+                    generator: g.clone(),
                 });
                 Some(Validator::new(
                     ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint)),
@@ -1956,7 +2021,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let sr = storage.snapshot_reader();
                 swap_reader.install(sr.clone());
                 let resolver = storage.resolver();
-                let tree = AVLTree::new(resolver, 32, None);
+                let tree = AVLTree::with_resolver(resolver, 32, None);
                 let mut prover = BatchAVLProver::new(tree, true);
 
                 for (box_id, box_bytes) in build_genesis_boxes(network) {
@@ -1989,13 +2054,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // (v1-era for mainnet, matching what block 1024's extension
                 // will carry).
                 let _ = chain_guard.recompute_active_parameters_from_storage(0);
-                let mining_ctx = miner_pk_opt.as_ref().map(|pk| MiningCtx {
-                    config: build_miner_config(pk, &node_config.mining, miner_votes, network),
+                let mining_ctx = mining_generator.as_ref().map(|g| MiningCtx {
+                    config: g.config.clone(),
                     proof_cache: mining_proof_cache.clone(),
                     snapshot_reader: Arc::new(sr),
+                    generator: g.clone(),
                 });
                 Some(Validator::new(
-                    ValidatorInner::Utxo(UtxoValidator::new(storage, prover, 0, checkpoint)),
+                    ValidatorInner::Utxo({
+                        let mut uv = UtxoValidator::new(storage, prover, 0, checkpoint);
+                        // Diagnostic: regenerate historical ADProofs that UTXO mode does
+                        // not store. Set ENR_DUMP_ADPROOFS_AT=h1,h2,... for a one-shot
+                        // genesis replay; writes adproofs-<H>.104 (raw type-104 section)
+                        // into data_dir at each listed height. Empty/unset = no-op.
+                        if let Ok(spec) = std::env::var("ENR_DUMP_ADPROOFS_AT") {
+                            let heights: std::collections::HashSet<u32> =
+                                spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                            if !heights.is_empty() {
+                                tracing::warn!(
+                                    ?heights, dir = %data_dir.display(),
+                                    "ENR_DUMP_ADPROOFS_AT set — ADProof dump enabled for this replay"
+                                );
+                                uv.set_adproof_dump(heights, data_dir.clone());
+                            }
+                        }
+                        uv
+                    }),
                     shared_validated_height.clone(),
                     shared_state_context.clone(),
                     block_applied_tx.clone(),
@@ -2243,10 +2327,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let handler_swap = swap_reader.clone();
             let handler_chain = chain.clone();
             let handler_proof_cache = mining_proof_cache.clone();
-            let handler_pk = miner_pk_opt.clone();
-            let handler_mining_cfg = node_config.mining.clone();
-            let handler_votes = miner_votes;
-            let handler_network = network;
+            let handler_generator = mining_generator.clone();
             let handler_validated = shared_validated_height.clone();
             let handler_state_ctx = shared_state_context.clone();
             let handler_block_applied = block_applied_tx.clone();
@@ -2262,10 +2343,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     handler_swap,
                     handler_chain,
                     handler_proof_cache,
-                    handler_pk,
-                    handler_mining_cfg,
-                    handler_votes,
-                    handler_network,
+                    handler_generator,
                     handler_validated,
                     handler_state_ctx,
                     handler_block_applied,
@@ -2358,7 +2436,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // just-written snapshot version is a short-circuit that
                     // loads the root node — same shape as the resume branch.
                     let resolver = storage.resolver();
-                    let tree = AVLTree::new(resolver, 32, None);
+                    let tree = AVLTree::with_resolver(resolver, 32, None);
                     let mut prover = BatchAVLProver::new(tree, true);
                     let (root, tree_h) = storage
                         .rollback(&version)
@@ -2685,157 +2763,146 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let p2p_for_connect = p2p.clone();
         let snapshot_store_for_api = snapshot_store.clone();
 
-        // Mining: construct CandidateGenerator + mining task if configured
-        let mining_generator: Option<Arc<ergo_mining::CandidateGenerator>> =
-            if let Some(ref pk) = miner_pk_opt {
-                if state_type == StateType::Utxo {
-                    let generator = Arc::new(ergo_mining::CandidateGenerator::new(
-                        build_miner_config(pk, &node_config.mining, miner_votes, network),
-                    ));
+        // Mining task: watches shared_height for tip changes, builds
+        // candidates. The generator itself was constructed pre-validator
+        // (the post-apply lifecycle hook holds it); this only spawns the
+        // polling worker when mining is configured.
+        if let Some(ref generator) = mining_generator {
+            let gen = generator.clone();
+            let proof_cache = mining_proof_cache.clone();
+            let mining_height = shared_validated_height.clone();
+            let mining_chain = chain.clone();
+            let mining_store = store.clone();
+            tokio::spawn(async move {
+                let mut last_height = 0u32;
+                loop {
+                    tokio::time::sleep(MINING_POLL_INTERVAL).await;
+                    let current = mining_height.load(std::sync::atomic::Ordering::Relaxed);
+                    if current == last_height || current == 0 {
+                        continue;
+                    }
+                    last_height = current;
 
-                    // Mining task: watches shared_height for tip changes, builds candidates
-                    let gen = generator.clone();
-                    let proof_cache = mining_proof_cache.clone();
-                    let mining_height = shared_validated_height.clone();
-                    let mining_chain = chain.clone();
-                    let mining_store = store.clone();
-                    tokio::spawn(async move {
-                        let mut last_height = 0u32;
-                        loop {
-                            tokio::time::sleep(MINING_POLL_INTERVAL).await;
-                            let current = mining_height.load(std::sync::atomic::Ordering::Relaxed);
-                            if current == last_height || current == 0 {
-                                continue;
-                            }
-                            last_height = current;
+                    // Read pre-computed proofs from the validator callback
+                    let proof_data = {
+                        let guard = proof_cache.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.clone()
+                    };
 
-                            // Read pre-computed proofs from the validator callback
-                            let proof_data = {
-                                let guard = proof_cache.lock().unwrap_or_else(|e| e.into_inner());
-                                guard.clone()
-                            };
+                    let proof_data = match proof_data {
+                        Some(d) if d.tip_height == current => d,
+                        _ => continue, // proofs not ready yet
+                    };
 
-                            let proof_data = match proof_data {
-                                Some(d) if d.tip_height == current => d,
-                                _ => continue, // proofs not ready yet
-                            };
+                    let candidate_height = proof_data.parent.height + 1;
 
-                            let candidate_height = proof_data.parent.height + 1;
-
-                            // Single chain lock: read n_bits, capture the active
-                            // proposed-update payload, check epoch boundary, compute
-                            // expected params if needed. The proposed-update bytes
-                            // must match what we encode into the extension below so
-                            // other peers compute identical expected params during
-                            // validation.
-                            let (n_bits, proposed_update_bytes, boundary_params) = {
-                                let chain_guard = mining_chain.lock().await;
-                                let n_bits = chain_guard.tip().n_bits;
-                                let proposed_update_bytes =
-                                    chain_guard.active_proposed_update_bytes().to_vec();
-                                let bp = if chain_guard.is_epoch_boundary(candidate_height) {
-                                    match chain_guard.compute_expected_parameters(
-                                        candidate_height,
-                                        &proposed_update_bytes,
-                                    ) {
-                                        Ok(p) => Some(p),
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                candidate_height,
-                                                "mining: compute_expected_parameters failed: {e}"
-                                            );
-                                            continue;
-                                        }
-                                    }
-                                } else {
-                                    None
-                                };
-                                (n_bits, proposed_update_bytes, bp)
-                            };
-
-                            // Read parent extension to unpack interlinks for the new block.
-                            // The parent extension lookup mirrors the chain extension loader:
-                            // header → section_ids[2] → extension bytes → mining helper.
-                            let parent_interlinks = {
-                                let parent_extension_id =
-                                    enr_chain::section_ids(&proof_data.parent)[2].1;
-                                match mining_store
-                                    .get(enr_chain::EXTENSION_TYPE_ID, &parent_extension_id)
-                                {
-                                    Ok(Some(ext_bytes)) => {
-                                        ergo_mining::extension::unpack_parent_interlinks(&ext_bytes)
-                                    }
-                                    Ok(None) => {
-                                        // Parent extension not yet stored (genesis or fresh chain)
-                                        vec![]
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "mining: parent extension store read failed: {e}; using empty interlinks"
-                                        );
-                                        vec![]
-                                    }
-                                }
-                            };
-
-                            // Build extension + header + WorkMessage
-                            let extension = match ergo_mining::extension::build_extension(
-                                &proof_data.parent,
-                                &parent_interlinks,
-                                boundary_params.as_ref(),
+                    // Single chain lock: read n_bits, capture the active
+                    // proposed-update payload, check epoch boundary, compute
+                    // expected params if needed. The proposed-update bytes
+                    // must match what we encode into the extension below so
+                    // other peers compute identical expected params during
+                    // validation.
+                    let (n_bits, proposed_update_bytes, boundary_params) = {
+                        let chain_guard = mining_chain.lock().await;
+                        let n_bits = chain_guard.tip().n_bits;
+                        let proposed_update_bytes =
+                            chain_guard.active_proposed_update_bytes().to_vec();
+                        let bp = if chain_guard.is_epoch_boundary(candidate_height) {
+                            match chain_guard.compute_expected_parameters(
+                                candidate_height,
                                 &proposed_update_bytes,
                             ) {
-                                Ok(ext) => ext,
+                                Ok(p) => Some(p),
                                 Err(e) => {
-                                    tracing::warn!("mining: extension build failed: {e}");
+                                    tracing::warn!(
+                                        candidate_height,
+                                        "mining: compute_expected_parameters failed: {e}"
+                                    );
                                     continue;
                                 }
-                            };
+                            }
+                        } else {
+                            None
+                        };
+                        (n_bits, proposed_update_bytes, bp)
+                    };
 
-                            let candidate = ergo_mining::CandidateBlock {
-                                parent: proof_data.parent.clone(),
-                                version: proof_data.parent.version,
-                                n_bits,
-                                state_root: proof_data.state_root,
-                                ad_proof_bytes: proof_data.ad_proof_bytes.clone(),
-                                transactions: vec![proof_data.emission_tx.clone()],
-                                timestamp: {
-                                    let now = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap()
-                                        .as_millis() as u64;
-                                    std::cmp::max(now, proof_data.parent.timestamp + 1)
-                                },
-                                extension,
-                                votes: gen.config.votes,
-                                header_bytes: vec![],
-                            };
-
-                            match ergo_mining::candidate::build_work_message(
-                                &candidate,
-                                &gen.config.miner_pk.h,
-                            ) {
-                                Ok((header_bytes, work)) => {
-                                    let mut candidate = candidate;
-                                    candidate.header_bytes = header_bytes;
-                                    gen.cache_candidate(candidate, work, current);
-                                    tracing::debug!(height = current + 1, "mining candidate cached");
-                                }
-                                Err(e) => {
-                                    tracing::warn!("mining: work message build failed: {e}");
-                                }
+                    // Read parent extension to unpack interlinks for the new block.
+                    // The parent extension lookup mirrors the chain extension loader:
+                    // header → section_ids[2] → extension bytes → mining helper.
+                    let parent_interlinks = {
+                        let parent_extension_id =
+                            enr_chain::section_ids(&proof_data.parent)[2].1;
+                        match mining_store
+                            .get(enr_chain::EXTENSION_TYPE_ID, &parent_extension_id)
+                        {
+                            Ok(Some(ext_bytes)) => {
+                                ergo_mining::extension::unpack_parent_interlinks(&ext_bytes)
+                            }
+                            Ok(None) => {
+                                // Parent extension not yet stored (genesis or fresh chain)
+                                vec![]
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "mining: parent extension store read failed: {e}; using empty interlinks"
+                                );
+                                vec![]
                             }
                         }
-                    });
-                    tracing::info!("mining task started");
-                    Some(generator)
-                } else {
-                    tracing::warn!("mining configured but node is in digest mode — mining disabled");
-                    None
+                    };
+
+                    // Build extension + header + WorkMessage
+                    let extension = match ergo_mining::extension::build_extension(
+                        &proof_data.parent,
+                        &parent_interlinks,
+                        boundary_params.as_ref(),
+                        &proposed_update_bytes,
+                    ) {
+                        Ok(ext) => ext,
+                        Err(e) => {
+                            tracing::warn!("mining: extension build failed: {e}");
+                            continue;
+                        }
+                    };
+
+                    let candidate = ergo_mining::CandidateBlock {
+                        parent: proof_data.parent.clone(),
+                        version: proof_data.parent.version,
+                        n_bits,
+                        state_root: proof_data.state_root,
+                        ad_proof_bytes: proof_data.ad_proof_bytes.clone(),
+                        transactions: vec![proof_data.emission_tx.clone()],
+                        timestamp: {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64;
+                            std::cmp::max(now, proof_data.parent.timestamp + 1)
+                        },
+                        extension,
+                        votes: gen.config.votes,
+                        header_bytes: vec![],
+                    };
+
+                    match ergo_mining::candidate::build_work_message(
+                        &candidate,
+                        &gen.config.miner_pk.h,
+                    ) {
+                        Ok((header_bytes, work)) => {
+                            let mut candidate = candidate;
+                            candidate.header_bytes = header_bytes;
+                            gen.cache_candidate(candidate, work, current);
+                            tracing::debug!(height = current + 1, "mining candidate cached");
+                        }
+                        Err(e) => {
+                            tracing::warn!("mining: work message build failed: {e}");
+                        }
+                    }
                 }
-            } else {
-                None
-            };
+            });
+            tracing::info!("mining task started");
+        }
 
         let api_state = ergo_api::ApiState {
             chain: Arc::new(HeaderChainAdapter { chain: api_chain }),
@@ -3175,7 +3242,7 @@ mod tests {
         // Insert into AVL+ tree and verify genesis state digest
         let resolver: ergo_avltree_rust::batch_node::Resolver =
             Arc::new(|digest: &[u8; 32]| Node::LabelOnly(NodeHeader::new(Some(*digest), None)));
-        let tree = AVLTree::new(resolver, 32, None);
+        let tree = AVLTree::with_resolver(resolver, 32, None);
         let mut prover = BatchAVLProver::new(tree, false);
 
         for (id, value) in &boxes {
@@ -3221,7 +3288,7 @@ mod tests {
         // Insert into AVL+ tree and verify genesis state digest
         let resolver: ergo_avltree_rust::batch_node::Resolver =
             Arc::new(|digest: &[u8; 32]| Node::LabelOnly(NodeHeader::new(Some(*digest), None)));
-        let tree = AVLTree::new(resolver, 32, None);
+        let tree = AVLTree::with_resolver(resolver, 32, None);
         let mut prover = BatchAVLProver::new(tree, false);
 
         for (id, value) in &boxes {

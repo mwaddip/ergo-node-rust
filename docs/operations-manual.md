@@ -355,6 +355,15 @@ re-run. Used to test validation logic changes against the full chain
 history without a full resync. Slow on archival nodes; expect
 hours-to-days depending on hardware.
 
+Mode behavior: in digest mode the validator resets and re-checks in
+place. In UTXO mode the state file (`state.redb`) is **discarded** at
+startup and rebuilt from stored blocks — if you want an instant
+rollback option, move `state.redb` aside manually instead of using the
+flag (same rebuild, but the old state survives as a file you can move
+back). Mutually exclusive with `utxo_bootstrap`. Ignored in light
+mode. The flag re-triggers on EVERY start while set — unset it after
+the replay completes.
+
 ### What sharpen can't fix
 
 If the redb files themselves are corrupted (filesystem damage,

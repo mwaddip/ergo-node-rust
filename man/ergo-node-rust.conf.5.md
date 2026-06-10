@@ -144,6 +144,12 @@ reference node and are appropriate for mainnet.
 :   On startup, replay validation against every stored block from
     genesis. Headers and sections are kept — nothing is re-downloaded.
     Useful when changing validation logic. Default: **false**.
+    In digest mode the validator resets and re-checks in place. In UTXO
+    mode the state file (`state.redb`) is **discarded** at startup and
+    rebuilt by re-applying stored blocks through full validation.
+    Mutually exclusive with **utxo_bootstrap**. Ignored in light mode
+    (no block validation). Remember to unset after the replay — the
+    flag re-triggers on every start while set.
 
 **checkpoint_height** = *integer*
 :   ErgoScript validation checkpoint. Blocks at or below this height
