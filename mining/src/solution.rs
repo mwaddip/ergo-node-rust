@@ -29,7 +29,7 @@ pub fn validate_solution(
         Digest32::from(hash)
     };
 
-    let tx_root = transactions_root(&candidate.transactions)?;
+    let tx_root = transactions_root(&candidate.transactions, candidate.version)?;
     let ext_root_bytes = crate::extension::extension_digest(&candidate.extension)?;
 
     // Build the full header with the submitted solution.

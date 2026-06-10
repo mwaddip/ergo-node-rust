@@ -1,0 +1,123 @@
+{
+  "source": "santa vectors/block/v6/captured/bigint-downcast-2666.json \u2014 real testnet block, height 2666, header version 4",
+  "blockVersion": 4,
+  "transactionsRoot": "076f2372d03da2f265c349aca2347daf14b9bd301321388fe48cae453dac502e",
+  "transactions": [
+    {
+      "dataInputs": [],
+      "id": "23c73fb1971d6fda60f6d1a1ffda63931f557ccf463673b53f171a2e4939b48d",
+      "inputs": [
+        {
+          "boxId": "2aea0537cdd14b136f88115365e24f63be760504b79e6a313ddda37fffa5b8df",
+          "spendingProof": {
+            "extension": {},
+            "proofBytes": ""
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "additionalRegisters": {},
+          "assets": [],
+          "boxId": "ec0876ae2f3bfc236dd4739d87b7b9dc1d7ee597c9ac6293bc5ab46533ad9f16",
+          "creationHeight": 2666,
+          "ergoTree": "101004020e36100204a00b08cd0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ea02d192a39a8cc7a7017300730110010204020404040004c0fd4f05808c82f5f6030580b8c9e5ae040580f882ad16040204c0944004c0f407040004000580f882ad16d19683030191a38cc7a7019683020193c2b2a57300007473017302830108cdeeac93a38cc7b2a573030001978302019683040193b1a5730493c2a7c2b2a573050093958fa3730673079973089c73097e9a730a9d99a3730b730c0599c1a7c1b2a5730d00938cc7b2a5730e0001a390c1a7730f",
+          "index": 0,
+          "transactionId": "23c73fb1971d6fda60f6d1a1ffda63931f557ccf463673b53f171a2e4939b48d",
+          "value": 93229177500000000
+        },
+        {
+          "additionalRegisters": {},
+          "assets": [],
+          "boxId": "ee790599edf6a0c585b31a270141b42fcd9efb1b0e645665e4304b9c8569bfcb",
+          "creationHeight": 2666,
+          "ergoTree": "100204a00b08cd0352c9d64b4da9c099490fb76ac569177d4b917a87480b06aa535d78b979995669ea02d192a39a8cc7a70173007301",
+          "index": 1,
+          "transactionId": "23c73fb1971d6fda60f6d1a1ffda63931f557ccf463673b53f171a2e4939b48d",
+          "value": 67500000000
+        }
+      ]
+    },
+    {
+      "dataInputs": [],
+      "id": "fcb58864185ff84be56fb405b3919939eeb706e2577c3f48fb730628e23c87da",
+      "inputs": [
+        {
+          "boxId": "90a2f39533729813e4635ec9a735ec803b4645bc28f63363b13fac9332f32fe9",
+          "spendingProof": {
+            "extension": {
+              "0": "1a012056002fb6194f8a7f147b54c98c98bd72205f46c35fed0f3c4111071ecb0763b7",
+              "1": "0e720356c9f063a7fdddd566da55d7d8dee934b6a0b291014d1285c8f93ef935ed85500256002fb6194f8a7f147b54c98c98bd72205f46c35fed0f3c4111071ecb0763b7ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00000009000000007735940000000400",
+              "2": "0e7602000000000000000000000000000000000000000000000000000000000000000056002fb6194f8a7f147b54c98c98bd72205f46c35fed0f3c4111071ecb0763b70000000002ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00000009000000007735940000000400"
+            },
+            "proofBytes": ""
+          }
+        },
+        {
+          "boxId": "b98a06c14edc67f3fb11e7a8903fcdf83bdcb37e52f8173c872bd2327bfb895a",
+          "spendingProof": {
+            "extension": {},
+            "proofBytes": "ceb615c07ec2e6927f88953ace2cbd7ae90f1d17235674833c2a431dc43b17d4aa010e15404604de4f0793e7fa73d716b3b084e2d0f70eb4"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "additionalRegisters": {},
+          "assets": [],
+          "boxId": "9e14e1c81f99daff20f153bc3c9a70a926b3dcc822d29c69b5f2cb8268c1fabb",
+          "creationHeight": 2664,
+          "ergoTree": "0008cd02856c5e4eb4b915005dccb8e0f42bed1777cae48565be13a77cbf31e3c93f4515",
+          "index": 0,
+          "transactionId": "fcb58864185ff84be56fb405b3919939eeb706e2577c3f48fb730628e23c87da",
+          "value": 67500000000
+        },
+        {
+          "additionalRegisters": {},
+          "assets": [],
+          "boxId": "eef4af49b5e90145da835aeb5f436c8debce71a3e96d2244f1de96c30aa23150",
+          "creationHeight": 2664,
+          "ergoTree": "1005040004000e36100204a00b08cd0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ea02d192a39a8cc7a701730073011001020402d19683030193a38cc7b2a57300000193c2b2a57301007473027303830108cdeeac93b1a57304",
+          "index": 1,
+          "transactionId": "fcb58864185ff84be56fb405b3919939eeb706e2577c3f48fb730628e23c87da",
+          "value": 1000000
+        },
+        {
+          "additionalRegisters": {},
+          "assets": [],
+          "boxId": "d6c874bdf207a649fc19512db3b76bca71469ae98e35ced6604336290e06ccc8",
+          "creationHeight": 2664,
+          "ergoTree": "0008cd02856c5e4eb4b915005dccb8e0f42bed1777cae48565be13a77cbf31e3c93f4515",
+          "index": 2,
+          "transactionId": "fcb58864185ff84be56fb405b3919939eeb706e2577c3f48fb730628e23c87da",
+          "value": 19999998000000
+        }
+      ]
+    },
+    {
+      "dataInputs": [],
+      "id": "ef59df21545edf1a6e912044583ab37427848ef2ce527f7b4adb4e66916a25bf",
+      "inputs": [
+        {
+          "boxId": "eef4af49b5e90145da835aeb5f436c8debce71a3e96d2244f1de96c30aa23150",
+          "spendingProof": {
+            "extension": {},
+            "proofBytes": ""
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "additionalRegisters": {},
+          "assets": [],
+          "boxId": "2a7f34295a72d3a07b9426cd467bc2a828c3cb9f68a1f0e5ccf65ca7124cb6f4",
+          "creationHeight": 2666,
+          "ergoTree": "100204a00b08cd0352c9d64b4da9c099490fb76ac569177d4b917a87480b06aa535d78b979995669ea02d192a39a8cc7a70173007301",
+          "index": 0,
+          "transactionId": "ef59df21545edf1a6e912044583ab37427848ef2ce527f7b4adb4e66916a25bf",
+          "value": 1000000
+        }
+      ]
+    }
+  ]
+}
