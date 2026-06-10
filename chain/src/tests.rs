@@ -46,10 +46,16 @@ mod parse_tests {
         assert_eq!(parsed.transaction_root, from_json.transaction_root);
         assert_eq!(parsed.state_root, from_json.state_root);
         assert_eq!(parsed.extension_root, from_json.extension_root);
-        // V2 wire format omits pow_onetime_pk and pow_distance — they're None after roundtrip
+        // V2 wire format omits pow_onetime_pk and pow_distance. In memory, parse
+        // fills pow_onetime_pk with the group generator — matching the JVM
+        // (`wForV2 = CryptoConstants.dlogGroup.generator`) — while pow_distance
+        // stays None.
         assert_eq!(parsed.autolykos_solution.miner_pk, from_json.autolykos_solution.miner_pk);
         assert_eq!(parsed.autolykos_solution.nonce, from_json.autolykos_solution.nonce);
-        assert!(parsed.autolykos_solution.pow_onetime_pk.is_none());
+        assert_eq!(
+            parsed.autolykos_solution.pow_onetime_pk,
+            Some(Box::new(ergo_chain_types::ec_point::generator()))
+        );
         assert!(parsed.autolykos_solution.pow_distance.is_none());
         assert_eq!(parsed.votes, from_json.votes);
     }
