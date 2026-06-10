@@ -20,7 +20,7 @@ use crate::routing::inv_table::InvTable;
 use crate::routing::latency::{LatencyStats, LatencyTracker};
 use crate::routing::tracker::{RequestTracker, SyncTracker};
 use crate::transport::handshake::PeerSpec;
-use crate::types::{ConnectionType, Direction, Network, PeerId, ProxyMode};
+use crate::types::{ConnectionType, Direction, ModifierId, Network, PeerId, ProxyMode};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -31,6 +31,61 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// cap of 64, that's 8.
 const PEERS_PER_GOSSIP_DIVISOR: usize = 8;
 const PEERS_PER_GOSSIP_MIN_CAP: usize = 16;
+
+/// Store-blind local-serve hook consulted by the ModifierRequest arm
+/// before any relay: `(modifier_type, id)` → `Some(bytes)` when the
+/// integrator's store holds the modifier. See `facts/p2p-routing.md`.
+pub type LocalServeFn = Arc<dyn Fn(u8, &[u8; 32]) -> Option<Vec<u8>> + Send + Sync>;
+
+/// Serve-side cap on one encoded `ModifierResponse` body, mirroring JVM
+/// `ModifiersSpec.maxMessageSize` (2_048_576). Kept below the frame
+/// layer's `MAX_BODY_SIZE` (2 MiB) so a served batch is never rejected
+/// by a symmetric (rust) peer's frame read cap.
+const MAX_SERVE_BATCH_BYTES: usize = 2_048_576;
+/// Conservative per-entry encoding overhead in a `ModifierResponse`
+/// body: 32-byte id + ≤5-byte VLQ data length.
+const SERVE_ENTRY_OVERHEAD: usize = 37;
+/// Conservative body header overhead: 1 type byte + ≤2-byte VLQ count
+/// (count is parse-capped at `MAX_INV_OBJECTS` = 400).
+const SERVE_HEADER_OVERHEAD: usize = 3;
+
+/// Block-component modifier types (JVM `NetworkObjectTypeId`):
+/// Header=101, BlockTransactions=102, ADProofs=104, Extension=108.
+/// Transaction=2 is mempool gossip, not block data — Light listeners
+/// still relay it. Same values as enr-chain's `*_TYPE_ID` constants;
+/// restated here because p2p sits below enr-chain in the layering.
+fn is_block_related(modifier_type: u8) -> bool {
+    matches!(modifier_type, 101 | 102 | 104 | 108)
+}
+
+/// Split locally-served modifiers into batches whose encoded
+/// `ModifierResponse` bodies stay under [`MAX_SERVE_BATCH_BYTES`]. A
+/// single modifier that alone exceeds the cap is shipped anyway in its
+/// own batch — JVM `sendByParts` parity (it warns and sends it).
+fn chunk_served(served: Vec<(ModifierId, Vec<u8>)>) -> Vec<Vec<(ModifierId, Vec<u8>)>> {
+    let mut batches = Vec::new();
+    let mut batch: Vec<(ModifierId, Vec<u8>)> = Vec::new();
+    let mut size = SERVE_HEADER_OVERHEAD;
+    for (id, data) in served {
+        let entry = SERVE_ENTRY_OVERHEAD + data.len();
+        if !batch.is_empty() && size + entry > MAX_SERVE_BATCH_BYTES {
+            batches.push(std::mem::take(&mut batch));
+            size = SERVE_HEADER_OVERHEAD;
+        }
+        if batch.is_empty() && size + entry > MAX_SERVE_BATCH_BYTES {
+            tracing::warn!(
+                data_len = data.len(),
+                "serving over-cap modifier alone (JVM sendByParts parity)"
+            );
+        }
+        size += entry;
+        batch.push((id, data));
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    batches
+}
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -109,6 +164,11 @@ pub struct Router {
     /// outbound serialized frame. Exposed to operators via
     /// [`Router::traffic_snapshot`].
     counters: Arc<TrafficCounters>,
+    /// Local-serve hook for ModifierRequests, consulted before any
+    /// relay (see `facts/p2p-routing.md`). `None` (the construction
+    /// default) preserves pure-proxy relay behavior; the integrator
+    /// wires it to the modifier store via [`Router::set_local_serve`].
+    local_serve: Option<LocalServeFn>,
 }
 
 impl Default for Router {
@@ -159,7 +219,17 @@ impl Router {
             network,
             filter_bogus_addresses,
             counters: Arc::new(TrafficCounters::new()),
+            local_serve: None,
         }
+    }
+
+    /// Install the local-serve hook consulted by the ModifierRequest arm
+    /// before any relay (see `facts/p2p-routing.md`). Store-blind: the
+    /// integrator wires it to the modifier store. Called synchronously on
+    /// the routing path — keep it to cheap single-key lookups; cost per
+    /// message is bounded by the parse-layer object cap (400 ids).
+    pub fn set_local_serve(&mut self, serve: LocalServeFn) {
+        self.local_serve = Some(serve);
     }
 
     /// Clone of the shared counter store. Hand this to peer tasks so
@@ -339,8 +409,36 @@ impl Router {
             }
 
             ProtocolMessage::ModifierRequest { modifier_type, ids } => {
+                // Mode filtering (contract): Light listeners are gossip-
+                // only — block-related requests are dropped outright,
+                // never served or relayed. Transaction requests (type 2)
+                // are gossip and fall through.
+                if source_mode == ProxyMode::Light && is_block_related(modifier_type) {
+                    return vec![];
+                }
+
                 let mut actions = Vec::new();
+                // Local hits, grouped into one ModifierResponse below
+                // (split only when the encoded body would exceed the
+                // serve batch cap).
+                let mut served: Vec<(ModifierId, Vec<u8>)> = Vec::new();
                 for id in &ids {
+                    // Local serve hook first. Serve and relay are per-id
+                    // exclusive: a locally-answered id is never also
+                    // relayed, and never enters the request tracker —
+                    // there is no upstream response to route back. Hook
+                    // cost is bounded by the parse-layer object cap
+                    // (`MAX_INV_OBJECTS`): at most 400 lookups per
+                    // message, the rate the JVM serves requests at too.
+                    if let Some(data) = self
+                        .local_serve
+                        .as_ref()
+                        .and_then(|serve| serve(modifier_type, id))
+                    {
+                        served.push((*id, data));
+                        continue;
+                    }
+
                     let target = if let Some(inv_target) = self.inv_table.lookup(id) {
                         if inv_target == source {
                             continue;
@@ -368,6 +466,18 @@ impl Router {
                             },
                         });
                     }
+                }
+                // The request parse cap bounds `ids`, so served batches
+                // can never exceed the response object cap.
+                debug_assert!(served.len() <= crate::protocol::messages::MAX_INV_OBJECTS);
+                for batch in chunk_served(served) {
+                    actions.push(Action::Send {
+                        target: source,
+                        message: ProtocolMessage::ModifierResponse {
+                            modifier_type,
+                            modifiers: batch,
+                        },
+                    });
                 }
                 actions
             }
@@ -1217,5 +1327,404 @@ mod tests {
             !router.blacklist.contains(source_addr),
             "testnet source not banned for gossiping private addresses"
         );
+    }
+
+    // ---- local-serve hook (facts/p2p-routing.md ModifierRequest arm) ----
+
+    /// Modifier id helper: 32 bytes of `n`.
+    fn mid(n: u8) -> ModifierId {
+        [n; 32]
+    }
+
+    /// Hook backed by a fixed id → bytes table.
+    fn serve_table(entries: Vec<(ModifierId, Vec<u8>)>) -> LocalServeFn {
+        let map: HashMap<ModifierId, Vec<u8>> = entries.into_iter().collect();
+        Arc::new(move |_mtype, id| map.get(id).cloned())
+    }
+
+    /// Requester + one outbound relay candidate. Returns (router, S, O).
+    fn router_with_requester_and_outbound() -> (Router, PeerId, PeerId) {
+        let mut router = Router::new(Network::Mainnet);
+        let source = PeerId(1);
+        router.register_peer(
+            source,
+            Direction::Inbound,
+            ProxyMode::Full,
+            pub_addr("78.46.40.1:9030"),
+            None,
+            None,
+        );
+        let outbound = PeerId(2);
+        router.register_peer(
+            outbound,
+            Direction::Outbound,
+            ProxyMode::Full,
+            pub_addr("78.46.40.2:9030"),
+            None,
+            None,
+        );
+        (router, source, outbound)
+    }
+
+    #[test]
+    fn local_serve_hit_responds_directly_without_relay() {
+        let (mut router, source, outbound) = router_with_requester_and_outbound();
+        router.set_local_serve(serve_table(vec![(mid(0xAA), b"header-bytes".to_vec())]));
+
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::ModifierRequest {
+                modifier_type: 101,
+                ids: vec![mid(0xAA)],
+            },
+        });
+        assert_eq!(actions.len(), 1, "exactly one action: the direct response");
+        match &actions[0] {
+            Action::Send {
+                target,
+                message:
+                    ProtocolMessage::ModifierResponse {
+                        modifier_type,
+                        modifiers,
+                    },
+            } => {
+                assert_eq!(*target, source, "response goes straight to the requester");
+                assert_eq!(*modifier_type, 101);
+                assert_eq!(modifiers.as_slice(), &[(mid(0xAA), b"header-bytes".to_vec())]);
+            }
+            other => panic!("expected direct ModifierResponse, got {other:?}"),
+        }
+
+        // Per-id exclusivity: the served id never entered the request
+        // tracker, so a later upstream response for it routes nowhere.
+        let follow = router.handle_event(ProtocolEvent::Message {
+            peer_id: outbound,
+            message: ProtocolMessage::ModifierResponse {
+                modifier_type: 101,
+                modifiers: vec![(mid(0xAA), b"other".to_vec())],
+            },
+        });
+        assert!(
+            follow.iter().all(|a| !matches!(a, Action::Send { .. })),
+            "no forward for an id that was served locally"
+        );
+    }
+
+    #[test]
+    fn local_serve_miss_relays_unchanged() {
+        let (mut router, source, outbound) = router_with_requester_and_outbound();
+        router.set_local_serve(serve_table(vec![])); // misses everything
+
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::ModifierRequest {
+                modifier_type: 102,
+                ids: vec![mid(0xBB)],
+            },
+        });
+        assert_eq!(actions.len(), 1, "exactly one action: the relayed request");
+        match &actions[0] {
+            Action::Send {
+                target,
+                message: ProtocolMessage::ModifierRequest { modifier_type, ids },
+            } => {
+                assert_eq!(*target, outbound, "miss falls back to outbound relay");
+                assert_eq!(*modifier_type, 102);
+                assert_eq!(ids.as_slice(), &[mid(0xBB)]);
+            }
+            other => panic!("expected relayed ModifierRequest, got {other:?}"),
+        }
+
+        // The relayed id WAS tracked: the upstream response forwards back.
+        let follow = router.handle_event(ProtocolEvent::Message {
+            peer_id: outbound,
+            message: ProtocolMessage::ModifierResponse {
+                modifier_type: 102,
+                modifiers: vec![(mid(0xBB), b"section".to_vec())],
+            },
+        });
+        assert!(
+            follow.iter().any(|a| matches!(
+                a,
+                Action::Send {
+                    target,
+                    message: ProtocolMessage::ModifierResponse { .. }
+                } if *target == source
+            )),
+            "relayed id forwards the upstream response to the requester"
+        );
+    }
+
+    #[test]
+    fn local_serve_mixed_batch_groups_hits_relays_misses() {
+        let (mut router, source, outbound) = router_with_requester_and_outbound();
+        router.set_local_serve(serve_table(vec![
+            (mid(0x0A), b"mod-a".to_vec()),
+            (mid(0x0C), b"mod-c".to_vec()),
+        ]));
+
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::ModifierRequest {
+                modifier_type: 102,
+                ids: vec![mid(0x0A), mid(0x0B), mid(0x0C)],
+            },
+        });
+
+        let responses: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Send {
+                    target,
+                    message: ProtocolMessage::ModifierResponse { modifiers, .. },
+                } => Some((*target, modifiers.clone())),
+                _ => None,
+            })
+            .collect();
+        let relays: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Send {
+                    target,
+                    message: ProtocolMessage::ModifierRequest { ids, .. },
+                } => Some((*target, ids.clone())),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(actions.len(), 2, "one grouped response + one relay");
+        assert_eq!(responses.len(), 1, "hits grouped into a single response");
+        let (resp_target, resp_mods) = &responses[0];
+        assert_eq!(*resp_target, source);
+        assert_eq!(
+            resp_mods.as_slice(),
+            &[
+                (mid(0x0A), b"mod-a".to_vec()),
+                (mid(0x0C), b"mod-c".to_vec())
+            ],
+            "both hits in one response, request order preserved"
+        );
+        assert_eq!(relays.len(), 1, "only the miss is relayed");
+        assert_eq!(relays[0], (outbound, vec![mid(0x0B)]));
+    }
+
+    #[test]
+    fn no_callback_legacy_relay_unchanged() {
+        // No hook installed: behavior (down to the encoded frames) must
+        // match the pre-hook relay logic — inv-table routing with
+        // outbound fallback, one single-id request per relayed id.
+        let (mut router, source, outbound) = router_with_requester_and_outbound();
+        let announcer = PeerId(3);
+        router.register_peer(
+            announcer,
+            Direction::Inbound,
+            ProxyMode::Full,
+            pub_addr("78.46.40.3:9030"),
+            None,
+            None,
+        );
+        // Announcer claims id X via Inv → inv-table route.
+        router.handle_event(ProtocolEvent::Message {
+            peer_id: announcer,
+            message: ProtocolMessage::Inv {
+                modifier_type: 102,
+                ids: vec![mid(0x11)],
+            },
+        });
+
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::ModifierRequest {
+                modifier_type: 102,
+                ids: vec![mid(0x11), mid(0x22)],
+            },
+        });
+
+        assert_eq!(actions.len(), 2, "one relay per id, no response actions");
+        let expect = |ids: Vec<ModifierId>| {
+            ProtocolMessage::ModifierRequest {
+                modifier_type: 102,
+                ids,
+            }
+            .to_frame()
+        };
+        match &actions[0] {
+            Action::Send { target, message } => {
+                assert_eq!(*target, announcer, "inv-known id routed to announcer");
+                assert_eq!(message.to_frame(), expect(vec![mid(0x11)]));
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+        match &actions[1] {
+            Action::Send { target, message } => {
+                assert_eq!(*target, outbound, "unknown id falls back to outbound");
+                assert_eq!(message.to_frame(), expect(vec![mid(0x22)]));
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn light_mode_block_modifier_request_dropped() {
+        let mut router = Router::new(Network::Mainnet);
+        let source = PeerId(1);
+        router.register_peer(
+            source,
+            Direction::Inbound,
+            ProxyMode::Light,
+            pub_addr("78.46.41.1:9030"),
+            None,
+            None,
+        );
+        let outbound = PeerId(2);
+        router.register_peer(
+            outbound,
+            Direction::Outbound,
+            ProxyMode::Full,
+            pub_addr("78.46.41.2:9030"),
+            None,
+            None,
+        );
+        // A hook that would serve anything — must never be consulted for
+        // block-related requests from a Light source.
+        router.set_local_serve(Arc::new(|_, _| Some(b"data".to_vec())));
+
+        for block_type in [101u8, 102, 104, 108] {
+            let actions = router.handle_event(ProtocolEvent::Message {
+                peer_id: source,
+                message: ProtocolMessage::ModifierRequest {
+                    modifier_type: block_type,
+                    ids: vec![mid(0x33)],
+                },
+            });
+            assert!(
+                actions.is_empty(),
+                "block-related type {block_type} dropped for Light source"
+            );
+        }
+
+        // Transactions (type 2) are mempool gossip, not block data —
+        // a Light source still gets them served.
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::ModifierRequest {
+                modifier_type: 2,
+                ids: vec![mid(0x44)],
+            },
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Send {
+                    target,
+                    message: ProtocolMessage::ModifierResponse { .. }
+                } if *target == source
+            )),
+            "transaction request from Light source still served"
+        );
+    }
+
+    #[test]
+    fn light_mode_sync_info_still_dropped() {
+        // Pre-existing mode filtering, untouched by the serve hook.
+        let mut router = Router::new(Network::Mainnet);
+        let source = PeerId(1);
+        router.register_peer(
+            source,
+            Direction::Inbound,
+            ProxyMode::Light,
+            pub_addr("78.46.41.3:9030"),
+            None,
+            None,
+        );
+        let outbound = PeerId(2);
+        router.register_peer(
+            outbound,
+            Direction::Outbound,
+            ProxyMode::Full,
+            pub_addr("78.46.41.4:9030"),
+            None,
+            None,
+        );
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::SyncInfo { body: vec![1, 2, 3] },
+        });
+        assert!(actions.is_empty(), "SyncInfo from Light source dropped");
+    }
+
+    #[test]
+    fn local_serve_oversized_batch_splits_responses() {
+        // Three ~900 KB modifiers: two fit under the serve batch cap
+        // (2_048_576), the third forces a second response — JVM
+        // sendByParts parity.
+        let (mut router, source, _outbound) = router_with_requester_and_outbound();
+        let big = vec![0u8; 900_000];
+        router.set_local_serve(serve_table(vec![
+            (mid(0x01), big.clone()),
+            (mid(0x02), big.clone()),
+            (mid(0x03), big.clone()),
+        ]));
+
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::ModifierRequest {
+                modifier_type: 104,
+                ids: vec![mid(0x01), mid(0x02), mid(0x03)],
+            },
+        });
+
+        let batches: Vec<Vec<ModifierId>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Send {
+                    target,
+                    message: ProtocolMessage::ModifierResponse { modifiers, .. },
+                } if *target == source => {
+                    Some(modifiers.iter().map(|(id, _)| *id).collect())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            batches,
+            vec![vec![mid(0x01), mid(0x02)], vec![mid(0x03)]],
+            "split into [A,B] + [C] at the serve batch cap"
+        );
+        // Every batch's encoded body stays under the frame read cap, so
+        // a symmetric rust peer never rejects a served response.
+        for a in &actions {
+            if let Action::Send { message, .. } = a {
+                assert!(message.to_frame().body.len() <= 2 * 1024 * 1024);
+            }
+        }
+    }
+
+    #[test]
+    fn local_serve_single_oversized_modifier_sent_alone() {
+        // A modifier alone exceeding the batch cap is shipped anyway in
+        // its own response (JVM sendByParts sends + warns).
+        let (mut router, source, _outbound) = router_with_requester_and_outbound();
+        router.set_local_serve(serve_table(vec![(mid(0x05), vec![0u8; 2_049_000])]));
+
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::ModifierRequest {
+                modifier_type: 104,
+                ids: vec![mid(0x05)],
+            },
+        });
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::Send {
+                target,
+                message: ProtocolMessage::ModifierResponse { modifiers, .. },
+            } => {
+                assert_eq!(*target, source);
+                assert_eq!(modifiers.len(), 1);
+                assert_eq!(modifiers[0].1.len(), 2_049_000);
+            }
+            other => panic!("expected lone oversized response, got {other:?}"),
+        }
     }
 }

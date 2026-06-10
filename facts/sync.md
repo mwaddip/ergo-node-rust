@@ -178,6 +178,65 @@ pick_sync_peer() → sync_from_peer() → synced()
    - 20s timer → send SyncInfo (scheduled cycle start)
    - Stall timeout (60s no progress) → rotate to different peer
 
+### Serving sync (peer behind us) — REQUIRED, not optional
+
+The sync exchange is bidirectional. On an incoming peer SyncInfo, after the
+existing tip-tracking/switch logic, the handler MUST serve peers whose chain
+is behind or forked from ours — the JVM does this in
+`ErgoNodeViewSynchronizer.processSyncV1` (`:412-418`):
+
+- **Peer Younger or Fork** (their anchors show less-developed or forked
+  chain): send `Inv { HEADER_TYPE_ID, ids }` with up to **400** continuation
+  header ids (`hr.continuationIds(syncInfo, size = 400)`).
+- **Empty anchor list = fresh peer** (from genesis): continuation starts at
+  height 1. The JVM's `continuationIds` explicitly serves the chain start
+  for an empty SyncInfo — a from-zero peer must receive Inv, not silence.
+- **Fork**: continuation starts after the best common point found among the
+  peer's reported anchor ids.
+- **Peer Older or Equal**: no Inv (existing behavior — we request, or idle).
+- The SyncInfo-response reply (existing behavior) stays; the Inv is in
+  addition to it.
+- **The SyncInfo response MUST be addressed to the SENDER of the incoming
+  SyncInfo, not to our own active sync peer** (JVM `processSync` replies to
+  `remote`). This is the only caught-up signal a peer syncing FROM us
+  receives: when it has all our headers our continuation is empty (no Inv
+  sent), so its transition to `synced()` depends entirely on receiving our
+  SyncInfo back and seeing `our_tip <= its_height`. Misaddressing it to our
+  sync peer strands the requester in the header loop forever — headers
+  complete, block download never engages. (Regression: a serving node at tip,
+  not syncing from the requester, still answers the requester.)
+
+Continuation computation is a `SyncChain` trait method:
+
+```rust
+/// Continuation header ids for a peer whose chain is behind/forked.
+/// `peer_last_ids`: the peer's SyncInfo anchor ids, newest first (may be
+/// empty = fresh peer). Returns ids of OUR chain's headers ascending from
+/// the best common point + 1, capped at `limit` (400 per JVM).
+fn continuation_ids(&self, peer_last_ids: &[BlockId], limit: usize)
+    -> impl Future<Output = Vec<[u8; 32]>> + Send;
+```
+
+Implemented by the main crate's `SharedChain` bridge via
+`HeaderChain::height_of` + `header_at`.
+
+**History (2026-06-08):** never implemented — only the consume side existed,
+because no peer had ever synced FROM this node (all prior peers were JVM
+archival nodes serving us). A from-genesis rust peer stalled forever at
+height 0 against a rust node. Discovered by the digest side-instance.
+
+### Serving modifier requests (store-first)
+
+Incoming `ModifierRequest` is served from the node's OWN store when the
+modifier is present; only ids absent locally fall through to the legacy
+relay-to-other-peers path (proxy heritage). Implementation note: serving
+lives in the **p2p router** via a store-blind local-serve callback injected
+by the main crate (see `facts/p2p-routing.md`, "Local serve hook") — NOT in
+the sync loop, so serve and relay can never double-respond for one request.
+Same discovery history as the continuation-Inv gap: relay-only behavior
+meant a node with an 11 GB block store answered requests by asking someone
+else.
+
 ### Peer rotation
 
 `stalled_peers: HashSet<PeerId>` tracks peers that failed to produce progress.

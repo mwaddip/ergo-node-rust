@@ -20,7 +20,7 @@ use std::io::{self, Cursor, Read};
 /// messages. Mirrors JVM `InvSpec.maxInvObjects = 400` (a `require` that
 /// throws on parse). Bounds pre-allocation: a hostile peer cannot drive
 /// `Vec::with_capacity` beyond this without us rejecting the frame first.
-const MAX_INV_OBJECTS: usize = 400;
+pub(crate) const MAX_INV_OBJECTS: usize = 400;
 
 type ModifierEntries = Vec<(ModifierId, Vec<u8>)>;
 

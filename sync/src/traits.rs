@@ -1,4 +1,4 @@
-use enr_chain::{Header, SyncInfo};
+use enr_chain::{BlockId, Header, SyncInfo};
 use enr_p2p::protocol::messages::ProtocolMessage;
 use enr_p2p::protocol::peer::ProtocolEvent;
 use enr_p2p::types::PeerId;
@@ -120,6 +120,22 @@ pub trait SyncChain {
 
     /// Parse an incoming SyncInfo message body.
     fn parse_sync_info(&self, body: &[u8]) -> Result<SyncInfo, enr_chain::ChainError>;
+
+    /// Continuation header ids for a peer whose chain is behind/forked.
+    ///
+    /// `peer_last_ids`: the peer's SyncInfo anchor ids, newest first (may
+    /// be empty = fresh peer). Returns ids of OUR chain's headers ascending
+    /// from the best common point + 1, capped at `limit` (400 per JVM).
+    /// An empty anchor list serves from the chain start (height 1); no
+    /// common point at all returns an empty Vec (nothing to serve).
+    ///
+    /// Mirrors JVM `ErgoHistoryReader.continuationIds`. See
+    /// `../facts/sync.md` § "Serving sync (peer behind us)".
+    fn continuation_ids(
+        &self,
+        peer_last_ids: &[BlockId],
+        limit: usize,
+    ) -> impl std::future::Future<Output = Vec<[u8; 32]>> + Send;
 
     /// Current blockchain parameters at the chain tip.
     /// Used by the validator to bound transaction costs on every block.

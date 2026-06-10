@@ -62,7 +62,7 @@ The transport layer never interprets message content. The protocol layer parses 
 - **VLQ everywhere**: Scorex method names (`putUShort`, `putUInt`) are misleading — all use VLQ encoding
 - **Except frame headers**: `body_length` in message framing is 4-byte big-endian, NOT VLQ
 - **Magic bytes**: Mainnet `[01,00,02,04]`, Testnet `[02,03,02,03]`
-- **Modifier types**: 1=Header, 2=Transaction, 3=BlockTransactions, 4=ADProofs, 5=Extension
+- **Modifier types** (JVM `NetworkObjectTypeId`): 101=Header, 2=Transaction, 102=BlockTransactions, 104=ADProofs, 108=Extension
 - Full wire format spec: `docs/protocol/ergo-p2p-wire-format.md` in the main repo
 
 ## JVM Reference

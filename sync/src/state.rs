@@ -13,8 +13,8 @@ use crate::apply_state_error::classify_apply_state_error;
 use crate::delivery::{DeliveryControl, DeliveryData, DeliveryTracker};
 use crate::sweep_backoff::StallDetail;
 use enr_chain::{
-    StateType, HEADER_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID, EXTENSION_TYPE_ID,
-    TRANSACTION_TYPE_ID,
+    BlockId, StateType, SyncInfo, HEADER_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID,
+    EXTENSION_TYPE_ID, TRANSACTION_TYPE_ID,
 };
 
 use crate::traits::{SyncChain, SyncStore, SyncTransport};
@@ -26,6 +26,21 @@ use ergo_validation::BlockValidator;
 /// 64 per type × 2 types = 128 sections per cycle = 64 blocks/cycle.
 fn is_block_section_type(type_id: u8) -> bool {
     matches!(type_id, BLOCK_TRANSACTIONS_TYPE_ID | AD_PROOFS_TYPE_ID | EXTENSION_TYPE_ID)
+}
+
+/// Max continuation header ids served to a behind/forked peer per incoming
+/// SyncInfo (JVM `processSyncV1`/`V2`: `continuationIds(syncInfo, size = 400)`).
+const CONTINUATION_IDS_LIMIT: usize = 400;
+
+/// Anchor ids from a parsed SyncInfo, newest first — the order
+/// `SyncChain::continuation_ids` expects. V2 headers arrive tip-first on the
+/// wire; V1 ids arrive oldest-first (JVM `lastHeaderIds` convention) and are
+/// reversed here.
+fn sync_info_anchor_ids(info: &SyncInfo) -> Vec<BlockId> {
+    match info {
+        SyncInfo::V2 { headers } => headers.iter().map(|h| h.id).collect(),
+        SyncInfo::V1 { header_ids } => header_ids.iter().rev().copied().collect(),
+    }
 }
 
 /// Result of a paired state/store flush.
@@ -1157,7 +1172,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         self.evals_in_flight += 1;
                         rayon::spawn(move || {
                             let h = eval.height;
-                            let result = ergo_validation::evaluate_scripts(&eval);
+                            let result = ergo_validation::evaluate_scripts(&eval).map(|_cost| ());
                             let _ = tx.send((h, result));
                         });
                     }
@@ -1496,14 +1511,22 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 }
 
                 // Peer's SyncInfo: respond with ours to keep the bidirectional
-                // exchange alive. The JVM expects this — without it, per-peer
-                // sync state goes stale and the JVM stops sending Inv.
+                // exchange alive (the JVM expects this — without it, per-peer
+                // sync state goes stale and the JVM stops sending Inv), and
+                // serve a continuation Inv when the sender's chain is behind
+                // or forked from ours — the other half of the bidirectional
+                // exchange (JVM processSyncV1/V2: Younger | Fork →
+                // continuationIds(400) → sendExtension). Without the serve
+                // side, a from-genesis peer syncing FROM us stalls at height
+                // 0 forever. See ../facts/sync.md § "Serving sync".
                 ProtocolMessage::SyncInfo { body } => {
+                    let mut result = EventResult::Continue;
                     if let Ok(info) = self.chain.parse_sync_info(&body) {
                         let peer_heights = C::sync_info_heights(&info);
                         let our_height = self.chain.chain_height().await;
+                        let peer_tip = peer_heights.first().copied();
 
-                        if let Some(&peer_tip) = peer_heights.first() {
+                        if let Some(peer_tip) = peer_tip {
                             // Publish the max peer tip we've seen — main crate
                             // reads this for the bootstrap gap decision.
                             let prev = self.peer_chain_tip
@@ -1516,19 +1539,64 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                             // "Caught up" only counts from the peer we're syncing from
                             if peer_id == peer && peer_tip <= our_height {
                                 tracing::debug!(our_height, peer_tip, "caught up with peer");
-                                return EventResult::Synced;
-                            }
-                            // Any peer ahead of us triggers a switch
-                            if peer_tip > our_height + 1 {
+                                result = EventResult::Synced;
+                            } else if peer_tip > our_height + 1 {
+                                // Any peer ahead of us triggers a switch
                                 tracing::debug!(our_height, peer_tip, peer = %peer_id, "peer is ahead, resuming sync");
-                                return EventResult::BehindPeer(peer_id);
+                                result = EventResult::BehindPeer(peer_id);
+                            }
+                        }
+
+                        // Serve the continuation. A peer strictly ahead is
+                        // never served (JVM: Older — we request from them
+                        // instead); equal or unknown chains self-gate via an
+                        // empty continuation, mirroring JVM sendExtension's
+                        // no-op on an empty extension. Empty anchors = fresh
+                        // peer = served from height 1. An empty own chain has
+                        // nothing to serve. Runs even when `result` flips to
+                        // Synced — a behind sync-peer still gets its Inv.
+                        let peer_strictly_ahead =
+                            peer_tip.is_some_and(|t| t > our_height);
+                        if our_height > 0 && !peer_strictly_ahead {
+                            let anchors = sync_info_anchor_ids(&info);
+                            let ids = self
+                                .chain
+                                .continuation_ids(&anchors, CONTINUATION_IDS_LIMIT)
+                                .await;
+                            if !ids.is_empty() {
+                                tracing::debug!(
+                                    peer = %peer_id,
+                                    count = ids.len(),
+                                    "peer behind/forked → serving continuation Inv"
+                                );
+                                let _ = self
+                                    .transport
+                                    .send_to(
+                                        peer_id,
+                                        ProtocolMessage::Inv {
+                                            modifier_type: HEADER_TYPE_ID,
+                                            ids,
+                                        },
+                                    )
+                                    .await;
                             }
                         }
                     }
 
-                    // Respond with our SyncInfo — mirrors JVM's syncSendNeeded behavior
-                    let _ = self.send_sync_info(peer).await;
-                    EventResult::Continue
+                    // Respond with our SyncInfo — mirrors JVM's syncSendNeeded
+                    // behavior. Skipped on state transitions, preserving the
+                    // pre-serve control flow where Synced/BehindPeer returned
+                    // before reaching this send. Addressed to the SENDER
+                    // (`peer_id`), not our active sync peer (`peer`): the JVM's
+                    // processSync replies to `remote`, and this response is the
+                    // only caught-up signal a peer syncing FROM us receives
+                    // (empty continuation ⇒ no Inv). Misaddressing it to our
+                    // sync peer strands the requester in the header loop
+                    // forever. See ../facts/sync.md § "Serving sync".
+                    if matches!(result, EventResult::Continue) {
+                        let _ = self.send_sync_info(peer_id).await;
+                    }
+                    result
                 }
 
                 // Transaction Inv: request unconfirmed txs from peers
@@ -2429,6 +2497,16 @@ mod shutdown_flush_tests {
             unreachable!("not called without a sync peer")
         }
 
+        async fn continuation_ids(
+            &self,
+            _peer_last_ids: &[BlockId],
+            _limit: usize,
+        ) -> Vec<[u8; 32]> {
+            // Empty chain — nothing to serve a behind peer. The handler's
+            // `our_height > 0` gate skips the call anyway.
+            Vec::new()
+        }
+
         async fn active_parameters(&self) -> Parameters {
             unreachable!("not called in shutdown-flush tests")
         }
@@ -2799,6 +2877,15 @@ mod blocks_to_keep_tests {
 
         fn parse_sync_info(&self, _body: &[u8]) -> Result<SyncInfo, ChainError> {
             unreachable!()
+        }
+
+        async fn continuation_ids(
+            &self,
+            _peer_last_ids: &[BlockId],
+            _limit: usize,
+        ) -> Vec<[u8; 32]> {
+            // Chain at height 0 — nothing to serve a behind peer.
+            Vec::new()
         }
 
         async fn active_parameters(&self) -> Parameters {
@@ -3349,6 +3436,13 @@ mod sweep_resume_tests {
         fn parse_sync_info(&self, _body: &[u8]) -> Result<SyncInfo, ChainError> {
             unreachable!()
         }
+        async fn continuation_ids(
+            &self,
+            _peer_last_ids: &[BlockId],
+            _limit: usize,
+        ) -> Vec<[u8; 32]> {
+            unreachable!("no SyncInfo events routed in sweep tests")
+        }
         async fn active_parameters(&self) -> Parameters {
             Parameters::default()
         }
@@ -3588,5 +3682,525 @@ mod sweep_resume_tests {
             "healthy sweep caught up to the downloaded tip"
         );
         assert_eq!(sync.sweep_backoff.consecutive(), 0, "progress arms no backoff");
+    }
+}
+
+#[cfg(test)]
+mod serve_continuation_tests {
+    //! Tests for the serve side of the sync exchange (`facts/sync.md`
+    //! § "Serving sync (peer behind us)").
+    //!
+    //! An incoming SyncInfo from a behind or forked peer must be answered
+    //! with `Inv { HEADER_TYPE_ID, continuation ids }` (JVM
+    //! processSyncV1/V2: Younger | Fork → continuationIds(size=400) →
+    //! sendExtension); peers ahead or equal must NOT be served.
+    //!
+    //! History (2026-06-08): only the consume side existed — a
+    //! from-genesis rust peer syncing FROM us stalled at height 0
+    //! forever ("sync stalled, rotating peer height=0" on loop).
+    use super::*;
+    use enr_chain::{ChainError, SyncInfo};
+    use ergo_chain_types::{ADDigest, Header};
+    use ergo_validation::{
+        ApplyStateOutcome, BlockValidator, Parameters, ValidationError,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Test chain tip. Above the 400-id continuation cap so the fresh-peer
+    /// case exercises the cap.
+    const TIP: u32 = 500;
+
+    /// Height-faithful fake id: height LE in the first 4 bytes. Unlike
+    /// `[height as u8; 32]`, unambiguous above 255.
+    fn id_at(height: u32) -> [u8; 32] {
+        let mut id = [0u8; 32];
+        id[..4].copy_from_slice(&height.to_le_bytes());
+        id
+    }
+
+    fn block_id_at(height: u32) -> BlockId {
+        BlockId(ergo_chain_types::Digest32::from(id_at(height)))
+    }
+
+    /// Off-chain id at `height` — a fork branch's header. Marker byte
+    /// keeps it distinct from every `id_at`.
+    fn fork_block_id_at(height: u32) -> BlockId {
+        let mut id = id_at(height);
+        id[8] = 0xFF;
+        BlockId(ergo_chain_types::Digest32::from(id))
+    }
+
+    fn test_header(height: u32, id: BlockId) -> Header {
+        use ergo_chain_types::*;
+        Header {
+            version: 2,
+            id,
+            parent_id: BlockId(Digest32::zero()),
+            ad_proofs_root: Digest32::zero(),
+            state_root: ADDigest::zero(),
+            transaction_root: Digest32::zero(),
+            timestamp: 1_000_000 + height as u64,
+            n_bits: 100_000,
+            height,
+            extension_root: Digest32::zero(),
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce: vec![0; 8],
+                pow_distance: None,
+            },
+            votes: Votes([0, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        }
+    }
+
+    /// Height of a peer anchor if it sits on our chain (test ids are
+    /// height-faithful), None for fork/alien ids.
+    fn on_chain_height(id: &BlockId) -> Option<u32> {
+        (1..=TIP).find(|&h| *id == block_id_at(h))
+    }
+
+    /// Chain at `TIP` whose `continuation_ids` mirrors the bridge
+    /// contract: ids ascending from the newest on-chain peer anchor + 1,
+    /// capped at `limit`; empty anchors serve from height 1; no common
+    /// point serves nothing. Counts invocations so the ahead test can
+    /// prove the handler gated the call entirely.
+    struct ServeChain {
+        continuation_calls: AtomicU32,
+    }
+
+    impl ServeChain {
+        fn new() -> Self {
+            Self { continuation_calls: AtomicU32::new(0) }
+        }
+    }
+
+    impl SyncChain for ServeChain {
+        async fn chain_height(&self) -> u32 {
+            TIP
+        }
+
+        async fn build_sync_info(&self) -> Vec<u8> {
+            // Only reached by the handler's SyncInfo response, which is
+            // rate-limited away in tests (last_sync_sent = construction
+            // time). Returns an empty body for the diagnostics parse.
+            Vec::new()
+        }
+
+        async fn header_at(&self, height: u32) -> Option<Header> {
+            (1..=TIP).contains(&height).then(|| test_header(height, block_id_at(height)))
+        }
+
+        async fn header_state_root(&self, _height: u32) -> Option<[u8; 33]> {
+            unreachable!("not called in serve tests")
+        }
+
+        /// Test encoding: 4-byte LE anchor specs, newest first (V2 wire
+        /// order). High bit set = fork id at that height, clear = our
+        /// chain's id. Empty body = fresh peer.
+        fn parse_sync_info(&self, body: &[u8]) -> Result<SyncInfo, ChainError> {
+            let headers = body
+                .chunks_exact(4)
+                .map(|c| {
+                    let spec = u32::from_le_bytes(c.try_into().unwrap());
+                    let height = spec & 0x7fff_ffff;
+                    let id = if spec & 0x8000_0000 != 0 {
+                        fork_block_id_at(height)
+                    } else {
+                        block_id_at(height)
+                    };
+                    test_header(height, id)
+                })
+                .collect();
+            Ok(SyncInfo::V2 { headers })
+        }
+
+        async fn continuation_ids(
+            &self,
+            peer_last_ids: &[BlockId],
+            limit: usize,
+        ) -> Vec<[u8; 32]> {
+            self.continuation_calls.fetch_add(1, Ordering::Relaxed);
+            let common = if peer_last_ids.is_empty() {
+                0 // fresh peer — serve from height 1
+            } else {
+                match peer_last_ids.iter().find_map(on_chain_height) {
+                    Some(h) => h,
+                    None => return Vec::new(), // alien chain
+                }
+            };
+            let to = TIP.min(common + limit as u32);
+            (common + 1..=to).map(id_at).collect()
+        }
+
+        async fn active_parameters(&self) -> Parameters {
+            unreachable!("not called in serve tests")
+        }
+
+        async fn is_epoch_boundary(&self, _height: u32) -> bool {
+            unreachable!("not called in serve tests")
+        }
+
+        async fn compute_expected_parameters(
+            &self,
+            _epoch_boundary_height: u32,
+            _block_proposed_update: &[u8],
+        ) -> Result<Parameters, ChainError> {
+            unreachable!("not called in serve tests")
+        }
+
+        async fn apply_epoch_boundary_parameters(
+            &self,
+            _params: Parameters,
+            _proposed_update_bytes: Vec<u8>,
+        ) {
+            unreachable!("not called in serve tests")
+        }
+
+        async fn active_proposed_update_bytes(&self) -> Vec<u8> {
+            unreachable!("not called in serve tests")
+        }
+
+        async fn verify_nipopow_envelope(
+            &self,
+            _envelope_body: &[u8],
+        ) -> Result<Vec<Header>, ChainError> {
+            unreachable!("not called in serve tests")
+        }
+
+        async fn is_better_nipopow(
+            &self,
+            _this: &[u8],
+            _than: &[u8],
+        ) -> Result<bool, ChainError> {
+            unreachable!("not called in serve tests")
+        }
+
+        async fn install_nipopow_suffix(
+            &self,
+            _suffix_head: Header,
+            _suffix_tail: Vec<Header>,
+        ) -> Result<(), ChainError> {
+            unreachable!("not called in serve tests")
+        }
+
+        async fn voting_length(&self) -> u32 {
+            1024
+        }
+    }
+
+    /// Transport recording every send; never delivers events (tests call
+    /// `handle_event` directly).
+    struct RecordingTransport {
+        sent: Arc<Mutex<Vec<(PeerId, ProtocolMessage)>>>,
+    }
+
+    impl SyncTransport for RecordingTransport {
+        async fn send_to(
+            &self,
+            peer: PeerId,
+            message: ProtocolMessage,
+        ) -> Result<(), Box<dyn std::error::Error + Send>> {
+            self.sent.lock().unwrap().push((peer, message));
+            Ok(())
+        }
+
+        async fn outbound_peers(&self) -> Vec<PeerId> {
+            Vec::new()
+        }
+
+        async fn next_event(&mut self) -> Option<ProtocolEvent> {
+            std::future::pending().await
+        }
+    }
+
+    struct NoopStore;
+
+    impl SyncStore for NoopStore {
+        async fn has_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> bool {
+            unreachable!("not called in serve tests")
+        }
+        async fn get_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> Option<Vec<u8>> {
+            unreachable!("not called in serve tests")
+        }
+        async fn script_verified_height(&self) -> Option<u32> {
+            None
+        }
+        async fn set_script_verified_height(&self, _height: u32) {}
+        async fn validated_height(&self) -> Option<u32> {
+            None
+        }
+        async fn set_validated_height(&self, _height: u32) {}
+        async fn flush(&self) {}
+        async fn prune_below_height(
+            &self,
+            _horizon: u32,
+            _type_ids: &[u8],
+        ) -> Result<usize, String> {
+            unreachable!("not called in serve tests")
+        }
+        async fn min_height_present(&self, _type_id: u8) -> Result<Option<u32>, String> {
+            unreachable!("not called in serve tests")
+        }
+    }
+
+    /// Never invoked — `handle_event`'s SyncInfo arm touches no validator.
+    struct NoopValidator;
+
+    impl BlockValidator for NoopValidator {
+        fn apply_state(
+            &mut self,
+            _header: &Header,
+            _block_txs: &[u8],
+            _ad_proofs: Option<&[u8]>,
+            _extension: &[u8],
+            _preceding_headers: &[Header],
+            _active_params: &Parameters,
+            _expected_boundary_params: Option<&Parameters>,
+            _expected_proposed_update: Option<&[u8]>,
+        ) -> Result<ApplyStateOutcome, ValidationError> {
+            unreachable!("not called in serve tests")
+        }
+        fn validated_height(&self) -> u32 {
+            unreachable!("not called in serve tests")
+        }
+        fn current_digest(&self) -> &ADDigest {
+            unreachable!("not called in serve tests")
+        }
+        fn reset_to(&mut self, _height: u32, _digest: ADDigest) {
+            unreachable!("not called in serve tests")
+        }
+    }
+
+    /// Messages recorded by [`RecordingTransport`], shared with the test.
+    type SentLog = Arc<Mutex<Vec<(PeerId, ProtocolMessage)>>>;
+
+    fn build_sync() -> (
+        HeaderSync<RecordingTransport, ServeChain, NoopStore, NoopValidator>,
+        SentLog,
+    ) {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (_progress_tx, progress_rx) = mpsc::channel(1);
+        let (_dc_tx, delivery_control_rx) = mpsc::unbounded_channel::<DeliveryControl>();
+        let (_dd_tx, delivery_data_rx) = mpsc::channel::<DeliveryData>(1);
+        let sync = HeaderSync::new(
+            SyncConfig::default(),
+            RecordingTransport { sent: Arc::clone(&sent) },
+            ServeChain::new(),
+            NoopStore,
+            None,
+            progress_rx,
+            delivery_control_rx,
+            delivery_data_rx,
+            None,
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(0)),
+            shutdown_rx,
+        );
+        (sync, sent)
+    }
+
+    /// The peer we're nominally syncing from in every test.
+    const SYNC_PEER: PeerId = PeerId(1);
+
+    fn sync_info_event(peer_id: PeerId, specs: &[u32]) -> ProtocolEvent {
+        let body: Vec<u8> = specs.iter().flat_map(|s| s.to_le_bytes()).collect();
+        ProtocolEvent::Message {
+            peer_id,
+            message: ProtocolMessage::SyncInfo { body },
+        }
+    }
+
+    /// All header Invs recorded by the transport.
+    fn sent_header_invs(
+        sent: &Mutex<Vec<(PeerId, ProtocolMessage)>>,
+    ) -> Vec<(PeerId, Vec<[u8; 32]>)> {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(p, m)| match m {
+                ProtocolMessage::Inv { modifier_type, ids }
+                    if *modifier_type == HEADER_TYPE_ID =>
+                {
+                    Some((*p, ids.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Recipients of every SyncInfo recorded by the transport, in send order.
+    fn sent_sync_info_peers(
+        sent: &Mutex<Vec<(PeerId, ProtocolMessage)>>,
+    ) -> Vec<PeerId> {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(p, m)| {
+                matches!(m, ProtocolMessage::SyncInfo { .. }).then_some(*p)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn fresh_peer_empty_anchors_served_from_height_1_capped_at_400() {
+        // The live repro: a from-genesis peer announces an empty SyncInfo.
+        // JVM continuationIds serves the chain start for an empty anchor
+        // list — the peer must get Inv, not silence.
+        let (mut sync, sent) = build_sync();
+        let fresh_peer = PeerId(7);
+
+        let result = sync
+            .handle_event(SYNC_PEER, sync_info_event(fresh_peer, &[]))
+            .await;
+
+        assert!(matches!(result, EventResult::Continue));
+        let invs = sent_header_invs(&sent);
+        assert_eq!(invs.len(), 1, "fresh peer must receive exactly one header Inv");
+        let (to, ids) = &invs[0];
+        assert_eq!(*to, fresh_peer, "Inv goes to the SyncInfo sender");
+        assert_eq!(ids.len(), 400, "continuation capped at 400 (JVM size)");
+        assert_eq!(ids[0], id_at(1), "continuation starts at height 1");
+        assert_eq!(ids[399], id_at(400), "continuation is ascending");
+    }
+
+    #[tokio::test]
+    async fn behind_peer_served_from_anchor_plus_one_even_on_caught_up_path() {
+        // Peer anchored mid-chain at 450 — serve 451..=TIP. The sender is
+        // our active sync peer reporting a tip below ours, so the handler
+        // also flips to Synced — the serve must happen anyway (the old
+        // early-return skipped everything below it).
+        let (mut sync, sent) = build_sync();
+
+        let result = sync
+            .handle_event(SYNC_PEER, sync_info_event(SYNC_PEER, &[450, 434, 322]))
+            .await;
+
+        assert!(
+            matches!(result, EventResult::Synced),
+            "sync peer at lower tip still flips the consume side to Synced"
+        );
+        let invs = sent_header_invs(&sent);
+        assert_eq!(invs.len(), 1, "behind peer must receive a header Inv");
+        let (to, ids) = &invs[0];
+        assert_eq!(*to, SYNC_PEER);
+        let expected: Vec<[u8; 32]> = (451..=TIP).map(id_at).collect();
+        assert_eq!(*ids, expected, "ids ascend from the newest anchor + 1 to our tip");
+    }
+
+    #[tokio::test]
+    async fn peer_at_our_tip_gets_no_inv() {
+        // Equal chains — JVM does nothing for Equal. The continuation
+        // self-gates (common point = our tip → empty → nothing sent).
+        let (mut sync, sent) = build_sync();
+
+        let result = sync
+            .handle_event(SYNC_PEER, sync_info_event(SYNC_PEER, &[TIP, TIP - 16]))
+            .await;
+
+        assert!(matches!(result, EventResult::Synced));
+        assert!(
+            sent_header_invs(&sent).is_empty(),
+            "a peer at our tip must not be served an Inv"
+        );
+    }
+
+    #[tokio::test]
+    async fn syncinfo_response_addressed_to_sender_not_sync_peer() {
+        // A peer that finished downloading our headers (now at our tip) and
+        // is NOT our active sync peer sends a final SyncInfo. Our SyncInfo
+        // response is its only caught-up signal — the continuation is empty
+        // (equal chains ⇒ no Inv), so its transition to `synced()` depends
+        // entirely on that response coming back to IT. The handler must
+        // address the response to the SENDER (`peer_id`), not our active sync
+        // peer (`peer`). Misaddressing it to the sync peer stranded a
+        // from-genesis rust peer in the header loop forever (2026-06-08);
+        // JVM processSync replies to `remote`. See ../facts/sync.md
+        // § "Serving sync".
+        let (mut sync, sent) = build_sync();
+        // The response is rate-limited away by default (last_sync_sent is set
+        // at construction, min interval 200ms). Drop the floor so the single
+        // response fires and we can assert where it was addressed.
+        sync.config.min_sync_send_interval = std::time::Duration::ZERO;
+        let requester = PeerId(7);
+        assert_ne!(requester, SYNC_PEER, "requester must differ from sync peer");
+
+        let result = sync
+            .handle_event(SYNC_PEER, sync_info_event(requester, &[TIP]))
+            .await;
+
+        // Equal chains, sender ≠ sync peer: the caught-up flip only fires for
+        // the sync peer, so the consume side stays Continue and the response
+        // path is reached. No continuation Inv (common point = our tip).
+        assert!(matches!(result, EventResult::Continue));
+        assert!(
+            sent_header_invs(&sent).is_empty(),
+            "a peer at our tip is not served a continuation Inv"
+        );
+        assert_eq!(
+            sent_sync_info_peers(&sent),
+            vec![requester],
+            "SyncInfo response must go to the sender, never the active sync \
+             peer (regression: send_sync_info(peer) addressed it to SYNC_PEER)"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_ahead_gets_no_inv_and_no_continuation_call() {
+        // Peer strictly ahead (JVM: Older) — never served, even though its
+        // deeper anchors sit on our chain (a continuation call would
+        // return ids; the handler must gate before the call).
+        let (mut sync, sent) = build_sync();
+        let ahead_peer = PeerId(9);
+
+        let result = sync
+            .handle_event(SYNC_PEER, sync_info_event(ahead_peer, &[550, 534, 422]))
+            .await;
+
+        assert!(
+            matches!(result, EventResult::BehindPeer(p) if p == ahead_peer),
+            "consume side still switches to the ahead peer"
+        );
+        assert!(
+            sent_header_invs(&sent).is_empty(),
+            "an ahead peer must not be served an Inv"
+        );
+        assert_eq!(
+            sync.chain.continuation_calls.load(Ordering::Relaxed),
+            0,
+            "the handler gates ahead peers before computing a continuation"
+        );
+    }
+
+    #[tokio::test]
+    async fn forked_peer_served_from_common_point_plus_one() {
+        // Peer at our height on a fork: tip + first anchor off-chain, a
+        // deeper anchor at 372 on our chain. JVM: Fork → serve from the
+        // best common point + 1.
+        let (mut sync, sent) = build_sync();
+        let forked_peer = PeerId(5);
+        const FORK: u32 = 0x8000_0000;
+
+        let result = sync
+            .handle_event(
+                SYNC_PEER,
+                sync_info_event(forked_peer, &[FORK | TIP, FORK | 484, 372]),
+            )
+            .await;
+
+        assert!(matches!(result, EventResult::Continue));
+        let invs = sent_header_invs(&sent);
+        assert_eq!(invs.len(), 1, "forked peer must receive a header Inv");
+        let (to, ids) = &invs[0];
+        assert_eq!(*to, forked_peer);
+        let expected: Vec<[u8; 32]> = (373..=TIP).map(id_at).collect();
+        assert_eq!(
+            *ids, expected,
+            "ids ascend from the common point (372) + 1 to our tip"
+        );
     }
 }

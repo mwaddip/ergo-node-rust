@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use enr_chain::{ChainError, Header, HeaderChain, SyncInfo};
+use enr_chain::{BlockId, ChainError, Header, HeaderChain, SyncInfo};
 use enr_p2p::node::P2pNode;
 use enr_p2p::protocol::messages::ProtocolMessage;
 use enr_p2p::protocol::peer::ProtocolEvent;
@@ -69,6 +69,36 @@ impl SyncChain for SharedChain {
 
     fn parse_sync_info(&self, body: &[u8]) -> Result<SyncInfo, ChainError> {
         enr_chain::parse_sync_info(body)
+    }
+
+    async fn continuation_ids(&self, peer_last_ids: &[BlockId], limit: usize) -> Vec<[u8; 32]> {
+        let chain = self.chain.lock().await;
+        // Best common point: the highest of the peer's anchors present in
+        // our chain. Empty anchor list = fresh peer → serve from height 1;
+        // non-empty anchors with NO common point = JVM `Unknown` status →
+        // serve nothing (facts/sync.md § Serving sync). We serve the full
+        // `limit` (400) — the JVM's V2 non-empty path quirks at size-1=399,
+        // but JVM requesters accept 400-id Invs, so the contract cap wins.
+        let anchor = if peer_last_ids.is_empty() {
+            0
+        } else {
+            match peer_last_ids
+                .iter()
+                .filter_map(|id| chain.height_of(id))
+                .max()
+            {
+                Some(h) => h,
+                None => return Vec::new(),
+            }
+        };
+        let tip = chain.height();
+        if anchor >= tip {
+            return Vec::new();
+        }
+        (anchor + 1..=tip)
+            .take(limit)
+            .filter_map(|h| chain.header_at(h).map(|hdr| hdr.id.0 .0))
+            .collect()
     }
 
     async fn header_at(&self, height: u32) -> Option<Header> {

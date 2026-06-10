@@ -440,6 +440,14 @@ mod tests {
         fn parse_sync_info(&self, _b: &[u8]) -> Result<enr_chain::SyncInfo, ChainError> {
             unimplemented!()
         }
+        async fn continuation_ids(
+            &self,
+            _peer_last_ids: &[BlockId],
+            _limit: usize,
+        ) -> Vec<[u8; 32]> {
+            // Bootstrap mock at height 0 — nothing to serve.
+            Vec::new()
+        }
         async fn active_parameters(&self) -> ergo_validation::Parameters {
             unimplemented!()
         }
@@ -759,6 +767,12 @@ mod tests {
             async fn header_state_root(&self, _h: u32) -> Option<[u8; 33]> { None }
             fn parse_sync_info(&self, _b: &[u8]) -> Result<enr_chain::SyncInfo, ChainError> {
                 unimplemented!()
+            }
+            async fn continuation_ids(
+                &self, _ids: &[BlockId], _limit: usize,
+            ) -> Vec<[u8; 32]> {
+                // Bootstrap-skip test — no SyncInfo traffic.
+                Vec::new()
             }
             async fn active_parameters(&self) -> ergo_validation::Parameters { unimplemented!() }
             async fn is_epoch_boundary(&self, _h: u32) -> bool { false }

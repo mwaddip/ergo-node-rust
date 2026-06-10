@@ -440,6 +440,15 @@ impl P2pNode {
         self.router.lock().await.register_consumed_code(code);
     }
 
+    /// Install the router's local-serve hook for ModifierRequests: the
+    /// callback answers `(modifier_type, id)` with locally-stored
+    /// modifier bytes, short-circuiting relay for ids we can serve
+    /// ourselves (rust-to-rust sync serving). Misses fall back to the
+    /// legacy relay path. See `facts/p2p-routing.md`.
+    pub async fn set_local_serve(&self, serve: crate::routing::router::LocalServeFn) {
+        self.router.lock().await.set_local_serve(serve);
+    }
+
     /// All known peers (PeerDb entries plus any currently-connected
     /// addresses not in the PeerDb). For `GET /peers/all`.
     pub async fn all_peers(&self) -> Vec<PeerEntry> {

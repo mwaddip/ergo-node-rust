@@ -109,7 +109,24 @@ bit-mask checks. The unstable `is_global` family is NOT used.
 - PeerConnected: when a peer transitions to Active, its handshake
   `PeerSpec` is recorded into PeerDb if it has a declared address.
 - Inv: not forwarded — recorded into the inv table for routing only.
-- ModifierRequest: routed via Inv table to the announcing peer if known. If no Inv entry exists, forwarded to any available outbound peer as fallback (enables chain sync, where modifier IDs come from SyncInfo rather than Inv).
+- ModifierRequest: **local serve hook first** — the router is constructed
+  with an optional store-blind callback
+  `local_serve: Option<Arc<dyn Fn(u8, &[u8; 32]) -> Option<Vec<u8>> + Send + Sync>>`
+  injected by the integrator (main crate wires it to the modifier store).
+  For each requested id: callback `Some(bytes)` → emit
+  `Action::Send { target: source, ModifierResponse(type, [(id, bytes)]) }`
+  directly and do NOT relay that id. Callback `None` (or no callback
+  configured, e.g. pure-proxy deployments) → legacy relay: routed via Inv
+  table to the announcing peer if known, else forwarded to any available
+  outbound peer as fallback (enables chain sync, where modifier IDs come
+  from SyncInfo rather than Inv). Serve and relay are per-id exclusive —
+  one request id never produces both a local response and a relayed
+  request. Batching: locally-served ids within one incoming request MAY be
+  grouped into a single ModifierResponse.
+  History (2026-06-08): before the hook, a node with a complete block
+  store relayed every request to other peers — rust-to-rust sync
+  impossible (no JVM peer in the middle = no data). Discovered by the
+  digest side-instance syncing against the live node.
 - ModifierResponse: routed via request tracker to the requester.
 - SyncInfo: routed via sync tracker (inbound↔outbound pairing).
 - Unknown: forwarded to all peers of opposite direction.
