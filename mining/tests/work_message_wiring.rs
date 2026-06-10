@@ -97,7 +97,7 @@ fn parent_for_wiring_test() -> Header {
         height: 100,
         extension_root: Digest32::from([0u8; 32]),
         autolykos_solution: AutolykosSolution {
-            miner_pk: Box::new((*test_miner_pk().h).clone()),
+            miner_pk: Box::new(*test_miner_pk().h),
             pow_onetime_pk: None,
             nonce: vec![0u8; 8],
             pow_distance: None,
@@ -162,7 +162,7 @@ fn build_work_message_wiring_matches_independent_serialization() {
     //         — every field assignment is right here, in the test, where
     //         a swap would be visible to the reader. ----
     let expected_ad_proofs_root: [u8; 32] = blake2b256_bytes(&known_ad_proof_bytes);
-    let expected_tx_root = transactions_root(&transactions).unwrap();
+    let expected_tx_root = transactions_root(&transactions, parent.version).unwrap();
     let expected_extension_root = extension_digest(&extension).unwrap();
 
     let independent_header = Header {
@@ -177,7 +177,7 @@ fn build_work_message_wiring_matches_independent_serialization() {
         height,
         extension_root: Digest32::from(expected_extension_root),
         autolykos_solution: AutolykosSolution {
-            miner_pk: Box::new((*miner_pk.h).clone()),
+            miner_pk: Box::new(*miner_pk.h),
             pow_onetime_pk: None,
             nonce: vec![0u8; 8],
             pow_distance: None,

@@ -201,8 +201,10 @@ Passed to mining handlers alongside ApiState.
 pub struct MiningState {
     /// Miner configuration (PK, reward delay, votes, candidate TTL).
     pub config: MinerConfig,
-    /// The current cached candidate. None if not yet generated or invalidated.
-    pub candidate: RwLock<Option<CachedCandidate>>,
+    /// Two-slot candidate cache + solved-block latch (see CandidateGenerator).
+    /// Arc-shared with the main crate's Validator, whose post-apply hook
+    /// calls `on_block_applied` for every applied block.
+    pub generator: Arc<CandidateGenerator>,
     /// Access to the UTXO validator for state root computation.
     /// Same validator used by the sync pipeline. UtxoValidator specifically
     /// (not Box<dyn BlockValidator>) because proofs_for_transactions() and
@@ -227,6 +229,86 @@ struct CachedCandidate {
     tip_height: u32,
     /// When this candidate was generated.
     created: Instant,
+}
+
+/// Stateful candidate manager. Two candidate slots + a solved-block latch,
+/// mirroring the JVM's CandidateGenerator actor state
+/// (cachedCandidate / cachedPreviousCandidate / solvedBlock —
+/// CandidateGenerator.scala:91-101, JVM PR 2291 semantics).
+pub struct CandidateGenerator {
+    pub config: MinerConfig,
+    /// Current candidate. None until generated, or after invalidate().
+    cached: RwLock<Option<CachedCandidate>>,
+    /// The immediately superseded candidate. A miner still hashing the old
+    /// work message can submit its solution against this slot.
+    previous: RwLock<Option<CachedCandidate>>,
+    /// Solved-block latch: set when a solution is accepted and the block is
+    /// handed to the (async) submitter; suppresses further solution
+    /// acceptance until block application clears it. JVM: solvedBlock.
+    solved: RwLock<Option<SolvedLatch>>,
+}
+
+struct SolvedLatch {
+    /// Header id of the block assembled from the accepted solution.
+    header_id: BlockId,
+    /// Height of that block.
+    height: u32,
+}
+```
+
+### Lifecycle API
+
+```rust
+impl CandidateGenerator {
+    /// Move current → previous, store the fresh candidate as current.
+    pub fn cache_candidate(&self, block: CandidateBlock, work: WorkMessage, tip_height: u32);
+
+    /// Poll-time read: current WorkMessage iff tip still matches and TTL fresh.
+    pub fn cached_work(&self, current_tip_height: u32) -> Option<WorkMessage>;
+
+    /// Current / previous CandidateBlock for solution validation.
+    pub fn cached_block(&self) -> Option<CandidateBlock>;
+    pub fn previous_block(&self) -> Option<CandidateBlock>;
+
+    /// Mempool-change push invalidation: current moves to previous, current
+    /// becomes None. In-flight solutions against the superseded candidate
+    /// stay valid via `previous`. (JVM: forced GenerateCandidate sets
+    /// cachedPreviousCandidate — CandidateGenerator.scala:182.)
+    pub fn invalidate(&self);
+
+    /// Atomically claim the latch IFF unset; false means another solution
+    /// won the race and the caller must reject (400). This is the
+    /// authoritative gate, taken BEFORE the block is handed to the
+    /// submitter — API handlers run concurrently (the JVM actor serializes;
+    /// axum does not), so a non-atomic check-then-set spanning the handler
+    /// would let two simultaneously valid solutions both pass. At testnet
+    /// difficulty 1 that is not a theoretical window.
+    pub fn try_mark_solved(&self, header_id: BlockId, height: u32) -> bool;
+
+    /// Release a claimed latch — ONLY for the submit-failure path (500/503):
+    /// the block never left the node, so holding the latch would wedge
+    /// solution acceptance until the next applied block.
+    pub fn clear_solved(&self);
+
+    /// True while a solved block awaits application. Cheap early rejection
+    /// in the handler; `try_mark_solved` is the gate that counts.
+    pub fn solved_pending(&self) -> bool;
+
+    /// Block-application hook — the lifecycle counterpart of the JVM's
+    /// FullBlockApplied handler (CandidateGenerator.scala:141-150). Called
+    /// by the main crate for EVERY applied block (own or peer):
+    ///   - drop current/previous candidates whose `parent_id != applied.id`
+    ///     (they no longer build on the tip);
+    ///   - clear the latch when `applied.height >= latch.height` (our block
+    ///     landed, or a competitor superseded it — stale either way).
+    ///
+    /// KNOWN DIVERGENCE (chosen): the latch clear is height-based; the JVM's
+    /// needNewSolution is parent-id-based. Outcomes match in all normal
+    /// paths (incl. solve-before-parent-applies); they diverge only when a
+    /// reorg re-applies blocks below the latch height, where we hold the
+    /// latch longer. Conservative direction — suppresses solutions, never
+    /// double-submits. Revisit only if JVM-exact behavior becomes a goal.
+    pub fn on_block_applied(&self, applied_id: &BlockId, applied_height: u32);
 }
 ```
 
@@ -460,7 +542,7 @@ Convert the candidate into the data miners need.
    | 1 | version | 1 byte | raw `u8` | `candidate.version` |
    | 2 | parentId | 32 bytes | raw bytes | `candidate.parent.id` |
    | 3 | ADProofsRoot | 32 bytes | raw bytes | `Blake2b256(candidate.ad_proof_bytes)` |
-   | 4 | transactionsRoot | 32 bytes | raw bytes | Merkle root of transaction IDs |
+   | 4 | transactionsRoot | 32 bytes | raw bytes | version-dependent Merkle root — see "transactionsRoot computation" below |
    | 5 | stateRoot | 33 bytes | raw bytes (32-byte hash + 1-byte tree height) | `candidate.state_root` |
    | 6 | timestamp | variable | VLQ `u64` | `candidate.timestamp` |
    | 7 | extensionRoot | 32 bytes | raw bytes | `candidate.extension.digest()` |
@@ -468,6 +550,27 @@ Convert the candidate into the data miners need.
    | 9 | height | variable | VLQ `u32` | `candidate.parent.height + 1` |
    | 10 | votes | 3 bytes | raw bytes | `candidate.votes` |
    | 11 | unparsedBytes (only if version > 1) | 1 byte length + N bytes | raw `u8` length prefix + raw bytes | empty for first release |
+
+   **transactionsRoot computation (corrected 2026-06-10 — consensus bug):**
+   JVM `BlockTransactions.scala:59-63` makes the Merkle leaves
+   version-dependent:
+   - block version 1: leaves = the tx IDs (32 bytes each,
+     `tx.serializedId` = blake2b256 of the proof-less signing bytes —
+     sigma-rust `Transaction::id()`).
+   - **block version ≥ 2: leaves = all tx IDs FOLLOWED BY all witness IDs**
+     (`txIds ++ witnessIds` — two concatenated lists, not interleaved).
+     A witness ID is
+     `blake2b256(concat(tx.inputs[*].spendingProof.proof)).tail` —
+     the 32-byte hash with its FIRST byte dropped, 31 bytes
+     (`ErgoTransaction.scala:77-78`). Empty proofs (e.g. storage-rent
+     spends) contribute zero bytes to the concatenation.
+
+   `transactions_root(txs)` previously implemented the v1 form
+   unconditionally — on v2+ networks (mainnet/testnet today) every
+   assembled candidate carried a transactionsRoot no JVM peer accepts;
+   mined blocks would have been orphaned network-wide. The signature is now
+   `transactions_root(txs, block_version)`. Surfaced 2026-06-10 by the
+   SANTA donner runner recomputing roots over real v4 testnet blocks.
 
    **Consensus-critical.** This serialization must match JVM
    `HeaderSerializer.bytesWithoutPow` byte-for-byte. Any divergence means
@@ -512,19 +615,24 @@ Convert the candidate into the data miners need.
 The candidate is cached and served to multiple miner polls:
 
 - **Invalidation triggers:**
-  - Chain tip changes (new block validated) → regenerate
+  - Block applied (own or peer) → `on_block_applied` drops both slots when
+    they no longer build on the new tip, then the next poll regenerates
+  - Mempool content changes → `invalidate()` (push): current → previous,
+    next poll regenerates with the fresh mempool snapshot
   - Candidate TTL expires → regenerate with fresh mempool snapshot
   - Node shutdown → discard
 
 - **On GET /mining/candidate:**
   1. If cached candidate exists and `tip_height == current_tip` and
      `created + candidate_ttl > now`: return cached WorkMessage.
-  2. Otherwise: regenerate candidate (steps 1-8), cache, return.
+  2. Otherwise: regenerate candidate (steps 1-8), cache (old current
+     moves to `previous`), return.
 
-- **No push invalidation from mempool.** New transactions don't immediately
-  invalidate the cached candidate. The TTL-based refresh picks them up.
-  This is simpler and matches the JVM's behavior with its
-  `blockCandidateGenerationInterval`.
+- **Two slots, not one.** Regeneration and invalidation preserve the
+  superseded candidate in `previous` so a miner that fetched work before
+  the swap can still submit a winning solution (JVM
+  cachedPreviousCandidate, CandidateGenerator.scala:182 + the fallback at
+  :213). `previous` only ever holds the immediately superseded candidate.
 
 ## Solution Submission
 
@@ -540,18 +648,28 @@ The candidate is cached and served to multiple miner polls:
    - `d`: 0
    The only required field is `n` (the 8-byte nonce).
 
-2. **Check cached candidate:** If no candidate is cached, return 400
-   ("no current candidate").
+2. **Check the solved latch:** If `solved_pending()`, return 400
+   ("solution already accepted, awaiting block application"). Both
+   candidate slots are at the latched height; accepting another solution
+   would submit a self-competing block. (JVM: solvedBlock latch,
+   CandidateGenerator.scala:146-147.)
 
-3. **Assemble header:** Combine the `HeaderWithoutPow` from the cached
+3. **Collect candidates:** current first, then previous. If both are
+   None, return 400 ("no current candidate"). For each, check it still
+   builds on the chain tip (`candidate.parent_id == tip.id`) — skip any
+   that don't. The `on_block_applied` clearing makes stale candidates
+   rare here; the check guards the race window between a peer block
+   applying and the clearing running.
+
+4. **Assemble header:** Combine the `HeaderWithoutPow` from the
    candidate with the submitted solution to produce a full `Header`.
 
-4. **Verify PoW:** `AutolykosPowScheme::validate(header)`.
+5. **Verify PoW:** `AutolykosPowScheme::validate(header)`.
    - Compute `hit = pow_hit(header)` using the Autolykos v2 algorithm
    - Verify `hit < target` where `target = decode_compact_bits(n_bits)`
-   - On failure: return 400 "invalid PoW solution"
+   - On failure (all candidates tried): return 400 "invalid PoW solution"
 
-5. **Assemble full block:**
+6. **Assemble full block:**
    ```
    Header (from step 3)
    BlockTransactions { header_id, version, transactions }
@@ -560,24 +678,33 @@ The candidate is cached and served to multiple miner polls:
    ```
    The `header_id` is derived from the full header (including PoW solution).
 
-6. **Validate block:** Submit to the normal validation pipeline. The
+7. **Claim the latch (atomic):** `try_mark_solved(header_id, height)`.
+   On false — a concurrent solution won the race — return 400 with the
+   step-2 message. This MUST precede the submitter hand-off: after
+   submission the losing block has already left the node and rejection is
+   too late. The candidate slots stay as-is — block application runs
+   `on_block_applied`, which drops the stale slots and clears the latch
+   in one place. An `invalidate()` here would be WRONG: it moves the
+   just-solved candidate to `previous`, leaving it re-solvable during
+   the accept→apply window.
+
+8. **Validate block:** Submit to the normal validation pipeline. The
    assembled block must pass the same validation as any block received
    from a peer. If validation fails, there's a bug in candidate assembly
-   — return 500 and log the error.
+   — `clear_solved()`, return 500 and log the error.
 
-7. **Apply block:** The validator applies the block, advancing state.
+9. **Apply block:** The validator applies the block, advancing state.
+   If the submitter is unavailable (503), `clear_solved()` first — the
+   block never left the node.
 
-8. **Broadcast to P2P:** Send the full block to connected peers as
-   separate modifier messages:
-   - Header (type 101)
-   - BlockTransactions (type 102)
-   - ADProofs (type 104)
-   - Extension (type 108)
+10. **Broadcast to P2P:** Send the full block to connected peers as
+    separate modifier messages:
+    - Header (type 101)
+    - BlockTransactions (type 102)
+    - ADProofs (type 104)
+    - Extension (type 108)
 
-9. **Invalidate candidate:** Clear the cached candidate (chain tip
-   changed — step 7 advanced it).
-
-10. **Return 200** on success.
+11. **Return 200** on success.
 
 ## Endpoints
 
@@ -754,7 +881,15 @@ return 503 with `"reason": "mining not configured"`.
 
 - Every `CandidateBlock`, if paired with a valid PoW solution, produces a
   block that passes the node's own validation pipeline.
-- The cached candidate is invalidated whenever the chain tip advances.
+- `on_block_applied` runs for EVERY applied block — own or peer — and is
+  the only place that drops candidates and clears the solved latch.
+  Candidates surviving it always build on the current tip.
+- A solution is never accepted while the solved latch is set: at most one
+  block per height leaves the node via the mining path (no
+  self-competition).
+- `previous` only ever holds the immediately superseded candidate, and
+  solutions against it are accepted only while it still builds on the
+  current tip.
 - `proofs_for_transactions()` never leaves the prover in a modified state.
 - The emission transaction is always the first transaction in the block.
 - The fee transaction (if present) is always the last transaction.

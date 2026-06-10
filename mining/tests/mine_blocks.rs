@@ -7,7 +7,6 @@
 use std::time::Duration;
 
 use ergo_chain_types::{
-    autolykos_pow_scheme::{decode_compact_bits, AutolykosPowScheme},
     ADDigest, AutolykosSolution, BlockId, Digest, Digest32, EcPoint, Header, Votes,
 };
 use tracing_test::traced_test;
@@ -15,13 +14,10 @@ use ergo_lib::chain::emission::{EmissionRules, MonetarySettings};
 use ergo_lib::chain::genesis;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
-use ergo_mining::candidate::build_work_message;
 use ergo_mining::emission::{build_emission_tx, ReemissionRules};
-use ergo_mining::extension::{build_extension, extension_digest};
 use ergo_mining::solution::validate_solution;
 use ergo_mining::types::*;
-use ergo_mining::MiningError;
-use num_bigint::BigInt;
+use ergo_mining::{MiningError, ValidatorProofsResult};
 
 /// Initial difficulty for testnet/mainnet — decodes to 1.
 /// Target = order / 1 ≈ 2^256, so any nonce is valid.
@@ -81,7 +77,7 @@ fn genesis_header() -> Header {
         height: 1, // genesis is height 1 in Ergo
         extension_root: Digest32::from([0u8; 32]),
         autolykos_solution: AutolykosSolution {
-            miner_pk: Box::new((*test_miner_pk().h).clone()),
+            miner_pk: Box::new(*test_miner_pk().h),
             pow_onetime_pk: None,
             nonce: vec![0u8; 8],
             pow_distance: None,
@@ -95,12 +91,9 @@ fn genesis_header() -> Header {
 ///
 /// With difficulty 1 this should succeed on the first attempt.
 fn cpu_mine(candidate: &CandidateBlock, max_attempts: u64) -> Result<Header, String> {
-    let pow = AutolykosPowScheme::default();
-    let target_bigint = order_bigint() / decode_compact_bits(candidate.n_bits);
-
     for nonce in 0u64..max_attempts {
         let solution = AutolykosSolution {
-            miner_pk: Box::new((*test_miner_pk().h).clone()),
+            miner_pk: Box::new(*test_miner_pk().h),
             pow_onetime_pk: None,
             nonce: nonce.to_be_bytes().to_vec(),
             pow_distance: None,
@@ -114,13 +107,6 @@ fn cpu_mine(candidate: &CandidateBlock, max_attempts: u64) -> Result<Header, Str
     }
 
     Err(format!("no solution found in {max_attempts} attempts"))
-}
-
-/// Get the secp256k1 group order as BigInt.
-fn order_bigint() -> BigInt {
-    // secp256k1 group order
-    let order_hex = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141";
-    BigInt::parse_bytes(order_hex.as_bytes(), 16).unwrap()
 }
 
 #[test]
@@ -176,8 +162,7 @@ fn generate_candidate_and_mine_block() {
     // Real state root computation requires a full UTXO validator.
     // This test verifies the mining pipeline: candidate → header → PoW.
     let mock_proofs =
-        |_txs: &[ergo_lib::chain::transaction::Transaction]|
-         -> Option<Result<(Vec<u8>, ADDigest), ergo_validation::ValidationError>> {
+        |_txs: &[ergo_lib::chain::transaction::Transaction]| -> ValidatorProofsResult {
             Some(Ok((vec![0u8; 64], ADDigest::from([0u8; 33]))))
         };
 
@@ -236,8 +221,7 @@ fn mine_three_consecutive_blocks() {
     };
 
     let mock_proofs =
-        |_txs: &[ergo_lib::chain::transaction::Transaction]|
-         -> Option<Result<(Vec<u8>, ADDigest), ergo_validation::ValidationError>> {
+        |_txs: &[ergo_lib::chain::transaction::Transaction]| -> ValidatorProofsResult {
             Some(Ok((vec![0u8; 64], ADDigest::from([0u8; 33]))))
         };
 
@@ -250,7 +234,7 @@ fn mine_three_consecutive_blocks() {
     // Block 2+: interlinks from previous update_interlinks call
     let mut interlinks: Vec<BlockId> = vec![];
 
-    for i in 0..3u32 {
+    for _ in 0..3u32 {
         let height = parent.height + 1;
 
         let (candidate, _work) = ergo_mining::generate_candidate(
@@ -340,8 +324,7 @@ fn mining_block_found_emits_contract_marker() {
     let parent = genesis_header();
 
     let mock_proofs =
-        |_txs: &[ergo_lib::chain::transaction::Transaction]|
-         -> Option<Result<(Vec<u8>, ADDigest), ergo_validation::ValidationError>> {
+        |_txs: &[ergo_lib::chain::transaction::Transaction]| -> ValidatorProofsResult {
             Some(Ok((vec![0u8; 64], ADDigest::from([0u8; 33]))))
         };
 

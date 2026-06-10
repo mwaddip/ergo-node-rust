@@ -982,6 +982,17 @@ pub async fn post_mining_solution(
 ) -> ApiResult<serde_json::Value> {
     let mining = state.mining.as_ref().ok_or_else(mining_err)?;
 
+    // Solved latch (contract step 2): an accepted solution is still awaiting
+    // block application. Both candidate slots are by construction at the
+    // latched height — accepting another solution would submit a
+    // self-competing block. Checked before any other work: cheapest rejection.
+    if mining.solved_pending() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "solution already accepted, awaiting block application",
+        );
+    }
+
     // Parse nonce
     let nonce = hex::decode(&submission.n).map_err(|_| {
         (
@@ -999,17 +1010,32 @@ pub async fn post_mining_solution(
 
     // Collect candidates to try: current first, then previous (so a GPU
     // miner solving the old candidate while a regen occurred still works).
+    // Skip any that no longer build on the chain tip (contract step 3) —
+    // `on_block_applied` drops those, but a peer block can land in the
+    // window between application and the hook running.
+    let tip_id = state.chain.tip().map(|h| h.id);
     let mut candidates = Vec::with_capacity(2);
-    if let Some(c) = mining.cached_block() {
-        candidates.push(c);
-    }
-    if let Some(p) = mining.previous_block() {
-        candidates.push(p);
+    let mut skipped_stale = false;
+    for slot in [mining.cached_block(), mining.previous_block()] {
+        let Some(candidate) = slot else { continue };
+        if tip_id == Some(candidate.parent.id) {
+            candidates.push(candidate);
+        } else {
+            skipped_stale = true;
+        }
     }
     if candidates.is_empty() {
+        // Distinct messages: "stale" tells the miner the node moved on
+        // (a new block applied since the work was fetched); "no current"
+        // means no candidate was ever generated. Same remedy — refetch —
+        // but the diagnostic difference matters when debugging a miner.
         return err(
             StatusCode::BAD_REQUEST,
-            "no current candidate — fetch /mining/candidate first",
+            if skipped_stale {
+                "stale candidate — chain tip advanced; refetch /mining/candidate"
+            } else {
+                "no current candidate — fetch /mining/candidate first"
+            },
         );
     }
 
@@ -1097,11 +1123,31 @@ pub async fn post_mining_solution(
             },
         )?;
 
-    // Submit to the local pipeline + P2P broadcast (if submitter configured)
+    // Claim the latch (contract step 7) BEFORE the submitter hand-off —
+    // after submission, rejecting the race loser is too late: its block has
+    // already left the node. The `solved_pending()` check at the top is the
+    // cheap fast path; this atomic claim is the gate that counts (handlers
+    // run concurrently; the JVM actor serializes, axum does not). The
+    // candidate slots stay as-is — block application runs `on_block_applied`,
+    // which drops the stale slots and clears the latch in one place. An
+    // `invalidate()` here would move the just-solved candidate to
+    // `previous`, leaving it re-solvable during the accept→apply window.
+    if !mining.try_mark_solved(header.id, header.height) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "solution already accepted, awaiting block application",
+        );
+    }
+
+    // Submit to the local pipeline + P2P broadcast. Both failure paths
+    // release the just-claimed latch (contract steps 8-9): the block never
+    // left the node, and a held latch would wedge solution acceptance until
+    // the next applied block.
     if let Some(ref submitter) = state.block_submitter {
         submitter
             .submit(header, block_txs_bytes, ad_proofs_bytes, extension_bytes)
             .map_err(|e| {
+                mining.clear_solved();
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ApiError {
@@ -1112,14 +1158,12 @@ pub async fn post_mining_solution(
                 )
             })?;
     } else {
+        mining.clear_solved();
         return err(
             StatusCode::SERVICE_UNAVAILABLE,
             "block submitter not configured",
         );
     }
-
-    // Invalidate the cached candidate so the next poll generates a fresh one
-    mining.invalidate();
 
     tracing::info!("valid mining solution accepted, block submitted");
     Ok(Json(serde_json::json!({ "status": "accepted" })))
@@ -3490,5 +3534,413 @@ mod tests {
         assert_eq!(json["reset"], true);
         assert_eq!(json["previous_generation"], 7);
         assert_eq!(json["current_generation"], 8);
+    }
+
+    // -----------------------------------------------------------------------
+    // POST /mining/solution — candidate lifecycle (latch + parent-vs-tip)
+    // -----------------------------------------------------------------------
+
+    use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
+    use ergo_mining::CandidateGenerator;
+
+    /// Initial difficulty (testnet/mainnet genesis nBits) — decodes to 1, so
+    /// target = order / 1 ≈ 2^256 and nearly any nonce is a valid solution.
+    const TRIVIAL_N_BITS: u32 = 16_842_752;
+
+    /// Chain whose tip is a fixed header.
+    struct TipChain {
+        tip: Header,
+    }
+    impl ChainAccess for TipChain {
+        fn height(&self) -> u32 {
+            self.tip.height
+        }
+        fn header_at(&self, _h: u32) -> Option<Header> {
+            None
+        }
+        fn header_by_id(&self, _id: &[u8; 32]) -> Option<Header> {
+            None
+        }
+        fn tip(&self) -> Option<Header> {
+            Some(self.tip.clone())
+        }
+        fn build_nipopow_proof(
+            &self,
+            _m: u32,
+            _k: u32,
+            _id: Option<[u8; 32]>,
+        ) -> Result<Vec<u8>, String> {
+            Err("unused".into())
+        }
+        fn header_ids(&self, _offset: u32, _limit: u32) -> Vec<[u8; 32]> {
+            vec![]
+        }
+        fn popow_header_by_id(&self, _id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
+            Ok(None)
+        }
+    }
+
+    /// Submitter that accepts everything — the happy-path stand-in.
+    struct OkSubmitter;
+    impl BlockSubmitter for OkSubmitter {
+        fn submit(&self, _h: Header, _b: Vec<u8>, _a: Vec<u8>, _e: Vec<u8>) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn test_miner_config() -> ergo_mining::MinerConfig {
+        ergo_mining::MinerConfig {
+            miner_pk: ProveDlog::new(EcPoint::default()),
+            reward_delay: 720,
+            votes: [0, 0, 0],
+            candidate_ttl: std::time::Duration::from_secs(60),
+            reemission_rules: ergo_mining::emission::ReemissionRules::mainnet(),
+        }
+    }
+
+    /// Minimal solvable candidate on `parent`: one P2PK tx (the merkle root
+    /// builder rejects empty tx lists) and trivial difficulty.
+    fn make_test_candidate(parent: &Header) -> ergo_mining::CandidateBlock {
+        ergo_mining::CandidateBlock {
+            parent: parent.clone(),
+            version: 2,
+            n_bits: TRIVIAL_N_BITS,
+            state_root: ADDigest::zero(),
+            ad_proof_bytes: vec![],
+            transactions: vec![make_vf_p2pk_tx(&make_vf_p2pk_box(1_000_000))],
+            timestamp: parent.timestamp + 1,
+            extension: ergo_mining::ExtensionCandidate { fields: vec![] },
+            votes: [0, 0, 0],
+            header_bytes: vec![],
+        }
+    }
+
+    /// WorkMessage stub — `cache_candidate` requires one, but the solution
+    /// handler never reads it.
+    fn stub_work() -> ergo_mining::WorkMessage {
+        ergo_mining::WorkMessage {
+            msg: String::new(),
+            b: String::new(),
+            h: 0,
+            pk: String::new(),
+            proof: ergo_mining::ProofOfUpcomingTransactions {
+                msg_preimage: String::new(),
+                tx_proofs: vec![],
+            },
+        }
+    }
+
+    /// CPU-grind a nonce for `candidate`, constructing the solution exactly
+    /// as the handler does from the configured miner PK. With trivial
+    /// difficulty the first attempt almost always wins.
+    fn grind_nonce(candidate: &ergo_mining::CandidateBlock, pk: &ProveDlog, max: u64) -> String {
+        for nonce in 0u64..max {
+            let solution = AutolykosSolution {
+                miner_pk: Box::new(*pk.h),
+                pow_onetime_pk: None,
+                nonce: nonce.to_be_bytes().to_vec(),
+                pow_distance: None,
+            };
+            if ergo_mining::solution::validate_solution(candidate, solution).is_ok() {
+                return hex::encode(nonce.to_be_bytes());
+            }
+        }
+        panic!("no nonce found in {max} attempts at trivial difficulty");
+    }
+
+    fn mining_state(tip: Header, generator: Arc<CandidateGenerator>) -> ApiState {
+        let mut state = test_state(Arc::new(TipChain { tip }));
+        state.mining = Some(generator);
+        state.block_submitter = Some(Arc::new(OkSubmitter));
+        state
+    }
+
+    #[test]
+    fn mining_solution_latch_set_returns_400() {
+        let generator = Arc::new(CandidateGenerator::new(test_miner_config()));
+        assert!(
+            generator.try_mark_solved(BlockId(Digest32::zero()), 5),
+            "claim on a fresh generator must succeed"
+        );
+        let state = mining_state(make_minimal_header(4), generator);
+
+        let rt = build_runtime();
+        let result = rt.block_on(post_mining_solution(
+            State(state),
+            Json(SolutionSubmission {
+                n: "0000000000000001".into(),
+            }),
+        ));
+        match result {
+            Err((status, body)) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(
+                    body.reason.contains("already accepted"),
+                    "unexpected reason: {}",
+                    body.reason
+                );
+            }
+            Ok(_) => panic!("expected 400, got 200"),
+        }
+    }
+
+    #[test]
+    fn mining_solution_stale_parent_candidate_skipped() {
+        // Candidate builds on header(4); the chain tip is header(7) — the
+        // candidate must be skipped without attempting PoW, and the error
+        // must be the stale-specific message, not "no current candidate".
+        let candidate_parent = make_minimal_header(4);
+        let generator = Arc::new(CandidateGenerator::new(test_miner_config()));
+        generator.cache_candidate(make_test_candidate(&candidate_parent), stub_work(), 4);
+        let state = mining_state(make_minimal_header(7), generator.clone());
+
+        let rt = build_runtime();
+        let result = rt.block_on(post_mining_solution(
+            State(state),
+            Json(SolutionSubmission {
+                n: "0000000000000001".into(),
+            }),
+        ));
+        match result {
+            Err((status, body)) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(
+                    body.reason.contains("stale candidate"),
+                    "unexpected reason: {}",
+                    body.reason
+                );
+            }
+            Ok(_) => panic!("expected 400, got 200"),
+        }
+        assert!(
+            !generator.solved_pending(),
+            "rejection must not set the latch"
+        );
+    }
+
+    #[test]
+    fn mining_solution_accept_sets_latch() {
+        let parent = make_minimal_header(4);
+        let config = test_miner_config();
+        let candidate = make_test_candidate(&parent);
+        let nonce_hex = grind_nonce(&candidate, &config.miner_pk, 1000);
+
+        let generator = Arc::new(CandidateGenerator::new(config));
+        generator.cache_candidate(candidate, stub_work(), 4);
+        let state = mining_state(parent, generator.clone());
+
+        let rt = build_runtime();
+        let result = rt.block_on(post_mining_solution(
+            State(state),
+            Json(SolutionSubmission { n: nonce_hex }),
+        ));
+        match result {
+            Ok(Json(v)) => assert_eq!(v["status"], "accepted"),
+            Err((status, body)) => panic!("expected 200, got {status} / {}", body.reason),
+        }
+        assert!(
+            generator.solved_pending(),
+            "latch must be set after an accepted solution"
+        );
+
+        // And the latch now gates the endpoint: an immediate re-submit of the
+        // same valid solution must bounce with 400 (the accept→apply window).
+        let generator2 = generator.clone();
+        let state2 = mining_state(make_minimal_header(4), generator2);
+        let result2 = rt.block_on(post_mining_solution(
+            State(state2),
+            Json(SolutionSubmission {
+                n: "0000000000000001".into(),
+            }),
+        ));
+        match result2 {
+            Err((status, body)) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(body.reason.contains("already accepted"));
+            }
+            Ok(_) => panic!("expected 400 while latch is set, got 200"),
+        }
+    }
+
+    /// Chain that claims the solved latch when `tip()` is read — simulating
+    /// a concurrent solution winning the race in the window between the
+    /// handler's `solved_pending()` fast path and its `try_mark_solved`
+    /// claim (the tip read sits between the two).
+    struct RaceTipChain {
+        tip: Header,
+        generator: Arc<CandidateGenerator>,
+    }
+    impl ChainAccess for RaceTipChain {
+        fn height(&self) -> u32 {
+            self.tip.height
+        }
+        fn header_at(&self, _h: u32) -> Option<Header> {
+            None
+        }
+        fn header_by_id(&self, _id: &[u8; 32]) -> Option<Header> {
+            None
+        }
+        fn tip(&self) -> Option<Header> {
+            let claimed = self
+                .generator
+                .try_mark_solved(BlockId(Digest32::zero()), self.tip.height + 1);
+            assert!(claimed, "race injection expects an unclaimed latch");
+            Some(self.tip.clone())
+        }
+        fn build_nipopow_proof(
+            &self,
+            _m: u32,
+            _k: u32,
+            _id: Option<[u8; 32]>,
+        ) -> Result<Vec<u8>, String> {
+            Err("unused".into())
+        }
+        fn header_ids(&self, _offset: u32, _limit: u32) -> Vec<[u8; 32]> {
+            vec![]
+        }
+        fn popow_header_by_id(&self, _id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
+            Ok(None)
+        }
+    }
+
+    /// Submitter that counts invocations — for asserting a block never
+    /// reached the hand-off.
+    struct CountingSubmitter(std::sync::atomic::AtomicUsize);
+    impl BlockSubmitter for CountingSubmitter {
+        fn submit(&self, _h: Header, _b: Vec<u8>, _a: Vec<u8>, _e: Vec<u8>) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn mining_solution_claim_loser_after_early_check_gets_400() {
+        // A concurrent winner claims the latch AFTER the cheap
+        // solved_pending() check but BEFORE try_mark_solved. The loser must
+        // get 400, its block must never reach the submitter, and the
+        // winner's latch must survive.
+        let parent = make_minimal_header(4);
+        let config = test_miner_config();
+        let candidate = make_test_candidate(&parent);
+        let nonce_hex = grind_nonce(&candidate, &config.miner_pk, 1000);
+
+        let generator = Arc::new(CandidateGenerator::new(config));
+        generator.cache_candidate(candidate, stub_work(), 4);
+
+        let submitted = Arc::new(CountingSubmitter(std::sync::atomic::AtomicUsize::new(0)));
+        let mut state = test_state(Arc::new(RaceTipChain {
+            tip: parent,
+            generator: generator.clone(),
+        }));
+        state.mining = Some(generator.clone());
+        state.block_submitter = Some(submitted.clone());
+
+        let rt = build_runtime();
+        let result = rt.block_on(post_mining_solution(
+            State(state),
+            Json(SolutionSubmission { n: nonce_hex }),
+        ));
+        match result {
+            Err((status, body)) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(
+                    body.reason.contains("already accepted"),
+                    "unexpected reason: {}",
+                    body.reason
+                );
+            }
+            Ok(_) => panic!("expected 400 for the claim loser, got 200"),
+        }
+        assert_eq!(
+            submitted.0.load(Ordering::SeqCst),
+            0,
+            "loser's block must never reach the submitter"
+        );
+        assert!(
+            generator.solved_pending(),
+            "winner's latch must survive the loser's rejection"
+        );
+    }
+
+    #[test]
+    fn mining_solution_no_submitter_releases_latch() {
+        // 503 path (contract step 9): claim, find no submitter, release.
+        // A second identical submission must reach 503 again — not bounce
+        // off a stuck latch with 400.
+        let parent = make_minimal_header(4);
+        let config = test_miner_config();
+        let candidate = make_test_candidate(&parent);
+        let nonce_hex = grind_nonce(&candidate, &config.miner_pk, 1000);
+
+        let generator = Arc::new(CandidateGenerator::new(config));
+        generator.cache_candidate(candidate, stub_work(), 4);
+        let mut state = mining_state(parent, generator.clone());
+        state.block_submitter = None;
+
+        let rt = build_runtime();
+        for attempt in 0..2 {
+            let result = rt.block_on(post_mining_solution(
+                State(state.clone()),
+                Json(SolutionSubmission {
+                    n: nonce_hex.clone(),
+                }),
+            ));
+            match result {
+                Err((status, body)) => {
+                    assert_eq!(
+                        status,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "attempt {attempt}: expected 503, got {status} / {}",
+                        body.reason
+                    );
+                    assert!(
+                        body.reason.contains("submitter"),
+                        "attempt {attempt}: unexpected reason: {}",
+                        body.reason
+                    );
+                }
+                Ok(_) => panic!("attempt {attempt}: expected 503, got 200"),
+            }
+            assert!(
+                !generator.solved_pending(),
+                "attempt {attempt}: latch must be released on the 503 path"
+            );
+        }
+    }
+
+    #[test]
+    fn mining_solution_submit_error_releases_latch() {
+        // 500 path (contract step 8): claim, submit fails, release. The
+        // default test_state submitter (UnusedSubmitter) always errors.
+        let parent = make_minimal_header(4);
+        let config = test_miner_config();
+        let candidate = make_test_candidate(&parent);
+        let nonce_hex = grind_nonce(&candidate, &config.miner_pk, 1000);
+
+        let generator = Arc::new(CandidateGenerator::new(config));
+        generator.cache_candidate(candidate, stub_work(), 4);
+        let mut state = mining_state(parent, generator.clone());
+        state.block_submitter = Some(Arc::new(UnusedSubmitter));
+
+        let rt = build_runtime();
+        let result = rt.block_on(post_mining_solution(
+            State(state),
+            Json(SolutionSubmission { n: nonce_hex }),
+        ));
+        match result {
+            Err((status, body)) => {
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+                assert!(
+                    body.reason.contains("block submission failed"),
+                    "unexpected reason: {}",
+                    body.reason
+                );
+            }
+            Ok(_) => panic!("expected 500, got 200"),
+        }
+        assert!(
+            !generator.solved_pending(),
+            "latch must be released on the 500 path"
+        );
     }
 }
