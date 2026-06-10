@@ -127,8 +127,45 @@ pub struct DeferredEval {
 ```rust
 /// Verify spending proofs for all transactions in a block.
 /// Pure computation — no validator state needed. Uses rayon par_iter internally.
-pub fn evaluate_scripts(eval: &DeferredEval) -> Result<(), ValidationError>;
+/// On success returns the block-accumulated transaction cost.
+pub fn evaluate_scripts(eval: &DeferredEval) -> Result<u64, ValidationError>;
 ```
+
+### Block cost semantics (added 2026-06-10)
+
+- The returned cost is **Σ of per-tx costs** as returned by ergo-lib
+  `TransactionContext::validate` (each per-tx number already includes the
+  JVM-equivalent `initialCost` components — input/data-input/output static
+  costs — plus script evaluation cost; this is the tx-tier-anchored number).
+- **JVM mapping:** `ErgoState.execTransactions` (`ErgoState.scala:106`) folds
+  `validateStateful` from `Valid(0L)`, threading the accumulated cost through
+  each tx; the running total is checked against `maxBlockCost` at each tx's
+  `startCost` (`ergo-core ErgoTransaction.scala:391-396`). Block cost = the
+  final fold value. There is **no block-level base term** — the sum IS the
+  block cost. (SANTA keystone: testnet block 2666 = 39379.)
+- **Enforcement (consensus check):** after all txs validate,
+  `Σ ≤ parameters.max_block_cost()` must hold; violation →
+  `BlockCostExceeded`. Verdict-equivalent to the JVM's threaded check: a
+  block is accepted iff every tx is individually valid AND the total is
+  within maxBlockCost. Which error fires first on a multi-fault block may
+  differ from the JVM (we validate txs in parallel; the JVM stops at the
+  first crossing) — error identity is diagnostic, the accept/reject verdict
+  is the contract.
+- Summation uses **checked arithmetic** (JVM `addExact` parity): overflow →
+  reject (`BlockCostExceeded` with saturated value is acceptable), never
+  wrap, never panic.
+- Degenerate cases return `Ok(0)`: empty transaction list; the height-1
+  no-preceding-headers guard. Blocks at or below a validator's
+  `checkpoint_height` never reach evaluation (no `DeferredEval` is built),
+  matching the JVM's `Valid(0L)` checkpoint shortcut.
+- The per-tx sigma-rust JIT budget (`max_block_cost × 10` per tx,
+  ergo-lib `tx_context.rs:202`) is unchanged — it bounds each evaluation's
+  runtime; the block-level sum check is the consensus gate on top. Do NOT
+  thread remaining-budget across txs: parallel evaluation is load-bearing
+  for sync throughput, and verdict-equivalence makes threading unnecessary.
+- Consumers: sync discards the cost today (`.map(|_| ())` at its call site —
+  consumer's choice, the seam exposes it); the donner SANTA runner reports it
+  on the accept arm (`runner.json: cost: true`).
 
 ## Phase 4a: DigestValidator
 
@@ -156,6 +193,28 @@ DigestValidator::new(
    - Read block version (VLQ sentinel: if > 10M, subtract 10M for version,
      read separate VLQ tx_count; else value IS tx_count and version = 1)
    - Parse tx_count transactions via `Transaction::sigma_parse()`
+
+1b. **Block-version gate** (consensus check, added 2026-06-10; **narrowed to
+   epoch boundaries same day** after JVM cross-reference by the implementing
+   session)
+   - At an **epoch-boundary block**: the newly computed boundary parameters'
+     `block_version()` must equal `header.version`; violation →
+     `BlockVersionMismatch { expected, got }`. (JVM `exBlockVersion`,
+     `ErgoStateContext.scala:222`.)
+   - At any **other block: NO version check.** `exBlockVersion` fires only at
+     boundaries — `processExtension` is gated on `epochStarts`
+     (`ErgoStateContext.scala:246`) — and the JVM has no header-level version
+     rule anywhere; mid-epoch it ignores `header.version` entirely (script
+     evaluation keys off `params.blockVersion`, `ErgoContext.scala:28`).
+     Enforcing mid-epoch would be STRICTER than the reference:
+     an adversarial wrong-version mid-epoch block (one block of PoW) is
+     accepted by JVM nodes — rejecting it forks us off the canonical chain.
+     Match JVM leniency; never add checks the reference node lacks.
+   - SANTA note: the tier's oracle composes the params-vs-header check
+     unconditionally and its `version-gate` mutation rides a mid-epoch donor
+     (2666). With this gate JVM-exact, donner shows that one cell red until
+     SANTA re-donors the mutation over a boundary block — finding relayed;
+     a red cell is the runner working.
 
 2. **Verify AD proofs digest**
    - `blake2b256(proof_bytes) == header.ad_proofs_root`
@@ -200,6 +259,7 @@ DigestValidator::new(
    - Returned as `ApplyStateOutcome.deferred_eval` for the sync layer
      to evaluate asynchronously via `evaluate_scripts()`
    - `evaluate_scripts` uses rayon `par_iter` for intra-block parallelism
+     and returns the block-accumulated cost (see "Block cost semantics")
 
 ### Error causes
 
@@ -209,6 +269,12 @@ DigestValidator::new(
 - `ProofVerificationFailed` — an operation failed during AD proof replay
 - `IntraBlockDoubleSpend` — same box spent twice within one block
 - `TransactionInvalid(index, details)` — tx validation failed (Phase 4a+)
+- `BlockCostExceeded { cost, max_cost }` — Σ per-tx costs >
+  `parameters.max_block_cost()` (added 2026-06-10; previously unenforced —
+  each tx independently got the full block budget)
+- `BlockVersionMismatch { expected, got }` — governing parameters'
+  `block_version()` != `header.version` (added 2026-06-10; JVM
+  `exBlockVersion`; previously unenforced)
 - `MissingProof` — ad_proofs is None but validator requires proofs
 
 ## Section Parsing (internal)
@@ -321,6 +387,41 @@ instead of `BatchAVLVerifier`. Same validation core — different box source:
 
 The `BlockValidator` trait is designed for both. `ad_proofs: Option<&[u8]>`
 is `Some` for digest, `None` for UTXO.
+
+## ADProof Regeneration (UTXO-mode diagnostic)
+
+UTXO mode generates each block's ADProof as a side effect of applying state
+(the prover's `generate_proof()` after the block's operations — see
+`apply_state_internal`) but normally discards it: the hot path serves no
+proofs ("Future: Phase 4b" above). On current testnet there is no reachable
+peer that keeps ADProofs (all observed peers run UTXO mode and discard them),
+so a digest client cannot obtain historical proofs from the network at all.
+Regenerating them locally is the only route.
+
+`UtxoValidator` can be configured to persist the proof at specific heights
+during a genesis→target replay:
+
+```rust
+impl UtxoValidator {
+    /// Persist the generated ADProof as a raw type-104 section at each height
+    /// in `heights`, into `dir`. Disabled by default (empty set / `None` dir):
+    /// zero overhead in normal operation. Intended for one-shot regeneration
+    /// via a genesis→target replay — the prover must pass through H-1 → H for
+    /// the proof at H to be correct — NOT steady-state serving.
+    pub fn set_adproof_dump(&mut self, heights: HashSet<u32>, dir: PathBuf);
+}
+```
+
+Behavior: when `apply_state` applies a block whose height is in `heights`, the
+ADProof bytes from the apply-time `generate_proof()` (the same proof a digest
+peer would verify, covering exactly that block's operations) are wrapped via
+`serialize_ad_proofs(header_id, proof)` (raw type-104 section bytes) and written
+to `<dir>/adproofs-<height>.104`. Logged at INFO. A write failure is logged at
+WARN and MUST NOT fail block application (diagnostic, opportunistic).
+
+Not part of the `BlockValidator` trait — UTXO-specific (digest mode has no
+prover to generate from). Realizes the Phase 4b "AD proofs generated as side
+effect (to serve digest-mode peers)" intent for the regeneration use case.
 
 ## Genesis State Root
 

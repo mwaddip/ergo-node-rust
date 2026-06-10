@@ -119,6 +119,16 @@ impl BlockValidator for DigestValidator {
                 None => (None, None),
             };
 
+        // 1b. Block-version gate (consensus check — JVM exBlockVersion).
+        // Boundary-only: the JVM checks header.version against the newly
+        // computed boundary parameters inside processExtension, which runs
+        // only at epoch boundaries (epochStarts gate). Mid-epoch the JVM
+        // has no version rule at all — checking there would reject blocks
+        // the reference accepts.
+        if let Some(boundary) = expected_boundary_params {
+            voting::check_block_version(boundary, header.version, header.height)?;
+        }
+
         // 2. Verify AD proofs digest matches header
         let proof_digest: [u8; 32] = blake2::Blake2b::<blake2::digest::typenum::U32>::digest(
             &parsed_proofs.proof_bytes,
@@ -160,7 +170,7 @@ impl BlockValidator for DigestValidator {
         let starting_digest = Bytes::copy_from_slice(&starting_digest_bytes);
         let proof_bytes = Bytes::copy_from_slice(&parsed_proofs.proof_bytes);
 
-        let tree = AVLTree::new(label_preserving_resolver(), KEY_LENGTH, None);
+        let tree = AVLTree::with_resolver(label_preserving_resolver(), KEY_LENGTH, None);
         let mut verifier = BatchAVLVerifier::new(
             &starting_digest,
             &proof_bytes,

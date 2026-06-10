@@ -1,6 +1,7 @@
 //! UtxoValidator: persistent AVL+ tree state verification via BatchAVLProver.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use bytes::Bytes;
 use enr_state::RedbAVLStorage;
@@ -42,6 +43,10 @@ pub struct UtxoValidator {
     emission_box_id: Option<[u8; 32]>,
     /// Emission contract ErgoTree bytes for matching outputs.
     emission_tree_bytes: Vec<u8>,
+    /// Heights at which to persist the apply-time ADProof. Empty = disabled.
+    adproof_dump_heights: HashSet<u32>,
+    /// Directory for dumped `adproofs-<height>.104` sections. None = disabled.
+    adproof_dump_dir: Option<PathBuf>,
 }
 
 impl UtxoValidator {
@@ -82,7 +87,19 @@ impl UtxoValidator {
             current_digest: digest,
             emission_box_id: None,
             emission_tree_bytes,
+            adproof_dump_heights: HashSet::new(),
+            adproof_dump_dir: None,
         }
+    }
+
+    /// Persist the generated ADProof as a raw type-104 section at each height
+    /// in `heights`, into `dir`. Disabled by default (empty set / `None` dir):
+    /// zero overhead in normal operation. Intended for one-shot regeneration
+    /// via a genesis→target replay — the prover must pass through H-1 → H for
+    /// the proof at H to be correct — NOT steady-state serving.
+    pub fn set_adproof_dump(&mut self, heights: HashSet<u32>, dir: PathBuf) {
+        self.adproof_dump_heights = heights;
+        self.adproof_dump_dir = Some(dir);
     }
 }
 
@@ -229,6 +246,16 @@ impl UtxoValidator {
             None => (None, None),
         };
 
+        // 1b. Block-version gate (consensus check — JVM exBlockVersion).
+        // Boundary-only: the JVM checks header.version against the newly
+        // computed boundary parameters inside processExtension, which runs
+        // only at epoch boundaries (epochStarts gate). Mid-epoch the JVM
+        // has no version rule at all — checking there would reject blocks
+        // the reference accepts.
+        if let Some(boundary) = expected_boundary_params {
+            voting::check_block_version(boundary, header.version, header.height)?;
+        }
+
         // 2. Compute state changes from transactions
         let summaries = transactions_to_summaries(&parsed_txs.transactions)?;
         let changes = compute_state_changes(summaries)?;
@@ -308,17 +335,44 @@ impl UtxoValidator {
             None
         };
 
-        // 7. Persist state changes atomically with block_height, then flush
-        //    the prover's tree-local state (resets visited/new flags) by
-        //    consuming the AD proof. Proof bytes are not served to peers
-        //    from validation today; digest-mode peers would need them but
-        //    that wiring is Phase 6.
+        // 7. Persist state changes atomically with block_height, then
+        //    generate the AD proof. generate_proof() also flushes the prover's
+        //    tree-local state (resets visited/new flags, directions, and
+        //    old_top_node) for the next block — that side effect is why the
+        //    call is kept even when the proof is dropped. The proof returned
+        //    here is the same one a digest-mode peer would verify: it covers
+        //    exactly this block's operations and replays cleanly from the
+        //    H-1 state root (confirmed by tests/adproof_dump_ordering_diag.rs,
+        //    which proves it survives the storage-side tree.reset()). Steady-
+        //    state serving is Phase 6; here it can optionally be dumped at
+        //    configured heights for ADProof regeneration (set_adproof_dump).
         self.storage
             .update_with_height(&mut self.prover, vec![], header.height)
             .map_err(|e| ValidationError::StateOperationFailed(
                 format!("persist failed: {e}"),
             ))?;
-        let _ = self.prover.generate_proof();
+        let proof = self.prover.generate_proof();
+        if let Some(dir) = &self.adproof_dump_dir {
+            if self.adproof_dump_heights.contains(&header.height) {
+                // Raw type-104 section: [header_id:32][proof_size:VLQ][proof].
+                let section =
+                    crate::sections::serialize_ad_proofs(&header.id.0 .0, proof.as_ref());
+                let path = dir.join(format!("adproofs-{}.104", header.height));
+                match std::fs::write(&path, &section) {
+                    Ok(()) => tracing::info!(
+                        height = header.height,
+                        bytes = section.len(),
+                        path = %path.display(),
+                        "dumped ADProof (type-104 section)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        height = header.height,
+                        error = %e,
+                        "ADProof dump write failed (non-fatal)"
+                    ),
+                }
+            }
+        }
 
         // 8. Track emission box: scan new outputs for emission contract
         if !self.emission_tree_bytes.is_empty() {

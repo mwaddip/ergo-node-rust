@@ -178,6 +178,52 @@ pub fn check_parameters_v6(
     Ok(())
 }
 
+/// Block-version gate (consensus check — JVM `exBlockVersion`,
+/// `ErgoStateContext.scala:222`): the governing parameters' BlockVersion
+/// entry must equal `header.version`.
+///
+/// Called at epoch-boundary blocks ONLY, with `governing` = the newly
+/// computed boundary parameters (JVM compares `calculatedParams` inside
+/// `processExtension`, which runs only when `epochStarts`). Mid-epoch
+/// blocks get no version check — the JVM has no header-level version
+/// rule, and enforcing one would reject blocks the reference accepts.
+///
+/// Reads the table via `get` instead of `Parameters::block_version()` —
+/// that accessor indexes the map and panics on an absent entry (the
+/// `Parameters::default()` omission class). A governing table without a
+/// BlockVersion entry rejects the block instead.
+pub fn check_block_version(
+    governing: &Parameters,
+    header_version: u8,
+    height: u32,
+) -> Result<(), ValidationError> {
+    match governing.parameters_table.get(&Parameter::BlockVersion) {
+        Some(&expected) if expected == i32::from(header_version) => Ok(()),
+        Some(&expected) => {
+            tracing::warn!(
+                height,
+                expected,
+                got = header_version,
+                "block-version gate: header.version disagrees with governing parameters"
+            );
+            Err(ValidationError::BlockVersionMismatch {
+                expected,
+                got: header_version,
+            })
+        }
+        None => {
+            tracing::warn!(
+                height,
+                got = header_version,
+                "block-version gate: governing parameters table has no BlockVersion entry"
+            );
+            Err(ValidationError::StateOperationFailed(format!(
+                "governing parameters table has no BlockVersion entry at height {height}"
+            )))
+        }
+    }
+}
+
 /// Pack a [`Parameters`] table into extension key-value fields for
 /// embedding in an epoch-boundary block's extension section.
 ///
@@ -464,6 +510,46 @@ mod tests {
         params.parameters_table.insert(Parameter::BlockVersion, 4);
         let pu = [0x02, 0xd7, 0x01, 0x99, 0x03];
         assert!(check_parameters_v6(&params, &params, 1_628_160, 4, &pu, &pu).is_ok());
+    }
+
+    #[test]
+    fn block_version_gate_mismatch_santa_vector() {
+        // SANTA `version-gate` mutation: params table id 123 shrunk to 3
+        // while header.version stays 4.
+        let mut params = Parameters::default();
+        params.parameters_table.clear();
+        params.parameters_table.insert(Parameter::BlockVersion, 3);
+
+        let err = check_block_version(&params, 4, 1024).unwrap_err();
+        match &err {
+            ValidationError::BlockVersionMismatch { expected, got } => {
+                assert_eq!(*expected, 3);
+                assert_eq!(*got, 4);
+            }
+            other => panic!("expected BlockVersionMismatch, got {other:?}"),
+        }
+        // Display mirrors the JVM reason string shape.
+        assert_eq!(
+            err.to_string(),
+            "block version mismatch: parameters blockVersion 3 != header.version 4"
+        );
+    }
+
+    #[test]
+    fn block_version_gate_match_ok() {
+        let mut params = Parameters::default();
+        params.parameters_table.insert(Parameter::BlockVersion, 4);
+        assert!(check_block_version(&params, 4, 128).is_ok());
+    }
+
+    #[test]
+    fn block_version_gate_absent_entry_rejects_without_panic() {
+        let mut params = Parameters::default();
+        params.parameters_table.clear();
+        // `Parameters::block_version()` would panic on this table — the
+        // gate must reject instead.
+        let err = check_block_version(&params, 4, 128).unwrap_err();
+        assert!(matches!(err, ValidationError::StateOperationFailed(_)));
     }
 
     #[test]

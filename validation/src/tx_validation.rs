@@ -10,7 +10,7 @@ use std::io::Cursor;
 
 use rayon::prelude::*;
 
-use ergo_lib::chain::ergo_state_context::ErgoStateContext;
+use ergo_lib::chain::ergo_state_context::{ErgoStateContext, Headers};
 use ergo_lib::chain::parameters::Parameters;
 use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
@@ -32,31 +32,30 @@ pub fn deserialize_box(bytes: &[u8]) -> Result<ErgoBox, ValidationError> {
     })
 }
 
-/// Build the `[Header; 10]` array required by ErgoStateContext.
+/// Build an ErgoStateContext from a header and its real ≤10 preceding headers
+/// (newest first), passed through unpadded.
 ///
-/// `preceding` contains headers in newest-first order (up to 10).
-/// Pads with the oldest available if fewer than 10 are provided.
-fn build_headers_array(preceding: &[Header]) -> [Header; 10] {
-    let mut headers: Vec<Header> = preceding.iter().take(10).cloned().collect();
-    let pad = headers.last().unwrap().clone();
-    while headers.len() < 10 {
-        headers.push(pad.clone());
-    }
-    headers.try_into().unwrap()
-}
-
-/// Build an ErgoStateContext from a header and preceding headers.
+/// The JVM gathers the same variable window — `headerChainBack(10, …)` stops
+/// at genesis (`FullBlockProcessor:71`), so fewer than 10 headers near genesis
+/// is legal chain state; padding to 10 by repeating the oldest (what this did
+/// before) diverged from the reference node for scripts reading
+/// `CONTEXT.headers`. ergo-lib derives `lastBlockUtxoRoot` from the newest
+/// preceding header's state_root — identical to the JVM's
+/// `previousStateDigest` (`ErgoStateContext.scala:92`) — with AvlTree flags
+/// verified against `ErgoContext.scala:17` / `ErgoInterpreter.scala:103-106`;
+/// nothing to override on our side.
 ///
-/// Requires at least one preceding header. Pads to 10 headers by
-/// repeating the oldest if fewer are provided.
+/// Requires ≥ 1 preceding header — caller-guarded, and now also enforced by
+/// the `Headers` type.
 pub fn build_state_context(
     header: &Header,
     preceding_headers: &[Header],
     parameters: &Parameters,
 ) -> ErgoStateContext {
     let pre_header = PreHeader::from(header.clone());
-    let headers_array = build_headers_array(preceding_headers);
-    ErgoStateContext::new(pre_header, headers_array, parameters.clone())
+    let headers = Headers::from_vec(preceding_headers.iter().take(10).cloned().collect())
+        .expect("build_state_context requires at least one preceding header (caller-guarded)");
+    ErgoStateContext::new(pre_header, headers, parameters.clone())
 }
 
 /// Validate a single transaction against provided input and data-input boxes.
@@ -90,22 +89,29 @@ pub fn validate_single_transaction(
 /// `proof_boxes`: input/data-input boxes extracted from the AD proof, keyed by box ID.
 /// For intra-block spending (tx2 spends tx1's output), the box comes from
 /// tx1's outputs — added to the lookup map alongside proof-returned boxes.
+///
+/// On success returns the block-accumulated cost: Σ of per-tx costs from
+/// `validate_single_transaction`, enforced ≤ `parameters.max_block_cost()`
+/// (JVM `ErgoState.execTransactions` parity — see the contract's "Block cost
+/// semantics"). The degenerate guards (no transactions, no preceding
+/// headers) return `Ok(0)`.
 pub fn validate_transactions(
     transactions: &[Transaction],
     proof_boxes: &HashMap<[u8; 32], ErgoBox>,
     header: &Header,
     preceding_headers: &[Header],
     parameters: &Parameters,
-) -> Result<(), ValidationError> {
+) -> Result<u64, ValidationError> {
     if transactions.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
     if preceding_headers.is_empty() {
         // Can't build ErgoStateContext without preceding headers.
         // Only happens at height 1 (genesis) which has no standard transactions.
+        // The SDK's `Headers` type (BoundedVec<_, 1, 10>) now also enforces ≥ 1.
         tracing::warn!(height = header.height, "skipping tx validation: no preceding headers");
-        return Ok(());
+        return Ok(0);
     }
 
     let state_context = build_state_context(header, preceding_headers, parameters);
@@ -119,10 +125,10 @@ pub fn validate_transactions(
         }
     }
 
-    transactions
+    let costs: Vec<u64> = transactions
         .par_iter()
         .enumerate()
-        .try_for_each(|(tx_idx, tx)| {
+        .map(|(tx_idx, tx)| {
             let input_boxes: Vec<ErgoBox> = tx
                 .inputs
                 .iter()
@@ -157,7 +163,6 @@ pub fn validate_transactions(
                 .unwrap_or_default();
 
             validate_single_transaction(tx, input_boxes, data_boxes, &state_context)
-                .map(|_cost| ())
                 .map_err(|e| match e {
                     ValidationError::TransactionInvalid { reason, .. } => {
                         ValidationError::TransactionInvalid { index: tx_idx, reason }
@@ -165,13 +170,42 @@ pub fn validate_transactions(
                     other => other,
                 })
         })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // max_block_cost() is i32. Negative is unreachable through voting bounds,
+    // but clamp to 0 (reject every non-empty block, the JVM's sign-preserving
+    // `.toLong` verdict) rather than sign-extend into accept-everything.
+    let max_cost = u64::try_from(parameters.max_block_cost()).unwrap_or(0);
+    enforce_block_cost(&costs, max_cost)
+}
+
+/// Checked block-cost summation plus the maxBlockCost consensus gate.
+///
+/// JVM parity: `execTransactions` folds per-tx costs from 0 with `addExact`
+/// and rejects once the total crosses maxBlockCost. Since per-tx costs are
+/// non-negative, "final sum ≤ max" is verdict-equivalent to the JVM's
+/// per-prefix check. Overflow rejects with the reported cost saturated to
+/// `u64::MAX` — never wraps, never panics.
+fn enforce_block_cost(costs: &[u64], max_cost: u64) -> Result<u64, ValidationError> {
+    let mut total: u64 = 0;
+    for &cost in costs {
+        total = total
+            .checked_add(cost)
+            .ok_or(ValidationError::BlockCostExceeded { cost: u64::MAX, max_cost })?;
+    }
+    if total > max_cost {
+        return Err(ValidationError::BlockCostExceeded { cost: total, max_cost });
+    }
+    Ok(total)
 }
 
 /// Verify spending proofs for all transactions in a block.
 ///
 /// Pure computation — no validator state needed. Can run on any thread.
 /// Uses rayon par_iter internally for intra-block parallelism.
-pub fn evaluate_scripts(eval: &crate::DeferredEval) -> Result<(), crate::ValidationError> {
+/// On success returns the block-accumulated transaction cost (Σ per-tx
+/// costs, enforced ≤ `parameters.max_block_cost()`).
+pub fn evaluate_scripts(eval: &crate::DeferredEval) -> Result<u64, crate::ValidationError> {
     validate_transactions(
         &eval.transactions,
         &eval.proof_boxes,
@@ -347,7 +381,7 @@ mod block_342964_tests {
         // Build state context
         let pre_header = make_pre_header();
         let dummy_header = make_dummy_header();
-        let headers: [Header; 10] = std::array::from_fn(|_| dummy_header.clone());
+        let headers = Headers::from_vec(vec![dummy_header.clone(); 10]).unwrap();
         let state_context =
             ErgoStateContext::new(pre_header, headers, Parameters::default());
 
@@ -399,7 +433,7 @@ mod block_342964_tests {
 
         let pre_header = make_pre_header();
         let dummy_header = make_dummy_header();
-        let headers: [Header; 10] = std::array::from_fn(|_| dummy_header.clone());
+        let headers = Headers::from_vec(vec![dummy_header.clone(); 10]).unwrap();
         let state_context =
             ErgoStateContext::new(pre_header, headers, Parameters::default());
 
@@ -606,7 +640,7 @@ mod block_342964_tests {
         // Build state context
         let pre_header = make_pre_header();
         let dummy_header = make_dummy_header();
-        let headers: [Header; 10] = std::array::from_fn(|_| dummy_header.clone());
+        let headers = Headers::from_vec(vec![dummy_header.clone(); 10]).unwrap();
         let state_context =
             ErgoStateContext::new(pre_header, headers, Parameters::default());
 
@@ -740,7 +774,7 @@ mod block_342964_tests {
 
         let pre_header = make_pre_header();
         let dummy_header = make_dummy_header();
-        let headers: [Header; 10] = std::array::from_fn(|_| dummy_header.clone());
+        let headers = Headers::from_vec(vec![dummy_header.clone(); 10]).unwrap();
         let state_context = ErgoStateContext::new(pre_header, headers, Parameters::default());
 
         let tx_context = TransactionContext::new(tx.clone(), vec![input0, input1, input2], vec![]).unwrap();
@@ -835,6 +869,319 @@ mod block_342964_tests {
                 0,
             ).unwrap();
             println!("  computed (R4=2):  {}", hex::encode(out0_r4_two.box_id().as_ref()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod state_context_window_tests {
+    use super::*;
+
+    use ergo_chain_types::{
+        ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint, Votes,
+    };
+
+    fn header_at(height: u32) -> Header {
+        Header {
+            version: 1,
+            id: BlockId(Digest32::from([height as u8; 32])),
+            parent_id: BlockId(Digest32::from([0u8; 32])),
+            ad_proofs_root: Digest32::from([0u8; 32]),
+            state_root: ADDigest::from([height as u8; 33]),
+            transaction_root: Digest32::from([0u8; 32]),
+            timestamp: 0,
+            n_bits: 118_099_735,
+            height,
+            extension_root: Digest32::from([0u8; 32]),
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce: vec![0u8; 8],
+                pow_distance: None,
+            },
+            votes: Votes([0, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        }
+    }
+
+    /// A real < 10 window passes through unpadded. The pre-fix code padded the
+    /// window to 10 by repeating the oldest header, diverging from the JVM's
+    /// variable window near genesis for scripts reading `CONTEXT.headers`.
+    #[test]
+    fn short_window_passes_through_unpadded() {
+        let header = header_at(4);
+        // Real window at height 4: parents at heights 3, 2, 1 — newest first.
+        let preceding = [header_at(3), header_at(2), header_at(1)];
+        let ctx = build_state_context(&header, &preceding, &Parameters::default());
+
+        assert_eq!(ctx.headers.len(), 3, "window must not be padded to 10");
+        assert_eq!(ctx.headers.first().height, 3, "parent header comes first");
+        assert_eq!(ctx.headers.as_vec()[1].height, 2);
+        assert_eq!(ctx.headers.last().height, 1);
+    }
+
+    /// Steady state: a full 10-header window passes through as-is.
+    #[test]
+    fn full_window_passes_through_identically() {
+        let header = header_at(20);
+        // Heights 19 down to 10, newest first.
+        let preceding: Vec<Header> = (10..20).rev().map(header_at).collect();
+        let ctx = build_state_context(&header, &preceding, &Parameters::default());
+
+        assert_eq!(ctx.headers.len(), 10);
+        assert_eq!(ctx.headers.first().height, 19);
+        assert_eq!(ctx.headers.last().height, 10);
+    }
+}
+
+#[cfg(test)]
+mod block_cost_tests {
+    use super::*;
+
+    use ergo_chain_types::{ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint, Votes};
+    use ergo_lib::chain::parameters::Parameter;
+    use ergo_lib::chain::transaction::input::prover_result::ProverResult as ChainProverResult;
+    use ergo_lib::chain::transaction::input::Input;
+    use ergo_lib::ergotree_ir::chain::ergo_box::{
+        box_value::BoxValue, ErgoBoxCandidate, NonMandatoryRegisters,
+    };
+    use ergo_lib::ergotree_ir::chain::tx_id::TxId;
+    use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
+    use ergotree_interpreter::sigma_protocol::prover::ProofBytes;
+    use ergotree_ir::chain::context_extension::ContextExtension;
+
+    // Fee-contract spend fixtures from block 342,964 (same vectors as
+    // block_342964_tests): one fee box in, one substituted miner-reward box
+    // out, empty proof — the script reduces to true on its own, giving a
+    // cheap deterministic per-tx cost.
+    const FEE_CONTRACT_HEX: &str = "1005040004000e36100204a00b08cd0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ea02d192a39a8cc7a701730073011001020402d19683030193a38cc7b2a57300000193c2b2a57301007473027303830108cdeeac93b1a57304";
+    const OUTPUT_TREE_HEX: &str = "100204a00b08cd02a27f37ca339c25a8ee65cbdb73fe7a7134dd89cd3e7c43e313a92c128859e4f6ea02d192a39a8cc7a70173007301";
+    const MINER_PK_HEX: &str = "02a27f37ca339c25a8ee65cbdb73fe7a7134dd89cd3e7c43e313a92c128859e4f6";
+    const BLOCK_HEIGHT: u32 = 342_964;
+
+    fn fee_box(seed: u8, value: u64) -> ErgoBox {
+        let tree = ErgoTree::sigma_parse_bytes(&hex::decode(FEE_CONTRACT_HEX).unwrap()).unwrap();
+        let tx_id = TxId::from(Digest32::from([seed; 32]));
+        ErgoBox::new(
+            BoxValue::try_from(value).unwrap(),
+            tree,
+            None,
+            NonMandatoryRegisters::empty(),
+            342_900,
+            tx_id,
+            0,
+        )
+        .unwrap()
+    }
+
+    fn fee_spend_tx(src: &ErgoBox) -> Transaction {
+        let output_tree =
+            ErgoTree::sigma_parse_bytes(&hex::decode(OUTPUT_TREE_HEX).unwrap()).unwrap();
+        let output = ErgoBoxCandidate {
+            value: src.value,
+            ergo_tree: output_tree,
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height: BLOCK_HEIGHT,
+        };
+        let input = Input::new(
+            src.box_id(),
+            ChainProverResult {
+                proof: ProofBytes::Empty,
+                extension: ContextExtension::empty(),
+            },
+        );
+        Transaction::new_from_vec(vec![input], vec![], vec![output]).unwrap()
+    }
+
+    /// Header for block 342,964 — `PreHeader::from(header)` must carry the
+    /// miner_pk/height the fee contract's SubstConstants check reads.
+    fn block_header() -> Header {
+        let miner_pk = EcPoint::from_base16_str(MINER_PK_HEX.to_string()).unwrap();
+        let parent_id_bytes: [u8; 32] = hex::decode(
+            "be5d64122592b6d2a07a3a619d4e68598e8df38e57ccbff732fc797bbdcf86ef",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        Header {
+            version: 1,
+            id: BlockId(Digest32::from([0u8; 32])),
+            parent_id: BlockId(parent_id_bytes.into()),
+            ad_proofs_root: Digest32::from([0u8; 32]),
+            state_root: ADDigest::from([0u8; 33]),
+            transaction_root: Digest32::from([0u8; 32]),
+            timestamp: 1603134264292,
+            n_bits: 118099735,
+            height: BLOCK_HEIGHT,
+            extension_root: Digest32::from([0u8; 32]),
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(miner_pk),
+                pow_onetime_pk: None,
+                nonce: vec![0u8; 8],
+                pow_distance: None,
+            },
+            votes: Votes([4, 3, 0]),
+            unparsed_bytes: Box::new([]),
+        }
+    }
+
+    fn parent_header() -> Header {
+        Header {
+            version: 1,
+            id: BlockId(Digest32::from([1u8; 32])),
+            parent_id: BlockId(Digest32::from([0u8; 32])),
+            ad_proofs_root: Digest32::from([0u8; 32]),
+            state_root: ADDigest::from([0u8; 33]),
+            transaction_root: Digest32::from([0u8; 32]),
+            timestamp: 1603134202817,
+            n_bits: 118099735,
+            height: BLOCK_HEIGHT - 1,
+            extension_root: Digest32::from([0u8; 32]),
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce: vec![0u8; 8],
+                pow_distance: None,
+            },
+            votes: Votes([4, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        }
+    }
+
+    fn params_with_max_cost(max: i32) -> Parameters {
+        let mut params = Parameters::default();
+        params.parameters_table.insert(Parameter::MaxBlockCost, max);
+        params
+    }
+
+    fn proof_box_map(boxes: &[ErgoBox]) -> HashMap<[u8; 32], ErgoBox> {
+        boxes
+            .iter()
+            .map(|b| (box_id_bytes(&b.box_id()), b.clone()))
+            .collect()
+    }
+
+    /// Accept path: the returned block cost is the sum of the per-tx costs
+    /// `validate_single_transaction` reports on identical fixtures.
+    #[test]
+    fn accept_path_returns_per_tx_cost_sum() {
+        let box_a = fee_box(0xA1, 2_000_000);
+        let box_b = fee_box(0xB2, 1_000_000);
+        let tx_a = fee_spend_tx(&box_a);
+        let tx_b = fee_spend_tx(&box_b);
+        let header = block_header();
+        let preceding = vec![parent_header()];
+        let params = Parameters::default();
+
+        let ctx = build_state_context(&header, &preceding, &params);
+        let cost_a =
+            validate_single_transaction(&tx_a, vec![box_a.clone()], vec![], &ctx).unwrap();
+        let cost_b =
+            validate_single_transaction(&tx_b, vec![box_b.clone()], vec![], &ctx).unwrap();
+        assert!(cost_a > 0 && cost_b > 0, "fixture txs must have nonzero cost");
+
+        let total = validate_transactions(
+            &[tx_a, tx_b],
+            &proof_box_map(&[box_a, box_b]),
+            &header,
+            &preceding,
+            &params,
+        )
+        .unwrap();
+        assert_eq!(total, cost_a + cost_b);
+    }
+
+    /// The consensus gap this closes (fork direction): every tx individually
+    /// passes under a shrunk MaxBlockCost (each gets the 10× per-tx JIT
+    /// budget), but the block-level sum crosses it — JVM rejects, so must we.
+    #[test]
+    fn block_sum_over_max_block_cost_rejects() {
+        let box_a = fee_box(0xA1, 2_000_000);
+        let box_b = fee_box(0xB2, 1_000_000);
+        let tx_a = fee_spend_tx(&box_a);
+        let tx_b = fee_spend_tx(&box_b);
+        let header = block_header();
+        let preceding = vec![parent_header()];
+
+        // Shrink MaxBlockCost to one tx's cost (+1 block unit: the block-scale
+        // cost floors the JIT-scale spend /10, so a limit of exactly 10×C JIT
+        // units trips on the rounding residue): each tx fits, the pair doesn't.
+        // Per-tx cost itself is independent of MaxBlockCost — it only sets limits.
+        let baseline_ctx = build_state_context(&header, &preceding, &Parameters::default());
+        let cost_a = validate_single_transaction(&tx_a, vec![box_a.clone()], vec![], &baseline_ctx)
+            .unwrap();
+        let cost_b = validate_single_transaction(&tx_b, vec![box_b.clone()], vec![], &baseline_ctx)
+            .unwrap();
+        let max = cost_a.max(cost_b) + 1;
+        let params = params_with_max_cost(i32::try_from(max).unwrap());
+
+        // Each tx individually passes under the shrunk parameters.
+        let shrunk_ctx = build_state_context(&header, &preceding, &params);
+        validate_single_transaction(&tx_a, vec![box_a.clone()], vec![], &shrunk_ctx).unwrap();
+        validate_single_transaction(&tx_b, vec![box_b.clone()], vec![], &shrunk_ctx).unwrap();
+
+        let err = validate_transactions(
+            &[tx_a, tx_b],
+            &proof_box_map(&[box_a, box_b]),
+            &header,
+            &preceding,
+            &params,
+        )
+        .unwrap_err();
+        match err {
+            ValidationError::BlockCostExceeded { cost, max_cost } => {
+                assert_eq!(cost, cost_a + cost_b);
+                assert_eq!(max_cost, max);
+            }
+            other => panic!("expected BlockCostExceeded, got: {other}"),
+        }
+    }
+
+    /// Empty-tx block and the no-preceding-headers guard both report cost 0.
+    #[test]
+    fn degenerate_blocks_cost_zero() {
+        let header = block_header();
+        let params = Parameters::default();
+
+        let empty =
+            validate_transactions(&[], &HashMap::new(), &header, &[parent_header()], &params)
+                .unwrap();
+        assert_eq!(empty, 0);
+
+        // Non-empty txs but no preceding headers (height-1 shape).
+        let bx = fee_box(0xC3, 1_000_000);
+        let tx = fee_spend_tx(&bx);
+        let no_headers =
+            validate_transactions(&[tx], &proof_box_map(&[bx]), &header, &[], &params).unwrap();
+        assert_eq!(no_headers, 0);
+    }
+
+    /// Direct overflow coverage for the checked summation — constructing
+    /// real overflow-cost transactions is impractical.
+    #[test]
+    fn enforce_block_cost_overflow_rejects_saturated() {
+        match enforce_block_cost(&[u64::MAX, 1], 1_000_000).unwrap_err() {
+            ValidationError::BlockCostExceeded { cost, max_cost } => {
+                assert_eq!(cost, u64::MAX, "overflow reports saturated cost");
+                assert_eq!(max_cost, 1_000_000);
+            }
+            other => panic!("expected BlockCostExceeded, got: {other}"),
+        }
+    }
+
+    /// Boundary semantics: sum == max accepts (JVM `maxCost >= startCost`),
+    /// one over rejects, empty sums to zero.
+    #[test]
+    fn enforce_block_cost_boundary() {
+        assert_eq!(enforce_block_cost(&[], 0).unwrap(), 0);
+        assert_eq!(enforce_block_cost(&[5, 6], 11).unwrap(), 11);
+        match enforce_block_cost(&[5, 7], 11).unwrap_err() {
+            ValidationError::BlockCostExceeded { cost, max_cost } => {
+                assert_eq!(cost, 12);
+                assert_eq!(max_cost, 11);
+            }
+            other => panic!("expected BlockCostExceeded, got: {other}"),
         }
     }
 }

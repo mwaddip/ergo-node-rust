@@ -43,7 +43,8 @@ pub struct ApplyStateOutcome {
     pub epoch_boundary_proposed_update: Option<Vec<u8>>,
     /// `Some` if script evaluation is needed (height > checkpoint).
     /// The caller should pass this to `evaluate_scripts()` — either
-    /// inline or on a background thread.
+    /// inline or on a background thread; on success it returns the
+    /// block-accumulated transaction cost.
     pub deferred_eval: Option<DeferredEval>,
 }
 
@@ -80,7 +81,8 @@ pub struct DeferredEval {
 ///
 /// Script evaluation is NOT performed by `apply_state`. Instead, the caller
 /// receives a `DeferredEval` and runs `evaluate_scripts()` — either inline
-/// or on a background thread.
+/// or on a background thread — which returns the block-accumulated cost
+/// on success.
 pub trait BlockValidator {
     /// Apply state transition: parse sections, compute state changes,
     /// apply AVL operations, verify digest, persist.
@@ -160,6 +162,12 @@ pub enum ValidationError {
 
     #[error("transaction {index} invalid: {reason}")]
     TransactionInvalid { index: usize, reason: String },
+
+    #[error("block cost {cost} exceeds maxBlockCost {max_cost}")]
+    BlockCostExceeded { cost: u64, max_cost: u64 },
+
+    #[error("block version mismatch: parameters blockVersion {expected} != header.version {got}")]
+    BlockVersionMismatch { expected: i32, got: u8 },
 
     #[error("AD proofs required but not provided")]
     MissingProof,
