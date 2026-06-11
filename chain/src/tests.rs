@@ -1831,6 +1831,93 @@ mod voting_chain_tests {
     }
 
     #[test]
+    fn candidate_fork_vote_starts_round_header_method_would_omit() {
+        // A fork-voting mining candidate at a boundary: the candidate is
+        // not in the chain (the chain tops out at 255 — exactly the mining
+        // situation), so the header-reading method sees no fork vote and
+        // omits the round start. The candidate-aware method threads the
+        // candidate's own votes through and declares the bookkeeping the
+        // validators will recompute — the self-orphan fix.
+        let chain = build_chain_with_votes(255, [0, 0, 0]);
+
+        let via_header = chain.compute_expected_parameters(256, &[]).unwrap();
+        assert_eq!(
+            via_header.soft_fork_starting_height(),
+            None,
+            "header-reading method cannot see an un-applied candidate's vote"
+        );
+
+        let (via_candidate, activated) = chain
+            .compute_expected_parameters_for_candidate(256, &[], [120, 0, 0])
+            .unwrap();
+        assert_eq!(via_candidate.soft_fork_starting_height(), Some(256));
+        assert_eq!(via_candidate.soft_fork_votes_collected(), Some(0));
+        assert_eq!(
+            activated,
+            crate::voting::encode_disabled_rules(&[]),
+            "round start is not an activation — canonical empty update"
+        );
+    }
+
+    #[test]
+    fn candidate_fork_vote_with_round_in_progress_accumulates() {
+        // In-progress round: id 122/121 installed from a prior boundary,
+        // window headers all vote 120 (seeded — the opening boundary 128
+        // votes 120 too). The candidate-built table carries the round's
+        // accumulation: 121 = 0 + 128 window votes; 122 preserved.
+        let mut chain = build_chain_with_votes_fn(255, |h| {
+            if (128..=255).contains(&h) {
+                [120, 0, 0]
+            } else {
+                [0, 0, 0]
+            }
+        });
+        let mut params = chain.active_parameters().clone();
+        params
+            .parameters_table
+            .insert(ergo_lib::chain::parameters::Parameter::SoftForkStartingHeight, 128);
+        params
+            .parameters_table
+            .insert(ergo_lib::chain::parameters::Parameter::SoftForkVotesCollected, 0);
+        let keep = chain.active_proposed_update_bytes().to_vec();
+        chain.apply_epoch_boundary_parameters(params, keep);
+
+        let (expected, _) = chain
+            .compute_expected_parameters_for_candidate(256, &[], [120, 0, 0])
+            .unwrap();
+        assert_eq!(expected.soft_fork_starting_height(), Some(128));
+        assert_eq!(
+            expected.soft_fork_votes_collected(),
+            Some(128),
+            "closing epoch's 128 seeded fork votes accumulate into id 121"
+        );
+    }
+
+    #[test]
+    fn candidate_zero_votes_matches_header_method() {
+        // A zero-vote candidate must be byte-equivalent to the existing
+        // header-reading method on the same fixture — table AND activated
+        // update. Fixture has a real ordinary-vote majority so the
+        // equality is non-trivial (a step actually applies).
+        let chain = build_chain_with_votes_fn(255, |h| {
+            if h == 128 || (129..=192).contains(&h) {
+                [1, 0, 0]
+            } else {
+                [0, 0, 0]
+            }
+        });
+
+        let via_header = chain.compute_expected_parameters(256, &[]).unwrap();
+        let (via_candidate, activated) = chain
+            .compute_expected_parameters_for_candidate(256, &[], [0, 0, 0])
+            .unwrap();
+
+        assert_eq!(via_candidate, via_header);
+        assert_eq!(via_candidate.storage_fee_factor(), 1_275_000, "step applied");
+        assert_eq!(activated, crate::voting::encode_disabled_rules(&[]));
+    }
+
+    #[test]
     fn compute_expected_parameters_no_votes_unchanged() {
         let config = testnet_config();
         let mut chain = HeaderChain::new(config.clone());

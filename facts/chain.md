@@ -395,6 +395,24 @@ Chain owns the live instance; consumers query it via `active_parameters()`.
 - **Determinism**: For any two correct implementations given the same chain,
   the output is byte-identical. This is the consensus rule.
 
+### `compute_expected_parameters_for_candidate(epoch_boundary_height: u32, block_proposed_update: &[u8], candidate_votes: [u8; 3]) -> Result<(Parameters, Vec<u8>), ChainError>`
+(added 2026-06-11)
+- **The candidate-aware sibling** of `compute_expected_parameters`: identical
+  pipeline, but `boundary_fork_vote` derives from the SUPPLIED
+  `candidate_votes` (id-120 membership) instead of `header_at(T)` — a mining
+  candidate is not in the chain yet. Also returns the activated update
+  (uniform with the pure seam; the mining caller may ignore it — the
+  extension's `[0x00, 124]` key carries the PROPOSED update, which the
+  caller already holds).
+- **Why**: `mining.votes` is operator config. A soft-fork-voting boundary
+  candidate assembled via the header-reading method omits its own fork-round
+  start from the declared table while its header carries the vote — every
+  validator recomputes with the vote present and rejects. The miner
+  self-orphans exactly when voting.
+- Existing `compute_expected_parameters` and its validation-path semantics
+  are unchanged (the applied header IS the right source there). Single
+  implementation: both delegate to the pure `compute_boundary_parameters`.
+
 ### `count_votes_in_epoch(epoch_end_height: u32) -> Result<HashMap<i8, u32>>`
 - **Precondition**: All headers in `[epoch_end_height - voting_length + 1, epoch_end_height]`
   are present in the chain.

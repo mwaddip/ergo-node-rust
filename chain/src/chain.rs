@@ -788,29 +788,73 @@ impl HeaderChain {
         epoch_boundary_height: u32,
         block_proposed_update: &[u8],
     ) -> Result<Parameters, ChainError> {
-        let tally = self.tally_just_ended_epoch(epoch_boundary_height)?;
-
         // JVM `forkVote`: the boundary header's OWN votes contain id 120
         // (`ErgoStateContext.process`). The boundary header is in the chain
-        // on every validation path (headers sync ahead of bodies). When it
-        // is absent — the mining-candidate path computes parameters for a
-        // header that does not exist yet — fall back to `false`: this node
-        // assembles candidates from `mining.votes`, and a configured fork
-        // vote at a boundary would need the candidate's votes threaded
-        // through here to start the round it announces.
+        // on every validation path (headers sync ahead of bodies). A header
+        // absent from the chain casts no vote; candidates assemble via
+        // [`Self::compute_expected_parameters_for_candidate`] instead.
         let boundary_fork_vote = self
             .header_at(epoch_boundary_height)
             .is_some_and(|h| h.votes.0.contains(&(SOFT_FORK_VOTE as u8)));
 
-        let (params, _activated_update) = crate::voting::compute_boundary_parameters(
+        let (params, _activated_update) = self.compute_boundary_parameters_at(
+            epoch_boundary_height,
+            block_proposed_update,
+            boundary_fork_vote,
+        )?;
+        Ok(params)
+    }
+
+    /// Candidate-aware sibling of [`Self::compute_expected_parameters`]:
+    /// identical pipeline, but `boundary_fork_vote` derives from the
+    /// SUPPLIED `candidate_votes` (id-120 membership) instead of
+    /// `header_at(T)` — a mining candidate is not in the chain yet.
+    ///
+    /// `mining.votes` is operator config: a soft-fork-voting boundary
+    /// candidate assembled via the header-reading method would omit its
+    /// own fork-round start from the declared table while its header
+    /// carries the vote — every validator recomputes with the vote present
+    /// and rejects, so the miner self-orphans exactly when voting. This
+    /// entry point threads the candidate's votes through instead.
+    ///
+    /// Also returns the activated update (`block_proposed_update` verbatim
+    /// at a voting-driven activation boundary, the canonical EMPTY
+    /// encoding `0x0000` otherwise) — mining needs it alongside the table
+    /// for extension key `[0x00, 124]` continuity.
+    pub fn compute_expected_parameters_for_candidate(
+        &self,
+        epoch_boundary_height: u32,
+        block_proposed_update: &[u8],
+        candidate_votes: [u8; 3],
+    ) -> Result<(Parameters, Vec<u8>), ChainError> {
+        let boundary_fork_vote = candidate_votes.contains(&(SOFT_FORK_VOTE as u8));
+        self.compute_boundary_parameters_at(
+            epoch_boundary_height,
+            block_proposed_update,
+            boundary_fork_vote,
+        )
+    }
+
+    /// Shared body of [`Self::compute_expected_parameters`] and
+    /// [`Self::compute_expected_parameters_for_candidate`]: seeded tally
+    /// over the closing epoch, then delegate to the pure
+    /// [`crate::voting::compute_boundary_parameters`]. The two public
+    /// entry points differ only in where `boundary_fork_vote` comes from.
+    fn compute_boundary_parameters_at(
+        &self,
+        epoch_boundary_height: u32,
+        block_proposed_update: &[u8],
+        boundary_fork_vote: bool,
+    ) -> Result<(Parameters, Vec<u8>), ChainError> {
+        let tally = self.tally_just_ended_epoch(epoch_boundary_height)?;
+        crate::voting::compute_boundary_parameters(
             &self.config.voting,
             epoch_boundary_height,
             &self.active_parameters,
             &tally,
             boundary_fork_vote,
             block_proposed_update,
-        )?;
-        Ok(params)
+        )
     }
 
     /// Tally header vote slots across one voting epoch — SEEDED, per JVM

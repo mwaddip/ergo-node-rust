@@ -2808,15 +2808,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let proposed_update_bytes =
                             chain_guard.active_proposed_update_bytes().to_vec();
                         let bp = if chain_guard.is_epoch_boundary(candidate_height) {
-                            match chain_guard.compute_expected_parameters(
+                            // Candidate-aware variant: boundary_fork_vote
+                            // comes from the candidate's own configured votes
+                            // — the candidate header isn't in the chain, so
+                            // the header-reading method would derive false
+                            // and a soft-fork-voting candidate would declare
+                            // a table missing its own fork-round start
+                            // (self-orphan). Activated update unused here:
+                            // the extension's [0x00,124] carries the
+                            // PROPOSED update captured above.
+                            match chain_guard.compute_expected_parameters_for_candidate(
                                 candidate_height,
                                 &proposed_update_bytes,
+                                gen.config.votes,
                             ) {
-                                Ok(p) => Some(p),
+                                Ok((p, _activated_update)) => Some(p),
                                 Err(e) => {
                                     tracing::warn!(
                                         candidate_height,
-                                        "mining: compute_expected_parameters failed: {e}"
+                                        "mining: compute_expected_parameters_for_candidate failed: {e}"
                                     );
                                     continue;
                                 }
