@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.7.1 — 2026-06-11
+
+The chain-tier release. The SANTA chain tier (retargeting + voting vectors)
+went live and donner grew its second arm — which, in the established
+tradition, surfaced consensus bugs in the code it was built to grade. Four
+voting divergences fixed, all JVM-verified:
+
+- **The vote tally is now SEEDED (JVM `VotingData` parity).** The boundary
+  parameter computation counted every non-zero vote id; the JVM seeds the
+  tally from the previous boundary's own votes at count 1 and increments
+  ONLY seeded ids — votes for unseeded ids count for nothing, and a
+  chain-start window (no previous boundary) tallies empty. A boundary whose
+  epoch carried votes the opening boundary didn't: we could step a parameter
+  the JVM doesn't — fork direction. Never hit on synced history.
+- **Approval thresholds** now use the closing epoch's id-120 count PLUS the
+  collected counter (was: collected only); the soft-fork lifecycle reads an
+  original-table snapshot so cleanup + same-boundary restart composes; an
+  approved vote for a table-absent or unknown id errors (JVM throw parity);
+  and id 9 (SubblocksPerBlock) is steppable via votes (the old `1..=8`
+  guard silently excluded it).
+- **Soft-fork-voting boundary candidates no longer self-orphan.**
+  `mining.votes` is live operator config; a boundary candidate's
+  fork-vote derivation read `header_at(T)` — absent for an un-applied
+  candidate — so a voting miner declared a table missing its own
+  fork-round start and every validator rejected it. New
+  `compute_expected_parameters_for_candidate` derives from the candidate's
+  own votes; the validation path is unchanged (one shared implementation).
+- **Pure consensus seams** for conformance: `voting::tally_votes_seeded`,
+  `voting::compute_boundary_parameters` (also returns the activated
+  update), `difficulty::{calculate, eip37_calculate, interpolate,
+  normalize_to_n_bits}` now public — settings as arguments, never network
+  presets. The donner runner's chain arm drives them: 10/10 on the corpus
+  (2 captured retarget points, 3 damping edges, 1 captured epoch boundary,
+  4 authored voting edges), block tier regression clean.
+- sigma-rust pin `a4ee7442` → `1e346127`. Addons re-pinned, lockfiles
+  synced: indexer 0.2.5, fastsync 0.1.3.
+
 ## v0.7.0 — 2026-06-10
 
 The conformance release. Building **donner** — the SANTA block-tier runner
