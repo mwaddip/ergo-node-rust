@@ -1500,7 +1500,13 @@ mod voting_chain_tests {
         header
     }
 
-    fn build_chain_with_votes(count: u32, votes: [u8; 3]) -> HeaderChain {
+    /// Build a testnet chain of `count` headers whose votes come from
+    /// `votes_at(height)`. The seeded tally makes vote PLACEMENT matter:
+    /// only ids voted by the epoch's opening boundary header accumulate.
+    fn build_chain_with_votes_fn(
+        count: u32,
+        votes_at: impl Fn(u32) -> [u8; 3],
+    ) -> HeaderChain {
         let config = testnet_config();
         let mut chain = HeaderChain::new(config.clone());
         let n_bits = config.initial_n_bits;
@@ -1510,7 +1516,7 @@ mod voting_chain_tests {
             BlockId(Digest32::zero()),
             1_000_000,
             n_bits,
-            votes,
+            votes_at(1),
         );
         let mut prev_id = genesis.id;
         chain.try_append_no_pow(genesis).unwrap();
@@ -1523,12 +1529,16 @@ mod voting_chain_tests {
                 prev_id,
                 1_000_000 + (h as u64 - 1) * 45_000,
                 expected_n_bits,
-                votes,
+                votes_at(h),
             );
             prev_id = header.id;
             chain.try_append_no_pow(header).unwrap();
         }
         chain
+    }
+
+    fn build_chain_with_votes(count: u32, votes: [u8; 3]) -> HeaderChain {
+        build_chain_with_votes_fn(count, |_| votes)
     }
 
     #[test]
@@ -1578,19 +1588,28 @@ mod voting_chain_tests {
         assert_eq!(chain.voting_length(), 128);
     }
 
+    // `count_votes_in_epoch(E)` tallies the epoch closing at boundary
+    // T = E + 1: window [T − L, T − 1], SEEDED by the previous boundary
+    // header (JVM `VotingData`). The pre-seeding versions of these tests
+    // called `count_votes_in_epoch(128)` — a window ending ON a boundary,
+    // which no consensus path uses — and expected unseeded counting; both
+    // encoded the retired plain-counter semantics.
+
     #[test]
     fn count_votes_in_epoch_uniform_voting() {
-        // Build 128 testnet headers each voting [1, 0, 0]
-        let chain = build_chain_with_votes(128, [1, 0, 0]);
-        let tally = chain.count_votes_in_epoch(128).unwrap();
+        // 256 testnet headers each voting [1, 0, 0]; the epoch closing at
+        // T=256 has window [128, 255] seeded by header 128's id-1 vote:
+        // seed 1 + 127 increments = 128.
+        let chain = build_chain_with_votes(256, [1, 0, 0]);
+        let tally = chain.count_votes_in_epoch(255).unwrap();
         assert_eq!(tally.get(&1), Some(&128));
         assert_eq!(tally.len(), 1);
     }
 
     #[test]
     fn count_votes_in_epoch_three_slots_summed() {
-        let chain = build_chain_with_votes(128, [1, 2, 3]);
-        let tally = chain.count_votes_in_epoch(128).unwrap();
+        let chain = build_chain_with_votes(256, [1, 2, 3]);
+        let tally = chain.count_votes_in_epoch(255).unwrap();
         assert_eq!(tally.get(&1), Some(&128));
         assert_eq!(tally.get(&2), Some(&128));
         assert_eq!(tally.get(&3), Some(&128));
@@ -1598,24 +1617,59 @@ mod voting_chain_tests {
 
     #[test]
     fn count_votes_in_epoch_zero_slots_ignored() {
-        let chain = build_chain_with_votes(128, [0, 0, 0]);
-        let tally = chain.count_votes_in_epoch(128).unwrap();
+        let chain = build_chain_with_votes(256, [0, 0, 0]);
+        let tally = chain.count_votes_in_epoch(255).unwrap();
         assert!(tally.is_empty());
     }
 
     #[test]
-    fn count_votes_in_epoch_only_uses_last_voting_length_headers() {
-        // Build 200 headers, only the last 128 should be counted at height=200.
-        let chain = build_chain_with_votes(200, [1, 0, 0]);
-        let tally = chain.count_votes_in_epoch(200).unwrap();
+    fn count_votes_in_epoch_chain_start_clamp_empty() {
+        // First boundary T=128: window clamps to [1, 127] and its head
+        // (height 1) is not the previous boundary — empty seed, so the
+        // tally is empty despite 110 id-1 votes in the window.
+        let chain =
+            build_chain_with_votes_fn(127, |h| if h <= 110 { [1, 0, 0] } else { [0, 0, 0] });
+        let tally = chain.count_votes_in_epoch(127).unwrap();
+        assert!(
+            tally.is_empty(),
+            "chain-start window has no previous boundary to seed from"
+        );
+    }
+
+    #[test]
+    fn count_votes_in_epoch_unseeded_id_dropped() {
+        // Header 128 (the seed) votes id 1; mid-epoch headers vote id 2.
+        // Id 2 was never seeded → drops; id 1 gets seed + nothing = 1.
+        let chain = build_chain_with_votes_fn(256, |h| {
+            if h == 128 {
+                [1, 0, 0]
+            } else if h > 128 {
+                [2, 0, 0]
+            } else {
+                [0, 0, 0]
+            }
+        });
+        let tally = chain.count_votes_in_epoch(255).unwrap();
+        assert_eq!(tally.get(&1), Some(&1), "seed vote counts as 1");
+        assert_eq!(tally.get(&2), None, "unseeded id accumulates nothing");
+    }
+
+    #[test]
+    fn count_votes_in_epoch_only_uses_window_headers() {
+        // 300 headers all voting id 1; the epoch closing at T=256 counts
+        // only its 128-header window [128, 255], not the whole chain.
+        let chain = build_chain_with_votes(300, [1, 0, 0]);
+        let tally = chain.count_votes_in_epoch(255).unwrap();
         assert_eq!(tally.get(&1), Some(&128));
     }
 
     #[test]
     fn count_votes_in_epoch_missing_header_errors() {
-        // Chain has only 50 headers; asking for epoch ending at 128 must error.
+        // Chain has only 50 headers; the window [1, 127] is not fully
+        // present, which is a caller error even though a chain-start
+        // window would tally empty.
         let chain = build_chain_with_votes(50, [1, 0, 0]);
-        assert!(chain.count_votes_in_epoch(128).is_err());
+        assert!(chain.count_votes_in_epoch(127).is_err());
     }
 
     #[test]
@@ -1655,102 +1709,125 @@ mod voting_chain_tests {
         assert_eq!(chain.active_parameters().block_version(), 2);
     }
 
+    // The pre-seeding versions of the next three tests placed their votes
+    // in the FIRST epoch (window [1, 127] — no previous boundary, empty
+    // seed) and expected unseeded counting. They encoded the retired
+    // plain-counter semantics; rebuilt here on the epoch closing at T=256,
+    // whose window [128, 255] is seeded by boundary header 128.
+
     #[test]
     fn compute_expected_parameters_majority_increases_step() {
-        // 65 of 128 testnet headers vote to increase StorageFeeFactor (ID 1).
+        // 65 of 128 window headers vote to increase StorageFeeFactor (ID 1):
+        // the seed (boundary header 128) + 64 mid-epoch headers.
         // changeApproved threshold is `> 64` (strict), so 65 passes.
-        let config = testnet_config();
-        let mut chain = HeaderChain::new(config.clone());
-        let n_bits = config.initial_n_bits;
-
-        // Genesis (no vote)
-        let mut prev_id = ergo_chain_types::BlockId(ergo_chain_types::Digest32::zero());
-        let genesis = make_header_with_votes(1, prev_id, 1_000_000, n_bits, [0, 0, 0]);
-        prev_id = genesis.id;
-        chain.try_append_no_pow(genesis).unwrap();
-
-        // Headers 2..=66: vote [1,0,0]; headers 67..=128: vote [0,0,0].
-        for h in 2..=128u32 {
-            let votes = if h <= 66 { [1, 0, 0] } else { [0, 0, 0] };
-            let header = make_header_with_votes(
-                h,
-                prev_id,
-                1_000_000 + (h as u64 - 1) * 45_000,
-                n_bits,
-                votes,
-            );
-            prev_id = header.id;
-            chain.try_append_no_pow(header).unwrap();
-        }
+        let chain = build_chain_with_votes_fn(256, |h| {
+            if h == 128 || (129..=192).contains(&h) {
+                [1, 0, 0]
+            } else {
+                [0, 0, 0]
+            }
+        });
 
         // Current active_parameters StorageFeeFactor = 1_250_000 (default)
-        let original = chain.active_parameters().storage_fee_factor();
-        assert_eq!(original, 1_250_000);
+        assert_eq!(chain.active_parameters().storage_fee_factor(), 1_250_000);
 
-        let expected = chain.compute_expected_parameters(128, &[]).unwrap();
+        let expected = chain.compute_expected_parameters(256, &[]).unwrap();
         // Step is +25_000 for ID 1
         assert_eq!(expected.storage_fee_factor(), 1_275_000);
     }
 
     #[test]
     fn compute_expected_parameters_exact_half_no_change() {
-        // 64 of 128 vote — exactly half — `change_approved` is strict `>`.
-        let config = testnet_config();
-        let mut chain = HeaderChain::new(config.clone());
-        let n_bits = config.initial_n_bits;
+        // 64 of 128 — the seed + 63 mid-epoch headers — exactly half;
+        // `change_approved` is strict `>`, so nothing steps. With the
+        // seed counting as 1, this pins the off-by-one the seeded tally
+        // could hide: 64-total must NOT approve, 65-total must.
+        let chain = build_chain_with_votes_fn(256, |h| {
+            if h == 128 || (129..=191).contains(&h) {
+                [1, 0, 0]
+            } else {
+                [0, 0, 0]
+            }
+        });
 
-        let mut prev_id = ergo_chain_types::BlockId(ergo_chain_types::Digest32::zero());
-        let genesis = make_header_with_votes(1, prev_id, 1_000_000, n_bits, [0, 0, 0]);
-        prev_id = genesis.id;
-        chain.try_append_no_pow(genesis).unwrap();
-
-        for h in 2..=128u32 {
-            let votes = if h <= 65 { [1, 0, 0] } else { [0, 0, 0] };
-            // 65 - 2 + 1 = 64 voting headers (heights 2..=65)
-            let header = make_header_with_votes(
-                h,
-                prev_id,
-                1_000_000 + (h as u64 - 1) * 45_000,
-                n_bits,
-                votes,
-            );
-            prev_id = header.id;
-            chain.try_append_no_pow(header).unwrap();
-        }
-
-        let expected = chain.compute_expected_parameters(128, &[]).unwrap();
-        // Tally is exactly 64 → not approved → unchanged.
+        let expected = chain.compute_expected_parameters(256, &[]).unwrap();
         assert_eq!(expected.storage_fee_factor(), 1_250_000);
     }
 
     #[test]
     fn compute_expected_parameters_negative_vote_decreases() {
-        // 65 vote -1 (decrease StorageFeeFactor).
-        let config = testnet_config();
-        let mut chain = HeaderChain::new(config.clone());
-        let n_bits = config.initial_n_bits;
+        // 65 of 128 window headers vote -1 (decrease StorageFeeFactor).
+        // (Negative ids can't appear in a valid boundary header on-chain —
+        // JVM hdrVotesUnknown — but the tally seeds whatever the window
+        // head carries; header-vote legality is enforced upstream.)
+        let chain = build_chain_with_votes_fn(256, |h| {
+            if h == 128 || (129..=192).contains(&h) {
+                [0xFFu8, 0, 0]
+            } else {
+                [0, 0, 0]
+            }
+        });
 
-        let mut prev_id = ergo_chain_types::BlockId(ergo_chain_types::Digest32::zero());
-        let genesis = make_header_with_votes(1, prev_id, 1_000_000, n_bits, [0, 0, 0]);
-        prev_id = genesis.id;
-        chain.try_append_no_pow(genesis).unwrap();
-
-        for h in 2..=128u32 {
-            // 65 voting headers: heights 2..=66
-            let votes = if h <= 66 { [0xFFu8, 0, 0] } else { [0, 0, 0] };
-            let header = make_header_with_votes(
-                h,
-                prev_id,
-                1_000_000 + (h as u64 - 1) * 45_000,
-                n_bits,
-                votes,
-            );
-            prev_id = header.id;
-            chain.try_append_no_pow(header).unwrap();
-        }
-
-        let expected = chain.compute_expected_parameters(128, &[]).unwrap();
+        let expected = chain.compute_expected_parameters(256, &[]).unwrap();
         assert_eq!(expected.storage_fee_factor(), 1_225_000); // -25_000
+    }
+
+    #[test]
+    fn compute_expected_parameters_first_epoch_votes_tally_empty() {
+        // Chain-start clamp through the full chain path: votes inside the
+        // first epoch (window [1, 127], no previous boundary) must not
+        // step anything at boundary 128 — JVM tallies that window empty.
+        let chain =
+            build_chain_with_votes_fn(128, |h| if h <= 110 { [1, 0, 0] } else { [0, 0, 0] });
+        let expected = chain.compute_expected_parameters(128, &[]).unwrap();
+        assert_eq!(
+            expected.storage_fee_factor(),
+            1_250_000,
+            "110 first-epoch votes count for nothing"
+        );
+    }
+
+    #[test]
+    fn compute_expected_parameters_fork_votes_without_boundary_vote_no_round() {
+        // Every window header votes for a soft fork, but the boundary
+        // header (256) itself does NOT: JVM starts a round only on the
+        // boundary header's own id-120 vote, so no counters may appear.
+        // (The retired lifecycle keyed the start off the epoch tally and
+        // would have opened a round here.)
+        let chain = build_chain_with_votes_fn(256, |h| {
+            if (128..=255).contains(&h) {
+                [120, 0, 0]
+            } else {
+                [0, 0, 0]
+            }
+        });
+        let expected = chain.compute_expected_parameters(256, &[]).unwrap();
+        assert_eq!(
+            expected.soft_fork_starting_height(),
+            None,
+            "no id-122 counter without a boundary fork vote"
+        );
+        assert_eq!(
+            expected.soft_fork_votes_collected(),
+            None,
+            "no id-121 counter without a boundary fork vote"
+        );
+    }
+
+    #[test]
+    fn compute_expected_parameters_boundary_fork_vote_starts_round() {
+        // Only the boundary header (256) votes for the fork → a round
+        // starts: id 122 = 256, id 121 = 0.
+        let chain = build_chain_with_votes_fn(256, |h| {
+            if h == 256 {
+                [120, 0, 0]
+            } else {
+                [0, 0, 0]
+            }
+        });
+        let expected = chain.compute_expected_parameters(256, &[]).unwrap();
+        assert_eq!(expected.soft_fork_starting_height(), Some(256));
+        assert_eq!(expected.soft_fork_votes_collected(), Some(0));
     }
 
     #[test]

@@ -398,10 +398,58 @@ Chain owns the live instance; consumers query it via `active_parameters()`.
 ### `count_votes_in_epoch(epoch_end_height: u32) -> Result<HashMap<i8, u32>>`
 - **Precondition**: All headers in `[epoch_end_height - voting_length + 1, epoch_end_height]`
   are present in the chain.
-- **Postcondition**: Returns the per-paramId vote count, summed across all
-  three vote slots in each header's `votes` field. Each slot is one signed
-  byte: positive = increase, negative = decrease, 0 = no vote, 120 = SoftFork.
+- **Postcondition (corrected 2026-06-11 — SEEDED tally, JVM `VotingData`
+  parity)**: For a boundary at `T` the window is `[T − voting_length, T − 1]`
+  (`epoch_end_height = T − 1`). The window's FIRST header — the previous
+  boundary — **seeds** the tally: each of its non-zero vote ids enters with
+  count 1 (the seed header's own vote counts). Every subsequent window header
+  increments **only already-seeded ids** — votes for unseeded ids count for
+  NOTHING (JVM `VotingData.update`; the seed is `ErgoStateContext.scala:
+  246-250` `VotingData(proposedVotes)` where `proposedVotes = votes.map(_ -> 1)`).
+  If the window's first header is NOT the previous boundary (chain-start
+  clamp: `T − voting_length < 1`, genesis is height 1), the seed is EMPTY and
+  the tally is empty — every vote in the window drops.
+- **Consensus note**: the previous postcondition specified a plain unseeded
+  counter (every non-zero id summed) and the implementation matched it. That
+  diverges from the JVM at any boundary whose epoch contained votes for ids
+  the opening boundary did not itself vote — fork direction (we could step a
+  parameter the JVM doesn't). Never hit on synced history (both networks
+  validate clean genesis→tip), surfaced by the SANTA chain-tier vectors.
 - **Helper for `compute_expected_parameters`**, exposed for testability.
+  Delegates to the pure `tally_votes_seeded` (below).
+
+### Pure consensus seams (added 2026-06-11 — SANTA chain tier)
+
+The SANTA chain tier grades these functions directly with settings handed
+per-entry. They MUST be pure: settings always arrive as arguments — never
+read from `ChainConfig::testnet()`/`mainnet()` presets (the bundled-1024-vs-
+testnet-128 votingLength bug class) and never from chain state.
+
+- `voting::tally_votes_seeded(window: &[(u32, [u8; 3])], boundary_height: u32,
+  voting_length: u32) -> HashMap<i8, u32>` — the seeded tally above, over
+  (height, votes) pairs. The legacy unseeded `tally_votes` is retired or
+  demoted to non-consensus use only (audit callers).
+- `voting::compute_boundary_parameters(voting: &VotingSettings,
+  boundary_height: u32, current: &Parameters, tally: &HashMap<i8, u32>,
+  boundary_fork_vote: bool, proposed_update: &[u8])
+  -> Result<(Parameters, Vec<u8>), ChainError>` — the pure extraction of
+  `compute_expected_parameters` steps 1-4 (ordinary steps, soft-fork
+  lifecycle, forced-v2, SubblocksPerBlock auto-insert), which becomes
+  tally + delegate (one implementation). Additionally returns the
+  **activated update**: the canonical `ErgoValidationSettingsUpdate`
+  encoding — `proposed_update` at a voting-driven activation boundary,
+  the canonical EMPTY encoding (`0x0000`) otherwise (JVM
+  `activatedUpdate`). `boundary_fork_vote` is the boundary header's OWN
+  id-120 vote (JVM `forkVote`, excluded from the window) — exact lifecycle
+  wiring per JVM `Parameters.update` / `ErgoStateContext.process`; the
+  SANTA chain contract (`~/projects/santa/docs/contract/
+  runner-contract-chain.md` §2 "voting") is the graded reference.
+- `difficulty::calculate`, `difficulty::eip37_calculate`,
+  `difficulty::interpolate`, `difficulty::normalize_to_n_bits` — pub
+  (currently private behind the chain-entangled `expected_difficulty`).
+  Signatures unchanged: anchor headers + numeric settings as args. The
+  damping clamps are EIP-37-arm-only; classic `calculate` stays unclamped
+  linear interpolation.
 
 ### `active_proposed_update_bytes() -> &[u8]`
 - **Postcondition**: Returns the raw `ErgoValidationSettingsUpdate`

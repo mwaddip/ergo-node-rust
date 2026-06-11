@@ -11,13 +11,6 @@
 use std::collections::HashMap;
 
 use ergo_lib::chain::parameters::{Parameter, Parameters};
-use hashbrown::HashMap as HbHashMap;
-
-// Note: Parameter::SoftForkVotesCollected (121) and Parameter::SoftForkStartingHeight (122)
-// are added by a parallel sigma-rust patch (`feat/parameter-soft-fork-variants`).
-// Until the integration branch lands and chain/Cargo.toml is bumped, references
-// to these variants will fail to compile. The chain code is correct in structure;
-// the build break is expected and will be unblocked by the main session.
 
 /// Vote slot value reserved for soft-fork ballots.
 ///
@@ -216,39 +209,6 @@ pub fn default_parameters(network: crate::Network) -> Parameters {
 /// `Parameters.SubblocksPerBlockDefault`). Auto-inserted whenever a
 /// `Parameters` table is constructed at protocol version 4 or higher.
 pub(crate) const SUBBLOCKS_PER_BLOCK_DEFAULT: i32 = 30;
-
-/// Apply a single ordinary parameter vote step to a parameters table.
-///
-/// `signed_id` is the raw byte from the header `votes` slot: positive
-/// means "increase", negative means "decrease". The step magnitude comes
-/// from [`parameter_step`] when hardcoded, otherwise `max(1, current / 100)`.
-///
-/// Boundary logic mirrors JVM: increase only applies if `current < max`,
-/// decrease only applies if `current > min`. No clamping — the guard
-/// prevents overshooting.
-///
-/// Returns `false` if `signed_id` is not an ordinary parameter (i.e. soft
-/// fork or unknown).
-pub(crate) fn apply_ordinary_step(table: &mut HbHashMap<Parameter, i32>, signed_id: i8) -> bool {
-    let Some(param) = ordinary_param(signed_id) else {
-        return false;
-    };
-    let Some(min) = parameter_min(signed_id) else {
-        return false;
-    };
-    let Some(max) = parameter_max(signed_id) else {
-        return false;
-    };
-
-    let current = *table.get(&param).unwrap_or(&0);
-    let step = parameter_step(signed_id).unwrap_or_else(|| 1.max(current / 100));
-
-    let new_val = if signed_id > 0 {
-        if current < max { current + step } else { current }
-    } else if current > min { current - step } else { current };
-    table.insert(param, new_val);
-    true
-}
 
 /// Parse parameters from a sequence of extension key-value pairs.
 ///
@@ -533,24 +493,267 @@ pub fn pack_extension_bytes(
     out
 }
 
-/// Tally header vote slots for one epoch's worth of headers.
+/// Seeded vote tally over one closing voting epoch — JVM `VotingData` parity.
 ///
-/// Each header `votes` field is `[i8; 3]` (or three signed-byte slots).
-/// Each non-zero slot contributes one count to its slot ID. Soft-fork
-/// votes (120) are tallied just like any other.
-pub fn tally_votes<'a, I>(headers: I) -> HashMap<i8, u32>
-where
-    I: IntoIterator<Item = &'a [u8; 3]>,
-{
+/// `window` is the `(height, votes)` stream for the epoch closing at
+/// `boundary_height` (`T`): exactly the headers in `[max(1, T −
+/// voting_length), T − 1]`, ascending. The window's FIRST header — the
+/// previous boundary — **seeds** the tally: each of its non-zero vote ids
+/// enters with count 1 (the seed header's own vote counts). Every
+/// subsequent window header increments **only already-seeded ids**; votes
+/// for unseeded ids count for nothing (JVM `VotingData.update`,
+/// `VotingData.scala:9-13`; the seed is `ErgoStateContext.scala:250-251`
+/// `VotingData(proposedVotes)` with `proposedVotes = votes.map(_ -> 1)`).
+///
+/// If the window's first header is NOT the previous boundary — the
+/// chain-start clamp, `T − voting_length < 1` with genesis at height 1 —
+/// the seed is empty and the tally is empty: every vote in the window
+/// drops (JVM starts from `VotingData.empty` and `update` can never add
+/// ids).
+///
+/// The boundary header `T` itself is NOT part of the window — its votes
+/// derive `forkVote` and seed the *next* epoch.
+///
+/// **Pure**: settings arrive as arguments, never from network presets or
+/// chain state. This is a SANTA chain-tier graded seam.
+pub fn tally_votes_seeded(
+    window: &[(u32, [u8; 3])],
+    boundary_height: u32,
+    voting_length: u32,
+) -> HashMap<i8, u32> {
+    let Some(((seed_height, seed_votes), rest)) = window.split_first() else {
+        return HashMap::new();
+    };
+    // Seed iff the window head is the previous boundary. At chain start
+    // (T − L < 1) no previous boundary exists and nothing seeds.
+    if boundary_height.checked_sub(voting_length) != Some(*seed_height) {
+        return HashMap::new();
+    }
+
     let mut tally: HashMap<i8, u32> = HashMap::new();
-    for slots in headers {
-        for &slot in slots {
+    for &slot in seed_votes {
+        if slot != 0 {
+            tally.insert(slot as i8, 1);
+        }
+    }
+    for (_, votes) in rest {
+        for &slot in votes {
             if slot != 0 {
-                *tally.entry(slot as i8).or_insert(0) += 1;
+                if let Some(count) = tally.get_mut(&(slot as i8)) {
+                    *count += 1;
+                }
             }
         }
     }
     tally
+}
+
+/// Compute the parameters an epoch-boundary block MUST emit, plus the
+/// activated validation-settings update — JVM `Parameters.update` parity.
+///
+/// Pure: every input arrives as an argument; nothing is read from network
+/// presets or chain state. This is a SANTA chain-tier graded seam; the
+/// chain-entangled [`crate::HeaderChain::compute_expected_parameters`] is
+/// tally + delegate onto this function (one implementation).
+///
+/// Inputs:
+/// - `voting`: epoch lengths and soft-fork thresholds.
+/// - `boundary_height`: the epoch-boundary height `T`
+///   (`T % voting_length == 0`, `T > 0`).
+/// - `current`: the parameters in force across the closing epoch (the
+///   previous boundary's table).
+/// - `tally`: the closing epoch's seeded vote tally (see
+///   [`tally_votes_seeded`]).
+/// - `boundary_fork_vote`: whether the boundary header `T`'s OWN votes
+///   contain id 120 (JVM `forkVote`, `ErgoStateContext.scala:240`). The
+///   boundary header is excluded from the closing tally; its fork vote
+///   gates only the start of a NEW voting round.
+/// - `proposed_update`: the raw `ErgoValidationSettingsUpdate` payload of
+///   the boundary block's own extension key `[0x00, 124]`; empty slice if
+///   absent.
+///
+/// Returns `(next_parameters, activated_update)` where `activated_update`
+/// is `proposed_update` verbatim at a voting-driven activation boundary
+/// and the canonical EMPTY encoding (`0x0000`, via
+/// [`encode_disabled_rules`] on no rules) otherwise — JVM
+/// `activatedUpdate`. The forced-v2 bump does NOT activate the update.
+///
+/// Port of JVM `Parameters.update` / `updateFork` / `updateParams`
+/// (`Parameters.scala:82-183`), including the sequential-`if` lifecycle
+/// structure whose conditions all read the PRE-update table while
+/// mutations accumulate in the running table.
+pub fn compute_boundary_parameters(
+    voting: &VotingConfig,
+    boundary_height: u32,
+    current: &Parameters,
+    tally: &HashMap<i8, u32>,
+    boundary_fork_vote: bool,
+    proposed_update: &[u8],
+) -> Result<(Parameters, Vec<u8>), crate::ChainError> {
+    use crate::ChainError;
+
+    if voting.voting_length == 0 {
+        return Err(ChainError::Voting("voting_length must be > 0".into()));
+    }
+
+    let mut next = current.clone();
+    let table = &mut next.parameters_table;
+    // None = no voting-driven activation this boundary (JVM
+    // `ErgoValidationSettingsUpdate.empty`).
+    let mut activated: Option<Vec<u8>> = None;
+
+    // --- JVM `updateFork` ---
+    //
+    // All branch conditions read the PRE-update state (JVM lazy vals over
+    // the receiver's table); only the running `table` mutates. Branches
+    // are sequential `if`s, not alternatives: cleanup and an immediate
+    // restart can fire at the same boundary. Height math in i64 — the
+    // starting height is an i32 table value and JVM does plain Int
+    // arithmetic; i64 keeps every reachable case exact without overflow.
+    let h = boundary_height as i64;
+    let l = voting.voting_length as i64;
+    let ve = voting.soft_fork_epochs as i64;
+    let ae = voting.activation_epochs as i64;
+
+    let starting_height = current
+        .parameters_table
+        .get(&Parameter::SoftForkStartingHeight)
+        .copied();
+    if let Some(start) = starting_height {
+        let start = start as i64;
+        // JVM `votes = votesInPrevEpoch + parametersTable(SoftForkVotesCollected)`.
+        let votes_in_prev_epoch = tally.get(&SOFT_FORK_VOTE).copied().unwrap_or(0) as i64;
+        let collected = current
+            .parameters_table
+            .get(&Parameter::SoftForkVotesCollected)
+            .copied()
+            .unwrap_or(0) as i64;
+        let votes_total = votes_in_prev_epoch + collected;
+        let approved = voting.soft_fork_approved(votes_total.clamp(0, u32::MAX as i64) as u32);
+
+        let mid_end = start + l * ve;
+        let activation = start + l * (ve + ae);
+        let cleanup_fail = start + l * (ve + 1);
+        let cleanup_success = start + l * (ve + ae + 1);
+
+        // Successful voting — cleanup after activation.
+        if h == cleanup_success && approved {
+            table.remove(&Parameter::SoftForkStartingHeight);
+            table.remove(&Parameter::SoftForkVotesCollected);
+        }
+        // Unsuccessful voting — cleanup.
+        if h == cleanup_fail && !approved {
+            table.remove(&Parameter::SoftForkStartingHeight);
+            table.remove(&Parameter::SoftForkVotesCollected);
+        }
+        // New voting starting over a just-cleaned round (the boundary
+        // header itself votes for a fork).
+        if boundary_fork_vote && (h == cleanup_success || (h == cleanup_fail && !approved)) {
+            table.insert(Parameter::SoftForkStartingHeight, boundary_height as i32);
+            table.insert(Parameter::SoftForkVotesCollected, 0);
+        }
+        // New epoch in voting — accumulate the closing epoch's fork votes.
+        if h <= mid_end {
+            table.insert(
+                Parameter::SoftForkVotesCollected,
+                votes_total.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+            );
+        }
+        // Successful voting — activation: bump BlockVersion, activate the
+        // proposed update.
+        if h == activation && approved {
+            let bv = table
+                .get(&Parameter::BlockVersion)
+                .copied()
+                .ok_or_else(|| {
+                    ChainError::Voting(
+                        "BlockVersion missing from parameters table at soft-fork activation"
+                            .into(),
+                    )
+                })?;
+            table.insert(Parameter::BlockVersion, bv + 1);
+            activated = Some(proposed_update.to_vec());
+        }
+    } else if boundary_fork_vote && boundary_height.is_multiple_of(voting.voting_length) {
+        // New voting with no round in progress.
+        table.insert(Parameter::SoftForkStartingHeight, boundary_height as i32);
+        table.insert(Parameter::SoftForkVotesCollected, 0);
+    }
+
+    // Forced version update to v2 — the non-voted mainnet hard fork.
+    // Reads the RUNNING table like JVM (a voting-driven bump at the same
+    // height suppresses the force).
+    if boundary_height == voting.version2_activation_height {
+        let bv = table.get(&Parameter::BlockVersion).copied().ok_or_else(|| {
+            ChainError::Voting(
+                "BlockVersion missing from parameters table at forced-v2 height".into(),
+            )
+        })?;
+        if bv == 1 {
+            table.insert(Parameter::BlockVersion, 2);
+        }
+    }
+
+    // --- JVM `updateParams` ---
+    //
+    // Ordinary parameter steps. JVM folds over the epoch votes filtered to
+    // ids `< SoftFork` (negatives included), reading each current value
+    // from the post-fork table SNAPSHOT (the `parametersTable` argument,
+    // not the fold accumulator) and writing into the running table. An
+    // approved vote for an id with no table entry throws in JVM (invalid
+    // block) — mirrored here as an error.
+    let base = table.clone();
+    for (&signed_id, &count) in tally {
+        if signed_id >= SOFT_FORK_VOTE {
+            continue;
+        }
+        if !voting.change_approved(count) {
+            continue;
+        }
+        let param = ordinary_param(signed_id).ok_or_else(|| {
+            ChainError::Voting(format!(
+                "approved vote for unknown parameter id {signed_id} at boundary {boundary_height}"
+            ))
+        })?;
+        let current_value = base.get(&param).copied().ok_or_else(|| {
+            ChainError::Voting(format!(
+                "approved vote for parameter id {signed_id} absent from table at boundary {boundary_height}"
+            ))
+        })?;
+        // Ids mapped by `ordinary_param` always have min/max entries.
+        let min = parameter_min(signed_id).unwrap_or(0);
+        let max = parameter_max(signed_id).unwrap_or(i32::MAX / 2);
+        let step = parameter_step(signed_id).unwrap_or_else(|| 1.max(current_value / 100));
+        let new_value = if signed_id > 0 {
+            if current_value < max {
+                current_value + step
+            } else {
+                current_value
+            }
+        } else if current_value > min {
+            current_value - step
+        } else {
+            current_value
+        };
+        table.insert(param, new_value);
+    }
+
+    // --- JVM `update` table3 ---
+    //
+    // Insert sub-blocks-per-block on the epoch after the v4 (protocol
+    // 6.0) activation: skipped when the update being activated RIGHT NOW
+    // disables rule 409 (`exMatchParameters`), in which case it fires at
+    // the next boundary instead.
+    let activated_bytes = activated.unwrap_or_else(|| encode_disabled_rules(&[]));
+    let bv_now = table.get(&Parameter::BlockVersion).copied().unwrap_or(-1);
+    if bv_now == 4
+        && !table.contains_key(&Parameter::SubblocksPerBlock)
+        && !parse_disabled_rules(&activated_bytes)?.contains(&409u16)
+    {
+        table.insert(Parameter::SubblocksPerBlock, SUBBLOCKS_PER_BLOCK_DEFAULT);
+    }
+
+    Ok((next, activated_bytes))
 }
 
 #[cfg(test)]
@@ -594,32 +797,77 @@ mod tests {
         assert!(cfg.soft_fork_approved(threshold + 1));
     }
 
-    #[test]
-    fn tally_three_slots_per_header() {
-        let headers = [[1u8, 0, 0], [1, 2, 0], [1, 2, 3]];
-        let refs: Vec<&[u8; 3]> = headers.iter().collect();
-        let tally = tally_votes(refs);
-        assert_eq!(tally.get(&1), Some(&3));
-        assert_eq!(tally.get(&2), Some(&2));
-        assert_eq!(tally.get(&3), Some(&1));
+    /// Window builder for seeded-tally tests: heights `start..start+n`,
+    /// each with the given votes.
+    fn window(start: u32, votes_per_height: &[[u8; 3]]) -> Vec<(u32, [u8; 3])> {
+        votes_per_height
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (start + i as u32, *v))
+            .collect()
     }
 
     #[test]
-    fn tally_zero_slots_ignored() {
-        let headers = vec![[0u8, 0, 0]; 100];
-        let refs: Vec<&[u8; 3]> = headers.iter().collect();
-        let tally = tally_votes(refs);
-        assert!(tally.is_empty());
+    fn seeded_tally_seed_counts_as_one() {
+        // Boundary T=256, L=128 → window [128, 255]. Seed (h=128) votes id 1;
+        // 64 mid-epoch headers vote id 1 → 65 total, seed included.
+        let mut w = vec![(128u32, [1u8, 0, 0])];
+        w.extend(window(129, &[[1u8, 0, 0]; 64]));
+        w.extend(window(193, &[[0u8, 0, 0]; 63]));
+        let tally = tally_votes_seeded(&w, 256, 128);
+        assert_eq!(tally.get(&1), Some(&65));
+        assert_eq!(tally.len(), 1);
     }
 
     #[test]
-    fn tally_negative_votes_distinct() {
-        // 0xFF = -1 as i8 = "decrease StorageFeeFactor"
-        let headers = [[1u8, 0xFF, 0]];
-        let refs: Vec<&[u8; 3]> = headers.iter().collect();
-        let tally = tally_votes(refs);
-        assert_eq!(tally.get(&1), Some(&1));
+    fn seeded_tally_chain_start_clamp_empty() {
+        // First boundary T=128: window clamps to [1, 127], head height 1 ≠
+        // T − L = 0 → empty seed → every vote drops, even 110 of them.
+        let mut w = window(1, &[[1u8, 0, 0]; 110]);
+        w.extend(window(111, &[[0u8, 0, 0]; 17]));
+        assert_eq!(w.len(), 127);
+        let tally = tally_votes_seeded(&w, 128, 128);
+        assert!(tally.is_empty(), "chain-start window must tally empty");
+    }
+
+    #[test]
+    fn seeded_tally_unseeded_id_ignored_mid_epoch() {
+        // Seed votes id 1 only; 70 mid-epoch headers vote id 2 → id 2
+        // accumulates nothing; 10 vote id 1 → 11 total.
+        let mut w = vec![(128u32, [1u8, 0, 0])];
+        w.extend(window(129, &[[2u8, 0, 0]; 70]));
+        w.extend(window(199, &[[1u8, 0, 0]; 10]));
+        w.extend(window(209, &[[0u8, 0, 0]; 47]));
+        let tally = tally_votes_seeded(&w, 256, 128);
+        assert_eq!(tally.get(&1), Some(&11));
+        assert_eq!(tally.get(&2), None, "votes for unseeded ids count for nothing");
+    }
+
+    #[test]
+    fn seeded_tally_empty_window_empty() {
+        assert!(tally_votes_seeded(&[], 256, 128).is_empty());
+    }
+
+    #[test]
+    fn seeded_tally_zero_vote_seed_stays_empty() {
+        // Seed header votes nothing → empty seed → nothing can accumulate.
+        let mut w = vec![(128u32, [0u8, 0, 0])];
+        w.extend(window(129, &[[1u8, 2, 3]; 127]));
+        assert!(tally_votes_seeded(&w, 256, 128).is_empty());
+    }
+
+    #[test]
+    fn seeded_tally_multi_slot_and_negative_ids() {
+        // Seed votes ids 1, -1 (0xFF), 120 across its three slots; each
+        // increments independently. (Negative ids can't appear in a valid
+        // boundary header on-chain — hdrVotesUnknown — but the pure tally
+        // seeds whatever the window head carries; legality is upstream.)
+        let mut w = vec![(128u32, [1u8, 0xFF, 120])];
+        w.extend(window(129, &[[1u8, 120, 0]; 5]));
+        let tally = tally_votes_seeded(&w, 256, 128);
+        assert_eq!(tally.get(&1), Some(&6));
         assert_eq!(tally.get(&-1), Some(&1));
+        assert_eq!(tally.get(&SOFT_FORK_VOTE), Some(&6));
     }
 
     #[test]
@@ -686,32 +934,67 @@ mod tests {
         );
     }
 
-    #[test]
-    fn apply_ordinary_step_increase() {
-        let mut table: HbHashMap<Parameter, i32> = HbHashMap::new();
-        table.insert(Parameter::StorageFeeFactor, 1_250_000);
-        let applied = apply_ordinary_step(&mut table, 1);
-        assert!(applied);
-        assert_eq!(table[&Parameter::StorageFeeFactor], 1_275_000);
+    // ---- compute_boundary_parameters (pure JVM Parameters.update port) ----
+
+    /// The canonical empty `ErgoValidationSettingsUpdate` encoding ("0000").
+    fn empty_update() -> Vec<u8> {
+        encode_disabled_rules(&[])
+    }
+
+    fn tally_of(entries: &[(i8, u32)]) -> HashMap<i8, u32> {
+        entries.iter().copied().collect()
+    }
+
+    /// Mainnet-default table (BlockVersion 1, no SubblocksPerBlock) — keeps
+    /// soft-fork lifecycle tests clear of the v4 auto-insert arm.
+    fn base_params() -> Parameters {
+        default_parameters(crate::Network::Mainnet)
     }
 
     #[test]
-    fn apply_ordinary_step_decrease() {
-        let mut table: HbHashMap<Parameter, i32> = HbHashMap::new();
-        table.insert(Parameter::StorageFeeFactor, 1_250_000);
-        let applied = apply_ordinary_step(&mut table, -1);
-        assert!(applied);
-        assert_eq!(table[&Parameter::StorageFeeFactor], 1_225_000);
+    fn boundary_params_majority_step_applies() {
+        let cfg = VotingConfig::testnet();
+        let (next, activated) = compute_boundary_parameters(
+            &cfg, 256, &base_params(), &tally_of(&[(1, 65)]), false, &[],
+        )
+        .unwrap();
+        assert_eq!(next.storage_fee_factor(), 1_275_000, "step +25_000 for id 1");
+        assert_eq!(activated, empty_update(), "non-activation boundary → 0x0000");
     }
 
     #[test]
-    fn apply_ordinary_step_guarded_at_min() {
-        let mut table: HbHashMap<Parameter, i32> = HbHashMap::new();
-        table.insert(Parameter::MaxBlockSize, 16 * 1024); // at min
-        let applied = apply_ordinary_step(&mut table, -3);
-        assert!(applied);
+    fn boundary_params_exact_half_no_step() {
+        let cfg = VotingConfig::testnet();
+        let (next, _) = compute_boundary_parameters(
+            &cfg, 256, &base_params(), &tally_of(&[(1, 64)]), false, &[],
+        )
+        .unwrap();
+        assert_eq!(next.storage_fee_factor(), 1_250_000, "64 of 128 is not > L/2");
+    }
+
+    #[test]
+    fn boundary_params_negative_vote_decreases() {
+        let cfg = VotingConfig::testnet();
+        let (next, _) = compute_boundary_parameters(
+            &cfg, 256, &base_params(), &tally_of(&[(-1, 65)]), false, &[],
+        )
+        .unwrap();
+        assert_eq!(next.storage_fee_factor(), 1_225_000);
+    }
+
+    #[test]
+    fn boundary_params_guarded_at_min() {
+        let cfg = VotingConfig::testnet();
+        let mut params = base_params();
+        params
+            .parameters_table
+            .insert(Parameter::MaxBlockSize, 16 * 1024); // at min
+        let (next, _) = compute_boundary_parameters(
+            &cfg, 256, &params, &tally_of(&[(-3, 65)]), false, &[],
+        )
+        .unwrap();
         assert_eq!(
-            table[&Parameter::MaxBlockSize],
+            next.max_block_size(),
             16 * 1024,
             "guard prevents decrease when current == min"
         );
@@ -721,24 +1004,264 @@ mod tests {
     /// The old hardcoded step of 100,000 produced 1,100,000 which disagreed
     /// with the extension section on mainnet.
     #[test]
-    fn apply_ordinary_step_max_block_cost_dynamic() {
-        let mut table: HbHashMap<Parameter, i32> = HbHashMap::new();
-        table.insert(Parameter::MaxBlockCost, 1_000_000);
-        let applied = apply_ordinary_step(&mut table, 4); // increase MaxBlockCost
-        assert!(applied);
-        // Dynamic step: max(1, 1_000_000 / 100) = 10_000
+    fn boundary_params_max_block_cost_dynamic_step() {
+        let cfg = VotingConfig::testnet();
+        let (next, _) = compute_boundary_parameters(
+            &cfg, 256, &base_params(), &tally_of(&[(4, 65)]), false, &[],
+        )
+        .unwrap();
         assert_eq!(
-            table[&Parameter::MaxBlockCost],
+            next.max_block_cost(),
             1_010_000,
             "dynamic step = max(1, current/100) = 10,000"
         );
     }
 
     #[test]
-    fn apply_ordinary_step_unknown_id() {
-        let mut table: HbHashMap<Parameter, i32> = HbHashMap::new();
-        let applied = apply_ordinary_step(&mut table, 99);
-        assert!(!applied);
+    fn boundary_params_approved_unknown_id_errors() {
+        // JVM `updateParams` reads `parametersTable(paramIdAbs)` for an
+        // approved id — an unknown id throws there (invalid block). Mirror.
+        let cfg = VotingConfig::testnet();
+        let r = compute_boundary_parameters(
+            &cfg, 256, &base_params(), &tally_of(&[(99, 65)]), false, &[],
+        );
+        assert!(r.is_err(), "approved unknown id must error like the JVM throw");
+    }
+
+    #[test]
+    fn boundary_params_unapproved_unknown_id_harmless() {
+        // Below the threshold the JVM guard short-circuits before the table
+        // read — unknown ids without a majority are silently ignored.
+        let cfg = VotingConfig::testnet();
+        let (next, _) = compute_boundary_parameters(
+            &cfg, 256, &base_params(), &tally_of(&[(99, 10)]), false, &[],
+        )
+        .unwrap();
+        assert_eq!(next, base_params());
+    }
+
+    // ---- soft-fork lifecycle through the pure seam ----
+
+    #[test]
+    fn boundary_params_fork_votes_without_round_leave_table_unchanged() {
+        // Tally full of id-120 votes, but the boundary header itself does
+        // NOT vote for a fork and no round is in progress: JVM starts a
+        // round only on `forkVote` (the boundary header's own vote) — the
+        // closing epoch's 120 count alone must NOT create counters.
+        let cfg = VotingConfig::testnet();
+        let (next, activated) = compute_boundary_parameters(
+            &cfg, 256, &base_params(), &tally_of(&[(SOFT_FORK_VOTE, 128)]), false, &[],
+        )
+        .unwrap();
+        assert_eq!(next, base_params(), "no 121/122 counters may appear");
+        assert_eq!(activated, empty_update());
+    }
+
+    #[test]
+    fn boundary_params_boundary_fork_vote_starts_round() {
+        let cfg = VotingConfig::testnet();
+        let (next, _) = compute_boundary_parameters(
+            &cfg, 256, &base_params(), &HashMap::new(), true, &[],
+        )
+        .unwrap();
+        assert_eq!(
+            next.soft_fork_starting_height(),
+            Some(256),
+            "id 122 = boundary height on round start"
+        );
+        assert_eq!(next.soft_fork_votes_collected(), Some(0), "id 121 starts at 0");
+    }
+
+    #[test]
+    fn boundary_params_mid_voting_accumulates_epoch_votes() {
+        let cfg = VotingConfig::testnet();
+        let mut params = base_params();
+        params
+            .parameters_table
+            .insert(Parameter::SoftForkStartingHeight, 128);
+        params
+            .parameters_table
+            .insert(Parameter::SoftForkVotesCollected, 10);
+        let (next, _) = compute_boundary_parameters(
+            &cfg, 256, &params, &tally_of(&[(SOFT_FORK_VOTE, 50)]), false, &[],
+        )
+        .unwrap();
+        assert_eq!(
+            next.soft_fork_votes_collected(),
+            Some(60),
+            "votes = closing epoch's 120 count + collected"
+        );
+        assert_eq!(next.soft_fork_starting_height(), Some(128));
+    }
+
+    #[test]
+    fn boundary_params_activation_bumps_version_and_activates_update() {
+        // start=128, L=128, ve=ae=32 → activation at 128 + 128*64 = 8320.
+        // Approval needs > 128*32*9/10 = 3686 collected votes.
+        let cfg = VotingConfig::testnet();
+        let mut params = base_params();
+        params
+            .parameters_table
+            .insert(Parameter::SoftForkStartingHeight, 128);
+        params
+            .parameters_table
+            .insert(Parameter::SoftForkVotesCollected, 3_700);
+        let proposed = encode_disabled_rules(&[215]);
+        let (next, activated) = compute_boundary_parameters(
+            &cfg, 8_320, &params, &HashMap::new(), false, &proposed,
+        )
+        .unwrap();
+        assert_eq!(next.block_version(), 2, "voting-driven activation bumps BlockVersion");
+        assert_eq!(
+            activated, proposed,
+            "activated update is the boundary's proposed update, passed through"
+        );
+        // Counters survive activation; cleanup happens one activation period later.
+        assert_eq!(next.soft_fork_starting_height(), Some(128));
+    }
+
+    #[test]
+    fn boundary_params_activation_without_approval_no_bump() {
+        let cfg = VotingConfig::testnet();
+        let mut params = base_params();
+        params
+            .parameters_table
+            .insert(Parameter::SoftForkStartingHeight, 128);
+        params
+            .parameters_table
+            .insert(Parameter::SoftForkVotesCollected, 100); // below 3686
+        let (next, activated) = compute_boundary_parameters(
+            &cfg, 8_320, &params, &HashMap::new(), false, &[],
+        )
+        .unwrap();
+        assert_eq!(next.block_version(), 1);
+        assert_eq!(activated, empty_update());
+    }
+
+    #[test]
+    fn boundary_params_failed_voting_cleanup() {
+        // cleanup-fail at start + L*(ve+1) = 128 + 128*33 = 4352 when not
+        // approved: counters removed, nothing re-inserted without forkVote.
+        let cfg = VotingConfig::testnet();
+        let mut params = base_params();
+        params
+            .parameters_table
+            .insert(Parameter::SoftForkStartingHeight, 128);
+        params
+            .parameters_table
+            .insert(Parameter::SoftForkVotesCollected, 100);
+        let (next, _) = compute_boundary_parameters(
+            &cfg, 4_352, &params, &HashMap::new(), false, &[],
+        )
+        .unwrap();
+        assert_eq!(next.soft_fork_starting_height(), None);
+        assert_eq!(next.soft_fork_votes_collected(), None);
+    }
+
+    #[test]
+    fn boundary_params_successful_voting_cleanup_and_restart() {
+        // cleanup-success at start + L*(ve+ae+1) = 128 + 128*65 = 8448 with
+        // approval. With the boundary header voting for a fork again, a new
+        // round starts at the same boundary (JVM sequential ifs).
+        let cfg = VotingConfig::testnet();
+        let mut params = base_params();
+        params
+            .parameters_table
+            .insert(Parameter::SoftForkStartingHeight, 128);
+        params
+            .parameters_table
+            .insert(Parameter::SoftForkVotesCollected, 3_700);
+        // Without forkVote: counters just clear.
+        let (cleared, _) = compute_boundary_parameters(
+            &cfg, 8_448, &params, &HashMap::new(), false, &[],
+        )
+        .unwrap();
+        assert_eq!(cleared.soft_fork_starting_height(), None);
+        assert_eq!(cleared.soft_fork_votes_collected(), None);
+        // With forkVote: cleanup then immediate restart.
+        let (restarted, _) = compute_boundary_parameters(
+            &cfg, 8_448, &params, &HashMap::new(), true, &[],
+        )
+        .unwrap();
+        assert_eq!(restarted.soft_fork_starting_height(), Some(8_448));
+        assert_eq!(restarted.soft_fork_votes_collected(), Some(0));
+    }
+
+    #[test]
+    fn boundary_params_forced_v2_at_activation_height() {
+        // Mainnet forced v1→v2 at 417,792 (a non-voted hard fork). The
+        // activated update stays empty — JVM does not wire activatedUpdate
+        // for the forced path.
+        let cfg = VotingConfig::mainnet();
+        let (next, activated) = compute_boundary_parameters(
+            &cfg, 417_792, &base_params(), &HashMap::new(), false, &[],
+        )
+        .unwrap();
+        assert_eq!(next.block_version(), 2);
+        assert_eq!(activated, empty_update(), "forced v2 does not activate the update");
+    }
+
+    #[test]
+    fn boundary_params_subblocks_insert_gated_on_rule_409() {
+        // A voting-driven 3→4 activation: when the activated update
+        // disables rule 409, the SubblocksPerBlock auto-insert is skipped
+        // (fires at the NEXT boundary); without 409 it fires immediately.
+        let cfg = VotingConfig::testnet();
+        let mut params = base_params();
+        params.parameters_table.insert(Parameter::BlockVersion, 3);
+        params
+            .parameters_table
+            .insert(Parameter::SoftForkStartingHeight, 128);
+        params
+            .parameters_table
+            .insert(Parameter::SoftForkVotesCollected, 3_700);
+
+        let with_409 = encode_disabled_rules(&[215, 409]);
+        let (next, activated) = compute_boundary_parameters(
+            &cfg, 8_320, &params, &HashMap::new(), false, &with_409,
+        )
+        .unwrap();
+        assert_eq!(next.block_version(), 4);
+        assert_eq!(activated, with_409);
+        assert!(
+            !next
+                .parameters_table
+                .contains_key(&Parameter::SubblocksPerBlock),
+            "rule 409 in the activated update suppresses the insert"
+        );
+
+        let without_409 = encode_disabled_rules(&[215]);
+        let (next, _) = compute_boundary_parameters(
+            &cfg, 8_320, &params, &HashMap::new(), false, &without_409,
+        )
+        .unwrap();
+        assert_eq!(next.block_version(), 4);
+        assert_eq!(
+            next.parameters_table
+                .get(&Parameter::SubblocksPerBlock)
+                .copied(),
+            Some(SUBBLOCKS_PER_BLOCK_DEFAULT),
+            "no 409 in the activated update → insert fires at this boundary"
+        );
+    }
+
+    #[test]
+    fn boundary_params_at_v4_inserts_subblocks_when_absent() {
+        // Non-activation boundary with the table already at v4 and id 9
+        // absent: activated update is empty (contains no 409) → insert.
+        let cfg = VotingConfig::testnet();
+        let mut params = base_params();
+        params.parameters_table.insert(Parameter::BlockVersion, 4);
+        let (next, _) = compute_boundary_parameters(
+            &cfg, 256, &params, &HashMap::new(), false, &[],
+        )
+        .unwrap();
+        assert_eq!(
+            next.parameters_table
+                .get(&Parameter::SubblocksPerBlock)
+                .copied(),
+            Some(SUBBLOCKS_PER_BLOCK_DEFAULT)
+        );
     }
 
     #[test]

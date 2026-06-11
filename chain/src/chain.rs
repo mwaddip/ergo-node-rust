@@ -721,13 +721,15 @@ impl HeaderChain {
         self.active_proposed_update_bytes = proposed_update_bytes;
     }
 
-    /// Tally the just-ended voting epoch's votes for an epoch boundary.
+    /// Tally the just-ended voting epoch's votes for an epoch boundary —
+    /// SEEDED, per JVM `VotingData` (see [`crate::voting::tally_votes_seeded`]).
     ///
-    /// The just-ended epoch nominally spans
-    /// `[epoch_boundary_height - voting_length, epoch_boundary_height - 1]`,
-    /// but since the chain's first valid block is height 1 (no block at
-    /// height 0), the very first epoch is one block shorter. Walks
-    /// `[max(1, h - voting_length), h - 1]` and tallies votes.
+    /// For a boundary at `T` the window is `[T - voting_length, T - 1]`:
+    /// the window's first header is the PREVIOUS boundary and seeds the
+    /// tally; later headers increment only seeded ids. Since the chain's
+    /// first valid block is height 1 (no block at height 0), the very
+    /// first epoch's window clamps to `[1, T - 1]` — its head is not a
+    /// boundary, the seed is empty, and the tally is empty.
     fn tally_just_ended_epoch(
         &self,
         epoch_boundary_height: u32,
@@ -743,16 +745,21 @@ impl HeaderChain {
             return Ok(HashMap::new());
         }
 
-        let mut votes: Vec<[u8; 3]> = Vec::with_capacity((end - start + 1) as usize);
+        let mut window: Vec<(u32, [u8; 3])> =
+            Vec::with_capacity((end - start + 1) as usize);
         for h in start..=end {
             let header = self.header_at(h).ok_or_else(|| {
                 ChainError::Voting(format!(
                     "header at height {h} missing from chain (epoch boundary {epoch_boundary_height})"
                 ))
             })?;
-            votes.push(header.votes.0);
+            window.push((h, header.votes.0));
         }
-        Ok(crate::voting::tally_votes(&votes))
+        Ok(crate::voting::tally_votes_seeded(
+            &window,
+            epoch_boundary_height,
+            voting_length,
+        ))
     }
 
     /// Compute the parameters that the block at `epoch_boundary_height`
@@ -781,206 +788,44 @@ impl HeaderChain {
         epoch_boundary_height: u32,
         block_proposed_update: &[u8],
     ) -> Result<Parameters, ChainError> {
-        let voting = &self.config.voting;
-        if voting.voting_length == 0 {
-            return Err(ChainError::Voting("voting_length must be > 0".into()));
-        }
-
         let tally = self.tally_just_ended_epoch(epoch_boundary_height)?;
 
-        let mut new_params = self.active_parameters.clone();
+        // JVM `forkVote`: the boundary header's OWN votes contain id 120
+        // (`ErgoStateContext.process`). The boundary header is in the chain
+        // on every validation path (headers sync ahead of bodies). When it
+        // is absent — the mining-candidate path computes parameters for a
+        // header that does not exist yet — fall back to `false`: this node
+        // assembles candidates from `mining.votes`, and a configured fork
+        // vote at a boundary would need the candidate's votes threaded
+        // through here to start the round it announces.
+        let boundary_fork_vote = self
+            .header_at(epoch_boundary_height)
+            .is_some_and(|h| h.votes.0.contains(&(SOFT_FORK_VOTE as u8)));
 
-        // Snapshot the pre-update BlockVersion so we can detect a voting-
-        // driven activation (Step 2) in Step 4. Taken before any step runs —
-        // Step 1 can't touch BlockVersion but this keeps the source of the
-        // snapshot obviously independent of the subsequent mutations.
-        let pre_update_block_version = new_params
-            .parameters_table
-            .get(&Parameter::BlockVersion)
-            .copied()
-            .unwrap_or(0);
-
-        // Step 1: ordinary parameter changes (IDs ±1..±8).
-        for (&signed_id, &count) in &tally {
-            let abs = signed_id.unsigned_abs() as i8;
-            if !(1..=8).contains(&abs) {
-                continue;
-            }
-            if voting.change_approved(count) {
-                crate::voting::apply_ordinary_step(
-                    &mut new_params.parameters_table,
-                    signed_id,
-                );
-            }
-        }
-
-        // Step 2: soft-fork lifecycle (operates directly on parameters_table).
-        let fork_votes = tally.get(&SOFT_FORK_VOTE).copied().unwrap_or(0);
-        Self::apply_soft_fork_lifecycle(
-            voting,
+        let (params, _activated_update) = crate::voting::compute_boundary_parameters(
+            &self.config.voting,
             epoch_boundary_height,
-            fork_votes,
-            &mut new_params,
-        );
-
-        // Step 3: forced v2 activation (mainnet hard-fork that pre-dates voting).
-        if voting.version2_activation_height != 0
-            && epoch_boundary_height == voting.version2_activation_height
-        {
-            let bv = new_params
-                .parameters_table
-                .get(&Parameter::BlockVersion)
-                .copied()
-                .unwrap_or(0);
-            if bv == 1 {
-                new_params
-                    .parameters_table
-                    .insert(Parameter::BlockVersion, 2);
-            }
-        }
-
-        // Step 4: auto-insert SubblocksPerBlock at BlockVersion == 4,
-        // gated on rule 409 in the activated update (JVM parity).
-        //
-        // Mirrors JVM `Parameters.scala::update` (lines 87-96): when the
-        // protocol reaches v4 (the 6.0 soft-fork that introduces sub-blocks)
-        // and `SubblocksPerBlock` is not yet present in the table, insert it
-        // with the default value (30) — UNLESS the update being activated
-        // in this call disables rule 409 (`exMatchParameters`). JVM's
-        // mainnet hard-codes `proposedUpdate = [215, 409]` at launch
-        // (`LaunchParameters.scala`), so when that proposal is activated at
-        // the v6 BlockVersion bump (h=1,628,160 on mainnet), rule 409 is
-        // present in `activatedUpdate` and the insert is skipped; it fires
-        // at the NEXT boundary instead.
-        //
-        // `activatedUpdate` in JVM is `proposedUpdate` at activation height,
-        // `empty` otherwise. We reproduce this by checking whether the
-        // voting lifecycle bumped BlockVersion in this call. The forced-v2
-        // activation (1 → 2 at `version2_activation_height`) is explicitly
-        // excluded — JVM does NOT wire `activatedUpdate` for that path.
-        let post_update_block_version = new_params
-            .parameters_table
-            .get(&Parameter::BlockVersion)
-            .copied()
-            .unwrap_or(0);
-        let is_voting_activation = post_update_block_version != pre_update_block_version
-            && !(voting.version2_activation_height != 0
-                && epoch_boundary_height == voting.version2_activation_height
-                && post_update_block_version == 2);
-        let rule_409_in_activated = if is_voting_activation {
-            crate::voting::parse_disabled_rules(block_proposed_update)?.contains(&409u16)
-        } else {
-            false
-        };
-
-        if post_update_block_version == 4
-            && !new_params
-                .parameters_table
-                .contains_key(&Parameter::SubblocksPerBlock)
-            && !rule_409_in_activated
-        {
-            new_params.parameters_table.insert(
-                Parameter::SubblocksPerBlock,
-                crate::voting::SUBBLOCKS_PER_BLOCK_DEFAULT,
-            );
-        }
-
-        Ok(new_params)
+            &self.active_parameters,
+            &tally,
+            boundary_fork_vote,
+            block_proposed_update,
+        )?;
+        Ok(params)
     }
 
-    /// Apply the six-state soft-fork lifecycle transition.
+    /// Tally header vote slots across one voting epoch — SEEDED, per JVM
+    /// `VotingData` (see [`crate::voting::tally_votes_seeded`]).
     ///
-    /// Mirrors JVM `Parameters.updateFork`. Branches are mutually exclusive
-    /// by height; at most one fires per call. After cleanup, a new voting
-    /// can start in the same call (sequential, not exclusive).
+    /// `epoch_end_height` is `T - 1` for the boundary at `T`: the window is
+    /// `[T - voting_length, T - 1]` (clamped to start at height 1 — the
+    /// chain-start window has an empty seed and tallies empty). The
+    /// window's first header — the previous boundary — seeds the tally;
+    /// later headers increment only seeded ids. Delegates to the pure
+    /// [`crate::voting::tally_votes_seeded`]; exposed for testability,
+    /// [`Self::compute_expected_parameters`] uses the same window
+    /// internally.
     ///
-    /// Operates directly on `params.parameters_table` via the new
-    /// `Parameter::SoftForkVotesCollected` / `Parameter::SoftForkStartingHeight`
-    /// variants — no separate state struct.
-    fn apply_soft_fork_lifecycle(
-        voting: &crate::voting::VotingConfig,
-        height: u32,
-        fork_votes: u32,
-        params: &mut Parameters,
-    ) {
-        let voting_length = voting.voting_length;
-        let soft_fork_epochs = voting.soft_fork_epochs;
-        let activation_epochs = voting.activation_epochs;
-
-        let starting_height = params
-            .parameters_table
-            .get(&Parameter::SoftForkStartingHeight)
-            .copied();
-        let votes_collected = params
-            .parameters_table
-            .get(&Parameter::SoftForkVotesCollected)
-            .copied();
-
-        if let (Some(starting_height), Some(votes_collected)) =
-            (starting_height, votes_collected)
-        {
-            let starting_height = starting_height as u32;
-            let votes_collected = votes_collected.max(0) as u32;
-            let approved = voting.soft_fork_approved(votes_collected);
-            let mid_end = starting_height + voting_length * soft_fork_epochs;
-            let activation = starting_height + voting_length * (soft_fork_epochs + activation_epochs);
-            let cleanup_fail = starting_height + voting_length * (soft_fork_epochs + 1);
-            let cleanup_success = starting_height + voting_length * (soft_fork_epochs + activation_epochs + 1);
-
-            if approved && height == cleanup_success {
-                // Successful voting cleanup
-                params.parameters_table.remove(&Parameter::SoftForkStartingHeight);
-                params.parameters_table.remove(&Parameter::SoftForkVotesCollected);
-            } else if !approved && height == cleanup_fail {
-                // Unsuccessful voting cleanup
-                params.parameters_table.remove(&Parameter::SoftForkStartingHeight);
-                params.parameters_table.remove(&Parameter::SoftForkVotesCollected);
-            } else if approved && height == activation {
-                // Activation: bump BlockVersion
-                let bv = params
-                    .parameters_table
-                    .get(&Parameter::BlockVersion)
-                    .copied()
-                    .unwrap_or(0);
-                params
-                    .parameters_table
-                    .insert(Parameter::BlockVersion, bv + 1);
-            } else if height <= mid_end {
-                // Mid-voting: add this epoch's votes
-                let new_total = votes_collected.saturating_add(fork_votes) as i32;
-                params
-                    .parameters_table
-                    .insert(Parameter::SoftForkVotesCollected, new_total);
-            }
-            // else: activation period (between mid_end and activation), no action.
-        }
-
-        // After cleanup OR if no voting was active, start new voting if fork
-        // votes are present this epoch.
-        let still_inactive = !params
-            .parameters_table
-            .contains_key(&Parameter::SoftForkStartingHeight);
-        if still_inactive && fork_votes > 0 {
-            params
-                .parameters_table
-                .insert(Parameter::SoftForkStartingHeight, height as i32);
-            // Per contract item 3: ID 121 = 0 on start. The current epoch's
-            // fork votes are not double-counted; they were the trigger but
-            // the running counter starts at zero.
-            params
-                .parameters_table
-                .insert(Parameter::SoftForkVotesCollected, 0);
-        }
-    }
-
-    /// Tally header vote slots across one voting epoch.
-    ///
-    /// Walks headers in `[epoch_end_height - voting_length + 1, epoch_end_height]`
-    /// inclusive and sums the three signed-byte vote slots in each
-    /// header's `votes` field. Used by [`Self::compute_expected_parameters`]
-    /// and exposed for testability.
-    ///
-    /// Errors if any header in the requested range is missing from the
+    /// Errors if any header in the (clamped) window is missing from the
     /// chain — callers must ensure the precondition holds before calling.
     pub fn count_votes_in_epoch(
         &self,
@@ -992,26 +837,33 @@ impl HeaderChain {
                 "voting_length must be > 0".into(),
             ));
         }
+        let boundary_height = epoch_end_height.checked_add(1).ok_or_else(|| {
+            ChainError::Voting(format!(
+                "epoch_end_height {epoch_end_height} overflows the boundary height"
+            ))
+        })?;
 
-        let start = epoch_end_height
-            .checked_sub(voting_length - 1)
-            .ok_or_else(|| {
-                ChainError::Voting(format!(
-                    "epoch_end_height {epoch_end_height} < voting_length {voting_length}"
-                ))
-            })?;
+        let start = boundary_height.saturating_sub(voting_length).max(1);
+        if start > epoch_end_height {
+            return Ok(std::collections::HashMap::new());
+        }
 
-        let mut votes: Vec<[u8; 3]> = Vec::with_capacity(voting_length as usize);
+        let mut window: Vec<(u32, [u8; 3])> =
+            Vec::with_capacity((epoch_end_height - start + 1) as usize);
         for h in start..=epoch_end_height {
             let header = self.header_at(h).ok_or_else(|| {
                 ChainError::Voting(format!(
                     "header at height {h} missing from chain (epoch end {epoch_end_height})"
                 ))
             })?;
-            votes.push(header.votes.0);
+            window.push((h, header.votes.0));
         }
 
-        Ok(crate::voting::tally_votes(&votes))
+        Ok(crate::voting::tally_votes_seeded(
+            &window,
+            boundary_height,
+            voting_length,
+        ))
     }
 
     // --- Light-client install ---

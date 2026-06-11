@@ -96,7 +96,10 @@ fn required_difficulty(header: &Header) -> BigInt {
 
 /// Normalize a difficulty BigInt through encode/decode roundtrip.
 /// This is consensus-critical — both JVM `calculate()` and `eip37Calculate()` do this.
-fn normalize_to_n_bits(difficulty: &BigInt, initial_n_bits: u32) -> u32 {
+///
+/// Pure consensus seam (SANTA chain tier): no chain state, all inputs as
+/// arguments.
+pub fn normalize_to_n_bits(difficulty: &BigInt, initial_n_bits: u32) -> u32 {
     let encoded = encode_compact_bits(difficulty);
     let n_bits = encoded as u32;
     // If roundtrip produces 0, use initial difficulty
@@ -105,8 +108,14 @@ fn normalize_to_n_bits(difficulty: &BigInt, initial_n_bits: u32) -> u32 {
 
 /// Pre-EIP-37 difficulty calculation using linear regression.
 ///
-/// Matches JVM `DifficultyAdjustment.calculate()`.
-fn calculate(
+/// Matches JVM `DifficultyAdjustment.calculate()`. Unclamped linear
+/// interpolation — the 0.5×–1.5× damping clamps are EIP-37-arm-only.
+///
+/// `headers` are the epoch-spaced anchor headers, ascending; only
+/// `n_bits`, `timestamp`, and `height` are read. Pure consensus seam
+/// (SANTA chain tier): no chain state, all settings as arguments.
+/// [`expected_difficulty`] delegates here outside the EIP-37 window.
+pub fn calculate(
     headers: &[&Header],
     epoch_length: u32,
     block_interval_ms: u64,
@@ -174,8 +183,11 @@ fn bitcoin_calculate(
 /// Averages predictive (linear regression) and classic (Bitcoin-style) approaches,
 /// with capping at 50%-150% of last difficulty.
 ///
-/// Matches JVM `DifficultyAdjustment.eip37Calculate()`.
-fn eip37_calculate(
+/// Matches JVM `DifficultyAdjustment.eip37Calculate()`. When the EIP-37
+/// arm governs, the EIP-37 epoch length is the `epoch_length` argument
+/// throughout. Pure consensus seam (SANTA chain tier);
+/// [`expected_difficulty`] delegates here inside the EIP-37 window.
+pub fn eip37_calculate(
     headers: &[&Header],
     epoch_length: u32,
     block_interval_ms: u64,
@@ -231,8 +243,8 @@ fn cap_difficulty(diff: &BigInt, reference: &BigInt) -> BigInt {
 /// Matches JVM `DifficultyAdjustment.interpolate()`.
 ///
 /// Data points are `(height, difficulty)`. Returns the extrapolated difficulty
-/// at `max_height + epoch_length`.
-fn interpolate(data: &[(i64, BigInt)], epoch_length: i64) -> BigInt {
+/// at `max_height + epoch_length`. Pure consensus seam (SANTA chain tier).
+pub fn interpolate(data: &[(i64, BigInt)], epoch_length: i64) -> BigInt {
     let n = data.len();
 
     if n == 1 {
