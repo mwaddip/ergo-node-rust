@@ -30,8 +30,8 @@ enr-store = { path = "store" }
 ergo-api = { path = "api" }
 ergo-sync = { path = "sync" }
 ergo_avltree_rust = "0.1.1"
-ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "a4ee7442" }
-ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "a4ee7442" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "1e346127" }
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "1e346127" }
 ergo-mempool = { path = "mempool" }
 ergo-mining = { path = "mining" }
 ergo-validation = { path = "validation" }
@@ -39,7 +39,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
-sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "a4ee7442" }
+sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "1e346127" }
 toml = "0.8"
 tracing = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
@@ -51,7 +51,7 @@ redb = "4"
 thiserror = "2"
 
 [dev-dependencies]
-sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "a4ee7442" }
+sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "1e346127" }
 serde_json = "1"
 tempfile = "3"
 k256 = { version = "0.13.1", features = ["arithmetic"] }

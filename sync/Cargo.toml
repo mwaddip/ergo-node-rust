@@ -19,7 +19,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 ergo_avltree_rust = "0.1.1"
-ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "a4ee7442" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "1e346127" }
 bytes = "1"
 hex = "0.4"
 tempfile = "3"

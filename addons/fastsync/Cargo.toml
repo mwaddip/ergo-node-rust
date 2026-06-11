@@ -8,9 +8,9 @@ description = "Fast bootstrap for ergo-node-rust via peer REST API — based on 
 
 [dependencies]
 # Ergo types — header PoW verification, transaction serialization
-ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "a4ee7442" }
-ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "a4ee7442" }
-sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "a4ee7442" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "1e346127" }
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "1e346127" }
+sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "1e346127" }
 
 # HTTP client — rustls so we ship static, no openssl
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
