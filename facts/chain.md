@@ -583,21 +583,28 @@ section counts are read as JVM `r.getUInt().toInt` — plain `.toInt`, not
 51). A payload declaring a ≥2^31 rules count therefore parses as
 rules-empty instead of erroring. Mirrored exactly; pinned by test.
 
-**statusUpdates handling — precise scope.** After the rules section the
-strict parse MUST read the `statusUpdates` COUNT (VLQ u32; a payload
-truncated before it — e.g. the 1-byte `0x00` — errors, JVM
-`getUInt` underflow parity). `count == 0` → Ok. `count > 0` → Ok
-WITHOUT validating the entries (lenient tail). Rationale: mainnet's real
-h=1,628,160 payload carries 3 status updates and MUST keep passing
-verbatim through the live wrappers — rejecting unparseable-to-us status
-entries would make the swallow wrapper replace REAL on-chain payloads
-with empty, diverging our proposedUpdate/activated tracking from JVM on
-canonical history. **Known gap (flagged to SANTA)**: JVM's strict parse
-fully decodes each status entry (`RuleStatusSerializer`, sigma-side — no
-Rust port exists in sigma-rust), so a payload with MALFORMED status
-entries rejects on JVM and passes here. Closing it needs the sigma
-`RuleStatusSerializer` wire format ported (sigma-rust session scope) —
-do not guess it from on-chain samples.
+**statusUpdates handling — STRICT (gap closed 2026-06-12, sigma pin
+`75be067f`).** After the rules section the strict parse reads the
+`statusUpdates` COUNT (VLQ; JVM `getUInt().toInt` — the count-wrap note
+above applies here too; a payload truncated before the count — e.g. the
+1-byte `0x00` — errors, JVM `getUInt` underflow parity), then decodes
+EVERY entry: `ruleId` = VLQ ushort wrapped through
+`(offset + FIRST_RULE_ID).toShort` (FIRST_RULE_ID = 1000), followed by
+`RuleStatus::sigma_parse` from the new sigma-rust
+`ergotree_ir::validation` module (wire format
+`[dataSize: VLQ ushort][statusCode: byte][dataBytes]`, JVM quirks
+included: ReplacedRule IGNORES dataSize and reads its VLQ ushort;
+unknown statusCode skips dataSize bytes → ReplacedRule(0) forward-compat
+arm). Malformed/truncated entries → Err at the strict seam; the live
+wrappers swallow to empty as before (two-layer split unchanged).
+Trailing bytes AFTER the final entry are NOT an error (JVM Reader
+parity — `parseBytes` does not enforce full consumption). Mainnet
+h=1,628,160's payload (3× ReplacedRule: 1011→1016, 1007→1017,
+1008→1018) parses strict-clean and flows verbatim — it is valid, not
+lenient-tolerated. The parsed statuses are decode-validated and
+DISCARDED: enr models update payloads as bytes (see
+`active_proposed_update_bytes` rationale); dynamic rule-status state
+remains out of scope until a real on-chain update requires it.
 
 ### Fork-vote window gate — JVM `checkForkVote` (added 2026-06-12, NEW live-path rule)
 
