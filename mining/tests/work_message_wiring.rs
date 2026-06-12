@@ -202,11 +202,14 @@ fn build_work_message_wiring_matches_independent_serialization() {
     let expected_msg = hex::encode(blake2b256_bytes(&bytes_via_serialize));
     assert_eq!(work.msg, expected_msg, "WorkMessage.msg mismatch");
 
-    // ---- 6. proof.msg_preimage must equal the bytes (hex encoded) ----
-    assert_eq!(
-        work.proof.msg_preimage,
-        hex::encode(&bytes_via_serialize),
-        "WorkMessage.proof.msg_preimage mismatch"
+    // ---- 6. the basic candidate omits the proof entirely ----
+    // `build_work_message` produces the {msg, b, h, pk} basic candidate
+    // (proof None). The header-preimage wiring is already verified
+    // byte-for-byte at step 4 via the returned `bytes_via_build`; a future
+    // candidateWithTxs path would set Some and hex-encode those same bytes.
+    assert!(
+        work.proof.is_none(),
+        "basic candidate must omit the proof (got Some)"
     );
 
     // ---- 7. Other WorkMessage fields ----

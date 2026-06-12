@@ -184,7 +184,7 @@ fn generate_candidate_and_mine_block() {
     assert!(!work.msg.is_empty(), "msg should be non-empty hex");
     assert!(!work.b.is_empty(), "b (target) should be non-empty");
     assert!(!work.pk.is_empty(), "pk should be non-empty hex");
-    assert!(!work.proof.msg_preimage.is_empty(), "preimage should be non-empty");
+    assert!(work.proof.is_none(), "basic candidate omits the proof (no nested msgPreimage)");
 
     // Verify candidate structure
     assert_eq!(candidate.transactions.len(), 1, "should have 1 tx (emission only)");

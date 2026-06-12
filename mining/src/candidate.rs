@@ -135,10 +135,17 @@ pub fn build_work_message(
         b: target.to_string(),
         h: height,
         pk: pk_hex,
-        proof: ProofOfUpcomingTransactions {
-            msg_preimage: hex::encode(&header_bytes),
-            tx_proofs: vec![],
-        },
+        // No mandatory transaction proofs today: the block carries only the
+        // emission tx. The JVM `WorkMessage` encoder drops a `None` proof via
+        // `.collect { case (_, Some(v)) => ... }`, so we emit `None` and the
+        // `proof` field is omitted from the JSON. This keeps the basic
+        // candidate ({msg, b, h, pk}) under the reference Autolykos2 miner's
+        // fixed jsmn REQ_LEN=11 token buffer; a nested proof object overflows
+        // it ("Jsmn failed to parse latest block"). A future candidateWithTxs
+        // path will build `Some(ProofOfUpcomingTransactions { msg_preimage:
+        // hex::encode(&header_bytes), tx_proofs })` — `header_bytes` is
+        // returned below for exactly that.
+        proof: None,
     };
 
     Ok((header_bytes, work))

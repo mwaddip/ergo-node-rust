@@ -164,19 +164,23 @@ without a separate encoding pass. Do not read the semantic types
 (`BigInt`/`EcPoint`/`[u8; 32]`) as the field types; they describe meaning,
 the JSON block describes the wire.
 
-JSON response:
+JSON response (basic candidate — no mandatory tx proofs, the only case
+the node produces today):
 
 ```json
 {
   "msg": "hex string (32 bytes)",
   "b": 748014723576678314041035877227113663879264849498014394977645987,
   "h": 271235,
-  "pk": "hex string (33 bytes compressed)",
-  "proof": {
-    "msgPreimage": "hex string (serialized header without PoW)",
-    "txProofs": []
-  }
+  "pk": "hex string (33 bytes compressed)"
 }
+```
+
+`proof` is **OMITTED** when there are no mandatory transaction proofs (see
+below). When present (a `candidateWithTxs`-style candidate), it is:
+
+```json
+  "proof": { "msgPreimage": "hex (header without PoW)", "txProofs": [...] }
 ```
 
 **`b` is a bare JSON NUMBER, not a quoted string (corrected 2026-06-12 —
@@ -194,7 +198,26 @@ serialize it as an arbitrary-precision JSON number (serde_json
 feature). This was invisible until the node was first driven by a real
 external miner (the "untested as a mining source" serve-direction gap —
 same class as the rust-peer serve bugs). `msg`/`pk` stay hex strings,
-`h` stays a number, `proof` stays as shown (JVM includes it).
+`h` stays a number.
+
+**`proof` is OPTIONAL and OMITTED when empty (corrected 2026-06-12 — the
+SECOND serve bug, same root cause).** JVM `WorkMessage` encoder
+(`ergo-core .../mining/WorkMessage.scala:27-39`) builds the object then
+`.collect { case (name, Some(value)) => ... }` — `proof` (and `h`) come
+from `Option`s and are **dropped from the JSON entirely** when `None`, NOT
+emitted as `null`. `proofsForMandatoryTransactions` is `None` for a
+candidate with no mandatory transactions (our only case — the block
+carries just the emission tx), so the JVM basic candidate is
+`{msg, b, h, pk}`. Our node emitted a full `proof` object
+unconditionally; that inflates the candidate to ~15 JSON tokens, and the
+reference Autolykos2 miners parse with a fixed `#define REQ_LEN 11`
+token buffer (`Autolykos2_NV_Miner secp256k1/include/definitions.h`) —
+jsmn returns `NOMEM`, "Jsmn failed to parse latest block", and the miner
+never mines. Fix: model `proof` as `Option`, `#[serde(skip_serializing_if
+= "Option::is_none")]`, and set it `None` while there are no mandatory tx
+proofs. (`h` is likewise `Option` JVM-side, omitted for v1 blocks; our
+always-present `h` is correct for v2+ — the only versions the node
+serves — and the miner expects it. Leave `h` present.)
 
 ### `ProofOfUpcomingTransactions`
 

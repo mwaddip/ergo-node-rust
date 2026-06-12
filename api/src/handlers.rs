@@ -3623,10 +3623,7 @@ mod tests {
             b: String::new(),
             h: 0,
             pk: String::new(),
-            proof: ergo_mining::ProofOfUpcomingTransactions {
-                msg_preimage: String::new(),
-                tx_proofs: vec![],
-            },
+            proof: None,
         }
     }
 

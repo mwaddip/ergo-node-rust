@@ -72,8 +72,21 @@ pub struct WorkMessage {
     pub h: u32,
     /// Miner public key — hex-encoded compressed point.
     pub pk: String,
-    /// Header pre-image for miner verification.
-    pub proof: ProofOfUpcomingTransactions,
+    /// Header pre-image and tx-membership proofs for miner verification.
+    ///
+    /// OPTIONAL: OMITTED from the JSON entirely (not `null`) when there are
+    /// no mandatory transaction proofs. Mirrors the JVM `WorkMessage` encoder
+    /// (`mining/WorkMessage.scala:27-39`), which builds the object then
+    /// `.collect { case (name, Some(value)) => ... }` — dropping a `None`
+    /// proof rather than emitting it. The basic `/mining/candidate` path
+    /// always sets this `None` (the block carries only the emission tx, so
+    /// there are no mandatory-tx proofs); a future `candidateWithTxs` path
+    /// will set `Some`. Emitting a nested proof object unconditionally
+    /// inflated the basic candidate past the reference Autolykos2 miner's
+    /// fixed jsmn `REQ_LEN=11` token buffer → "Jsmn failed to parse latest
+    /// block" and the miner never mines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof: Option<ProofOfUpcomingTransactions>,
 }
 
 /// Serialize the decimal target `b` as a bare (unquoted) JSON number.
@@ -122,16 +135,15 @@ pub struct CachedCandidate {
 mod tests {
     use super::*;
 
+    /// A basic candidate WorkMessage (proof `None` — the only shape the node
+    /// produces today), parameterized by the target `b`.
     fn work_with_b(b: &str) -> WorkMessage {
         WorkMessage {
             msg: "00".repeat(32),
             b: b.to_string(),
             h: 271_235,
             pk: format!("02{}", "11".repeat(32)),
-            proof: ProofOfUpcomingTransactions {
-                msg_preimage: "dead".to_string(),
-                tx_proofs: vec![],
-            },
+            proof: None,
         }
     }
 
@@ -166,16 +178,53 @@ mod tests {
     }
 
     #[test]
-    fn only_b_changes_shape() {
-        // Guard the rest of the wire shape: msg/pk stay quoted hex strings,
-        // h stays a bare number, proof is unchanged.
+    fn surviving_fields_keep_their_shape() {
+        // msg/pk stay quoted hex strings, h stays a bare number. (proof
+        // omission is asserted separately in basic_candidate_omits_proof.)
         let json = serde_json::to_string(&work_with_b("12237864960")).unwrap();
         assert!(json.contains(r#""msg":"0000"#), "msg must stay a hex string: {json}");
         assert!(json.contains(r#""pk":"0211"#), "pk must stay a hex string: {json}");
         assert!(json.contains(r#""h":271235"#), "h must stay a bare number: {json}");
+    }
+
+    #[test]
+    fn basic_candidate_omits_proof() {
+        // The basic candidate is {msg, b, h, pk} — the JVM `WorkMessage`
+        // encoder drops a `None` proof, and the reference Autolykos2 miner
+        // parses with a fixed jsmn REQ_LEN=11 token buffer. A nested proof
+        // object overflows it ("Jsmn failed to parse latest block"), so the
+        // `proof` key must be ABSENT, not `null`.
+        let json = serde_json::to_string(&work_with_b("12237864960")).unwrap();
+
         assert!(
-            json.contains(r#""msgPreimage":"dead""#),
-            "proof.msgPreimage must stay a hex string: {json}"
+            !json.contains("proof"),
+            "basic candidate must omit the proof key entirely, got: {json}"
+        );
+        assert!(
+            !json.contains("msgPreimage"),
+            "no nested proof preimage on the basic candidate: {json}"
+        );
+        assert!(
+            !json.contains("null"),
+            "proof must be OMITTED, not serialized as null: {json}"
+        );
+
+        // The four expected keys are present, b still bare.
+        assert!(json.contains(r#""msg":"#), "msg present: {json}");
+        assert!(json.contains(r#""b":12237864960"#), "b present and bare: {json}");
+        assert!(json.contains(r#""h":271235"#), "h present: {json}");
+        assert!(json.contains(r#""pk":"#), "pk present: {json}");
+
+        // Token-count sanity (nice-to-have): the candidate must fit the
+        // miner's REQ_LEN=11 jsmn buffer. jsmn counts one token for the
+        // object + one per key + one per scalar value = 1 + 4 + 4 = 9 <= 11.
+        // Assert exactly four scalar fields and no nesting.
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object().expect("WorkMessage serializes to a JSON object");
+        assert_eq!(obj.len(), 4, "basic candidate must have exactly 4 keys: {json}");
+        assert!(
+            obj.values().all(|v| !v.is_object() && !v.is_array()),
+            "no nested objects/arrays in the basic candidate: {json}"
         );
     }
 }
