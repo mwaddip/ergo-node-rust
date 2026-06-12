@@ -477,27 +477,63 @@ testnet-128 votingLength bug class) and never from chain state.
 - `voting::compute_boundary_parameters(voting: &VotingSettings,
   boundary_height: u32, current: &Parameters, tally: &[(i8, u32)],
   boundary_fork_vote: bool, proposed_update: &[u8])
-  -> Result<(Parameters, Vec<u8>), ChainError>` — the pure extraction of
-  `compute_expected_parameters` steps 1-4 (ordinary steps, soft-fork
-  lifecycle, forced-v2, SubblocksPerBlock auto-insert), which stays
-  tally + delegate (one implementation). Additionally returns the
-  **activated update**: the canonical `ErgoValidationSettingsUpdate`
-  encoding — `proposed_update` verbatim at a voting-driven activation
-  boundary, the canonical EMPTY encoding (`0x0000`) otherwise (JVM
-  `activatedUpdate`). `boundary_fork_vote` is the boundary header's OWN
-  id-120 vote (JVM `forkVote`, excluded from the window) — exact lifecycle
-  wiring per JVM `Parameters.update` / `ErgoStateContext.process`; the
-  SANTA chain contract (`~/projects/santa/docs/contract/
-  runner-contract-chain.md` §2/§3/§4 "voting", incl. the REJECT arm) is
-  the graded reference. **Strictness (added 2026-06-12)**: the pure seam
-  parse-validates `proposed_update` UP FRONT via
-  `parse_validation_settings_update` (below) and errors on failure — JVM
-  parity at the seam level is "these bytes must deserialize", because the
-  JVM object handed to `Parameters.update` cannot exist otherwise. Live
-  callers pre-swallow (see `compute_expected_parameters`). The
-  `votesInPrevEpoch` operand is the FIRST id-120 entry of the ordered
-  tally (JVM `epochVotes.find(_._1 == SoftFork)`), and `updateParams`
-  folds in tally order.
+  -> Result<(Parameters, ValidationSettingsUpdate), ChainError>` — the
+  pure extraction of `compute_expected_parameters` steps 1-4 (ordinary
+  steps, soft-fork lifecycle, forced-v2, SubblocksPerBlock auto-insert),
+  which stays tally + delegate (one implementation). Additionally returns
+  the **activated update AS A PARSED VALUE** (changed 2026-06-12, round 3
+  — was canonical bytes, before that verbatim bytes): JVM
+  `Parameters.update` returns the `ErgoValidationSettingsUpdate` OBJECT;
+  the wire form is whatever a consumer gets from `serialize(value)`,
+  NEVER the input slice. At a voting-driven activation boundary the value
+  is the parse of `proposed_update`; otherwise the EMPTY value. Trailing
+  garbage and count-wrap artifacts in the input cannot survive into the
+  value (the canonicalization the SANTA `status-*-canonicalized` vectors
+  pin). The 409 auto-insert gate reads `value.rules` directly — no
+  re-parse of just-produced bytes. `boundary_fork_vote` is the boundary
+  header's OWN id-120 vote (JVM `forkVote`, excluded from the window) —
+  exact lifecycle wiring per JVM `Parameters.update` /
+  `ErgoStateContext.process`; the SANTA chain contract
+  (`~/projects/santa/docs/contract/runner-contract-chain.md` §2/§3/§4
+  "voting", incl. the REJECT arm) is the graded reference. **Strictness
+  (added 2026-06-12)**: the pure seam parse-validates `proposed_update`
+  UP FRONT via `parse_validation_settings_update` (below) and errors on
+  failure — JVM parity at the seam level is "these bytes must
+  deserialize", because the JVM object handed to `Parameters.update`
+  cannot exist otherwise. Live callers pre-swallow (see
+  `compute_expected_parameters`). The `votesInPrevEpoch` operand is the
+  FIRST id-120 entry of the ordered tally (JVM
+  `epochVotes.find(_._1 == SoftFork)`), and `updateParams` folds in
+  tally order.
+
+### `ValidationSettingsUpdate` value + canonical encoder (added 2026-06-12)
+
+```rust
+pub struct ValidationSettingsUpdate {
+    pub rules: Vec<u16>,                      // rulesToDisable, input order
+    pub statuses: Vec<(i16, RuleStatus)>,     // (ruleId, status), input order
+}
+// the EMPTY value encodes to "0000"
+voting::encode_validation_settings_update(&ValidationSettingsUpdate)
+    -> Result<Vec<u8>, ChainError>
+```
+
+Canonical serializer — port of
+`ErgoValidationSettingsUpdateSerializer.serialize` (rules count + VLQ
+ids; statuses count + per-entry `putUShort(ruleId − FIRST_RULE_ID)` +
+`RuleStatus` sigma-serialize). **Fallible by JVM parity**: a status
+ruleId < 1000 makes the offset negative and JVM's `putUShort`
+require-fails — notably `ReplacedRule(0)`, which is exactly what the
+unknown-statusCode forward-compat PARSE arm produces. The JVM can accept
+an update it cannot re-serialize (SANTA finding, 2026-06-12): a node
+that ACTIVATES such an update throws only when something later
+serializes the value (e.g. a miner assembling a boundary extension) —
+`Parameters.update` itself succeeds. Mirror exactly: parse accepts,
+encode Errs. The activation arm of this case is UNREPRESENTABLE as a
+SANTA vector (the expected hex cannot exist); donner maps an
+encode-Err to the errored envelope. No live-node consumer encodes the
+activated value today (the proposed-bytes tracking for
+`active_proposed_update_bytes` is verbatim-by-design and unaffected).
 - `difficulty::calculate`, `difficulty::eip37_calculate`,
   `difficulty::interpolate`, `difficulty::normalize_to_n_bits` — pub
   (currently private behind the chain-entangled `expected_difficulty`).
@@ -553,7 +589,7 @@ verbatim. Approval compares via signed widening (`votes as i64 > threshold`)
 (Threshold math `L·ve·9/10` stays in u64 — JVM Int-overflow on hostile
 SETTINGS is out of scope; vectors hand sane settings.)
 
-### `parse_validation_settings_update(bytes: &[u8]) -> Result<Vec<u16>, ChainError>` (added 2026-06-12)
+### `parse_validation_settings_update(bytes: &[u8]) -> Result<ValidationSettingsUpdate, ChainError>` (added 2026-06-12; returns the full value since round 3)
 
 Strict deserialization of an `ErgoValidationSettingsUpdate` payload —
 port of `ErgoValidationSettingsUpdateSerializer.parse`
@@ -572,9 +608,11 @@ Ergo `rulesSpec` disableability (ValidationRules.scala:22-231, v6.0.3):
   200, 201, 203-211, 213, 214, 216, 300-305, 307, 403, 500, 501.
 - Not in spec (passes): everything else, incl. 110, 202, 414, ≥1000.
 
-`parse_disabled_rules` remains the lenient rules-section reader used by
-the 409 auto-insert gate on ALREADY-NORMALIZED bytes; the strict seam is
-the validation entry point.
+`parse_disabled_rules` was REMOVED in round 3 (2026-06-12): the 409
+auto-insert gate reads the parsed value's `rules` directly and no other
+non-test caller remained. The strict seam is the only parse entry point.
+The encoder's Err variant is `ChainError::Voting` (pinned
+implementation-side, round 3).
 
 **Count-wrap parity (added 2026-06-12, implementation-derived)**: both
 section counts are read as JVM `r.getUInt().toInt` — plain `.toInt`, not
@@ -600,11 +638,13 @@ wrappers swallow to empty as before (two-layer split unchanged).
 Trailing bytes AFTER the final entry are NOT an error (JVM Reader
 parity — `parseBytes` does not enforce full consumption). Mainnet
 h=1,628,160's payload (3× ReplacedRule: 1011→1016, 1007→1017,
-1008→1018) parses strict-clean and flows verbatim — it is valid, not
-lenient-tolerated. The parsed statuses are decode-validated and
-DISCARDED: enr models update payloads as bytes (see
-`active_proposed_update_bytes` rationale); dynamic rule-status state
-remains out of scope until a real on-chain update requires it.
+1008→1018) parses strict-clean — it is valid, not lenient-tolerated.
+The parsed statuses are RETAINED in the returned
+`ValidationSettingsUpdate` value (round 3 — previously discarded) so
+consumers can canonically re-encode; dynamic rule-status STATE remains
+out of scope until a real on-chain update requires it
+(`active_proposed_update_bytes` keeps tracking the block's verbatim
+bytes, unaffected).
 
 ### Fork-vote window gate — JVM `checkForkVote` (added 2026-06-12, NEW live-path rule)
 
