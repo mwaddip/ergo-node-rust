@@ -589,6 +589,31 @@ verbatim. Approval compares via signed widening (`votes as i64 > threshold`)
 (Threshold math `L·ve·9/10` stays in u64 — JVM Int-overflow on hostile
 SETTINGS is out of scope; vectors hand sane settings.)
 
+**HEIGHT/start arithmetic is i64-exact — a DELIBERATE divergence from JVM
+`Int`, out of scope (verified 2026-06-12).** JVM `Height = Int` and
+`votingLength`/`softForkEpochs`/`activationEpochs`/`version2ActivationHeight`
+are all `Int` (VotingSettings.scala:3-6, ErgoHistoryUtils Height = Int), so
+the JVM computes every checkpoint (`S + L·(ve+ae+1)` etc., and the
+`check_fork_vote` window `finishing`/`afterActivation`) in WRAPPING 32-bit.
+We compute them in `i64` exact (`h/l/ve/ae/start as i64`). These agree for
+ALL reachable inputs and diverge ONLY when BOTH (a) `start = table[122]` is
+negative — impossible in real or JVM-produced state, the lifecycle only ever
+writes `122 = height ≥ genesis` — AND (b) `boundary_height` is chosen near
+2³² so its low-32-bits match the JVM-wrapped checkpoint. Within `[0, 2³²)`
+with `start ≥ 0` and sane settings the i64-exact value and the
+i32-wrapped-reinterpreted-as-u32 value are bit-identical, so the branch
+decisions match (this is WHY the wrapping-votes vector E is green while the
+height math is not wrapped — votes wrap is reachable via a hostile
+table[121]; height wrap needs an unreachable negative start). Matching the
+JVM here would require interpreting `boundary_height` as a wrapping i32
+EVERYWHERE (incl. Scala negative-modulo in the `h % L == 0` restart
+disjunct) for zero reachable benefit — a representational virus on the hot
+path. Same out-of-scope class as settings-overflow and in-table-unknown-ids:
+SANTA flags before authoring any hostile-height (`height ≥ 2³¹`) or
+negative-`122` vector; absent that flag the board's green here means
+"agrees on all reachable input," NOT "byte-matches JVM Int wrap on
+adversarial heights."
+
 ### `parse_validation_settings_update(bytes: &[u8]) -> Result<ValidationSettingsUpdate, ChainError>` (added 2026-06-12; returns the full value since round 3)
 
 Strict deserialization of an `ErgoValidationSettingsUpdate` payload —
@@ -702,6 +727,63 @@ chain-entangled delegation onto this seam (active parameters + network
 header on the live path (JVM-indistinguishable there: both surface as
 rule-407 invalid through `validateNoThrow`); the three-way split exists
 for the tier's grading granularity.
+
+### Header vote-field validity — JVM `validateVotes` (added 2026-06-12, NEW live-path rule)
+
+Port of `ErgoStateContext.validateVotes` (ErgoStateContext.scala:328-345),
+rules 212-214. **Was MISSING entirely** — chain/ read `header.votes` only
+for the tally and the fork gate and validated the field for nothing
+(accept-what-JVM-rejects, fork direction; invisible on canonical history —
+no real header violates these — but an adversary who MINES a header with a
+malformed vote field gets it into our tree while the network rejects it).
+Found in the 2026-06-12 vote-rule cross-read.
+
+```rust
+voting::check_header_votes(votes: [u8; 3]) -> Result<(), ChainError>
+```
+
+Stateless on the header's own three vote bytes (rules 212-214 need no
+chain state, no epoch position). Let `vs` = the non-zero bytes (zeros
+dropped), each interpreted as **i8** (vote ids are signed; `0xFF` = −1,
+decrease votes are negative). Rules, all fatal:
+
+- **212 `hdrVotesNumber`**: `count(vs where v != 120) <= 2`
+  (`ParamVotesCount = 2`; the soft-fork vote 120 does NOT count toward the
+  limit). `[1,2,120]` ok; `[1,2,3]` rejects.
+- **213 `hdrVotesDuplicates`**: every id in `vs` appears exactly once
+  (checked over the non-zero list — multiple zero slots are fine). `[1,1,0]`
+  rejects.
+- **214 `hdrVotesContradictory`**: no id `v` appears together with `−v`,
+  where the negation is **i8-wrapping** (`(-v) as i8`, JVM `(-v).toByte`).
+  `[1, 0xFF, 0]` (= [1, −1]) rejects. **Quirk to replicate exactly**:
+  `−128` (`0x80`) is its own i8 negation (`-(-128)` overflows back to
+  `−128`), so a lone `[0x80,0,0]` is SELF-contradictory and rejects even
+  though it appears once. Test-pin it.
+
+`Ok(())` = valid; `Err` names the failed rule. On the live path Err
+rejects the header. **Live hook**: chain-entangled delegation in the
+header-validation entry (every header, not just boundaries) — one
+implementation, same pattern as `check_fork_vote`.
+
+**Rule 215 (`hdrVotesUnknown`) is DEFERRED — not a bug-by-omission, a
+dynamic-status case.** It rejects an epoch-start (`votingStarts`) vote for
+an id absent from `parametersDescs` (= {1,2,3,4,5,6,7,8,120} — note NOT 9).
+But 215 is `mayBeDisabled=true` and **active at genesis, DISABLED at the
+6.0 soft-fork** (it is in the `[215,409]` proposedUpdate activated mainnet
+h=1,628,160) — so correct behavior is height-dependent, requiring the
+dynamic rule-status tracking deferred across this contract (same carve-out
+as 407's "implemented always-on; dynamic disable out of scope"). Our
+non-enforcement MATCHES post-6.0 JVM and DIVERGES pre-6.0 (we'd accept an
+unknown epoch-start vote the pre-fork JVM rejects — adversarial-header
+reachable only, no canonical block carries one). Documented, not silently
+skipped. 212 is also `mayBeDisabled=true` but never actually disabled by
+any update → implemented always-on like 407, same caveat. 213/214 are
+`mayBeDisabled=false` → unconditional, no caveat.
+
+Implementing 214 retroactively makes the round-1 ordered-tally contract
+claim ("a contradictory seed pair is unreachable on-chain —
+`hdrVotesContradictory` rejects such a header upstream") TRUE for our node;
+until now that guard existed only on the JVM.
 
 ### `active_proposed_update_bytes() -> &[u8]`
 - **Postcondition**: Returns the raw `ErgoValidationSettingsUpdate`

@@ -1608,9 +1608,13 @@ mod voting_chain_tests {
     #[test]
     fn count_votes_in_epoch_three_slots_summed() {
         // Ordered tally: entries appear in the seed header's SLOT order.
-        let chain = build_chain_with_votes(256, [1, 2, 3]);
+        // Slot 3 carries the softfork ballot (120): a valid header holds at
+        // most 2 ordinary votes (rule 212 hdrVotesNumber), so [1,2,3] is not
+        // a real header — [1,2,120] is the valid three-non-zero-slot shape,
+        // and the seeded tally counts id 120 like any other id.
+        let chain = build_chain_with_votes(256, [1, 2, 120]);
         let tally = chain.count_votes_in_epoch(255).unwrap();
-        assert_eq!(tally, vec![(1, 128), (2, 128), (3, 128)]);
+        assert_eq!(tally, vec![(1, 128), (2, 128), (120, 128)]);
     }
 
     #[test]
@@ -1771,6 +1775,52 @@ mod voting_chain_tests {
         let quiet_header = make_header_with_votes(6, tip.id, ts, nb, [0, 0, 0]);
         chain.try_append_no_pow(quiet_header).unwrap();
         assert_eq!(chain.height(), 6, "the no-vote sibling extends normally");
+    }
+
+    #[test]
+    fn header_votes_validation_wired_into_append() {
+        // JVM validateVotes (rules 212-214) through the live path: a header
+        // with a contradictory vote field is refused at append; a valid-votes
+        // sibling at the same position extends. Stateless — no round needed.
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let n_bits = config.initial_n_bits;
+
+        let genesis =
+            make_header_with_votes(1, BlockId(Digest32::zero()), 1_000_000, n_bits, [0, 0, 0]);
+        let mut prev_id = genesis.id;
+        chain.try_append_no_pow(genesis).unwrap();
+        for h in 2..=5 {
+            let tip = chain.tip();
+            let nb = crate::difficulty::expected_difficulty(&tip, &chain).unwrap();
+            let header = make_header_with_votes(
+                h,
+                prev_id,
+                1_000_000 + (h as u64 - 1) * 45_000,
+                nb,
+                [0, 0, 0],
+            );
+            prev_id = header.id;
+            chain.try_append_no_pow(header).unwrap();
+        }
+
+        let tip = chain.tip();
+        let nb = crate::difficulty::expected_difficulty(&tip, &chain).unwrap();
+        let ts = tip.timestamp + 45_000;
+
+        // [1, 0xFF, 0] = id 1 together with its i8 negation −1: rule 214.
+        let bad = make_header_with_votes(6, tip.id, ts, nb, [1, 0xFF, 0]);
+        let err = chain.try_append_no_pow(bad).unwrap_err();
+        assert!(
+            matches!(err, crate::ChainError::Voting(_)),
+            "rule 214 must reject the contradictory vote field, got: {err}"
+        );
+        assert_eq!(chain.height(), 5, "the rejected header must not be appended");
+
+        // A valid-votes sibling at the same position extends normally.
+        let good = make_header_with_votes(6, tip.id, ts, nb, [1, 2, 0]);
+        chain.try_append_no_pow(good).unwrap();
+        assert_eq!(chain.height(), 6, "the valid-votes sibling extends normally");
     }
 
     #[test]

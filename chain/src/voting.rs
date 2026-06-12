@@ -19,6 +19,12 @@ use ergo_lib::chain::parameters::{Parameter, Parameters};
 /// votes (1-8) which appear as the same byte in their dedicated slot.
 pub const SOFT_FORK_VOTE: i8 = 120;
 
+/// JVM `Parameters.ParamVotesCount` (= 2): the maximum number of ordinary
+/// parameter votes a header may carry. The soft-fork ballot
+/// [`SOFT_FORK_VOTE`] (120) does NOT count toward this limit — see
+/// [`check_header_votes`] rule 212 (`hdrVotesNumber`).
+pub const PARAM_VOTES_COUNT: usize = 2;
+
 /// Param ID 9: number of sub-blocks per block, on average. Lives on
 /// [`Parameters`] as [`Parameter::SubblocksPerBlock`]. Introduced by the
 /// 6.0 soft-fork (block version 4); auto-inserted whenever the table
@@ -1118,6 +1124,88 @@ pub fn check_fork_vote(
     Ok(true)
 }
 
+/// Validates a header's three `votes` bytes against JVM `validateVotes`
+/// rules 212-214 (`ErgoStateContext.scala:328-345`). **Stateless on the
+/// three bytes** — rules 212-214 need no chain state and no epoch position.
+///
+/// The non-zero bytes (zeros are JVM `Parameters.NoParameter`, dropped) are
+/// each interpreted as **i8**: vote ids are signed, so `0xFF` is −1 (a
+/// decrease vote) and negation wraps in i8. Rules, all fatal:
+///
+/// - **212 `hdrVotesNumber`**: at most [`PARAM_VOTES_COUNT`] (= 2) ordinary
+///   votes (`votes.count(_ != SoftFork) <= ParamVotesCount`); the soft-fork
+///   ballot 120 is excluded from the count.
+/// - **213 `hdrVotesDuplicates`**: every id appears exactly once over the
+///   non-zero list (`votes.count(_ == v) == 1`); repeated zero slots are fine.
+/// - **214 `hdrVotesContradictory`**: no id `v` together with its i8-wrapping
+///   negation. JVM builds `reverseVotes = votes.map(v => (-v).toByte)` and
+///   rejects when `reverseVotes.contains(v)`; equivalently, reject when `v`'s
+///   own wrapping negation is present. `wrapping_neg` fixes `0x80` (−128) as
+///   its own negation, so a lone `0x80` is self-contradictory and rejects.
+///
+/// Returns `Ok(())` when valid; `Err(ChainError::Voting)` names the failed
+/// rule for the live log. On the live path any `Err` rejects the header.
+///
+/// **Rule 215 (`hdrVotesUnknown`) is deliberately NOT implemented.** It
+/// rejects an epoch-start vote for an id absent from `parametersDescs`, but
+/// it is `mayBeDisabled` and disabled at the 6.0 soft-fork (in the
+/// `[215,409]` activated update at mainnet h=1,628,160), so correct behavior
+/// is height-dependent — it needs the dynamic rule-status tracking deferred
+/// across this contract. Our non-enforcement matches post-6.0 JVM. 212 is
+/// likewise `mayBeDisabled` but never actually disabled → implemented
+/// always-on (same caveat as rule 407); 213/214 are `mayBeDisabled=false` →
+/// unconditional.
+///
+/// **Pure**: the three bytes are the only input. The live hook is
+/// chain-entangled delegation onto this seam — same pattern as
+/// [`check_fork_vote`].
+pub fn check_header_votes(votes: [u8; 3]) -> Result<(), crate::ChainError> {
+    use crate::ChainError;
+
+    // JVM `header.votes.filter(_ != Parameters.NoParameter)` (NoParameter
+    // = 0). Each surviving byte is a SIGNED vote id — Scala `Byte` is i8.
+    let vs: Vec<i8> = votes
+        .iter()
+        .copied()
+        .filter(|&b| b != 0)
+        .map(|b| b as i8)
+        .collect();
+
+    // 212 hdrVotesNumber: at most `ParamVotesCount` ordinary votes; the
+    // soft-fork ballot (120) does not count toward the limit.
+    let votes_count = vs.iter().filter(|&&v| v != SOFT_FORK_VOTE).count();
+    if votes_count > PARAM_VOTES_COUNT {
+        return Err(ChainError::Voting(format!(
+            "hdrVotesNumber (212): {votes_count} ordinary votes exceed \
+             ParamVotesCount={PARAM_VOTES_COUNT} (votes={vs:?})"
+        )));
+    }
+
+    // 213/214 are JVM per-element checks (`validateSeq(votes)`), 213 before
+    // 214 — mirror that order so the reported rule matches the reference.
+    for &v in &vs {
+        // 213 hdrVotesDuplicates: each id appears exactly once.
+        if vs.iter().filter(|&&x| x == v).count() != 1 {
+            return Err(ChainError::Voting(format!(
+                "hdrVotesDuplicates (213): id {v} appears more than once (votes={vs:?})"
+            )));
+        }
+
+        // 214 hdrVotesContradictory: v together with its i8-wrapping
+        // negation. `(0x80).wrapping_neg() == 0x80`, so a lone `0x80`
+        // self-contradicts.
+        let neg = v.wrapping_neg();
+        if vs.contains(&neg) {
+            return Err(ChainError::Voting(format!(
+                "hdrVotesContradictory (214): id {v} present with its negation {neg} \
+                 (votes={vs:?})"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2134,6 +2222,52 @@ mod tests {
                 "orphan-122 must error at h={h}"
             );
         }
+    }
+
+    // ---- check_header_votes (JVM ErgoStateContext.validateVotes 212-214) ----
+
+    /// Assert the error message names the expected rule number.
+    fn votes_err_names(votes: [u8; 3], rule: &str) {
+        match check_header_votes(votes) {
+            Err(crate::ChainError::Voting(msg)) => assert!(
+                msg.contains(rule),
+                "votes {votes:?}: expected rule {rule} in error, got: {msg}"
+            ),
+            other => panic!("votes {votes:?}: expected Voting err naming {rule}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_header_votes_rule_212_count() {
+        // votesCount = count(_ != 120) <= ParamVotesCount (= 2).
+        assert!(check_header_votes([1, 2, 120]).is_ok(), "2 ordinary + softfork");
+        assert!(check_header_votes([1, 120, 0]).is_ok(), "1 ordinary + softfork");
+        // Three ordinary (non-120) votes is the only way to exceed 2.
+        votes_err_names([1, 2, 3], "212");
+    }
+
+    #[test]
+    fn check_header_votes_rule_213_duplicates() {
+        votes_err_names([1, 1, 0], "213");
+        assert!(check_header_votes([1, 2, 0]).is_ok(), "distinct ids pass");
+        assert!(check_header_votes([0, 0, 0]).is_ok(), "all zeros pass (no votes)");
+    }
+
+    #[test]
+    fn check_header_votes_rule_214_contradictory() {
+        // 0xFF = −1: id 1 and its negation present together.
+        votes_err_names([1, 0xFF, 0], "214");
+        // The −128 (0x80) self-negation quirk: lone 0x80 is its own
+        // negation, so it self-contradicts even appearing once.
+        votes_err_names([0x80, 0, 0], "214");
+        assert!(check_header_votes([1, 2, 0]).is_ok(), "non-paired ids pass");
+    }
+
+    #[test]
+    fn check_header_votes_real_header_shapes_pass() {
+        // Shapes that appear in real headers — must never break sync.
+        assert!(check_header_votes([4, 3, 0]).is_ok(), "canonical two-vote header");
+        assert!(check_header_votes([0, 0, 0]).is_ok(), "the overwhelmingly common no-vote header");
     }
 
     // ---- zombie family regression ----

@@ -1453,6 +1453,8 @@ impl HeaderChain {
             crate::verify_pow(header)?;
         }
 
+        // JVM validateVotes (rules 212-214): reject malformed vote fields.
+        crate::voting::check_header_votes(header.votes.0)?;
         self.check_fork_vote_gate(header)?;
 
         Ok(())
@@ -1570,6 +1572,8 @@ impl HeaderChain {
                 });
             }
         }
+        // JVM validateVotes (rules 212-214): reject malformed vote fields.
+        crate::voting::check_header_votes(header.votes.0)?;
         self.check_fork_vote_gate(header)?;
         Ok(())
     }
@@ -1661,6 +1665,8 @@ impl HeaderChain {
 
         crate::verify_pow(header)?;
 
+        // JVM validateVotes (rules 212-214): reject malformed vote fields.
+        crate::voting::check_header_votes(header.votes.0)?;
         self.check_fork_vote_gate(header)?;
 
         Ok(())
