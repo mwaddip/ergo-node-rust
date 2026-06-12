@@ -1602,17 +1602,15 @@ mod voting_chain_tests {
         // seed 1 + 127 increments = 128.
         let chain = build_chain_with_votes(256, [1, 0, 0]);
         let tally = chain.count_votes_in_epoch(255).unwrap();
-        assert_eq!(tally.get(&1), Some(&128));
-        assert_eq!(tally.len(), 1);
+        assert_eq!(tally, vec![(1, 128)]);
     }
 
     #[test]
     fn count_votes_in_epoch_three_slots_summed() {
+        // Ordered tally: entries appear in the seed header's SLOT order.
         let chain = build_chain_with_votes(256, [1, 2, 3]);
         let tally = chain.count_votes_in_epoch(255).unwrap();
-        assert_eq!(tally.get(&1), Some(&128));
-        assert_eq!(tally.get(&2), Some(&128));
-        assert_eq!(tally.get(&3), Some(&128));
+        assert_eq!(tally, vec![(1, 128), (2, 128), (3, 128)]);
     }
 
     #[test]
@@ -1650,8 +1648,11 @@ mod voting_chain_tests {
             }
         });
         let tally = chain.count_votes_in_epoch(255).unwrap();
-        assert_eq!(tally.get(&1), Some(&1), "seed vote counts as 1");
-        assert_eq!(tally.get(&2), None, "unseeded id accumulates nothing");
+        assert_eq!(
+            tally,
+            vec![(1, 1)],
+            "seed vote counts as 1; unseeded id accumulates nothing"
+        );
     }
 
     #[test]
@@ -1660,7 +1661,7 @@ mod voting_chain_tests {
         // only its 128-header window [128, 255], not the whole chain.
         let chain = build_chain_with_votes(300, [1, 0, 0]);
         let tally = chain.count_votes_in_epoch(255).unwrap();
-        assert_eq!(tally.get(&1), Some(&128));
+        assert_eq!(tally, vec![(1, 128)]);
     }
 
     #[test]
@@ -1670,6 +1671,97 @@ mod voting_chain_tests {
         // window would tally empty.
         let chain = build_chain_with_votes(50, [1, 0, 0]);
         assert!(chain.count_votes_in_epoch(127).is_err());
+    }
+
+    #[test]
+    fn expected_parameters_swallow_hostile_proposed_update() {
+        // JVM `Parameters.parseExtension` swallow parity: in-band 124
+        // bytes that fail the strict parse are INERT — the live wrappers
+        // substitute the canonical EMPTY update and the block is
+        // ACCEPTED. (The pure seam errors on the same bytes — see
+        // `boundary_params_strict_parse_reject_arm` in voting.rs.)
+        let chain = build_chain_with_votes(256, [0, 0, 0]);
+        let with_empty = chain.compute_expected_parameters(256, &[]).unwrap();
+
+        // Semantically hostile: rule 102 (txManyInputs) is mandatory.
+        let hostile = crate::voting::encode_disabled_rules(&[102]);
+        let swallowed = chain.compute_expected_parameters(256, &hostile).unwrap();
+        assert_eq!(swallowed, with_empty, "hostile 124 must be inert");
+
+        // Structurally hostile: truncated before the statusUpdates count.
+        let swallowed = chain.compute_expected_parameters(256, &[0x00]).unwrap();
+        assert_eq!(swallowed, with_empty);
+
+        // The candidate path agrees and the activated update stays the
+        // canonical EMPTY encoding at a non-activation boundary.
+        let (params, activated) = chain
+            .compute_expected_parameters_for_candidate(256, &hostile, [0, 0, 0])
+            .unwrap();
+        assert_eq!(params, with_empty);
+        assert_eq!(activated, crate::voting::encode_disabled_rules(&[]));
+    }
+
+    #[test]
+    fn fork_vote_gate_wired_into_append() {
+        // Rule 407 (`exCheckForkVote`) through the live path: a header
+        // voting 120 while the active round sits inside a reject window
+        // is refused at append; the same header without the vote extends.
+        use ergo_lib::chain::parameters::Parameter;
+
+        let mut config = testnet_config();
+        config.voting = crate::voting::VotingConfig {
+            voting_length: 2,
+            soft_fork_epochs: 2,
+            activation_epochs: 1,
+            version2_activation_height: 0,
+        };
+        let mut chain = HeaderChain::new(config.clone());
+        let n_bits = config.initial_n_bits;
+
+        let genesis =
+            make_header_with_votes(1, BlockId(Digest32::zero()), 1_000_000, n_bits, [0, 0, 0]);
+        let mut prev_id = genesis.id;
+        chain.try_append_no_pow(genesis).unwrap();
+        for h in 2..=5 {
+            let tip = chain.tip();
+            let nb = crate::difficulty::expected_difficulty(&tip, &chain).unwrap();
+            let header = make_header_with_votes(
+                h,
+                prev_id,
+                1_000_000 + (h as u64 - 1) * 45_000,
+                nb,
+                [0, 0, 0],
+            );
+            prev_id = header.id;
+            chain.try_append_no_pow(header).unwrap();
+        }
+
+        // Install an active round: S=2, L=2, ve=2 → finishing = 6;
+        // collected=0 is not approved → reject window [6, 8).
+        let mut params = chain.active_parameters().clone();
+        params
+            .parameters_table
+            .insert(Parameter::SoftForkStartingHeight, 2);
+        params
+            .parameters_table
+            .insert(Parameter::SoftForkVotesCollected, 0);
+        let keep = chain.active_proposed_update_bytes().to_vec();
+        chain.apply_epoch_boundary_parameters(params, keep);
+
+        let tip = chain.tip();
+        let nb = crate::difficulty::expected_difficulty(&tip, &chain).unwrap();
+        let ts = tip.timestamp + 45_000;
+
+        let voting_header = make_header_with_votes(6, tip.id, ts, nb, [120, 0, 0]);
+        let err = chain.try_append_no_pow(voting_header).unwrap_err();
+        assert!(
+            matches!(err, crate::ChainError::Voting(_)),
+            "rule 407 must reject the in-window fork vote, got: {err}"
+        );
+
+        let quiet_header = make_header_with_votes(6, tip.id, ts, nb, [0, 0, 0]);
+        chain.try_append_no_pow(quiet_header).unwrap();
+        assert_eq!(chain.height(), 6, "the no-vote sibling extends normally");
     }
 
     #[test]

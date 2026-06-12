@@ -730,10 +730,14 @@ impl HeaderChain {
     /// first valid block is height 1 (no block at height 0), the very
     /// first epoch's window clamps to `[1, T - 1]` — its head is not a
     /// boundary, the seed is empty, and the tally is empty.
+    ///
+    /// The tally is an ORDERED sequence in seed-slot order, duplicates
+    /// preserved — see the order note on
+    /// [`crate::voting::tally_votes_seeded`].
     fn tally_just_ended_epoch(
         &self,
         epoch_boundary_height: u32,
-    ) -> Result<HashMap<i8, u32>, ChainError> {
+    ) -> Result<Vec<(i8, u32)>, ChainError> {
         let voting_length = self.config.voting.voting_length;
         let nominal_start = epoch_boundary_height.saturating_sub(voting_length);
         let start = nominal_start.max(1);
@@ -742,7 +746,7 @@ impl HeaderChain {
             .ok_or_else(|| ChainError::Voting("epoch boundary cannot be 0".into()))?;
 
         if start > end {
-            return Ok(HashMap::new());
+            return Ok(Vec::new());
         }
 
         let mut window: Vec<(u32, [u8; 3])> =
@@ -775,10 +779,13 @@ impl HeaderChain {
     ///
     /// `block_proposed_update` is the raw payload of the block's extension
     /// key `[0x00, 124]` (`SoftForkDisablingRules` /
-    /// `ErgoValidationSettingsUpdate`), or the empty slice if absent. It is
-    /// consulted ONLY to gate the `SubblocksPerBlock` auto-insert at the
-    /// voting-driven v4 activation — see Step 4 below and
-    /// `facts/chain.md` Phase 6.
+    /// `ErgoValidationSettingsUpdate`), or the empty slice if absent. It
+    /// gates the `SubblocksPerBlock` auto-insert at the voting-driven v4
+    /// activation and becomes the activated update at an activation
+    /// boundary. Bytes that fail the strict parse are pre-normalized to
+    /// the canonical EMPTY update — JVM `Parameters.parseExtension`
+    /// swallow parity; see the shared `compute_boundary_parameters_at`
+    /// and `facts/chain.md` Phase 6.
     ///
     /// **Determinism**: For any two correct implementations given the same
     /// chain history, the output is byte-identical. This is the consensus
@@ -840,6 +847,15 @@ impl HeaderChain {
     /// over the closing epoch, then delegate to the pure
     /// [`crate::voting::compute_boundary_parameters`]. The two public
     /// entry points differ only in where `boundary_fork_vote` comes from.
+    ///
+    /// Pre-normalizes the block's raw ID 124 bytes through the strict
+    /// parse — JVM `Parameters.parseExtension` swallow parity
+    /// (`Parameters.scala:382-386`, `parseBytesTry(...).toOption
+    /// .getOrElse(empty)`): on ANY parse failure the bytes are replaced
+    /// by the canonical EMPTY update encoding before delegating. In-band,
+    /// a hostile 124 field is INERT and the block is ACCEPTED; rejecting
+    /// it would be reject-what-JVM-accepts fork bait. The pure seam
+    /// itself stays strict for directly-handed bytes.
     fn compute_boundary_parameters_at(
         &self,
         epoch_boundary_height: u32,
@@ -847,13 +863,21 @@ impl HeaderChain {
         boundary_fork_vote: bool,
     ) -> Result<(Parameters, Vec<u8>), ChainError> {
         let tally = self.tally_just_ended_epoch(epoch_boundary_height)?;
+        let normalized_empty;
+        let proposed_update: &[u8] =
+            if crate::voting::parse_validation_settings_update(block_proposed_update).is_ok() {
+                block_proposed_update
+            } else {
+                normalized_empty = crate::voting::encode_disabled_rules(&[]);
+                &normalized_empty
+            };
         crate::voting::compute_boundary_parameters(
             &self.config.voting,
             epoch_boundary_height,
             &self.active_parameters,
             &tally,
             boundary_fork_vote,
-            block_proposed_update,
+            proposed_update,
         )
     }
 
@@ -869,12 +893,16 @@ impl HeaderChain {
     /// [`Self::compute_expected_parameters`] uses the same window
     /// internally.
     ///
+    /// Returns an ORDERED sequence in seed-slot order, duplicates
+    /// preserved (JVM `VotingData.epochVotes` is `Array[(Byte, Int)]`) —
+    /// see the order note on [`crate::voting::tally_votes_seeded`].
+    ///
     /// Errors if any header in the (clamped) window is missing from the
     /// chain — callers must ensure the precondition holds before calling.
     pub fn count_votes_in_epoch(
         &self,
         epoch_end_height: u32,
-    ) -> Result<std::collections::HashMap<i8, u32>, ChainError> {
+    ) -> Result<Vec<(i8, u32)>, ChainError> {
         let voting_length = self.config.voting.voting_length;
         if voting_length == 0 {
             return Err(ChainError::Voting(
@@ -889,7 +917,7 @@ impl HeaderChain {
 
         let start = boundary_height.saturating_sub(voting_length).max(1);
         if start > epoch_end_height {
-            return Ok(std::collections::HashMap::new());
+            return Ok(Vec::new());
         }
 
         let mut window: Vec<(u32, [u8; 3])> =
@@ -1418,6 +1446,8 @@ impl HeaderChain {
             crate::verify_pow(header)?;
         }
 
+        self.check_fork_vote_gate(header)?;
+
         Ok(())
     }
 
@@ -1533,6 +1563,7 @@ impl HeaderChain {
                 });
             }
         }
+        self.check_fork_vote_gate(header)?;
         Ok(())
     }
 
@@ -1623,6 +1654,35 @@ impl HeaderChain {
 
         crate::verify_pow(header)?;
 
+        self.check_fork_vote_gate(header)?;
+
         Ok(())
+    }
+
+    /// JVM `ErgoStateContext.process` → `checkForkVote` (rule 407,
+    /// `ErgoStateContext.scala:243`): every header carrying an id-120
+    /// vote — boundary and mid-epoch alike — is checked against the
+    /// ACTIVE parameters; voting for a fork inside the closing or
+    /// activation window of the current round invalidates the header.
+    /// Inert while no round is in progress (no 122 in the active table).
+    ///
+    /// Chain-entangled delegation onto the pure
+    /// [`crate::voting::check_fork_vote`] seam. Both `Ok(false)` (rule
+    /// 407 fires) and `Err` (orphan-122 table) reject the header —
+    /// JVM-indistinguishable on the live path.
+    fn check_fork_vote_gate(&self, header: &Header) -> Result<(), ChainError> {
+        if crate::voting::check_fork_vote(
+            &self.config.voting,
+            header.height,
+            header.votes.0,
+            &self.active_parameters,
+        )? {
+            Ok(())
+        } else {
+            Err(ChainError::Voting(format!(
+                "voting for fork is prohibited at height {}",
+                header.height
+            )))
+        }
     }
 }

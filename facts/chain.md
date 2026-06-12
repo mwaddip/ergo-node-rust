@@ -381,17 +381,28 @@ Chain owns the live instance; consumers query it via `active_parameters()`.
      param ID = increase, negative ID = decrease.
   3. Apply soft-fork machinery (see "Soft-fork lifecycle" below).
   4. Return the new `Parameters` table.
-- **`block_proposed_update` usage**: consulted **only** to gate the
-  `BlockVersion == 4` auto-insert of `SubblocksPerBlock` (ID 9), and **only**
-  when the current call is a voting-driven activation (BlockVersion bumped
-  from ≠4 to 4 in this update — not the forced-v2 mainnet activation at
-  `version2_activation_height`). Parsed internally via a minimal
-  `ErgoValidationSettingsUpdate` decoder (just `rulesToDisable`; we don't
-  need `statusUpdates`). If the parsed rule list contains **409**
-  (`exMatchParameters`), the auto-insert is skipped — JVM mainnet activates
-  rule 409 at the same boundary as the v6 BlockVersion bump, so the insert
-  fires only at the **next** boundary. At non-activation boundaries the
-  payload is ignored entirely.
+- **`block_proposed_update` usage**: gates the `BlockVersion == 4`
+  auto-insert of `SubblocksPerBlock` (ID 9) — if the rule list of the update
+  being activated RIGHT NOW contains **409** (`exMatchParameters`), the
+  auto-insert is skipped and fires at the **next** boundary instead (JVM
+  mainnet activates rule 409 at the same boundary as the v6 bump). It is
+  also the payload returned as `activated_update` at a voting-driven
+  activation boundary.
+- **`block_proposed_update` normalization (added 2026-06-12 — JVM
+  `Parameters.parseExtension` swallow parity)**: the LIVE wrappers
+  (`compute_expected_parameters`, `compute_expected_parameters_for_candidate`
+  — i.e. the shared `compute_boundary_parameters_at`) MUST pre-normalize the
+  block's raw 124 bytes through the strict parse
+  (`parse_validation_settings_update`, below): on ANY parse failure —
+  malformed structure or a non-disableable rule in `rulesToDisable` — the
+  bytes are replaced by the EMPTY update encoding before delegating to the
+  pure seam. JVM `Parameters.parseExtension` (Parameters.scala:382-386) does
+  exactly this: `parseBytesTry(...).toOption.getOrElse(empty)`. In-band, a
+  hostile 124 field is INERT on the JVM — the block is ACCEPTED with an
+  empty proposed update. Rejecting such a block would be
+  reject-what-JVM-accepts fork bait (the exBlockVersion lesson). The pure
+  seam itself stays strict (tier semantics, below); only the live wrappers
+  swallow.
 - **Determinism**: For any two correct implementations given the same chain,
   the output is byte-identical. This is the consensus rule.
 
@@ -413,7 +424,7 @@ Chain owns the live instance; consumers query it via `active_parameters()`.
   are unchanged (the applied header IS the right source there). Single
   implementation: both delegate to the pure `compute_boundary_parameters`.
 
-### `count_votes_in_epoch(epoch_end_height: u32) -> Result<HashMap<i8, u32>>`
+### `count_votes_in_epoch(epoch_end_height: u32) -> Result<Vec<(i8, u32)>>`
 - **Precondition**: All headers in `[epoch_end_height - voting_length + 1, epoch_end_height]`
   are present in the chain.
 - **Postcondition (corrected 2026-06-11 — SEEDED tally, JVM `VotingData`
@@ -427,6 +438,20 @@ Chain owns the live instance; consumers query it via `active_parameters()`.
   If the window's first header is NOT the previous boundary (chain-start
   clamp: `T − voting_length < 1`, genesis is height 1), the seed is EMPTY and
   the tally is empty — every vote in the window drops.
+- **Order is consensus-relevant (corrected 2026-06-12)**: the tally is an
+  ORDERED sequence, not a map — JVM `VotingData.epochVotes` is
+  `Array[(Byte, Int)]` seeded in the boundary header's vote-SLOT order
+  (zero slots filtered, order preserved, duplicates NOT deduped —
+  `ErgoStateContext.scala:238,250`). `updateParams` folds over it in
+  sequence order while reading each current value from the post-fork table
+  SNAPSHOT, so a handed window whose seed carries a contradictory pair
+  (+id and −id, both later approved) produces a LAST-WRITE-WINS result that
+  depends on slot order. A `HashMap` tally makes that nondeterministic.
+  (Unreachable on-chain — `hdrVotesContradictory`/`hdrVotesDuplicates`
+  reject such a seed header — but the pure seam is graded over HANDED
+  streams; legality is upstream.) If the seed carries a duplicated id, each
+  copy is a separate entry and every window vote for that id increments ALL
+  matching entries (JVM `VotingData.update` maps over the whole array).
 - **Consensus note**: the previous postcondition specified a plain unseeded
   counter (every non-zero id summed) and the implementation matched it. That
   diverges from the JVM at any boundary whose epoch contained votes for ids
@@ -444,30 +469,192 @@ read from `ChainConfig::testnet()`/`mainnet()` presets (the bundled-1024-vs-
 testnet-128 votingLength bug class) and never from chain state.
 
 - `voting::tally_votes_seeded(window: &[(u32, [u8; 3])], boundary_height: u32,
-  voting_length: u32) -> HashMap<i8, u32>` — the seeded tally above, over
-  (height, votes) pairs. The legacy unseeded `tally_votes` is retired or
-  demoted to non-consensus use only (audit callers).
+  voting_length: u32) -> Vec<(i8, u32)>` — the seeded tally above, over
+  (height, votes) pairs. **Returns an ORDERED sequence** (signature
+  corrected 2026-06-12): entries in seed-slot order, duplicates preserved,
+  increments applied to every matching entry — see the order note under
+  `count_votes_in_epoch`. The legacy unseeded `tally_votes` is retired.
 - `voting::compute_boundary_parameters(voting: &VotingSettings,
-  boundary_height: u32, current: &Parameters, tally: &HashMap<i8, u32>,
+  boundary_height: u32, current: &Parameters, tally: &[(i8, u32)],
   boundary_fork_vote: bool, proposed_update: &[u8])
   -> Result<(Parameters, Vec<u8>), ChainError>` — the pure extraction of
   `compute_expected_parameters` steps 1-4 (ordinary steps, soft-fork
-  lifecycle, forced-v2, SubblocksPerBlock auto-insert), which becomes
+  lifecycle, forced-v2, SubblocksPerBlock auto-insert), which stays
   tally + delegate (one implementation). Additionally returns the
   **activated update**: the canonical `ErgoValidationSettingsUpdate`
-  encoding — `proposed_update` at a voting-driven activation boundary,
-  the canonical EMPTY encoding (`0x0000`) otherwise (JVM
+  encoding — `proposed_update` verbatim at a voting-driven activation
+  boundary, the canonical EMPTY encoding (`0x0000`) otherwise (JVM
   `activatedUpdate`). `boundary_fork_vote` is the boundary header's OWN
   id-120 vote (JVM `forkVote`, excluded from the window) — exact lifecycle
   wiring per JVM `Parameters.update` / `ErgoStateContext.process`; the
   SANTA chain contract (`~/projects/santa/docs/contract/
-  runner-contract-chain.md` §2 "voting") is the graded reference.
+  runner-contract-chain.md` §2/§3/§4 "voting", incl. the REJECT arm) is
+  the graded reference. **Strictness (added 2026-06-12)**: the pure seam
+  parse-validates `proposed_update` UP FRONT via
+  `parse_validation_settings_update` (below) and errors on failure — JVM
+  parity at the seam level is "these bytes must deserialize", because the
+  JVM object handed to `Parameters.update` cannot exist otherwise. Live
+  callers pre-swallow (see `compute_expected_parameters`). The
+  `votesInPrevEpoch` operand is the FIRST id-120 entry of the ordered
+  tally (JVM `epochVotes.find(_._1 == SoftFork)`), and `updateParams`
+  folds in tally order.
 - `difficulty::calculate`, `difficulty::eip37_calculate`,
   `difficulty::interpolate`, `difficulty::normalize_to_n_bits` — pub
   (currently private behind the chain-entangled `expected_difficulty`).
   Signatures unchanged: anchor headers + numeric settings as args. The
   damping clamps are EIP-37-arm-only; classic `calculate` stays unclamped
   linear interpolation.
+
+### Soft-fork lifecycle — JVM-exactness pins (added 2026-06-12)
+
+Port of `Parameters.updateFork` (Parameters.scala:98-155). Sequential `if`s;
+every condition reads the PRE-update table (`current`); mutations accumulate
+in the running table. With `S = table[122]`, `L = voting_length`,
+`ve = soft_fork_epochs`, `ae = activation_epochs`:
+
+1. cleanup-success: `122 present && h == S + L·(ve+ae+1) && approved(votes)`
+   → remove 121/122.
+2. cleanup-fail: `122 present && h == S + L·(ve+1) && !approved(votes)`
+   → remove 121/122.
+3. restart/start (single `if`, three disjuncts, short-circuit ||):
+   `forkVote && ((122 absent && h % L == 0) || (122 present && h ==
+   S + L·(ve+ae+1)) || (122 present && h == S + L·(ve+1) &&
+   !approved(votes)))` → insert 122=h, 121=0. **The second disjunct has NO
+   approval check** — a fork vote exactly at the late-cleanup height
+   restarts the round even when the dying round was never approved (the
+   one legal zombie revival; at any later boundary no branch can fire and
+   the counters are stuck forever — the zombie family pins this AS-IS, do
+   not rationalize).
+4. accumulate: `122 present && h <= S + L·ve` → write
+   `121 = votes` (the running total).
+5. activation: `122 present && h == S + L·(ve+ae) && approved(votes)` →
+   `123 += 1` as wrapping i32 (JVM `table(BlockVersion) + 1` is Int `+`;
+   a hostile 123=i32::MAX wraps negative — same Int-parity rule as
+   `votes`); running-table read; absent 123 errors = JVM Map.apply
+   throw. activated_update = proposed_update.
+
+**`votes` laziness — `hostile-122-without-121` parity.** JVM
+`lazy val votes = votesInPrevEpoch + parametersTable(SoftForkVotesCollected)`
+(Parameters.scala:108) throws `NoSuchElementException` iff FORCED with 121
+absent. Force sites are exactly: the cleanup-success condition (after the
+height conjunct matches), the cleanup-fail condition (ditto), the restart
+third disjunct (forkVote, 122 present, h == S+L·(ve+1), first two disjuncts
+false), the accumulate BODY (h ≤ S+L·ve), and the activation condition
+(after the height conjunct). A table with 122-but-no-121 therefore errors
+iff `h ≤ S+L·ve || h == S+L·(ve+1) || h == S+L·(ve+ae) || h == S+L·(ve+ae+1)`
+— at any OTHER boundary the lifecycle passes through WITHOUT error. Do NOT
+read 121 eagerly (current `unwrap_or(0)` never errors — wrong; an eager
+`ok_or` errors at non-force boundaries — also wrong, stricter than JVM).
+
+**`votes` arithmetic**: JVM `Int +` — compute as `i32::wrapping_add(
+tally_120_count as i32, collected)`; the accumulate branch stores that i32
+verbatim. Approval compares via signed widening (`votes as i64 > threshold`)
+— negative wrapped totals are never approved, matching JVM signed compare.
+(Threshold math `L·ve·9/10` stays in u64 — JVM Int-overflow on hostile
+SETTINGS is out of scope; vectors hand sane settings.)
+
+### `parse_validation_settings_update(bytes: &[u8]) -> Result<Vec<u16>, ChainError>` (added 2026-06-12)
+
+Strict deserialization of an `ErgoValidationSettingsUpdate` payload —
+port of `ErgoValidationSettingsUpdateSerializer.parse`
+(ErgoValidationSettingsUpdate.scala:41-58) including the disableability
+`require` (lines 47-50): for every id in `rulesToDisable`,
+`rulesSpec.get(id).forall(_.mayBeDisabled)` — a KNOWN ergo rule that is
+NOT disableable errors; ids absent from the spec pass through (sigma ids
+≥1000, gaps 110/202, and 414 — which has a constant but NO rulesSpec
+entry, so it is disableable-by-omission). Empty input = empty update
+(absent-field convention), no error.
+
+Ergo `rulesSpec` disableability (ValidationRules.scala:22-231, v6.0.3):
+- **mayBeDisabled = true**: 111, 118, 120, 121, 123, 124, 212, 215, 306,
+  400, 401, 402, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413.
+- **mayBeDisabled = false** (errors): 100-109, 112-117, 119, 122,
+  200, 201, 203-211, 213, 214, 216, 300-305, 307, 403, 500, 501.
+- Not in spec (passes): everything else, incl. 110, 202, 414, ≥1000.
+
+`parse_disabled_rules` remains the lenient rules-section reader used by
+the 409 auto-insert gate on ALREADY-NORMALIZED bytes; the strict seam is
+the validation entry point.
+
+**Count-wrap parity (added 2026-06-12, implementation-derived)**: both
+section counts are read as JVM `r.getUInt().toInt` — plain `.toInt`, not
+`.toIntExact` — so a VLQ count in `[2^31, 2^32)` truncates NEGATIVE and
+`(0 until n)` reads ZERO entries (ErgoValidationSettingsUpdate.scala:43,
+51). A payload declaring a ≥2^31 rules count therefore parses as
+rules-empty instead of erroring. Mirrored exactly; pinned by test.
+
+**statusUpdates handling — precise scope.** After the rules section the
+strict parse MUST read the `statusUpdates` COUNT (VLQ u32; a payload
+truncated before it — e.g. the 1-byte `0x00` — errors, JVM
+`getUInt` underflow parity). `count == 0` → Ok. `count > 0` → Ok
+WITHOUT validating the entries (lenient tail). Rationale: mainnet's real
+h=1,628,160 payload carries 3 status updates and MUST keep passing
+verbatim through the live wrappers — rejecting unparseable-to-us status
+entries would make the swallow wrapper replace REAL on-chain payloads
+with empty, diverging our proposedUpdate/activated tracking from JVM on
+canonical history. **Known gap (flagged to SANTA)**: JVM's strict parse
+fully decodes each status entry (`RuleStatusSerializer`, sigma-side — no
+Rust port exists in sigma-rust), so a payload with MALFORMED status
+entries rejects on JVM and passes here. Closing it needs the sigma
+`RuleStatusSerializer` wire format ported (sigma-rust session scope) —
+do not guess it from on-chain samples.
+
+### Fork-vote window gate — JVM `checkForkVote` (added 2026-06-12, NEW live-path rule)
+
+Port of `ErgoStateContext.checkForkVote` (ErgoStateContext.scala:156-168),
+fired from header processing for EVERY header whose votes contain 120
+(rule 407 `exCheckForkVote`, ErgoStateContext.scala:243 — boundary and
+mid-epoch alike). With `S = active table[122]` (gate inert when absent),
+`finishing = S + L·ve`, `afterActivation = finishing + L·(ae+1)`,
+`collected = active table[121]` (**collected ONLY — not
+closing-epoch+collected**; a different operand than `updateFork`'s
+`votes`):
+
+- reject when `h >= finishing && h < finishing + L && !approved(collected)`
+  (the epoch right after a failed round closes), OR
+- reject when `h >= finishing && h < afterActivation && approved(collected)`
+  (the whole activation window + one epoch of an approved round).
+
+122-present-but-121-absent: JVM `.get` throws inside `validateNoThrow` →
+header invalid; mirror as an error (NOTE: this read is EAGER — `.get` on
+gate entry, unlike `updateFork`'s lazy `votes`; the same orphan-122 table
+is lenient in the boundary computation at non-force heights and fatal
+here). Rule 407 is votable-disableable but active on both networks for
+all of history (launch default disables only 215/409) — implement as
+always-on; dynamic rule-status tracking is out of scope until a real
+on-chain update disables it. **Consensus note**: this gate was MISSING
+entirely (accept-what-JVM-rejects, fork direction) — dormant while no
+round is in progress, live the moment any 122 enters the table. Found
+during the 2026-06-12 JVM cross-read.
+
+**Pure seam (added 2026-06-12, SANTA chain tier kind `fork_vote_gate`)**:
+
+```rust
+voting::check_fork_vote(
+    voting: &VotingConfig,
+    header_height: u32,
+    header_votes: [u8; 3],
+    current: &Parameters,
+) -> Result<bool, ChainError>
+```
+
+- `Ok(true)` — header passes the gate. Includes: votes do NOT contain 120
+  (the JVM call-site condition `if (forkVote)` is folded into the seam —
+  ErgoStateContext.scala:243), or no round in progress (122 absent), or
+  height outside both reject windows.
+- `Ok(false)` — rule 407 fires ("Voting for fork is prohibited"): header
+  invalid.
+- `Err` — 122 present, 121 absent (the eager `.get`): impossible-state
+  input, SANTA errored envelope.
+
+Pure: settings as args, `version2_activation_height` unread but present
+(uniform settings block). The live header-processing hook is
+chain-entangled delegation onto this seam (active parameters + network
+`VotingConfig`) — one implementation, same pattern as
+`compute_boundary_parameters`. Both `Ok(false)` and `Err` reject the
+header on the live path (JVM-indistinguishable there: both surface as
+rule-407 invalid through `validateNoThrow`); the three-way split exists
+for the tier's grading granularity.
 
 ### `active_proposed_update_bytes() -> &[u8]`
 - **Postcondition**: Returns the raw `ErgoValidationSettingsUpdate`

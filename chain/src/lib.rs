@@ -40,8 +40,9 @@ pub use nipopow_proof::{
     verify_nipopow_proof_bytes, NipopowVerificationResult,
 };
 pub use voting::{
-    compute_boundary_parameters, extract_disabling_rules_from_kv, pack_extension_bytes,
-    pack_parameters_to_kv, parse_extension_bytes, parse_parameters_from_kv,
+    check_fork_vote, compute_boundary_parameters, extract_disabling_rules_from_kv,
+    pack_extension_bytes, pack_parameters_to_kv, parse_extension_bytes,
+    parse_parameters_from_kv, parse_validation_settings_update,
     tally_votes_seeded, ExtensionField, VotingConfig,
     ID_BLOCK_VERSION, ID_SOFT_FORK_DISABLING_RULES, ID_SOFT_FORK_STARTING_HEIGHT,
     ID_SOFT_FORK_VOTES_COLLECTED, SOFT_FORK_VOTE,

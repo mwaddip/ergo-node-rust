@@ -91,11 +91,16 @@ impl VotingConfig {
     /// `true` iff the given vote count meets the soft-fork supermajority.
     ///
     /// JVM `softForkApproved`: `votes > votingLength * softForkEpochs * 9 / 10`
-    /// (90% supermajority across all soft-fork voting epochs).
-    pub fn soft_fork_approved(&self, votes: u32) -> bool {
+    /// (90% supermajority across all soft-fork voting epochs). The JVM
+    /// operand is a signed Int — the running 121 total is stored with
+    /// wrapping arithmetic, and a wrapped-negative total is never approved
+    /// under the signed compare. Takes `i64` so every i32 table value
+    /// widens losslessly. Threshold math stays in u64 — JVM Int-overflow
+    /// on hostile SETTINGS is out of scope (vectors hand sane settings).
+    pub fn soft_fork_approved(&self, votes: i64) -> bool {
         let threshold =
             (self.voting_length as u64) * (self.soft_fork_epochs as u64) * 9 / 10;
-        (votes as u64) > threshold
+        votes > threshold as i64
     }
 
     /// `true` iff a vote count meets the ordinary parameter change threshold.
@@ -286,6 +291,12 @@ pub fn extract_disabling_rules_from_kv(kv: &[ExtensionField]) -> Vec<u8> {
 /// Empty input → empty `Vec` (mirrors JVM's
 /// `ErgoValidationSettingsUpdate.empty`, the default when extension key
 /// `[0x00, 124]` is absent from the block).
+///
+/// This is the LENIENT reader, used for the rule-409 auto-insert gate on
+/// already-normalized bytes. The validation entry point for raw block
+/// bytes is [`parse_validation_settings_update`], which additionally
+/// enforces the disableability `require` and the statusUpdates-count
+/// read.
 pub fn parse_disabled_rules(bytes: &[u8]) -> Result<Vec<u16>, crate::ChainError> {
     use crate::ChainError;
     use sigma_ser::vlq_encode::ReadSigmaVlqExt;
@@ -309,6 +320,115 @@ pub fn parse_disabled_rules(bytes: &[u8]) -> Result<Vec<u16>, crate::ChainError>
         })?;
         rules.push(rule);
     }
+    Ok(rules)
+}
+
+/// `true` iff `id` is a KNOWN ergo validation rule that may NOT be
+/// disabled via soft-fork.
+///
+/// Transcribed from JVM `ValidationRules.rulesSpec`
+/// (`ValidationRules.scala:22-231`, v6.0.3): the ids below are exactly
+/// the spec entries with `mayBeDisabled = false`. Ids absent from the
+/// spec — the gaps 110/202, 414 (`exMatchParameters60`, which has a
+/// constant but no spec entry), sigma-side ids ≥ 1000, and everything
+/// else — return `false` here and pass the strict parse
+/// (disableable-by-omission, JVM `rulesSpec.get(rd).forall(_.mayBeDisabled)`).
+fn rule_may_not_be_disabled(id: u16) -> bool {
+    matches!(
+        id,
+        // transaction rules: txDust(111), txBoxToSpend(118), txBoxSize(120),
+        // txBoxPropositionSize(121), txReemission(123), txMonotonicHeight(124)
+        // are disableable; the rest of 100-124 are mandatory.
+        100..=109 | 112..=117 | 119 | 122
+        // header rules: hdrVotesNumber(212) and hdrVotesUnknown(215) are
+        // disableable; 202 is a gap.
+        | 200 | 201 | 203..=211 | 213 | 214 | 216
+        // block-section rules: bsBlockTransactionsSize(306) is disableable.
+        | 300..=305 | 307
+        // extension rules: all disableable except exKeyLength(403).
+        | 403
+        // full-block application rules.
+        | 500 | 501
+    )
+}
+
+/// Strict deserialization of an `ErgoValidationSettingsUpdate` payload —
+/// port of `ErgoValidationSettingsUpdateSerializer.parse`
+/// (`ErgoValidationSettingsUpdate.scala:41-58`) including the
+/// disableability `require` (lines 47-50). This is the validation entry
+/// point for extension key `[0x00, 124]` bytes; [`parse_disabled_rules`]
+/// remains the lenient rules-section reader used on already-normalized
+/// bytes.
+///
+/// Layout:
+///
+/// ```text
+/// [disabledRulesNum: VLQ u32]
+/// disabledRules × disabledRulesNum: [rule_id: VLQ u16]
+/// [statusUpdatesNum: VLQ u32]
+/// (statusUpdate entries — NOT validated, see below)
+/// ```
+///
+/// - Empty input = empty update (absent-field convention), no error.
+/// - Every id in `rulesToDisable` must satisfy JVM
+///   `rulesSpec.get(id).forall(_.mayBeDisabled)`: a KNOWN rule that is
+///   not disableable errors; ids absent from the spec pass through (see
+///   the private `rule_may_not_be_disabled` table). The check runs after
+///   the full id list is read and before `statusUpdatesNum` — JVM error
+///   precedence.
+/// - The `statusUpdates` COUNT must parse: a payload truncated before it
+///   (e.g. the bare 1-byte `0x00`) errors — JVM `getUInt` underflow
+///   parity. Entries after a `count > 0` pass UNVALIDATED (lenient
+///   tail): mainnet's real h=1,628,160 payload carries 3 status updates
+///   and must keep flowing verbatim through the live wrappers. Known
+///   gap (flagged to SANTA): JVM fully decodes each entry via the
+///   sigma-side `RuleStatusSerializer`, which has no Rust port — a
+///   payload with malformed status entries rejects on JVM and passes
+///   here. Do not guess the entry wire format; closing this needs the
+///   sigma port.
+/// - Counts mirror JVM `getUInt().toInt`: values ≥ 2^31 wrap negative
+///   and `0 until n` reads ZERO entries — a count of `0xFFFFFFFF`
+///   parses as an empty rules list, not a 4-billion-entry read.
+pub fn parse_validation_settings_update(
+    bytes: &[u8],
+) -> Result<Vec<u16>, crate::ChainError> {
+    use crate::ChainError;
+    use sigma_ser::vlq_encode::ReadSigmaVlqExt;
+
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut cursor = std::io::Cursor::new(bytes);
+    let raw_count = cursor.get_u32().map_err(|e| {
+        ChainError::ExtensionParse(format!("settings update: disabled rules count: {e}"))
+    })?;
+    // JVM `getUInt().toInt` wraps ≥ 2^31 negative; `(0 until n)` on a
+    // negative n is empty.
+    let count = if raw_count > i32::MAX as u32 {
+        0
+    } else {
+        raw_count as usize
+    };
+    let cap = count.min(bytes.len());
+    let mut rules = Vec::with_capacity(cap);
+    for i in 0..count {
+        let rule = cursor.get_u16().map_err(|e| {
+            ChainError::ExtensionParse(format!(
+                "settings update: disabled rule id at index {i}: {e}"
+            ))
+        })?;
+        rules.push(rule);
+    }
+    for &rule in &rules {
+        if rule_may_not_be_disabled(rule) {
+            return Err(ChainError::ExtensionParse(format!(
+                "settings update: trying to deactivate rule {rule}, that may not be disabled"
+            )));
+        }
+    }
+    cursor.get_u32().map_err(|e| {
+        ChainError::ExtensionParse(format!("settings update: status updates count: {e}"))
+    })?;
     Ok(rules)
 }
 
@@ -505,6 +625,19 @@ pub fn pack_extension_bytes(
 /// `VotingData.scala:9-13`; the seed is `ErgoStateContext.scala:250-251`
 /// `VotingData(proposedVotes)` with `proposedVotes = votes.map(_ -> 1)`).
 ///
+/// The tally is an ORDERED sequence, not a map — JVM
+/// `VotingData.epochVotes` is `Array[(Byte, Int)]` seeded in the boundary
+/// header's vote-SLOT order (zero slots filtered, order preserved,
+/// duplicates NOT deduped — `ErgoStateContext.scala:238,250`).
+/// `updateParams` folds over it in sequence order, so a seed carrying a
+/// contradictory pair (+id and −id, both later approved) produces a
+/// last-write-wins result that depends on slot order. If the seed carries
+/// a duplicated id, each copy is a separate entry and every window vote
+/// for that id increments ALL matching entries (JVM `VotingData.update`
+/// maps over the whole array). Unreachable on-chain —
+/// `hdrVotesContradictory`/`hdrVotesDuplicates` reject such a seed header
+/// — but this seam is graded over HANDED streams; legality is upstream.
+///
 /// If the window's first header is NOT the previous boundary — the
 /// chain-start clamp, `T − voting_length < 1` with genesis at height 1 —
 /// the seed is empty and the tally is empty: every vote in the window
@@ -520,27 +653,28 @@ pub fn tally_votes_seeded(
     window: &[(u32, [u8; 3])],
     boundary_height: u32,
     voting_length: u32,
-) -> HashMap<i8, u32> {
+) -> Vec<(i8, u32)> {
     let Some(((seed_height, seed_votes), rest)) = window.split_first() else {
-        return HashMap::new();
+        return Vec::new();
     };
     // Seed iff the window head is the previous boundary. At chain start
     // (T − L < 1) no previous boundary exists and nothing seeds.
     if boundary_height.checked_sub(voting_length) != Some(*seed_height) {
-        return HashMap::new();
+        return Vec::new();
     }
 
-    let mut tally: HashMap<i8, u32> = HashMap::new();
-    for &slot in seed_votes {
-        if slot != 0 {
-            tally.insert(slot as i8, 1);
-        }
-    }
+    let mut tally: Vec<(i8, u32)> = seed_votes
+        .iter()
+        .filter(|&&slot| slot != 0)
+        .map(|&slot| (slot as i8, 1u32))
+        .collect();
     for (_, votes) in rest {
         for &slot in votes {
             if slot != 0 {
-                if let Some(count) = tally.get_mut(&(slot as i8)) {
-                    *count += 1;
+                for entry in tally.iter_mut() {
+                    if entry.0 == slot as i8 {
+                        entry.1 += 1;
+                    }
                 }
             }
         }
@@ -578,6 +712,13 @@ pub fn tally_votes_seeded(
 /// [`encode_disabled_rules`] on no rules) otherwise — JVM
 /// `activatedUpdate`. The forced-v2 bump does NOT activate the update.
 ///
+/// `proposed_update` is parse-validated UP FRONT via
+/// [`parse_validation_settings_update`] and a failure errors (the SANTA
+/// reject arm): the JVM object handed to `Parameters.update` cannot exist
+/// unless these bytes deserialize. Live callers pre-swallow failures to
+/// the canonical EMPTY encoding instead (JVM `Parameters.parseExtension`
+/// parity — see `HeaderChain::compute_expected_parameters`).
+///
 /// Port of JVM `Parameters.update` / `updateFork` / `updateParams`
 /// (`Parameters.scala:82-183`), including the sequential-`if` lifecycle
 /// structure whose conditions all read the PRE-update table while
@@ -586,11 +727,13 @@ pub fn compute_boundary_parameters(
     voting: &VotingConfig,
     boundary_height: u32,
     current: &Parameters,
-    tally: &HashMap<i8, u32>,
+    tally: &[(i8, u32)],
     boundary_fork_vote: bool,
     proposed_update: &[u8],
 ) -> Result<(Parameters, Vec<u8>), crate::ChainError> {
     use crate::ChainError;
+
+    parse_validation_settings_update(proposed_update)?;
 
     if voting.voting_length == 0 {
         return Err(ChainError::Voting("voting_length must be > 0".into()));
@@ -621,47 +764,74 @@ pub fn compute_boundary_parameters(
         .copied();
     if let Some(start) = starting_height {
         let start = start as i64;
-        // JVM `votes = votesInPrevEpoch + parametersTable(SoftForkVotesCollected)`.
-        let votes_in_prev_epoch = tally.get(&SOFT_FORK_VOTE).copied().unwrap_or(0) as i64;
+        // JVM `votesInPrevEpoch`: the FIRST id-120 entry of the ordered
+        // tally (`epochVotes.find(_._1 == SoftFork)`) — find, not sum.
+        let votes_in_prev_epoch = tally
+            .iter()
+            .find(|(id, _)| *id == SOFT_FORK_VOTE)
+            .map(|(_, count)| *count)
+            .unwrap_or(0);
+        // JVM `lazy val votes = votesInPrevEpoch + parametersTable(
+        // SoftForkVotesCollected)` (Parameters.scala:108): Int wrapping
+        // add, and `Map.apply` throws iff the lazy val is FORCED with 121
+        // absent. The five force sites are marked below; a 122-but-no-121
+        // table at any OTHER boundary passes through without error. Do
+        // NOT evaluate eagerly.
         let collected = current
             .parameters_table
             .get(&Parameter::SoftForkVotesCollected)
-            .copied()
-            .unwrap_or(0) as i64;
-        let votes_total = votes_in_prev_epoch + collected;
-        let approved = voting.soft_fork_approved(votes_total.clamp(0, u32::MAX as i64) as u32);
+            .copied();
+        let force_votes = || -> Result<i32, ChainError> {
+            collected
+                .map(|c| (votes_in_prev_epoch as i32).wrapping_add(c))
+                .ok_or_else(|| {
+                    ChainError::Voting(format!(
+                        "SoftForkVotesCollected (121) absent from parameters table at \
+                         boundary {boundary_height} (JVM lazy `votes` force)"
+                    ))
+                })
+        };
+        // Approval compares the (possibly wrapped-negative) i32 total via
+        // signed widening — a negative total is never approved.
+        let approved = |votes: i32| voting.soft_fork_approved(votes as i64);
 
         let mid_end = start + l * ve;
         let activation = start + l * (ve + ae);
         let cleanup_fail = start + l * (ve + 1);
         let cleanup_success = start + l * (ve + ae + 1);
 
-        // Successful voting — cleanup after activation.
-        if h == cleanup_success && approved {
+        // Successful voting — cleanup after activation. (`votes` force
+        // site: the approval operand evaluates only after the height
+        // conjunct matches.)
+        if h == cleanup_success && approved(force_votes()?) {
             table.remove(&Parameter::SoftForkStartingHeight);
             table.remove(&Parameter::SoftForkVotesCollected);
         }
-        // Unsuccessful voting — cleanup.
-        if h == cleanup_fail && !approved {
+        // Unsuccessful voting — cleanup. (`votes` force site.)
+        if h == cleanup_fail && !approved(force_votes()?) {
             table.remove(&Parameter::SoftForkStartingHeight);
             table.remove(&Parameter::SoftForkVotesCollected);
         }
         // New voting starting over a just-cleaned round (the boundary
-        // header itself votes for a fork).
-        if boundary_fork_vote && (h == cleanup_success || (h == cleanup_fail && !approved)) {
+        // header itself votes for a fork). The first disjunct has NO
+        // approval check — a fork vote exactly at the late-cleanup height
+        // restarts the round even when the dying round was never approved
+        // (the one legal zombie revival). The second disjunct is a `votes`
+        // force site, short-circuited away at the cleanup-success height.
+        if boundary_fork_vote
+            && (h == cleanup_success || (h == cleanup_fail && !approved(force_votes()?)))
+        {
             table.insert(Parameter::SoftForkStartingHeight, boundary_height as i32);
             table.insert(Parameter::SoftForkVotesCollected, 0);
         }
-        // New epoch in voting — accumulate the closing epoch's fork votes.
+        // New epoch in voting — store the running total verbatim, wrapped
+        // i32 like the JVM Int. (`votes` force site: the BODY forces.)
         if h <= mid_end {
-            table.insert(
-                Parameter::SoftForkVotesCollected,
-                votes_total.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-            );
+            table.insert(Parameter::SoftForkVotesCollected, force_votes()?);
         }
         // Successful voting — activation: bump BlockVersion, activate the
-        // proposed update.
-        if h == activation && approved {
+        // proposed update. (`votes` force site.)
+        if h == activation && approved(force_votes()?) {
             let bv = table
                 .get(&Parameter::BlockVersion)
                 .copied()
@@ -671,7 +841,7 @@ pub fn compute_boundary_parameters(
                             .into(),
                     )
                 })?;
-            table.insert(Parameter::BlockVersion, bv + 1);
+            table.insert(Parameter::BlockVersion, bv.wrapping_add(1));
             activated = Some(proposed_update.to_vec());
         }
     } else if boundary_fork_vote && boundary_height.is_multiple_of(voting.voting_length) {
@@ -697,13 +867,15 @@ pub fn compute_boundary_parameters(
     // --- JVM `updateParams` ---
     //
     // Ordinary parameter steps. JVM folds over the epoch votes filtered to
-    // ids `< SoftFork` (negatives included), reading each current value
-    // from the post-fork table SNAPSHOT (the `parametersTable` argument,
-    // not the fold accumulator) and writing into the running table. An
-    // approved vote for an id with no table entry throws in JVM (invalid
-    // block) — mirrored here as an error.
+    // ids `< SoftFork` (negatives included) in SEQUENCE order, reading
+    // each current value from the post-fork table SNAPSHOT (the
+    // `parametersTable` argument, not the fold accumulator) and writing
+    // into the running table — a contradictory pair (+id and −id, both
+    // approved) is last-write-wins by tally order. An approved vote for
+    // an id with no table entry throws in JVM (invalid block) — mirrored
+    // here as an error.
     let base = table.clone();
-    for (&signed_id, &count) in tally {
+    for &(signed_id, count) in tally {
         if signed_id >= SOFT_FORK_VOTE {
             continue;
         }
@@ -756,6 +928,103 @@ pub fn compute_boundary_parameters(
     Ok((next, activated_bytes))
 }
 
+/// Fork-vote window gate — port of JVM `ErgoStateContext.checkForkVote`
+/// (`ErgoStateContext.scala:156-168`), consensus rule 407
+/// (`exCheckForkVote`): voting for a fork is prohibited while the active
+/// round is closing or activating.
+///
+/// The JVM call-site condition `if (forkVote)` (`ErgoStateContext.scala:
+/// 243` — boundary and mid-epoch headers alike) is folded into the seam:
+/// `header_votes` not containing 120 passes without reading `current` at
+/// all. `current` is the ACTIVE parameters — the table in force at the
+/// header's height, JVM `currentParameters`.
+///
+/// With `S = current[122]` (gate inert when absent), `finishing =
+/// S + L·ve`, `afterActivation = finishing + L·(ae+1)`, and `collected =
+/// current[121]` — collected ONLY, not closing-epoch + collected; a
+/// different operand than `updateFork`'s `votes` — the gate fires when:
+///
+/// - `finishing <= h < finishing + L` and the round is NOT approved (the
+///   epoch right after a failed round closes), or
+/// - `finishing <= h < afterActivation` and the round IS approved (the
+///   whole activation window plus one epoch).
+///
+/// Returns:
+/// - `Ok(true)` — header passes: no 120 vote, or no round in progress,
+///   or height outside both reject windows.
+/// - `Ok(false)` — rule 407 fires ("Voting for fork is prohibited"):
+///   header invalid.
+/// - `Err` — 122 present but 121 absent. The JVM `.get` is EAGER on gate
+///   entry — unlike `updateFork`'s lazy `votes`, an orphan-122 table is
+///   fatal here even at heights outside the windows (it throws inside
+///   `validateNoThrow`, invalidating the header).
+///
+/// On the live path both `Ok(false)` and `Err` reject the header
+/// (JVM-indistinguishable there — both surface as rule-407 invalid); the
+/// three-way split exists for the SANTA chain-tier grading granularity
+/// (kind `fork_vote_gate`).
+///
+/// Rule 407 is votable-disableable but active on both networks for all of
+/// history (launch defaults disable only 215/409) — implemented as
+/// always-on; dynamic rule-status tracking is out of scope until a real
+/// on-chain update disables it.
+///
+/// **Pure**: settings and the active table arrive as arguments
+/// (`version2_activation_height` is unread but present — uniform
+/// settings block). The live hook is chain-entangled delegation onto
+/// this seam — one implementation, same pattern as
+/// [`compute_boundary_parameters`].
+pub fn check_fork_vote(
+    voting: &VotingConfig,
+    header_height: u32,
+    header_votes: [u8; 3],
+    current: &Parameters,
+) -> Result<bool, crate::ChainError> {
+    use crate::ChainError;
+
+    if !header_votes.contains(&(SOFT_FORK_VOTE as u8)) {
+        return Ok(true);
+    }
+    let Some(&start) = current
+        .parameters_table
+        .get(&Parameter::SoftForkStartingHeight)
+    else {
+        return Ok(true);
+    };
+
+    // EAGER `.get` (ErgoStateContext.scala:161): read 121 before any
+    // window math — an orphan-122 table errors regardless of height.
+    let collected = current
+        .parameters_table
+        .get(&Parameter::SoftForkVotesCollected)
+        .copied()
+        .ok_or_else(|| {
+            ChainError::Voting(format!(
+                "SoftForkVotesCollected (121) absent with SoftForkStartingHeight present \
+                 at height {header_height} (JVM checkForkVote `.get` throw)"
+            ))
+        })?;
+    let approved = voting.soft_fork_approved(collected as i64);
+
+    let h = header_height as i64;
+    let l = voting.voting_length as i64;
+    let ve = voting.soft_fork_epochs as i64;
+    let ae = voting.activation_epochs as i64;
+    let finishing = start as i64 + l * ve;
+    let after_activation = finishing + l * (ae + 1);
+
+    // Deliberately kept in the JVM's redundant two-window shape
+    // (ErgoStateContext.scala:163-164) — reviewability against the
+    // reference outweighs boolean minimality in a consensus rule.
+    #[allow(clippy::nonminimal_bool)]
+    if (h >= finishing && h < finishing + l && !approved)
+        || (h >= finishing && h < after_activation && approved)
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -792,9 +1061,17 @@ mod tests {
     fn soft_fork_approved_supermajority() {
         let cfg = VotingConfig::testnet();
         // 128 * 32 * 9 / 10 = 36864 / 10 = 3686 (integer div)
-        let threshold = 128u32 * 32 * 9 / 10;
+        let threshold = (128 * 32 * 9 / 10) as i64;
         assert!(!cfg.soft_fork_approved(threshold));
         assert!(cfg.soft_fork_approved(threshold + 1));
+    }
+
+    #[test]
+    fn soft_fork_approved_negative_never() {
+        // A wrapped-negative running total compares signed — never approved.
+        let cfg = VotingConfig::testnet();
+        assert!(!cfg.soft_fork_approved(-1));
+        assert!(!cfg.soft_fork_approved(i32::MIN as i64));
     }
 
     /// Window builder for seeded-tally tests: heights `start..start+n`,
@@ -815,8 +1092,7 @@ mod tests {
         w.extend(window(129, &[[1u8, 0, 0]; 64]));
         w.extend(window(193, &[[0u8, 0, 0]; 63]));
         let tally = tally_votes_seeded(&w, 256, 128);
-        assert_eq!(tally.get(&1), Some(&65));
-        assert_eq!(tally.len(), 1);
+        assert_eq!(tally, vec![(1, 65)]);
     }
 
     #[test]
@@ -839,8 +1115,7 @@ mod tests {
         w.extend(window(199, &[[1u8, 0, 0]; 10]));
         w.extend(window(209, &[[0u8, 0, 0]; 47]));
         let tally = tally_votes_seeded(&w, 256, 128);
-        assert_eq!(tally.get(&1), Some(&11));
-        assert_eq!(tally.get(&2), None, "votes for unseeded ids count for nothing");
+        assert_eq!(tally, vec![(1, 11)], "unseeded id 2 accumulates nothing");
     }
 
     #[test]
@@ -859,15 +1134,36 @@ mod tests {
     #[test]
     fn seeded_tally_multi_slot_and_negative_ids() {
         // Seed votes ids 1, -1 (0xFF), 120 across its three slots; each
-        // increments independently. (Negative ids can't appear in a valid
-        // boundary header on-chain — hdrVotesUnknown — but the pure tally
-        // seeds whatever the window head carries; legality is upstream.)
+        // increments independently, entries in SLOT order. (Negative ids
+        // can't appear in a valid boundary header on-chain —
+        // hdrVotesUnknown — but the pure tally seeds whatever the window
+        // head carries; legality is upstream.)
         let mut w = vec![(128u32, [1u8, 0xFF, 120])];
         w.extend(window(129, &[[1u8, 120, 0]; 5]));
         let tally = tally_votes_seeded(&w, 256, 128);
-        assert_eq!(tally.get(&1), Some(&6));
-        assert_eq!(tally.get(&-1), Some(&1));
-        assert_eq!(tally.get(&SOFT_FORK_VOTE), Some(&6));
+        assert_eq!(tally, vec![(1, 6), (-1, 1), (SOFT_FORK_VOTE, 6)]);
+    }
+
+    #[test]
+    fn seeded_tally_slot_order_preserved() {
+        // The tally is ordered by the seed header's vote SLOTS, not by id:
+        // a seed voting [3, 1, 2] yields entries in exactly that order.
+        let w = vec![(128u32, [3u8, 1, 2])];
+        let tally = tally_votes_seeded(&w, 256, 128);
+        assert_eq!(tally, vec![(3, 1), (1, 1), (2, 1)]);
+    }
+
+    #[test]
+    fn seeded_tally_duplicate_seed_id_increments_all_copies() {
+        // A duplicated id in the seed produces one entry per copy, and
+        // every window vote for that id increments ALL matching entries
+        // (JVM `VotingData.update` maps over the whole array). On-chain
+        // such a seed is rejected by hdrVotesDuplicates; handed streams
+        // are graded anyway.
+        let mut w = vec![(128u32, [1u8, 1, 0])];
+        w.extend(window(129, &[[1u8, 0, 0]; 4]));
+        let tally = tally_votes_seeded(&w, 256, 128);
+        assert_eq!(tally, vec![(1, 5), (1, 5)]);
     }
 
     #[test]
@@ -941,14 +1237,27 @@ mod tests {
         encode_disabled_rules(&[])
     }
 
-    fn tally_of(entries: &[(i8, u32)]) -> HashMap<i8, u32> {
-        entries.iter().copied().collect()
+    fn tally_of(entries: &[(i8, u32)]) -> Vec<(i8, u32)> {
+        entries.to_vec()
     }
 
     /// Mainnet-default table (BlockVersion 1, no SubblocksPerBlock) — keeps
     /// soft-fork lifecycle tests clear of the v4 auto-insert arm.
     fn base_params() -> Parameters {
         default_parameters(crate::Network::Mainnet)
+    }
+
+    /// `base_params` plus an in-progress soft-fork round: 122 = `start`,
+    /// 121 = `collected` (or ABSENT for the hostile 122-without-121 family).
+    fn params_with_round(start: i32, collected: Option<i32>) -> Parameters {
+        let mut p = base_params();
+        p.parameters_table
+            .insert(Parameter::SoftForkStartingHeight, start);
+        if let Some(c) = collected {
+            p.parameters_table
+                .insert(Parameter::SoftForkVotesCollected, c);
+        }
+        p
     }
 
     #[test]
@@ -1061,7 +1370,7 @@ mod tests {
     fn boundary_params_boundary_fork_vote_starts_round() {
         let cfg = VotingConfig::testnet();
         let (next, _) = compute_boundary_parameters(
-            &cfg, 256, &base_params(), &HashMap::new(), true, &[],
+            &cfg, 256, &base_params(), &[], true, &[],
         )
         .unwrap();
         assert_eq!(
@@ -1108,7 +1417,7 @@ mod tests {
             .insert(Parameter::SoftForkVotesCollected, 3_700);
         let proposed = encode_disabled_rules(&[215]);
         let (next, activated) = compute_boundary_parameters(
-            &cfg, 8_320, &params, &HashMap::new(), false, &proposed,
+            &cfg, 8_320, &params, &[], false, &proposed,
         )
         .unwrap();
         assert_eq!(next.block_version(), 2, "voting-driven activation bumps BlockVersion");
@@ -1131,7 +1440,7 @@ mod tests {
             .parameters_table
             .insert(Parameter::SoftForkVotesCollected, 100); // below 3686
         let (next, activated) = compute_boundary_parameters(
-            &cfg, 8_320, &params, &HashMap::new(), false, &[],
+            &cfg, 8_320, &params, &[], false, &[],
         )
         .unwrap();
         assert_eq!(next.block_version(), 1);
@@ -1151,7 +1460,7 @@ mod tests {
             .parameters_table
             .insert(Parameter::SoftForkVotesCollected, 100);
         let (next, _) = compute_boundary_parameters(
-            &cfg, 4_352, &params, &HashMap::new(), false, &[],
+            &cfg, 4_352, &params, &[], false, &[],
         )
         .unwrap();
         assert_eq!(next.soft_fork_starting_height(), None);
@@ -1173,14 +1482,14 @@ mod tests {
             .insert(Parameter::SoftForkVotesCollected, 3_700);
         // Without forkVote: counters just clear.
         let (cleared, _) = compute_boundary_parameters(
-            &cfg, 8_448, &params, &HashMap::new(), false, &[],
+            &cfg, 8_448, &params, &[], false, &[],
         )
         .unwrap();
         assert_eq!(cleared.soft_fork_starting_height(), None);
         assert_eq!(cleared.soft_fork_votes_collected(), None);
         // With forkVote: cleanup then immediate restart.
         let (restarted, _) = compute_boundary_parameters(
-            &cfg, 8_448, &params, &HashMap::new(), true, &[],
+            &cfg, 8_448, &params, &[], true, &[],
         )
         .unwrap();
         assert_eq!(restarted.soft_fork_starting_height(), Some(8_448));
@@ -1194,7 +1503,7 @@ mod tests {
         // for the forced path.
         let cfg = VotingConfig::mainnet();
         let (next, activated) = compute_boundary_parameters(
-            &cfg, 417_792, &base_params(), &HashMap::new(), false, &[],
+            &cfg, 417_792, &base_params(), &[], false, &[],
         )
         .unwrap();
         assert_eq!(next.block_version(), 2);
@@ -1218,7 +1527,7 @@ mod tests {
 
         let with_409 = encode_disabled_rules(&[215, 409]);
         let (next, activated) = compute_boundary_parameters(
-            &cfg, 8_320, &params, &HashMap::new(), false, &with_409,
+            &cfg, 8_320, &params, &[], false, &with_409,
         )
         .unwrap();
         assert_eq!(next.block_version(), 4);
@@ -1232,7 +1541,7 @@ mod tests {
 
         let without_409 = encode_disabled_rules(&[215]);
         let (next, _) = compute_boundary_parameters(
-            &cfg, 8_320, &params, &HashMap::new(), false, &without_409,
+            &cfg, 8_320, &params, &[], false, &without_409,
         )
         .unwrap();
         assert_eq!(next.block_version(), 4);
@@ -1253,7 +1562,7 @@ mod tests {
         let mut params = base_params();
         params.parameters_table.insert(Parameter::BlockVersion, 4);
         let (next, _) = compute_boundary_parameters(
-            &cfg, 256, &params, &HashMap::new(), false, &[],
+            &cfg, 256, &params, &[], false, &[],
         )
         .unwrap();
         assert_eq!(
@@ -1262,6 +1571,340 @@ mod tests {
                 .copied(),
             Some(SUBBLOCKS_PER_BLOCK_DEFAULT)
         );
+    }
+
+    // ---- hostile 122-without-121: the lazy `votes` force sites ----
+    //
+    // With testnet settings and S=128: mid-round accumulate ends at
+    // 128 + 128·32 = 4224; cleanup-fail = 128 + 128·33 = 4352;
+    // activation = 128 + 128·64 = 8320; cleanup-success = 128 + 128·65
+    // = 8448.
+
+    #[test]
+    fn boundary_params_122_without_121_errors_at_force_heights() {
+        // JVM forces `lazy val votes` (a Map.apply read of 121) at: any
+        // accumulate boundary (h ≤ S+L·ve), the cleanup-fail height, the
+        // activation height, and the cleanup-success height.
+        let cfg = VotingConfig::testnet();
+        let params = params_with_round(128, None);
+        for h in [256u32, 4_352, 8_320, 8_448] {
+            let r = compute_boundary_parameters(&cfg, h, &params, &[], false, &[]);
+            assert!(r.is_err(), "h={h} must force `votes` and error on absent 121");
+        }
+    }
+
+    #[test]
+    fn boundary_params_122_without_121_passes_at_non_force_boundary() {
+        // At any boundary that is NOT a force site the lifecycle passes
+        // through WITHOUT error — an eager read of 121 (either defaulted
+        // or erroring) diverges from the JVM in one direction or the
+        // other. 4480 and 8576 are past mid-round and none of the
+        // cleanup/activation heights.
+        let cfg = VotingConfig::testnet();
+        let params = params_with_round(128, None);
+        for h in [4_480u32, 8_576] {
+            let (next, activated) =
+                compute_boundary_parameters(&cfg, h, &params, &[], false, &[]).unwrap();
+            assert_eq!(next, params, "table passes through unchanged at h={h}");
+            assert_eq!(activated, empty_update());
+        }
+    }
+
+    #[test]
+    fn boundary_params_votes_in_prev_epoch_is_first_120_entry() {
+        // JVM `epochVotes.find(_._1 == SoftFork)` — the FIRST id-120
+        // entry of the ordered tally, not a sum over duplicates.
+        let cfg = VotingConfig::testnet();
+        let params = params_with_round(128, Some(5));
+        let (next, _) = compute_boundary_parameters(
+            &cfg,
+            256,
+            &params,
+            &tally_of(&[(SOFT_FORK_VOTE, 10), (SOFT_FORK_VOTE, 99)]),
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            next.soft_fork_votes_collected(),
+            Some(15),
+            "collected 5 + FIRST 120 entry (10), not the sum or the max"
+        );
+    }
+
+    #[test]
+    fn boundary_params_votes_wrap_like_jvm_int() {
+        // JVM `votes` is Int addition: the accumulate branch stores the
+        // wrapped i32 verbatim, and the signed approval compare never
+        // approves a negative total.
+        let cfg = VotingConfig::testnet();
+        let params = params_with_round(128, Some(i32::MAX));
+        let (next, _) = compute_boundary_parameters(
+            &cfg,
+            256,
+            &params,
+            &tally_of(&[(SOFT_FORK_VOTE, 1)]),
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            next.soft_fork_votes_collected(),
+            Some(i32::MIN),
+            "i32::MAX + 1 wraps and is stored verbatim"
+        );
+    }
+
+    // ---- ordered updateParams fold ----
+
+    #[test]
+    fn boundary_params_contradictory_pair_order_determines_result() {
+        // +1 and −1 both approved (handed seed slots — on-chain such a
+        // seed is rejected by hdrVotesContradictory; legality is
+        // upstream): JVM folds in sequence order, each step reading the
+        // post-fork SNAPSHOT, so the LAST entry wins deterministically.
+        let cfg = VotingConfig::testnet();
+        let (plus_then_minus, _) = compute_boundary_parameters(
+            &cfg, 256, &base_params(), &tally_of(&[(1, 65), (-1, 65)]), false, &[],
+        )
+        .unwrap();
+        assert_eq!(
+            plus_then_minus.storage_fee_factor(),
+            1_225_000,
+            "(+1, −1): the −1 write lands last"
+        );
+
+        let (minus_then_plus, _) = compute_boundary_parameters(
+            &cfg, 256, &base_params(), &tally_of(&[(-1, 65), (1, 65)]), false, &[],
+        )
+        .unwrap();
+        assert_eq!(
+            minus_then_plus.storage_fee_factor(),
+            1_275_000,
+            "(−1, +1): the +1 write lands last"
+        );
+    }
+
+    #[test]
+    fn boundary_params_duplicate_entries_read_snapshot_not_accumulator() {
+        // Duplicate approved entries for one id: each fold step reads the
+        // snapshot, so the step applies once — not compounded.
+        let cfg = VotingConfig::testnet();
+        let (next, _) = compute_boundary_parameters(
+            &cfg, 256, &base_params(), &tally_of(&[(1, 65), (1, 65)]), false, &[],
+        )
+        .unwrap();
+        assert_eq!(next.storage_fee_factor(), 1_275_000, "one step, not two");
+    }
+
+    // ---- strict parse: parse_validation_settings_update ----
+
+    #[test]
+    fn strict_parse_mandatory_rule_rejects() {
+        // 102 (txManyInputs) is mayBeDisabled=false in rulesSpec.
+        let bytes = encode_disabled_rules(&[102]);
+        assert!(parse_validation_settings_update(&bytes).is_err());
+    }
+
+    #[test]
+    fn strict_parse_disableable_and_unknown_ids_pass() {
+        // 111/409 are mayBeDisabled=true; 414 has a constant but no
+        // rulesSpec entry; 1011 is a sigma-side id — both pass through
+        // (JVM `rulesSpec.get(rd).forall(_.mayBeDisabled)`).
+        for id in [111u16, 409, 414, 1011] {
+            let bytes = encode_disabled_rules(&[id]);
+            assert_eq!(
+                parse_validation_settings_update(&bytes).unwrap(),
+                vec![id],
+                "id {id} must pass the strict parse"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_parse_empty_input_ok() {
+        // Absent extension field = empty update by convention.
+        assert_eq!(
+            parse_validation_settings_update(&[]).unwrap(),
+            Vec::<u16>::new()
+        );
+    }
+
+    #[test]
+    fn strict_parse_bare_rules_count_rejects() {
+        // A 1-byte `0x00` payload is truncated before the statusUpdates
+        // count — JVM `getUInt` underflow. The lenient
+        // `parse_disabled_rules` keeps accepting it (see
+        // `parse_disabled_rules_count_only_ok`).
+        assert!(parse_validation_settings_update(&[0x00]).is_err());
+        assert!(
+            parse_disabled_rules(&[0x00]).is_ok(),
+            "lenient reader contrast"
+        );
+    }
+
+    #[test]
+    fn strict_parse_truncated_rules_rejects() {
+        // Claims 2 rules, supplies bytes for 1.
+        assert!(parse_validation_settings_update(&[0x02, 0xD7, 0x01]).is_err());
+    }
+
+    #[test]
+    fn strict_parse_mainnet_v6_payload_passes_with_status_tail() {
+        // The real h=1,628,160 ID 124 payload: rulesToDisable=[215,409]
+        // plus 3 status updates. Entries after the count pass
+        // UNVALIDATED — the payload must keep flowing verbatim.
+        let bytes: [u8; 18] = [
+            0x02, 0xD7, 0x01, 0x99, 0x03, 0x03, 0x0B, 0x01, 0x03,
+            0x10, 0x07, 0x01, 0x03, 0x11, 0x08, 0x01, 0x03, 0x12,
+        ];
+        assert_eq!(
+            parse_validation_settings_update(&bytes).unwrap(),
+            vec![215, 409]
+        );
+    }
+
+    #[test]
+    fn strict_parse_nonzero_status_count_lenient_tail() {
+        // Rules count 0, status count 2, one garbage byte: entries are
+        // not validated (no RuleStatusSerializer port) — Ok.
+        assert_eq!(
+            parse_validation_settings_update(&[0x00, 0x02, 0xAB]).unwrap(),
+            Vec::<u16>::new()
+        );
+    }
+
+    #[test]
+    fn strict_parse_rules_count_wraps_like_jvm_toint() {
+        // JVM `getUInt().toInt` wraps 0xFFFFFFFF to −1 and `0 until -1`
+        // reads zero rule ids: the payload parses as an empty list, then
+        // the status count.
+        let bytes = [0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x00];
+        assert_eq!(
+            parse_validation_settings_update(&bytes).unwrap(),
+            Vec::<u16>::new()
+        );
+    }
+
+    #[test]
+    fn boundary_params_strict_parse_reject_arm() {
+        // The pure seam parse-validates `proposed_update` up front — a
+        // mandatory-rule update errors (the SANTA reject arm). The live
+        // wrappers pre-swallow instead; see the chain-level test.
+        let cfg = VotingConfig::testnet();
+        let hostile = encode_disabled_rules(&[102]);
+        let r =
+            compute_boundary_parameters(&cfg, 256, &base_params(), &[], false, &hostile);
+        assert!(r.is_err());
+    }
+
+    // ---- check_fork_vote (JVM ErgoStateContext.checkForkVote) ----
+    //
+    // S=128, testnet: finishing = 128 + 128·32 = 4224; afterActivation =
+    // 4224 + 128·33 = 8448.
+
+    /// A header voting 120 in its first slot — the gate's trigger case.
+    const FORK_VOTE_SLOTS: [u8; 3] = [120, 0, 0];
+
+    #[test]
+    fn check_fork_vote_no_120_vote_always_passes() {
+        // The JVM call-site condition `if (forkVote)` is folded into the
+        // seam: a header not voting 120 passes WITHOUT reading the table
+        // — even an orphan-122 table cannot error.
+        let cfg = VotingConfig::testnet();
+        let orphan = params_with_round(128, None);
+        assert!(check_fork_vote(&cfg, 4_224, [0, 0, 0], &orphan).unwrap());
+        assert!(check_fork_vote(&cfg, 4_224, [1, 2, 3], &base_params()).unwrap());
+    }
+
+    #[test]
+    fn check_fork_vote_inert_without_round() {
+        // No 122 in the table: Ok(true) at any height, vote present.
+        let cfg = VotingConfig::testnet();
+        for h in [1u32, 4_224, 8_447, 1_000_000] {
+            assert!(
+                check_fork_vote(&cfg, h, FORK_VOTE_SLOTS, &base_params()).unwrap(),
+                "no round in progress must pass at h={h}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_fork_vote_failed_round_window_edges() {
+        // collected=100, not approved: Ok(false) exactly on [finishing,
+        // finishing+L) = [4224, 4352).
+        let cfg = VotingConfig::testnet();
+        let params = params_with_round(128, Some(100));
+        let gate = |h| check_fork_vote(&cfg, h, FORK_VOTE_SLOTS, &params).unwrap();
+        assert!(gate(4_223), "before finishing");
+        assert!(!gate(4_224), "window start");
+        assert!(!gate(4_351), "last in window");
+        assert!(gate(4_352), "past the failed-round window");
+        // 120 in any vote slot triggers the gate, not just slot 0.
+        assert!(!check_fork_vote(&cfg, 4_224, [0, 120, 0], &params).unwrap());
+    }
+
+    #[test]
+    fn check_fork_vote_approved_round_window_edges() {
+        // collected=3700 > 3686, approved: Ok(false) on [finishing,
+        // afterActivation) = [4224, 8448) — the whole activation period
+        // plus one epoch.
+        let cfg = VotingConfig::testnet();
+        let params = params_with_round(128, Some(3_700));
+        let gate = |h| check_fork_vote(&cfg, h, FORK_VOTE_SLOTS, &params).unwrap();
+        assert!(gate(4_223), "before finishing");
+        assert!(!gate(4_224), "window start");
+        assert!(!gate(8_447), "last in window");
+        assert!(gate(8_448), "after the activation window");
+    }
+
+    #[test]
+    fn check_fork_vote_122_without_121_errors_eagerly() {
+        // The `.get` of 121 is EAGER on gate entry (unlike `updateFork`'s
+        // lazy `votes`): with a 120 vote present, an orphan-122 table
+        // errors even at heights OUTSIDE both reject windows.
+        let cfg = VotingConfig::testnet();
+        let params = params_with_round(128, None);
+        for h in [10u32, 4_224, 100_000] {
+            assert!(
+                check_fork_vote(&cfg, h, FORK_VOTE_SLOTS, &params).is_err(),
+                "orphan-122 must error at h={h}"
+            );
+        }
+    }
+
+    // ---- zombie family regression ----
+
+    #[test]
+    fn boundary_params_zombie_stuck_table_passes_through() {
+        // A round whose cleanup heights were missed (recompute resumed
+        // past them): at any later boundary no lifecycle branch can fire
+        // — the stuck counters pass through unchanged, no error, no
+        // rationalizing them away.
+        let cfg = VotingConfig::testnet();
+        let params = params_with_round(128, Some(100));
+        let (next, activated) =
+            compute_boundary_parameters(&cfg, 8_576, &params, &[], false, &[]).unwrap();
+        assert_eq!(next, params, "stuck counters pass through AS-IS");
+        assert_eq!(activated, empty_update());
+    }
+
+    #[test]
+    fn boundary_params_zombie_revival_at_late_cleanup_height() {
+        // A fork vote exactly at S + L·(ve+ae+1) restarts the round even
+        // when the dying round was never approved — the restart's
+        // cleanup-success disjunct has NO approval check (JVM
+        // Parameters.scala:127-128). The one legal zombie revival.
+        let cfg = VotingConfig::testnet();
+        let params = params_with_round(128, Some(100)); // never approved
+        let (next, _) =
+            compute_boundary_parameters(&cfg, 8_448, &params, &[], true, &[]).unwrap();
+        assert_eq!(
+            next.soft_fork_starting_height(),
+            Some(8_448),
+            "round restarted at the late-cleanup boundary"
+        );
+        assert_eq!(next.soft_fork_votes_collected(), Some(0));
     }
 
     #[test]
