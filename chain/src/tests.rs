@@ -1692,6 +1692,15 @@ mod voting_chain_tests {
         let swallowed = chain.compute_expected_parameters(256, &[0x00]).unwrap();
         assert_eq!(swallowed, with_empty);
 
+        // Structurally hostile in the strict status tail (gap closed
+        // 2026-06-12): a status entry cut inside its dataBytes errors at
+        // the seam and is swallowed to empty the same way.
+        let truncated_status = [0x00, 0x01, 0x0B, 0x02, 0x04, 0xAA];
+        let swallowed = chain
+            .compute_expected_parameters(256, &truncated_status)
+            .unwrap();
+        assert_eq!(swallowed, with_empty);
+
         // The candidate path agrees and the activated update stays the
         // canonical EMPTY encoding at a non-activation boundary.
         let (params, activated) = chain

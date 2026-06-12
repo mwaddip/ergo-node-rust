@@ -295,8 +295,8 @@ pub fn extract_disabling_rules_from_kv(kv: &[ExtensionField]) -> Vec<u8> {
 /// This is the LENIENT reader, used for the rule-409 auto-insert gate on
 /// already-normalized bytes. The validation entry point for raw block
 /// bytes is [`parse_validation_settings_update`], which additionally
-/// enforces the disableability `require` and the statusUpdates-count
-/// read.
+/// enforces the disableability `require` and strict per-entry
+/// statusUpdates decoding.
 pub fn parse_disabled_rules(bytes: &[u8]) -> Result<Vec<u16>, crate::ChainError> {
     use crate::ChainError;
     use sigma_ser::vlq_encode::ReadSigmaVlqExt;
@@ -366,7 +366,9 @@ fn rule_may_not_be_disabled(id: u16) -> bool {
 /// [disabledRulesNum: VLQ u32]
 /// disabledRules × disabledRulesNum: [rule_id: VLQ u16]
 /// [statusUpdatesNum: VLQ u32]
-/// (statusUpdate entries — NOT validated, see below)
+/// statusUpdates × statusUpdatesNum:
+///   [rule_id_offset: VLQ u16]
+///   [dataSize: VLQ u16] [statusCode: u8] [dataBytes: dataSize bytes]
 /// ```
 ///
 /// - Empty input = empty update (absent-field convention), no error.
@@ -376,30 +378,42 @@ fn rule_may_not_be_disabled(id: u16) -> bool {
 ///   the private `rule_may_not_be_disabled` table). The check runs after
 ///   the full id list is read and before `statusUpdatesNum` — JVM error
 ///   precedence.
-/// - The `statusUpdates` COUNT must parse: a payload truncated before it
-///   (e.g. the bare 1-byte `0x00`) errors — JVM `getUInt` underflow
-///   parity. Entries after a `count > 0` pass UNVALIDATED (lenient
-///   tail): mainnet's real h=1,628,160 payload carries 3 status updates
-///   and must keep flowing verbatim through the live wrappers. Known
-///   gap (flagged to SANTA): JVM fully decodes each entry via the
-///   sigma-side `RuleStatusSerializer`, which has no Rust port — a
-///   payload with malformed status entries rejects on JVM and passes
-///   here. Do not guess the entry wire format; closing this needs the
-///   sigma port.
+/// - A payload truncated before the `statusUpdates` count (e.g. the bare
+///   1-byte `0x00`) errors — JVM `getUInt` underflow parity.
+/// - Every `statusUpdates` entry is strictly decoded (gap closed
+///   2026-06-12, sigma pin `75be067f`): rule id = VLQ ushort offset
+///   wrapped through `(offset + FIRST_RULE_ID).toShort`
+///   (`ErgoValidationSettingsUpdate.scala:53`), then
+///   `RuleStatus::sigma_parse` — the sigma-rust port of the JVM
+///   `RuleStatusSerializer`, quirks included (`ReplacedRule` ignores
+///   `dataSize` and reads its own VLQ ushort; an unknown status code
+///   skips `dataSize` bytes and yields `ReplacedRule(0)`, the
+///   forward-compat soft-fork arm). Malformed or truncated entries
+///   error. The decoded statuses are validated and DISCARDED — enr
+///   models update payloads as raw bytes (see
+///   [`crate::HeaderChain::active_proposed_update_bytes`]); dynamic
+///   rule-status state stays out of scope until a real on-chain update
+///   requires it.
+/// - Trailing bytes AFTER the final entry are NOT an error — JVM Reader
+///   parity (`parseBytes` does not enforce full consumption).
 /// - Counts mirror JVM `getUInt().toInt`: values ≥ 2^31 wrap negative
 ///   and `0 until n` reads ZERO entries — a count of `0xFFFFFFFF`
-///   parses as an empty rules list, not a 4-billion-entry read.
+///   parses as an empty section, not a 4-billion-entry read. Applies to
+///   BOTH the rules and statusUpdates counts.
 pub fn parse_validation_settings_update(
     bytes: &[u8],
 ) -> Result<Vec<u16>, crate::ChainError> {
     use crate::ChainError;
+    use ergo_lib::ergotree_ir::serialization::sigma_byte_reader::from_bytes;
+    use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+    use ergo_lib::ergotree_ir::validation::{RuleStatus, FIRST_RULE_ID};
     use sigma_ser::vlq_encode::ReadSigmaVlqExt;
 
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
-    let mut cursor = std::io::Cursor::new(bytes);
-    let raw_count = cursor.get_u32().map_err(|e| {
+    let mut r = from_bytes(bytes);
+    let raw_count = r.get_u32().map_err(|e| {
         ChainError::ExtensionParse(format!("settings update: disabled rules count: {e}"))
     })?;
     // JVM `getUInt().toInt` wraps ≥ 2^31 negative; `(0 until n)` on a
@@ -412,7 +426,7 @@ pub fn parse_validation_settings_update(
     let cap = count.min(bytes.len());
     let mut rules = Vec::with_capacity(cap);
     for i in 0..count {
-        let rule = cursor.get_u16().map_err(|e| {
+        let rule = r.get_u16().map_err(|e| {
             ChainError::ExtensionParse(format!(
                 "settings update: disabled rule id at index {i}: {e}"
             ))
@@ -426,9 +440,31 @@ pub fn parse_validation_settings_update(
             )));
         }
     }
-    cursor.get_u32().map_err(|e| {
+    let raw_status_count = r.get_u32().map_err(|e| {
         ChainError::ExtensionParse(format!("settings update: status updates count: {e}"))
     })?;
+    // Same `.toInt` wrap as the rules count.
+    let status_count = if raw_status_count > i32::MAX as u32 {
+        0
+    } else {
+        raw_status_count as usize
+    };
+    for i in 0..status_count {
+        // JVM `(r.getUShort() + FirstRule).toShort` — decoded, discarded.
+        let _rule_id = r
+            .get_u16()
+            .map_err(|e| {
+                ChainError::ExtensionParse(format!(
+                    "settings update: status update rule id at index {i}: {e}"
+                ))
+            })?
+            .wrapping_add(FIRST_RULE_ID as u16) as i16;
+        RuleStatus::sigma_parse(&mut r).map_err(|e| {
+            ChainError::ExtensionParse(format!(
+                "settings update: status update at index {i}: {e}"
+            ))
+        })?;
+    }
     Ok(rules)
 }
 
@@ -1749,15 +1785,69 @@ mod tests {
         assert!(parse_validation_settings_update(&[0x02, 0xD7, 0x01]).is_err());
     }
 
+    /// The real mainnet h=1,628,160 ID 124 payload: rulesToDisable=
+    /// [215,409] plus 3 status updates (1011→1016, 1007→1017,
+    /// 1008→1018, all ReplacedRule). Strict-decoded end-to-end since
+    /// the sigma `RuleStatusSerializer` port (pin `75be067f`) — the
+    /// payload is VALID, not lenient-tolerated.
+    const MAINNET_V6_PAYLOAD: [u8; 18] = [
+        0x02, 0xD7, 0x01, 0x99, 0x03, 0x03, 0x0B, 0x01, 0x03,
+        0x10, 0x07, 0x01, 0x03, 0x11, 0x08, 0x01, 0x03, 0x12,
+    ];
+
     #[test]
     fn strict_parse_mainnet_v6_payload_passes_with_status_tail() {
-        // The real h=1,628,160 ID 124 payload: rulesToDisable=[215,409]
-        // plus 3 status updates. Entries after the count pass
-        // UNVALIDATED — the payload must keep flowing verbatim.
-        let bytes: [u8; 18] = [
-            0x02, 0xD7, 0x01, 0x99, 0x03, 0x03, 0x0B, 0x01, 0x03,
-            0x10, 0x07, 0x01, 0x03, 0x11, 0x08, 0x01, 0x03, 0x12,
-        ];
+        assert_eq!(
+            parse_validation_settings_update(&MAINNET_V6_PAYLOAD).unwrap(),
+            vec![215, 409]
+        );
+    }
+
+    #[test]
+    fn strict_parse_status_count_without_entries_rejects() {
+        // Rules count 0, status count 2, one garbage byte (0xAB has the
+        // VLQ continuation bit — not even a complete rule-id offset).
+        // The pre-`75be067f` lenient tail accepted exactly this; the
+        // strict per-entry decode rejects it, JVM parity.
+        assert!(parse_validation_settings_update(&[0x00, 0x02, 0xAB]).is_err());
+    }
+
+    #[test]
+    fn strict_parse_status_entry_truncated_in_data_rejects() {
+        // One status entry: rule offset 0x0B, ChangedRule (code 4)
+        // claiming dataSize=2 but cut after 1 payload byte.
+        let bytes = [0x00, 0x01, 0x0B, 0x02, 0x04, 0xAA];
+        assert!(parse_validation_settings_update(&bytes).is_err());
+    }
+
+    #[test]
+    fn strict_parse_status_entry_bogus_data_size_rejects() {
+        // Unknown status code 0x63 with dataSize=5 and ZERO bytes left:
+        // the forward-compat skip arm still bounds-checks against the
+        // buffer end (JVM `r.position += dataSize` throws past-end).
+        let bytes = [0x00, 0x01, 0x0B, 0x05, 0x63];
+        assert!(parse_validation_settings_update(&bytes).is_err());
+    }
+
+    #[test]
+    fn strict_parse_unknown_status_code_skips_ok() {
+        // Unknown status code 0x63 with dataSize=2 and both bytes
+        // present: skipped and processed as a soft-fork —
+        // `ReplacedRule(0)`, discarded (JVM forward-compat arm).
+        let bytes = [0x00, 0x01, 0x0B, 0x02, 0x63, 0xAA, 0xBB];
+        assert_eq!(
+            parse_validation_settings_update(&bytes).unwrap(),
+            Vec::<u16>::new()
+        );
+    }
+
+    #[test]
+    fn strict_parse_trailing_bytes_after_final_entry_ok() {
+        // Garbage AFTER the final decoded entry is not an error — JVM
+        // Reader parity (`parseBytes` does not enforce full
+        // consumption).
+        let mut bytes = MAINNET_V6_PAYLOAD.to_vec();
+        bytes.extend_from_slice(&[0xDE, 0xAD]);
         assert_eq!(
             parse_validation_settings_update(&bytes).unwrap(),
             vec![215, 409]
@@ -1765,11 +1855,13 @@ mod tests {
     }
 
     #[test]
-    fn strict_parse_nonzero_status_count_lenient_tail() {
-        // Rules count 0, status count 2, one garbage byte: entries are
-        // not validated (no RuleStatusSerializer port) — Ok.
+    fn strict_parse_status_count_wraps_like_jvm_toint() {
+        // The `getUInt().toInt` wrap governs the statusUpdates count
+        // too: 0xFFFFFFFF wraps to −1, zero entries are read, and the
+        // (otherwise hostile) absent entries are never reached.
+        let bytes = [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F];
         assert_eq!(
-            parse_validation_settings_update(&[0x00, 0x02, 0xAB]).unwrap(),
+            parse_validation_settings_update(&bytes).unwrap(),
             Vec::<u16>::new()
         );
     }
