@@ -62,7 +62,11 @@ pub struct CandidateBlock {
 pub struct WorkMessage {
     /// Blake2b256(serialized HeaderWithoutPow) — hex-encoded.
     pub msg: String,
-    /// Target value from nBits — decimal string.
+    /// Target value from nBits. Held as a decimal string internally, but
+    /// serialized as a BARE JSON number to match JVM `ExternalCandidateBlock`
+    /// (jsmn-based miner/pool parsers reject a quoted target). See
+    /// `serialize_b_as_number`.
+    #[serde(serialize_with = "serialize_b_as_number")]
     pub b: String,
     /// Block height.
     pub h: u32,
@@ -70,6 +74,30 @@ pub struct WorkMessage {
     pub pk: String,
     /// Header pre-image for miner verification.
     pub proof: ProofOfUpcomingTransactions,
+}
+
+/// Serialize the decimal target `b` as a bare (unquoted) JSON number.
+///
+/// `b` ranges up to the secp256k1 group order (~2^256), so it fits neither
+/// `u64` nor `u128` and cannot go through serde's numeric data model. We wrap
+/// the decimal digits in a `serde_json::value::RawValue`, which emits them
+/// verbatim — yielding the arbitrary-precision number token the JVM
+/// `ExternalCandidateBlock` produces and JVM-compatible miner/pool parsers
+/// require. RawValue's verbatim emission only applies through serde_json's
+/// serializer, which is the only serializer WorkMessage ever sees (axum's
+/// `Json` in production, `serde_json::to_string` in tests).
+///
+/// `b` is always the decimal string from `decode_compact_bits(..).to_string()`
+/// (a non-negative `BigInt`: valid JSON, no leading zeros, no sign), so the
+/// RawValue construction never fails in practice — but we surface it as a
+/// serialization error rather than panic if that invariant is ever violated.
+fn serialize_b_as_number<S>(b: &str, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let raw = serde_json::value::RawValue::from_string(b.to_owned())
+        .map_err(serde::ser::Error::custom)?;
+    raw.serialize(serializer)
 }
 
 #[derive(Clone, Serialize)]
@@ -88,4 +116,66 @@ pub struct CachedCandidate {
     pub work: WorkMessage,
     pub tip_height: u32,
     pub created: Instant,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn work_with_b(b: &str) -> WorkMessage {
+        WorkMessage {
+            msg: "00".repeat(32),
+            b: b.to_string(),
+            h: 271_235,
+            pk: format!("02{}", "11".repeat(32)),
+            proof: ProofOfUpcomingTransactions {
+                msg_preimage: "dead".to_string(),
+                tx_proofs: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn b_serializes_as_bare_number() {
+        let json = serde_json::to_string(&work_with_b("12237864960")).unwrap();
+        assert!(
+            json.contains(r#""b":12237864960"#),
+            "b must be a bare JSON number, got: {json}"
+        );
+        assert!(
+            !json.contains(r#""b":"12237864960""#),
+            "b must NOT be a quoted string, got: {json}"
+        );
+    }
+
+    #[test]
+    fn b_preserves_arbitrary_precision_beyond_u64() {
+        // ~7.5e62 (≈ 2^209): exceeds both u64 (~2e19) and u128 (~3.4e38),
+        // proving the value survives without lossy integer coercion. This is
+        // the JVM LiteClientExamples target.
+        let huge = "748014723576678314041035877227113663879264849498014394977645987";
+        let json = serde_json::to_string(&work_with_b(huge)).unwrap();
+        assert!(
+            json.contains(&format!(r#""b":{huge}"#)),
+            "arbitrary-precision b must survive verbatim, got: {json}"
+        );
+        assert!(
+            !json.contains(&format!(r#""b":"{huge}""#)),
+            "b must not be quoted, got: {json}"
+        );
+    }
+
+    #[test]
+    fn only_b_changes_shape() {
+        // Guard the rest of the wire shape: msg/pk stay quoted hex strings,
+        // h stays a bare number, proof is unchanged.
+        let json = serde_json::to_string(&work_with_b("12237864960")).unwrap();
+        assert!(json.contains(r#""msg":"0000"#), "msg must stay a hex string: {json}");
+        assert!(json.contains(r#""pk":"0211"#), "pk must stay a hex string: {json}");
+        assert!(json.contains(r#""h":271235"#), "h must stay a bare number: {json}");
+        assert!(
+            json.contains(r#""msgPreimage":"dead""#),
+            "proof.msgPreimage must stay a hex string: {json}"
+        );
+    }
 }

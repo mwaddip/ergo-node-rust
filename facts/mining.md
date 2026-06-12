@@ -69,11 +69,19 @@ current candidate is lost; miners just poll for a new one.
 - `ergo_avltree_rust` — via UtxoValidator (temporary prover operations for
   state root computation)
 - `blake2` — Blake2b256 for header hash (WorkMessage `msg` field)
-- `serde` — serialization of types (JSON encoding is the API crate's job)
+- `serde` — `Serialize` derives on the wire types
+- `serde_json` (feature `raw_value`) — ONLY for `WorkMessage.b`'s
+  `serialize_with`: `b` ranges to ~2^256, which serde's numeric data model
+  cannot represent, so it is emitted as a bare JSON number via
+  `serde_json::value::RawValue` wrapping the decimal digits (added
+  2026-06-12 with the b-as-number fix). The API crate still does the
+  HTTP-level `Json(work)` encoding; mining only owns this one
+  number-shape escape hatch.
 
-Does NOT depend on: `axum`, `serde_json`, P2P transport, sync state machine,
-block storage internals, redb. The mining crate is HTTP-agnostic — all wire
-format concerns belong to the API crate.
+Does NOT depend on: `axum`, P2P transport, sync state machine,
+block storage internals, redb. The mining crate is HTTP-agnostic — all
+HTTP/routing concerns belong to the API crate (the lone `serde_json`
+use above is a serialization-shape detail, not HTTP).
 
 ## Core Types
 
@@ -148,12 +156,20 @@ pub struct WorkMessage {
 }
 ```
 
+The struct above is the SEMANTIC shape. The impl (`mining/src/types.rs`)
+stores the wire-ready encodings directly — `msg`/`pk`/`proof.msgPreimage`
+as hex `String`s, `b` as a decimal `String` (serialized to a bare number,
+below), `h` as `u32` — so it serializes straight to the JSON response
+without a separate encoding pass. Do not read the semantic types
+(`BigInt`/`EcPoint`/`[u8; 32]`) as the field types; they describe meaning,
+the JSON block describes the wire.
+
 JSON response:
 
 ```json
 {
   "msg": "hex string (32 bytes)",
-  "b": "decimal string (BigInt)",
+  "b": 748014723576678314041035877227113663879264849498014394977645987,
   "h": 271235,
   "pk": "hex string (33 bytes compressed)",
   "proof": {
@@ -162,6 +178,23 @@ JSON response:
   }
 }
 ```
+
+**`b` is a bare JSON NUMBER, not a quoted string (corrected 2026-06-12 —
+JVM-compat serve bug).** JVM `ExternalCandidateBlock` encodes `b` as a
+`BigInt` via circe → an arbitrary-precision unquoted JSON number
+(`ergo-core .../examples/LiteClientExamples.scala:27`: `"b" :
+748014723576678314041035877227113663879264849498014394977645987`).
+Emitting it as a string (the prior contract + impl) breaks every
+JVM-compatible miner/pool: their jsmn-based parsers expect a numeric
+token and reject the candidate ("Jsmn failed to parse"). `b` ranges up
+to the secp256k1 group order (~2^256), so it does NOT fit u64 —
+serialize it as an arbitrary-precision JSON number (serde_json
+`raw_value`: a `serialize_with` that wraps the decimal digits in a
+`RawValue`, emitting them verbatim/unquoted; or the `arbitrary_precision`
+feature). This was invisible until the node was first driven by a real
+external miner (the "untested as a mining source" serve-direction gap —
+same class as the rust-peer serve bugs). `msg`/`pk` stay hex strings,
+`h` stays a number, `proof` stays as shown (JVM includes it).
 
 ### `ProofOfUpcomingTransactions`
 
