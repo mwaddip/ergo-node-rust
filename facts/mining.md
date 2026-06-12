@@ -320,6 +320,10 @@ impl CandidateGenerator {
     pub fn cache_candidate(&self, block: CandidateBlock, work: WorkMessage, tip_height: u32);
 
     /// Poll-time read: current WorkMessage iff tip still matches and TTL fresh.
+    /// `current_tip_height` MUST be the **VALIDATED** height — the same
+    /// source the mining task passes to `cache_candidate` (the candidate is
+    /// built on the validated tip's state root). See the height-source note
+    /// under "GET /mining/candidate" below.
     pub fn cached_work(&self, current_tip_height: u32) -> Option<WorkMessage>;
 
     /// Current / previous CandidateBlock for solution validation.
@@ -771,10 +775,32 @@ mining-specific behavior that the API handlers invoke.
 
 No request body. Returns `WorkMessage` JSON.
 
+**Height source — query by VALIDATED height, NOT header height (fixed
+2026-06-12 — bug #3).** The handler MUST query `cached_work` with
+`ApiState.validated_height` (the validator's last-fully-applied height —
+the SAME `Arc<AtomicU32>` the mining task uses to key the cache, wired in
+`main.rs`), NOT `chain.height()` (the HEADER-chain tip). The candidate is
+built on the validated tip's state root and cached keyed to the validated
+height; querying by header height fails the `cached.tip_height ==
+current_tip_height` check whenever the header chain leads validation
+(`full < headers`) — which is the NORMAL transient state every time a new
+header arrives before its body is validated, and a persistent state when
+validation trails reception (e.g. a single slow peer). The original
+`chain.height()` query made the candidate `503` continuously in that
+window even though a valid candidate for the validated tip sat in the
+cache — the node was unservable as a mining source whenever it wasn't
+perfectly synced. Found driving a real external miner; the miner grinds on
+`validated_tip + 1`, racing the network for that height and switching when
+the node validates the next block (own or network). Regression: a
+candidate cached at validated height H must be served while header height
+is H+1.
+
 Returns 503 if:
 - Mining not configured (no miner PK in config)
 - Node is in digest mode (cannot compute state roots)
-- Node is still syncing (validator height far below chain tip)
+- No fresh candidate cached for the current VALIDATED tip (post-restart
+  before the first at-tip block applies; or briefly between a block
+  applying and the mining task regenerating)
 
 ### `POST /mining/solution`
 

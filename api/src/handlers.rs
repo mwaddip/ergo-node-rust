@@ -904,7 +904,15 @@ pub async fn get_mining_candidate(
 ) -> ApiResult<ergo_mining::WorkMessage> {
     let mining = state.mining.as_ref().ok_or_else(mining_err)?;
 
-    let tip_height = state.chain.height();
+    // Query by VALIDATED height, NOT the header-chain tip. The mining task
+    // builds the candidate on the validated tip's state root and keys the
+    // cache to `validated_height` (the same Arc<AtomicU32> ApiState holds).
+    // The header chain leads validation (`full < headers`) every time a new
+    // header arrives before its body validates — querying `chain.height()`
+    // there fails `cached.tip_height == current_tip_height` and returns 503
+    // even though a valid candidate for the validated tip is cached.
+    // (facts/mining.md — "GET /mining/candidate", height-source paragraph.)
+    let tip_height = state.validated_height.load(std::sync::atomic::Ordering::Relaxed);
     match mining.cached_work(tip_height) {
         Some(work) => Ok(Json(work)),
         None => err(
@@ -3939,5 +3947,47 @@ mod tests {
             !generator.solved_pending(),
             "latch must be released on the 500 path"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /mining/candidate — height-source (bug #3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn candidate_served_when_header_leads_validation() {
+        // The candidate is built and cached on the VALIDATED tip's state root,
+        // keyed to the validated height. The header chain leads validation
+        // (`full < headers`) every time a new header arrives before its body
+        // validates — and persistently behind a slow peer. Querying the cache
+        // by header height (chain.height()) misses and returns 503 even though
+        // a valid candidate for the validated tip is cached, making the node
+        // unservable as a mining source unless perfectly synced. The handler
+        // must query by validated height. (facts/mining.md, GET
+        // /mining/candidate.)
+        const H: u32 = 100;
+
+        // Candidate cached at the VALIDATED tip height H, carrying a sentinel
+        // `h` so the served work is unmistakably this one.
+        let generator = Arc::new(CandidateGenerator::new(test_miner_config()));
+        let mut work = stub_work();
+        work.h = H;
+        generator.cache_candidate(make_test_candidate(&make_minimal_header(H)), work, H);
+
+        // Header chain leads validation by one block: the tip reports H+1 ...
+        let mut state = mining_state(make_minimal_header(H + 1), generator);
+        // ... while the validator's last fully-applied height is still H.
+        state.validated_height = Arc::new(AtomicU32::new(H));
+
+        let rt = build_runtime();
+        match rt.block_on(get_mining_candidate(State(state))) {
+            Ok(Json(served)) => assert_eq!(
+                served.h, H,
+                "must serve the cached candidate for the validated tip, not 503"
+            ),
+            Err((status, body)) => panic!(
+                "expected 200 with the cached candidate, got {status} / {}",
+                body.reason
+            ),
+        }
     }
 }
