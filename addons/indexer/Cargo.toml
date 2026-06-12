@@ -2,7 +2,7 @@
 
 [package]
 name = "ergo-indexer"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 description = "Blockchain indexer for ergo-node-rust — rich query API over SQLite or PostgreSQL"
 

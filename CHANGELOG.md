@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.7.2 — 2026-06-12
+
+The JVM-exactness release. The SANTA chain tier kept growing vectors
+(statusUpdates, a fork-vote-gate kind, a header-votes kind) and, in the
+established tradition, each round surfaced or pinned a real consensus gap in
+the code built to grade it. Five missing-or-divergent rules closed, all
+JVM-verified against ergo-core v6.0.3; the donner board carries them at red 0.
+
+- **Header vote-field validation (rules 212/213/214) — was missing entirely.**
+  The vote field was read only for the tally and the fork gate, never
+  validated. JVM `validateVotes` rejects >2 ordinary votes (`hdrVotesNumber`),
+  duplicate ids (`hdrVotesDuplicates`), and an id present with its i8-wrapping
+  negation (`hdrVotesContradictory`, including the `0x80` self-negation). A
+  malformed-vote header we accepted and the network rejects — fork direction,
+  adversarial-header reachable. New pure `voting::check_header_votes` seam +
+  live hook. Rule 215 (`hdrVotesUnknown`) is deferred (height-varying rule
+  status).
+- **Fork-vote window gate (rule 407, `checkForkVote`) — was missing.** Voting
+  for a fork during a round's closing or activation window is prohibited; we
+  enforced nothing. New `voting::check_fork_vote` tri-state seam (operand is
+  the collected counter only) wired into the three header-validation paths.
+- **Soft-fork lifecycle laziness + ordering.** The `votes` operand now
+  follows JVM lazy-val force semantics (a 122-without-121 table errors only at
+  the boundaries that force it, passes elsewhere); the vote tally is an
+  ordered sequence (JVM `VotingData` is an array — contradictory pairs are now
+  deterministic by slot order, not HashMap-random); votes and the BlockVersion
+  bump use wrapping i32 (JVM `Int`).
+- **Validation-settings updates are strict + canonical.** The `[0,124]`
+  payload is fully deserialized — `rulesToDisable` disableability (JVM
+  `mayBeDisabled`) and every `statusUpdates` entry via the new sigma-rust
+  `RuleStatusSerializer` port — and the activated update is the parsed VALUE
+  re-serialized canonically, never the input bytes echoed (trailing garbage
+  and count-wraps no longer survive). Live wrappers swallow a bad in-band 124
+  to empty (JVM `parseExtension` parity); the pure seam rejects.
+- **`reset_to` no longer swallows rollback failure.** `BlockValidator::reset_to`
+  returns `Result`; on a failed state rollback the validator is left unchanged
+  and sync holds its watermarks rather than advancing the cache onto un-rolled
+  state — the latent gap-wedge hole, closed end to end (new
+  `validation_rollback_failed` journal event).
+- sigma-rust pin `1e346127` → `75be067f` (parse-path hardening: sigma-ser
+  position-limit checks, box token gate; the `RuleStatusSerializer` port; the
+  powSolutions `d`-field JSON round-trip fix). Addons re-pinned, lockfiles
+  synced: indexer 0.2.6, fastsync 0.1.4.
+
 ## v0.7.1 — 2026-06-11
 
 The chain-tier release. The SANTA chain tier (retargeting + voting vectors)
