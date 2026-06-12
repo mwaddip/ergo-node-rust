@@ -261,9 +261,12 @@ impl BlockValidator for DigestValidator {
         &self.current_digest
     }
 
-    fn reset_to(&mut self, height: u32, digest: ADDigest) {
+    fn reset_to(&mut self, height: u32, digest: ADDigest) -> Result<(), ValidationError> {
+        // Plain field assignment — no persistent state to roll back, so
+        // this reset is infallible (contract: DigestValidator always Ok).
         self.validated_height = height;
         self.current_digest = digest;
         tracing::info!(height, "validator reset to fork point");
+        Ok(())
     }
 }

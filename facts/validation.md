@@ -85,10 +85,18 @@ pub trait BlockValidator {
     ///   - `height < self.validated_height()`
     ///   - `digest` is the state_root from the header at `height`
     ///
-    /// Postconditions:
+    /// Postconditions on Ok:
     ///   - `self.validated_height()` == height
     ///   - `self.current_digest()` == digest
-    fn reset_to(&mut self, height: u32, digest: ADDigest);
+    /// Postconditions on Err (changed 2026-06-12 — was a silent swallow):
+    ///   - the underlying state rollback FAILED and the validator's
+    ///     observable state is UNCHANGED: `validated_height()`,
+    ///     `current_digest()`, and the prover are exactly as before the
+    ///     call. No cache advance on un-rolled state — the caller decides
+    ///     recovery (see facts/sync.md reconciliation arms).
+    ///   - DigestValidator: infallible reset (plain field assignment),
+    ///     always Ok.
+    fn reset_to(&mut self, height: u32, digest: ADDigest) -> Result<(), ValidationError>;
 
     /// Compute AD proofs for transactions without modifying state.
     /// None for digest-mode validators (mining requires UTXO mode).
@@ -354,8 +362,10 @@ On `DeliveryControl::Reorg { fork_point, .. }` (received via unbounded control c
 1. Drain and discard in-flight eval results
 2. Reset `downloaded_height` to fork_point
 3. Get header at fork_point from chain
-4. Call `validator.reset_to(fork_point, header.state_root)`
-5. `state_applied_height` and `script_verified_height` reset to fork_point
+4. Call `validator.reset_to(fork_point, header.state_root)` — on Err the
+   validator did NOT move; sync must not perform step 5 (watermarks stay
+   where they were; see facts/sync.md)
+5. On Ok: `state_applied_height` and `script_verified_height` reset to fork_point
 6. Re-queue sections for the new branch, re-scan watermark
 7. Re-validate from fork_point + 1 as sections become available
 
@@ -383,7 +393,10 @@ instead of `BatchAVLVerifier`. Same validation core — different box source:
 - State root verified by tree operations, not proof replay
 - AD proofs not required (not downloaded in UTXO mode)
 - AD proofs generated as side effect (to serve digest-mode peers)
-- `reset_to()` uses `PersistentBatchAVLProver::rollback()`
+- `reset_to()` uses `PersistentBatchAVLProver::rollback()`; a rollback
+  failure surfaces as Err with validator state unchanged (2026-06-12 —
+  previously logged-and-swallowed while the cache advanced onto
+  un-rolled state, the latent gap-wedge hole)
 
 The `BlockValidator` trait is designed for both. `ad_proofs: Option<&[u8]>`
 is `Some` for digest, `None` for UTXO.

@@ -11,7 +11,7 @@
 
 use std::io;
 use std::sync::{Arc, Mutex};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::fmt::MakeWriter;
 
 #[derive(Clone, Default)]
@@ -249,5 +249,37 @@ fn validation_stuck_renders_marker_and_named_fields() {
     assert!(
         output.contains(&format!("missing_key={key_hex}")),
         "missing key hex: {output}"
+    );
+}
+
+#[test]
+fn validation_rollback_failed_renders_marker_and_named_fields() {
+    // Inline mirror of the `validation rollback failed` ERROR emitted by
+    // `handle_eval_failure` and the reorg arm in `src/state.rs` when
+    // `BlockValidator::reset_to` returns Err (validator unmoved, watermarks
+    // held in place). Fields: height (u64, the rollback TARGET), path
+    // (string: "eval_failure" | "reorg"), error (Display). Not yet listed
+    // in `facts/journal-events.md` — contract addition owed by the main
+    // session; this pins the shape the entry must describe.
+    let output = capture(|| {
+        error!(
+            height = 2668u64,
+            path = "eval_failure",
+            error = %"rollback to height 2668 failed: simulated storage failure",
+            "validation rollback failed"
+        );
+    });
+    assert!(
+        output.contains("validation rollback failed"),
+        "missing marker: {output}"
+    );
+    assert!(output.contains("height=2668"), "missing height: {output}");
+    assert!(
+        output.contains("path=\"eval_failure\""),
+        "missing path: {output}"
+    );
+    assert!(
+        output.contains("error=rollback to height 2668 failed"),
+        "missing error field: {output}"
     );
 }

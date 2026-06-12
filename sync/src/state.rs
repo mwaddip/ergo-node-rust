@@ -1415,7 +1415,21 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
 
         if let Some(v) = self.validator.as_mut() {
             if let Some(header) = self.chain.header_at(rollback_to).await {
-                v.reset_to(rollback_to, header.state_root);
+                if let Err(e) = v.reset_to(rollback_to, header.state_root) {
+                    // The rollback failed — the validator did NOT move
+                    // (contract: validated_height/digest/prover unchanged on
+                    // Err). Every watermark stays in place: retreating them
+                    // onto un-rolled state is the gap-wedge hole. The sweep
+                    // backoff retries the resulting stall; no separate retry
+                    // mechanism here. See `../facts/sync.md`.
+                    tracing::error!(
+                        height = rollback_to as u64,
+                        path = "eval_failure",
+                        error = %e,
+                        "validation rollback failed"
+                    );
+                    return;
+                }
             } else {
                 tracing::error!(rollback_to, "cannot find header for rollback");
                 return;
@@ -1459,14 +1473,43 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     self.downloaded_height = fork_point;
                 }
                 if self.state_applied_height > fork_point {
-                    if let Some(fork_header) = self.chain.header_at(fork_point).await {
-                        if let Some(v) = self.validator.as_mut() {
-                            v.reset_to(fork_point, fork_header.state_root);
-                        }
+                    // The state watermarks may only retreat if the validator
+                    // actually rolled back — on a failed rollback the state
+                    // genuinely sits where it was, and retreating the
+                    // watermarks onto un-rolled state is the gap-wedge hole
+                    // (see `../facts/sync.md`). No validator (light mode) =
+                    // nothing to roll, watermarks are sync-local.
+                    let rolled_back = match self.validator.as_mut() {
+                        Some(v) => match self.chain.header_at(fork_point).await {
+                            Some(fork_header) => {
+                                match v.reset_to(fork_point, fork_header.state_root) {
+                                    Ok(()) => true,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            height = fork_point as u64,
+                                            path = "reorg",
+                                            error = %e,
+                                            "validation rollback failed"
+                                        );
+                                        false
+                                    }
+                                }
+                            }
+                            None => {
+                                tracing::error!(
+                                    fork_point,
+                                    "cannot find fork-point header for rollback"
+                                );
+                                false
+                            }
+                        },
+                        None => true,
+                    };
+                    if rolled_back {
+                        self.state_applied_height = fork_point;
+                        self.script_verified_height = fork_point;
+                        self.store.set_script_verified_height(self.script_verified_height).await;
                     }
-                    self.state_applied_height = fork_point;
-                    self.script_verified_height = fork_point;
-                    self.store.set_script_verified_height(self.script_verified_height).await;
                 }
 
                 // Purge pending requests — they're for the wrong branch
@@ -2224,7 +2267,11 @@ mod cross_db_flush_tests {
             &self.digest
         }
 
-        fn reset_to(&mut self, _height: u32, _digest: ADDigest) {
+        fn reset_to(
+            &mut self,
+            _height: u32,
+            _digest: ADDigest,
+        ) -> Result<(), ValidationError> {
             unimplemented!("not called in flush-ordering tests")
         }
 
@@ -2435,7 +2482,11 @@ mod shutdown_flush_tests {
             &self.digest
         }
 
-        fn reset_to(&mut self, _height: u32, _digest: ADDigest) {
+        fn reset_to(
+            &mut self,
+            _height: u32,
+            _digest: ADDigest,
+        ) -> Result<(), ValidationError> {
             unreachable!("not called in shutdown-flush tests")
         }
 
@@ -2822,7 +2873,11 @@ mod blocks_to_keep_tests {
             &self.digest
         }
 
-        fn reset_to(&mut self, _height: u32, _digest: ADDigest) {
+        fn reset_to(
+            &mut self,
+            _height: u32,
+            _digest: ADDigest,
+        ) -> Result<(), ValidationError> {
             unreachable!("not called in blocks_to_keep tests")
         }
 
@@ -3096,7 +3151,7 @@ mod blocks_to_keep_tests {
             fn current_digest(&self) -> &ADDigest {
                 &self.0.digest
             }
-            fn reset_to(&mut self, _h: u32, _d: ADDigest) {
+            fn reset_to(&mut self, _h: u32, _d: ADDigest) -> Result<(), ValidationError> {
                 unreachable!()
             }
             fn flush(&self) -> Result<(), ValidationError> {
@@ -3336,19 +3391,29 @@ mod sweep_resume_tests {
     /// Validator that enforces the real consecutiveness guard: it accepts
     /// only `validated_height + 1` and advances on success, mirroring
     /// `UtxoValidator::apply_state_internal`'s `HeightMismatch`. `reset_to`
-    /// lowers the height as a successful storage rollback would. Records the
-    /// exact sequence of heights it actually applied so a test can prove the
-    /// sweep resumed at the right block.
+    /// lowers the height as a successful storage rollback would — unless
+    /// `failing_reset()` arms the failure mode, in which case it returns Err
+    /// and leaves the height untouched, exactly like the real validator's
+    /// unchanged-on-Err contract. Records the exact sequence of heights it
+    /// applied and the rollback targets it was asked for, so a test can
+    /// prove the sweep resumed at the right block and the rollback was
+    /// actually attempted.
     struct SweepValidator {
         validated_height: u32,
         digest: ADDigest,
         applied: Vec<u32>,
+        /// Rollback targets passed to `reset_to`, in call order — recorded
+        /// even when the reset is made to fail.
+        resets: Vec<u32>,
         /// When `Some(h)`, `apply_state` rejects height `h` every time with a
         /// `StateRootMismatch`, modelling a deterministic divergence that
         /// never advances the tip past `h - 1`. The backoff keys on the tip
         /// stall, not the error kind, so this stands in equally for an
         /// `apply_state` error and a deferred-eval rollback.
         fail_at: Option<u32>,
+        /// When true, `reset_to` returns Err and does NOT move
+        /// `validated_height`, modelling a failed storage rollback.
+        reset_fails: bool,
         /// Every `apply_state` call, success or failure — lets a test prove
         /// the gate actually suppressed a retry.
         attempts: u32,
@@ -3360,13 +3425,20 @@ mod sweep_resume_tests {
                 validated_height: height,
                 digest: ADDigest::zero(),
                 applied: Vec::new(),
+                resets: Vec::new(),
                 fail_at: None,
+                reset_fails: false,
                 attempts: 0,
             }
         }
 
         fn failing_at(mut self, height: u32) -> Self {
             self.fail_at = Some(height);
+            self
+        }
+
+        fn failing_reset(mut self) -> Self {
+            self.reset_fails = true;
             self
         }
     }
@@ -3411,24 +3483,46 @@ mod sweep_resume_tests {
             &self.digest
         }
 
-        fn reset_to(&mut self, height: u32, _digest: ADDigest) {
+        fn reset_to(&mut self, height: u32, _digest: ADDigest) -> Result<(), ValidationError> {
+            self.resets.push(height);
+            if self.reset_fails {
+                return Err(ValidationError::StateOperationFailed(format!(
+                    "rollback to height {height} failed: simulated storage failure"
+                )));
+            }
             self.validated_height = height;
+            Ok(())
         }
     }
 
-    /// Chain that hands out a header for every height and is never at an
-    /// epoch boundary, so the sweep takes its plain (non-voting) path.
-    struct SweepChain;
+    /// Chain that hands out a header for every height up to `tip` and is
+    /// never at an epoch boundary, so the sweep takes its plain (non-voting)
+    /// path. The sweep tests want an effectively unbounded chain (the sweep
+    /// range is capped by `downloaded_height`); the reorg tests need a real
+    /// tip so the post-reorg rescan terminates.
+    struct SweepChain {
+        tip: u32,
+    }
+
+    impl SweepChain {
+        fn unbounded() -> Self {
+            Self { tip: 1_000_000 }
+        }
+
+        fn at_tip(tip: u32) -> Self {
+            Self { tip }
+        }
+    }
 
     impl SyncChain for SweepChain {
         async fn chain_height(&self) -> u32 {
-            1_000_000
+            self.tip
         }
         async fn build_sync_info(&self) -> Vec<u8> {
             unreachable!()
         }
         async fn header_at(&self, height: u32) -> Option<Header> {
-            (height >= 1).then(|| fake_header(height))
+            (height >= 1 && height <= self.tip).then(|| fake_header(height))
         }
         async fn header_state_root(&self, _height: u32) -> Option<[u8; 33]> {
             Some([0u8; 33])
@@ -3539,6 +3633,13 @@ mod sweep_resume_tests {
     fn build_sync(
         validator: SweepValidator,
     ) -> HeaderSync<SweepTransport, SweepChain, SweepStore, SweepValidator> {
+        build_sync_with_chain(validator, SweepChain::unbounded())
+    }
+
+    fn build_sync_with_chain(
+        validator: SweepValidator,
+        chain: SweepChain,
+    ) -> HeaderSync<SweepTransport, SweepChain, SweepStore, SweepValidator> {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let (_progress_tx, progress_rx) = mpsc::channel(1);
         let (_dc_tx, delivery_control_rx) = mpsc::unbounded_channel::<DeliveryControl>();
@@ -3546,7 +3647,7 @@ mod sweep_resume_tests {
         HeaderSync::new(
             SyncConfig::default(),
             SweepTransport,
-            SweepChain,
+            chain,
             SweepStore,
             Some(validator),
             progress_rx,
@@ -3619,7 +3720,11 @@ mod sweep_resume_tests {
         sync.downloaded_height = 2670;
         // Simulate a rollback to 2667 (validator only — cache left stale,
         // exactly the hazardous state the fix must tolerate).
-        sync.validator.as_mut().unwrap().reset_to(2667, ADDigest::zero());
+        sync.validator
+            .as_mut()
+            .unwrap()
+            .reset_to(2667, ADDigest::zero())
+            .expect("simulated rollback succeeds");
 
         sync.advance_state_applied_height().await;
 
@@ -3630,6 +3735,110 @@ mod sweep_resume_tests {
             "sweep re-applies from the rolled-back tip + 1, not from the stale cache"
         );
         assert_eq!(sync.state_applied_height, 2670, "cache back in sync with the prover");
+    }
+
+    #[tokio::test]
+    async fn eval_failure_rollback_ok_retreats_watermarks() {
+        // The normal eval-failure path: scripts failed at 2669, the storage
+        // rollback succeeds, and all three watermarks retreat to 2668 with
+        // the validator.
+        let mut sync = build_sync(SweepValidator::at(2670));
+        sync.state_applied_height = 2670;
+        sync.script_verified_height = 2670;
+        sync.downloaded_height = 2670;
+
+        sync.handle_eval_failure(2669).await;
+
+        let v = sync.validator.as_ref().unwrap();
+        assert_eq!(v.resets, vec![2668], "rollback targeted failed_height - 1");
+        assert_eq!(v.validated_height(), 2668, "validator rolled back");
+        assert_eq!(sync.state_applied_height, 2668);
+        assert_eq!(sync.script_verified_height, 2668);
+        assert_eq!(sync.downloaded_height, 2668);
+    }
+
+    #[tokio::test]
+    async fn eval_failure_rollback_err_leaves_watermarks_untouched() {
+        // The gap-wedge hole, closed: the storage rollback FAILS, so the
+        // validator did not move — every watermark must stay exactly where
+        // it was. Retreating them would make sync believe state sits at
+        // 2668 while the prover still holds 2670 (the old logged-and-
+        // swallowed behavior). The sweep backoff owns the retry; this
+        // handler just logs loud and returns.
+        let mut sync = build_sync(SweepValidator::at(2670).failing_reset());
+        sync.state_applied_height = 2670;
+        sync.script_verified_height = 2670;
+        sync.downloaded_height = 2670;
+
+        sync.handle_eval_failure(2669).await;
+
+        let v = sync.validator.as_ref().unwrap();
+        assert_eq!(v.resets, vec![2668], "rollback was attempted");
+        assert_eq!(v.validated_height(), 2670, "validator unmoved on Err");
+        assert_eq!(sync.state_applied_height, 2670, "state watermark NOT retreated");
+        assert_eq!(sync.script_verified_height, 2670, "script watermark NOT retreated");
+        assert_eq!(sync.downloaded_height, 2670, "download watermark NOT retreated");
+    }
+
+    #[tokio::test]
+    async fn reorg_rollback_ok_resets_then_revalidates_new_branch() {
+        // Successful reorg rollback: validator rolls to the fork point, the
+        // state watermarks follow, and the handler's immediate rescan
+        // re-applies the new branch's on-disk blocks from fork_point + 1.
+        let mut sync =
+            build_sync_with_chain(SweepValidator::at(2670), SweepChain::at_tip(2670));
+        sync.state_applied_height = 2670;
+        sync.script_verified_height = 2670;
+        sync.downloaded_height = 2670;
+
+        sync.handle_control_event(
+            DeliveryControl::Reorg { fork_point: 2667, old_tip: 2670, new_tip: 2670 },
+            PeerId(0),
+        )
+        .await;
+
+        let v = sync.validator.as_ref().unwrap();
+        assert_eq!(v.resets, vec![2667], "validator rolled back to the fork point");
+        assert_eq!(
+            v.applied,
+            vec![2668, 2669, 2670],
+            "rescan re-applied the new branch from fork_point + 1"
+        );
+        assert_eq!(sync.state_applied_height, 2670, "sweep re-advanced after the rollback");
+        assert_eq!(
+            sync.script_verified_height, 2667,
+            "scripts above the fork point re-verify only via real evals"
+        );
+    }
+
+    #[tokio::test]
+    async fn reorg_rollback_err_keeps_state_watermarks() {
+        // Same reorg, but the storage rollback fails: the validator stays
+        // at 2670, so state_applied/script_verified MUST NOT retreat to the
+        // fork point — and nothing may be re-applied onto the un-rolled
+        // state. (downloaded_height legitimately resets and rescans: it
+        // tracks the store against the already-switched header chain, not
+        // the prover — facts/validation.md reorg steps 2 vs 5.)
+        let mut sync = build_sync_with_chain(
+            SweepValidator::at(2670).failing_reset(),
+            SweepChain::at_tip(2670),
+        );
+        sync.state_applied_height = 2670;
+        sync.script_verified_height = 2670;
+        sync.downloaded_height = 2670;
+
+        sync.handle_control_event(
+            DeliveryControl::Reorg { fork_point: 2667, old_tip: 2670, new_tip: 2670 },
+            PeerId(0),
+        )
+        .await;
+
+        let v = sync.validator.as_ref().unwrap();
+        assert_eq!(v.resets, vec![2667], "rollback was attempted");
+        assert_eq!(v.validated_height(), 2670, "validator unmoved on Err");
+        assert!(v.applied.is_empty(), "nothing re-applied onto un-rolled state");
+        assert_eq!(sync.state_applied_height, 2670, "state watermark NOT retreated");
+        assert_eq!(sync.script_verified_height, 2670, "script watermark NOT retreated");
     }
 
     #[tokio::test]
@@ -3968,7 +4177,11 @@ mod serve_continuation_tests {
         fn current_digest(&self) -> &ADDigest {
             unreachable!("not called in serve tests")
         }
-        fn reset_to(&mut self, _height: u32, _digest: ADDigest) {
+        fn reset_to(
+            &mut self,
+            _height: u32,
+            _digest: ADDigest,
+        ) -> Result<(), ValidationError> {
             unreachable!("not called in serve tests")
         }
     }

@@ -351,14 +351,17 @@ impl BlockValidator for Validator {
         }
     }
 
-    fn reset_to(&mut self, height: u32, digest: ADDigest) {
-        match &mut self.inner {
+    fn reset_to(&mut self, height: u32, digest: ADDigest) -> Result<(), ValidationError> {
+        let result = match &mut self.inner {
             ValidatorInner::Digest(v) => v.reset_to(height, digest),
             ValidatorInner::Utxo(v) => v.reset_to(height, digest),
         };
+        // Republish the validator's ACTUAL height: the new one on Ok, the
+        // unchanged one on Err (reset_to Err = validator unmoved).
         let h = self.validated_height();
         self.shared_height.store(h, std::sync::atomic::Ordering::Relaxed);
         let _ = self.height_watch_tx.send(h);
+        result
     }
 
     fn flush(&self) -> Result<(), ValidationError> {
@@ -2257,14 +2260,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let header_at_stored = chain_guard.header_at(stored);
                     drop(chain_guard);
                     if let Some(header) = header_at_stored {
-                        v.reset_to(stored, header.state_root);
-                        tracing::warn!(
-                            state_height = m,
-                            store_height = stored,
-                            mode = "rollback",
-                            gap,
-                            "validated_height drift detected"
-                        );
+                        match v.reset_to(stored, header.state_root) {
+                            Ok(()) => {
+                                tracing::warn!(
+                                    state_height = m,
+                                    store_height = stored,
+                                    mode = "rollback",
+                                    gap,
+                                    "validated_height drift detected"
+                                );
+                            }
+                            Err(e) => {
+                                // Rollback failed — the validator did not
+                                // move (facts/validation.md reset_to Err
+                                // postcondition). State genuinely sits at
+                                // m: trust it, like the rollback-impossible
+                                // arm below; self-corrects on next flush.
+                                sync_store.set_validated_height(m).await;
+                                tracing::warn!(
+                                    state_height = m,
+                                    store_height = stored,
+                                    mode = "rollback_failed",
+                                    gap,
+                                    error = %e,
+                                    "validated_height drift detected"
+                                );
+                            }
+                        }
                     } else {
                         sync_store.set_validated_height(m).await;
                         tracing::warn!(

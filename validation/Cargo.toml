@@ -21,3 +21,4 @@ thiserror = "2"
 [dev-dependencies]
 ergotree-interpreter = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "75be067f" }
 ergotree-ir = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "75be067f" }
+tempfile = "3"

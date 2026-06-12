@@ -165,9 +165,11 @@ phase's `_started`.
 - **Level:** WARN
 - **Marker:** `"validated_height drift detected"`
 - **Fields:** `state_height` (u64), `store_height` (u64), `mode`
-  (string: `forward`|`rollback`|`forced_trust`|`regressed`), `gap`
-  (u64: `|state_height - store_height|`)
-- **Since:** 1.2
+  (string: `forward`|`rollback`|`rollback_failed`|`forced_trust`|
+  `regressed`), `gap` (u64: `|state_height - store_height|`), `error`
+  (string, only with mode `rollback_failed`)
+- **Since:** 1.2 (`rollback_failed` added 2026-06-12 — additive;
+  consumers must tolerate unknown modes)
 - **Stability:** stable
 - **Emitted:** at most once at startup, after `state.redb` is opened
   and the modifier store's `chain_meta[b"validated_height"]` is read,
@@ -175,10 +177,13 @@ phase's `_started`.
   Surfaces cross-DB drift that crossed an unclean shutdown. Modes:
   `forward` (state ran ahead, brought store forward); `rollback`
   (state ran ahead beyond trust threshold, rolled state back to store);
-  `forced_trust` (state ran ahead, rollback impossible — store brought
-  forward with loud warning); `regressed` (state below store, sync
-  will re-validate forward).  Absence of this event at startup means
-  the two databases agreed.
+  `rollback_failed` (rollback attempted and FAILED — validator state
+  unchanged at `state_height`, store brought forward to match: the
+  forced-trust outcome with the rollback error attached; `reset_to →
+  Result`, 2026-06-12); `forced_trust` (state ran ahead, rollback
+  impossible — store brought forward with loud warning); `regressed`
+  (state below store, sync will re-validate forward).  Absence of this
+  event at startup means the two databases agreed.
 
 #### `peerdb_initialised`
 - **Level:** INFO
@@ -247,6 +252,28 @@ phase's `_started`.
   resets the counter. **Before 1.3** this fired only on the
   `apply_state` path — a deferred eval-failure stall (the loop that
   hammered on a wrongly-rejected script) did not emit it.
+
+#### `validation_rollback_failed`
+- **Level:** ERROR
+- **Marker:** `"validation rollback failed"`
+- **Fields:** `height` (u64: the rollback TARGET height), `path`
+  (string: `eval_failure`|`reorg`), `error` (string: the underlying
+  storage/rollback error, Display-formatted)
+- **Since:** 1.4 (added 2026-06-12 with `reset_to → Result`)
+- **Stability:** stable
+- **Emitted:** when `BlockValidator::reset_to` returns Err on the
+  deferred-eval-failure path or the reorg-control path — the underlying
+  state rollback failed and the validator did NOT move (its height and
+  digest are unchanged; facts/validation.md `reset_to` Err
+  postcondition). Sync holds every watermark in place rather than
+  retreating onto un-rolled state; recovery rides the sweep/backoff
+  machinery. Previously this failure was logged-and-swallowed inside
+  the validator while its cache advanced — the gap-wedge latent hole.
+  The startup-reconciliation variant of the same failure surfaces as
+  `validated_height_drift` with `mode = "rollback_failed"` instead.
+  The Doctor adapter should treat repeated emissions at the same
+  height as a stuck-frontier signal (it will co-occur with
+  `validation_stuck` once attempts accumulate).
 
 #### `deep_reorg_succeeded`
 - **Level:** INFO

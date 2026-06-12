@@ -396,8 +396,19 @@ match M.cmp(&V) {
         } else if let Some(header) = chain.header_at(V).await {
             // Suspicious gap. Roll state back to V via existing reset_to
             // (state.rollback + validator.validated_height = V).
-            validator.reset_to(V, header.state_root);
-            // warn!(M, V, gap, "state rolled back to recorded validated_height");
+            // reset_to returns Result (2026-06-12): on Err the validator
+            // did NOT move — fall through to the forced-trust arm (state
+            // genuinely sits at M; set_validated_height(M) + loud warn).
+            // This codifies what the old swallow accidentally did in the
+            // 2026-06-09 sweep incident: state stayed at tip,
+            // self-corrected on next flush, no corruption.
+            match validator.reset_to(V, header.state_root) {
+                Ok(()) => { /* warn!(M, V, gap, "state rolled back to V") */ }
+                Err(_e) => {
+                    store.set_validated_height(M).await;
+                    // warn!(M, V, gap, e, "rollback FAILED; forced trust at M");
+                }
+            }
         } else {
             // V is below the persisted header range OR rollback window
             // exceeded. Forced trust with loud warning.
@@ -1000,8 +1011,13 @@ no post-drain code overwrites them.
 1. Drain and discard remaining channel results
 2. Look up digest via `chain.header_at(failed_height - 1).state_root`
 3. Call `validator.reset_to(failed_height - 1, digest)`
-4. Reset `state_applied_height` and `script_verified_height` to `failed_height - 1`
-5. Reset `downloaded_height` to match
+4. **On Ok**: reset `state_applied_height` and `script_verified_height`
+   to `failed_height - 1`, reset `downloaded_height` to match
+5. **On Err (2026-06-12)**: the validator did NOT move — watermarks stay
+   exactly where they are (NO resets; retreating them onto un-rolled
+   state is the gap-wedge hole). Log loud (`validation_rollback_failed`)
+   and resume — the sweep/backoff machinery (v0.6.11) retries the stall.
+   Same rule for the Reorg-control path (the other `reset_to` site).
 6. Log the error, resume sync
 
 ### Startup gap handling

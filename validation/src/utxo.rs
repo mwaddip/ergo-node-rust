@@ -150,17 +150,18 @@ impl BlockValidator for UtxoValidator {
         &self.current_digest
     }
 
-    fn reset_to(&mut self, height: u32, digest: ADDigest) {
+    fn reset_to(&mut self, height: u32, digest: ADDigest) -> Result<(), ValidationError> {
         let digest_bytes: [u8; 33] = digest.into();
         let avl_digest = Bytes::copy_from_slice(&digest_bytes);
 
-        let (root, tree_height) = match self.storage.rollback(&avl_digest) {
-            Ok(x) => x,
-            Err(e) => {
-                tracing::error!(height, error = %e, "UTXO state rollback failed");
-                return;
-            }
-        };
+        // The rollback is the only fallible step and nothing may mutate
+        // before it succeeds: on Err the contract guarantees
+        // validated_height/current_digest/prover are exactly as before.
+        let (root, tree_height) = self.storage.rollback(&avl_digest).map_err(|e| {
+            ValidationError::StateOperationFailed(format!(
+                "rollback to height {height} failed: {e}"
+            ))
+        })?;
         self.prover.base.tree.root = Some(root);
         self.prover.base.tree.height = tree_height;
 
@@ -175,6 +176,7 @@ impl BlockValidator for UtxoValidator {
         self.validated_height = height;
         self.current_digest = digest;
         tracing::info!(height, "UTXO validator reset to fork point");
+        Ok(())
     }
 
     fn flush(&self) -> Result<(), ValidationError> {

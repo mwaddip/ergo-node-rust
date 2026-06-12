@@ -108,8 +108,14 @@ pub trait BlockValidator {
     /// Current state root digest (33 bytes).
     fn current_digest(&self) -> &ADDigest;
 
-    /// Reset to a previous state after reorg.
-    fn reset_to(&mut self, height: u32, digest: ADDigest);
+    /// Reset to a previous state after reorg or deferred-eval failure.
+    ///
+    /// On Err the underlying state rollback FAILED and the validator's
+    /// observable state is UNCHANGED: `validated_height()`,
+    /// `current_digest()`, and the prover are exactly as before the call.
+    /// The caller must not advance its own bookkeeping (watermarks, caches)
+    /// onto the un-rolled state — it decides recovery.
+    fn reset_to(&mut self, height: u32, digest: ADDigest) -> Result<(), ValidationError>;
 
     /// Force a durable commit (fsync) of all outstanding storage writes.
     /// Call periodically during long sweeps (bounds crash data loss) and
