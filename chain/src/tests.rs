@@ -1702,12 +1702,12 @@ mod voting_chain_tests {
         assert_eq!(swallowed, with_empty);
 
         // The candidate path agrees and the activated update stays the
-        // canonical EMPTY encoding at a non-activation boundary.
+        // EMPTY value at a non-activation boundary.
         let (params, activated) = chain
             .compute_expected_parameters_for_candidate(256, &hostile, [0, 0, 0])
             .unwrap();
         assert_eq!(params, with_empty);
-        assert_eq!(activated, crate::voting::encode_disabled_rules(&[]));
+        assert_eq!(activated, crate::voting::ValidationSettingsUpdate::default());
     }
 
     #[test]
@@ -1955,8 +1955,8 @@ mod voting_chain_tests {
         assert_eq!(via_candidate.soft_fork_votes_collected(), Some(0));
         assert_eq!(
             activated,
-            crate::voting::encode_disabled_rules(&[]),
-            "round start is not an activation — canonical empty update"
+            crate::voting::ValidationSettingsUpdate::default(),
+            "round start is not an activation — EMPTY value"
         );
     }
 
@@ -2015,7 +2015,7 @@ mod voting_chain_tests {
 
         assert_eq!(via_candidate, via_header);
         assert_eq!(via_candidate.storage_fee_factor(), 1_275_000, "step applied");
-        assert_eq!(activated, crate::voting::encode_disabled_rules(&[]));
+        assert_eq!(activated, crate::voting::ValidationSettingsUpdate::default());
     }
 
     #[test]

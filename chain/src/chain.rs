@@ -10,7 +10,10 @@ use num_bigint::BigUint;
 use crate::cache::LazyHeaderStore;
 use crate::config::ChainConfig;
 use crate::error::{ChainError, RestoreError};
-use crate::voting::{default_parameters, default_proposed_update_bytes, SOFT_FORK_VOTE};
+use crate::voting::{
+    default_parameters, default_proposed_update_bytes, ValidationSettingsUpdate,
+    SOFT_FORK_VOTE,
+};
 
 /// Map a signed parameter ID (1-8) to its [`Parameter`] enum variant.
 ///
@@ -824,16 +827,20 @@ impl HeaderChain {
     /// and rejects, so the miner self-orphans exactly when voting. This
     /// entry point threads the candidate's votes through instead.
     ///
-    /// Also returns the activated update (`block_proposed_update` verbatim
-    /// at a voting-driven activation boundary, the canonical EMPTY
-    /// encoding `0x0000` otherwise) — mining needs it alongside the table
-    /// for extension key `[0x00, 124]` continuity.
+    /// Also returns the activated update (the PARSED VALUE of
+    /// `block_proposed_update` at a voting-driven activation boundary,
+    /// the EMPTY value otherwise) — uniform with the pure seam. The
+    /// mining caller may ignore it: the extension's `[0x00, 124]` key
+    /// carries the PROPOSED update, which the caller already holds. When
+    /// wire bytes of the value are needed, encode via
+    /// [`crate::voting::encode_validation_settings_update`] (fallible —
+    /// see its docs).
     pub fn compute_expected_parameters_for_candidate(
         &self,
         epoch_boundary_height: u32,
         block_proposed_update: &[u8],
         candidate_votes: [u8; 3],
-    ) -> Result<(Parameters, Vec<u8>), ChainError> {
+    ) -> Result<(Parameters, ValidationSettingsUpdate), ChainError> {
         let boundary_fork_vote = candidate_votes.contains(&(SOFT_FORK_VOTE as u8));
         self.compute_boundary_parameters_at(
             epoch_boundary_height,
@@ -861,7 +868,7 @@ impl HeaderChain {
         epoch_boundary_height: u32,
         block_proposed_update: &[u8],
         boundary_fork_vote: bool,
-    ) -> Result<(Parameters, Vec<u8>), ChainError> {
+    ) -> Result<(Parameters, ValidationSettingsUpdate), ChainError> {
         let tally = self.tally_just_ended_epoch(epoch_boundary_height)?;
         let normalized_empty;
         let proposed_update: &[u8] =

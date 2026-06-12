@@ -274,55 +274,6 @@ pub fn extract_disabling_rules_from_kv(kv: &[ExtensionField]) -> Vec<u8> {
     Vec::new()
 }
 
-/// Parse just the `rulesToDisable` list from a raw
-/// `ErgoValidationSettingsUpdate` payload (extension key `[0x00, 124]`).
-///
-/// Mirrors JVM `ErgoValidationSettingsUpdateSerializer.parse`
-/// (`ErgoValidationSettingsUpdate.scala`) but stops after the
-/// `disabledRulesNum` + rule IDs section — we don't need `statusUpdates`
-/// for the consensus checks that use this. Encoding:
-///
-/// ```text
-/// [disabledRulesNum: VLQ u32]
-/// disabledRules × disabledRulesNum: [rule_id: VLQ u16]
-/// (remainder: statusUpdates — ignored here)
-/// ```
-///
-/// Empty input → empty `Vec` (mirrors JVM's
-/// `ErgoValidationSettingsUpdate.empty`, the default when extension key
-/// `[0x00, 124]` is absent from the block).
-///
-/// This is the LENIENT reader, used for the rule-409 auto-insert gate on
-/// already-normalized bytes. The validation entry point for raw block
-/// bytes is [`parse_validation_settings_update`], which additionally
-/// enforces the disableability `require` and strict per-entry
-/// statusUpdates decoding.
-pub fn parse_disabled_rules(bytes: &[u8]) -> Result<Vec<u16>, crate::ChainError> {
-    use crate::ChainError;
-    use sigma_ser::vlq_encode::ReadSigmaVlqExt;
-
-    if bytes.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut cursor = std::io::Cursor::new(bytes);
-    let count = cursor
-        .get_u32()
-        .map_err(|e| ChainError::ExtensionParse(format!("disabled rules count: {e}")))?
-        as usize;
-    // Cap capacity so a bogus `count` on a small payload can't force a large
-    // pre-allocation. The subsequent `get_u16` calls will bail naturally if
-    // the byte stream is truncated.
-    let cap = count.min(bytes.len());
-    let mut rules = Vec::with_capacity(cap);
-    for i in 0..count {
-        let rule = cursor.get_u16().map_err(|e| {
-            ChainError::ExtensionParse(format!("disabled rule id at index {i}: {e}"))
-        })?;
-        rules.push(rule);
-    }
-    Ok(rules)
-}
-
 /// `true` iff `id` is a KNOWN ergo validation rule that may NOT be
 /// disabled via soft-fork.
 ///
@@ -352,13 +303,39 @@ fn rule_may_not_be_disabled(id: u16) -> bool {
     )
 }
 
+/// Re-export of the sigma-rust `RuleStatus` (JVM
+/// `sigma.validation.RuleStatus`) carried by
+/// [`ValidationSettingsUpdate::statuses`], so consumers can name the
+/// type without depending on `ergo_lib` directly.
+pub use ergo_lib::ergotree_ir::validation::RuleStatus;
+
+/// Parsed `ErgoValidationSettingsUpdate` value — JVM
+/// `org.ergoplatform.validation.ErgoValidationSettingsUpdate`.
+///
+/// Both sections preserve INPUT order: the JVM case class holds the
+/// sequences exactly as parsed (canonical ordering is a property the
+/// on-chain payloads happen to have, not one the type enforces). The
+/// [`Default`] value — both sections empty — is JVM
+/// `ErgoValidationSettingsUpdate.empty`, the non-activation return of
+/// [`compute_boundary_parameters`]; it encodes to exactly `[0x00, 0x00]`.
+///
+/// The wire form of a value is [`encode_validation_settings_update`]
+/// (fallible — see its docs), NEVER an input slice echoed through:
+/// trailing garbage and count-wrap artifacts in a parsed payload do not
+/// survive into the value.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ValidationSettingsUpdate {
+    /// `rulesToDisable`: validation rule ids to disable, input order.
+    pub rules: Vec<u16>,
+    /// `statusUpdates`: `(ruleId, status)` pairs, input order.
+    pub statuses: Vec<(i16, RuleStatus)>,
+}
+
 /// Strict deserialization of an `ErgoValidationSettingsUpdate` payload —
 /// port of `ErgoValidationSettingsUpdateSerializer.parse`
 /// (`ErgoValidationSettingsUpdate.scala:41-58`) including the
 /// disableability `require` (lines 47-50). This is the validation entry
-/// point for extension key `[0x00, 124]` bytes; [`parse_disabled_rules`]
-/// remains the lenient rules-section reader used on already-normalized
-/// bytes.
+/// point for extension key `[0x00, 124]` bytes.
 ///
 /// Layout:
 ///
@@ -389,11 +366,13 @@ fn rule_may_not_be_disabled(id: u16) -> bool {
 ///   `dataSize` and reads its own VLQ ushort; an unknown status code
 ///   skips `dataSize` bytes and yields `ReplacedRule(0)`, the
 ///   forward-compat soft-fork arm). Malformed or truncated entries
-///   error. The decoded statuses are validated and DISCARDED — enr
-///   models update payloads as raw bytes (see
-///   [`crate::HeaderChain::active_proposed_update_bytes`]); dynamic
-///   rule-status state stays out of scope until a real on-chain update
-///   requires it.
+///   error. The decoded statuses are RETAINED in the returned value
+///   (round 3 — previously discarded) so consumers can canonically
+///   re-encode via [`encode_validation_settings_update`]; dynamic
+///   rule-status STATE stays out of scope until a real on-chain update
+///   requires it
+///   ([`crate::HeaderChain::active_proposed_update_bytes`] keeps
+///   tracking the block's verbatim bytes, unaffected).
 /// - Trailing bytes AFTER the final entry are NOT an error — JVM Reader
 ///   parity (`parseBytes` does not enforce full consumption).
 /// - Counts mirror JVM `getUInt().toInt`: values ≥ 2^31 wrap negative
@@ -402,15 +381,15 @@ fn rule_may_not_be_disabled(id: u16) -> bool {
 ///   BOTH the rules and statusUpdates counts.
 pub fn parse_validation_settings_update(
     bytes: &[u8],
-) -> Result<Vec<u16>, crate::ChainError> {
+) -> Result<ValidationSettingsUpdate, crate::ChainError> {
     use crate::ChainError;
     use ergo_lib::ergotree_ir::serialization::sigma_byte_reader::from_bytes;
     use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
-    use ergo_lib::ergotree_ir::validation::{RuleStatus, FIRST_RULE_ID};
+    use ergo_lib::ergotree_ir::validation::FIRST_RULE_ID;
     use sigma_ser::vlq_encode::ReadSigmaVlqExt;
 
     if bytes.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ValidationSettingsUpdate::default());
     }
     let mut r = from_bytes(bytes);
     let raw_count = r.get_u32().map_err(|e| {
@@ -449,9 +428,12 @@ pub fn parse_validation_settings_update(
     } else {
         raw_status_count as usize
     };
+    // Same capacity cap as the rules section: a bogus declared count on a
+    // small payload must not force a large pre-allocation.
+    let mut statuses = Vec::with_capacity(status_count.min(bytes.len()));
     for i in 0..status_count {
-        // JVM `(r.getUShort() + FirstRule).toShort` — decoded, discarded.
-        let _rule_id = r
+        // JVM `(r.getUShort() + FirstRule).toShort`.
+        let rule_id = r
             .get_u16()
             .map_err(|e| {
                 ChainError::ExtensionParse(format!(
@@ -459,13 +441,77 @@ pub fn parse_validation_settings_update(
                 ))
             })?
             .wrapping_add(FIRST_RULE_ID as u16) as i16;
-        RuleStatus::sigma_parse(&mut r).map_err(|e| {
+        let status = RuleStatus::sigma_parse(&mut r).map_err(|e| {
             ChainError::ExtensionParse(format!(
                 "settings update: status update at index {i}: {e}"
             ))
         })?;
+        statuses.push((rule_id, status));
     }
-    Ok(rules)
+    Ok(ValidationSettingsUpdate { rules, statuses })
+}
+
+/// Canonical serialization of a [`ValidationSettingsUpdate`] — port of
+/// `ErgoValidationSettingsUpdateSerializer.serialize`
+/// (`ErgoValidationSettingsUpdate.scala:31-39`).
+///
+/// ```text
+/// [disabledRulesNum: VLQ u32]
+/// disabledRules × disabledRulesNum: [rule_id: VLQ u16]
+/// [statusUpdatesNum: VLQ u32]
+/// statusUpdates × statusUpdatesNum:
+///   [putUShort(ruleId − FIRST_RULE_ID)]
+///   [RuleStatus sigma-serialize]
+/// ```
+///
+/// The EMPTY value encodes to exactly `[0x00, 0x00]`.
+///
+/// **Fallible by JVM parity**: a status entry whose `ruleId` is below
+/// `FIRST_RULE_ID` (1000) makes the wire offset negative and JVM's
+/// `putUShort` require-fails — likewise a [`RuleStatus::ReplacedRule`]
+/// payload id below 1000 (the sigma-rust `sigma_serialize` rejects it).
+/// `ReplacedRule(0)` is the REACHABLE case: it is exactly what the
+/// unknown-statusCode forward-compat PARSE arm produces, so the JVM can
+/// accept an update it cannot re-serialize (SANTA finding, 2026-06-12) —
+/// a node that activates such an update throws only when something later
+/// serializes the value; `Parameters.update` itself succeeds. Mirrored
+/// exactly: [`parse_validation_settings_update`] accepts, this encoder
+/// Errs.
+pub fn encode_validation_settings_update(
+    update: &ValidationSettingsUpdate,
+) -> Result<Vec<u8>, crate::ChainError> {
+    use crate::ChainError;
+    use ergo_lib::ergotree_ir::serialization::sigma_byte_writer::SigmaByteWriter;
+    use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+    use ergo_lib::ergotree_ir::validation::FIRST_RULE_ID;
+    use sigma_ser::vlq_encode::WriteSigmaVlqExt;
+
+    let mut out = Vec::with_capacity(2 + update.rules.len() * 2 + update.statuses.len() * 4);
+    let mut w = SigmaByteWriter::new(&mut out, None);
+    w.put_u32(update.rules.len() as u32).expect("Vec write");
+    for &rule in &update.rules {
+        w.put_u16(rule).expect("Vec write");
+    }
+    w.put_u32(update.statuses.len() as u32).expect("Vec write");
+    for (i, (rule_id, status)) in update.statuses.iter().enumerate() {
+        // JVM `w.putUShort(ruleId - FirstRuleId)` (Int arithmetic) — the
+        // scorex `putUShort` require rejects a negative offset.
+        let offset =
+            u16::try_from(*rule_id as i32 - FIRST_RULE_ID as i32).map_err(|_| {
+                ChainError::Voting(format!(
+                    "settings update encode: status update rule id {rule_id} at index {i} \
+                     is below FIRST_RULE_ID {FIRST_RULE_ID} (negative wire offset, JVM \
+                     putUShort require)"
+                ))
+            })?;
+        w.put_u16(offset).expect("Vec write");
+        status.sigma_serialize(&mut w).map_err(|e| {
+            ChainError::Voting(format!(
+                "settings update encode: status update at index {i}: {e}"
+            ))
+        })?;
+    }
+    Ok(out)
 }
 
 /// Encode a list of disabled rule IDs as an `ErgoValidationSettingsUpdate`
@@ -481,13 +527,12 @@ pub fn parse_validation_settings_update(
 /// [statusUpdatesNum: VLQ u32 = 0]
 /// ```
 ///
-/// We do NOT encode status updates here — mainnet / testnet launch
-/// parameters don't carry any, and the chain has no path to introduce
-/// them yet. When a consensus rule change requires status updates the
-/// encoder + storage model will need to be extended.
-///
-/// This is the inverse of [`parse_disabled_rules`] for the
-/// empty-statusUpdates case; round-trip is stable for any `[u16]` list.
+/// The infallible rules-only counterpart of
+/// [`encode_validation_settings_update`] (statuses are where encoding
+/// can fail), kept for the launch-default seed and the live wrappers'
+/// EMPTY normalization. [`parse_validation_settings_update`] decodes the
+/// result back for any rules list that passes the disableability
+/// `require`.
 pub fn encode_disabled_rules(rules: &[u16]) -> Vec<u8> {
     use sigma_ser::vlq_encode::WriteSigmaVlqExt;
 
@@ -743,10 +788,17 @@ pub fn tally_votes_seeded(
 ///   absent.
 ///
 /// Returns `(next_parameters, activated_update)` where `activated_update`
-/// is `proposed_update` verbatim at a voting-driven activation boundary
-/// and the canonical EMPTY encoding (`0x0000`, via
-/// [`encode_disabled_rules`] on no rules) otherwise — JVM
-/// `activatedUpdate`. The forced-v2 bump does NOT activate the update.
+/// is the PARSED VALUE of `proposed_update` at a voting-driven activation
+/// boundary and the EMPTY value otherwise — JVM `Parameters.update`
+/// returns the `ErgoValidationSettingsUpdate` OBJECT; the wire form is
+/// whatever a consumer gets from
+/// [`encode_validation_settings_update`], NEVER the input slice
+/// (trailing garbage and count-wrap artifacts in `proposed_update`
+/// cannot survive into the value). The encoder is fallible — the JVM
+/// can ACCEPT an update it cannot re-serialize (`ReplacedRule(0)` from
+/// the unknown-statusCode parse arm); activation here succeeds the same
+/// way, and the throw belongs to whoever later encodes. The forced-v2
+/// bump does NOT activate the update.
 ///
 /// `proposed_update` is parse-validated UP FRONT via
 /// [`parse_validation_settings_update`] and a failure errors (the SANTA
@@ -766,10 +818,10 @@ pub fn compute_boundary_parameters(
     tally: &[(i8, u32)],
     boundary_fork_vote: bool,
     proposed_update: &[u8],
-) -> Result<(Parameters, Vec<u8>), crate::ChainError> {
+) -> Result<(Parameters, ValidationSettingsUpdate), crate::ChainError> {
     use crate::ChainError;
 
-    parse_validation_settings_update(proposed_update)?;
+    let parsed_update = parse_validation_settings_update(proposed_update)?;
 
     if voting.voting_length == 0 {
         return Err(ChainError::Voting("voting_length must be > 0".into()));
@@ -777,9 +829,9 @@ pub fn compute_boundary_parameters(
 
     let mut next = current.clone();
     let table = &mut next.parameters_table;
-    // None = no voting-driven activation this boundary (JVM
-    // `ErgoValidationSettingsUpdate.empty`).
-    let mut activated: Option<Vec<u8>> = None;
+    // false = no voting-driven activation this boundary (the activated
+    // update stays JVM `ErgoValidationSettingsUpdate.empty`).
+    let mut activated = false;
 
     // --- JVM `updateFork` ---
     //
@@ -878,7 +930,7 @@ pub fn compute_boundary_parameters(
                     )
                 })?;
             table.insert(Parameter::BlockVersion, bv.wrapping_add(1));
-            activated = Some(proposed_update.to_vec());
+            activated = true;
         }
     } else if boundary_fork_vote && boundary_height.is_multiple_of(voting.voting_length) {
         // New voting with no round in progress.
@@ -951,17 +1003,22 @@ pub fn compute_boundary_parameters(
     // Insert sub-blocks-per-block on the epoch after the v4 (protocol
     // 6.0) activation: skipped when the update being activated RIGHT NOW
     // disables rule 409 (`exMatchParameters`), in which case it fires at
-    // the next boundary instead.
-    let activated_bytes = activated.unwrap_or_else(|| encode_disabled_rules(&[]));
+    // the next boundary instead. The gate reads the activated VALUE's
+    // rules directly (JVM `activatedUpdate.rulesToDisable.contains`).
+    let activated_update = if activated {
+        parsed_update
+    } else {
+        ValidationSettingsUpdate::default()
+    };
     let bv_now = table.get(&Parameter::BlockVersion).copied().unwrap_or(-1);
     if bv_now == 4
         && !table.contains_key(&Parameter::SubblocksPerBlock)
-        && !parse_disabled_rules(&activated_bytes)?.contains(&409u16)
+        && !activated_update.rules.contains(&409u16)
     {
         table.insert(Parameter::SubblocksPerBlock, SUBBLOCKS_PER_BLOCK_DEFAULT);
     }
 
-    Ok((next, activated_bytes))
+    Ok((next, activated_update))
 }
 
 /// Fork-vote window gate — port of JVM `ErgoStateContext.checkForkVote`
@@ -1268,9 +1325,18 @@ mod tests {
 
     // ---- compute_boundary_parameters (pure JVM Parameters.update port) ----
 
-    /// The canonical empty `ErgoValidationSettingsUpdate` encoding ("0000").
-    fn empty_update() -> Vec<u8> {
-        encode_disabled_rules(&[])
+    /// The EMPTY `ErgoValidationSettingsUpdate` value (JVM `.empty`) —
+    /// the non-activation activated-update return. Encodes to "0000".
+    fn empty_update() -> ValidationSettingsUpdate {
+        ValidationSettingsUpdate::default()
+    }
+
+    /// A rules-only [`ValidationSettingsUpdate`] value.
+    fn rules_update(rules: &[u16]) -> ValidationSettingsUpdate {
+        ValidationSettingsUpdate {
+            rules: rules.to_vec(),
+            statuses: Vec::new(),
+        }
     }
 
     fn tally_of(entries: &[(i8, u32)]) -> Vec<(i8, u32)> {
@@ -1458,8 +1524,9 @@ mod tests {
         .unwrap();
         assert_eq!(next.block_version(), 2, "voting-driven activation bumps BlockVersion");
         assert_eq!(
-            activated, proposed,
-            "activated update is the boundary's proposed update, passed through"
+            activated,
+            rules_update(&[215]),
+            "activated update is the PARSED VALUE of the boundary's proposed update"
         );
         // Counters survive activation; cleanup happens one activation period later.
         assert_eq!(next.soft_fork_starting_height(), Some(128));
@@ -1567,7 +1634,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(next.block_version(), 4);
-        assert_eq!(activated, with_409);
+        assert_eq!(activated, rules_update(&[215, 409]));
         assert!(
             !next
                 .parameters_table
@@ -1751,7 +1818,7 @@ mod tests {
             let bytes = encode_disabled_rules(&[id]);
             assert_eq!(
                 parse_validation_settings_update(&bytes).unwrap(),
-                vec![id],
+                rules_update(&[id]),
                 "id {id} must pass the strict parse"
             );
         }
@@ -1762,21 +1829,15 @@ mod tests {
         // Absent extension field = empty update by convention.
         assert_eq!(
             parse_validation_settings_update(&[]).unwrap(),
-            Vec::<u16>::new()
+            empty_update()
         );
     }
 
     #[test]
     fn strict_parse_bare_rules_count_rejects() {
         // A 1-byte `0x00` payload is truncated before the statusUpdates
-        // count — JVM `getUInt` underflow. The lenient
-        // `parse_disabled_rules` keeps accepting it (see
-        // `parse_disabled_rules_count_only_ok`).
+        // count — JVM `getUInt` underflow parity.
         assert!(parse_validation_settings_update(&[0x00]).is_err());
-        assert!(
-            parse_disabled_rules(&[0x00]).is_ok(),
-            "lenient reader contrast"
-        );
     }
 
     #[test]
@@ -1796,10 +1857,19 @@ mod tests {
     ];
 
     #[test]
-    fn strict_parse_mainnet_v6_payload_passes_with_status_tail() {
+    fn strict_parse_mainnet_v6_payload_full_value() {
+        // Statuses RETAINED since round 3: rules [215, 409] plus the 3
+        // ReplacedRule status updates, input order.
         assert_eq!(
             parse_validation_settings_update(&MAINNET_V6_PAYLOAD).unwrap(),
-            vec![215, 409]
+            ValidationSettingsUpdate {
+                rules: vec![215, 409],
+                statuses: vec![
+                    (1011, RuleStatus::ReplacedRule(1016)),
+                    (1007, RuleStatus::ReplacedRule(1017)),
+                    (1008, RuleStatus::ReplacedRule(1018)),
+                ],
+            }
         );
     }
 
@@ -1833,11 +1903,16 @@ mod tests {
     fn strict_parse_unknown_status_code_skips_ok() {
         // Unknown status code 0x63 with dataSize=2 and both bytes
         // present: skipped and processed as a soft-fork —
-        // `ReplacedRule(0)`, discarded (JVM forward-compat arm).
+        // `ReplacedRule(0)` under the entry's rule id (JVM
+        // forward-compat arm). Retained in the value; such a value
+        // cannot be re-encoded (see `encode_replaced_rule_zero_errs`).
         let bytes = [0x00, 0x01, 0x0B, 0x02, 0x63, 0xAA, 0xBB];
         assert_eq!(
             parse_validation_settings_update(&bytes).unwrap(),
-            Vec::<u16>::new()
+            ValidationSettingsUpdate {
+                rules: vec![],
+                statuses: vec![(1011, RuleStatus::ReplacedRule(0))],
+            }
         );
     }
 
@@ -1845,12 +1920,17 @@ mod tests {
     fn strict_parse_trailing_bytes_after_final_entry_ok() {
         // Garbage AFTER the final decoded entry is not an error — JVM
         // Reader parity (`parseBytes` does not enforce full
-        // consumption).
+        // consumption). The trailing bytes do NOT survive into the
+        // value (see `encode_mainnet_v6_payload_byte_identical`).
         let mut bytes = MAINNET_V6_PAYLOAD.to_vec();
         bytes.extend_from_slice(&[0xDE, 0xAD]);
+        let value = parse_validation_settings_update(&bytes).unwrap();
+        assert_eq!(value.rules, vec![215, 409]);
+        assert_eq!(value.statuses.len(), 3);
         assert_eq!(
-            parse_validation_settings_update(&bytes).unwrap(),
-            vec![215, 409]
+            value,
+            parse_validation_settings_update(&MAINNET_V6_PAYLOAD).unwrap(),
+            "trailing garbage must not change the parsed value"
         );
     }
 
@@ -1862,7 +1942,7 @@ mod tests {
         let bytes = [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F];
         assert_eq!(
             parse_validation_settings_update(&bytes).unwrap(),
-            Vec::<u16>::new()
+            empty_update()
         );
     }
 
@@ -1874,8 +1954,99 @@ mod tests {
         let bytes = [0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x00];
         assert_eq!(
             parse_validation_settings_update(&bytes).unwrap(),
-            Vec::<u16>::new()
+            empty_update()
         );
+    }
+
+    // ---- canonical encoder: encode_validation_settings_update ----
+
+    #[test]
+    fn encode_empty_value_is_0000() {
+        assert_eq!(
+            encode_validation_settings_update(&empty_update()).unwrap(),
+            vec![0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn encode_rules_only_matches_encode_disabled_rules() {
+        // The canonical encoder and the rules-only helper agree on every
+        // statuses-empty value.
+        for rules in [&[][..], &[215u16][..], &[215, 409][..]] {
+            assert_eq!(
+                encode_validation_settings_update(&rules_update(rules)).unwrap(),
+                encode_disabled_rules(rules),
+                "encoders must agree on rules {rules:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_canonicalizes_garbage_tail() {
+        // The SANTA `status-*-canonicalized` pin: `016f00deadbeef` (rule
+        // 111, empty statuses, 4 trailing garbage bytes) parses clean and
+        // re-encodes WITHOUT the tail — the wire form is serialize(value),
+        // never the input slice.
+        let input = [0x01, 0x6F, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+        let value = parse_validation_settings_update(&input).unwrap();
+        assert_eq!(value, rules_update(&[111]));
+        assert_eq!(
+            encode_validation_settings_update(&value).unwrap(),
+            vec![0x01, 0x6F, 0x00]
+        );
+    }
+
+    #[test]
+    fn encode_canonicalizes_count_wraps() {
+        // Both count-wrap shapes parse to the EMPTY value and re-encode
+        // to the canonical "0000" — the wrap artifact cannot survive.
+        for input in [
+            &[0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x00][..], // rules count wraps
+            &[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F][..], // status count wraps
+        ] {
+            let value = parse_validation_settings_update(input).unwrap();
+            assert_eq!(
+                encode_validation_settings_update(&value).unwrap(),
+                vec![0x00, 0x00],
+                "wrap input {input:02X?} must canonicalize to 0000"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_mainnet_v6_payload_byte_identical() {
+        // The mainnet h=1,628,160 payload IS canonical: value → encode
+        // reproduces the input byte-for-byte, statuses included.
+        let value = parse_validation_settings_update(&MAINNET_V6_PAYLOAD).unwrap();
+        assert_eq!(
+            encode_validation_settings_update(&value).unwrap(),
+            MAINNET_V6_PAYLOAD.to_vec()
+        );
+    }
+
+    #[test]
+    fn encode_replaced_rule_zero_errs() {
+        // The JVM accepts updates it cannot re-serialize: the
+        // unknown-statusCode parse arm yields `ReplacedRule(0)`, whose
+        // wire offset (0 − 1000) fails the JVM `putUShort` require at
+        // SERIALIZE time. Parse accepts, encode Errs — mirrored exactly.
+        let bytes = [0x00, 0x01, 0x0B, 0x02, 0x63, 0xAA, 0xBB];
+        let value = parse_validation_settings_update(&bytes).unwrap();
+        assert_eq!(value.statuses, vec![(1011, RuleStatus::ReplacedRule(0))]);
+        assert!(encode_validation_settings_update(&value).is_err());
+    }
+
+    #[test]
+    fn encode_status_key_below_first_rule_id_errs() {
+        // The entry KEY has the same negative-offset failure mode as the
+        // ReplacedRule payload: a wire offset of 64536 wraps the key id
+        // through `(64536 + 1000).toShort` to 0, and re-encoding computes
+        // `putUShort(0 − 1000)` → JVM require failure. VLQ(64536) =
+        // [0x98, 0xF8, 0x03]; the status itself (EnabledRule) is fine.
+        let bytes = [0x00, 0x01, 0x98, 0xF8, 0x03, 0x00, 0x01];
+        let value = parse_validation_settings_update(&bytes).unwrap();
+        assert_eq!(value.statuses, vec![(0, RuleStatus::EnabledRule)]);
+        assert!(encode_validation_settings_update(&value).is_err());
     }
 
     #[test]
@@ -2201,56 +2372,16 @@ mod tests {
         assert_eq!(bytes[32], 0x00);
     }
 
-    /// Regression: mainnet block 1,628,160 extension carries this exact
-    /// `SoftForkDisablingRules` payload (key `[0x00, 0x7C]`). JVM's
-    /// `ErgoValidationSettingsUpdateSerializer` parses it as
-    /// `rulesToDisable = [215, 409]` + 3 status updates. Rule 409 in this
-    /// list is what suppresses the `SubblocksPerBlock` auto-insert at the
-    /// v6 BlockVersion activation — without this gate our node emits 12
-    /// parameter-table entries vs JVM's 11 and diverges.
-    #[test]
-    fn parse_disabled_rules_mainnet_v6_activation() {
-        // 02 d7 01 99 03 03 0b 01 03 10 07 01 03 11 08 01 03 12
-        // ^^ ^^^^^^^^^^^^^^ ^^ -- remainder is statusUpdates (ignored)
-        // |  |           |
-        // |  215 (VLQ)   409 (VLQ)
-        // disabledRulesNum = 2 (VLQ)
-        let bytes: [u8; 18] = [
-            0x02, 0xD7, 0x01, 0x99, 0x03, 0x03, 0x0B, 0x01, 0x03,
-            0x10, 0x07, 0x01, 0x03, 0x11, 0x08, 0x01, 0x03, 0x12,
-        ];
-        let rules = parse_disabled_rules(&bytes).unwrap();
-        assert_eq!(rules, vec![215u16, 409u16]);
-    }
-
-    #[test]
-    fn parse_disabled_rules_empty_input_ok() {
-        // Absent ID 124 field maps to empty input by convention — JVM
-        // treats it as `ErgoValidationSettingsUpdate.empty`.
-        assert_eq!(parse_disabled_rules(&[]).unwrap(), Vec::<u16>::new());
-    }
-
-    #[test]
-    fn parse_disabled_rules_count_only_ok() {
-        // `disabledRulesNum = 0` with no rules following — valid.
-        assert_eq!(parse_disabled_rules(&[0x00]).unwrap(), Vec::<u16>::new());
-    }
-
-    #[test]
-    fn parse_disabled_rules_truncated_errors() {
-        // Claims 2 rules, supplies bytes for 1. Must not panic.
-        let bytes = [0x02u8, 0xD7, 0x01];
-        assert!(parse_disabled_rules(&bytes).is_err());
-    }
-
     /// Round-trip: encode the mainnet launch default
     /// (`ErgoValidationSettingsUpdate(Seq(215, 409), Seq.empty)`) and
     /// parse it back. Any future encoder change must preserve this.
     #[test]
     fn encode_decode_mainnet_launch_round_trip() {
         let bytes = encode_disabled_rules(&[215, 409]);
-        let rules = parse_disabled_rules(&bytes).unwrap();
-        assert_eq!(rules, vec![215u16, 409u16]);
+        assert_eq!(
+            parse_validation_settings_update(&bytes).unwrap(),
+            rules_update(&[215, 409])
+        );
     }
 
     /// The encoder produces exactly the launch-default byte sequence:
