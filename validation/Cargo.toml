@@ -6,9 +6,9 @@ license = "MIT"
 description = "Block validation for the Ergo Rust node"
 
 [dependencies]
-ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "75be067f" }
-ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "75be067f" }
-sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "75be067f" }
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "159d1473" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "159d1473" }
+sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "159d1473" }
 ergo_avltree_rust = "0.1.1"
 enr-state = { path = "../state" }
 rayon = "1"
@@ -19,6 +19,6 @@ tracing = "0.1"
 thiserror = "2"
 
 [dev-dependencies]
-ergotree-interpreter = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "75be067f" }
-ergotree-ir = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "75be067f" }
+ergotree-interpreter = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "159d1473" }
+ergotree-ir = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "159d1473" }
 tempfile = "3"
