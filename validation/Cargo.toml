@@ -5,6 +5,14 @@ edition = "2021"
 license = "MIT"
 description = "Block validation for the Ergo Rust node"
 
+[features]
+# Opt-in JSON (de)serialization for sigma types — OFF by default, so the
+# node build is unchanged (the node never needs serde on these types).
+# External consumers (e.g. the SANTA donner-runner) enable it for serde on
+# enr-exposed types; cargo feature-unification then also turns on
+# ergo-chain-types/json, giving enr_chain::Header its Deserialize impl.
+json = ["ergo-lib/json", "ergo-chain-types/json"]
+
 [dependencies]
 ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "159d1473" }
 ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "159d1473" }

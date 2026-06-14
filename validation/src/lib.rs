@@ -23,7 +23,7 @@ pub use voting::{pack_parameters, parse_parameters_from_extension};
 
 // Re-export types needed by mempool callers
 pub use ergo_lib::chain::ergo_state_context::ErgoStateContext;
-pub use ergo_lib::chain::parameters::Parameters;
+pub use ergo_lib::chain::parameters::{Parameter, Parameters};
 pub use ergo_lib::chain::transaction::Transaction;
 pub use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
 
