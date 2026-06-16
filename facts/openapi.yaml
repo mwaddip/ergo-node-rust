@@ -353,8 +353,10 @@ paths:
         (`Transaction::bytes_to_sign()` — what every input signature commits
         to) and `bytes` (the full canonical
         `Transaction::sigma_serialize_bytes()`, byte-exact including the
-        on-chain ContextExtension wire order). `blake2b256(bytes)` is the
-        transaction id.
+        on-chain ContextExtension wire order). The transaction id is
+        `blake2b256(signingMessage)`, NOT `blake2b256(bytes)` — proofs and
+        extensions (carried in `bytes`, absent from the signing message) are
+        not part of the id.
 
         Errors use the standard `ApiError` shape with the short code
         string carried in `reason` and any context (echoed `headerId`,
@@ -1819,10 +1821,12 @@ components:
             outputs. The on-chain ContextExtension wire order is preserved
             byte-for-byte (sigma stores it order-faithfully as an `IndexMap`);
             unlike the JSON endpoints, which normalize extension keys
-            ascending, this is byte-exact. `blake2b256(bytes)` IS the
-            transaction id — index-align with `GET /blocks/{header_id}`
-            `transactions[i].id` to verify. Intended for cross-impl
-            conformance vectors that pin serialization-order rules.
+            ascending, this is byte-exact. NOTE: the tx id is
+            `blake2b256(signingMessage)` (proofs + extensions stripped), NOT
+            `blake2b256(bytes)`; to confirm `bytes` belongs to
+            `transactions[i]`, re-parse it (its id must equal
+            `transactions[i].id`) or hash its `signingMessage`. Intended for
+            cross-impl conformance vectors that pin serialization-order rules.
 
     # ---- Transactions ----
     Transaction:
