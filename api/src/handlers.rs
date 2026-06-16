@@ -3226,12 +3226,13 @@ mod tests {
 
         // `bytes` is the full canonical sigma_serialize_bytes() (proofs +
         // ContextExtension in wire order). The Ergo tx id is
-        // blake2b256(bytes_to_sign) — proofs AND extensions stripped — NOT of
-        // the full bytes, so identity is checked via `signing_message`; `bytes`
-        // is then verified to re-parse to a tx with that same id. (This fixture
-        // is proof-less, so bytes == bytes_to_sign here; ContextExtension
-        // order-preservation is sigma's IndexMap property, exercised cross-impl
-        // by SANTA's conformance vectors rather than this unit test.)
+        // blake2b256(bytes_to_sign), which strips proofs but KEEPS the
+        // ContextExtensions (in wire order) — so it is NOT blake2b256(bytes)
+        // (which adds the proofs back); identity is checked via
+        // `signing_message`, and `bytes` is verified to re-parse to a tx with
+        // that same id. (This fixture is proof-less, so bytes == bytes_to_sign
+        // here; ContextExtension order-preservation is sigma's IndexMap
+        // property, exercised cross-impl by SANTA's conformance vectors.)
         use blake2::digest::consts::U32;
         use blake2::{Blake2b, Digest};
         use ergo_lib::chain::transaction::Transaction;

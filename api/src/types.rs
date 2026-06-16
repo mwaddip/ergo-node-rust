@@ -209,6 +209,7 @@ pub struct ValidationFragmentsTx {
     /// outputs. The on-chain ContextExtension wire order is preserved
     /// byte-for-byte (NOT sorted), unlike the JSON endpoints which normalize
     /// extension keys ascending. The tx id is `blake2b256(signingMessage)`
-    /// (proofs + extensions stripped), NOT `blake2b256(bytes)`.
+    /// (proofs stripped, ContextExtensions kept in wire order), NOT
+    /// `blake2b256(bytes)`.
     pub bytes: String,
 }
