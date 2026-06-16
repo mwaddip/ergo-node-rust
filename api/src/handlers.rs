@@ -2050,8 +2050,10 @@ pub async fn get_block_validation_fragments(
             max_block_cost: p.max_block_cost(),
         });
 
-    // Per-tx signing message. Pitfall #1: this is bytes_to_sign(), NOT the
-    // full canonical tx bytes.
+    // Per-tx fragments. `signing_message` is bytes_to_sign() (Pitfall #1:
+    // strips proofs AND ContextExtensions). `bytes` is the full canonical
+    // sigma_serialize_bytes() — every input's spending proof + ContextExtension
+    // in on-chain wire order — whose blake2b256 IS the tx id.
     let mut tx_fragments = Vec::with_capacity(parsed_txs.transactions.len());
     for tx in &parsed_txs.transactions {
         let signing_message = tx.bytes_to_sign().map_err(|e| {
@@ -2061,8 +2063,16 @@ pub async fn get_block_validation_fragments(
                 Some(format!("{e}")),
             )
         })?;
+        let canonical_bytes = tx.sigma_serialize_bytes().map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tx-serialize-failed",
+                Some(format!("{e}")),
+            )
+        })?;
         tx_fragments.push(ValidationFragmentsTx {
             signing_message: hex::encode(&signing_message),
+            bytes: hex::encode(&canonical_bytes),
         });
     }
 
@@ -3143,6 +3153,10 @@ mod tests {
         assert!(!body.transactions[0].signing_message.is_empty());
         hex::decode(&body.transactions[0].signing_message).expect("signingMessage is hex");
 
+        // bytes (full canonical tx bytes) is non-empty hex too.
+        assert!(!body.transactions[0].bytes.is_empty());
+        hex::decode(&body.transactions[0].bytes).expect("bytes is hex");
+
         // parameters is None for this fixture — we never stored an extension
         // section. Contract pitfall #2 says null on parse failure.
         assert!(body.parameters.is_none());
@@ -3209,6 +3223,25 @@ mod tests {
             parsed.transactions.len(),
             "tx count must match /blocks/{{id}}",
         );
+
+        // Round-trip / order-preservation proof: each tx's `bytes` is the full
+        // canonical sigma_serialize_bytes(), so blake2b256(bytes) must reproduce
+        // the tx id (itself defined as that hash). A regression that emitted
+        // bytes_to_sign() — or re-sorted ContextExtension keys — into `bytes`
+        // would break this.
+        use blake2::digest::consts::U32;
+        use blake2::{Blake2b, Digest};
+        type Blake2b256 = Blake2b<U32>;
+        for (i, frag) in body.transactions.iter().enumerate() {
+            assert!(!frag.bytes.is_empty(), "tx[{i}] bytes must be non-empty");
+            let raw = hex::decode(&frag.bytes).expect("bytes is hex");
+            let digest: [u8; 32] = Blake2b256::digest(&raw).into();
+            assert_eq!(
+                digest,
+                parsed.transactions[i].id().0 .0,
+                "blake2b256(bytes) must equal transactions[{i}].id",
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

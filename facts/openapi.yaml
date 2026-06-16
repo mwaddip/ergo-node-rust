@@ -349,16 +349,19 @@ paths:
         blocks). The node does NOT substitute `Parameters::default()` —
         the client owns the fallback policy.
 
-        `signingMessage` is `Transaction::bytes_to_sign()`, NOT the full
-        canonical transaction bytes. This is what every input signature
-        commits to.
+        Each transaction carries both `signingMessage`
+        (`Transaction::bytes_to_sign()` — what every input signature commits
+        to) and `bytes` (the full canonical
+        `Transaction::sigma_serialize_bytes()`, byte-exact including the
+        on-chain ContextExtension wire order). `blake2b256(bytes)` is the
+        transaction id.
 
         Errors use the standard `ApiError` shape with the short code
         string carried in `reason` and any context (echoed `headerId`,
         underlying error message) in `detail`. Reason values:
         `invalid-header-id`, `block-not-found`, `block-pruned`,
         `header-serialize-failed`, `block-transactions-parse-failed`,
-        `tx-bytes-to-sign-failed`.
+        `tx-bytes-to-sign-failed`, `tx-serialize-failed`.
       operationId: getBlockValidationFragments
       x-rust-only: true
       parameters:
@@ -1798,14 +1801,28 @@ components:
 
     ValidationFragmentsTx:
       type: object
-      required: [signingMessage]
+      required: [signingMessage, bytes]
       properties:
         signingMessage:
           $ref: '#/components/schemas/HexString'
           description: |
             `Transaction::bytes_to_sign()` — inputs without proofs/extensions,
             then data-inputs, then outputs, concatenated. NOT the full
-            canonical tx bytes. This is what every input signature commits to.
+            canonical tx bytes (see `bytes`). This is what every input
+            signature commits to.
+        bytes:
+          $ref: '#/components/schemas/HexString'
+          description: |
+            Full canonical transaction bytes —
+            `Transaction::sigma_serialize_bytes()`: each input as
+            boxId + spending proof + ContextExtension, then data-inputs, then
+            outputs. The on-chain ContextExtension wire order is preserved
+            byte-for-byte (sigma stores it order-faithfully as an `IndexMap`);
+            unlike the JSON endpoints, which normalize extension keys
+            ascending, this is byte-exact. `blake2b256(bytes)` IS the
+            transaction id — index-align with `GET /blocks/{header_id}`
+            `transactions[i].id` to verify. Intended for cross-impl
+            conformance vectors that pin serialization-order rules.
 
     # ---- Transactions ----
     Transaction:

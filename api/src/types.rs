@@ -203,4 +203,11 @@ pub struct ValidationFragmentsTx {
     /// the full canonical tx bytes. This is what every input's signature
     /// commits to.
     pub signing_message: String,
+    /// Full canonical transaction bytes from
+    /// `Transaction::sigma_serialize_bytes()`, hex-encoded — each input as
+    /// boxId + spending proof + ContextExtension, then data-inputs, then
+    /// outputs. The on-chain ContextExtension wire order is preserved
+    /// byte-for-byte (NOT sorted), unlike the JSON endpoints which normalize
+    /// extension keys ascending. `blake2b256(bytes)` is the transaction id.
+    pub bytes: String,
 }
