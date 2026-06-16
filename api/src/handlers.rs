@@ -3224,22 +3224,36 @@ mod tests {
             "tx count must match /blocks/{{id}}",
         );
 
-        // Round-trip / order-preservation proof: each tx's `bytes` is the full
-        // canonical sigma_serialize_bytes(), so blake2b256(bytes) must reproduce
-        // the tx id (itself defined as that hash). A regression that emitted
-        // bytes_to_sign() — or re-sorted ContextExtension keys — into `bytes`
-        // would break this.
+        // `bytes` is the full canonical sigma_serialize_bytes() (proofs +
+        // ContextExtension in wire order). The Ergo tx id is
+        // blake2b256(bytes_to_sign) — proofs AND extensions stripped — NOT of
+        // the full bytes, so identity is checked via `signing_message`; `bytes`
+        // is then verified to re-parse to a tx with that same id. (This fixture
+        // is proof-less, so bytes == bytes_to_sign here; ContextExtension
+        // order-preservation is sigma's IndexMap property, exercised cross-impl
+        // by SANTA's conformance vectors rather than this unit test.)
         use blake2::digest::consts::U32;
         use blake2::{Blake2b, Digest};
+        use ergo_lib::chain::transaction::Transaction;
         type Blake2b256 = Blake2b<U32>;
         for (i, frag) in body.transactions.iter().enumerate() {
+            // signing_message — not the full bytes — is what hashes to the id
+            let sm = hex::decode(&frag.signing_message).expect("signingMessage is hex");
+            let sm_digest: [u8; 32] = Blake2b256::digest(&sm).into();
+            assert_eq!(
+                sm_digest,
+                parsed.transactions[i].id().0 .0,
+                "blake2b256(signingMessage) must equal transactions[{i}].id",
+            );
+            // full canonical bytes are non-empty hex and re-parse to the same tx
             assert!(!frag.bytes.is_empty(), "tx[{i}] bytes must be non-empty");
             let raw = hex::decode(&frag.bytes).expect("bytes is hex");
-            let digest: [u8; 32] = Blake2b256::digest(&raw).into();
+            let reparsed = Transaction::sigma_parse_bytes(&raw)
+                .expect("bytes must re-parse to a Transaction");
             assert_eq!(
-                digest,
+                reparsed.id().0 .0,
                 parsed.transactions[i].id().0 .0,
-                "blake2b256(bytes) must equal transactions[{i}].id",
+                "bytes must re-parse to the tx with id transactions[{i}].id",
             );
         }
     }
