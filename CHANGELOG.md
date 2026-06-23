@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.7.3 — 2026-06-23
+
+Mining-serve JVM compat + sigma-rust eni rebase. Three real serve bugs
+surfaced by pointing a reference GPU miner at the node — the serve
+direction had never been exercised by a real miner before.
+
+- **WorkMessage `b` as JSON number, not string.** JVM emits a bare
+  arbitrary-precision number; we emitted a quoted string. The reference
+  miner's fixed-length jsmn buffer overflowed on the extra tokens.
+- **Omit WorkMessage `proof` when empty.** JVM drops `proof` (and `h`)
+  via `.collect`-drop-None; we always emitted a full nested `{}`. Same
+  jsmn NOMEM failure.
+- **Candidate queried by validated height, not header height.**
+  `GET /mining/candidate` keyed off `chain.height()` (headers) but the
+  mining cache is indexed by validated height — persistent 503 whenever
+  the full tip lagged behind headers.
+- **sigma-rust pin `10a77c5c` → `f76db922`** (4 new eni commits):
+  check_value_type before eval (tuple arity order, kushti review #897),
+  hard-wire-error gate in the sized-ErgoTree degrade path, reject
+  non-soft-forkable constant type codes (rule 1009), and MaxBlockCost
+  enforcement in block units (not raw JIT accumulator). JVM-compat
+  consensus fixes — all three are fork-direction (accept-what-JVM-rejects).
+- **validation-fragments `bytes` field:** full canonical tx bytes
+  (`Transaction::sigma_serialize_bytes()`) emitted alongside the existing
+  per-input fragments — needed by SANTA for tx-tier conformance vectors
+  where ContextExtension wire order matters.
+- **runner-API:** validation `json` feature + chain `ADDigest` and
+  validation `Parameter` re-exports so donner-runner can source types
+  through enr crates without a direct sigma-rust dep.
+- Addons bumped: indexer 0.2.7, fastsync 0.1.5.
+
 ## v0.7.2 — 2026-06-12
 
 The JVM-exactness release. The SANTA chain tier kept growing vectors
