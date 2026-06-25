@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.7.4 — 2026-06-25
+
+Fix per-block state-root mismatch when mining-serve is enabled at tip
+([#15](https://github.com/mwaddip/ergo-node-rust/issues/15)).
+
+- **`compute_proofs` no longer shares tree nodes with the main prover.**
+  The mining proof path called `prover.generate_proof_for_operations()`,
+  which shallow-clones the AVL tree (`Rc<RefCell<Node>>`) and then mutates
+  shared nodes during operations — setting `visited` flags and changing
+  children pointers during tree restructuring. These mutations corrupted
+  the main prover's in-memory tree, causing the next block's first apply
+  to fail with a state-root mismatch. The retry self-healed (rollback
+  reloads from storage), but with an overlap warning from stale flags.
+  Fixed by building a **separate prover from storage** for the mining
+  path — fresh nodes, no shared Rc pointers, zero interference.
+
 ## v0.7.3 — 2026-06-23
 
 Mining-serve JVM compat + sigma-rust eni rebase. Three real serve bugs

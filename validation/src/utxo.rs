@@ -7,6 +7,7 @@ use bytes::Bytes;
 use enr_state::RedbAVLStorage;
 use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
+use ergo_avltree_rust::batch_node::AVLTree;
 use ergo_avltree_rust::operation::{KeyValue, Operation};
 use ergo_avltree_rust::versioned_avl_storage::VersionedAVLStorage;
 use ergo_chain_types::{ADDigest, Header};
@@ -439,8 +440,13 @@ impl UtxoValidator {
     /// Compute AD proofs and new state root for a set of transactions
     /// without modifying persistent state.
     ///
-    /// Uses BatchAVLProver::generate_proof_for_operations which creates
-    /// a temporary prover copy internally. The real prover is untouched.
+    /// Builds a **separate** prover from storage (fresh tree, no shared Rc
+    /// nodes).  The main prover's tree is never touched — the old path of
+    /// calling `prover.generate_proof_for_operations()` cloned the tree
+    /// shallowly (`Rc<RefCell<Node>>`) and operations on the clone mutated
+    /// shared nodes (visited flags + children pointers during restructuring),
+    /// corrupting the main prover for the next block apply (state-root
+    /// mismatch on the first attempt; self-healing retry after rollback).
     fn compute_proofs(
         &self,
         txs: &[ergo_lib::chain::transaction::Transaction],
@@ -466,16 +472,55 @@ impl UtxoValidator {
             }));
         }
 
-        // 3. Generate proof WITHOUT modifying state.
-        //    generate_proof_for_operations creates a temp prover internally.
-        let (proof_bytes, new_digest) = self
-            .prover
-            .generate_proof_for_operations(&operations)
+        // 3. Build a separate prover from storage — do NOT touch self.prover.
+        //    generate_proof_for_operations clones the tree shallowly (Rc)
+        //    and operations on the clone mutate shared nodes, corrupting the
+        //    main prover.  Instead, load the current root from storage into a
+        //    fresh tree with its own resolver — every resolved node is a new
+        //    Rc<RefCell<Node>>, independent of the main prover.
+        let (root_label, tree_height) = self
+            .storage
+            .root_state()
+            .ok_or_else(|| {
+                ValidationError::StateOperationFailed(
+                    "no root state for mining proof computation".to_string(),
+                )
+            })?;
+        let root_bytes = self
+            .storage
+            .get_node(&root_label)
             .map_err(|e| {
                 ValidationError::StateOperationFailed(format!(
-                    "proof generation for mining failed: {e}"
+                    "mining proof: failed to read root node: {e}"
                 ))
+            })?
+            .ok_or_else(|| {
+                ValidationError::StateOperationFailed(
+                    "mining proof: root node not found in storage".to_string(),
+                )
             })?;
+
+        let mut tree = AVLTree::with_resolver(self.storage.resolver(), 32, None);
+        let root_node = tree.unpack(&root_bytes);
+        tree.root = Some(root_node);
+        tree.height = tree_height;
+
+        let mut temp_prover = BatchAVLProver::new(tree, false);
+        for op in &operations {
+            temp_prover
+                .perform_one_operation(op)
+                .map_err(|e| {
+                    ValidationError::StateOperationFailed(format!(
+                        "mining proof operation failed: {e}"
+                    ))
+                })?;
+        }
+        let proof_bytes = temp_prover.generate_proof();
+        let new_digest = temp_prover.digest().ok_or_else(|| {
+            ValidationError::StateOperationFailed(
+                "temp prover has no root after mining operations".to_string(),
+            )
+        })?;
 
         let ad_digest = bytes_to_ad_digest(&new_digest);
         Ok((proof_bytes.to_vec(), ad_digest))
