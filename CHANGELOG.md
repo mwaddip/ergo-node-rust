@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- **Sweep timer: decouple validation sweep from download progress.**
+  `advance_state_applied_height` was only called from
+  `advance_downloaded_height`, which gates on the downloaded watermark
+  advancing. When downloads stalled (fork dead-end, peer disconnect,
+  network disruption), the sweep simply stopped — blocks already on disk
+  sat unvalidated, and the backoff escalated toward 300s between
+  single-block retries. Fixed by adding a 10-second sweep ticker in
+  `sync_from_peer()` that calls `advance_state_applied_height` directly.
+  The sweep's existing backoff gate still prevents tight-looping on
+  deterministic failures; the timer just ensures the function gets a
+  chance to run regardless of download activity.
+
 ## v0.7.4 — 2026-06-25
 
 Fix per-block state-root mismatch when mining-serve is enabled at tip

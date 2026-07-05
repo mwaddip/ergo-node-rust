@@ -798,6 +798,11 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         // One progress-triggered send per 20s cycle — gives the two-batch
         // pattern (one scheduled + one progress) matching JVM behavior.
         let mut progress_send_used = false;
+        // Sweep timer: retry validation periodically even when downloads stall.
+        // The sweep's internal backoff gate (sweep_backoff.should_defer) prevents
+        // tight-looping on deterministic failures — this just ensures the sweep
+        // gets a chance to run at regular intervals regardless of download activity.
+        let mut sweep_ticker = tokio::time::interval(Duration::from_secs(10));
 
         loop {
             let until_next = self.config.sync_interval
@@ -885,6 +890,14 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     if self.last_progress.elapsed() > self.config.stall_timeout {
                         return SyncOutcome::Stalled;
                     }
+                }
+
+                // Sweep timer: retry validation periodically even when downloads stall.
+                // The sweep's internal backoff gate (sweep_backoff.should_defer) prevents
+                // tight-looping on deterministic failures — this just ensures the sweep
+                // gets a chance to run at regular intervals regardless of download activity.
+                _ = sweep_ticker.tick() => {
+                    self.advance_state_applied_height().await;
                 }
             }
         }
