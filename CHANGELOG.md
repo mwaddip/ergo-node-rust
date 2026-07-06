@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.7.5 — 2026-07-06
 
 - **Proof-digest consensus check in UtxoValidator.** The JVM checks
   `blake2b256(internalProof) == header.ad_proofs_root` after applying
