@@ -338,23 +338,54 @@ impl UtxoValidator {
             None
         };
 
-        // 7. Persist state changes atomically with block_height, then
-        //    generate the AD proof. generate_proof() also flushes the prover's
-        //    tree-local state (resets visited/new flags, directions, and
-        //    old_top_node) for the next block — that side effect is why the
-        //    call is kept even when the proof is dropped. The proof returned
-        //    here is the same one a digest-mode peer would verify: it covers
-        //    exactly this block's operations and replays cleanly from the
-        //    H-1 state root (confirmed by tests/adproof_dump_ordering_diag.rs,
-        //    which proves it survives the storage-side tree.reset()). Steady-
-        //    state serving is Phase 6; here it can optionally be dumped at
-        //    configured heights for ADProof regeneration (set_adproof_dump).
+        // 7. Generate the AD proof BEFORE persisting to storage.
+        //    generate_proof() calls complete_batch() which produces the proof
+        //    using the CURRENT visited flags set during perform_one_operation.
+        //    If generate_proof runs after update_with_height, tree.reset()
+        //    (inside update_with_height) clears those flags — for blocks with
+        //    Lookups the proof then collapses to a single root label instead
+        //    of the full tree structure (SANTA: proof-digest mismatch).
+        //    generate_proof() also flushes the prover's tree-local state
+        //    (resets visited/new flags, directions, and old_top_node) for the
+        //    next block.
+        let proof = self.prover.generate_proof();
+
+        // 8. Persist state changes atomically with block_height.
+        //    update_with_height's tree.reset() is still needed to prevent
+        //    stale flags from accumulating across blocks — but by this point
+        //    the proof is already captured.
         self.storage
             .update_with_height(&mut self.prover, vec![], header.height)
             .map_err(|e| ValidationError::StateOperationFailed(
                 format!("persist failed: {e}"),
             ))?;
-        let proof = self.prover.generate_proof();
+
+        // TEMP: 28474 Lookup divergence investigation — remove after SANTA resolves
+        if header.height == 28474 {
+            let internal_digest: [u8; 32] = blake2b256_hash(proof.as_ref()).0;
+            let expected_digest: [u8; 32] = header.ad_proofs_root.into();
+            tracing::info!(
+                height = 28474,
+                proof_digest = %hex::encode(internal_digest),
+                ad_proofs_root = %hex::encode(expected_digest),
+                proof_bytes_hex = %hex::encode(proof.as_ref()),
+                "28474 diagnostics"
+            );
+            for (i, op) in operations.iter().enumerate() {
+                match op {
+                    Operation::Lookup(key) => {
+                        tracing::info!(height=28474, op_index=i, op_kind="Lookup", box_id=%hex::encode(key.as_ref()));
+                    }
+                    Operation::Remove(key) => {
+                        tracing::info!(height=28474, op_index=i, op_kind="Remove", box_id=%hex::encode(key.as_ref()));
+                    }
+                    Operation::Insert(kv) => {
+                        tracing::info!(height=28474, op_index=i, op_kind="Insert", box_id=%hex::encode(kv.key.as_ref()));
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         // Consensus: the JVM checks that internally-generated proof bytes hash
         // to the header's declared ad_proofs_root, even for proofless blocks.
@@ -392,7 +423,7 @@ impl UtxoValidator {
             }
         }
 
-        // 8. Track emission box: scan new outputs for emission contract
+        // 9. Track emission box: scan new outputs for emission contract
         if !self.emission_tree_bytes.is_empty() {
             self.emission_box_id = None;
             for (box_id, box_bytes) in &changes.insertions {
@@ -408,7 +439,7 @@ impl UtxoValidator {
             }
         }
 
-        // 9. Advance state
+        // 10. Advance state
         self.current_digest = header.state_root;
         self.validated_height = header.height;
 
