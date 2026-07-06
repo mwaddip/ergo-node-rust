@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **Proof-digest consensus check in UtxoValidator.** The JVM checks
+  `blake2b256(internalProof) == header.ad_proofs_root` after applying
+  block transactions. ergo-node-rust was skipping this entirely, which
+  caused a live testnet consensus fork at height 431,367 (Rust-mined
+  block accepted by Rust nodes, rejected by JVM reference). Two related
+  fixes were needed to make the check work:
+  - **Genesis bootstrap**: call `generate_proof()` after populating the
+    genesis UTXO set so the prover batch is committed before block 1.
+  - **Proof ordering**: move `generate_proof()` before
+    `update_with_height` so visited flags set during operations are
+    preserved during proof generation. Previously `update_internal`'s
+    `tree.reset()` cleared them, collapsing Lookup-block proofs to a
+    single root label.
+  Both divergences isolated by SANTA; the sigma-rust prover itself is
+  byte-identical to the JVM. The proof-digest check now passes for all
+  JVM-mined blocks and correctly rejects Rust-mined blocks with
+  non-canonical proof serialization.
+
 - **Sweep timer: decouple validation sweep from download progress.**
   `advance_state_applied_height` was only called from
   `advance_downloaded_height`, which gates on the downloaded watermark
