@@ -10,7 +10,7 @@ use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
 use ergo_avltree_rust::batch_node::AVLTree;
 use ergo_avltree_rust::operation::{KeyValue, Operation};
 use ergo_avltree_rust::versioned_avl_storage::VersionedAVLStorage;
-use ergo_chain_types::{ADDigest, Header};
+use ergo_chain_types::{blake2b256_hash, ADDigest, Header};
 use ergo_lib::chain::parameters::Parameters;
 
 use crate::sections::{parse_block_transactions, parse_extension};
@@ -355,6 +355,21 @@ impl UtxoValidator {
                 format!("persist failed: {e}"),
             ))?;
         let proof = self.prover.generate_proof();
+
+        // Consensus: the JVM checks that internally-generated proof bytes hash
+        // to the header's declared ad_proofs_root, even for proofless blocks.
+        // Without this, a Rust-mined block whose AVL proof serialization differs
+        // from the JVM's gets accepted by Rust nodes but rejected by the JVM
+        // reference node (live testnet fork at height 431,367).
+        let internal_proof_digest = blake2b256_hash(proof.as_ref()).0;
+        let expected_proof_digest: [u8; 32] = header.ad_proofs_root.into();
+        if internal_proof_digest != expected_proof_digest {
+            return Err(ValidationError::ProofDigestMismatch {
+                expected: expected_proof_digest,
+                got: internal_proof_digest,
+            });
+        }
+
         if let Some(dir) = &self.adproof_dump_dir {
             if self.adproof_dump_heights.contains(&header.height) {
                 // Raw type-104 section: [header_id:32][proof_size:VLQ][proof].
