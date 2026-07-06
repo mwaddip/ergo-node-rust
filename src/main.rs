@@ -2043,6 +2043,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .update_with_height(&mut prover, vec![], 0)
                     .expect("genesis state update failed");
 
+                // Commit the genesis batch — without this, the prover's internal
+                // batch state (old_top_node, directions) bleeds into block 1, so
+                // the proof generated at height 1 covers the genesis bootstrap
+                // inserts plus block 1's operations starting from an empty tree
+                // instead of just block 1's ops from the 3-box genesis tree.
+                // The resulting blake2b256(proof) != header.ad_proofs_root for
+                // block 1, triggering a false ProofDigestMismatch.
+                prover.generate_proof();
+
                 let actual = prover.digest().expect("prover has no root after genesis");
                 let expected: [u8; 33] = genesis_digest.into();
                 assert_eq!(
