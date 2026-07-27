@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.7.6 — 2026-07-27
+
+- **Fix AVL tree node persistence bug (double `tree.reset()`).**
+  `BatchAVLProver::generate_proof()` called `tree.reset()` which cleared
+  `is_new`/`visited` flags before `VersionedAVLStorage::update()` could
+  use them to persist changed nodes. Internal nodes created during AVL
+  rebalancing were silently dropped from storage. The next block that
+  traversed a path through those missing nodes hit a resolver miss →
+  `LabelOnly` placeholder → panic "Should never reach this point."
+  Fixed upstream in ergo_avltree_rust (rev `2fc88d83`→`3dc6a06`):
+  `tree.reset()` now lives only in `update()`, which calls it AFTER
+  collecting changed nodes. `generate_proof()` no longer resets flags it
+  doesn't own. State built under prior versions has missing nodes
+  permanently — nuke `state.redb` and resync after upgrading.
+
 ## v0.7.5 — 2026-07-06
 
 - **Proof-digest consensus check in UtxoValidator.** The JVM checks

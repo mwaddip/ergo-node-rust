@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "ergo-node-rust"
-version = "0.7.4"
+version = "0.7.6"
 dependencies = [
  "anyhow",
  "bytes",
@@ -933,7 +933,7 @@ dependencies = [
 [[package]]
 name = "ergo_avltree_rust"
 version = "0.1.1"
-source = "git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=2fc88d83#2fc88d8356fb6dbd453277c54cbaea07eef0d667"
+source = "git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=3dc6a06#3dc6a06444ebfda1df7a0c30f6d546db7be29ac9"
 dependencies = [
  "anyhow",
  "base16",
