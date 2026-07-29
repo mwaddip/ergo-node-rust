@@ -503,6 +503,18 @@ impl RedbAVLStorage {
         let mut write_txn = self.db.begin_write()?;
         write_txn.set_quick_repair(true);
         write_txn.set_durability(Durability::Immediate)?;
+        // Write a sentinel key so the fsync has real pages to flush.
+        // An empty commit with shadow-paging may not dirty any pages,
+        // leaving prior Durability::None commits unreachable by a
+        // new Database handle opened against the same file.
+        {
+            let mut meta = write_txn.open_table(META_TABLE)?;
+            let val = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            meta.insert(META_FLUSH_SENTINEL, val.to_be_bytes().as_slice())?;
+        }
         write_txn.commit().context("flush commit failed")?;
         Ok(())
     }

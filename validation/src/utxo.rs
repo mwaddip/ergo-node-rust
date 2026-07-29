@@ -395,6 +395,12 @@ impl UtxoValidator {
         let internal_proof_digest = blake2b256_hash(proof.as_ref()).0;
         let expected_proof_digest: [u8; 32] = header.ad_proofs_root.into();
         if internal_proof_digest != expected_proof_digest {
+            tracing::error!(
+                height = header.height,
+                expected = %hex::encode(expected_proof_digest),
+                got = %hex::encode(internal_proof_digest),
+                "proof-digest mismatch"
+            );
             return Err(ValidationError::ProofDigestMismatch {
                 expected: expected_proof_digest,
                 got: internal_proof_digest,

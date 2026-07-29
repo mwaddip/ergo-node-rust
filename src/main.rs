@@ -1168,6 +1168,12 @@ async fn at_tip_storage_reopen(
     prover.base.tree.height = tree_height;
     // load-bearing — see memory/feedback_avl_prover_flush_reset.md
     prover.base.tree.reset();
+    // Sync old_top_node to the restored root. After manually installing the
+    // root from storage, old_top_node still points to the dummy leaf from
+    // BatchAVLProver::new(). generate_proof() updates it as a side effect
+    // (batch_avl_prover.rs line 224). Discard the proof — it is a minimal
+    // root-label proof on a fresh tree with no operations.
+    let _ = prover.generate_proof();
 
     let mining_ctx = mining_generator.as_ref().map(|g| MiningCtx {
         config: g.config.clone(),
@@ -1919,6 +1925,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Clear it so the first flush after restart doesn't treat the
                 // entire tree as "newly inserted".
                 prover.base.tree.reset();
+                // Sync old_top_node — same issue as at-tip handler.
+                let _ = prover.generate_proof();
 
                 let prover_digest = prover.digest().expect("prover has no root");
                 let prover_digest_arr: [u8; 33] = prover_digest.as_ref().try_into()

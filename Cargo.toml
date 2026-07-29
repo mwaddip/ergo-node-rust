@@ -4,7 +4,7 @@ exclude = ["addons/fastsync", "addons/indexer"]
 
 [package]
 name = "ergo-node-rust"
-version = "0.7.6"
+version = "0.7.7"
 edition = "2021"
 license = "MIT"
 description = "Full Ergo blockchain node in Rust"
@@ -75,4 +75,4 @@ secp256k1 = "0.29"
 # rev: bump HERE (members declare the plain "0.1.1"). Coordinate rev with the
 # sigma-rust session (fork main / PR #16).
 [patch.crates-io]
-ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "3dc6a06" }
+ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "042c830" }

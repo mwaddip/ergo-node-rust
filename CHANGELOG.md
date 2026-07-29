@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.7.7 — 2026-07-29
+
+- **Fix proof-digest mismatch after at-tip storage reopen.**
+  `RedbAVLStorage::flush()` used an empty write transaction to fsync.
+  With redb's shadow-paging, an empty commit dirties no pages, so the
+  fsync was a no-op — prior `Durability::None` commits stayed in the
+  OS page cache and were invisible to the new `Database` handle opened
+  during the at-tip reopen. The resolver loaded stale tree data,
+  producing a wrong proof digest. Fixed by writing a sentinel key in
+  `flush()` to force actual page writes through the fsync.
+
+- **Sync `old_top_node` after manual rollback in at-tip handler and
+  main resume path.** Both paths bypass `PersistentBatchAVLProver` and
+  manually install the tree root from storage. `old_top_node` was left
+  pointing to the dummy leaf from `BatchAVLProver::new()`, producing a
+  stale-tree proof on the first post-resume block. Fixed by calling
+  `generate_proof()` after `tree.reset()` to sync the snapshot.
+
+- **Bump ergo_avltree_rust pin to `042c830`.** Includes two fixes:
+  `tree.reset()` removed from `generate_proof()` (deferred to first
+  `perform_one_operation` via `needs_cycle_reset`), and `old_top_node`
+  synced after `PersistentBatchAVLProver::rollback()`.
+
+- **Debug logging for proof-digest mismatches.** The validator now logs
+  both expected and actual proof-digest hex values at ERROR level when
+  a mismatch occurs, instead of just "AD proofs digest mismatch".
+
 ## v0.7.6 — 2026-07-27
 
 - **Fix AVL tree node persistence bug (double `tree.reset()`).**

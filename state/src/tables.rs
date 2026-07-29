@@ -10,3 +10,4 @@ pub const META_CURRENT_VERSION: &str = "current_version";
 pub const META_LSN: &str = "lsn";
 pub const META_VERSIONS: &str = "versions";
 pub const META_BLOCK_HEIGHT: &str = "block_height";
+pub const META_FLUSH_SENTINEL: &str = "flush_sentinel";
