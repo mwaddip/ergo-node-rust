@@ -339,6 +339,9 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     at_tip_request_tx: Option<tokio::sync::oneshot::Sender<u32>>,
     /// At-tip transition: oneshot to receive the rebuilt validator.
     at_tip_validator_rx: Option<tokio::sync::oneshot::Receiver<V>>,
+    /// At-tip transition: cache size to apply via resize_cache() on the
+    /// existing storage handle (no reopen, no second mmap).
+    synced_cache_bytes: Option<usize>,
     /// Exponential backoff gating the validation sweep when the applied
     /// tip fails to advance — a deterministic block failure (apply_state
     /// error OR a deferred-eval rollback; both leave `validated_height()`
@@ -416,9 +419,20 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             last_flush_height,
             at_tip_request_tx: None,
             at_tip_validator_rx: None,
+            synced_cache_bytes: None,
             sweep_backoff: crate::sweep_backoff::SweepBackoff::default(),
             shutdown_rx,
         }
+    }
+
+    /// Configure the at-tip transition. When `synced()` is first entered,
+    /// `resize_cache()` is called on the validator with `synced_cache_bytes`
+    /// to shrink the read cache without reopening the database.
+    pub fn set_at_tip_cache(
+        &mut self,
+        synced_cache_bytes: usize,
+    ) {
+        self.synced_cache_bytes = Some(synced_cache_bytes);
     }
 
     /// Configure the at-tip transition channels. When `synced()` is first
@@ -426,6 +440,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     /// handle), its height is sent on `request_tx`, and the new validator
     /// is awaited on `validator_rx`. The integrator handles the actual
     /// storage reopen + validator rebuild on the other end of the pair.
+    /// Deprecated: prefer [`set_at_tip_cache`] which resizes in-place.
     pub fn set_at_tip_channels(
         &mut self,
         request_tx: tokio::sync::oneshot::Sender<u32>,
@@ -1772,6 +1787,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         // (or was never wired in the first place).
         let nothing_left = self.at_tip_request_tx.is_none()
             && self.at_tip_validator_rx.is_none()
+            && self.synced_cache_bytes.is_none()
             && self.config.synced_flush_heap_threshold_mb.is_none()
             && self.config.synced_flush_max_blocks.is_none()
             && self.config.synced_flush_min_blocks.is_none();
@@ -1817,7 +1833,25 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             self.config.flush_min_blocks = v;
         }
 
-        // ── Storage reopen handshake ──
+        // ── In-place cache resize (no reopen, no second mmap) ──
+        if let Some(cache_bytes) = self.synced_cache_bytes.take() {
+            if let Some(ref validator) = self.validator {
+                if let Err(e) = validator.resize_cache(cache_bytes) {
+                    tracing::error!(
+                        cache_bytes,
+                        error = ?e,
+                        "at-tip: resize_cache failed; continuing with cold-sync cache size"
+                    );
+                } else {
+                    tracing::info!(
+                        cache_bytes,
+                        "at-tip: cache resized in-place on existing storage handle"
+                    );
+                }
+            }
+        }
+
+        // ── Storage reopen handshake (legacy, kept for digest-mode) ──
         if let (Some(req_tx), Some(val_rx)) =
             (self.at_tip_request_tx.take(), self.at_tip_validator_rx.take())
         {

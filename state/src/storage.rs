@@ -232,6 +232,13 @@ impl RedbAVLStorage {
         self.keep_versions = keep_versions;
     }
 
+    /// Resize the read cache at runtime without reopening the database.
+    /// Evicts excess cached pages immediately if the new limit is smaller.
+    pub fn resize_cache(&self, cache_bytes: usize) {
+        self.db.set_read_cache_limit(cache_bytes);
+        self.db.clear_read_cache();
+    }
+
     /// Create a read-only snapshot reader that shares the database handle.
     /// Call this BEFORE handing the storage to PersistentBatchAVLProver.
     pub fn snapshot_reader(&self) -> SnapshotReader {

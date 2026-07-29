@@ -2,30 +2,29 @@
 
 ## v0.7.7 — 2026-07-29
 
-- **Fix proof-digest mismatch after at-tip storage reopen.**
-  `RedbAVLStorage::flush()` used an empty write transaction to fsync.
-  With redb's shadow-paging, an empty commit dirties no pages, so the
-  fsync was a no-op — prior `Durability::None` commits stayed in the
-  OS page cache and were invisible to the new `Database` handle opened
-  during the at-tip reopen. The resolver loaded stale tree data,
-  producing a wrong proof digest. Fixed by writing a sentinel key in
-  `flush()` to force actual page writes through the fsync.
+- **Proof-digest mismatch after at-tip cache resize — fixed by patching redb
+  for in-place cache resizing.** The at-tip handler (`synced_cache_mb`) opened
+  a second `Database` handle to resize the read cache. Two mmap'd handles to
+  the same file had incoherent page caches, producing non-deterministic proof
+  digests. Fixed by patching redb: `max_read_cache_bytes`→`AtomicUsize`,
+  public `set_read_cache_limit()`+`clear_read_cache()` on `Database`, and a
+  new `resize_cache()` method on `RedbAVLStorage`. The sync layer now calls
+  `resize_cache()` on the existing handle at tip — no second mmap, no
+  coherency bug.
 
-- **Sync `old_top_node` after manual rollback in at-tip handler and
-  main resume path.** Both paths bypass `PersistentBatchAVLProver` and
-  manually install the tree root from storage. `old_top_node` was left
-  pointing to the dummy leaf from `BatchAVLProver::new()`, producing a
-  stale-tree proof on the first post-resume block. Fixed by calling
-  `generate_proof()` after `tree.reset()` to sync the snapshot.
+- **Flush sentinel forces actual page writes.** `RedbAVLStorage::flush()` used
+  an empty write transaction with `Durability::Immediate`. With redb's
+  shadow-paging, an empty commit dirties no pages — the fsync was a no-op,
+  leaving prior `Durability::None` commits invisible to a subsequent `Database`
+  handle. Fixed by writing a `flush_sentinel` key to force a real page write
+  through the fsync.
 
-- **Bump ergo_avltree_rust pin to `042c830`.** Includes two fixes:
-  `tree.reset()` removed from `generate_proof()` (deferred to first
-  `perform_one_operation` via `needs_cycle_reset`), and `old_top_node`
-  synced after `PersistentBatchAVLProver::rollback()`.
+- **Bump ergo_avltree_rust pin to `042c830`.** Removes `tree.reset()` from
+  `generate_proof()` (deferred to first `perform_one_operation` via
+  `needs_cycle_reset`) and syncs `old_top_node` after `PersistentBatchAVLProver::rollback()`.
 
-- **Debug logging for proof-digest mismatches.** The validator now logs
-  both expected and actual proof-digest hex values at ERROR level when
-  a mismatch occurs, instead of just "AD proofs digest mismatch".
+- **Debug hex logging for proof-digest mismatches.** The validator now logs
+  expected vs. got hex values at ERROR level on mismatch.
 
 ## v0.7.6 — 2026-07-27
 

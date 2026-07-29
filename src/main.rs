@@ -1080,169 +1080,7 @@ fn conv_snapshot_map(
 }
 
 /// At-tip storage reopen handler. Awaits a one-shot from sync's `synced()`
-/// entry, reopens `state.redb` with a smaller cache, rebuilds the validator
-/// from the resume pattern, swaps the shared SnapshotReader, and hands the
-/// new validator back. Runs at most once per process. On failure, the
-/// validator never returns; sync stalls and the operator restarts (cold-sync
-/// path opens with `cache_mb` and re-attempts the at-tip transition once
-/// tip is reached again).
-#[allow(clippy::too_many_arguments)]
-async fn at_tip_storage_reopen(
-    req_rx: tokio::sync::oneshot::Receiver<u32>,
-    val_tx: tokio::sync::oneshot::Sender<Validator>,
-    state_path: std::path::PathBuf,
-    synced_cache_mb: u64,
-    swap_reader: Arc<ergo_node_rust::SwappableReader>,
-    chain: Arc<Mutex<HeaderChain>>,
-    mining_proof_cache: MiningProofCache,
-    mining_generator: Option<Arc<ergo_mining::CandidateGenerator>>,
-    shared_validated_height: Arc<std::sync::atomic::AtomicU32>,
-    shared_state_context: Arc<tokio::sync::RwLock<Option<ergo_validation::ErgoStateContext>>>,
-    block_applied_tx: tokio::sync::mpsc::Sender<Vec<ergo_validation::Transaction>>,
-    height_watch_tx: tokio::sync::watch::Sender<u32>,
-    checkpoint: u32,
-) {
-    let height = match req_rx.await {
-        Ok(h) => h,
-        Err(_) => {
-            tracing::warn!("at-tip handler: request channel closed before signal");
-            return;
-        }
-    };
-    tracing::info!(height, synced_cache_mb, "at-tip handler: received resume signal");
 
-    // Drop the wrapper's hold on the old SnapshotReader. After this the
-    // remaining Arc<Database> refs are: in-flight `current()` callers
-    // (transient, microseconds) and an in-flight snapshot dump if one is
-    // running (rare, but can run for tens of seconds). The retry loop in
-    // `open_state_with_retry` covers both.
-    drop(swap_reader.take());
-
-    let mut storage = match open_state_with_retry(&state_path, synced_cache_mb, 30).await {
-        Some(s) => s,
-        None => {
-            tracing::error!(
-                "at-tip handler: state.redb still locked after retries; giving up. Sync will stall — restart the process to recover."
-            );
-            return;
-        }
-    };
-
-    let current_version = match storage.version() {
-        Some(v) => v,
-        None => {
-            tracing::error!("at-tip handler: reopened state has no version (unexpected); aborting");
-            return;
-        }
-    };
-
-    // Recompute active parameters at the resume height BEFORE building the
-    // prover. BatchAVLProver internally holds Rc<RefCell<Node>> (not Send);
-    // any .await between prover creation and Validator wrapping (which has
-    // an unsafe Send impl) breaks the spawned future's Send bound.
-    {
-        let mut chain_guard = chain.lock().await;
-        if let Err(e) = chain_guard.recompute_active_parameters_from_storage(height) {
-            tracing::warn!(error = %e, "at-tip handler: recompute_active_parameters failed");
-        }
-    }
-
-    // From here on out: NO .await until val_tx.send(). Synchronous block.
-    // Resume pattern (mirrors the UTXO resume branch in main()). Install
-    // the new SnapshotReader into the swap wrapper before constructing the
-    // prover so concurrent mempool/API/dump-trigger reads land on the new DB.
-    let new_sr = storage.snapshot_reader();
-    swap_reader.install(new_sr.clone());
-
-    let resolver = storage.resolver();
-    let tree = AVLTree::with_resolver(resolver, 32, None);
-    let mut prover = BatchAVLProver::new(tree, true);
-    let (root, tree_height) = match storage.rollback(&current_version) {
-        Ok(rh) => rh,
-        Err(e) => {
-            tracing::error!(error = %e, "at-tip handler: rollback to current version failed");
-            return;
-        }
-    };
-    prover.base.tree.root = Some(root);
-    prover.base.tree.height = tree_height;
-    // load-bearing — see memory/feedback_avl_prover_flush_reset.md
-    prover.base.tree.reset();
-    // Sync old_top_node to the restored root. After manually installing the
-    // root from storage, old_top_node still points to the dummy leaf from
-    // BatchAVLProver::new(). generate_proof() updates it as a side effect
-    // (batch_avl_prover.rs line 224). Discard the proof — it is a minimal
-    // root-label proof on a fresh tree with no operations.
-    let _ = prover.generate_proof();
-
-    let mining_ctx = mining_generator.as_ref().map(|g| MiningCtx {
-        config: g.config.clone(),
-        proof_cache: mining_proof_cache,
-        snapshot_reader: Arc::new(new_sr),
-        generator: g.clone(),
-    });
-
-    let validator = Validator::new(
-        ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint)),
-        shared_validated_height,
-        shared_state_context,
-        block_applied_tx,
-        height_watch_tx,
-        mining_ctx,
-    );
-
-    if val_tx.send(validator).is_err() {
-        tracing::error!("at-tip handler: validator send failed (sync dropped val_rx)");
-        return;
-    }
-    tracing::info!(
-        height,
-        synced_cache_mb,
-        "at-tip handler: validator rebuilt and handed back to sync"
-    );
-}
-
-/// Try to open `state.redb` with the given cache size, retrying briefly on
-/// file-lock errors so an in-flight snapshot dump (or any other transient
-/// holder of the old `Arc<Database>`) has time to release.
-async fn open_state_with_retry(
-    path: &std::path::Path,
-    cache_mb: u64,
-    max_attempts: u32,
-) -> Option<RedbAVLStorage> {
-    for attempt in 1..=max_attempts {
-        let params = AVLTreeParams { key_length: 32, value_length: None };
-        let cache = CacheSize::Bytes(cache_mb as usize * 1024 * 1024);
-        match RedbAVLStorage::open(path, params, 256, cache) {
-            Ok(s) => {
-                if attempt > 1 {
-                    tracing::info!(attempt, "at-tip handler: state.redb opened after retry");
-                }
-                return Some(s);
-            }
-            Err(e) => {
-                tracing::debug!(
-                    attempt,
-                    max_attempts,
-                    error = %e,
-                    "at-tip handler: state.redb open failed; will retry"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
-        }
-    }
-    None
-}
-
-/// Locate the config path, in this order:
-///   1. First non-flag positional arg (skips argv[0] and any `--foo` flags).
-///   2. `./ergo.toml` (current working directory).
-///   3. `$XDG_CONFIG_HOME/ergo-node/ergo.toml` or `$HOME/.config/ergo-node/ergo.toml`.
-///   4. `/etc/ergo-node/ergo.toml` (system-wide, .deb install).
-///
-/// Returns `None` if no path was supplied and nothing exists in any of the
-/// search locations. The caller decides what to do with `None` — the daemon
-/// path cold-bootstraps a default; maintenance subcommands fail clearly.
 fn locate_config(args: &[String]) -> Option<String> {
     if let Some(p) = args.iter().skip(1).find(|a| !a.starts_with("--")).cloned() {
         return Some(p);
@@ -1925,8 +1763,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Clear it so the first flush after restart doesn't treat the
                 // entire tree as "newly inserted".
                 prover.base.tree.reset();
-                // Sync old_top_node — same issue as at-tip handler.
-                let _ = prover.generate_proof();
 
                 let prover_digest = prover.digest().expect("prover has no root");
                 let prover_digest_arr: [u8; 33] = prover_digest.as_ref().try_into()
@@ -2346,54 +2182,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_rx,
     );
 
-    // At-tip storage reopen wiring. When `synced_cache_mb` is configured
-    // and we're in UTXO mode, hand HeaderSync a pair of oneshots and spawn
-    // the handler task. On first synced() entry sync drops its validator
-    // and signals us with the resume height; we reopen state.redb with the
-    // smaller cache, rebuild the validator (resume pattern), swap the
-    // shared SnapshotReader, and send the new validator back.
-    //
-    // The handler runs at most once per process. If anything fails, the
-    // validator never returns and sync stalls; restart re-runs the cold
-    // path. See `prompts/main-at-tip-storage-reopen.md` for the design.
+    // At-tip cache resize. When `synced_cache_mb` is configured, the sync
+    // layer calls resize_cache() on the existing storage handle at first
+    // synced() entry — no second Database handle, no mmap coherency bug.
     if state_type == StateType::Utxo {
         if let Some(synced_cache_mb) = node_config.synced_cache_mb {
-            let (at_tip_req_tx, at_tip_req_rx) = tokio::sync::oneshot::channel::<u32>();
-            let (at_tip_val_tx, at_tip_val_rx) = tokio::sync::oneshot::channel::<Validator>();
-            sync.set_at_tip_channels(at_tip_req_tx, at_tip_val_rx);
-
-            let handler_state_path = data_dir.join("state.redb");
-            let handler_swap = swap_reader.clone();
-            let handler_chain = chain.clone();
-            let handler_proof_cache = mining_proof_cache.clone();
-            let handler_generator = mining_generator.clone();
-            let handler_validated = shared_validated_height.clone();
-            let handler_state_ctx = shared_state_context.clone();
-            let handler_block_applied = block_applied_tx.clone();
-            let handler_height_watch = height_watch_tx.clone();
-            let handler_checkpoint = configured_checkpoint.unwrap_or(0);
-
-            tokio::spawn(async move {
-                at_tip_storage_reopen(
-                    at_tip_req_rx,
-                    at_tip_val_tx,
-                    handler_state_path,
-                    synced_cache_mb,
-                    handler_swap,
-                    handler_chain,
-                    handler_proof_cache,
-                    handler_generator,
-                    handler_validated,
-                    handler_state_ctx,
-                    handler_block_applied,
-                    handler_height_watch,
-                    handler_checkpoint,
-                )
-                .await;
-            });
+            let cache_bytes = synced_cache_mb as usize * 1024 * 1024;
+            sync.set_at_tip_cache(cache_bytes);
             tracing::info!(
                 synced_cache_mb,
-                "at-tip storage reopen wired; will fire on first synced() entry"
+                "at-tip cache resize wired; will fire on first synced() entry"
             );
         }
     }

@@ -186,6 +186,11 @@ impl BlockValidator for UtxoValidator {
         })
     }
 
+    fn resize_cache(&self, cache_bytes: usize) -> Result<(), ValidationError> {
+        self.storage.resize_cache(cache_bytes);
+        Ok(())
+    }
+
     fn proofs_for_transactions(
         &self,
         txs: &[ergo_lib::chain::transaction::Transaction],

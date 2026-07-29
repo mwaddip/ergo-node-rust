@@ -124,6 +124,12 @@ pub trait BlockValidator {
         Ok(())
     }
 
+    /// Resize the storage read cache at runtime (e.g. after initial sync).
+    /// Digest-mode validators may make this a no-op.
+    fn resize_cache(&self, _cache_bytes: usize) -> Result<(), ValidationError> {
+        Ok(())
+    }
+
     /// Compute AD proofs and new state root for a set of transactions
     /// without modifying persistent state. Returns None for digest-mode
     /// validators (mining requires UTXO mode).

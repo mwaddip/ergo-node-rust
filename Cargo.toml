@@ -76,3 +76,4 @@ secp256k1 = "0.29"
 # sigma-rust session (fork main / PR #16).
 [patch.crates-io]
 ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "042c830" }
+redb = { path = "patches/redb" }
