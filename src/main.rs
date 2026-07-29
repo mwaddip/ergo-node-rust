@@ -1745,24 +1745,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // prover and resolve the block height from state's own metadata.
                 let sr = storage.snapshot_reader();
                 swap_reader.install(sr.clone());
-                let resolver = storage.resolver();
-                let tree = AVLTree::with_resolver(resolver, 32, None);
-                let mut prover = BatchAVLProver::new(tree, true);
 
-                // Install the current version's root into the prover's
-                // in-memory tree. `rollback` to the CURRENT version is a
-                // cheap short-circuit in RedbAVLStorage — same pattern as
-                // PersistentBatchAVLProver::new used before.
+                // Load the persisted root BEFORE constructing the prover.
+                // BatchAVLProver::new snapshots tree.root into old_top_node
+                // (line 74). If the tree is empty at construction time, the
+                // sentinel infinity-leaf is snapshotted instead, and the first
+                // resumed block produces a proof against an empty-tree baseline
+                // → ProofDigestMismatch. Installing the real root first skips
+                // the constructor's is_none() branch and snapshots the correct
+                // root. Same fix as PersistentBatchAVLProver::rollback() line 66
+                // in avltree 042c830.
                 let (root, tree_height) = storage
                     .rollback(&current_version)
                     .expect("failed to load current version root from storage");
-                prover.base.tree.root = Some(root);
-                prover.base.tree.height = tree_height;
+
+                let resolver = storage.resolver();
+                let mut tree = AVLTree::with_resolver(resolver, 32, None);
+                tree.root = Some(root);
+                tree.height = tree_height;
 
                 // Freshly-unpacked nodes have is_new=true (NodeHeader::new).
                 // Clear it so the first flush after restart doesn't treat the
                 // entire tree as "newly inserted".
-                prover.base.tree.reset();
+                tree.reset();
+
+                let prover = BatchAVLProver::new(tree, true);
 
                 let prover_digest = prover.digest().expect("prover has no root");
                 let prover_digest_arr: [u8; 33] = prover_digest.as_ref().try_into()
@@ -2269,22 +2276,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // any concurrent reads land on the new DB.
                     snapshot_swap_reader.install(storage.snapshot_reader());
 
-                    // Build prover from the loaded snapshot. rollback() to the
-                    // just-written snapshot version is a short-circuit that
-                    // loads the root node — same shape as the resume branch.
-                    let resolver = storage.resolver();
-                    let tree = AVLTree::with_resolver(resolver, 32, None);
-                    let mut prover = BatchAVLProver::new(tree, true);
+                    // Build prover from the loaded snapshot. Load the root
+                    // BEFORE constructing the prover — same old_top_node
+                    // snapshot issue as the resume branch (see above).
                     let (root, tree_h) = storage
                         .rollback(&version)
                         .expect("failed to load snapshot root from storage");
-                    prover.base.tree.root = Some(root);
-                    prover.base.tree.height = tree_h;
+
+                    let resolver = storage.resolver();
+                    let mut tree = AVLTree::with_resolver(resolver, 32, None);
+                    tree.root = Some(root);
+                    tree.height = tree_h;
 
                     // Freshly-unpacked nodes have is_new=true. Clear it so
                     // the first flush doesn't treat the whole snapshot tree
                     // as "newly inserted" in its undo record.
-                    prover.base.tree.reset();
+                    tree.reset();
+
+                    let prover = BatchAVLProver::new(tree, true);
 
                     let validator = Validator::new(
                         ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint)),

@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.7.8 — 2026-07-29
+
+- **Fix proof-digest mismatch after restart from non-empty UTXO state.**
+  `BatchAVLProver::new` snapshots `tree.root` into `old_top_node`. The resume
+  and snapshot-bootstrap branches constructed the prover around an empty tree
+  (so the constructor installed a sentinel infinity-leaf and snapshotted that),
+  then assigned the persisted root into `tree.root` afterwards. `old_top_node`
+  was never updated, so the first block after resume produced a proof against
+  an empty-tree baseline — permanent `AD proofs digest mismatch`. Fixed by
+  loading the root into the tree BEFORE constructing the prover, so the
+  constructor snapshots the canonical root. Affected every restart from
+  non-empty state (graceful or otherwise). The genesis bootstrap path already
+  had an equivalent fix via `generate_proof()`.
+
 ## v0.7.7 — 2026-07-29
 
 - **Proof-digest mismatch after at-tip cache resize — fixed by patching redb
