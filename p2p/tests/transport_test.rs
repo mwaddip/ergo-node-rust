@@ -64,7 +64,7 @@ fn vlq_read_overflow_returns_error() {
 #[test]
 fn vlq_length_rejects_oversized() {
     let mut buf = Vec::new();
-    vlq::write_vlq(&mut buf, 3_000_000);
+    vlq::write_vlq(&mut buf, 20_000_000);
     let mut cursor = std::io::Cursor::new(buf.as_slice());
     assert!(vlq::read_vlq_length(&mut cursor).is_err());
 }

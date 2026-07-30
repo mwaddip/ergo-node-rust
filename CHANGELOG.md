@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.7.9 — 2026-07-30
+
+- **Bump P2P frame cap to match JVM v6.0.4 `MaxMessageSize`.** The frame layer's
+  `MAX_BODY_SIZE` was 2 MiB. v6.0.4 sets `MaxMessageSize = 16,388,608` at the
+  serializer level. Both `MAX_BODY_SIZE` (frame) and `MAX_VLQ_LENGTH`
+  (per-modifier data lengths) now match the JVM's cap.
+
+- **Fix proof-digest mismatch after restart — `is_new` leak and stale
+  `old_top_node`.** Root-caused by two mechanisms in the avltree fork:
+  (1) nodes unpacked from storage were born `is_new = true`, so the prover's
+  `update()` mutated the `Rc`-shared pre-block tree in-place instead of
+  copy-on-write → `pack_tree(old_top_node)` walked a corrupted graph → wrong
+  proof bytes. (2) Recovery (`rollback_prover_to`) installed a fresh root but
+  never rebased `old_top_node` → stale pointer serialized as a single label →
+  identical wrong digest every retry. Fixed by `is_new = false` for persisted
+  nodes (`b1c4374`) + `BatchAVLProver::restore_root` (`2941396`) which
+  atomically installs the root, resets flags, clears change buffers, and
+  rebases the proof-cycle baseline. Four inline restore sites collapsed to
+  one call.
+
+- **Bump ergo_avltree_rust pin to `2941396`.** `is_new = false` for
+  storage-loaded nodes (scrypto PR #117 hardening included transitively).
+
 ## v0.7.8 — 2026-07-29
 
 - **Fix proof-digest mismatch after restart from non-empty UTXO state.**

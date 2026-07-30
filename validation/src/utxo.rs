@@ -163,16 +163,7 @@ impl BlockValidator for UtxoValidator {
                 "rollback to height {height} failed: {e}"
             ))
         })?;
-        self.prover.base.tree.root = Some(root);
-        self.prover.base.tree.height = tree_height;
-
-        // Drop stale dirty-node bookkeeping from the pre-rollback chain —
-        // the freshly-unpacked tree is the ground truth. Without this, the
-        // next flush's undo record would list nodes from the demoted branch
-        // as "inserted", and a subsequent rollback would delete them.
-        self.prover.base.tree.reset();
-        self.prover.base.changed_nodes_buffer.clear();
-        self.prover.base.changed_nodes_buffer_to_check.clear();
+        self.prover.restore_root(root, tree_height);
 
         self.validated_height = height;
         self.current_digest = digest;
@@ -477,12 +468,7 @@ impl UtxoValidator {
 
         match self.storage.rollback(&avl_digest) {
             Ok((root, tree_height)) => {
-                self.prover.base.tree.root = Some(root);
-                self.prover.base.tree.height = tree_height;
-                // Mirrors reset_to — feedback_avl_prover_flush_reset.md.
-                self.prover.base.tree.reset();
-                self.prover.base.changed_nodes_buffer.clear();
-                self.prover.base.changed_nodes_buffer_to_check.clear();
+                self.prover.restore_root(root, tree_height);
             }
             Err(e) => {
                 tracing::error!(

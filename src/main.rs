@@ -1760,16 +1760,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .expect("failed to load current version root from storage");
 
                 let resolver = storage.resolver();
-                let mut tree = AVLTree::with_resolver(resolver, 32, None);
-                tree.root = Some(root);
-                tree.height = tree_height;
-
-                // Freshly-unpacked nodes have is_new=true (NodeHeader::new).
-                // Clear it so the first flush after restart doesn't treat the
-                // entire tree as "newly inserted".
-                tree.reset();
-
-                let prover = BatchAVLProver::new(tree, true);
+                let tree = AVLTree::with_resolver(resolver, 32, None);
+                let mut prover = BatchAVLProver::new(tree, true);
+                prover.restore_root(root, tree_height);
 
                 let prover_digest = prover.digest().expect("prover has no root");
                 let prover_digest_arr: [u8; 33] = prover_digest.as_ref().try_into()
@@ -2276,24 +2269,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // any concurrent reads land on the new DB.
                     snapshot_swap_reader.install(storage.snapshot_reader());
 
-                    // Build prover from the loaded snapshot. Load the root
-                    // BEFORE constructing the prover — same old_top_node
-                    // snapshot issue as the resume branch (see above).
                     let (root, tree_h) = storage
                         .rollback(&version)
                         .expect("failed to load snapshot root from storage");
 
                     let resolver = storage.resolver();
-                    let mut tree = AVLTree::with_resolver(resolver, 32, None);
-                    tree.root = Some(root);
-                    tree.height = tree_h;
-
-                    // Freshly-unpacked nodes have is_new=true. Clear it so
-                    // the first flush doesn't treat the whole snapshot tree
-                    // as "newly inserted" in its undo record.
-                    tree.reset();
-
-                    let prover = BatchAVLProver::new(tree, true);
+                    let tree = AVLTree::with_resolver(resolver, 32, None);
+                    let mut prover = BatchAVLProver::new(tree, true);
+                    prover.restore_root(root, tree_h);
 
                     let validator = Validator::new(
                         ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint)),

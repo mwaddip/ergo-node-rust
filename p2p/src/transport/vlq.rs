@@ -3,7 +3,7 @@
 //! # Contract
 //! - `write_vlq`: encodes any `u64` into 1–10 bytes, 7 data bits per byte, high bit = continuation.
 //! - `read_vlq`: inverse of `write_vlq`. Errors on overflow (>63 useful bits) or unexpected EOF.
-//! - `read_vlq_length`: same as `read_vlq` but rejects values > 256KB (protocol sanity bound).
+//! - `read_vlq_length`: same as `read_vlq` but rejects values > `MAX_VLQ_LENGTH` (matches frame cap).
 //! - `zigzag_encode`/`zigzag_decode`: map signed i32 to unsigned u32 for VLQ encoding.
 
 use std::io::{self, Read};
@@ -55,12 +55,17 @@ pub fn read_vlq<R: Read>(reader: &mut R) -> io::Result<u64> {
     Ok(result)
 }
 
-const MAX_VLQ_LENGTH: u64 = 2 * 1024 * 1024;
+/// VLQ length cap matching the frame-layer `MAX_BODY_SIZE`.
+/// Individual modifier payloads within a `Modifiers` message (e.g. ADProofs)
+/// can reach `ModifiersSpec.maxMsgSizeWithReserve` ≈ 8.4 MB on the JVM side,
+/// so this must be at least that large.
+const MAX_VLQ_LENGTH: u64 = 16_388_608;
 
-/// Read a VLQ value representing a byte length, capped at 2MB.
+/// Read a VLQ value representing a byte length, capped at the frame-layer
+/// maximum (~16.4 MB, matching the JVM's `MessageConstants.MaxMessageSize`).
 ///
 /// # Postcondition
-/// - Returns a `usize` in range `0..=2097152`, or an error if the value exceeds the cap.
+/// - Returns a `usize` in range `0..=MAX_BODY_SIZE`, or an error if the value exceeds the cap.
 pub fn read_vlq_length<R: Read>(reader: &mut R) -> io::Result<usize> {
     let val = read_vlq(reader)?;
     if val > MAX_VLQ_LENGTH {
