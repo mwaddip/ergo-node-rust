@@ -447,6 +447,166 @@ I/O during initial sync.
 un-versioned range. This is safe because reorgs deeper than `keep_versions`
 require re-syncing from scratch anyway.
 
+## Offline Compaction
+
+### Why
+
+Two mechanisms have historically left unreachable rows in `nodes`:
+
+1. **Rollback skip** (`storage.rs`, rollback path). Deleting an undo record's
+   `inserted_labels` is unsafe while those labels may still be referenced by
+   the rolled-back-to tree or by older versions in the chain, so the deletion
+   is skipped. Fires only on reorg or a failed apply.
+2. **Call-order regression** (node v0.7.5–v0.7.9). `generate_proof()` cleared
+   the changed-node buffers before `update_internal` read them via
+   `removed_nodes()`, so the per-block delete list was empty and *every*
+   superseded node leaked. Fixed by restoring `update` → `generate_proof`.
+   Observed: 235 GB at height ~1.66M against a ~4–8 GB live tree.
+
+Both produce the same artefact: rows in `nodes` unreachable from any live
+root. The tree itself stays consistent — this is wasted space, not corruption.
+No consensus impact, and no resync is required for correctness.
+
+Compaction reclaims that space offline.
+
+### Approach: rewrite, not sweep
+
+Compaction is a **rewrite of the reachable tree into a fresh database**, not a
+mark-and-sweep of the existing one.
+
+A sweep would have to mark every node reachable from all `keep_versions + 1`
+retained roots. Those roots share nearly all their nodes, so correctness
+demands a visited set spanning every reachable digest — at mainnet scale
+plausibly hundreds of millions of 32-byte labels, tens of GB of RAM. It is not
+guaranteed to run on operator hardware.
+
+A rewrite walks the single current root. Every live node in an AVL+ tree has
+exactly one parent, so a depth-first traversal visits each node exactly once
+with no visited set at all. Memory is O(tree depth) — around 30 frames.
+
+Because the output database is built fresh containing only live nodes, it is
+minimal by construction. **`redb::Database::compact()` is not used and is not
+required.**
+
+### API
+
+```rust
+impl RedbAVLStorage {
+    /// Rewrite the reachable tree from `source` into `dest`.
+    ///
+    /// Neither opens `source` for write. On any error `dest` is removed and
+    /// `source` is left untouched.
+    ///
+    /// Returns statistics for the caller to report.
+    pub fn compact_to(
+        source: &Path,
+        dest: &Path,
+        progress: Option<&dyn Fn(CompactionProgress)>,
+    ) -> Result<CompactionStats>;
+}
+
+pub struct CompactionStats {
+    pub nodes_written: u64,
+    pub source_bytes: u64,
+    pub dest_bytes: u64,
+    pub block_height: u32,
+    pub digest: ADDigest,
+}
+
+pub struct CompactionProgress {
+    pub nodes_written: u64,
+}
+```
+
+### Preconditions
+
+- No process holds `source` open. redb's file lock enforces this; surface the
+  lock error as "stop the node first", not as a raw redb error.
+- `source` has a `current_version` and a `top_node_hash` — i.e. it is not an
+  empty/uninitialised database. Empty source is an error, not a no-op.
+- `dest` does not already exist.
+
+### Algorithm
+
+1. Open `source` read-only. Read `top_node_hash`, `top_node_height`,
+   `current_version`, `block_height`, `lsn` from `metadata`.
+2. Create `dest`. Depth-first from `top_node_hash`: read the packed bytes for
+   each label from the source `nodes` table, write them to the dest `nodes`
+   table under the same label, recurse into `left_label` / `right_label` for
+   internal nodes. Leaves terminate.
+   - A label present in the tree but missing from source `nodes` is a
+     **fatal** error — the source is genuinely corrupt, not merely bloated.
+     Do not skip it.
+3. Write `metadata`: `top_node_hash`, `top_node_height`, `current_version`,
+   `block_height` and `lsn` carried over verbatim; `versions` set to a single
+   entry `(lsn, current_version)`.
+4. Leave `undo` empty.
+5. Commit with `Durability::Immediate` and `set_quick_repair(true)`.
+6. **Verify before returning** (see below). On failure, delete `dest` and
+   return `Err`.
+
+### Verification (mandatory, in-process)
+
+After committing `dest`, reopen it, load the root, and recompute the AVL
+digest. It must equal `current_version` read from `source`.
+
+This is a cryptographic check, not a heuristic: the digest is the root label
+plus tree height, and a label is a Blake2b256 hash over the node's contents
+including its children's labels. A missing, truncated, or altered node cannot
+produce a matching root digest. A match therefore proves the rewrite preserved
+every reachable node exactly.
+
+`compact_to` MUST NOT return `Ok` without this check passing.
+
+### Postconditions
+
+On `Ok`:
+
+- `source` is byte-identical to before the call.
+- `dest` contains exactly the nodes reachable from the current root.
+- `dest`'s digest equals `source`'s `current_version`.
+- `dest`'s `block_height` equals `source`'s.
+- `dest` has one version in its chain and an empty `undo` table.
+
+On `Err`:
+
+- `source` is byte-identical to before the call.
+- `dest` does not exist.
+
+### What compaction drops
+
+The rollback window. `dest` retains a single version, so rollback is
+impossible until the node has applied `keep_versions` further blocks and
+rebuilt the chain. A reorg deeper than the rebuilt window during that period
+requires a resync.
+
+This is the deliberate trade for O(depth) memory. Retaining the window would
+reintroduce the multi-root visited set that makes sweeping impractical.
+
+### Swap protocol
+
+`compact_to` never touches the live path. Swapping is the caller's decision:
+
+1. Stop the node.
+2. `compact_to("state.redb", "state.redb.compacted")`.
+3. Inspect `CompactionStats` — in particular that `digest` matches the
+   `stateRoot` of the header at `block_height`, which can be cross-checked
+   against the chain independently of this crate.
+4. Move `state.redb` aside (do not delete), rename `state.redb.compacted` into
+   place, start the node, confirm it resumes at `block_height` and applies the
+   next block.
+5. Only then remove the set-aside original.
+
+### Characteristics
+
+- Memory: O(tree depth), independent of database size.
+- I/O: one random read per live node from source, one insert per live node
+  into dest. Random-read bound; dominated by source database size rather than
+  live-set size.
+- Runtime scales with the live node count, not the bloat. A heavily bloated
+  database compacts in roughly the same time as a clean one of the same
+  height.
+
 ## Crash Recovery
 
 The primary design constraint. The node WILL be killed mid-operation.
@@ -653,9 +813,16 @@ covers transient holders (e.g. an in-flight snapshot dump).
 - No method panics.
 - `version()` is always consistent with the `nodes` table.
 - If `rollback_versions()` yields a digest, `rollback()` to that digest will succeed.
-- The `nodes` table never contains orphaned entries (nodes not reachable from root).
-  - Exception: crash during `update()` with `keep_versions = 0` could theoretically
-    leave new nodes written but metadata not yet updated. redb's ACID prevents this.
+- Every node reachable from `top_node_hash` is present in the `nodes` table.
+  A missing reachable node is corruption.
+- The converse does NOT hold: `nodes` may contain entries unreachable from any
+  root. This is expected, not a bug — see [Offline Compaction](#offline-compaction)
+  for the mechanisms that produce them. Unreachable rows waste space; they never
+  affect correctness, because lookups and traversals only ever follow labels
+  from a root. Nothing in this crate may assume `nodes` contains only live
+  entries — in particular, row count is not a proxy for tree size.
+  - Crash during `update()` with `keep_versions = 0` could theoretically leave
+    new nodes written but metadata not yet updated. redb's ACID prevents this.
 - `update()` is not re-entrant. One update at a time.
 - After `rollback()`, the returned `(NodeId, height)` reconstructs the exact tree
   state at that version — same root label, same tree structure.
@@ -676,3 +843,9 @@ Because the crate is Ergo-agnostic, tests use synthetic key-value data:
    verify lookups work.
 6. **Integration (in validation/):** Apply real testnet blocks via UtxoValidator,
    compare resulting digest with known header state_roots.
+7. **Compaction:** build a tree, churn it so unreachable rows accumulate
+   (repeated overwrite of the same keys), record the digest, `compact_to()` a
+   fresh path. Assert: digest unchanged, `block_height` carried over, dest row
+   count equals the reachable node count, source unmodified, dest smaller.
+   Also assert the failure path — point the root at a label absent from
+   `nodes` and verify `compact_to` returns `Err` and removes `dest`.

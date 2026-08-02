@@ -334,27 +334,33 @@ impl UtxoValidator {
             None
         };
 
-        // 7. Generate the AD proof BEFORE persisting to storage.
-        //    generate_proof() calls complete_batch() which produces the proof
-        //    using the CURRENT visited flags set during perform_one_operation.
-        //    If generate_proof runs after update_with_height, tree.reset()
-        //    (inside update_with_height) clears those flags — for blocks with
-        //    Lookups the proof then collapses to a single root label instead
-        //    of the full tree structure (SANTA: proof-digest mismatch).
-        //    generate_proof() also flushes the prover's tree-local state
-        //    (resets visited/new flags, directions, and old_top_node) for the
-        //    next block.
-        let proof = self.prover.generate_proof();
-
-        // 8. Persist state changes atomically with block_height.
-        //    update_with_height's tree.reset() is still needed to prevent
-        //    stale flags from accumulating across blocks — but by this point
-        //    the proof is already captured.
+        // 7. Persist state changes atomically with block_height.
+        //    Must precede generate_proof(): update_internal builds its delete
+        //    list from prover.removed_nodes(), and generate_proof() clears the
+        //    changed-node buffers that back it. With the proof first (the
+        //    v0.7.5 order, commit 2c0811f) removed_nodes() returned empty on
+        //    every block, so superseded nodes were never deleted from
+        //    NODES_TABLE — unbounded orphan growth (235 GB at height ~1.66M,
+        //    ~658 KB/block, zero deletions).
         self.storage
             .update_with_height(&mut self.prover, vec![], header.height)
             .map_err(|e| ValidationError::StateOperationFailed(
                 format!("persist failed: {e}"),
             ))?;
+
+        // 8. Generate the AD proof AFTER persisting — the canonical order,
+        //    matching the JVM's
+        //    PersistentBatchAVLProver.generateProofAndUpdateStorage
+        //    (storage.update, then generateProof).
+        //
+        //    Safe as of ergo_avltree_rust #18 (in pinned rev 2941396):
+        //    pack_tree now gates on was_modified() — an Rc::as_ptr scan of
+        //    modified_nodes — instead of the tree's visited flags, and
+        //    modified_nodes survives update_with_height's tree.reset().
+        //    Before #18 this order collapsed Lookup-bearing proofs to a
+        //    single root label (block 28474, isolated by SANTA); on the
+        //    pinned rev both orders yield byte-identical proof bytes.
+        let proof = self.prover.generate_proof();
 
         // TEMP: 28474 Lookup divergence investigation — remove after SANTA resolves
         if header.height == 28474 {
