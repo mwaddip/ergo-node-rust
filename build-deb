@@ -7,7 +7,11 @@ PKG="ergo-node-rust_${VERSION}_${ARCH}"
 
 echo "Building ergo-node-rust v${VERSION} for ${ARCH}..."
 
-cargo build --release --bin ergo-node-rust --bin sharpen
+# --locked: the avltree patch tracks a branch, so Cargo.lock is what pins the
+# exact commit a release is built from. Without this a stale or missing
+# lockfile would be silently regenerated against whatever the branch tip is,
+# making a tagged release unreproducible. Fail loudly instead.
+cargo build --locked --release --bin ergo-node-rust --bin sharpen
 
 rm -rf "target/${PKG}"
 mkdir -p "target/${PKG}/DEBIAN"
