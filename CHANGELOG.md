@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.7.10 — 2026-08-02
+
+- **Fix unbounded `state.redb` growth — superseded AVL nodes were never
+  deleted.** `BatchAVLProver::generate_proof()` clears the prover's
+  changed-node buffers on entry, and `RedbAVLStorage::update_internal` reads
+  those same buffers via `removed_nodes()` to build its per-block delete list.
+  Since `2c0811f` (v0.7.5) the node called `generate_proof()` *before*
+  `update_with_height()`, so the delete list was empty on every block and every
+  superseded node stayed in the `nodes` table forever. Measured on live
+  mainnet: **235 GB against a ~4–8 GB live tree** at height 1.66M, growing
+  ~658 KB per block with zero deletions.
+
+  The v0.7.5 inversion was itself a fix: pre-#18 `pack_tree` gated on the
+  tree's `visited` flags, which `update_with_height`'s `tree.reset()` cleared,
+  collapsing Lookup-bearing proofs to a single root label (mainnet block 28474,
+  isolated by SANTA). `ergo_avltree_rust` #18 — already in the pinned rev
+  `2941396` — switched `pack_tree` to `was_modified()`, an `Rc::as_ptr` scan of
+  `modified_nodes` that survives `tree.reset()`. The canonical order is
+  therefore safe again, and it matches the JVM's
+  `PersistentBatchAVLProver.generateProofAndUpdateStorage`.
+
+  Verified on live mainnet: 4,072 blocks applied with **zero** file growth
+  (the pre-fix rate predicted ~2.68 GB) and zero proof-digest mismatches.
+
+  **Operators upgrading from v0.7.5–v0.7.9:** existing bloat is unreachable
+  rows, not corruption — the on-disk tree is consistent and no resync is
+  required for correctness. This release stops further growth but does not
+  reclaim what is already there. Offline compaction to reclaim it is specified
+  in `facts/state.md` and is not yet implemented; a resync also clears it.
+
+  Addons are unchanged in this release (fastsync 0.1.6, indexer 0.2.8) — they
+  communicate with the node over REST and are unaffected.
+
 ## v0.7.9 — 2026-07-30
 
 - **Bump P2P frame cap to match JVM v6.0.4 `MaxMessageSize`.** The frame layer's
