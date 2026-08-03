@@ -451,6 +451,11 @@ impl ValidationPipeline {
             }
         }
 
+        // Fork point of a deep reorg that actually executed in this batch.
+        // Consumed by the store flush below to keep demoted headers from
+        // clobbering the BEST_CHAIN slots the reorg just wrote.
+        let mut reorg_fork_point: Option<u32> = None;
+
         // Execute pending deep reorg while still holding the chain lock
         if let Some((fork_point, new_branch_with_raw)) = pending_reorg {
             let old_tip = chain.height();
@@ -501,6 +506,8 @@ impl ValidationPipeline {
                         );
                     }
 
+                    reorg_fork_point = Some(fork_point);
+
                     // Notify sync machine — Reorg MUST NOT be dropped.
                     // A missed reorg leaves the validator with a stale state root,
                     // permanently stalling validation. Unbounded channel = infallible.
@@ -530,7 +537,50 @@ impl ValidationPipeline {
         }
         let purged = before_purge - self.buffer.len();
 
-        // Persist chained headers to disk
+        // Persist chained headers to disk.
+        //
+        // If a deep reorg executed above, every store_entry ABOVE the fork
+        // point was appended to the chain that reorg has just demoted.
+        // `put_batch` does an UNCONDITIONAL BEST_CHAIN insert for headers, so
+        // flushing them here would overwrite the BEST_CHAIN slots the reorg
+        // wrote a few lines up — last writer wins, and it would be the losing
+        // branch.
+        //
+        // This is what wedged mainnet on 2026-07-30. A single batch held the
+        // losing 1,840,209 header (Extended → deferred into store_entries),
+        // its winning sibling (Forked), and the winner's child (fork-extension
+        // → deep reorg). The reorg correctly wrote BEST_CHAIN[1840209] =
+        // winner; this flush then re-inserted the demoted loser over it. The
+        // in-memory chain stayed correct, so nothing surfaced until the next
+        // restart rebuilt `by_id` from the clobbered index — after which the
+        // validator applied the losing block body and the node wedged on an
+        // AVL missing-key (the emission box) at 1,840,210.
+        //
+        // Demoted entries are still persisted, but through `put_header` with a
+        // fork number: PRIMARY + HEADER_FORKS, and BEST_CHAIN only when the
+        // slot is empty. Dropping them outright would discard the header
+        // bodies that make a later reorg back onto this branch possible.
+        if let Some(fork_point) = reorg_fork_point {
+            let (best, demoted): (Vec<StoreEntry>, Vec<StoreEntry>) = store_entries
+                .into_iter()
+                .partition(|(_, _, height, _, _)| *height <= fork_point);
+            store_entries = best;
+
+            for (_, id, height, raw, score) in demoted {
+                let fork_num = self
+                    .store
+                    .header_ids_at_height(height)
+                    .map(|forks| forks.last().map(|(_, f)| f + 1).unwrap_or(1))
+                    .unwrap_or(1);
+                let score_bytes = score.unwrap_or_default();
+                if let Err(e) =
+                    self.store.put_header(&id, height, fork_num, &score_bytes, &raw)
+                {
+                    tracing::error!(height, "store demoted header failed: {e}");
+                }
+            }
+        }
+
         if !store_entries.is_empty() {
             if let Err(e) = self.store.put_batch(&store_entries) {
                 tracing::error!(count = store_entries.len(), "store write failed: {e}");

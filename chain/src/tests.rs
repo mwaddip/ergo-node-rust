@@ -3893,3 +3893,380 @@ mod restore_tests {
     }
 }
 
+#[cfg(test)]
+mod linkage_tests {
+    //! Parent-linkage invariant tests (`facts/chain.md`, "Parent
+    //! linkage" — violated in production 2026-08-02 at mainnet
+    //! 1,840,209/1,840,210).
+    //!
+    //! Three angles:
+    //! 1. The designed fork path (losing candidate first, deep reorg to
+    //!    the winner) keeps linkage at every height — the chain-side
+    //!    machinery is sound.
+    //! 2. The production shape: a store index corrupted upstream (the
+    //!    demoted loser resurrected at height N under the winner's
+    //!    child at N+1) restores verbatim, SERVES the broken link, and
+    //!    `verify_best_chain_linkage` is what detects it.
+    //! 3. Live store/chain divergence: a loader that returns a header
+    //!    the chain never accepted at that height is masked to `None`
+    //!    by `header_at` and described by the linkage walk.
+
+    use crate::{AppendResult, ChainConfig, ChainError, HeaderChain};
+    use ergo_chain_types::*;
+    use sigma_ser::ScorexSerializable;
+
+    fn make_chain_header(
+        height: u32,
+        parent_id: BlockId,
+        timestamp: u64,
+        n_bits: u32,
+    ) -> Header {
+        make_chain_header_with_nonce(
+            height,
+            parent_id,
+            timestamp,
+            n_bits,
+            height.to_be_bytes().repeat(2),
+        )
+    }
+
+    /// Different nonces at the same height produce different IDs,
+    /// simulating competing blocks.
+    fn make_chain_header_with_nonce(
+        height: u32,
+        parent_id: BlockId,
+        timestamp: u64,
+        n_bits: u32,
+        nonce: Vec<u8>,
+    ) -> Header {
+        let zero32 = Digest32::zero();
+        let mut header = Header {
+            version: 2,
+            id: BlockId(Digest32::zero()),
+            parent_id,
+            ad_proofs_root: zero32,
+            state_root: ADDigest::zero(),
+            transaction_root: zero32,
+            timestamp,
+            n_bits,
+            height,
+            extension_root: zero32,
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce,
+                pow_distance: None,
+            },
+            votes: Votes([0, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        };
+        let bytes = header.scorex_serialize_bytes().unwrap();
+        let reparsed = Header::scorex_parse_bytes(&bytes).unwrap();
+        header.id = reparsed.id;
+        header
+    }
+
+    fn testnet_config() -> ChainConfig {
+        ChainConfig::testnet()
+    }
+
+    fn make_genesis(config: &ChainConfig) -> Header {
+        make_chain_header(1, BlockId(Digest32::zero()), 1_000_000, config.initial_n_bits)
+    }
+
+    fn build_test_chain(count: u32) -> HeaderChain {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let genesis = make_genesis(&config);
+        chain.try_append_no_pow(genesis).unwrap();
+        for h in 2..=count {
+            let tip = chain.tip();
+            let expected_n_bits =
+                crate::difficulty::expected_difficulty(&tip, &chain).unwrap();
+            let header = make_chain_header(
+                h,
+                tip.id,
+                1_000_000 + (h as u64 - 1) * 45_000,
+                expected_n_bits,
+            );
+            chain.try_append_no_pow(header).unwrap();
+        }
+        chain
+    }
+
+    /// Assert the parent-linkage corollary from `facts/chain.md` for
+    /// every adjacent pair, plus by_id round-trips.
+    fn assert_linkage(chain: &HeaderChain) {
+        let base = chain.reorg_floor(); // base_height for full chains = 1
+        for h in base..=chain.height() {
+            let header = chain
+                .header_at(h)
+                .unwrap_or_else(|| panic!("header missing at height {h}"));
+            assert_eq!(header.height, h, "height field mismatch at {h}");
+            assert_eq!(
+                chain.height_of(&header.id),
+                Some(h),
+                "by_id round-trip failed at {h}"
+            );
+            if h > base {
+                let parent = chain.header_at(h - 1).unwrap();
+                assert_eq!(
+                    header.parent_id,
+                    parent.id,
+                    "broken parent link at height {h}"
+                );
+            }
+        }
+    }
+
+    /// The designed fork path: losing candidate arrives first and
+    /// extends the chain, the winner arrives as a fork, the winner's
+    /// child forces the deep reorg. Linkage must hold at every height
+    /// afterwards and the loser must be gone.
+    #[test]
+    fn fork_losing_first_reorg_to_winner_keeps_linkage() {
+        let mut chain = build_test_chain(5);
+        let tip5 = chain.tip();
+        let n_bits = tip5.n_bits;
+
+        // Losing candidate at 6 arrives first — extends the best chain.
+        let loser = make_chain_header_with_nonce(
+            6, tip5.id, tip5.timestamp + 45_000, n_bits, vec![0xAA; 8],
+        );
+        assert!(matches!(
+            chain.try_append_no_pow(loser.clone()).unwrap(),
+            AppendResult::Extended
+        ));
+
+        // Winner at 6 (same parent, different id) — reported as a fork,
+        // NOT stored in the chain.
+        let winner = make_chain_header_with_nonce(
+            6, tip5.id, tip5.timestamp + 50_000, n_bits, vec![0xBB; 8],
+        );
+        assert_ne!(winner.id, loser.id);
+        assert!(matches!(
+            chain.try_append_no_pow(winner.clone()).unwrap(),
+            AppendResult::Forked { fork_height: 5 }
+        ));
+
+        // The winner's child — parent not in the best chain.
+        let child = make_chain_header(7, winner.id, tip5.timestamp + 100_000, n_bits);
+        assert!(matches!(
+            chain.try_append_no_pow(child.clone()),
+            Err(ChainError::ParentNotFound { .. })
+        ));
+
+        // Deep reorg to the winner branch (what the pipeline runs once
+        // the fork branch outscores the best chain).
+        let demoted = chain
+            .try_reorg_deep_no_pow(5, vec![winner.clone(), child.clone()])
+            .unwrap();
+        assert_eq!(demoted, vec![loser.id]);
+
+        assert_eq!(chain.height(), 7);
+        assert!(!chain.contains(&loser.id), "demoted loser must be gone");
+        assert_eq!(chain.header_at(6).unwrap().id, winner.id);
+        assert_eq!(chain.header_at(7).unwrap().id, child.id);
+        assert_linkage(&chain);
+        chain
+            .verify_best_chain_linkage(None)
+            .expect("clean post-reorg chain must verify");
+    }
+
+    /// Regression for the exact mainnet 1,840,209/1,840,210 shape: the
+    /// store's best-chain index holds the demoted LOSER at height N and
+    /// the WINNER'S CHILD at N+1 (the winner itself absent). `restore`
+    /// accepts the index verbatim (it has no parent ids to check), the
+    /// chain then SERVES the broken link, and
+    /// `verify_best_chain_linkage` is the detector.
+    ///
+    /// Fixture mirrors the incident at small scale: common chain 1..=3,
+    /// loser L@4 and winner W@4 both children of h3, child C@5 built on
+    /// W. Store view: [1, 2, 3, L@4, C@5].
+    #[test]
+    fn restored_broken_index_serves_broken_link_and_walk_detects_it() {
+        let config = testnet_config();
+        let genesis = make_genesis(&config);
+        let h2 = make_chain_header(2, genesis.id, 1_050_000, config.initial_n_bits);
+        let h3 = make_chain_header(3, h2.id, 1_100_000, config.initial_n_bits);
+        let loser = make_chain_header_with_nonce(
+            4, h3.id, 1_150_000, config.initial_n_bits, vec![0x5f; 8],
+        );
+        let winner = make_chain_header_with_nonce(
+            4, h3.id, 1_151_000, config.initial_n_bits, vec![0x89; 8],
+        );
+        let child = make_chain_header(5, winner.id, 1_200_000, config.initial_n_bits);
+        assert_eq!(child.parent_id, winner.id);
+        assert_ne!(winner.id, loser.id);
+
+        // The corrupted BEST_CHAIN index: loser at 4, winner's child at 5.
+        let entries = vec![
+            (1u32, genesis.id),
+            (2, h2.id),
+            (3, h3.id),
+            (4, loser.id),
+            (5, child.id),
+        ];
+        let mut chain = HeaderChain::restore(config, entries)
+            .expect("restore trusts the index — it cannot see parent ids");
+
+        // Loader serving the same corrupted view (the store bridge).
+        // Heights are unique in `view`: 1..=3 common, 4→loser, 5→child.
+        let view = [genesis.clone(), h2.clone(), h3.clone(), loser.clone(), child.clone()];
+        chain.set_header_loader(move |h| {
+            view.iter().find(|hdr| hdr.height == h).cloned()
+        });
+
+        // The chain serves the broken link — this is the production
+        // observable (`header_at(N).id != header_at(N+1).parent_id`).
+        assert_eq!(chain.header_at(4).unwrap().id, loser.id);
+        let served_child = chain.header_at(5).unwrap();
+        assert_eq!(served_child.id, child.id);
+        assert_ne!(
+            served_child.parent_id,
+            chain.header_at(4).unwrap().id,
+            "fixture must reproduce the broken-link observable"
+        );
+
+        // The walk detects it, naming all three ids.
+        match chain.verify_best_chain_linkage(None) {
+            Err(ChainError::BrokenParentLink {
+                height,
+                child_id,
+                expected_parent,
+                found_parent,
+            }) => {
+                assert_eq!(height, 5);
+                assert_eq!(child_id, child.id);
+                assert_eq!(expected_parent, winner.id);
+                assert_eq!(found_parent, loser.id);
+            }
+            other => panic!("expected BrokenParentLink, got {other:?}"),
+        }
+
+        // The break sits on the tip link, so even a depth-1 ancestry
+        // check catches it — the cheap startup configuration.
+        assert!(matches!(
+            chain.verify_best_chain_linkage(Some(1)),
+            Err(ChainError::BrokenParentLink { height: 5, .. })
+        ));
+    }
+
+    /// Depth semantics: a bounded walk that never reaches the break
+    /// reports Ok; extending the depth to cover it reports the break.
+    #[test]
+    fn bounded_walk_depth_controls_detection_range() {
+        let config = testnet_config();
+        let genesis = make_genesis(&config);
+        let h2 = make_chain_header(2, genesis.id, 1_050_000, config.initial_n_bits);
+        let h3 = make_chain_header(3, h2.id, 1_100_000, config.initial_n_bits);
+        // Impostor at height 3: also a child of h2, but not h4's parent.
+        let impostor = make_chain_header_with_nonce(
+            3, h2.id, 1_101_000, config.initial_n_bits, vec![0xEE; 8],
+        );
+        let h4 = make_chain_header(4, h3.id, 1_150_000, config.initial_n_bits);
+        let h5 = make_chain_header(5, h4.id, 1_200_000, config.initial_n_bits);
+        let h6 = make_chain_header(6, h5.id, 1_250_000, config.initial_n_bits);
+
+        // Corrupted index: impostor at 3, real chain elsewhere. The
+        // single break is at height 4 (h4 names h3, chain holds the
+        // impostor at 3).
+        let entries = vec![
+            (1u32, genesis.id),
+            (2, h2.id),
+            (3, impostor.id),
+            (4, h4.id),
+            (5, h5.id),
+            (6, h6.id),
+        ];
+        let mut chain = HeaderChain::restore(config, entries).unwrap();
+        let view = [genesis, h2, impostor, h4, h5, h6];
+        chain.set_header_loader(move |h| {
+            view.iter().find(|hdr| hdr.height == h).cloned()
+        });
+
+        // Links checked tip-down: depth 1 → 6-5; depth 2 → +5-4; both clean.
+        chain.verify_best_chain_linkage(Some(1)).expect("6→5 link is clean");
+        chain.verify_best_chain_linkage(Some(2)).expect("5→4 link is clean");
+        // Depth 3 reaches the 4→3 link.
+        assert!(matches!(
+            chain.verify_best_chain_linkage(Some(3)),
+            Err(ChainError::BrokenParentLink { height: 4, .. })
+        ));
+        assert!(matches!(
+            chain.verify_best_chain_linkage(None),
+            Err(ChainError::BrokenParentLink { height: 4, .. })
+        ));
+    }
+
+    /// Live store/chain divergence (no restart involved): by_id holds
+    /// the accepted header, the loader serves a different one at that
+    /// height. `header_at` must mask the impostor to `None` rather than
+    /// serve a header the chain never accepted, and the linkage walk
+    /// must describe the divergence.
+    #[test]
+    fn header_at_returns_none_when_loader_diverges_from_chain() {
+        use std::num::NonZeroUsize;
+
+        let mut chain = build_test_chain(5);
+        let real: Vec<Header> = (1..=5).map(|h| chain.header_at(h).unwrap()).collect();
+        let accepted_h3 = real[2].clone();
+
+        // An impostor at height 3 the chain never accepted.
+        let h2 = &real[1];
+        let impostor = make_chain_header_with_nonce(
+            3, h2.id, h2.timestamp + 46_000, accepted_h3.n_bits, vec![0xEE; 8],
+        );
+        assert_ne!(impostor.id, accepted_h3.id);
+        // A store bridge that serves every height, but the wrong header
+        // at height 3 — the shape of a diverged best-chain index.
+        chain.set_header_loader(move |h| {
+            if h == 3 {
+                Some(impostor.clone())
+            } else {
+                real.iter().find(|hdr| hdr.height == h).cloned()
+            }
+        });
+
+        // Evict height 3 from the LRU cache so the next read falls
+        // through to the (divergent) loader. The fixture reads above
+        // touched heights 2 and 3, so re-touch 4 and 5 first — the
+        // resize keeps the two most-recently-used entries.
+        let _ = chain.header_at(4);
+        let _ = chain.header_at(5);
+        chain.set_cache_capacity(NonZeroUsize::new(2).unwrap());
+
+        assert!(
+            chain.header_at(3).is_none(),
+            "divergent loader result must be masked to None, not served"
+        );
+        // Cache-resident heights are unaffected.
+        assert_eq!(chain.header_at(5).unwrap().id, chain.tip().id);
+
+        // The linkage walk names the divergence instead of masking it.
+        match chain.verify_best_chain_linkage(None) {
+            Err(ChainError::IndexInconsistency { height: 3, .. }) => {}
+            other => panic!("expected IndexInconsistency at 3, got {other:?}"),
+        }
+    }
+
+    /// Empty and single-header chains verify trivially; a clean built
+    /// chain verifies at any depth.
+    #[test]
+    fn verify_linkage_trivial_and_clean_cases() {
+        let empty = HeaderChain::new(testnet_config());
+        empty.verify_best_chain_linkage(None).expect("empty chain is clean");
+
+        let single = build_test_chain(1);
+        single.verify_best_chain_linkage(None).expect("single header is clean");
+
+        let chain = build_test_chain(8);
+        chain.verify_best_chain_linkage(None).expect("full walk clean");
+        chain.verify_best_chain_linkage(Some(3)).expect("bounded walk clean");
+        chain
+            .verify_best_chain_linkage(Some(100))
+            .expect("depth beyond chain length clamps to the chain");
+        assert_linkage(&chain);
+    }
+}
+

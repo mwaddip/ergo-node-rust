@@ -1179,6 +1179,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Maintenance subcommand: reclaim unreachable rows from state.redb by
+    // rewriting the reachable tree into a fresh database. See the "Offline
+    // Compaction" section of facts/state.md.
+    //
+    // Writes alongside the original and never touches it — swapping is a
+    // deliberate operator step, so that a compaction whose stats look wrong
+    // costs nothing. Requires the node to be stopped (redb file lock).
+    if args.iter().any(|a| a == "--compact-state") {
+        let config_path = locate_config(&args).ok_or_else(|| -> Box<dyn std::error::Error> {
+            "no config found (pass an explicit path, or place one at ./ergo.toml, \
+             ~/.config/ergo-node/ergo.toml, or /etc/ergo-node/ergo.toml)".into()
+        })?;
+        let config_content = std::fs::read_to_string(&config_path)?;
+        let root_config: RootConfig = toml::from_str(&config_content)?;
+        let node_config = root_config.node.unwrap_or_default();
+        let data_dir = std::path::PathBuf::from(node_config.data_dir);
+        let source = data_dir.join("state.redb");
+        let dest = data_dir.join("state.redb.compacted");
+
+        if !source.exists() {
+            return Err(format!("no state database at {}", source.display()).into());
+        }
+        if dest.exists() {
+            return Err(format!(
+                "{} already exists — remove it or move it aside first",
+                dest.display()
+            )
+            .into());
+        }
+
+        tracing::info!(
+            source = %source.display(),
+            dest = %dest.display(),
+            "compaction starting — this rewrites only the reachable tree; \
+             the source is not modified"
+        );
+
+        let started = std::time::Instant::now();
+        let progress = |p: enr_state::CompactionProgress| {
+            tracing::info!(nodes = p.nodes_written, "compaction: copying");
+        };
+
+        let stats = enr_state::RedbAVLStorage::compact_to(&source, &dest, Some(&progress))?;
+
+        let pct = if stats.source_bytes > 0 {
+            100.0 - (stats.dest_bytes as f64 / stats.source_bytes as f64 * 100.0)
+        } else {
+            0.0
+        };
+        tracing::info!(
+            nodes = stats.nodes_written,
+            source_bytes = stats.source_bytes,
+            dest_bytes = stats.dest_bytes,
+            reclaimed_pct = format!("{pct:.1}"),
+            block_height = stats.block_height,
+            digest = %hex::encode(AsRef::<[u8]>::as_ref(&stats.digest)),
+            elapsed_secs = started.elapsed().as_secs(),
+            "compaction complete — digest verified against every reachable node"
+        );
+        tracing::info!(
+            "next steps: verify the digest above matches the stateRoot of the header at \
+             height {}, then (1) keep the node stopped, (2) move {} aside — do not delete it, \
+             (3) rename {} into its place, (4) start the node and confirm it resumes at \
+             height {} and applies the next block, (5) only then remove the original. \
+             NOTE: the compacted database retains a single version, so rollback is \
+             unavailable until {} further blocks have been applied.",
+            stats.block_height,
+            source.display(),
+            dest.display(),
+            stats.block_height,
+            // Mirrors the hardcoded keep_versions at the storage open site below.
+            256u32,
+        );
+        return Ok(());
+    }
+
     let config_path = match locate_config(&args) {
         Some(p) => p,
         None => {
@@ -1474,6 +1550,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         });
+
+        // Verify best-chain parent linkage now that both loaders are wired
+        // (the walk reads through them, so it must come after).
+        //
+        // A restored chain can carry a broken link — `header_at(N).id !=
+        // header_at(N+1).parent_id` — if a demoted header ever clobbered a
+        // BEST_CHAIN slot the reorg owned. The in-memory chain is correct
+        // while the process lives; the damage only materialises on the next
+        // restore(). Mainnet ran 1.84M headers restored from a clobbered
+        // index without noticing, until the validator applied a losing block
+        // body and wedged on an AVL missing-key two thousand blocks later.
+        //
+        // Bounded by default: a full walk is ~1.8M loader reads. The recent
+        // tail is where reorg damage lands, so checking it catches the real
+        // failure mode at negligible boot cost. This is diagnostic only — it
+        // reports and does not refuse to start, because a broken link is
+        // recoverable (rewrite the BEST_CHAIN slot, roll state back to the
+        // fork point) and refusing to boot would remove the operator's means
+        // of doing so.
+        const LINKAGE_CHECK_DEPTH: u32 = 4096;
+        match chain.verify_best_chain_linkage(Some(LINKAGE_CHECK_DEPTH)) {
+            Ok(()) => {
+                tracing::info!(
+                    depth = LINKAGE_CHECK_DEPTH,
+                    "best-chain linkage verified"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    depth = LINKAGE_CHECK_DEPTH,
+                    error = %e,
+                    "BEST-CHAIN LINKAGE BROKEN — the restored chain is internally \
+                     inconsistent. Block application will wedge at or above the \
+                     reported height with an AVL missing-key error. Recovery needs \
+                     the BEST_CHAIN slot rewritten to the correct branch AND the \
+                     UTXO state rolled back to the fork point."
+                );
+            }
+        }
 
         // Note: active_parameters is recomputed from storage AFTER the
         // validator's resume height is known (inside the validator init

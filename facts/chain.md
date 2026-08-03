@@ -257,6 +257,43 @@ Two wire formats exist. V2 is used by all current nodes (>= 4.0.16).
 - The chain never contains two headers at the same height on the same fork.
 - All timestamps are treated as untrusted data. Timing logic uses block height.
 
+### Parent linkage (load-bearing — violated in production 2026-08-02)
+
+**A header may only enter the chain if its parent is already present.** For any
+accepted header `H` at height `N > 1`, `header_at(N-1)` on `H`'s branch must
+resolve to a header whose id equals `H.parent_id`. A header whose parent is
+absent is an orphan: hold it or drop it, but do not index it.
+
+This holds regardless of ingestion path. Headers arrive from P2P gossip and
+from the fastsync bulk REST fetch, and **both must go through the same
+acceptance check**. A path that writes the height index directly, or that
+accepts a header because its *height* slot is free without checking the parent
+link, breaks the invariant.
+
+When a second candidate arrives for an already-occupied height, that is a fork,
+not a conflict to resolve by overwrite or by dropping the newcomer. Both
+candidates are retained, cumulative difficulty selects the best chain, and a
+branch switch is reported so downstream can roll back — see `DeliveryControl::Reorg`
+in `facts/sync.md`.
+
+**Why this is load-bearing.** Reorg detection is derived from the chain's own
+view. If the chain never sees two candidates at a height, it reports no fork,
+and every downstream consumer stays silent — the sync layer's reorg path is
+never invoked and the UTXO state is left anchored to a branch the chain has
+already abandoned. The failure surfaces far away and much later, as an AVL
+`Key ... does not exist` during block application, which reads like state
+corruption rather than a header-acceptance bug.
+
+Observed instance: at mainnet height 1,840,209 the chain held the losing
+candidate `5fd5dac8…` while holding header `1e08e826…` at 1,840,210 whose
+`parentId` was the *winning* candidate `89f6ba6e…` — a header that was never
+stored. No fork was reported, `reset_to` was never called, and the node wedged
+retrying 1,840,210 against a state built on the losing branch.
+
+Corollary for consumers: `header_at(N).id == header_at(N+1).parent_id` must be
+safe to rely on. Code that walks the chain by height is entitled to assume the
+links are consistent.
+
 ## State Type
 
 ### `StateType` enum

@@ -81,6 +81,34 @@ pub enum ChainError {
     /// contains headers. The install API only accepts an empty chain.
     #[error("chain not empty: install_from_nipopow_proof requires is_empty()")]
     ChainNotEmpty,
+
+    /// The best chain violates the parent-linkage invariant: the header
+    /// at `height` names a parent other than the header the chain holds
+    /// one height below. Reported by
+    /// [`crate::HeaderChain::verify_best_chain_linkage`] — typically the
+    /// signature of a corrupted store index restored verbatim at startup
+    /// (see `facts/chain.md`, "Parent linkage").
+    #[error(
+        "broken parent link at height {height}: header {child_id} names parent \
+         {expected_parent}, but the best chain holds {found_parent} one height below"
+    )]
+    BrokenParentLink {
+        /// Height of the child header whose link is broken.
+        height: u32,
+        /// Id of the child header at `height`.
+        child_id: BlockId,
+        /// The parent the child names (`child.parent_id`).
+        expected_parent: BlockId,
+        /// The header the chain actually holds at `height - 1`.
+        found_parent: BlockId,
+    },
+
+    /// The chain's height view (LRU cache + header loader) and its
+    /// id→height index disagree, or a header in the walked range is
+    /// unresolvable or mis-filed. Reported by
+    /// [`crate::HeaderChain::verify_best_chain_linkage`].
+    #[error("chain index inconsistency at height {height}: {detail}")]
+    IndexInconsistency { height: u32, detail: String },
 }
 
 /// Errors returned by [`crate::HeaderChain::restore`] when the `(height,

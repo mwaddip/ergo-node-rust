@@ -210,6 +210,12 @@ impl HeaderChain {
     ///   unwired. The integrator MUST call [`Self::set_header_loader`]
     ///   and [`Self::set_score_loader`] before any query that may miss
     ///   the LRU cache.
+    /// - `restore` CANNOT verify parent linkage — the `(height, id)`
+    ///   index carries no parent ids. A store index corrupted upstream
+    ///   restores cleanly and becomes the chain's best-chain view
+    ///   verbatim. The integrator MUST call
+    ///   [`Self::verify_best_chain_linkage`] after wiring the header
+    ///   loader (`facts/chain.md`, "Parent linkage").
     pub fn restore<I>(config: ChainConfig, entries: I) -> Result<Self, RestoreError>
     where
         I: IntoIterator<Item = (u32, BlockId)>,
@@ -318,19 +324,20 @@ impl HeaderChain {
     /// Panics if the chain is empty, or if the tip cannot be
     /// resolved through the lazy store (shouldn't happen — the
     /// cache is write-through on push, so the tip is always
-    /// freshly resident).
+    /// freshly resident), or if the resolved header is not the one
+    /// the chain accepted at the tip height (store/chain divergence
+    /// — see [`Self::header_at`]).
     pub fn tip(&self) -> Header {
         if self.is_empty() {
             panic!("tip() called on empty chain");
         }
-        // Delegate to `height()` instead of recomputing `base +
-        // scores.len() - 1` here — that arithmetic only holds under
-        // the `base_height.is_some() iff !scores.is_empty()`
-        // invariant; routing through `height()` makes the empty-path
-        // guard explicit at every caller.
-        self.lazy
-            .get_header(self.height())
-            .expect("tip header unavailable — cache evicted with no loader wired")
+        // Delegate to `header_at` so the tip read shares the bounds
+        // guard and the by_id-consistency check with every other
+        // height read.
+        self.header_at(self.height()).expect(
+            "tip header unresolvable — cache evicted with no loader wired, \
+             or loader returned a header the chain did not accept at the tip",
+        )
     }
 
     /// Header at the given height, if it exists in the chain.
@@ -339,12 +346,27 @@ impl HeaderChain {
     /// miss. Returns `None` for heights below [`Self::base_height`],
     /// above [`Self::height`], or when the lazy store can't resolve
     /// the height (cache evicted + no loader wired).
+    ///
+    /// Also returns `None` when the resolved header is not the one the
+    /// chain accepted at this height (`by_id` doesn't map its id to
+    /// `height`). The loader is external input — the integrator's store
+    /// bridge — and a store whose height index has diverged from the
+    /// chain's accepted state (e.g. a stale best-chain row left by a
+    /// mis-ordered store write) must not be served as best-chain truth.
+    /// "Absent" lets callers surface the gap through their normal
+    /// missing-height handling instead of silently operating on a
+    /// branch the chain never accepted. Cache hits never trip this:
+    /// the cache is write-through and in lockstep with `by_id`.
     pub fn header_at(&self, height: u32) -> Option<Header> {
         let base = self.base_height?;
         if height < base || height > self.height() {
             return None;
         }
-        self.lazy.get_header(height)
+        let header = self.lazy.get_header(height)?;
+        if self.by_id.get(&header.id) != Some(&height) {
+            return None;
+        }
+        Some(header)
     }
 
     /// Whether this header ID is part of the validated chain.
@@ -1113,6 +1135,124 @@ impl HeaderChain {
         self.light_client_mode
     }
 
+    // --- Best-chain consistency ---
+
+    /// Walk the best chain and verify the parent-linkage invariant:
+    /// for every visited height `h`, the header at `h` names the header
+    /// at `h - 1` as its parent, the header's own `height` field agrees
+    /// with its slot, and `by_id` maps its id back to `h`.
+    ///
+    /// `max_depth` bounds the walk: `Some(n)` verifies the `n` links
+    /// closest to the tip (tip-ancestry check); `None` walks the full
+    /// chain down to [`Self::base_height`]. Cost is one header
+    /// resolution per visited height — cache first, then the registered
+    /// [`HeaderLoader`](crate::HeaderLoader). A full mainnet walk is
+    /// ~1.8M point reads through the loader and churns the LRU cache,
+    /// so prefer a bounded depth for routine startups and reserve
+    /// `None` for post-incident audits.
+    ///
+    /// **Why this exists** (`facts/chain.md`, "Parent linkage" —
+    /// violated in production 2026-08-02): [`Self::restore`] rebuilds
+    /// the chain from the store's `(height, id)` index and cannot
+    /// verify linkage itself — parent ids live in the header bytes,
+    /// which restore never sees. A store index corrupted upstream (a
+    /// mis-ordered best-chain write that resurrected a reorg-demoted
+    /// header under the winning branch's child) restores "successfully"
+    /// and only surfaces much later as an AVL key error during block
+    /// application. The integrator MUST call this after `restore` +
+    /// loader wiring to turn that silent corruption into a startup-time
+    /// report.
+    ///
+    /// Returns the FIRST violation found walking tip-down:
+    /// - [`ChainError::BrokenParentLink`] — adjacent heights don't
+    ///   link. Carries the child height and all three ids so repair
+    ///   tooling can locate the divergence without re-walking.
+    /// - [`ChainError::IndexInconsistency`] — a header in the range is
+    ///   unresolvable (cache miss + loader `None`), mis-filed (its
+    ///   `height` field disagrees with its slot), or not in `by_id`.
+    ///
+    /// Empty and single-header chains verify trivially.
+    pub fn verify_best_chain_linkage(
+        &self,
+        max_depth: Option<u32>,
+    ) -> Result<(), ChainError> {
+        let Some(base) = self.base_height else {
+            return Ok(());
+        };
+        let tip_height = self.height();
+        if tip_height <= base {
+            return Ok(());
+        }
+        let links = tip_height - base;
+        let checked_links = match max_depth {
+            Some(d) => links.min(d),
+            None => links,
+        };
+        if checked_links == 0 {
+            return Ok(());
+        }
+        // Child heights run (start_child ..= tip_height); each
+        // iteration loads the parent one below, so the walk touches
+        // `checked_links + 1` headers total, one load per height.
+        let start_child = tip_height - checked_links + 1;
+
+        let mut child = self.load_for_linkage_walk(tip_height)?;
+        for h in (start_child..=tip_height).rev() {
+            let parent = self.load_for_linkage_walk(h - 1)?;
+            if child.parent_id != parent.id {
+                return Err(ChainError::BrokenParentLink {
+                    height: h,
+                    child_id: child.id,
+                    expected_parent: child.parent_id,
+                    found_parent: parent.id,
+                });
+            }
+            child = parent;
+        }
+        Ok(())
+    }
+
+    /// Resolve the header at `height` for the linkage walk, verifying
+    /// slot/field/index agreement but NOT parent linkage (that's the
+    /// walk's job). Deliberately bypasses [`Self::header_at`]'s
+    /// silent-`None` divergence masking so the walk can DESCRIBE the
+    /// divergence instead of reporting a bare gap.
+    fn load_for_linkage_walk(&self, height: u32) -> Result<Header, ChainError> {
+        let header = self.lazy.get_header(height).ok_or_else(|| {
+            ChainError::IndexInconsistency {
+                height,
+                detail: "header unresolvable (cache miss and loader returned None)"
+                    .into(),
+            }
+        })?;
+        if header.height != height {
+            return Err(ChainError::IndexInconsistency {
+                height,
+                detail: format!(
+                    "header {} is mis-filed: its height field says {}",
+                    header.id, header.height
+                ),
+            });
+        }
+        match self.by_id.get(&header.id) {
+            Some(&mapped) if mapped == height => Ok(header),
+            Some(&mapped) => Err(ChainError::IndexInconsistency {
+                height,
+                detail: format!(
+                    "height view holds {} but by_id maps it to height {mapped}",
+                    header.id
+                ),
+            }),
+            None => Err(ChainError::IndexInconsistency {
+                height,
+                detail: format!(
+                    "height view holds {} which the chain's id index does not contain",
+                    header.id
+                ),
+            }),
+        }
+    }
+
     // --- Reorg ---
 
     /// Perform a 1-deep chain reorganization.
@@ -1162,6 +1302,29 @@ impl HeaderChain {
         let is_first = self.base_height.is_none();
         if is_first {
             self.base_height = Some(header.height);
+        } else {
+            // Contract (`facts/chain.md`, "Parent linkage"): a header
+            // only enters the best chain if it links to the current
+            // tip. Every caller validates this before pushing; the
+            // asserts make the invariant hold at the single choke
+            // point so a future path can't forget it. The parent-id
+            // assert is gated on tip resolvability so test fixtures
+            // with tiny caches and no loader don't panic on the read
+            // itself.
+            debug_assert_eq!(
+                header.height,
+                self.height() + 1,
+                "push_header: header must extend the tip height by exactly 1",
+            );
+            #[cfg(debug_assertions)]
+            if let Some(tip) = self.header_at(self.height()) {
+                debug_assert_eq!(
+                    tip.id, header.parent_id,
+                    "push_header: parent linkage broken — header at height {} \
+                     does not link to the current tip",
+                    header.height,
+                );
+            }
         }
         let parent_score = if is_first {
             BigUint::ZERO
@@ -1189,11 +1352,21 @@ impl HeaderChain {
             return None;
         }
         let tip_height = self.height();
-        let header = self.lazy.get_header(tip_height).expect(
-            "tip header unavailable during pop — cache evicted with no loader wired",
+        // Route through `header_at` so a loader that has diverged from
+        // the chain's accepted state (id not mapped to this height in
+        // `by_id`) panics here instead of silently removing nothing
+        // from `by_id` and corrupting the base/len arithmetic.
+        let header = self.header_at(tip_height).expect(
+            "tip header unresolvable during pop — cache evicted with no loader \
+             wired, or loader diverged from the chain's accepted state",
         );
         let score = self.score_at(tip_height).unwrap_or_default();
-        self.by_id.remove(&header.id);
+        let removed = self.by_id.remove(&header.id);
+        debug_assert_eq!(
+            removed,
+            Some(tip_height),
+            "pop_header: by_id out of lockstep with the height view at {tip_height}",
+        );
         self.lazy.evict(tip_height);
         if self.by_id.is_empty() {
             self.base_height = None;
@@ -1316,13 +1489,16 @@ impl HeaderChain {
             )));
         }
 
-        // First header's parent must match the fork point.
+        // First header's parent must match the fork point. `header_at`
+        // (rather than a raw lazy read) so a loader that has diverged
+        // from the chain's accepted state aborts the reorg here, before
+        // any mutation.
         let fork_point_id = self
-            .lazy
-            .get_header(fork_point_height)
+            .header_at(fork_point_height)
             .ok_or_else(|| {
                 ChainError::Reorg(format!(
-                    "fork-point header at {fork_point_height} unavailable (cache evicted, no loader wired)"
+                    "fork-point header at {fork_point_height} unavailable \
+                     (cache evicted with no loader wired, or store/chain divergence)"
                 ))
             })?
             .id;
@@ -1341,7 +1517,10 @@ impl HeaderChain {
         let mut saved_headers: Vec<Header> = Vec::with_capacity(saved_capacity);
         let mut saved_scores: Vec<BigUint> = Vec::with_capacity(saved_capacity);
         for h in (fork_point_height + 1)..=tip_height {
-            let hdr = self.lazy.get_header(h).ok_or_else(|| {
+            // `header_at` (not a raw lazy read): draining a divergent
+            // header would save the wrong branch for rollback and
+            // remove nothing from `by_id` below. Bail pre-mutation.
+            let hdr = self.header_at(h).ok_or_else(|| {
                 ChainError::Reorg(format!(
                     "header at height {h} unavailable for reorg drain"
                 ))
