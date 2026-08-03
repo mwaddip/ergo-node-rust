@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "ergo-node-rust"
-version = "0.7.10"
+version = "0.7.11"
 dependencies = [
  "anyhow",
  "bytes",

@@ -1,5 +1,71 @@
 # Changelog
 
+## v0.7.11 — 2026-08-03
+
+- **Fix demoted headers clobbering `BEST_CHAIN` after a reorg — the node
+  wedged one block later.** A single batch could hold a losing header
+  (`Extended`, deferred into `store_entries`), its winning sibling (`Forked`),
+  and the winner's child (fork-extension, triggering a deep reorg). The reorg
+  correctly wrote `BEST_CHAIN` for the new branch; the end-of-batch
+  `store_entries` flush — `put_batch` does an *unconditional* `BEST_CHAIN`
+  insert for headers — then re-inserted the demoted loser over it.
+
+  The in-memory chain stayed correct, so nothing surfaced until the next
+  restart rebuilt `by_id` from the clobbered index. Mainnet then held
+  `header_at(1840209) = 5fd5dac8…` while `header_at(1840210).parent_id =
+  89f6ba6e…` — a broken parent link on the best chain. With no fork visible,
+  reorg detection never fired, `reset_to` was never called, and the validator
+  applied the losing block body, wedging at the next height on an AVL
+  missing-key (the emission box differs per branch) and retrying every five
+  minutes indefinitely.
+
+  `store_entries` is now partitioned at the reorg's fork point. Entries above
+  it are demoted and written via `put_header` with a fork number — PRIMARY +
+  HEADER_FORKS, and `BEST_CHAIN` only when the slot is empty. Partitioning
+  rather than reordering keeps it crash-consistent, and demoting rather than
+  dropping preserves the header bodies that make a reorg back possible.
+
+  **Operators on v0.7.5–v0.7.10 may already carry a clobbered index.** It only
+  manifests after a restart. The new boot-time check reports it but cannot
+  repair it; recovery is a resync.
+
+- **New: boot-time best-chain linkage check.** `verify_best_chain_linkage`
+  walks the recent chain after restore and reports `BrokenParentLink` /
+  `IndexInconsistency`. Bounded to 4096 blocks by default (a full walk is
+  ~1.8M loader reads, and reorg damage lands in the tail). It reports rather
+  than refusing to start — a broken link is recoverable, and refusing to boot
+  would remove the operator's means of recovering.
+
+- **Fix fastsync losing one header per chunk; cold start never bootstrapped.**
+  `GET /blocks/chainSlice` yields `(fromHeight, toHeight]` — the lower bound is
+  excluded. Phase 1 treated it as inclusive, asking for `headers_height + 1`
+  and advancing chunks by `to + 1`, so each chunk silently dropped the header
+  at its own lower bound. On a cold start that is height 1 — genesis — after
+  which nothing can chain and every header sits in the orphan buffer forever.
+  On a warm start it punched a hole every `chunk_size` headers. Never
+  previously exercised: prior runs all logged "headers already synced —
+  skipping phase 1".
+
+- **New: `--compact-state`.** Reclaims unreachable rows from `state.redb` by
+  rewriting the reachable tree into a fresh database, verified by recomputing
+  every node's label against the label its parent references. Writes
+  `state.redb.compacted` alongside and never opens the source for write;
+  swapping is a deliberate operator step. Validated on a real 247.4 GB mainnet
+  database: **247,439,298,560 → 2,155,876,352 bytes (99.1% reclaimed)**,
+  6,596,937 nodes, 404 MB peak RSS, 15m54s, digest matching the applied
+  block's `stateRoot` exactly. Compaction drops the rollback window to a
+  single version, rebuilt as the node syncs forward.
+
+- **Bump `ergo_avltree_rust` to `568e7c3`.** Proof generation was quadratic —
+  `was_modified()` linear-scanned an unbounded `Vec` appended to on every node
+  visit; now O(1) (769s → 46s on the crate's benchmark, and it runs per-block
+  in UTXO mode). Crafted proofs no longer abort the verifier: double-rotation
+  accessors return `Result` instead of panicking, and `Node::label` is an
+  explicit-stack walk instead of recursing per tree level. Every converted
+  site aborted before, so no currently-succeeding input changes behaviour.
+
+- Addons: fastsync 0.1.7 (the chainSlice fix); indexer unchanged at 0.2.8.
+
 ## v0.7.10 — 2026-08-02
 
 - **Fix unbounded `state.redb` growth — superseded AVL nodes were never
