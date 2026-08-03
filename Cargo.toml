@@ -68,26 +68,25 @@ secp256k1 = "0.29"
 # rejecting (consensus-robustness / DoS). The fork returns Err there; this puts
 # Err-not-panic on the eval path, not just the store.
 #
-# Tracks the fork's `main` rather than a rev, deliberately. The workflow is
-# avltree changes → node rebuilds → SANTA grades the result → only then tag.
-# A rev pin adds a hand-maintained number that must be bumped in lockstep and
-# buys nothing, because main is by construction what the node is built and
-# graded against.
+# PINNED BY REV, deliberately — the node ships release binaries, so the exact
+# commit a build came from must be readable from the manifest, not only from
+# Cargo.lock. This dependency is consensus-critical (the AVL prover/verifier
+# decides AD-proof bytes and therefore block validity), so it moves only when
+# someone bumps it and re-verifies. Branch-tracking was tried and reverted:
+# `cargo update` for an unrelated reason would silently move a consensus dep.
 #
-# It also fixes a real coupling: `[patch]` applies ONLY from the top-level
-# workspace root, so a downstream consumer that takes our crates as path-deps
-# (SANTA's donner runner) must restate this patch, and its rev then governs
-# OUR crates too. Two manifests obliged to change together with nothing
-# enforcing it — they had drifted 14 commits. Both tracking `main` removes the
-# hand-matching entirely.
+# Asymmetry with SANTA's donner runner is intentional. `[patch]` applies ONLY
+# from the top-level workspace root, so donner — which consumes our crates as
+# path-deps — must restate this patch, and its rev then governs OUR crates too.
+# donner MAY float on `main`: it is a grading harness, and floating keeps it
+# from drifting behind (the two manifests had silently diverged 14 commits).
+# The node does not float. When main advances, bump HERE deliberately.
 #
-# Reproducibility rests on Cargo.lock, which pins the exact commit and IS
-# committed. `cargo build` will not chase the branch tip; only an explicit
-# `cargo update` moves it. build-deb passes --locked so a stale lockfile fails
-# CI loudly instead of silently building whatever main happens to be.
+# build-deb passes --locked so a stale or missing lockfile fails CI loudly
+# rather than being silently regenerated.
 #
 # Single source of the fork reference: change HERE (members declare the plain
-# "0.1.1"). Coordinate with the sigma-rust session.
+# "0.1.1"). Coordinate the bump with the sigma-rust session, which owns the fork.
 [patch.crates-io]
-ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", branch = "main" }
+ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "d18773c" }
 redb = { path = "patches/redb" }
