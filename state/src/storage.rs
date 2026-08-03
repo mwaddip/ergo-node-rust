@@ -4,8 +4,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use bytes::Bytes;
-use redb::{Database, Durability, ReadableDatabase, ReadableTable};
+use bytes::{Bytes, BytesMut};
+use redb::{
+    Database, DatabaseError, Durability, ReadOnlyDatabase, ReadableDatabase, ReadableTable,
+    ReadableTableMetadata,
+};
 use tracing::{debug, error, info, warn};
 
 use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
@@ -59,6 +62,31 @@ impl Default for CacheSize {
     }
 }
 
+/// Outcome of a successful [`RedbAVLStorage::compact_to`].
+#[derive(Debug, Clone)]
+pub struct CompactionStats {
+    /// Live tree nodes copied into the destination.
+    pub nodes_written: u64,
+    /// Size of the source file, which the call never modifies.
+    pub source_bytes: u64,
+    /// Size of the destination file after commit.
+    pub dest_bytes: u64,
+    /// Block height carried over from the source verbatim.
+    pub block_height: u32,
+    /// The destination's root digest, recomputed from its own stored nodes
+    /// and proven equal to the source's `current_version`.  Cross-check it
+    /// against the `stateRoot` of the header at `block_height` before
+    /// swapping the file into place.
+    pub digest: ADDigest,
+}
+
+/// Periodic progress report from [`RedbAVLStorage::compact_to`]'s copy pass.
+#[derive(Debug, Clone, Copy)]
+pub struct CompactionProgress {
+    /// Nodes copied so far.
+    pub nodes_written: u64,
+}
+
 impl CacheSize {
     /// Resolve to a concrete byte count.
     ///
@@ -75,14 +103,19 @@ impl CacheSize {
     }
 }
 
-/// Format a 32-byte digest as a flat lowercase hex string (64 chars).
-/// Used for grep-friendly diagnostic logging.
-fn digest_hex(label: &Digest32) -> String {
-    let mut s = String::with_capacity(64);
-    for b in label {
+/// Format bytes as a flat lowercase hex string.
+fn bytes_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
         let _ = write!(&mut s, "{:02x}", b);
     }
     s
+}
+
+/// Format a 32-byte digest as a flat lowercase hex string (64 chars).
+/// Used for grep-friendly diagnostic logging.
+fn digest_hex(label: &Digest32) -> String {
+    bytes_hex(label)
 }
 
 /// Log a resolver miss at WARN with the digest hex and a short reason tag.
@@ -1115,5 +1148,645 @@ impl VersionedAVLStorage for RedbAVLStorage {
 
     fn flush(&self) -> Result<()> {
         RedbAVLStorage::flush(self)
+    }
+}
+
+// ── Offline compaction ────────────────────────────────────────────────
+
+/// First byte of an internal node's packed form.
+const PACKED_INTERNAL_PREFIX: u8 = 0x00;
+/// First byte of a leaf node's packed form.
+const PACKED_LEAF_PREFIX: u8 = 0x01;
+/// An internal node's two child labels always occupy the final 64 bytes of
+/// its packed form, whatever the key length.  The copy pass relies on that
+/// to walk the tree without knowing the tree's parameters.
+const INTERNAL_CHILD_LABELS_LEN: usize = 64;
+/// The AVL digest encodes tree height in a single byte, so no well-formed
+/// tree is deeper than this.  Used as a traversal depth cap: a corrupt file
+/// whose child labels form a cycle would otherwise walk forever.
+const MAX_TREE_DEPTH: usize = 255;
+/// Upper bound for the key-length search on a single-leaf tree.
+const MAX_KEY_LENGTH: usize = 64;
+/// redb page cache for the handles compaction opens, split 9:1 by redb
+/// between its read and write caches.
+///
+/// Pinning this is what makes peak memory a constant.  The traversal is
+/// O(tree depth) on its own, but redb's 1 GiB-per-handle default lets the
+/// caches fill to whatever the database offers, and peak RSS then tracks
+/// file size rather than tree depth.  Measured on a synthetic 800k-node
+/// tree (1.08 GB source, 269 MB destination): 32 MB cache → 39 MB peak in
+/// 16.5 s, 256 MB → 275 MB in 10.0 s, 1 GiB → 414 MB in 9.6 s.  256 MB is
+/// the knee — a further 4x of cache buys 4% of throughput.
+const COMPACTION_CACHE_BYTES: usize = 256 * 1024 * 1024;
+/// Nodes between progress callbacks during the copy pass.
+const COMPACTION_PROGRESS_INTERVAL: u64 = 100_000;
+/// Nodes between `info!` ticks during the verification pass.  The contract's
+/// progress callback covers the copy pass only, and verification of a
+/// mainnet-sized tree is long enough that silence looks like a hang.
+const COMPACTION_VERIFY_LOG_INTERVAL: u64 = 1_000_000;
+
+/// Shape of a packed node, with an internal node's child labels extracted.
+enum PackedShape {
+    Internal { left: Digest32, right: Digest32 },
+    Leaf,
+}
+
+/// Validate a packed node against `key_length` and pull out its child labels.
+///
+/// `AVLTree::unpack` panics on short or malformed input; every call site here
+/// runs this check first so a damaged database produces an error instead of
+/// aborting the process.
+///
+/// Assumes variable-length values (`value_length: None`) — the only mode this
+/// crate is used in.  A fixed-length database fails the length arithmetic and
+/// aborts the compaction; it cannot be silently mis-verified.
+fn inspect_packed(packed: &[u8], key_length: usize) -> Result<PackedShape> {
+    match packed.first() {
+        Some(&PACKED_INTERNAL_PREFIX) => {
+            // [0x00 | balance: i8 | key | left_label: 32B | right_label: 32B]
+            let expected = 2 + key_length + INTERNAL_CHILD_LABELS_LEN;
+            if packed.len() != expected {
+                bail!(
+                    "internal node is {} bytes, expected {} for a {}-byte key",
+                    packed.len(),
+                    expected,
+                    key_length
+                );
+            }
+            let off = 2 + key_length;
+            let mut left: Digest32 = [0u8; 32];
+            let mut right: Digest32 = [0u8; 32];
+            left.copy_from_slice(&packed[off..off + 32]);
+            right.copy_from_slice(&packed[off + 32..off + 64]);
+            Ok(PackedShape::Internal { left, right })
+        }
+        Some(&PACKED_LEAF_PREFIX) => {
+            // [0x01 | key | value_len: u32 BE | value | next_key]
+            let vlen_off = 1 + key_length;
+            if packed.len() < vlen_off + 4 + key_length {
+                bail!(
+                    "leaf node is {} bytes, too short for a {}-byte key",
+                    packed.len(),
+                    key_length
+                );
+            }
+            let vlen = u32::from_be_bytes(packed[vlen_off..vlen_off + 4].try_into()?) as usize;
+            let expected = vlen_off + 4 + vlen + key_length;
+            if packed.len() != expected {
+                bail!(
+                    "leaf node is {} bytes, expected {} for a {}-byte value",
+                    packed.len(),
+                    expected,
+                    vlen
+                );
+            }
+            Ok(PackedShape::Leaf)
+        }
+        Some(other) => bail!("unknown packed node prefix 0x{:02x}", other),
+        None => bail!("empty packed node"),
+    }
+}
+
+/// Pack/unpack-only tree, used to recompute labels during verification.
+///
+/// The resolver is never called — `unpack` builds `LabelOnly` children
+/// directly from the packed bytes and `label()` reads their labels straight
+/// out of the node header — but it returns a labelled placeholder rather
+/// than panicking, per this crate's no-panic invariant.
+fn compaction_tree(key_length: usize) -> AVLTree {
+    let resolver: Resolver =
+        Arc::new(|digest: &Digest32| Node::LabelOnly(NodeHeader::new(Some(*digest), None)));
+    AVLTree::with_resolver(resolver, key_length, None)
+}
+
+/// Recompute a packed node's label using the crate's own hashing.
+///
+/// Internal nodes hash `balance` plus their two child labels; leaves hash
+/// key, value and next-key.  `unpack` leaves the header label unset, so
+/// `label()` derives it from the bytes rather than returning a cached value —
+/// which is what makes the comparison against the stored key meaningful.
+fn recompute_label(tree: &AVLTree, packed: &[u8]) -> Digest32 {
+    tree.label(&tree.unpack(&Bytes::copy_from_slice(packed)))
+}
+
+/// Recover the tree's key length from the root node's packed bytes.
+///
+/// `compact_to` takes only two paths and a callback, so it has no
+/// `AVLTreeParams` to work from.  Every candidate is confirmed by
+/// recomputing the root label and comparing it against the label the source
+/// metadata stores the root under, so a wrong guess is rejected rather than
+/// accepted — the operation fails closed.
+fn derive_key_length(root_packed: &[u8], expected_root: &Digest32) -> Result<usize> {
+    let candidates: Vec<usize> = match root_packed.first() {
+        Some(&PACKED_INTERNAL_PREFIX) => {
+            // 1 + 1 + key + 32 + 32 — the key length falls straight out.
+            let fixed = 2 + INTERNAL_CHILD_LABELS_LEN;
+            if root_packed.len() <= fixed {
+                bail!(
+                    "corrupt root: internal node is {} bytes, needs more than {}",
+                    root_packed.len(),
+                    fixed
+                );
+            }
+            vec![root_packed.len() - fixed]
+        }
+        // Single-leaf tree: key length and value length are two unknowns in
+        // one length equation, so try every key length the arithmetic
+        // permits and let the label decide.
+        Some(&PACKED_LEAF_PREFIX) => (1..=MAX_KEY_LENGTH)
+            .filter(|k| inspect_packed(root_packed, *k).is_ok())
+            .collect(),
+        Some(other) => bail!("corrupt root: unknown packed node prefix 0x{:02x}", other),
+        None => bail!("corrupt root: empty packed bytes"),
+    };
+
+    for key_length in candidates {
+        if inspect_packed(root_packed, key_length).is_err() {
+            continue;
+        }
+        if recompute_label(&compaction_tree(key_length), root_packed) == *expected_root {
+            return Ok(key_length);
+        }
+    }
+
+    bail!(
+        "verification failed: the root node's bytes do not hash to {} under any key length",
+        digest_hex(expected_root)
+    )
+}
+
+/// Open `source` with a shared lock and no write capability.
+///
+/// The error mapping is deliberately operator-facing: a locked file means
+/// the node is still running, and an unclean shutdown means redb has no
+/// saved allocator state to load and cannot rebuild it through a read-only
+/// handle.  Neither should surface as a raw redb error.
+fn open_source_read_only(source: &Path) -> Result<ReadOnlyDatabase> {
+    match redb::Builder::new()
+        .set_cache_size(COMPACTION_CACHE_BYTES)
+        .open_read_only(source)
+    {
+        Ok(db) => Ok(db),
+        Err(DatabaseError::DatabaseAlreadyOpen) => bail!(
+            "{} is locked by another process — stop the node first, then run compaction",
+            source.display()
+        ),
+        Err(DatabaseError::RepairAborted) => bail!(
+            "{} was not shut down cleanly and needs repair, which compaction cannot perform \
+             without writing to it — start the node once and stop it gracefully, then retry",
+            source.display()
+        ),
+        Err(e) => Err(anyhow::Error::new(e)
+            .context(format!("failed to open {} read-only", source.display()))),
+    }
+}
+
+/// Walk `dest` from `expected_root`, recomputing every node's label from its
+/// own stored bytes and checking it against the label the parent — or, at the
+/// root, the metadata — references.
+///
+/// A label is Blake2b256 over the node's contents *including its children's
+/// labels*, so a match at the root, established inductively down every
+/// branch, proves that each reachable node was copied byte-exactly and that
+/// none went missing.  That is what makes the rewrite provably lossless
+/// rather than merely plausible; a shallow root-only check would prove
+/// nothing about the other twenty million rows.
+///
+/// Returns the recomputed root label.
+fn verify_compacted(dest: &Path, expected_root: &Digest32, expected_nodes: u64) -> Result<Digest32> {
+    let db = redb::Builder::new()
+        .set_cache_size(COMPACTION_CACHE_BYTES)
+        .open_read_only(dest)
+        .map_err(anyhow::Error::new)
+        .context("failed to reopen the compacted database for verification")?;
+    let read_txn = db.begin_read()?;
+    let nodes = read_txn.open_table(NODES_TABLE)?;
+
+    let key_length = {
+        let guard = nodes
+            .get(expected_root.as_slice())?
+            .context("verification failed: the root node is missing from the compacted database")?;
+        derive_key_length(guard.value(), expected_root)?
+    };
+    let tree = compaction_tree(key_length);
+
+    let mut root_label: Option<Digest32> = None;
+    let mut visited: u64 = 0;
+    let mut next_log = COMPACTION_VERIFY_LOG_INTERVAL;
+    let mut stack: Vec<(Digest32, usize)> = vec![(*expected_root, 0)];
+
+    while let Some((label, depth)) = stack.pop() {
+        if depth > MAX_TREE_DEPTH {
+            bail!(
+                "verification failed: traversal passed {} levels at node {}",
+                MAX_TREE_DEPTH,
+                digest_hex(&label)
+            );
+        }
+
+        let guard = nodes.get(label.as_slice())?.with_context(|| {
+            format!(
+                "verification failed: node {} is missing from the compacted database",
+                digest_hex(&label)
+            )
+        })?;
+        let packed: &[u8] = guard.value();
+
+        let shape = inspect_packed(packed, key_length).with_context(|| {
+            format!(
+                "verification failed: node {} is malformed",
+                digest_hex(&label)
+            )
+        })?;
+
+        let computed = recompute_label(&tree, packed);
+        if computed != label {
+            // The check cannot tell a bad copy from an already-damaged
+            // source, and does not need to: either way the result must not
+            // be presented as a compacted database.
+            bail!(
+                "verification failed: the node stored under {} hashes to {} — the source is \
+                 corrupt, or the copy was not byte-exact",
+                digest_hex(&label),
+                digest_hex(&computed)
+            );
+        }
+        drop(guard);
+
+        if depth == 0 {
+            root_label = Some(computed);
+        }
+        visited += 1;
+        if visited >= next_log {
+            info!(verified = visited, "compaction: verification in progress");
+            next_log += COMPACTION_VERIFY_LOG_INTERVAL;
+        }
+
+        if let PackedShape::Internal { left, right } = shape {
+            stack.push((right, depth + 1));
+            stack.push((left, depth + 1));
+        }
+    }
+
+    if visited != expected_nodes {
+        bail!(
+            "verification failed: the compacted database holds {} reachable nodes, but {} were \
+             written",
+            visited,
+            expected_nodes
+        );
+    }
+
+    // Postcondition: dest contains *exactly* the reachable nodes.  Anything
+    // extra would mean the rewrite carried bloat across.
+    let total_rows = nodes.len()?;
+    if total_rows != visited {
+        bail!(
+            "verification failed: the compacted database holds {} rows but only {} are reachable",
+            total_rows,
+            visited
+        );
+    }
+
+    root_label.context("verification failed: traversal visited no nodes")
+}
+
+impl RedbAVLStorage {
+    /// Rewrite the reachable tree from `source` into a fresh database at
+    /// `dest`, discarding rows that no longer belong to the live tree.
+    ///
+    /// Two mechanisms leave unreachable rows behind: the rollback path skips
+    /// deleting an undo record's inserted labels (they may still be
+    /// referenced), and node v0.7.5–v0.7.9 shipped a call-order bug that
+    /// leaked every superseded node.  Neither corrupts the tree — traversals
+    /// only ever follow labels from a root — so this reclaims space, it does
+    /// not repair anything.
+    ///
+    /// A depth-first walk of the current root visits every live node exactly
+    /// once (each has exactly one parent), so no visited set is needed and
+    /// traversal memory is O(tree depth).  The destination is built fresh
+    /// from only those nodes, which makes it minimal by construction —
+    /// `redb::Database::compact()` is neither used nor required.
+    ///
+    /// The rollback window is not carried over: `dest` holds a single
+    /// version and an empty `undo` table.  Retaining the window would mean
+    /// walking every retained root, which reintroduces the visited set this
+    /// design exists to avoid.
+    ///
+    /// `source` is opened read-only and is never written to.  On any error
+    /// `dest` is removed.  Returning `Ok` requires the verification pass to
+    /// pass, so a missing or altered node cannot be laundered into a
+    /// "compacted" database.
+    ///
+    /// The tree's key length is recovered from the root node's packed bytes
+    /// and confirmed cryptographically; values are assumed variable-length,
+    /// which is the only mode this crate is used in.  A database that
+    /// violates that assumption fails verification rather than compacting
+    /// incorrectly.
+    ///
+    /// Rows in `nodes` that are not tree nodes — the `additional_data`
+    /// entries `update()` accepts — are not reachable from the root and are
+    /// therefore dropped.  No caller in this workspace passes any.
+    pub fn compact_to(
+        source: &Path,
+        dest: &Path,
+        progress: Option<&dyn Fn(CompactionProgress)>,
+    ) -> Result<CompactionStats> {
+        if dest.exists() {
+            bail!(
+                "compaction destination {} already exists — refusing to overwrite it",
+                dest.display()
+            );
+        }
+
+        match Self::compact_to_inner(source, dest, progress) {
+            Ok(stats) => Ok(stats),
+            Err(e) => {
+                // Every handle on dest is owned by compact_to_inner and has
+                // been dropped by the time we get here, so the file can go.
+                if dest.exists() {
+                    if let Err(rm) = std::fs::remove_file(dest) {
+                        error!(
+                            path = %dest.display(),
+                            error = %rm,
+                            "failed to remove the partial compaction output — delete it manually"
+                        );
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn compact_to_inner(
+        source: &Path,
+        dest: &Path,
+        progress: Option<&dyn Fn(CompactionProgress)>,
+    ) -> Result<CompactionStats> {
+        let source_bytes = std::fs::metadata(source)
+            .with_context(|| format!("cannot stat compaction source {}", source.display()))?
+            .len();
+
+        let source_db = open_source_read_only(source)?;
+
+        // 1. Read the source's root state.  An empty database is an error,
+        //    not a no-op — there is nothing to compact and silently
+        //    producing an empty dest would be worse than saying so.
+        let source_read = source_db.begin_read()?;
+        let (top_node_hash, top_node_height, current_version, block_height, lsn) = {
+            let meta = source_read
+                .open_table(META_TABLE)
+                .context("source is not an enr-state database (no `metadata` table)")?;
+
+            let hash_guard = meta.get(META_TOP_NODE_HASH)?.context(
+                "source database has no top_node_hash — it is empty or uninitialised, \
+                 nothing to compact",
+            )?;
+            let hash_bytes: &[u8] = hash_guard.value();
+            if hash_bytes.len() != 32 {
+                bail!(
+                    "corrupt source: top_node_hash is {} bytes, expected 32",
+                    hash_bytes.len()
+                );
+            }
+            let mut top_node_hash: Digest32 = [0u8; 32];
+            top_node_hash.copy_from_slice(hash_bytes);
+            drop(hash_guard);
+
+            let height_guard = meta
+                .get(META_TOP_NODE_HEIGHT)?
+                .context("corrupt source: top_node_hash is set but top_node_height is missing")?;
+            let top_node_height = u32::from_be_bytes(
+                height_guard
+                    .value()
+                    .try_into()
+                    .context("corrupt source: top_node_height is not 4 bytes")?,
+            );
+            drop(height_guard);
+
+            let version_guard = meta.get(META_CURRENT_VERSION)?.context(
+                "source database has no current_version — it is empty or uninitialised, \
+                 nothing to compact",
+            )?;
+            let current_version: ADDigest = Bytes::copy_from_slice(version_guard.value());
+            drop(version_guard);
+
+            let block_height = match meta.get(META_BLOCK_HEIGHT)? {
+                Some(v) => u32::from_be_bytes(
+                    v.value()
+                        .try_into()
+                        .context("corrupt source: block_height is not 4 bytes")?,
+                ),
+                None => 0,
+            };
+            let lsn = match meta.get(META_LSN)? {
+                Some(v) => u64::from_be_bytes(
+                    v.value()
+                        .try_into()
+                        .context("corrupt source: lsn is not 8 bytes")?,
+                ),
+                None => 1,
+            };
+
+            (
+                top_node_hash,
+                top_node_height,
+                current_version,
+                block_height,
+                lsn,
+            )
+        };
+
+        info!(
+            source = %source.display(),
+            dest = %dest.display(),
+            block_height,
+            root = %digest_hex(&top_node_hash),
+            "compaction: copying the reachable tree"
+        );
+
+        // 2. Copy pass.  One read transaction over the source for a
+        //    consistent view, one write transaction over the destination so
+        //    a failure leaves nothing behind.  redb returns pages freed
+        //    within a transaction straight to its allocator, so the single
+        //    large transaction does not accumulate superseded B-tree pages.
+        let dest_db = Database::builder()
+            .set_cache_size(COMPACTION_CACHE_BYTES)
+            .create(dest)
+            .with_context(|| {
+                format!("failed to create compaction destination {}", dest.display())
+            })?;
+
+        let mut nodes_written: u64 = 0;
+        {
+            let src_nodes = source_read
+                .open_table(NODES_TABLE)
+                .context("source is not an enr-state database (no `nodes` table)")?;
+
+            let mut write_txn = dest_db.begin_write()?;
+            write_txn.set_quick_repair(true);
+            write_txn.set_durability(Durability::Immediate)?;
+            {
+                let mut dst_nodes = write_txn.open_table(NODES_TABLE)?;
+                let mut dst_meta = write_txn.open_table(META_TABLE)?;
+                // Create `undo` so the destination has the same table shape
+                // as a normally-created database.  It stays empty.
+                let _ = write_txn.open_table(UNDO_TABLE)?;
+
+                let mut next_progress = COMPACTION_PROGRESS_INTERVAL;
+                let mut stack: Vec<(Digest32, usize)> = vec![(top_node_hash, 0)];
+
+                while let Some((label, depth)) = stack.pop() {
+                    if depth > MAX_TREE_DEPTH {
+                        bail!(
+                            "source is corrupt: traversal passed {} levels at node {} — the \
+                             child labels form a cycle or are damaged",
+                            MAX_TREE_DEPTH,
+                            digest_hex(&label)
+                        );
+                    }
+
+                    // A reachable label with no row behind it is genuine
+                    // corruption, not bloat.  Skipping it would launder a
+                    // damaged tree into a database that looks compacted.
+                    let guard = src_nodes.get(label.as_slice())?.with_context(|| {
+                        format!(
+                            "source is corrupt: node {} is reachable from the root but missing \
+                             from the `nodes` table",
+                            digest_hex(&label)
+                        )
+                    })?;
+                    let packed: &[u8] = guard.value();
+
+                    // The copy pass does not need the tree parameters: an
+                    // internal node's child labels are always its final 64
+                    // bytes, and leaves terminate.
+                    let children = match packed.first() {
+                        Some(&PACKED_INTERNAL_PREFIX) => {
+                            if packed.len() < 2 + INTERNAL_CHILD_LABELS_LEN {
+                                bail!(
+                                    "source is corrupt: internal node {} is only {} bytes",
+                                    digest_hex(&label),
+                                    packed.len()
+                                );
+                            }
+                            let split = packed.len() - INTERNAL_CHILD_LABELS_LEN;
+                            let mut left: Digest32 = [0u8; 32];
+                            let mut right: Digest32 = [0u8; 32];
+                            left.copy_from_slice(&packed[split..split + 32]);
+                            right.copy_from_slice(&packed[split + 32..]);
+                            Some((left, right))
+                        }
+                        Some(&PACKED_LEAF_PREFIX) => None,
+                        Some(other) => bail!(
+                            "source is corrupt: node {} has unknown packed prefix 0x{:02x}",
+                            digest_hex(&label),
+                            other
+                        ),
+                        None => bail!(
+                            "source is corrupt: node {} has empty packed bytes",
+                            digest_hex(&label)
+                        ),
+                    };
+
+                    dst_nodes.insert(label.as_slice(), packed)?;
+                    drop(guard);
+                    nodes_written += 1;
+
+                    if nodes_written >= next_progress {
+                        if let Some(cb) = progress {
+                            cb(CompactionProgress { nodes_written });
+                        }
+                        next_progress += COMPACTION_PROGRESS_INTERVAL;
+                    }
+
+                    if let Some((left, right)) = children {
+                        stack.push((right, depth + 1));
+                        stack.push((left, depth + 1));
+                    }
+                }
+
+                // 3. Metadata carried over verbatim, except the version
+                //    chain, which collapses to the single surviving version.
+                dst_meta.insert(META_TOP_NODE_HASH, top_node_hash.as_slice())?;
+                dst_meta.insert(
+                    META_TOP_NODE_HEIGHT,
+                    top_node_height.to_be_bytes().as_slice(),
+                )?;
+                dst_meta.insert(META_CURRENT_VERSION, current_version.as_ref())?;
+                dst_meta.insert(META_LSN, lsn.to_be_bytes().as_slice())?;
+                dst_meta.insert(META_BLOCK_HEIGHT, block_height.to_be_bytes().as_slice())?;
+
+                let chain = VecDeque::from([(lsn, current_version.clone())]);
+                let chain_bytes = Self::serialize_version_chain(&chain);
+                dst_meta.insert(META_VERSIONS, chain_bytes.as_slice())?;
+            }
+            write_txn
+                .commit()
+                .context("failed to commit the compacted database")?;
+        }
+
+        if let Some(cb) = progress {
+            cb(CompactionProgress { nodes_written });
+        }
+
+        // Release both exclusive handles: the verification pass opens dest
+        // read-only, which needs a shared lock.
+        drop(dest_db);
+        drop(source_read);
+        drop(source_db);
+
+        let dest_bytes = std::fs::metadata(dest)
+            .with_context(|| format!("cannot stat compaction destination {}", dest.display()))?
+            .len();
+
+        info!(
+            nodes_written,
+            source_bytes, dest_bytes, "compaction: copy complete, verifying"
+        );
+
+        // 4. Verification is mandatory.  Without it "compacted" would mean
+        //    "we think we copied everything".
+        let root_label = verify_compacted(dest, &top_node_hash, nodes_written)?;
+
+        // The AVL digest is the root label followed by the tree height as a
+        // single byte — see AuthenticatedTreeOps::digest.
+        if top_node_height > u8::MAX as u32 {
+            bail!(
+                "corrupt source: top_node_height {} does not fit the single byte the AVL digest \
+                 encodes it in",
+                top_node_height
+            );
+        }
+        let mut digest = BytesMut::with_capacity(root_label.len() + 1);
+        digest.extend_from_slice(&root_label);
+        digest.extend_from_slice(&[top_node_height as u8]);
+        let digest: ADDigest = digest.freeze();
+
+        if digest != current_version {
+            bail!(
+                "verification failed: the compacted root digest {} does not match the source's \
+                 current_version {}",
+                bytes_hex(&digest),
+                bytes_hex(&current_version)
+            );
+        }
+
+        info!(
+            nodes_written,
+            source_bytes,
+            dest_bytes,
+            block_height,
+            digest = %bytes_hex(&digest),
+            "compaction: verified"
+        );
+
+        Ok(CompactionStats {
+            nodes_written,
+            source_bytes,
+            dest_bytes,
+            block_height,
+            digest,
+        })
     }
 }

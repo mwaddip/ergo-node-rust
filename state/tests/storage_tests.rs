@@ -885,3 +885,417 @@ fn block_height_is_none_on_empty_storage() {
     assert!(storage.version().is_none());
     assert!(storage.block_height().is_none());
 }
+
+// ── Offline compaction ───────────────────────────────────────────────
+
+use enr_state::{CompactionProgress, CompactionStats};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
+use std::cell::RefCell;
+use std::path::Path;
+
+const NODES_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("nodes");
+const UNDO_DEF: TableDefinition<u64, &[u8]> = TableDefinition::new("undo");
+const META_DEF: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
+
+/// Open storage and rebuild a prover on top of whatever root is stored —
+/// the resume flow from the contract's initialization section.  Used to
+/// churn a tree across several open/close cycles.
+fn open_with_prover(path: &Path, keep_versions: u32) -> (RedbAVLStorage, BatchAVLProver) {
+    let mut storage =
+        RedbAVLStorage::open(path, params(), keep_versions, CacheSize::default()).unwrap();
+    let resolver = storage.resolver();
+    let mut tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
+    if let Some(version) = storage.version() {
+        let (root, height) = storage.rollback(&version).unwrap();
+        tree.root = Some(root);
+        tree.height = height;
+    }
+    let prover = BatchAVLProver::new(tree, true);
+    (storage, prover)
+}
+
+/// Overwrite every key with a round-specific value and commit at `height`.
+fn churn_round(path: &Path, keys: u8, round: u8, value_len: usize, height: u32) {
+    let (mut storage, mut prover) = open_with_prover(path, 10);
+    for k in 0..keys {
+        prover
+            .perform_one_operation(&Operation::InsertOrUpdate(KeyValue {
+                key: make_key(k),
+                value: make_value(k.wrapping_add(round), value_len),
+            }))
+            .unwrap();
+    }
+    storage.update_with_height(&mut prover, vec![], height).unwrap();
+    storage.flush().unwrap();
+}
+
+fn every_node_row(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let db = Database::builder().create(path).unwrap();
+    let txn = db.begin_read().unwrap();
+    let table = txn.open_table(NODES_DEF).unwrap();
+    table
+        .iter()
+        .unwrap()
+        .map(|row| {
+            let (k, v) = row.unwrap();
+            (k.value().to_vec(), v.value().to_vec())
+        })
+        .collect()
+}
+
+fn node_row_count(path: &Path) -> u64 {
+    let db = Database::builder().create(path).unwrap();
+    let txn = db.begin_read().unwrap();
+    txn.open_table(NODES_DEF).unwrap().len().unwrap()
+}
+
+fn undo_row_count(path: &Path) -> u64 {
+    let db = Database::builder().create(path).unwrap();
+    let txn = db.begin_read().unwrap();
+    txn.open_table(UNDO_DEF).unwrap().len().unwrap()
+}
+
+/// Independent walk of the live tree, so the test's notion of "reachable"
+/// does not come from the code under test.
+fn reachable_node_count(path: &Path) -> u64 {
+    let db = Database::builder().create(path).unwrap();
+    let txn = db.begin_read().unwrap();
+    let nodes = txn.open_table(NODES_DEF).unwrap();
+    let meta = txn.open_table(META_DEF).unwrap();
+
+    let root = meta
+        .get("top_node_hash")
+        .unwrap()
+        .unwrap()
+        .value()
+        .to_vec();
+
+    let mut stack = vec![root];
+    let mut count = 0u64;
+    while let Some(label) = stack.pop() {
+        let packed = nodes
+            .get(label.as_slice())
+            .unwrap()
+            .expect("reachable node missing from source")
+            .value()
+            .to_vec();
+        count += 1;
+        // Internal node: the two child labels are the final 64 bytes.
+        if packed[0] == 0x00 {
+            let split = packed.len() - 64;
+            stack.push(packed[split..split + 32].to_vec());
+            stack.push(packed[split + 32..].to_vec());
+        }
+    }
+    count
+}
+
+/// Re-insert the rows an update deleted.  This reproduces the v0.7.5–v0.7.9
+/// leak, where `generate_proof()` cleared the changed-node buffers before
+/// `update_internal` read them, so the per-block delete list came back empty
+/// and every superseded node stayed in `nodes`.  Returns the rows put back.
+fn reinject_removed(path: &Path, before: &[(Vec<u8>, Vec<u8>)]) -> usize {
+    let db = Database::builder().create(path).unwrap();
+    let mut write_txn = db.begin_write().unwrap();
+    write_txn.set_quick_repair(true);
+    let mut reinjected = 0;
+    {
+        let mut table = write_txn.open_table(NODES_DEF).unwrap();
+        for (label, packed) in before {
+            let gone = table.get(label.as_slice()).unwrap().is_none();
+            if gone {
+                table.insert(label.as_slice(), packed.as_slice()).unwrap();
+                reinjected += 1;
+            }
+        }
+    }
+    write_txn.commit().unwrap();
+    reinjected
+}
+
+/// Build a bloated source: populate, then churn, leaking every superseded
+/// node the way the shipped bug did.  Returns the tempdir, the source path
+/// and the number of leaked rows.
+fn bloated_source(rounds: u8) -> (tempfile::TempDir, std::path::PathBuf, usize) {
+    const KEYS: u8 = 200;
+    const VALUE_LEN: usize = 512;
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("state.redb");
+
+    churn_round(&src, KEYS, 0, VALUE_LEN, 1);
+
+    let mut leaked = 0;
+    for round in 1..=rounds {
+        let before = every_node_row(&src);
+        churn_round(&src, KEYS, round, VALUE_LEN, 1 + u32::from(round));
+        leaked += reinject_removed(&src, &before);
+    }
+
+    (dir, src, leaked)
+}
+
+#[test]
+fn compact_to_reclaims_unreachable_rows() {
+    let (dir, src, leaked) = bloated_source(12);
+    assert!(leaked > 0, "the churn loop leaked nothing to reclaim");
+
+    let bloated_rows = node_row_count(&src);
+    let reachable = reachable_node_count(&src);
+    assert!(
+        bloated_rows > reachable,
+        "expected unreachable rows: {bloated_rows} total vs {reachable} reachable"
+    );
+
+    let (version, block_height) = {
+        let storage = RedbAVLStorage::open(&src, params(), 10, CacheSize::default()).unwrap();
+        (storage.version().unwrap(), storage.block_height().unwrap())
+    };
+
+    // Byte-level baseline — the contract promises source is untouched.
+    let source_before = std::fs::read(&src).unwrap();
+
+    let dest = dir.path().join("state.redb.compacted");
+    let ticks = RefCell::new(Vec::new());
+    let stats = RedbAVLStorage::compact_to(
+        &src,
+        &dest,
+        Some(&|p: CompactionProgress| ticks.borrow_mut().push(p.nodes_written)),
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read(&src).unwrap(),
+        source_before,
+        "source must be byte-identical after compaction"
+    );
+
+    assert_eq!(stats.digest, version, "compaction must preserve the digest");
+    assert_eq!(stats.block_height, block_height, "block_height must carry over");
+    assert_eq!(stats.nodes_written, reachable);
+    assert_eq!(stats.source_bytes, source_before.len() as u64);
+    assert_eq!(
+        node_row_count(&dest),
+        reachable,
+        "dest must hold exactly the reachable nodes"
+    );
+    assert_eq!(undo_row_count(&dest), 0, "dest must have an empty undo table");
+    assert!(
+        stats.dest_bytes < stats.source_bytes,
+        "dest ({}) is not smaller than source ({})",
+        stats.dest_bytes,
+        stats.source_bytes
+    );
+
+    // The final tick always fires, so the caller sees the true total.
+    let ticks = ticks.into_inner();
+    assert_eq!(ticks.last().copied(), Some(reachable));
+}
+
+#[test]
+fn compacted_output_resumes_and_applies_the_next_block() {
+    // The swap protocol's acceptance test: the compacted file opens as
+    // storage, reports the same version and height, and takes another block.
+    let (dir, src, _) = bloated_source(6);
+
+    let (version, block_height) = {
+        let storage = RedbAVLStorage::open(&src, params(), 10, CacheSize::default()).unwrap();
+        (storage.version().unwrap(), storage.block_height().unwrap())
+    };
+
+    let dest = dir.path().join("state.redb.compacted");
+    let stats = RedbAVLStorage::compact_to(&src, &dest, None).unwrap();
+    assert_eq!(stats.digest, version);
+
+    {
+        let storage = RedbAVLStorage::open(&dest, params(), 10, CacheSize::default()).unwrap();
+        assert_eq!(storage.version().unwrap(), version);
+        assert_eq!(storage.block_height().unwrap(), block_height);
+        // The rollback window is the documented trade — a single version
+        // survives, so there is nothing to roll back to.
+        assert_eq!(storage.rollback_versions().count(), 0);
+    }
+
+    // Resume a prover from the compacted root and apply one more block.
+    let (mut storage, mut prover) = open_with_prover(&dest, 10);
+    assert_eq!(prover.digest().unwrap(), version);
+
+    prover
+        .perform_one_operation(&Operation::InsertOrUpdate(KeyValue {
+            key: make_key(250),
+            value: make_value(250, 64),
+        }))
+        .unwrap();
+    storage
+        .update_with_height(&mut prover, vec![], block_height + 1)
+        .unwrap();
+
+    assert_ne!(storage.version().unwrap(), version);
+    assert_eq!(storage.block_height().unwrap(), block_height + 1);
+    assert_eq!(prover.digest().unwrap(), storage.version().unwrap());
+}
+
+#[test]
+fn compact_to_drops_rollback_orphans() {
+    // Mechanism 1 from the contract: rollback deliberately skips deleting an
+    // undo record's inserted labels, because they may still be referenced.
+    // The ones that are not become unreachable rows.
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("state.redb");
+
+    churn_round(&src, 120, 0, 256, 1);
+    let mut versions = Vec::new();
+    for round in 1..=6u8 {
+        churn_round(&src, 120, round, 256, 1 + u32::from(round));
+        let storage = RedbAVLStorage::open(&src, params(), 20, CacheSize::default()).unwrap();
+        versions.push(storage.version().unwrap());
+    }
+
+    let target = versions[1].clone();
+    {
+        let mut storage = RedbAVLStorage::open(&src, params(), 20, CacheSize::default()).unwrap();
+        storage.rollback(&target).unwrap();
+        storage.flush().unwrap();
+    }
+
+    let reachable = reachable_node_count(&src);
+    assert!(
+        node_row_count(&src) > reachable,
+        "rollback should have left orphaned nodes behind"
+    );
+
+    let dest = dir.path().join("state.redb.compacted");
+    let stats = RedbAVLStorage::compact_to(&src, &dest, None).unwrap();
+
+    assert_eq!(stats.digest, target);
+    assert_eq!(stats.nodes_written, reachable);
+    assert_eq!(node_row_count(&dest), reachable);
+}
+
+#[test]
+fn compact_to_fails_when_a_reachable_node_is_missing() {
+    // Genuine corruption, not bloat: a root label with no row behind it.
+    // Compaction must refuse rather than launder it into a "compacted" file.
+    let (dir, src, _) = bloated_source(2);
+
+    {
+        let db = Database::builder().create(&src).unwrap();
+        let mut write_txn = db.begin_write().unwrap();
+        write_txn.set_quick_repair(true);
+        {
+            let mut meta = write_txn.open_table(META_DEF).unwrap();
+            meta.insert("top_node_hash", [0xABu8; 32].as_slice()).unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    let dest = dir.path().join("state.redb.compacted");
+    let err = RedbAVLStorage::compact_to(&src, &dest, None).unwrap_err();
+
+    assert!(
+        err.to_string().contains("missing from the `nodes` table"),
+        "unexpected error: {err}"
+    );
+    assert!(!dest.exists(), "dest must be removed on failure");
+}
+
+#[test]
+fn compact_to_fails_when_a_node_is_altered() {
+    // The copy pass moves bytes verbatim, so nothing before verification
+    // would notice a leaf whose value had been rewritten under its original
+    // label.  Verification recomputes every label from the bytes actually
+    // stored, which is the only reason "provably lossless" means anything —
+    // without this the check would be a tautology over the root row.
+    let (dir, src, _) = bloated_source(2);
+
+    // Flip a byte inside some leaf's value and put it back under the same key.
+    let victim = every_node_row(&src)
+        .into_iter()
+        .find(|(_, packed)| packed[0] == 0x01)
+        .expect("no leaf in the tree");
+    let (label, mut packed) = victim;
+    let value_start = 1 + KEY_LEN + 4;
+    packed[value_start] ^= 0xFF;
+
+    {
+        let db = Database::builder().create(&src).unwrap();
+        let mut write_txn = db.begin_write().unwrap();
+        write_txn.set_quick_repair(true);
+        {
+            let mut nodes = write_txn.open_table(NODES_DEF).unwrap();
+            nodes.insert(label.as_slice(), packed.as_slice()).unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    let dest = dir.path().join("state.redb.compacted");
+    let err = RedbAVLStorage::compact_to(&src, &dest, None).unwrap_err();
+
+    // Specifically the label-mismatch branch, not some incidental failure.
+    assert!(
+        err.to_string().contains("the copy was not byte-exact"),
+        "unexpected error: {err}"
+    );
+    assert!(!dest.exists(), "dest must be removed on failure");
+}
+
+#[test]
+fn compact_to_refuses_an_existing_destination() {
+    let (dir, src, _) = bloated_source(1);
+
+    let dest = dir.path().join("state.redb.compacted");
+    std::fs::write(&dest, b"not mine").unwrap();
+
+    let err = RedbAVLStorage::compact_to(&src, &dest, None).unwrap_err();
+    assert!(err.to_string().contains("already exists"), "unexpected error: {err}");
+    // Refusing to overwrite means refusing to delete, too.
+    assert_eq!(std::fs::read(&dest).unwrap(), b"not mine");
+}
+
+#[test]
+fn compact_to_rejects_an_empty_source() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("state.redb");
+    drop(RedbAVLStorage::open(&src, params(), 10, CacheSize::default()).unwrap());
+
+    let dest = dir.path().join("state.redb.compacted");
+    let err = RedbAVLStorage::compact_to(&src, &dest, None).unwrap_err();
+
+    assert!(err.to_string().contains("nothing to compact"), "unexpected error: {err}");
+    assert!(!dest.exists());
+}
+
+#[test]
+fn compact_to_reports_a_locked_source() {
+    // Someone will run this against a running node.  They get told to stop
+    // it, not a raw redb error string.
+    let (dir, src, _) = bloated_source(1);
+
+    let _held = RedbAVLStorage::open(&src, params(), 10, CacheSize::default()).unwrap();
+
+    let dest = dir.path().join("state.redb.compacted");
+    let err = RedbAVLStorage::compact_to(&src, &dest, None).unwrap_err();
+
+    assert!(
+        err.to_string().contains("stop the node first"),
+        "unexpected error: {err}"
+    );
+    assert!(!dest.exists());
+}
+
+#[test]
+fn compaction_stats_are_reported() {
+    // CompactionStats is what the operator inspects before swapping files,
+    // so every field has to be populated.
+    let (dir, src, _) = bloated_source(4);
+    let dest = dir.path().join("state.redb.compacted");
+
+    let stats: CompactionStats = RedbAVLStorage::compact_to(&src, &dest, None).unwrap();
+
+    assert!(stats.nodes_written > 0);
+    assert_eq!(stats.source_bytes, std::fs::metadata(&src).unwrap().len());
+    assert_eq!(stats.dest_bytes, std::fs::metadata(&dest).unwrap().len());
+    assert_eq!(stats.block_height, 5);
+    // The AVL digest is the 32-byte root label plus the tree height byte.
+    assert_eq!(stats.digest.len(), 33);
+}

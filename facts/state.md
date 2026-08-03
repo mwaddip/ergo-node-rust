@@ -522,9 +522,35 @@ pub struct CompactionProgress {
 
 - No process holds `source` open. redb's file lock enforces this; surface the
   lock error as "stop the node first", not as a raw redb error.
+- **`source` was last closed cleanly.** A database whose final commit left no
+  allocator-state table — i.e. the node was SIGKILLed rather than stopped —
+  cannot be opened read-only at all: redb returns `RepairAborted`, and a
+  read-only open is not permitted to run the repair. Surface this as "start
+  the node once and stop it gracefully, then retry", not as a raw redb error.
+  This is a live risk on any first compaction of a database from a crashed
+  node.
 - `source` has a `current_version` and a `top_node_hash` — i.e. it is not an
   empty/uninitialised database. Empty source is an error, not a no-op.
 - `dest` does not already exist.
+
+### Tree parameters
+
+`compact_to` takes no `AVLTreeParams`. Leaf label verification needs
+`key_length` and `value_length`, which are recovered rather than supplied:
+
+- `key_length` is derived from the root node's packed bytes and then confirmed
+  cryptographically — a wrong derivation cannot produce matching labels, so it
+  fails closed.
+- `value_length` is assumed `None` (variable-length values), which is what
+  every database this crate writes uses.
+
+A source built with a fixed `value_length` is therefore **unsupported**, but
+unsupported safely: leaf parsing would misread, recomputed labels would not
+match, and verification returns `Err`. There is no path to a false `Ok`.
+
+Keeping the parameters out of the signature is deliberate — an offline tool
+that requires the operator to remember the parameters a file was created with
+is its own footgun, and the file is self-describing enough to avoid it.
 
 ### Algorithm
 
@@ -547,16 +573,32 @@ pub struct CompactionProgress {
 
 ### Verification (mandatory, in-process)
 
-After committing `dest`, reopen it, load the root, and recompute the AVL
-digest. It must equal `current_version` read from `source`.
-
-This is a cryptographic check, not a heuristic: the digest is the root label
-plus tree height, and a label is a Blake2b256 hash over the node's contents
-including its children's labels. A missing, truncated, or altered node cannot
-produce a matching root digest. A match therefore proves the rewrite preserved
-every reachable node exactly.
+After committing `dest`, reopen it and walk the whole reachable tree again,
+recomputing **every** node's label from that node's own stored bytes and
+comparing it against the label its parent references. The root's recomputed
+label plus `top_node_height` must equal `current_version` read from `source`.
 
 `compact_to` MUST NOT return `Ok` without this check passing.
+
+**Do not shortcut this to "load the root and recompute the digest."** That
+verifies exactly one row. Unpacking a node yields `LabelOnly` children whose
+labels are read out of the *parent's* packed bytes, not out of the children's
+own stored rows — so re-hashing the root merely re-hashes bytes that were
+copied verbatim from source, and a missing, truncated, or altered node
+anywhere below the root goes undetected. An earlier revision of this contract
+asserted the shortcut was sufficient; it is not.
+
+The recursive form is what makes the check cryptographic rather than a
+heuristic. Each label is a Blake2b256 over the node's contents including its
+children's labels, so recomputing bottom-up chains every stored row into the
+root digest. A match then genuinely proves the rewrite preserved every
+reachable node exactly.
+
+Cost is a second full pass over `dest` — but `dest` is the *compacted* database,
+so on a heavily bloated source the pass is close to free. Measured at mainnet
+scale: copy 15m24s (random reads across a 247 GB source), verify **30s** (2.16 GB
+dest, largely page-cached). Verification was **3%** of total runtime. There is
+no efficiency argument for trading the guarantee away.
 
 ### Postconditions
 
@@ -567,6 +609,12 @@ On `Ok`:
 - `dest`'s digest equals `source`'s `current_version`.
 - `dest`'s `block_height` equals `source`'s.
 - `dest` has one version in its chain and an empty `undo` table.
+- Any rows `update()` wrote into `nodes` from its `additional_data` argument
+  that are not reachable from the root are **dropped**, being
+  indistinguishable from orphans. Every caller in this workspace passes
+  `vec![]`, so this is currently vacuous — but a future caller that uses
+  `additional_data` for side-band storage must not expect it to survive
+  compaction.
 
 On `Err`:
 
@@ -599,13 +647,74 @@ reintroduce the multi-root visited set that makes sweeping impractical.
 
 ### Characteristics
 
-- Memory: O(tree depth), independent of database size.
+**Memory is engineered, not inherent.** The traversal itself is O(tree depth)
+— an explicit stack, ~35 frames at mainnet size, no visited set. But redb
+defaults to a **1 GiB page cache per handle**, and with that default peak RSS
+tracks source file size rather than live-set size. Every handle opened by
+`compact_to` must therefore pin its cache explicitly.
+
+Measured on a synthetic 800k-node tree (1.08 GB source → 269 MB dest):
+
+| Page cache | Peak RSS | Runtime |
+|---|---|---|
+| 1 GiB (redb default) | 414 MB | 9.6 s |
+| 256 MB (chosen) | 275 MB | 10.0 s |
+| 32 MB | 39 MB | 16.5 s |
+
+At 32 MB the peak is flat — 4× the nodes moved RSS by ~5% — which isolates the
+page cache as the only size-dependent term. 256 MB is the knee: 4× more cache
+buys ~4% throughput.
+
+Resulting profile: peak RSS roughly constant regardless of source size, plus
+redb allocator bookkeeping that scales with the **live** tree only.
+
+**Validated at mainnet scale 2026-08-03** — a 247.4 GB source, 229× larger than
+the synthetic fixture the cache was tuned on:
+
+| | |
+|---|---|
+| Source / dest | 247,439,298,560 → 2,155,876,352 B (**99.1%** reclaimed) |
+| Live nodes | 6,596,937 |
+| Peak RSS | **404 MB** |
+| Wall clock | 15m54s (copy 15m24s, verify 30s) |
+| CPU | 35% — I/O bound, 56.8M filesystem reads |
+| Digest | matched the applied block's `stateRoot` exactly |
+| Source | byte-identical afterwards |
+
+Peak RSS came in ~25% above the extrapolation from the 1 GB fixture (~300–325 MB
+predicted). The important property held: it tracks the **live tree**, not the
+source file. Under redb's default 1 GiB-per-handle cache this run would have
+consumed tens of GB.
+
+Any future change that adds a handle, or that stops pinning the cache, silently
+reintroduces the dependence on file size. Treat the pinning as part of the
+contract, not an implementation detail.
+
 - I/O: one random read per live node from source, one insert per live node
-  into dest. Random-read bound; dominated by source database size rather than
-  live-set size.
+  into dest, then a second full pass for verification.
 - Runtime scales with the live node count, not the bloat. A heavily bloated
   database compacts in roughly the same time as a clean one of the same
   height.
+
+### Progress reporting
+
+`progress` is `Option<&dyn Fn(CompactionProgress)>`. Because it is `Fn` and not
+`FnMut`, an accumulating callback needs interior mutability (`RefCell` or an
+atomic); a plain printer needs nothing. This is adequate for the CLI and not
+worth a signature change.
+
+`progress` covers the **copy pass only**. Verification is a second pass of
+comparable length during which the callback is silent, so the implementation
+additionally emits an `info!` line every 1M nodes verified. An operator
+watching a long run should expect callback output to stop and log output to
+continue. Adding a phase discriminator to `CompactionProgress` would close the
+gap if callback coverage of both passes is ever wanted.
+
+### Traversal safety
+
+The explicit stack is capped at 255 levels, matching the bound implied by the
+single height byte in an AVL digest. A corrupt source cannot drive the
+traversal into an unbounded loop or exhaust the stack.
 
 ## Crash Recovery
 
