@@ -140,8 +140,18 @@ async fn run(cli: Cli) -> Result<()> {
     if target <= node_info.headers_height {
         info!("headers already synced — skipping phase 1");
     } else {
-        let start_height = node_info.headers_height + 1;
-        info!(from = start_height, to = target, "phase 1: fetching headers");
+        // `fetch_headers` takes an EXCLUSIVE lower bound, because chainSlice
+        // yields (fromHeight, toHeight]. So pass the height we already hold —
+        // 0 for an empty store, which is what makes genesis (height 1) arrive.
+        // Passing `headers_height + 1` skipped exactly one header per chunk;
+        // on a cold start that header was genesis, so nothing could ever chain
+        // and every fetched header sat in the orphan buffer.
+        let start_height = node_info.headers_height;
+        info!(
+            from = start_height + 1,
+            to = target,
+            "phase 1: fetching headers"
+        );
 
         let phase1_start = Instant::now();
         let (pushed, ids) = pool

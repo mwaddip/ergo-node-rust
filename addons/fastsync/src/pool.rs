@@ -247,14 +247,30 @@ impl PeerPool {
     ) -> Result<(u32, Vec<(u32, String)>)> {
         let chunk_size = self.chunk_size;
 
-        // Build the work queue — each entry is (from_height, to_height)
+        // Build the work queue — each entry is (from_height, to_height) as the
+        // chainSlice endpoint takes them.
+        //
+        // `chainSlice` is EXCLUSIVE of fromHeight and inclusive of toHeight —
+        // it yields (from, to]. Verified against the reference node:
+        //   fromHeight=0 toHeight=3 -> [1,2,3]
+        //   fromHeight=1 toHeight=3 -> [2,3]
+        //
+        // So `from` must be the height BEFORE the first header we want, and a
+        // chunk's exclusive `from` is the previous chunk's inclusive `to` — not
+        // `to + 1`. Advancing by `to + 1` dropped exactly one header per chunk:
+        // at bootstrap that is height 1, i.e. genesis, after which nothing can
+        // chain and every header sits in the orphan buffer forever; on resume
+        // it silently punched a hole every `chunk_size` headers.
+        //
+        // `start` is the caller's last-held height (0 for an empty store), so
+        // it is already the correct exclusive lower bound.
         let mut chunks: VecDeque<(u32, u32)> = VecDeque::new();
         {
             let mut from = start;
-            while from <= target {
-                let to = (from + chunk_size - 1).min(target);
+            while from < target {
+                let to = (from + chunk_size).min(target);
                 chunks.push_back((from, to));
-                from = to + 1;
+                from = to;
             }
         }
 
@@ -316,7 +332,7 @@ impl PeerPool {
 
                     if total_empties > max_empties || self.healthy_count() == 0 {
                         warn!(
-                            height = next_flush.saturating_sub(1),
+                            height = next_flush,
                             "all peers behind target — truncating"
                         );
                         break;
@@ -377,21 +393,25 @@ impl PeerPool {
                             }
                         }
 
-                        next_flush = chunk_to + 1;
+                        // Chunks are (exclusive_from, inclusive_to] and the next
+                        // chunk's exclusive `from` IS this chunk's `to`, so the
+                        // flush cursor advances to `chunk_to`, not `chunk_to + 1`.
+                        // `next_flush` therefore reads as "highest height flushed".
+                        next_flush = chunk_to;
                     }
 
                     // Throttled progress log (every 2s)
                     if last_log.elapsed() >= Duration::from_secs(2) {
                         let elapsed = phase_start.elapsed().as_secs_f64();
                         let rate = headers_pushed as f64 / elapsed;
-                        let remaining = target.saturating_sub(next_flush - 1);
+                        let remaining = target.saturating_sub(next_flush);
                         let eta = if rate > 0.0 {
                             remaining as f64 / rate
                         } else {
                             0.0
                         };
                         info!(
-                            height = next_flush - 1,
+                            height = next_flush,
                             pushed = headers_pushed,
                             buffered = buffer.len(),
                             peers = self.healthy_count(),
@@ -455,7 +475,7 @@ impl PeerPool {
                     if self.healthy_count() == 0 {
                         bail!(
                             "all peers unhealthy — stuck at height {}",
-                            next_flush.saturating_sub(1)
+                            next_flush
                         );
                     }
 
@@ -480,7 +500,7 @@ impl PeerPool {
             let elapsed = phase_start.elapsed().as_secs_f64();
             let rate = headers_pushed as f64 / elapsed;
             info!(
-                height = next_flush.saturating_sub(1),
+                height = next_flush,
                 pushed = headers_pushed,
                 rate = format!("{rate:.0}/s"),
                 elapsed = format!("{elapsed:.1}s"),
@@ -488,9 +508,9 @@ impl PeerPool {
             );
         }
 
-        if next_flush <= target && !chunks.is_empty() {
+        if next_flush < target && !chunks.is_empty() {
             warn!(
-                reached = next_flush.saturating_sub(1),
+                reached = next_flush,
                 target,
                 remaining = chunks.len(),
                 "header fetch truncated"
