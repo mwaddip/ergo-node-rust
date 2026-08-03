@@ -87,6 +87,23 @@ secp256k1 = "0.29"
 #
 # Single source of the fork reference: change HERE (members declare the plain
 # "0.1.1"). Coordinate the bump with the sigma-rust session, which owns the fork.
+#
+# ⚠ THIS TABLE IS A CROSS-REPO CONTRACT. `[patch]` applies ONLY from the
+# top-level workspace root, so any downstream consumer that takes our crates as
+# path-deps (SANTA's donner runner) must restate EVERY entry below — not just
+# the ones it happens to know about. Adding an entry here silently breaks them:
+# the crate resolves to its unpatched crates.io copy in their build, which
+# either fails to compile or, worse, compiles against subtly different code.
+#
+# Precedent: `redb` was added to this table in 5c5c76c (v0.7.7, 2026-07-29).
+# donner never restated it, so `enr-state` failed to compile through donner's
+# workspace for three weeks — while building clean standalone — and donner
+# silently vanished from SANTA's board entirely (ungraded, not red) for four
+# weeks. Nothing flagged it.
+#
+# So: when adding or removing an entry here, tell the SANTA session in the same
+# breath. The durable fix is santa-run deriving this whole table from the staged
+# enr's manifest; until that lands, this comment is the only guardrail.
 [patch.crates-io]
 ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "568e7c3" }
 redb = { path = "patches/redb" }
