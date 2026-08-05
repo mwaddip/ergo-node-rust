@@ -62,10 +62,9 @@ pub struct NipopowVerificationResult {
 /// interlink hierarchy on demand and only fetches the popow headers the
 /// proof actually visits — `O(m + k + m · log₂ N)` per call instead of `O(N)`.
 ///
-/// **Genesis special case**: per `facts/chain.md` Phase 6 invariants, the
-/// genesis block's `interlinks = [genesis_id]` is canonical and the extension
-/// loader MUST NOT be called for `height == 1` (real testnet/mainnet genesis
-/// extensions are empty and would yield wrong interlinks). The
+/// **Genesis special case**: the genesis block has empty interlinks and an
+/// empty proof. The extension loader MUST NOT be called for `height == 1`
+/// because real testnet/mainnet genesis extensions are empty. The
 /// `popow_header_at_height(1)` and `popow_header_by_id(genesis_id)` paths
 /// synthesize the popow header in-process; every other height path goes
 /// through the loader as normal.
@@ -74,18 +73,14 @@ struct ChainPopowReader<'a> {
 }
 
 impl<'a> ChainPopowReader<'a> {
-    /// Synthesize a `PoPowHeader` for `header` with interlinks given by
-    /// `interlinks`. Builds a synthetic `ExtensionCandidate` carrying the
-    /// canonical packed-interlinks fields and feeds it through
-    /// `NipopowAlgos::proof_for_interlink_vector` so the resulting merkle
-    /// proof is byte-identical with the JVM equivalent.
-    fn build_popow_header(header: Header, interlinks: Vec<BlockId>) -> Option<PoPowHeader> {
-        let extension_candidate =
-            ExtensionCandidate::new(NipopowAlgos::pack_interlinks(interlinks.clone())).ok()?;
+    /// Synthesize the canonical genesis `PoPowHeader` without consulting the
+    /// extension loader.
+    fn build_genesis_popow_header(header: Header) -> Option<PoPowHeader> {
+        let extension_candidate = ExtensionCandidate::default();
         let interlinks_proof = NipopowAlgos::proof_for_interlink_vector(&extension_candidate)?;
         Some(PoPowHeader {
             header,
-            interlinks,
+            interlinks: Vec::new(),
             interlinks_proof,
         })
     }
@@ -105,11 +100,9 @@ impl<'a> PopowHeaderReader for ChainPopowReader<'a> {
         let header = self.chain.header_at(height)?;
 
         // Genesis: synthesize in-process. NEVER call the loader for h=1 —
-        // real genesis extensions are empty and would produce empty
-        // interlinks, which is wrong by convention.
+        // Real genesis extensions and canonical interlinks/proof are empty.
         if height == 1 {
-            let genesis_id = header.id;
-            return Self::build_popow_header(header, vec![genesis_id]);
+            return Self::build_genesis_popow_header(header);
         }
 
         // h >= 2: load real extension bytes, unpack canonical interlinks.
@@ -370,14 +363,32 @@ mod tests {
     use crate::voting::pack_extension_bytes;
     use crate::{ChainConfig, HeaderChain};
     use ergo_chain_types::{ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint, Header, Votes};
+    use ergo_merkle_tree::{MerkleNode, MerkleTree};
     use sigma_ser::ScorexSerializable;
     use std::sync::{Arc, Mutex};
 
-    fn make_synthetic_header(
+    fn extension_root(fields: &[([u8; 2], Vec<u8>)]) -> Digest32 {
+        MerkleTree::new(
+            fields
+                .iter()
+                .map(|(key, value)| {
+                    std::iter::once(2u8)
+                        .chain(key.iter().copied())
+                        .chain(value.iter().copied())
+                        .collect::<Vec<_>>()
+                })
+                .map(MerkleNode::from_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .root_hash_special()
+    }
+
+    fn make_synthetic_header_with_extension_root(
         height: u32,
         parent_id: BlockId,
         timestamp: u64,
         n_bits: u32,
+        extension_root: Digest32,
     ) -> Header {
         let zero32 = Digest32::zero();
         let mut header = Header {
@@ -390,7 +401,7 @@ mod tests {
             timestamp,
             n_bits,
             height,
-            extension_root: zero32,
+            extension_root,
             autolykos_solution: AutolykosSolution {
                 miner_pk: Box::new(EcPoint::default()),
                 pow_onetime_pk: None,
@@ -404,6 +415,21 @@ mod tests {
         let reparsed = Header::scorex_parse_bytes(&bytes).unwrap();
         header.id = reparsed.id;
         header
+    }
+
+    fn make_synthetic_header(
+        height: u32,
+        parent_id: BlockId,
+        timestamp: u64,
+        n_bits: u32,
+    ) -> Header {
+        make_synthetic_header_with_extension_root(
+            height,
+            parent_id,
+            timestamp,
+            n_bits,
+            Digest32::zero(),
+        )
     }
 
     /// Build a synthetic chain of `count` headers + a per-height extension
@@ -424,54 +450,45 @@ mod tests {
         let mut chain = HeaderChain::new(config.clone());
         let n_bits = config.initial_n_bits;
 
-        // Build headers list first so we can compute interlinks for each
-        // and store the extension bytes per height.
+        // Build sequentially because each header id commits to its extension
+        // root and the next block's interlinks commit to prior header ids.
         let mut headers: Vec<Header> = Vec::with_capacity(count as usize);
+        let mut interlinks: Vec<BlockId> = Vec::new();
+        let mut store: std::collections::HashMap<u32, Vec<u8>> =
+            std::collections::HashMap::new();
         let mut prev_id = BlockId(Digest32::zero());
-        let g = make_synthetic_header(1, prev_id, 1_000_000, n_bits);
-        prev_id = g.id;
-        headers.push(g);
-        for h in 2..=count {
+        for h in 1..=count {
+            if let Some(previous_header) = headers.last() {
+                interlinks =
+                    NipopowAlgos::update_interlinks(previous_header.clone(), interlinks)
+                        .expect("update_interlinks");
+            }
+
+            let mut fields = if h == 1 {
+                Vec::new()
+            } else {
+                NipopowAlgos::pack_interlinks(interlinks.clone())
+            };
+            if h > 1 {
+                // Exercise full-extension proofs rather than the degenerate
+                // interlinks-only root used by the legacy verifier.
+                fields.insert(0, ([0x00, 0x00], h.to_be_bytes().to_vec()));
+            }
             // Compute expected difficulty based on currently-built chain
             // for nBits inheritance — but to avoid bringing in chain state
             // here, we just use the parent's n_bits within the first epoch.
-            let header = make_synthetic_header(
+            let header = make_synthetic_header_with_extension_root(
                 h,
                 prev_id,
                 1_000_000 + (h as u64 - 1) * 45_000,
                 n_bits,
+                extension_root(&fields),
             );
+            if h != 1 || include_genesis_in_loader {
+                store.insert(h, pack_extension_bytes(&header.id, &fields));
+            }
             prev_id = header.id;
             headers.push(header);
-        }
-
-        // Build per-height interlinks and extension bytes.
-        let mut interlinks: Vec<Vec<BlockId>> = Vec::with_capacity(headers.len());
-        for (idx, h) in headers.iter().enumerate() {
-            if idx == 0 {
-                // Genesis: interlinks = [genesis_id]
-                interlinks.push(vec![h.id]);
-            } else {
-                let prev_header = &headers[idx - 1];
-                let prev_interlinks = interlinks[idx - 1].clone();
-                let new_interlinks =
-                    NipopowAlgos::update_interlinks(prev_header.clone(), prev_interlinks)
-                        .expect("update_interlinks");
-                interlinks.push(new_interlinks);
-            }
-        }
-
-        // Pack each into extension bytes keyed by height.
-        let mut store: std::collections::HashMap<u32, Vec<u8>> =
-            std::collections::HashMap::new();
-        for (idx, h) in headers.iter().enumerate() {
-            if h.height == 1 && !include_genesis_in_loader {
-                continue;
-            }
-            let interlinks_for_h = &interlinks[idx];
-            let fields = NipopowAlgos::pack_interlinks(interlinks_for_h.clone());
-            let bytes = pack_extension_bytes(&h.id, &fields);
-            store.insert(h.height, bytes);
         }
 
         // Append headers to chain (no_pow path).
@@ -867,8 +884,10 @@ mod tests {
             .expect("genesis must return Some(bytes)");
         let parsed = PoPowHeader::scorex_parse_bytes(&bytes).expect("parses cleanly");
         assert_eq!(parsed.header.id, genesis_id);
-        // Genesis interlinks convention: [genesis_id].
-        assert_eq!(parsed.interlinks, vec![genesis_id]);
+        assert!(parsed.interlinks.is_empty());
+        assert!(parsed.interlinks_proof.get_indices().is_empty());
+        assert!(parsed.interlinks_proof.get_proofs().is_empty());
+        assert!(parsed.check_interlinks_proof());
     }
 
     #[test]
