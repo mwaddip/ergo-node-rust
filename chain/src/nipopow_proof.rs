@@ -275,12 +275,14 @@ pub fn compare_nipopow_proof_bytes(a: &[u8], b: &[u8]) -> Result<bool, ChainErro
 /// **Precondition**: `bytes` is the inner NiPoPoW proof payload (the main
 /// crate has stripped any P2P message envelope).
 ///
-/// **Validation checks** (mirrors `NipopowProof.isValid`):
+/// **Validation checks** (mirrors `NipopowProof.isValid`, plus PoW):
 /// 1. The proof parses cleanly via the Scorex serializer.
-/// 2. Heights strictly increasing across the headers chain.
-/// 3. Each header's PoW passes [`crate::verify_pow`].
-/// 4. Parent connections in the chain are consistent (via
+/// 2. Parent connections in the chain are consistent (via
 ///    `NipopowProof::has_valid_connections`).
+/// 3. Every prefix and suffix-head interlinks proof passes
+///    `PoPowHeader::check_interlinks_proof`.
+/// 4. Heights strictly increase across the headers chain.
+/// 5. Each header's PoW passes [`crate::verify_pow`].
 ///
 /// Does NOT touch chain state. Does NOT apply the proof to local chain.
 /// The returned [`NipopowVerificationResult::headers`] field carries the
@@ -310,6 +312,16 @@ fn verify_inner(bytes: &[u8], check_pow: bool) -> Result<NipopowVerificationResu
 
     if !proof.has_valid_connections() {
         return Err(ChainError::Nipopow("invalid connections".into()));
+    }
+
+    // `NipopowProof::has_valid_proofs` is private in the pinned dependency,
+    // so apply its per-PoPowHeader predicate explicitly at this consumer
+    // boundary before the proof is reduced to bare headers.
+    if !std::iter::once(&proof.suffix_head)
+        .chain(proof.prefix.iter())
+        .all(PoPowHeader::check_interlinks_proof)
+    {
+        return Err(ChainError::Nipopow("invalid interlinks proof".into()));
     }
 
     // Walk all headers (prefix + suffix_head + suffix_tail) in order, check
@@ -537,6 +549,70 @@ mod tests {
         // Heights are strictly increasing across the extracted chain.
         for pair in result.headers.windows(2) {
             assert!(pair[0].height < pair[1].height);
+        }
+    }
+
+    #[test]
+    fn verify_rejects_invalid_interlinks_proof() {
+        let source_chain = build_chain_with_interlinks(20);
+        let bytes = build_nipopow_proof(&source_chain, 6, 10, None).expect("build");
+        let control = verify_nipopow_proof_bytes_no_pow(&bytes)
+            .expect("control proof must pass verification");
+        assert_eq!(control.suffix_tip_height, 20);
+
+        for mutate_prefix in [false, true] {
+            let mut proof = NipopowProof::scorex_parse_bytes(&bytes).expect("parse built proof");
+            assert_eq!(proof.m, 6);
+            assert_eq!(proof.k, 10);
+            assert!(
+                proof.has_valid_connections(),
+                "control connections must be valid"
+            );
+
+            let location = if mutate_prefix {
+                "prefix"
+            } else {
+                "suffix head"
+            };
+            {
+                let target = if mutate_prefix {
+                    proof
+                        .prefix
+                        .last_mut()
+                        .expect("fixture must contain a prefix")
+                } else {
+                    &mut proof.suffix_head
+                };
+                assert!(
+                    target.check_interlinks_proof(),
+                    "control {location} interlinks proof must be valid"
+                );
+
+                // Change only the disclosed interlinks while retaining the
+                // original Merkle proof. Existing connection evidence remains
+                // present, but the interlinks-proof predicate must now fail.
+                let added_link = BlockId(Digest32::from([0xA5; 32]));
+                assert!(!target.interlinks.contains(&added_link));
+                target.interlinks.push(added_link);
+                assert!(
+                    !target.check_interlinks_proof(),
+                    "isolated {location} mutation must fail the proof predicate"
+                );
+            }
+
+            assert!(
+                proof.has_valid_connections(),
+                "isolated {location} mutation must not break connections"
+            );
+            let observed_bytes = proof
+                .scorex_serialize_bytes()
+                .expect("serialize observation");
+            let err = verify_nipopow_proof_bytes_no_pow(&observed_bytes)
+                .expect_err("verifier must reject an invalid interlinks proof");
+            assert!(
+                matches!(err, ChainError::Nipopow(ref msg) if msg == "invalid interlinks proof"),
+                "unexpected {location} rejection: {err:?}"
+            );
         }
     }
 
