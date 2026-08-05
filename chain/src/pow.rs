@@ -19,12 +19,18 @@ fn pow_scheme() -> &'static AutolykosPowScheme {
 /// `q / decode_compact_bits(header.n_bits)`, where `q` is the secp256k1 group order.
 ///
 /// Returns `Ok(())` if valid, `Err(ChainError::PowInvalid)` if the hit doesn't
-/// meet the target, or `Err(ChainError::PowCompute)` if the hit can't be computed.
+/// meet the target, `Err(ChainError::InvalidPowTarget)` if the compact target
+/// decodes to zero, or `Err(ChainError::PowCompute)` if the hit can't be computed.
 pub fn verify_pow(header: &Header) -> Result<(), ChainError> {
     let pow = pow_scheme();
     let hit = pow.pow_hit(header)?;
 
     let decoded_n_bits = decode_compact_bits(header.n_bits);
+    if decoded_n_bits == 0.into() {
+        return Err(ChainError::InvalidPowTarget {
+            n_bits: header.n_bits,
+        });
+    }
     let target = order_bigint() / decoded_n_bits;
 
     let hit_bigint = hit

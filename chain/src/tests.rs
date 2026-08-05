@@ -3,7 +3,7 @@ mod parse_tests {
     use crate::{parse_header, ChainError};
     use sigma_ser::ScorexSerializable;
 
-    fn v2_header_json() -> &'static str {
+    pub(super) fn v2_header_json() -> &'static str {
         r#"{
             "extensionId": "d16f25b14457186df4c5f6355579cc769261ce1aebc8209949ca6feadbac5a3f",
             "difficulty": "626412390187008",
@@ -126,7 +126,7 @@ mod parse_tests {
 
 #[cfg(test)]
 mod pow_tests {
-    use crate::verify_pow;
+    use crate::{verify_pow, ChainError};
 
     /// Valid V2 header at height 614400 (first N increase) — known-good PoW from sigma-rust tests.
     #[test]
@@ -157,6 +157,21 @@ mod pow_tests {
         let header: ergo_chain_types::Header = serde_json::from_str(json).unwrap();
         let result = verify_pow(&header);
         assert!(result.is_ok(), "valid PoW should pass: {result:?}");
+    }
+
+    #[test]
+    fn verify_pow_rejects_zero_decoded_target_without_panic() {
+        let mut header: ergo_chain_types::Header =
+            serde_json::from_str(super::parse_tests::v2_header_json()).unwrap();
+        header.n_bits = 0;
+
+        let result = std::panic::catch_unwind(|| verify_pow(&header));
+
+        assert!(result.is_ok(), "zero decoded target must not panic");
+        assert!(matches!(
+            result.unwrap(),
+            Err(ChainError::InvalidPowTarget { n_bits: 0 })
+        ));
     }
 
     /// Invalid V2 header at height 2870 — PoW doesn't meet difficulty target.

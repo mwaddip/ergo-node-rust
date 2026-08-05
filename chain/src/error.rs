@@ -13,6 +13,10 @@ pub enum ChainError {
     #[error("PoW verification failed: hit {hit} >= target {target}")]
     PowInvalid { hit: String, target: String },
 
+    /// Header's compact difficulty decodes to an unusable zero target.
+    #[error("invalid PoW target: nBits {n_bits} decodes to zero")]
+    InvalidPowTarget { n_bits: u32 },
+
     /// Error computing proof-of-work hit.
     #[error("PoW computation error: {0}")]
     PowCompute(#[from] AutolykosPowSchemeError),
