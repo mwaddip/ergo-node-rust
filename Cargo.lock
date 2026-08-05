@@ -644,6 +644,7 @@ version = "0.1.0"
 dependencies = [
  "ergo-chain-types",
  "ergo-lib",
+ "ergo-merkle-tree",
  "ergo-nipopow",
  "hashbrown 0.16.1",
  "lru",
