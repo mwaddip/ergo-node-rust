@@ -396,6 +396,11 @@ Stable keys, opaque to the store, consumed by higher-level crates
 |---|---|---|
 | `b"scores_migrated_v1"` | `[1u8]` once migration completes; absent before | Empty-placeholder → real scores migration |
 | `b"validated_height"` | 4-byte big-endian `u32`: highest height at which state.redb was flushed with `Durability::Immediate`. Absent ⇒ fresh install or pre-handshake upgrade. | sync's flush pair (see `facts/sync.md` "Cross-DB Durability Handshake") |
+| `b"nipopow_difficulty_context_v1"` | Versioned, bounded record containing the installed suffix-head height/ID and its authenticated sparse difficulty headers. Written after all suffix `BEST_CHAIN` entries and flushed before bootstrap success. Required on every light-chain restore; absent, malformed, oversized, or stale bindings fail closed. | `SharedChain::install_nipopow_suffix` |
+
+Pre-metadata light-client databases have no authoritative source for this
+record and are not upgraded in place. Initialize a new light-client data
+directory and complete a fresh proof bootstrap instead.
 
 ## Peer DB key encoding
 

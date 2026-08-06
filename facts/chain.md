@@ -180,8 +180,11 @@ Where `I: IntoIterator<Item = (u32, BlockId)>`.
   - `base_height = first entry's height` (or `None` if `entries` is empty).
   - `height() = last entry's height` (or `0` if empty).
   - `light_client_mode = (base_height.unwrap_or(1) > 1)` — a chain
-    starting above height 1 must have been installed from a NiPoPoW
-    proof and the SPV difficulty skip is preserved.
+    starting above height 1 must have been installed from a NiPoPoW proof.
+    Its sparse difficulty context is initially unready. The integrator MUST
+    load the versioned context record and call
+    `restore_nipopow_difficulty_context` before allowing any successor or
+    reorg; absence, corruption, or a suffix-head mismatch is fatal.
   - `active_parameters` / `active_proposed_update_bytes` are at
     construction defaults. The integrator must call
     `recompute_active_parameters_from_storage(height())` after
@@ -1053,17 +1056,11 @@ JVM reference: `ergo-core/src/main/scala/org/ergoplatform/modifiers/history/popo
   the JVM's `PoPowAlgosWithDBSpec` takes with `DefaultFakePowScheme`.
   Use `prove_with_reader` for any production path; the in-memory
   `prove` is only appropriate for test scenarios with synthetic chains.
-- **Non-scope**: JVM's `continuous = true` mode (which interleaves
-  difficulty-recalculation-boundary headers into the prefix so that
-  light clients can self-validate difficulty for blocks after the
-  suffix) is NOT supported. sigma-rust's `NipopowProof` struct has no
-  `continuous` field — adding it requires a separate change to the
-  struct, serializer, and on-wire format. `build_nipopow_proof`
-  produces non-continuous proofs. JVM peers applying non-continuous
-  proofs still succeed (`applyPopowProof` doesn't strictly require the
-  flag); they just can't self-validate post-suffix difficulty until
-  they sync more headers. This is fine for P2P serve. Tracked as
-  follow-up in the roadmap.
+- **Continuous mode**: the producer mirrors the JVM database prover. It adds
+  every historical height returned by `heightsForNextRecalculation` that is
+  below the suffix head to the proof prefix, validates the enriched proof,
+  and appends the JVM terminal byte `1`. The sigma-rust 0.28 core type remains
+  unchanged; the node adapter owns this terminal byte and enrichment.
 - **Genesis (height 1) special case**: The genesis block's interlinks
   vector is canonical and MUST NOT be read from the extension loader. The
   **reader implementation** (not `build_nipopow_proof` directly) is
@@ -1104,13 +1101,16 @@ JVM reference: `ergo-core/src/main/scala/org/ergoplatform/modifiers/history/popo
 
 - **Precondition**: `bytes` is the inner NiPoPoW proof payload (the main
   crate has already stripped the message envelope). `context` carries the
-  exact requested `m` and `k` plus the deployment's configured genesis ID.
+  exact requested `m` and `k`, the deployment's configured genesis ID, and
+  the configured difficulty epoch/use-last-epochs values.
 - **Postcondition**: the proof has passed canonical sigma-rust validation,
   matches the requested security parameters, starts at the configured
   genesis, and every extracted header passes `verify_pow`. The returned
-  value preserves the parser's exact `prefix` / `suffix_head` /
-  `suffix_tail` boundary so the installer never reconstructs it from a
-  flattened vector.
+  payload is explicitly continuous (`terminal byte == 1`), and every required
+  historical difficulty header is present in the authenticated prefix. The
+  returned value preserves the parser's exact `prefix` / `suffix_head` /
+  `suffix_tail` boundary plus the exact sparse difficulty subset so the
+  installer never reconstructs either from a flattened vector.
 - **Validation checks**:
   1. The Scorex core parses from an explicitly tracked cursor. No remainder
      is accepted except one JVM terminal mode byte (`0` or `1`).
@@ -1118,7 +1118,10 @@ JVM reference: `ergo-core/src/main/scala/org/ergoplatform/modifiers/history/popo
      connection, interlinks-proof, height, and suffix-cardinality invariants.
   3. Proof `m` and `k` equal the values in `context`.
   4. The first proof-chain header equals `context.expected_genesis_id`.
-  5. Every prefix, suffix-head, and suffix-tail header passes `verify_pow`.
+  5. The terminal mode is exactly `1`; absent and mode `0` remain parseable
+     for diagnostics but cannot authorize bootstrap.
+  6. Every required historical difficulty height is present in the prefix.
+  7. Every prefix, suffix-head, and suffix-tail header passes `verify_pow`.
 - **Does NOT** apply the proof to local chain state. Chain mutation remains
   an explicit consumer operation.
 
@@ -1128,9 +1131,11 @@ JVM reference: `ergo-core/src/main/scala/org/ergoplatform/modifiers/history/popo
 pub struct NipopowVerificationResult {
     pub m: u32,
     pub k: u32,
-    /// JVM terminal mode, or `None` for a Rust-core-only payload.
+    /// JVM terminal mode; authorizing verification returns `Some(true)`.
     pub continuous: Option<bool>,
     pub prefix: Vec<Header>,
+    /// Exact authenticated subset required by difficulty recalculation.
+    pub difficulty_headers: Vec<Header>,
     pub suffix_head: Header,
     pub suffix_tail: Vec<Header>,
 }
@@ -1142,7 +1147,7 @@ segments rather than stored as duplicable metadata. The separate
 unsolicited code-91 log path may use it, but bootstrap selection and
 installation must not.
 
-### `install_from_nipopow_proof(suffix_head: Header, suffix_tail: Vec<Header>) -> Result<Vec<InstalledHeader>>`
+### `install_from_nipopow_proof(difficulty_headers: Vec<Header>, suffix_head: Header, suffix_tail: Vec<Header>) -> Result<Vec<InstalledHeader>>`
 
 Install a verified NiPoPoW proof's suffix as the chain's starting point for
 light-client mode.
@@ -1155,11 +1160,11 @@ pub struct InstalledHeader {
 }
 ```
 
-- **Precondition**: Chain is empty (`is_empty() == true`). The headers in
-  `suffix_head` + `suffix_tail` MUST already have been validated by the
-  caller via `verify_nipopow_proof_bytes`. This function does NOT re-verify
-  the proof; it assumes the caller has done so and is installing the
-  trusted suffix.
+- **Precondition**: Chain is empty (`is_empty() == true`). All three arguments
+  MUST come directly from the same `NipopowVerificationResult`. The installer
+  does not re-run proof scoring or interlink validation, but it independently
+  checks the exact configured anchor-height set, context/suffix PoW, suffix
+  linkage, and every suffix `n_bits` value before returning success.
 - **Postcondition on Ok**: Chain now contains `suffix_head` followed by every
   header in `suffix_tail`, in order. `tip()` returns the last header in
   `suffix_tail` (or `suffix_head` if `suffix_tail` is empty). `height()`
@@ -1172,7 +1177,9 @@ pub struct InstalledHeader {
   header). The integrator persists these by calling
   `store.put_header(id, height, fork=0, score=score_be, data=...)` for
   each — without this write the store's score loader will return `None`
-  on later queries and the chain's score-dependent paths break.
+  on later queries and the chain's score-dependent paths break. The sparse
+  context is retained separately from best-chain state and never contributes
+  a score or becomes a reorg anchor.
 - **Postcondition on Err**: Chain is unchanged (rolled back). Possible errors:
   - Chain not empty.
   - `suffix_head.parent_id` is anything other than what the caller expects
@@ -1180,18 +1187,14 @@ pub struct InstalledHeader {
     (the suffix head is rarely actually genesis), but it MUST be self-
     consistent with `suffix_tail` (each header's `parent_id` is the previous
     header's `id`).
-  - Any header's PoW fails `verify_pow`.
-  - Note: the `expected_difficulty` check is NOT performed on suffix
-    headers, and is permanently disabled for `try_append` after install
-    via the `light_client_mode` flag. See the "Light-client difficulty
-    checking" invariant below for the full rationale — light clients
-    cannot independently recompute difficulty and must trust the
-    `n_bits` values in incoming headers, validated only by self-contained
-    PoW verification.
+  - Required anchor count/height mismatch, duplicate anchor, or missing anchor.
+  - Any context or suffix header's PoW fails `verify_pow`.
+  - Any suffix header's `n_bits` differs from `expected_difficulty` computed
+    with the sparse anchors and already-installed suffix history.
 - **Behavior**:
-  - Sets `light_client_mode = true` on the chain — this flag persists for
-    the chain's lifetime and disables the difficulty-target check on all
-    subsequent `try_append` calls (see invariant below).
+  - Sets `light_client_mode = true` and marks the sparse difficulty context
+    ready. The flag controls the reorg floor and restart contract; it does not
+    disable difficulty-target checks.
   - `suffix_head` is pushed via the same internal `push_header` path used
     by `try_append`'s tip-extension branch, but the genesis-validation check
     is bypassed.
@@ -1204,7 +1207,7 @@ pub struct InstalledHeader {
     scores are returned to the integrator in the `Vec<InstalledHeader>`
     result; the chain itself does NOT persist them, only emits them.
   - For each header in `suffix_tail`, validate parent linkage (`parent_id ==
-    previous.id`), validate PoW, and push. Skip the difficulty-target check.
+    previous.id`), expected difficulty, and PoW before pushing.
   - `active_parameters` is left at `default_parameters(network)` — light
     clients have no source for voted parameters because they don't download
     block extensions. See "Light-client parameter limitation" below.
@@ -1272,14 +1275,13 @@ peer on demand. Tracked as a follow-up.
   reader); it is consensus-critical because real genesis extensions are
   empty and cannot produce the canonical `interlinks = [genesis_id]`
   vector via the loader path.
-- **`light_client_mode` flag skips `expected_difficulty`.** `HeaderChain`
-  gains an internal `light_client_mode: bool` flag, set to `true` during
-  `install_from_nipopow_proof` and `false` otherwise. When true,
-  `validate_child` and `validate_child_no_pow` skip the
-  `expected_difficulty` check. PoW verification (`verify_pow`) and
-  parent-linkage checks remain in force. Standard SPV behavior — light
-  clients can't recompute `expected_difficulty` because they don't have
-  the historical epoch boundaries the recalc depends on.
+- **Continuous difficulty context is mandatory.** `light_client_mode` never
+  relaxes `expected_difficulty`. The exact JVM recalculation heights below the
+  suffix head are retained in a sparse authenticated map; normal suffix/best-
+  chain headers satisfy the remaining lookups. A restored light chain starts
+  with `nipopow_difficulty_context_ready = false` and rejects every successor
+  and reorg until the versioned, suffix-head-bound record is parsed and
+  validated. Missing lookup heights are errors, never silently omitted.
 - `reorg_floor()` is consulted before any reorg execution. Reorgs whose
   fork point falls below the floor are rejected.
 

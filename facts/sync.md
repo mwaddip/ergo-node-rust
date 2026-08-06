@@ -692,26 +692,39 @@ State machine:
 
 4. **Verify each response** through `SyncChain::verify_nipopow_envelope`.
    The bridge strips the envelope and calls context-bound
-   `enr_chain::verify_nipopow_proof_bytes` with the exact requested `m/k` and
-   configured genesis. Failed verification marks that response hostile and
-   cannot add a candidate or mutate the chain.
+   `enr_chain::verify_nipopow_proof_bytes` with the exact requested `m/k`,
+   configured genesis, and difficulty epoch context. Only terminal mode `1`
+   with every required authenticated difficulty header can authorize
+   bootstrap. Failed verification marks that response hostile and cannot add
+   a candidate or mutate the chain.
 
 5. **Select among verified candidates only.** Multiple candidates are
    compared pairwise through `NipopowProof::is_better_than`; all have already
    passed the same request/genesis context. A comparison error skips that
    challenger and retains the incumbent.
 
-6. **Install the selected result's exact parsed suffix** into the local
-   `HeaderChain`. `NipopowVerificationResult` carries `prefix`, `suffix_head`,
-   and `suffix_tail` separately. The bootstrap discards the prefix and passes
-   the two suffix fields directly to `install_from_nipopow_proof`; it never
-   reconstructs the boundary from `headers.len() - k`.
+6. **Install the selected result's exact parsed suffix and difficulty
+   context** into the local `HeaderChain`. `NipopowVerificationResult` carries
+   `difficulty_headers`, `suffix_head`, and `suffix_tail` separately. The
+   bootstrap passes these fields directly to `install_from_nipopow_proof`; it
+   never reconstructs the boundary or anchor set from a flattened vector.
 
-7. **Transition to normal tip-following sync** via the existing
+7. **Persist and flush the restart dependency.** `SharedChain` writes every
+   installed suffix header first, then writes the versioned, bounded,
+   suffix-head-bound `nipopow_difficulty_context_v1` record and flushes the
+   modifier store. If the final record is absent or corrupt after interruption,
+   the next startup refuses light mode instead of continuing without anchors.
+   The in-memory install and these store writes are not one cross-layer
+   transaction: a write failure is fatal to the current sync run and does not
+   roll the in-memory chain back. The missing or incomplete metadata then makes
+   restart fail closed. Supporting retry in the same process would require a
+   separate atomic-install design.
+
+8. **Transition to normal tip-following sync** via the existing
    `sync_from_peer` loop. From here on out, light mode behaves like full
    mode minus block bodies: the sync machine sends SyncInfo, receives
-   header Inv, requests headers, validates them via `try_append`, and
-   advances the tip.
+   header Inv, requests headers, validates them (including expected
+   difficulty) via `try_append`, and advances the tip.
 
 ### `LightBootstrapError`
 
@@ -732,18 +745,23 @@ for first release, terminate.
 ### Bootstrap invariants
 
 - **Shared verification context**: every candidate is verified against the
-  same requested `m=6`, `k=10`, and configured genesis before comparison.
-  A failed candidate never enters pairwise selection.
+  same requested `m=6`, `k=10`, configured genesis, and difficulty epoch
+  settings before comparison. A failed candidate never enters pairwise
+  selection.
 - **Lossless install boundary**: selection retains the typed verification
-  result, and installation consumes its exact `suffix_head` and
-  `suffix_tail`. No consumer re-parses or re-splits a flattened header list.
-- **No restart-resume state**: bootstrap is one-shot and re-runs from
-  scratch on every restart where `chain.is_empty()`. Once the chain is
-  installed, subsequent restarts skip bootstrap entirely (chain is loaded
-  from store and is non-empty). There is no partial-bootstrap state that
-  needs persistence — the operation is atomic.
+  result, and installation consumes its exact `difficulty_headers`,
+  `suffix_head`, and `suffix_tail`. No consumer re-parses or re-splits a
+  flattened header list.
+- **Restart is fail-closed**: bootstrap is one-shot when `chain.is_empty()`.
+  A non-empty restored light chain must also restore the matching versioned
+  difficulty context before the sync task is constructed. Missing/corrupt
+  context or a suffix-head height/ID mismatch aborts startup.
+  Light-client databases created before this metadata existed are intentionally
+  not migrated in place; recovery is a new light-client data directory followed
+  by a fresh proof bootstrap.
 - **Proof bytes are not archived** after install. `SharedChain` persists the
-  installed suffix headers through the normal header-store path.
+  installed suffix headers through the normal header-store path and only the
+  bounded difficulty subset in `chain_meta`.
 
 ### Trust model
 
