@@ -6,10 +6,10 @@
 //!   We build it from the local chain via `enr_chain::build_nipopow_proof`
 //!   and respond with a code 91 message.
 //!
-//! - **91 (`NipopowProof`)**: peer sends us an unsolicited proof. We inspect it
-//!   via `enr_chain::inspect_nipopow_proof_bytes` and log only diagnostic
-//!   metadata. This path has no request context and cannot authorize bootstrap
-//!   selection or installation.
+//! - **91 (`NipopowProof`)**: peer sends us an unsolicited proof. We validate
+//!   only its bounded envelope and return a typed V1-disabled disposition.
+//!   This path has no request context and cannot authorize bootstrap selection,
+//!   installation, or full proof inspection.
 //!
 //! Both codes use VLQ-encoded integer fields with a `putUShort(0)` pad-length
 //! footer for forward compatibility (the JVM convention for new message
@@ -175,6 +175,34 @@ pub fn parse_nipopow_proof(body: &[u8]) -> Result<Vec<u8>, NipopowError> {
     Ok(proof_bytes)
 }
 
+/// Result of classifying an unsolicited code-91 message.
+///
+/// Legacy V1 proofs have no request-bound authorization context, so this type
+/// deliberately exposes only the bounded envelope size and never parsed proof
+/// metadata or headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsolicitedNipopowDisposition {
+    /// The envelope is well formed, but unsolicited V1 inspection is disabled.
+    V1InspectionDisabled {
+        /// Size of the inner proof payload declared by the bounded envelope.
+        proof_size: usize,
+    },
+}
+
+/// Validate a code-91 envelope without inspecting its inner V1 proof.
+///
+/// The request-bound light-bootstrap state machine may consume the original
+/// message separately. This diagnostic path must not duplicate its structural,
+/// cryptographic, or proof-of-work validation.
+pub fn classify_unsolicited_nipopow_proof(
+    body: &[u8],
+) -> Result<UnsolicitedNipopowDisposition, NipopowError> {
+    let proof_bytes = parse_nipopow_proof(body)?;
+    Ok(UnsolicitedNipopowDisposition::V1InspectionDisabled {
+        proof_size: proof_bytes.len(),
+    })
+}
+
 /// Serialize the inner proof bytes into a `NipopowProof` (code 91) message body.
 ///
 /// Inverse of [`parse_nipopow_proof`].
@@ -280,6 +308,28 @@ mod tests {
         let serialized = serialize_nipopow_proof(&original);
         let parsed = parse_nipopow_proof(&serialized).unwrap();
         assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn unsolicited_v1_proof_returns_disabled_without_inner_inspection() {
+        let body = serialize_nipopow_proof(&[0xff]);
+
+        assert_eq!(
+            classify_unsolicited_nipopow_proof(&body).unwrap(),
+            UnsolicitedNipopowDisposition::V1InspectionDisabled { proof_size: 1 }
+        );
+    }
+
+    #[test]
+    fn unsolicited_v1_proof_keeps_bounded_envelope_validation() {
+        let mut body = Vec::new();
+        body.put_u32(2).unwrap();
+        body.push(0xff);
+
+        assert!(matches!(
+            classify_unsolicited_nipopow_proof(&body),
+            Err(NipopowError::Truncated)
+        ));
     }
 
     #[test]

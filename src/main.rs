@@ -424,8 +424,8 @@ async fn penalize(
 /// Handle an incoming NiPoPoW message (code 90 GetNipopowProof or 91 NipopowProof).
 ///
 /// For code 90: parse the request, lock the chain, build the proof, and send the
-/// response via the P2P node. For code 91: parse the inner proof bytes and verify
-/// against the chain (logged but not applied — light-client mode is a future session).
+/// response via the P2P node. For code 91: validate only the bounded envelope;
+/// unsolicited V1 inspection is disabled and request-bound handling occurs in sync.
 ///
 /// Errors during parsing/building/verification are logged at warn level and dropped.
 /// We never send error responses — JVM doesn't expect them.
@@ -521,28 +521,25 @@ async fn handle_nipopow_event(
         }
 
         nipopow_serve::NIPOPOW_PROOF => {
-            let proof_bytes = match nipopow_serve::parse_nipopow_proof(body) {
-                Ok(b) => b,
+            let disposition = match nipopow_serve::classify_unsolicited_nipopow_proof(body) {
+                Ok(disposition) => disposition,
                 Err(e) => {
                     penalize(p2p, peer_id, "misbehavior", &format!("NipopowProof parse failed: {e}"), false).await;
                     return;
                 }
             };
 
-            // Diagnostic-only inspection: this unsolicited/log-only path has
-            // no request context and never authorizes bootstrap installation.
-            match enr_chain::inspect_nipopow_proof_bytes(&proof_bytes) {
-                Ok(meta) => {
-                    tracing::info!(
+            // This unsolicited path has no request context. Keep only bounded
+            // envelope validation; request-bound handling continues in sync.
+            match disposition {
+                nipopow_serve::UnsolicitedNipopowDisposition::V1InspectionDisabled {
+                    proof_size,
+                } => {
+                    tracing::debug!(
                         peer = %peer_id,
-                        suffix_tip_height = meta.suffix_tip_height,
-                        total_headers = meta.total_headers,
-                        continuous = ?meta.continuous,
-                        "received and inspected NiPoPoW proof (diagnostic only)"
+                        proof_size,
+                        "received NiPoPoW proof; unsolicited V1 inspection disabled"
                     );
-                }
-                Err(e) => {
-                    penalize(p2p, peer_id, "permanent", &format!("NiPoPoW proof verification failed: {e}"), true).await;
                 }
             }
         }
