@@ -192,8 +192,8 @@ pub trait SyncChain {
 
     /// Strip a `NipopowProof` (P2P code 91) message envelope and verify the
     /// inner proof bytes via [`enr_chain::verify_nipopow_proof_bytes`].
-    /// Returns the extracted header chain in strictly-increasing height order
-    /// on success.
+    /// Returns the context-bound proof with its parsed prefix/suffix boundary
+    /// preserved on success.
     ///
     /// Used by the light-client bootstrap state machine. The bridge wraps
     /// `nipopow_serve::parse_nipopow_proof` (envelope strip) +
@@ -201,14 +201,17 @@ pub trait SyncChain {
     fn verify_nipopow_envelope(
         &self,
         envelope_body: &[u8],
-    ) -> impl std::future::Future<Output = Result<Vec<Header>, enr_chain::ChainError>> + Send;
+    ) -> impl std::future::Future<
+        Output = Result<enr_chain::NipopowVerificationResult, enr_chain::ChainError>,
+    > + Send;
 
     /// Compare two NiPoPoW proofs (raw P2P code-91 envelope bodies) and
     /// return `true` if `this` is better than `that` per KMZ17 §4.3.
     ///
     /// Used by the light-client bootstrap to pick the best proof from
-    /// multiple peers. Both envelopes must be parseable (they should have
-    /// already passed [`Self::verify_nipopow_envelope`]).
+    /// multiple peers. Both envelopes must already have passed
+    /// [`Self::verify_nipopow_envelope`] in the same bootstrap session and
+    /// therefore against the same request/genesis context.
     fn is_better_nipopow(
         &self,
         this_envelope: &[u8],

@@ -678,44 +678,36 @@ returns immediately.
 
 State machine:
 
-1. **Wait for at least one outbound peer** with a delivery-eligible status
-   (handshake complete, not banned). Poll `transport.outbound_peers()` every
-   1s up to a 60s deadline. No peers → `LightBootstrapError::NoPeers`.
+1. **Wait for outbound peers** with completed handshakes. Poll
+   `transport.outbound_peers()` up to the peer-wait deadline. No peers yields
+   `LightBootstrapError::NoPeers`.
 
-2. **Send `GetNipopowProof`** to the first eligible peer with `m=6`, `k=10`,
-   `header_id = None` (no anchor — request a proof at the peer's current tip).
-   The wire envelope is built via `src/nipopow_serve::serialize_get_nipopow_proof`
-   (a new function — currently only the response serializer exists).
+2. **Broadcast `GetNipopowProof`** with `m=6`, `k=10`, and
+   `header_id = None` to every currently eligible outbound peer. If every
+   send fails, return `LightBootstrapError::AllPeersStalled`.
 
-3. **Wait for `NipopowProof` response** (P2P code 91) from that peer with a
-   30-second timeout. Other messages from other peers during this window are
-   processed normally by the rest of the sync machine; only `code == 91`
-   from the requested peer counts as the response. Timeout or wrong-peer
-   response → mark peer stalled, rotate to next eligible peer, retry up to
-   3 peers total. All 3 stalled → `LightBootstrapError::AllPeersStalled`.
+3. **Collect code-91 responses** from only the peers that received the
+   request, until they have all responded or the collection window expires.
+   Unsolicited peers and non-proof messages do not enter the candidate set.
 
-4. **Verify** the inner proof bytes via
-   `enr_chain::verify_nipopow_proof_bytes`. Verification failure → mark
-   peer hostile (NOT just stalled — sending an invalid proof is a protocol
-   violation), rotate, retry. Three hostile peers in a row →
-   `LightBootstrapError::AllPeersHostile`.
+4. **Verify each response** through `SyncChain::verify_nipopow_envelope`.
+   The bridge strips the envelope and calls context-bound
+   `enr_chain::verify_nipopow_proof_bytes` with the exact requested `m/k` and
+   configured genesis. Failed verification marks that response hostile and
+   cannot add a candidate or mutate the chain.
 
-5. **Install** the verified suffix into the local `HeaderChain`:
-   - The result's `headers: Vec<Header>` slice contains, in order:
-     `prefix`, then `suffix_head.header`, then `suffix_tail`. The light
-     client only installs the suffix portion (`suffix_head` + `suffix_tail`),
-     NOT the prefix headers — the prefix exists to prove cumulative work
-     and is discarded after verification.
-   - The split point inside `headers` is `headers.len() - k` (the last `k`
-     entries are the suffix; the rest is the prefix). With `k=10`, the
-     install passes `headers[headers.len()-10]` as `suffix_head` and the
-     remaining 9 as `suffix_tail`.
-   - On success, `chain.height()` returns the suffix tip's height. Set
-     the `validated_height` watermark to the same value (light mode treats
-     all installed headers as "validated" — the proof's PoW checks are
-     the validation).
+5. **Select among verified candidates only.** Multiple candidates are
+   compared pairwise through `NipopowProof::is_better_than`; all have already
+   passed the same request/genesis context. A comparison error skips that
+   challenger and retains the incumbent.
 
-6. **Transition to normal tip-following sync** via the existing
+6. **Install the selected result's exact parsed suffix** into the local
+   `HeaderChain`. `NipopowVerificationResult` carries `prefix`, `suffix_head`,
+   and `suffix_tail` separately. The bootstrap discards the prefix and passes
+   the two suffix fields directly to `install_from_nipopow_proof`; it never
+   reconstructs the boundary from `headers.len() - k`.
+
+7. **Transition to normal tip-following sync** via the existing
    `sync_from_peer` loop. From here on out, light mode behaves like full
    mode minus block bodies: the sync machine sends SyncInfo, receives
    header Inv, requests headers, validates them via `try_append`, and
@@ -739,29 +731,27 @@ for first release, terminate.
 
 ### Bootstrap invariants
 
-- **Single peer per attempt**: bootstrap requests from ONE peer at a time.
-  Multi-peer best-arg comparison (KMZ17 §4.3, where the client compares
-  proofs from multiple peers and picks the one with highest cumulative work
-  via `bestArg`) is **out of scope for first release** and tracked as a
-  hardening follow-up. The first-release trust model is "trust the first
-  peer that returns a verifiable proof." This is documented as a known
-  limitation in the user-facing release notes.
+- **Shared verification context**: every candidate is verified against the
+  same requested `m=6`, `k=10`, and configured genesis before comparison.
+  A failed candidate never enters pairwise selection.
+- **Lossless install boundary**: selection retains the typed verification
+  result, and installation consumes its exact `suffix_head` and
+  `suffix_tail`. No consumer re-parses or re-splits a flattened header list.
 - **No restart-resume state**: bootstrap is one-shot and re-runs from
   scratch on every restart where `chain.is_empty()`. Once the chain is
   installed, subsequent restarts skip bootstrap entirely (chain is loaded
   from store and is non-empty). There is no partial-bootstrap state that
   needs persistence — the operation is atomic.
-- **Bootstrap NEVER mutates `store/`** beyond what `HeaderChain` itself
-  writes via its existing persistence path. The proof bytes are not
-  archived after install. If we want to re-verify the proof after a
-  reboot, we'd need to re-fetch it; this is not a first-release concern.
+- **Proof bytes are not archived** after install. `SharedChain` persists the
+  installed suffix headers through the normal header-store path.
 
 ### Trust model
 
-Standard SPV: single-peer bootstrap trusts that peer's view of the
-chain. Failure mode is liveness, not safety — a hostile peer causes a
-recoverable DoS, not loss of funds. Multi-peer best-arg comparison
-(KMZ17 §4.3) is the standard hardening, tracked as a follow-up.
+Bootstrap accepts only proofs that match the configured chain identity and
+requested security parameters, then selects the best verified proof among the
+responses it observed. Security still depends on the NiPoPoW assumptions and
+the available peer view; verification and multi-peer comparison do not by
+themselves guarantee peer diversity or network availability.
 
 ## Block Section Download
 

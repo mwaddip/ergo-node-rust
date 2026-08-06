@@ -2636,7 +2636,7 @@ mod shutdown_flush_tests {
         async fn verify_nipopow_envelope(
             &self,
             _envelope_body: &[u8],
-        ) -> Result<Vec<Header>, ChainError> {
+        ) -> Result<enr_chain::NipopowVerificationResult, ChainError> {
             unreachable!("not called when state_type=Utxo")
         }
 
@@ -3021,7 +3021,7 @@ mod blocks_to_keep_tests {
         async fn verify_nipopow_envelope(
             &self,
             _envelope_body: &[u8],
-        ) -> Result<Vec<Header>, ChainError> {
+        ) -> Result<enr_chain::NipopowVerificationResult, ChainError> {
             unreachable!()
         }
 
@@ -3610,7 +3610,7 @@ mod sweep_resume_tests {
         async fn verify_nipopow_envelope(
             &self,
             _envelope_body: &[u8],
-        ) -> Result<Vec<Header>, ChainError> {
+        ) -> Result<enr_chain::NipopowVerificationResult, ChainError> {
             unreachable!()
         }
         async fn is_better_nipopow(&self, _this: &[u8], _than: &[u8]) -> Result<bool, ChainError> {
@@ -4121,7 +4121,7 @@ mod serve_continuation_tests {
         async fn verify_nipopow_envelope(
             &self,
             _envelope_body: &[u8],
-        ) -> Result<Vec<Header>, ChainError> {
+        ) -> Result<enr_chain::NipopowVerificationResult, ChainError> {
             unreachable!("not called in serve tests")
         }
 

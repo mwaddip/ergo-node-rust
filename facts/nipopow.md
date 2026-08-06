@@ -95,8 +95,9 @@ future_pad_length: u16 (VLQ — JVM putUShort)
 **Validation**:
 - Total body size MUST be ≤ 2,000,000 bytes (reject before allocating).
 - `proof_length` MUST be > 0 AND < 2,000,000.
-- `proof_bytes` is the inner NiPoPoW proof — passed verbatim to
-  `chain.verify_nipopow_proof_bytes(proof_bytes)`.
+- `proof_bytes` is the inner NiPoPoW proof. The bootstrap path passes it to
+  context-bound verification with the exact requested `m/k` and configured
+  genesis; the unsolicited log path uses diagnostic-only inspection.
 
 ## Module: `src/nipopow_handler` (or inline in main.rs)
 
@@ -113,17 +114,16 @@ messages. Mirrors the snapshot sync handler structure.
        calls `p2p.send_to(from, ProtocolMessage::Custom(91, body))`.
      - On error, log + drop. (Do NOT send an error message — the JVM doesn't
        expect one and will time out instead.)
-  3. On every `ProtocolEvent::Message { from, code, body }` with `code == 91`:
+  3. On an unsolicited `ProtocolEvent::Message` with `code == 91`:
      - Parses `body` to extract the inner proof bytes.
-     - Acquires the chain lock, calls `chain.verify_nipopow_proof_bytes(...)`.
-     - In `StateType::Utxo`/`Digest` modes: logs the result and drops it
-       (the existing serve-side observation path — verifies for visibility,
-       does not mutate state).
-     - In `StateType::Light` mode: routes the verified result to the
-       light-client bootstrap state machine via a one-shot channel
-       established at bootstrap start. The bootstrap waits for exactly
-       one such verified result from its requested peer; subsequent code
-       91 messages from other peers (if any) are logged and dropped.
+     - Calls `inspect_nipopow_proof_bytes` and logs header-free metadata.
+       This diagnostic path has no request context and never authorizes
+       bootstrap selection or installation.
+  4. The light-bootstrap session processes responses to its own code-90
+     broadcast separately. It accepts code-91 candidates only from peers that
+     received that request, calls `SyncChain::verify_nipopow_envelope`, retains
+     each lossless verification result for comparison, and installs only the
+     selected result's exact parsed suffix.
 - **Invariant**: The handler never blocks the event loop — long-running chain
   operations happen on a `tokio::task::block_in_place` boundary or in a
   spawned task, mirroring the existing pattern from snapshot sync.
@@ -168,13 +168,14 @@ adds no value.
 
 ### Sigma-rust integration
 
-The chain submodule's `build_nipopow_proof`, `verify_nipopow_proof_bytes`,
-and `install_from_nipopow_proof` wrap `ergo_nipopow::NipopowAlgos` and
+The chain submodule's `build_nipopow_proof`, context-bound
+`verify_nipopow_proof_bytes`, and `install_from_nipopow_proof` wrap
+`ergo_nipopow::NipopowAlgos` and
 `ergo_nipopow::NipopowProofSerializer`. The main crate does NOT import
 `ergo-nipopow` directly — that's the chain's job. The main crate only
-sees `Vec<u8>` (proof bytes), the `NipopowVerificationResult` struct
-returned from `verify_nipopow_proof_bytes`, and `Header` (for installing
-the suffix into the chain via `install_from_nipopow_proof`).
+sees `Vec<u8>` proof bytes plus the lossless `NipopowVerificationResult`
+returned from verification. The bootstrap carries that typed result through
+selection and installs its `suffix_head` / `suffix_tail` fields directly.
 
 ## Routing behavior (current limitation)
 

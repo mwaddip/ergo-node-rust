@@ -148,7 +148,7 @@ impl SyncChain for SharedChain {
     async fn verify_nipopow_envelope(
         &self,
         envelope_body: &[u8],
-    ) -> Result<Vec<Header>, ChainError> {
+    ) -> Result<enr_chain::NipopowVerificationResult, ChainError> {
         // Strip the P2P code-91 envelope (length-prefixed inner bytes + future
         // pad). The wire codec lives in the main crate's `nipopow_serve` so
         // sync stays codec-free.
@@ -158,12 +158,7 @@ impl SyncChain for SharedChain {
             let chain = self.chain.lock().await;
             enr_chain::NipopowVerificationContext::from_chain(&chain, 6, 10)?
         };
-        let result = enr_chain::verify_nipopow_proof_bytes(&inner, &context)?;
-        let mut headers = Vec::with_capacity(result.total_headers());
-        headers.extend(result.prefix);
-        headers.push(result.suffix_head);
-        headers.extend(result.suffix_tail);
-        Ok(headers)
+        enr_chain::verify_nipopow_proof_bytes(&inner, &context)
     }
 
     async fn is_better_nipopow(
