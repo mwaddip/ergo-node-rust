@@ -81,6 +81,14 @@ pub enum ChainError {
     #[error("nipopow error: {0}")]
     Nipopow(String),
 
+    /// Legacy NiPoPoW V1 proofs do not authenticate sparse difficulty
+    /// headers as members of the proved branch, so they cannot authorize a
+    /// variable-difficulty bootstrap installation.
+    #[error(
+        "NiPoPoW V1 bootstrap disabled: sparse difficulty headers are not branch-authenticated"
+    )]
+    NipopowBootstrapDisabled,
+
     /// `install_from_nipopow_proof` was called on a chain that already
     /// contains headers. The install API only accepts an empty chain.
     #[error("chain not empty: install_from_nipopow_proof requires is_empty()")]

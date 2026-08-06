@@ -100,9 +100,9 @@ pub struct HeaderChain {
     /// source for [`Self::height`] / [`Self::len`] — chain length is
     /// `by_id.len()` and the tip height is `base_height + by_id.len() - 1`.
     by_id: HashMap<BlockId, u32>,
-    /// Sparse, authenticated epoch-boundary headers carried by a continuous
-    /// NiPoPoW proof. They are difficulty context only: never best-chain
-    /// entries, never score contributors, and never reorg anchors.
+    /// Legacy V1 sparse epoch-boundary headers selected by height. They are
+    /// difficulty-context mechanics only: never best-chain entries, score
+    /// contributors, reorg anchors, or proof of branch membership.
     nipopow_difficulty_headers: BTreeMap<u32, Header>,
     /// A restored light chain cannot accept successors or reorgs until its
     /// suffix-bound sparse context has been validated.
@@ -143,8 +143,9 @@ pub struct HeaderChain {
     extension_loader: Option<ExtensionLoader>,
     /// Set to `true` when the best-chain origin was installed from a NiPoPoW
     /// suffix. It controls the reorg floor and restart contract only; it does
-    /// not relax expected-difficulty validation. Sparse authenticated headers
-    /// above supply the pre-install recalculation inputs.
+    /// not relax expected-difficulty validation. The legacy V1 bootstrap
+    /// verifier is disabled because the sparse headers above are not
+    /// branch-authenticated.
     light_client_mode: bool,
     /// Lazy header/score store. After v0.5.0 this is the sole source
     /// of truth for both header and cumulative-score reads at heights
@@ -374,9 +375,9 @@ impl HeaderChain {
         Some(header)
     }
 
-    /// Header lookup used only by difficulty recalculation. Continuous
-    /// NiPoPoW anchors below the install boundary are not part of the best
-    /// chain, but are authenticated context for this one predicate.
+    /// Header lookup used only by difficulty recalculation. Legacy V1 anchors
+    /// below the install boundary are not part of the best chain and are not
+    /// branch-authenticated; the public V1 bootstrap verifier is disabled.
     pub(crate) fn difficulty_header_at(&self, height: u32) -> Option<Header> {
         self.header_at(height)
             .or_else(|| self.nipopow_difficulty_headers.get(&height).cloned())
@@ -992,15 +993,17 @@ impl HeaderChain {
 
     // --- Light-client install ---
 
-    /// Install a verified NiPoPoW proof's suffix as the chain's starting
+    /// Install an externally authorized NiPoPoW suffix as the chain's starting
     /// point for light-client mode.
     ///
     /// **Precondition**: chain is empty ([`Self::is_empty`] returns `true`).
     /// `difficulty_headers`, `suffix_head`, and `suffix_tail` MUST come from
-    /// the same typed result already validated by the caller via
-    /// [`crate::nipopow_proof::verify_nipopow_proof_bytes`]. This function
-    /// does NOT re-verify the proof; it assumes the caller has done so and
-    /// is installing the trusted suffix.
+    /// one branch-authenticated format and authorization result. This function
+    /// does NOT verify branch membership. Legacy V1 cannot satisfy this
+    /// precondition and [`crate::nipopow_proof::verify_nipopow_proof_bytes`]
+    /// always returns [`ChainError::NipopowBootstrapDisabled`]. The method is
+    /// retained as the install seam for a future authenticated format and for
+    /// isolated install-mechanics tests.
     ///
     /// **Postcondition on Ok**: chain contains `suffix_head` followed by
     /// every header in `suffix_tail`, in order. `tip()` returns the last
@@ -1356,9 +1359,9 @@ impl HeaderChain {
         self.base_height.unwrap_or(1)
     }
 
-    /// Whether this chain originated from a NiPoPoW suffix and is running
-    /// without block-body or transaction validation. Header difficulty remains
-    /// fully checked using the authenticated sparse context.
+    /// Whether this chain originated from an externally authorized NiPoPoW
+    /// suffix and is running without block-body or transaction validation.
+    /// Legacy V1 cannot enter this mode through the public verifier.
     pub fn light_client_mode(&self) -> bool {
         self.light_client_mode
     }
@@ -1980,7 +1983,8 @@ impl HeaderChain {
                 got: header.timestamp,
             });
         }
-        // Light mode uses authenticated sparse pre-install anchors here.
+        // This validates post-install difficulty mechanics. Legacy V1 cannot
+        // reach installation because its sparse anchors lack branch proofs.
         let expected_n_bits = crate::difficulty::expected_difficulty(&tip, self)?;
         if header.n_bits != expected_n_bits {
             return Err(ChainError::WrongDifficulty {

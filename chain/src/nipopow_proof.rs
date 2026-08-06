@@ -1,9 +1,9 @@
-//! NiPoPoW proof construction and verification (Phase 6).
+//! NiPoPoW proof construction, inspection, and bootstrap authorization.
 //!
-//! Wraps `ergo-nipopow` for build/verify on the local header chain. Received
-//! proofs are bound to their request parameters and configured genesis before
-//! their exact prefix/suffix split is returned to the light-bootstrap layer.
-//! Chain-state mutation remains the responsibility of that consumer.
+//! Wraps `ergo-nipopow` for build and bounded inspection on the local header
+//! chain. Legacy V1 proofs cannot authorize bootstrap because their sparse
+//! difficulty headers are not branch-authenticated. Chain-state mutation
+//! remains the responsibility of a separately authorized consumer.
 //!
 //! JVM reference:
 //! - `ergo-core/src/main/scala/org/ergoplatform/modifiers/history/popow/NipopowProof.scala`
@@ -24,8 +24,9 @@ use crate::error::ChainError;
 /// caps the proof size for sanity.
 pub const MAX_M_K: u32 = 256;
 
-/// Versioned modifier-store key for the authenticated sparse difficulty
-/// context carried by a continuous NiPoPoW proof.
+/// Versioned modifier-store key for the legacy V1 sparse difficulty context.
+/// The codec is retained for compatibility and future migration work; V1
+/// bootstrap authorization is disabled.
 pub const NIPOPOW_DIFFICULTY_CONTEXT_META_KEY: &[u8] = b"nipopow_difficulty_context_v1";
 
 const NIPOPOW_DIFFICULTY_CONTEXT_MAGIC: [u8; 4] = *b"NDCX";
@@ -40,9 +41,10 @@ const NIPOPOW_DIFFICULTY_CONTEXT_FIXED_BYTES: usize = 4 + 1 + 4 + 32 + 4;
 const MAX_NIPOPOW_DIFFICULTY_CONTEXT_BYTES: usize = NIPOPOW_DIFFICULTY_CONTEXT_FIXED_BYTES
     + MAX_NIPOPOW_DIFFICULTY_CONTEXT_HEADERS * (4 + MAX_NIPOPOW_DIFFICULTY_HEADER_BYTES);
 
-/// Decoded, versioned persistence record for continuous-proof difficulty
-/// anchors. The suffix-head binding prevents stale context from a previous
-/// bootstrap at the same database path being applied to another chain.
+/// Decoded, versioned persistence record for legacy V1 difficulty anchors.
+/// The suffix-head binding prevents stale context from a previous bootstrap
+/// at the same database path being applied to another chain, but does not
+/// prove branch membership.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PersistedNipopowDifficultyContext {
     pub suffix_head_height: u32,
@@ -50,8 +52,9 @@ pub struct PersistedNipopowDifficultyContext {
     pub headers: Vec<Header>,
 }
 
-/// Serialize the small authenticated header set needed for future difficulty
-/// recalculations after a continuous NiPoPoW bootstrap.
+/// Serialize the small legacy V1 header set selected for future difficulty
+/// recalculations. This storage binding does not prove branch membership and
+/// must not authorize V1 bootstrap installation.
 pub fn serialize_nipopow_difficulty_context(
     suffix_head: &Header,
     headers: &[Header],
@@ -337,8 +340,9 @@ pub struct NipopowVerificationResult {
     /// JVM terminal mode, or `None` for a Rust-core-only payload.
     pub continuous: Option<bool>,
     pub prefix: Vec<Header>,
-    /// Authenticated sparse history required to validate difficulty after
-    /// installing the suffix. This is a subset of `prefix`.
+    /// Legacy V1 sparse difficulty candidates selected by height from
+    /// `prefix`. V1 does not authenticate their membership in the proved
+    /// branch, so this field must not authorize bootstrap installation.
     pub difficulty_headers: Vec<Header>,
     pub suffix_head: Header,
     pub suffix_tail: Vec<Header>,
@@ -602,10 +606,12 @@ pub fn popow_header_by_id(
 /// payload only). Returns `true` if `a` represents a better chain than `b`
 /// per KMZ17 §4.3.
 ///
-/// Both byte slices must already have passed [`verify_nipopow_proof_bytes`]
-/// against the same [`NipopowVerificationContext`]. This function validates
-/// both proofs again, and sigma-rust rejects unequal `m`/`k` parameters during
-/// comparison. Parse or validation failure on either side returns an error.
+/// This is a non-authorizing scoring primitive. Callers must first obtain a
+/// branch-authenticated authorization result for both proofs under the same
+/// context. Legacy V1 cannot satisfy that precondition because
+/// [`verify_nipopow_proof_bytes`] always fails closed. This function validates
+/// both structures again, and sigma-rust rejects unequal `m`/`k` parameters
+/// during comparison. Parse or validation failure returns an error.
 pub fn compare_nipopow_proof_bytes(a: &[u8], b: &[u8]) -> Result<bool, ChainError> {
     let (proof_a, _) = parse_received_nipopow_proof(a)
         .map_err(|e| ChainError::Nipopow(format!("parse proof A failed: {e}")))?;
@@ -669,6 +675,7 @@ fn verify_nipopow_headers_pow(proof: &NipopowProof) -> Result<(), ChainError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn continuous_difficulty_headers(
     proof: &NipopowProof,
     context: &NipopowVerificationContext,
@@ -700,23 +707,23 @@ fn continuous_difficulty_headers(
     Ok(headers)
 }
 
-/// Verify a NiPoPoW proof from raw bytes.
+/// Verify a NiPoPoW proof for bootstrap authorization.
 ///
 /// **Precondition**: `bytes` is the inner NiPoPoW proof payload (the main
 /// crate has stripped any P2P message envelope).
 ///
-/// The proof must pass canonical sigma-rust validation, match `context`
-/// exactly, bind its first proof-chain header to the configured genesis, and
-/// pass [`crate::verify_pow`] for every extracted header.
-///
-/// Does NOT touch chain state. Does NOT apply the proof to local chain.
-/// The returned result preserves the parsed prefix and suffix boundary so an
-/// installer never has to reconstruct it from a flattened header vector.
+/// Legacy V1 proofs cannot authorize bootstrap because their sparse
+/// difficulty headers are not authenticated as members of the proved branch.
+/// This entry point therefore validates the local context and then fails with
+/// [`ChainError::NipopowBootstrapDisabled`]. Use
+/// [`inspect_nipopow_proof_bytes`] for bounded parsing and diagnostic PoW
+/// inspection; inspection results cannot authorize selection or installation.
 pub fn verify_nipopow_proof_bytes(
-    bytes: &[u8],
+    _bytes: &[u8],
     context: &NipopowVerificationContext,
 ) -> Result<NipopowVerificationResult, ChainError> {
-    verify_inner(bytes, context, true)
+    context.validate()?;
+    Err(ChainError::NipopowBootstrapDisabled)
 }
 
 /// Inspect a proof for diagnostics without binding it to a request or genesis.
@@ -753,6 +760,7 @@ pub(crate) fn verify_nipopow_proof_bytes_no_pow(
     verify_inner(bytes, context, false)
 }
 
+#[cfg(test)]
 fn verify_inner(
     bytes: &[u8],
     context: &NipopowVerificationContext,
@@ -1152,6 +1160,26 @@ mod tests {
         let err = verify_nipopow_proof_bytes(&[], &context)
             .expect_err("pathological context must fail before proof parsing");
         assert!(matches!(err, ChainError::Nipopow(ref msg) if msg.contains("exceeds maximum")));
+    }
+
+    #[test]
+    fn bootstrap_verifier_rejects_structurally_valid_v1_as_unauthenticated() {
+        let chain = build_chain_with_interlinks(300);
+        let bytes = build_nipopow_proof(&chain, 6, 10, None).expect("build V1 proof");
+        let context = verification_context(&chain, 6, 10);
+
+        let err = verify_nipopow_proof_bytes(&bytes, &context)
+            .expect_err("V1 must not authorize bootstrap installation");
+        assert!(matches!(&err, ChainError::NipopowBootstrapDisabled));
+        let message = err.to_string();
+        assert!(
+            message.contains("bootstrap disabled"),
+            "unexpected fail-close error: {message}"
+        );
+        assert!(
+            message.contains("not branch-authenticated"),
+            "unexpected fail-close error: {message}"
+        );
     }
 
     #[test]

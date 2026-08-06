@@ -575,9 +575,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     /// through to [`Self::shutdown_flush`] via [`Self::run`].
     async fn run_inner(&mut self) {
         // Light-client bootstrap: if state_type is Light AND chain is empty,
-        // run a one-shot NiPoPoW bootstrap before entering the normal sync
-        // cycle. The bootstrap installs the proof's suffix as the chain
-        // origin; subsequent tip-following uses the existing loop unchanged.
+        // run a one-shot NiPoPoW bootstrap before entering normal sync.
+        // Legacy V1 returns BootstrapDisabled before comparison or install;
+        // the success branch is retained for a future authenticated format.
         // Idempotent: skipped on restart when the chain is non-empty.
         if self.config.state_type == StateType::Light && self.chain.chain_height().await == 0 {
             tracing::info!("light-client mode: running NiPoPoW bootstrap");
@@ -589,9 +589,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             {
                 Ok(()) => {
                     let height = self.chain.chain_height().await;
-                    // Light mode treats all installed headers as "validated"
-                    // — the proof's PoW checks ARE the validation. There's
-                    // no validator running and no block sections to download.
+                    // Reachable only after a future authorization path has
+                    // authenticated the installed origin. Legacy V1 cannot
+                    // reach this branch.
                     self.downloaded_height = height;
                     self.state_applied_height = height;
                     tracing::info!(height, "light bootstrap installed, entering tip-following sync");

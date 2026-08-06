@@ -240,7 +240,8 @@ impl SyncChain for SharedChain {
         }
         // This record is deliberately committed after every BEST_CHAIN write.
         // A crash before it lands makes the next startup refuse light mode
-        // instead of continuing without authenticated difficulty history.
+        // instead of continuing without the required difficulty-context
+        // record. This persistence binding is not V1 branch authentication.
         self.store
             .chain_meta_put(
                 enr_chain::NIPOPOW_DIFFICULTY_CONTEXT_META_KEY,

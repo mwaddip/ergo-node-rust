@@ -2142,13 +2142,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         StateType::Light => {
-            // Light mode runs no validator. The chain is bootstrapped from a
-            // verified NiPoPoW proof (see sync's light bootstrap state) and
-            // tip-following uses HeaderChain::try_append, which the chain
-            // crate's light_client_mode flag teaches to skip the
-            // expected_difficulty recalc. Mining and transaction validation
-            // are not available.
-            tracing::info!("light-client mode: no block validator constructed");
+            // Light mode runs no block validator. Legacy NiPoPoW V1 bootstrap
+            // is fail-closed before comparison or installation because its
+            // sparse difficulty headers are not branch-authenticated. Mining
+            // and transaction validation are not available.
+            tracing::info!(
+                "light-client mode: no block validator; NiPoPoW V1 bootstrap is disabled"
+            );
             None
         }
     };

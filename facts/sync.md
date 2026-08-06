@@ -665,9 +665,10 @@ Critical findings from debugging sync against JVM 6.0.3 peers:
 
 When `config.state_type == StateType::Light` AND the chain is empty at startup,
 the sync machine runs a one-shot NiPoPoW bootstrap BEFORE entering the normal
-sync cycle. The bootstrap installs the proof's suffix as the chain origin via
-`HeaderChain::install_from_nipopow_proof`; subsequent tip-following uses the
-existing header sync loop without modification.
+sync cycle. Legacy V1 is currently non-authorizing: after the first solicited
+proof response, the chain verifier returns a typed capability error and sync
+terminates before comparison or installation. Build, serve, parser, and
+inspection behavior remain available.
 
 ### `run_light_bootstrap(transport, chain, config) -> Result<(), LightBootstrapError>`
 
@@ -690,41 +691,24 @@ State machine:
    request, until they have all responded or the collection window expires.
    Unsolicited peers and non-proof messages do not enter the candidate set.
 
-4. **Verify each response** through `SyncChain::verify_nipopow_envelope`.
+4. **Ask the chain crate to authorize each response** through
+   `SyncChain::verify_nipopow_envelope`.
    The bridge strips the envelope and calls context-bound
    `enr_chain::verify_nipopow_proof_bytes` with the exact requested `m/k`,
-   configured genesis, and difficulty epoch context. Only terminal mode `1`
-   with every required authenticated difficulty header can authorize
-   bootstrap. Failed verification marks that response hostile and cannot add
-   a candidate or mutate the chain.
+   configured genesis, and difficulty epoch context. The V1 entry point
+   validates the local context and returns
+   `ChainError::NipopowBootstrapDisabled` because the height-selected sparse
+   headers are not authenticated as branch members.
 
-5. **Select among verified candidates only.** Multiple candidates are
-   compared pairwise through `NipopowProof::is_better_than`; all have already
-   passed the same request/genesis context. A comparison error skips that
-   challenger and retains the incumbent.
+5. **Propagate the capability failure immediately.** Sync returns
+   `LightBootstrapError::BootstrapDisabled`. It does not classify the peer as
+   hostile, add a candidate, compare proofs, install headers, or write the
+   legacy difficulty-context record.
 
-6. **Install the selected result's exact parsed suffix and difficulty
-   context** into the local `HeaderChain`. `NipopowVerificationResult` carries
-   `difficulty_headers`, `suffix_head`, and `suffix_tail` separately. The
-   bootstrap passes these fields directly to `install_from_nipopow_proof`; it
-   never reconstructs the boundary or anchor set from a flattened vector.
-
-7. **Persist and flush the restart dependency.** `SharedChain` writes every
-   installed suffix header first, then writes the versioned, bounded,
-   suffix-head-bound `nipopow_difficulty_context_v1` record and flushes the
-   modifier store. If the final record is absent or corrupt after interruption,
-   the next startup refuses light mode instead of continuing without anchors.
-   The in-memory install and these store writes are not one cross-layer
-   transaction: a write failure is fatal to the current sync run and does not
-   roll the in-memory chain back. The missing or incomplete metadata then makes
-   restart fail closed. Supporting retry in the same process would require a
-   separate atomic-install design.
-
-8. **Transition to normal tip-following sync** via the existing
-   `sync_from_peer` loop. From here on out, light mode behaves like full
-   mode minus block bodies: the sync machine sends SyncInfo, receives
-   header Inv, requests headers, validates them (including expected
-   difficulty) via `try_append`, and advances the tip.
+The retained comparison, exact-suffix install, persistence, and restart
+mechanics are exercised by isolated tests but are unreachable from legacy V1
+in production. A future proof format must first supply branch-authenticated
+difficulty-transition evidence.
 
 ### `LightBootstrapError`
 
@@ -733,6 +717,7 @@ pub enum LightBootstrapError {
     NoPeers,
     AllPeersStalled,
     AllPeersHostile,
+    BootstrapDisabled,
     InstallFailed(ChainError),
     StreamClosed,
 }
@@ -744,32 +729,24 @@ for first release, terminate.
 
 ### Bootstrap invariants
 
-- **Shared verification context**: every candidate is verified against the
-  same requested `m=6`, `k=10`, configured genesis, and difficulty epoch
-  settings before comparison. A failed candidate never enters pairwise
-  selection.
-- **Lossless install boundary**: selection retains the typed verification
-  result, and installation consumes its exact `difficulty_headers`,
-  `suffix_head`, and `suffix_tail`. No consumer re-parses or re-splits a
-  flattened header list.
-- **Restart is fail-closed**: bootstrap is one-shot when `chain.is_empty()`.
-  A non-empty restored light chain must also restore the matching versioned
-  difficulty context before the sync task is constructed. Missing/corrupt
-  context or a suffix-head height/ID mismatch aborts startup.
-  Light-client databases created before this metadata existed are intentionally
-  not migrated in place; recovery is a new light-client data directory followed
-  by a fresh proof bootstrap.
-- **Proof bytes are not archived** after install. `SharedChain` persists the
-  installed suffix headers through the normal header-store path and only the
-  bounded difficulty subset in `chain_meta`.
+- **V1 fails closed**: every V1 authorization attempt returns the typed
+  capability error before candidate comparison or chain installation.
+- **Capability failure is not peer hostility**: a conforming V1 response does
+  not count as an invalid-proof attack; sync terminates with
+  `BootstrapDisabled`.
+- **Inspection is non-authorizing**: successful bounded parsing, structural
+  validation, and per-header PoW checks cannot be converted into an install
+  result.
+- **Dormant install mechanics remain isolated**: exact prefix/suffix identity,
+  sparse-context bounds, suffix difficulty, and restart binding continue to
+  have regression coverage for a future authenticated format.
 
 ### Trust model
 
-Bootstrap accepts only proofs that match the configured chain identity and
-requested security parameters, then selects the best verified proof among the
-responses it observed. Security still depends on the NiPoPoW assumptions and
-the available peer view; verification and multi-peer comparison do not by
-themselves guarantee peer diversity or network availability.
+Legacy V1 accepts no proof for bootstrap installation. A future V2 design must
+authenticate the difficulty-transition evidence as part of the selected
+branch before multi-peer comparison or installation can be re-enabled. V2 is
+not specified by this implementation.
 
 ## Block Section Download
 

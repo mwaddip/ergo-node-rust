@@ -1,15 +1,16 @@
 //! NiPoPoW light-client bootstrap state machine.
 //!
 //! Runs once at startup when `state_type == StateType::Light` and the chain
-//! is empty. Broadcasts `GetNipopowProof` to all outbound peers, collects
-//! valid proofs within a timeout window, compares them via KMZ17 §4.3
-//! (`is_better_than`), and installs the best as the chain's starting point.
-//! Subsequent tip-following uses the existing header sync loop.
+//! is empty. Legacy V1 responses currently terminate with
+//! [`LightBootstrapError::BootstrapDisabled`] before comparison or install,
+//! because V1 does not branch-authenticate its sparse difficulty headers.
+//! The bounded request/collection and dormant selection/install mechanics are
+//! retained for a future proof format that can satisfy that authorization.
 //!
 //! JVM reference: `ErgoNodeViewSynchronizer.scala:1032` (outbound request),
 //! `PopowProcessor.applyPopowProof` (install side).
 
-use enr_chain::{BlockId, NipopowVerificationResult};
+use enr_chain::{BlockId, ChainError, NipopowVerificationResult};
 use enr_p2p::protocol::messages::ProtocolMessage;
 use enr_p2p::protocol::peer::ProtocolEvent;
 use enr_p2p::types::PeerId;
@@ -49,6 +50,11 @@ pub enum LightBootstrapError {
     #[error("all {0} attempted peers returned invalid proofs")]
     AllPeersHostile(usize),
 
+    #[error(
+        "NiPoPoW V1 bootstrap is disabled: sparse difficulty headers are not branch-authenticated"
+    )]
+    BootstrapDisabled,
+
     #[error("install failed: {0}")]
     InstallFailed(enr_chain::ChainError),
 
@@ -85,14 +91,13 @@ fn build_get_nipopow_proof_body(m: i32, k: i32, header_id: Option<&BlockId>) -> 
 ///
 /// Idempotent: returns immediately if `chain.chain_height() > 0`.
 ///
-/// Top-level state machine (KMZ17 §4.3 multi-peer comparison):
+/// Top-level state machine:
 /// 1. Wait for at least one outbound peer (60s deadline).
 /// 2. Broadcast `GetNipopowProof(m=6, k=10)` to ALL outbound peers.
-/// 3. Collect valid proofs within a 30s window. Verify each on arrival.
-/// 4. If multiple valid proofs, compare pairwise via `is_better_than`
-///    and pick the best. If one valid proof, use it.
-/// 5. Install the exact parsed suffix carried by the best verified result.
-/// 6. No valid proofs → return error.
+/// 3. The V1 authorization verifier returns a typed capability error.
+/// 4. Propagate `BootstrapDisabled` before comparison or installation.
+///
+/// Candidate comparison and installation remain unreachable for V1.
 pub async fn run_light_bootstrap<T: SyncTransport, C: SyncChain>(
     transport: &mut T,
     chain: &C,
@@ -194,6 +199,13 @@ pub async fn run_light_bootstrap<T: SyncTransport, C: SyncChain>(
                     verification,
                     envelope: body,
                 });
+            }
+            Err(ChainError::NipopowBootstrapDisabled) => {
+                tracing::warn!(
+                    peer = ?peer_id,
+                    "light bootstrap: V1 bootstrap capability is disabled"
+                );
+                return Err(LightBootstrapError::BootstrapDisabled);
             }
             Err(e) => {
                 tracing::warn!(
@@ -409,6 +421,7 @@ mod tests {
     enum VerifyResult {
         Ok(Box<NipopowVerificationResult>),
         Err(String),
+        Disabled,
     }
 
     impl VerifyResult {
@@ -511,6 +524,7 @@ mod tests {
                     return match result {
                         VerifyResult::Ok(result) => Ok(result.as_ref().clone()),
                         VerifyResult::Err(e) => Err(ChainError::Nipopow(e.clone())),
+                        VerifyResult::Disabled => Err(ChainError::NipopowBootstrapDisabled),
                     };
                 }
             }
@@ -595,6 +609,27 @@ mod tests {
 
         let result = run_light_bootstrap(&mut transport, &chain).await;
         assert!(matches!(result, Err(LightBootstrapError::AllPeersHostile(_))));
+        assert!(chain.installed().is_none());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_propagates_v1_disabled_without_comparison_or_install() {
+        let peer = PeerId(1);
+        let body = vec![0xd1];
+        let chain = MockChain::new();
+        chain.add_verify(body.clone(), VerifyResult::Disabled);
+        let mut transport = MockTransport::new(vec![peer], vec![proof_event(peer, body)]);
+
+        let err = run_light_bootstrap(&mut transport, &chain)
+            .await
+            .expect_err("V1 capability failure must terminate bootstrap");
+
+        assert!(matches!(&err, LightBootstrapError::BootstrapDisabled));
+        assert!(
+            err.to_string().contains("bootstrap is disabled"),
+            "unexpected capability error: {err}"
+        );
+        assert!(chain.comparison_calls().is_empty());
         assert!(chain.installed().is_none());
     }
 
