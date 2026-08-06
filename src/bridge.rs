@@ -12,6 +12,32 @@ use ergo_sync::{SyncChain, SyncStore, SyncTransport};
 use sigma_ser::ScorexSerializable;
 use tokio::sync::{mpsc, Mutex};
 
+/// Restore the sparse difficulty anchors required by a light chain. A
+/// best-chain index starting above genesis is not usable without the matching
+/// versioned context record, so absence and corruption are hard errors.
+pub fn restore_nipopow_difficulty_context_from_store(
+    chain: &mut HeaderChain,
+    store: &RedbModifierStore,
+) -> Result<(), ChainError> {
+    if !chain.light_client_mode() {
+        return Ok(());
+    }
+    let bytes = store
+        .chain_meta_get(enr_chain::NIPOPOW_DIFFICULTY_CONTEXT_META_KEY)
+        .map_err(|e| ChainError::Nipopow(format!("read NiPoPoW difficulty context: {e}")))?
+        .ok_or_else(|| {
+            ChainError::Nipopow(
+                "restored light chain is missing persisted NiPoPoW difficulty context".into(),
+            )
+        })?;
+    let context = enr_chain::parse_nipopow_difficulty_context(&bytes)?;
+    chain.restore_nipopow_difficulty_context(
+        context.suffix_head_height,
+        context.suffix_head_id,
+        context.headers,
+    )
+}
+
 /// Wraps `P2pNode` + event receiver to implement `SyncTransport`.
 pub struct P2pTransport {
     node: Arc<P2pNode>,
@@ -175,29 +201,55 @@ impl SyncChain for SharedChain {
 
     async fn install_nipopow_suffix(
         &self,
+        difficulty_headers: Vec<Header>,
         suffix_head: Header,
         suffix_tail: Vec<Header>,
     ) -> Result<(), ChainError> {
         let all_headers: Vec<Header> = std::iter::once(suffix_head.clone())
             .chain(suffix_tail.iter().cloned())
             .collect();
-        let installed = self
-            .chain
-            .lock()
-            .await
-            .install_from_nipopow_proof(suffix_head, suffix_tail)?;
+        let raw_headers = all_headers
+            .iter()
+            .map(|header| {
+                header
+                    .scorex_serialize_bytes()
+                    .map_err(|e| ChainError::Nipopow(format!("serialize installed header: {e}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let difficulty_context_bytes =
+            enr_chain::serialize_nipopow_difficulty_context(&suffix_head, &difficulty_headers)?;
+        let installed = self.chain.lock().await.install_from_nipopow_proof(
+            difficulty_headers,
+            suffix_head,
+            suffix_tail,
+        )?;
 
         // Persist each installed header with its real cumulative score so
         // the store's ScoreLoader can serve subsequent chain queries.
         // install_from_nipopow_proof returns InstalledHeader entries in
         // the same order as `all_headers`.
-        for (header, ih) in all_headers.iter().zip(installed.iter()) {
-            let raw = header.scorex_serialize_bytes()
-                .map_err(|e| ChainError::Nipopow(format!("re-serialize installed header: {e}")))?;
+        for ((header, raw), ih) in all_headers
+            .iter()
+            .zip(raw_headers.iter())
+            .zip(installed.iter())
+        {
             self.store
-                .put_header(&ih.id.0.0, ih.height, 0, &ih.score_be, &raw)
+                .put_header(&ih.id.0 .0, ih.height, 0, &ih.score_be, raw)
                 .map_err(|e| ChainError::Nipopow(format!("persist installed header: {e}")))?;
+            debug_assert_eq!(header.id, ih.id);
         }
+        // This record is deliberately committed after every BEST_CHAIN write.
+        // A crash before it lands makes the next startup refuse light mode
+        // instead of continuing without authenticated difficulty history.
+        self.store
+            .chain_meta_put(
+                enr_chain::NIPOPOW_DIFFICULTY_CONTEXT_META_KEY,
+                &difficulty_context_bytes,
+            )
+            .map_err(|e| ChainError::Nipopow(format!("persist NiPoPoW difficulty context: {e}")))?;
+        self.store
+            .flush()
+            .map_err(|e| ChainError::Nipopow(format!("flush NiPoPoW bootstrap state: {e}")))?;
         Ok(())
     }
 
@@ -397,5 +449,150 @@ impl SyncStore for SharedStore {
                 Err(format!("spawn_blocking panicked: {e}"))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use enr_chain::ChainConfig;
+    use ergo_chain_types::{ADDigest, AutolykosSolution, Digest32, EcPoint, Votes};
+    use sigma_ser::ScorexSerializable;
+
+    fn synthetic_header(height: u32, parent_id: BlockId, n_bits: u32) -> Header {
+        let zero32 = Digest32::zero();
+        let header = Header {
+            version: 2,
+            id: BlockId(Digest32::zero()),
+            parent_id,
+            ad_proofs_root: zero32,
+            state_root: ADDigest::zero(),
+            transaction_root: zero32,
+            timestamp: 1_000_000 + u64::from(height) * 50_000,
+            n_bits,
+            height,
+            extension_root: zero32,
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce: height.to_be_bytes().repeat(2),
+                pow_distance: None,
+            },
+            votes: Votes([0, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        };
+        Header::scorex_parse_bytes(
+            &header
+                .scorex_serialize_bytes()
+                .expect("serialize synthetic header"),
+        )
+        .expect("parse canonical synthetic header")
+    }
+
+    #[test]
+    fn restored_light_chain_fails_closed_when_difficulty_context_is_absent() {
+        let dir = tempfile::tempdir().expect("temporary store directory");
+        let store = RedbModifierStore::new(&dir.path().join("modifiers.redb"))
+            .expect("open modifier store");
+        let suffix_head_id = BlockId(Digest32::from([0x37; 32]));
+        let mut chain = HeaderChain::restore(ChainConfig::testnet(), [(375, suffix_head_id)])
+            .expect("restore light-chain index");
+
+        let err = restore_nipopow_difficulty_context_from_store(&mut chain, &store)
+            .expect_err("light mode without persisted anchors must fail closed");
+        assert!(matches!(err, ChainError::Nipopow(ref msg) if msg.contains("missing")));
+        assert!(chain.nipopow_difficulty_headers().is_empty());
+    }
+
+    #[test]
+    fn restored_light_chain_fails_closed_when_difficulty_context_is_corrupt() {
+        let dir = tempfile::tempdir().expect("temporary store directory");
+        let store = RedbModifierStore::new(&dir.path().join("modifiers.redb"))
+            .expect("open modifier store");
+        store
+            .chain_meta_put(enr_chain::NIPOPOW_DIFFICULTY_CONTEXT_META_KEY, b"corrupt")
+            .expect("write corrupt context fixture");
+        let suffix_head_id = BlockId(Digest32::from([0x37; 32]));
+        let mut chain = HeaderChain::restore(ChainConfig::testnet(), [(375, suffix_head_id)])
+            .expect("restore light-chain index");
+
+        let err = restore_nipopow_difficulty_context_from_store(&mut chain, &store)
+            .expect_err("corrupt persisted anchors must fail closed");
+        assert!(matches!(err, ChainError::Nipopow(_)));
+        assert!(chain.nipopow_difficulty_headers().is_empty());
+    }
+
+    #[test]
+    fn restored_full_chain_does_not_require_nipopow_context() {
+        let dir = tempfile::tempdir().expect("temporary store directory");
+        let store = RedbModifierStore::new(&dir.path().join("modifiers.redb"))
+            .expect("open modifier store");
+        store
+            .chain_meta_put(
+                enr_chain::NIPOPOW_DIFFICULTY_CONTEXT_META_KEY,
+                b"corrupt stale context",
+            )
+            .expect("write stale context fixture");
+        let genesis_id = BlockId(Digest32::from([0x01; 32]));
+        let mut chain = HeaderChain::restore(ChainConfig::testnet(), [(1, genesis_id)])
+            .expect("restore full-chain index");
+
+        restore_nipopow_difficulty_context_from_store(&mut chain, &store)
+            .expect("full chain has no sparse-context dependency");
+        assert!(!chain.light_client_mode());
+    }
+
+    #[tokio::test]
+    async fn continuous_install_persists_and_restores_bound_difficulty_context() {
+        let dir = tempfile::tempdir().expect("temporary store directory");
+        let store = Arc::new(
+            RedbModifierStore::new(&dir.path().join("modifiers.redb"))
+                .expect("open modifier store"),
+        );
+        let config = ChainConfig::testnet();
+        let suffix_head = synthetic_header(
+            375,
+            BlockId(Digest32::from([0x75; 32])),
+            config.initial_n_bits,
+        );
+        let difficulty_headers = vec![
+            synthetic_header(
+                128,
+                BlockId(Digest32::from([0x80; 32])),
+                config.initial_n_bits,
+            ),
+            synthetic_header(
+                256,
+                BlockId(Digest32::from([0x81; 32])),
+                config.initial_n_bits,
+            ),
+        ];
+        let live_chain = Arc::new(Mutex::new(HeaderChain::new(config.clone())));
+        let shared = SharedChain::new(live_chain, store.clone());
+
+        shared
+            .install_nipopow_suffix(difficulty_headers.clone(), suffix_head.clone(), Vec::new())
+            .await
+            .expect("install and persist continuous proof state");
+
+        let raw_context = store
+            .chain_meta_get(enr_chain::NIPOPOW_DIFFICULTY_CONTEXT_META_KEY)
+            .expect("read context metadata")
+            .expect("context metadata exists");
+        let persisted = enr_chain::parse_nipopow_difficulty_context(&raw_context)
+            .expect("parse persisted context");
+        assert_eq!(persisted.suffix_head_height, suffix_head.height);
+        assert_eq!(persisted.suffix_head_id, suffix_head.id);
+        assert_eq!(persisted.headers, difficulty_headers);
+
+        let entries = store
+            .best_chain_entries()
+            .expect("read persisted best chain")
+            .into_iter()
+            .map(|(height, id)| (height, BlockId(Digest32::from(id))));
+        let mut restored = HeaderChain::restore(config, entries).expect("restore persisted suffix");
+        restore_nipopow_difficulty_context_from_store(&mut restored, store.as_ref())
+            .expect("restore persisted sparse context");
+        assert_eq!(restored.nipopow_difficulty_headers(), difficulty_headers);
     }
 }

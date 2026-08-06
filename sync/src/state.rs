@@ -2650,6 +2650,7 @@ mod shutdown_flush_tests {
 
         async fn install_nipopow_suffix(
             &self,
+            _difficulty_headers: Vec<Header>,
             _suffix_head: Header,
             _suffix_tail: Vec<Header>,
         ) -> Result<(), ChainError> {
@@ -3035,6 +3036,7 @@ mod blocks_to_keep_tests {
 
         async fn install_nipopow_suffix(
             &self,
+            _difficulty_headers: Vec<Header>,
             _suffix_head: Header,
             _suffix_tail: Vec<Header>,
         ) -> Result<(), ChainError> {
@@ -3618,6 +3620,7 @@ mod sweep_resume_tests {
         }
         async fn install_nipopow_suffix(
             &self,
+            _difficulty_headers: Vec<Header>,
             _suffix_head: Header,
             _suffix_tail: Vec<Header>,
         ) -> Result<(), ChainError> {
@@ -4135,6 +4138,7 @@ mod serve_continuation_tests {
 
         async fn install_nipopow_suffix(
             &self,
+            _difficulty_headers: Vec<Header>,
             _suffix_head: Header,
             _suffix_tail: Vec<Header>,
         ) -> Result<(), ChainError> {

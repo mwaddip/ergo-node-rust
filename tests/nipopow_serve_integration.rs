@@ -67,6 +67,8 @@ fn testnet_verification_context(m: u32, k: u32) -> enr_chain::NipopowVerificatio
         expected_genesis_id: TESTNET_GENESIS_ID
             .parse()
             .expect("canonical testnet genesis ID must parse"),
+        difficulty_epoch_length: 128,
+        use_last_epochs: 8,
     }
 }
 

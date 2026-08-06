@@ -227,6 +227,7 @@ pub trait SyncChain {
     /// NOT re-verify.
     fn install_nipopow_suffix(
         &self,
+        difficulty_headers: Vec<Header>,
         suffix_head: Header,
         suffix_tail: Vec<Header>,
     ) -> impl std::future::Future<Output = Result<(), enr_chain::ChainError>> + Send;

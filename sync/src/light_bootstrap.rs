@@ -228,6 +228,7 @@ pub async fn run_light_bootstrap<T: SyncTransport, C: SyncChain>(
     // Step 5: install the verifier's exact parsed suffix. Do not reconstruct
     // this boundary from a flattened header vector or a local k constant.
     let NipopowVerificationResult {
+        difficulty_headers,
         suffix_head,
         suffix_tail,
         ..
@@ -235,12 +236,13 @@ pub async fn run_light_bootstrap<T: SyncTransport, C: SyncChain>(
 
     tracing::info!(
         suffix_head_height = suffix_head.height,
+        difficulty_header_count = difficulty_headers.len(),
         suffix_tail_len = suffix_tail.len(),
         "light bootstrap: installing suffix"
     );
 
     chain
-        .install_nipopow_suffix(suffix_head, suffix_tail)
+        .install_nipopow_suffix(difficulty_headers, suffix_head, suffix_tail)
         .await
         .map_err(LightBootstrapError::InstallFailed)?;
 
@@ -347,11 +349,13 @@ mod tests {
         suffix_head: Header,
         suffix_tail: Vec<Header>,
     ) -> NipopowVerificationResult {
+        let difficulty_headers = prefix.first().cloned().into_iter().collect();
         NipopowVerificationResult {
             m: P2P_NIPOPOW_M as u32,
             k: P2P_NIPOPOW_K as u32,
-            continuous: None,
+            continuous: Some(true),
             prefix,
+            difficulty_headers,
             suffix_head,
             suffix_tail,
         }
@@ -427,6 +431,9 @@ mod tests {
     /// `(this_envelope, than_envelope, scripted_result)` triples.
     type ScriptedComparison = (Vec<u8>, Vec<u8>, CompareResult);
 
+    /// Exact authenticated context and suffix carried into installation.
+    type InstalledProof = (Vec<Header>, Header, Vec<Header>);
+
     /// Mock chain that returns scripted verification and comparison results.
     struct MockChain {
         /// Map envelope body → verification result.
@@ -434,7 +441,7 @@ mod tests {
         /// Pairwise comparison results: (this, that) → result.
         compare_results: Mutex<Vec<ScriptedComparison>>,
         comparison_calls: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
-        installed: Mutex<Option<(Header, Vec<Header>)>>,
+        installed: Mutex<Option<InstalledProof>>,
     }
 
     impl MockChain {
@@ -455,7 +462,7 @@ mod tests {
             self.compare_results.lock().unwrap().push((this, than, result));
         }
 
-        fn installed(&self) -> Option<(Header, Vec<Header>)> {
+        fn installed(&self) -> Option<InstalledProof> {
             self.installed.lock().unwrap().clone()
         }
 
@@ -534,10 +541,11 @@ mod tests {
 
         async fn install_nipopow_suffix(
             &self,
+            difficulty_headers: Vec<Header>,
             suffix_head: Header,
             suffix_tail: Vec<Header>,
         ) -> Result<(), ChainError> {
-            *self.installed.lock().unwrap() = Some((suffix_head, suffix_tail));
+            *self.installed.lock().unwrap() = Some((difficulty_headers, suffix_head, suffix_tail));
             Ok(())
         }
 
@@ -638,7 +646,7 @@ mod tests {
         assert!(result.is_ok());
         assert!(chain.comparison_calls().is_empty());
         assert_eq!(
-            chain.installed().expect("valid proof installed").0,
+            chain.installed().expect("valid proof installed").1,
             expected_head
         );
     }
@@ -680,7 +688,7 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(chain.comparison_calls(), vec![(body_c, body_a)]);
         assert_eq!(
-            chain.installed().expect("best proof installed").0,
+            chain.installed().expect("best proof installed").1,
             expected_head
         );
     }
@@ -690,6 +698,7 @@ mod tests {
         let peer_a = PeerId(1);
         let body_a = vec![0xaa];
         let proof = standard_verification_result();
+        let expected_context = proof.difficulty_headers.clone();
         let expected_head = proof.suffix_head.clone();
         let expected_tail = proof.suffix_tail.clone();
         let chain = MockChain::new();
@@ -702,7 +711,8 @@ mod tests {
 
         let result = run_light_bootstrap(&mut transport, &chain).await;
         assert!(result.is_ok());
-        let (head, tail) = chain.installed().expect("should have installed");
+        let (context, head, tail) = chain.installed().expect("should have installed");
+        assert_eq!(context, expected_context);
         assert_eq!(head, expected_head);
         assert_eq!(tail, expected_tail);
     }
@@ -876,6 +886,7 @@ mod tests {
         let exact_head = fake_header(200);
         let exact_tail = vec![fake_header(201), fake_header(202)];
         let proof = verification_result(fake_headers(15), exact_head.clone(), exact_tail.clone());
+        let exact_context = proof.difficulty_headers.clone();
         let chain = MockChain::new();
         chain.add_verify(body_a.clone(), VerifyResult::ok(proof));
 
@@ -886,7 +897,10 @@ mod tests {
 
         let result = run_light_bootstrap(&mut transport, &chain).await;
         assert!(result.is_ok());
-        assert_eq!(chain.installed(), Some((exact_head, exact_tail)));
+        assert_eq!(
+            chain.installed(),
+            Some((exact_context, exact_head, exact_tail))
+        );
     }
 
     #[tokio::test]
@@ -929,8 +943,13 @@ mod tests {
                 unimplemented!()
             }
             async fn install_nipopow_suffix(
-                &self, _h: Header, _t: Vec<Header>,
-            ) -> Result<(), ChainError> { unimplemented!() }
+                &self,
+                _d: Vec<Header>,
+                _h: Header,
+                _t: Vec<Header>,
+            ) -> Result<(), ChainError> {
+                unimplemented!()
+            }
             async fn voting_length(&self) -> u32 { 1024 }
         }
 

@@ -23,7 +23,10 @@ use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
 use ergo_chain_types::EcPoint;
 use enr_store::{ModifierStore, RedbModifierStore};
-use ergo_node_rust::{P2pTransport, PeerStorageAdapter, SharedChain, SharedStore, ValidationPipeline};
+use ergo_node_rust::{
+    restore_nipopow_difficulty_context_from_store, P2pTransport, PeerStorageAdapter, SharedChain,
+    SharedStore, ValidationPipeline,
+};
 use ergo_sync::{HeaderSync, SyncConfig, SyncStore};
 use ergo_validation::{ApplyStateOutcome, BlockValidator, DigestValidator, UtxoValidator, ValidationError};
 use serde::Deserialize;
@@ -1451,6 +1454,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let mut chain = HeaderChain::restore(chain_config, restore_entries)
         .map_err(|e| format!("header chain restore failed: {e:?}"))?;
+    restore_nipopow_difficulty_context_from_store(&mut chain, store.as_ref())
+        .map_err(|e| format!("NiPoPoW difficulty context restore failed: {e}"))?;
     match tip_id {
         Some(tip) => tracing::info!(
             headers = entry_count as u64,
