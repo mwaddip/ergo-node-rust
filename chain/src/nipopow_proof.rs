@@ -1,9 +1,9 @@
 //! NiPoPoW proof construction and verification (Phase 6).
 //!
-//! Wraps `ergo-nipopow` for build/verify on the local header chain.
-//! Light-client sync mode (applying a proof to chain state) is out of
-//! scope — proofs are verified for correctness but not used to skip
-//! block download.
+//! Wraps `ergo-nipopow` for build/verify on the local header chain. Received
+//! proofs are bound to their request parameters and configured genesis before
+//! their exact prefix/suffix split is returned to the light-bootstrap layer.
+//! Chain-state mutation remains the responsibility of that consumer.
 //!
 //! JVM reference:
 //! - `ergo-core/src/main/scala/org/ergoplatform/modifiers/history/popow/NipopowProof.scala`
@@ -22,37 +22,86 @@ use crate::error::ChainError;
 /// caps the proof size for sanity.
 pub const MAX_M_K: u32 = 256;
 
-/// Result of a successful NiPoPoW proof verification.
-///
-/// Carries the metadata fields used by serve-side log paths AND the full
-/// extracted header chain so the light-client install path can pass it to
-/// [`HeaderChain::install_from_nipopow_proof`] without re-parsing the bytes.
-///
-/// Renamed from `NipopowProofMeta` (which only carried metadata) to reflect
-/// the new return shape. Existing serve-side consumers reference fields by
-/// name only, so the rename is type-name-only there.
+/// Request and trust-anchor values a received proof must match exactly.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct NipopowVerificationContext {
+    pub expected_m: u32,
+    pub expected_k: u32,
+    pub expected_genesis_id: BlockId,
+}
+
+impl NipopowVerificationContext {
+    /// Build a context from the chain's configured trust anchor.
+    pub fn from_chain(
+        chain: &HeaderChain,
+        expected_m: u32,
+        expected_k: u32,
+    ) -> Result<Self, ChainError> {
+        let expected_genesis_id = chain
+            .configured_genesis_id()
+            .ok_or_else(|| ChainError::Nipopow("configured genesis id is absent".into()))?;
+        Ok(Self {
+            expected_m,
+            expected_k,
+            expected_genesis_id,
+        })
+    }
+
+    fn validate(&self) -> Result<(), ChainError> {
+        if self.expected_m == 0
+            || self.expected_k == 0
+            || self.expected_m > MAX_M_K
+            || self.expected_k > MAX_M_K
+        {
+            return Err(ChainError::Nipopow(format!(
+                "invalid verification context: m={}, k={}, max={MAX_M_K}",
+                self.expected_m, self.expected_k
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Lossless result of context-bound NiPoPoW proof verification.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct NipopowVerificationResult {
-    /// Height of the suffix tip (highest header in the proof).
+    pub m: u32,
+    pub k: u32,
+    /// JVM terminal mode, or `None` for a Rust-core-only payload.
+    pub continuous: Option<bool>,
+    pub prefix: Vec<Header>,
+    pub suffix_head: Header,
+    pub suffix_tail: Vec<Header>,
+}
+
+impl NipopowVerificationResult {
+    pub fn total_headers(&self) -> usize {
+        self.prefix.len() + 1 + self.suffix_tail.len()
+    }
+
+    pub fn suffix_tip_height(&self) -> u32 {
+        self.suffix_tail.last().unwrap_or(&self.suffix_head).height
+    }
+
+    pub fn headers(&self) -> impl Iterator<Item = &Header> {
+        self.prefix
+            .iter()
+            .chain(std::iter::once(&self.suffix_head))
+            .chain(self.suffix_tail.iter())
+    }
+}
+
+/// Structurally and cryptographically checked metadata for diagnostics only.
+///
+/// This type intentionally carries no headers and cannot authorize bootstrap
+/// installation because it is not bound to a request or configured genesis.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct NipopowInspection {
+    pub m: u32,
+    pub k: u32,
+    pub continuous: Option<bool>,
     pub suffix_tip_height: u32,
-    /// Total number of headers in the proof (prefix + suffix).
     pub total_headers: usize,
-    /// Whether the proof is in continuous mode (carries difficulty headers).
-    ///
-    /// Always `false` for first release; we don't currently propagate the
-    /// continuous-mode flag from `NipopowProof`. Difficulty-recalculation
-    /// header presence is not separately validated either.
-    pub continuous: bool,
-    /// Headers extracted from the verified proof, in strictly-increasing
-    /// height order: `prefix.iter().map(|p| p.header)
-    ///     .chain(once(suffix_head.header))
-    ///     .chain(suffix_tail)`.
-    ///
-    /// The light-client install path passes `headers.last()` as `suffix_head`
-    /// and the `k - 1` headers preceding it as `suffix_tail`. Callers that
-    /// only want metadata (the existing serve-side log path) can ignore the
-    /// field at zero parsing cost — it's already materialized.
-    pub headers: Vec<Header>,
 }
 
 /// `PopowHeaderReader` adapter over the local `HeaderChain`.
@@ -250,17 +299,71 @@ pub fn popow_header_by_id(
 /// payload only). Returns `true` if `a` represents a better chain than `b`
 /// per KMZ17 §4.3.
 ///
-/// Both byte slices must be valid NiPoPoW proof payloads (as produced by
-/// `NipopowProof::scorex_serialize_bytes`). Parse failure on either side
-/// returns an error.
+/// Both byte slices must already have passed [`verify_nipopow_proof_bytes`]
+/// against the same [`NipopowVerificationContext`]. This function validates
+/// both proofs again, and sigma-rust rejects unequal `m`/`k` parameters during
+/// comparison. Parse or validation failure on either side returns an error.
 pub fn compare_nipopow_proof_bytes(a: &[u8], b: &[u8]) -> Result<bool, ChainError> {
-    let proof_a = NipopowProof::scorex_parse_bytes(a)
-        .map_err(|e| ChainError::Nipopow(format!("parse proof A failed: {e:?}")))?;
-    let proof_b = NipopowProof::scorex_parse_bytes(b)
-        .map_err(|e| ChainError::Nipopow(format!("parse proof B failed: {e:?}")))?;
+    let (proof_a, _) = parse_received_nipopow_proof(a)
+        .map_err(|e| ChainError::Nipopow(format!("parse proof A failed: {e}")))?;
+    let (proof_b, _) = parse_received_nipopow_proof(b)
+        .map_err(|e| ChainError::Nipopow(format!("parse proof B failed: {e}")))?;
     proof_a
         .is_better_than(&proof_b)
         .map_err(|e| ChainError::Nipopow(format!("comparison failed: {e:?}")))
+}
+
+fn parse_received_nipopow_proof(bytes: &[u8]) -> Result<(NipopowProof, Option<bool>), ChainError> {
+    if bytes.is_empty() {
+        return Err(ChainError::Nipopow("empty proof bytes".into()));
+    }
+
+    let mut cursor = std::io::Cursor::new(bytes);
+    let proof = NipopowProof::scorex_parse(&mut cursor)
+        .map_err(|e| ChainError::Nipopow(format!("parse failed: {e:?}")))?;
+    let consumed = usize::try_from(cursor.position())
+        .map_err(|_| ChainError::Nipopow("proof cursor position does not fit usize".into()))?;
+    let remaining = bytes
+        .get(consumed..)
+        .ok_or_else(|| ChainError::Nipopow("proof cursor exceeded input".into()))?;
+    let continuous = match remaining {
+        [] => None,
+        [0] => Some(false),
+        [1] => Some(true),
+        [mode] => {
+            return Err(ChainError::Nipopow(format!(
+                "invalid JVM continuous mode byte {mode}"
+            )))
+        }
+        _ => {
+            return Err(ChainError::Nipopow(format!(
+                "unexpected {} trailing bytes after proof core",
+                remaining.len()
+            )))
+        }
+    };
+
+    Ok((proof, continuous))
+}
+
+fn validate_received_nipopow_proof(proof: &NipopowProof) -> Result<(), ChainError> {
+    proof
+        .validate()
+        .map_err(|e| ChainError::Nipopow(format!("proof validation failed: {e}")))?;
+    Ok(())
+}
+
+fn verify_nipopow_headers_pow(proof: &NipopowProof) -> Result<(), ChainError> {
+    for header in proof
+        .prefix
+        .iter()
+        .map(|p| &p.header)
+        .chain(std::iter::once(&proof.suffix_head.header))
+        .chain(proof.suffix_tail.iter())
+    {
+        crate::verify_pow(header)?;
+    }
+    Ok(())
 }
 
 /// Verify a NiPoPoW proof from raw bytes.
@@ -268,21 +371,41 @@ pub fn compare_nipopow_proof_bytes(a: &[u8], b: &[u8]) -> Result<bool, ChainErro
 /// **Precondition**: `bytes` is the inner NiPoPoW proof payload (the main
 /// crate has stripped any P2P message envelope).
 ///
-/// **Validation checks** (mirrors `NipopowProof.isValid`, plus PoW):
-/// 1. The proof parses cleanly via the Scorex serializer.
-/// 2. Parent connections in the chain are consistent (via
-///    `NipopowProof::has_valid_connections`).
-/// 3. Every prefix and suffix-head interlinks proof passes
-///    `PoPowHeader::check_interlinks_proof`.
-/// 4. Heights strictly increase across the headers chain.
-/// 5. Each header's PoW passes [`crate::verify_pow`].
+/// The proof must pass canonical sigma-rust validation, match `context`
+/// exactly, bind its first proof-chain header to the configured genesis, and
+/// pass [`crate::verify_pow`] for every extracted header.
 ///
 /// Does NOT touch chain state. Does NOT apply the proof to local chain.
-/// The returned [`NipopowVerificationResult::headers`] field carries the
-/// extracted header chain in height order so the caller can install it via
-/// [`crate::HeaderChain::install_from_nipopow_proof`] without re-parsing.
-pub fn verify_nipopow_proof_bytes(bytes: &[u8]) -> Result<NipopowVerificationResult, ChainError> {
-    verify_inner(bytes, true)
+/// The returned result preserves the parsed prefix and suffix boundary so an
+/// installer never has to reconstruct it from a flattened header vector.
+pub fn verify_nipopow_proof_bytes(
+    bytes: &[u8],
+    context: &NipopowVerificationContext,
+) -> Result<NipopowVerificationResult, ChainError> {
+    verify_inner(bytes, context, true)
+}
+
+/// Inspect a proof for diagnostics without binding it to a request or genesis.
+///
+/// The returned type intentionally contains no headers and MUST NOT authorize
+/// bootstrap selection or installation.
+pub fn inspect_nipopow_proof_bytes(bytes: &[u8]) -> Result<NipopowInspection, ChainError> {
+    let (proof, continuous) = parse_received_nipopow_proof(bytes)?;
+    validate_received_nipopow_proof(&proof)?;
+    verify_nipopow_headers_pow(&proof)?;
+    let suffix_tip_height = proof
+        .suffix_tail
+        .last()
+        .unwrap_or(&proof.suffix_head.header)
+        .height;
+    let total_headers = proof.prefix.len() + 1 + proof.suffix_tail.len();
+    Ok(NipopowInspection {
+        m: proof.m,
+        k: proof.k,
+        continuous,
+        suffix_tip_height,
+        total_headers,
+    })
 }
 
 /// Test-only: verify a NiPoPoW proof without running the per-header PoW
@@ -291,69 +414,64 @@ pub fn verify_nipopow_proof_bytes(bytes: &[u8]) -> Result<NipopowVerificationRes
 #[cfg(test)]
 pub(crate) fn verify_nipopow_proof_bytes_no_pow(
     bytes: &[u8],
+    context: &NipopowVerificationContext,
 ) -> Result<NipopowVerificationResult, ChainError> {
-    verify_inner(bytes, false)
+    verify_inner(bytes, context, false)
 }
 
-fn verify_inner(bytes: &[u8], check_pow: bool) -> Result<NipopowVerificationResult, ChainError> {
-    if bytes.is_empty() {
-        return Err(ChainError::Nipopow("empty proof bytes".into()));
-    }
-    let proof = NipopowProof::scorex_parse_bytes(bytes).map_err(|e| {
-        ChainError::Nipopow(format!("parse failed: {e:?}"))
-    })?;
+fn verify_inner(
+    bytes: &[u8],
+    context: &NipopowVerificationContext,
+    check_pow: bool,
+) -> Result<NipopowVerificationResult, ChainError> {
+    context.validate()?;
+    let (proof, continuous) = parse_received_nipopow_proof(bytes)?;
+    validate_received_nipopow_proof(&proof)?;
 
-    if !proof.has_valid_connections() {
-        return Err(ChainError::Nipopow("invalid connections".into()));
+    if proof.m != context.expected_m {
+        return Err(ChainError::Nipopow(format!(
+            "expected m {}, got {}",
+            context.expected_m, proof.m
+        )));
+    }
+    if proof.k != context.expected_k {
+        return Err(ChainError::Nipopow(format!(
+            "expected k {}, got {}",
+            context.expected_k, proof.k
+        )));
     }
 
-    // `NipopowProof::has_valid_proofs` is private in the pinned dependency,
-    // so apply its per-PoPowHeader predicate explicitly at this consumer
-    // boundary before the proof is reduced to bare headers.
-    if !std::iter::once(&proof.suffix_head)
-        .chain(proof.prefix.iter())
-        .all(PoPowHeader::check_interlinks_proof)
-    {
-        return Err(ChainError::Nipopow("invalid interlinks proof".into()));
-    }
-
-    // Walk all headers (prefix + suffix_head + suffix_tail) in order, check
-    // strictly-increasing heights + (optionally) PoW, and retain ownership
-    // so the caller can install them without re-parsing the bytes.
-    let all_headers: Vec<Header> = proof
+    let proof_genesis_id = proof
         .prefix
-        .iter()
-        .map(|p| &p.header)
-        .chain(std::iter::once(&proof.suffix_head.header))
-        .chain(proof.suffix_tail.iter())
-        .cloned()
-        .collect();
-
-    if all_headers.is_empty() {
-        return Err(ChainError::Nipopow("empty proof headers chain".into()));
+        .first()
+        .map(|p| p.header.id)
+        .unwrap_or(proof.suffix_head.header.id);
+    if proof_genesis_id != context.expected_genesis_id {
+        return Err(ChainError::Nipopow(format!(
+            "proof genesis {proof_genesis_id} does not match configured genesis {}",
+            context.expected_genesis_id
+        )));
     }
 
-    let mut last_height: Option<u32> = None;
-    for h in &all_headers {
-        if let Some(prev) = last_height {
-            if h.height <= prev {
-                return Err(ChainError::Nipopow(format!(
-                    "non-increasing heights: {} after {}",
-                    h.height, prev
-                )));
-            }
-        }
-        last_height = Some(h.height);
-        if check_pow {
-            crate::verify_pow(h)?;
-        }
+    if check_pow {
+        verify_nipopow_headers_pow(&proof)?;
     }
 
+    let NipopowProof {
+        m,
+        k,
+        prefix,
+        suffix_head,
+        suffix_tail,
+        ..
+    } = proof;
     Ok(NipopowVerificationResult {
-        suffix_tip_height: last_height.unwrap_or(0),
-        total_headers: all_headers.len(),
-        continuous: false,
-        headers: all_headers,
+        m,
+        k,
+        continuous,
+        prefix: prefix.into_iter().map(|p| p.header).collect(),
+        suffix_head: suffix_head.header,
+        suffix_tail,
     })
 }
 
@@ -362,7 +480,9 @@ mod tests {
     use super::*;
     use crate::voting::pack_extension_bytes;
     use crate::{ChainConfig, HeaderChain};
-    use ergo_chain_types::{ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint, Header, Votes};
+    use ergo_chain_types::{
+        ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint, Header, Votes,
+    };
     use ergo_merkle_tree::{MerkleNode, MerkleTree};
     use sigma_ser::ScorexSerializable;
     use std::sync::{Arc, Mutex};
@@ -505,6 +625,18 @@ mod tests {
         chain
     }
 
+    fn verification_context(
+        chain: &HeaderChain,
+        expected_m: u32,
+        expected_k: u32,
+    ) -> NipopowVerificationContext {
+        NipopowVerificationContext {
+            expected_m,
+            expected_k,
+            expected_genesis_id: chain.header_at(1).expect("genesis header").id,
+        }
+    }
+
     #[test]
     fn build_proof_too_short_chain_errors() {
         let chain = build_chain_with_interlinks(3);
@@ -552,30 +684,157 @@ mod tests {
     fn build_then_verify_roundtrip_no_pow() {
         let chain = build_chain_with_interlinks(20);
         let bytes = build_nipopow_proof(&chain, 2, 2, None).expect("build");
-        let result = verify_nipopow_proof_bytes_no_pow(&bytes).expect("verify");
-        assert!(result.total_headers > 0);
-        assert_eq!(result.suffix_tip_height, 20);
-        // The headers field carries the same chain that's reflected in
-        // total_headers + suffix_tip_height — the install path consumes it
+        let context = verification_context(&chain, 2, 2);
+        let result = verify_nipopow_proof_bytes_no_pow(&bytes, &context).expect("verify");
+        assert!(result.total_headers() > 0);
+        assert_eq!(result.suffix_tip_height(), 20);
+        // The lossless segments carry the same chain reflected in
+        // total_headers + suffix_tip_height; the install path consumes them
         // directly without re-parsing the bytes.
-        assert_eq!(result.headers.len(), result.total_headers);
-        assert_eq!(
-            result.headers.last().unwrap().height,
-            result.suffix_tip_height
-        );
+        let headers: Vec<&Header> = result.headers().collect();
+        assert_eq!(headers.len(), result.total_headers());
+        assert_eq!(headers.last().unwrap().height, result.suffix_tip_height());
         // Heights are strictly increasing across the extracted chain.
-        for pair in result.headers.windows(2) {
+        for pair in headers.windows(2) {
             assert!(pair[0].height < pair[1].height);
         }
+    }
+
+    #[test]
+    fn verification_result_preserves_parsed_suffix_boundary() {
+        let chain = build_chain_with_interlinks(20);
+        let bytes = build_nipopow_proof(&chain, 2, 2, None).expect("build");
+        let parsed = NipopowProof::scorex_parse_bytes(&bytes).expect("parse control");
+        assert!(
+            !parsed.prefix.is_empty(),
+            "fixture must exercise the prefix"
+        );
+
+        let expected_prefix: Vec<BlockId> = parsed.prefix.iter().map(|p| p.header.id).collect();
+        let expected_suffix_head = parsed.suffix_head.header.id;
+        let expected_suffix_tail: Vec<BlockId> = parsed.suffix_tail.iter().map(|h| h.id).collect();
+        let context = verification_context(&chain, 2, 2);
+
+        let result = verify_nipopow_proof_bytes_no_pow(&bytes, &context).expect("verify");
+
+        assert_eq!(result.m, 2);
+        assert_eq!(result.k, 2);
+        assert_eq!(result.continuous, None);
+        assert_eq!(
+            result.prefix.iter().map(|h| h.id).collect::<Vec<_>>(),
+            expected_prefix
+        );
+        assert_eq!(result.suffix_head.id, expected_suffix_head);
+        assert_eq!(
+            result.suffix_tail.iter().map(|h| h.id).collect::<Vec<_>>(),
+            expected_suffix_tail
+        );
+        assert_eq!(
+            result.total_headers(),
+            result.prefix.len() + 1 + result.suffix_tail.len()
+        );
+        assert_eq!(result.suffix_tip_height(), 20);
+    }
+
+    #[test]
+    fn verify_rejects_unrequested_m() {
+        let chain = build_chain_with_interlinks(20);
+        let bytes = build_nipopow_proof(&chain, 2, 2, None).expect("build");
+        let context = verification_context(&chain, 3, 2);
+
+        let err = verify_nipopow_proof_bytes_no_pow(&bytes, &context)
+            .expect_err("proof m must match the request");
+        assert!(matches!(err, ChainError::Nipopow(ref msg) if msg.contains("expected m")));
+    }
+
+    #[test]
+    fn verify_rejects_unrequested_k() {
+        let chain = build_chain_with_interlinks(20);
+        let bytes = build_nipopow_proof(&chain, 2, 2, None).expect("build");
+        let context = verification_context(&chain, 2, 3);
+
+        let err = verify_nipopow_proof_bytes_no_pow(&bytes, &context)
+            .expect_err("proof k must match the request");
+        assert!(matches!(err, ChainError::Nipopow(ref msg) if msg.contains("expected k")));
+    }
+
+    #[test]
+    fn verify_rejects_suffix_length_mismatch() {
+        let chain = build_chain_with_interlinks(20);
+        let bytes = build_nipopow_proof(&chain, 2, 2, None).expect("build");
+        let mut proof = NipopowProof::scorex_parse_bytes(&bytes).expect("parse control");
+        proof.k = 3;
+        let malformed = proof
+            .scorex_serialize_bytes()
+            .expect("serialize malformed proof");
+        let context = verification_context(&chain, 2, 3);
+
+        assert!(verify_nipopow_proof_bytes_no_pow(&malformed, &context).is_err());
+    }
+
+    #[test]
+    fn verify_rejects_wrong_genesis() {
+        let chain = build_chain_with_interlinks(20);
+        let bytes = build_nipopow_proof(&chain, 2, 2, None).expect("build");
+        let mut context = verification_context(&chain, 2, 2);
+        context.expected_genesis_id = BlockId(Digest32::from([0xA6; 32]));
+
+        let err = verify_nipopow_proof_bytes_no_pow(&bytes, &context)
+            .expect_err("proof must bind configured genesis");
+        assert!(matches!(err, ChainError::Nipopow(ref msg) if msg.contains("genesis")));
+    }
+
+    #[test]
+    fn verification_context_rejects_absent_configured_genesis() {
+        let chain = HeaderChain::new(ChainConfig::testnet());
+
+        assert!(NipopowVerificationContext::from_chain(&chain, 6, 10).is_err());
+    }
+
+    #[test]
+    fn verify_parses_optional_jvm_terminal_mode() {
+        let chain = build_chain_with_interlinks(20);
+        let core = build_nipopow_proof(&chain, 2, 2, None).expect("build");
+        let context = verification_context(&chain, 2, 2);
+
+        for (terminal, expected) in [(None, None), (Some(0), Some(false)), (Some(1), Some(true))] {
+            let mut bytes = core.clone();
+            if let Some(mode) = terminal {
+                bytes.push(mode);
+            }
+            let result = verify_nipopow_proof_bytes_no_pow(&bytes, &context).expect("verify");
+            assert_eq!(result.continuous, expected);
+        }
+    }
+
+    #[test]
+    fn verify_rejects_invalid_jvm_terminal_mode() {
+        let chain = build_chain_with_interlinks(20);
+        let mut bytes = build_nipopow_proof(&chain, 2, 2, None).expect("build");
+        bytes.push(2);
+        let context = verification_context(&chain, 2, 2);
+
+        assert!(verify_nipopow_proof_bytes_no_pow(&bytes, &context).is_err());
+    }
+
+    #[test]
+    fn verify_rejects_extra_bytes_after_jvm_terminal_mode() {
+        let chain = build_chain_with_interlinks(20);
+        let mut bytes = build_nipopow_proof(&chain, 2, 2, None).expect("build");
+        bytes.extend_from_slice(&[0, 0]);
+        let context = verification_context(&chain, 2, 2);
+
+        assert!(verify_nipopow_proof_bytes_no_pow(&bytes, &context).is_err());
     }
 
     #[test]
     fn verify_rejects_invalid_interlinks_proof() {
         let source_chain = build_chain_with_interlinks(20);
         let bytes = build_nipopow_proof(&source_chain, 6, 10, None).expect("build");
-        let control = verify_nipopow_proof_bytes_no_pow(&bytes)
+        let context = verification_context(&source_chain, 6, 10);
+        let control = verify_nipopow_proof_bytes_no_pow(&bytes, &context)
             .expect("control proof must pass verification");
-        assert_eq!(control.suffix_tip_height, 20);
+        assert_eq!(control.suffix_tip_height(), 20);
 
         for mutate_prefix in [false, true] {
             let mut proof = NipopowProof::scorex_parse_bytes(&bytes).expect("parse built proof");
@@ -624,10 +883,10 @@ mod tests {
             let observed_bytes = proof
                 .scorex_serialize_bytes()
                 .expect("serialize observation");
-            let err = verify_nipopow_proof_bytes_no_pow(&observed_bytes)
+            let err = verify_nipopow_proof_bytes_no_pow(&observed_bytes, &context)
                 .expect_err("verifier must reject an invalid interlinks proof");
             assert!(
-                matches!(err, ChainError::Nipopow(ref msg) if msg == "invalid interlinks proof"),
+                matches!(err, ChainError::Nipopow(ref msg) if msg.contains("interlink proofs")),
                 "unexpected {location} rejection: {err:?}"
             );
         }
@@ -635,13 +894,23 @@ mod tests {
 
     #[test]
     fn verify_empty_bytes_errors() {
-        let r = verify_nipopow_proof_bytes(&[]);
+        let context = NipopowVerificationContext {
+            expected_m: 6,
+            expected_k: 10,
+            expected_genesis_id: BlockId(Digest32::zero()),
+        };
+        let r = verify_nipopow_proof_bytes(&[], &context);
         assert!(r.is_err());
     }
 
     #[test]
     fn verify_garbage_bytes_errors() {
-        let r = verify_nipopow_proof_bytes(&[0xFFu8; 32]);
+        let context = NipopowVerificationContext {
+            expected_m: 6,
+            expected_k: 10,
+            expected_genesis_id: BlockId(Digest32::zero()),
+        };
+        let r = verify_nipopow_proof_bytes(&[0xFFu8; 32], &context);
         assert!(r.is_err());
     }
 
@@ -664,9 +933,10 @@ mod tests {
         // build, serialize, and round-trip back through the verifier.
         let chain = build_chain_with_interlinks_opts(20, false);
         let bytes = build_nipopow_proof(&chain, 2, 2, None).expect("build");
-        let result = verify_nipopow_proof_bytes_no_pow(&bytes).expect("verify");
-        assert!(result.total_headers >= 4); // m + k = 4
-        assert_eq!(result.suffix_tip_height, 20);
+        let context = verification_context(&chain, 2, 2);
+        let result = verify_nipopow_proof_bytes_no_pow(&bytes, &context).expect("verify");
+        assert!(result.total_headers() >= 4); // m + k = 4
+        assert_eq!(result.suffix_tip_height(), 20);
     }
 
     #[test]
@@ -679,7 +949,8 @@ mod tests {
         if bytes.len() > 50 {
             bytes[50] ^= 0xFFu8;
         }
-        let r = verify_nipopow_proof_bytes_no_pow(&bytes);
+        let context = verification_context(&chain, 2, 2);
+        let r = verify_nipopow_proof_bytes_no_pow(&bytes, &context);
         assert!(r.is_err(), "mutated proof must fail");
     }
 
@@ -758,7 +1029,7 @@ mod tests {
         // End-to-end regression test for the silent-corruption postcondition:
         //
         // `build_nipopow_proof` MUST NEVER return `Ok(bytes)` where
-        // `verify_nipopow_proof_bytes(bytes)` fails. Either the build
+        // context-bound verification of `bytes` fails. Either the build
         // returns an `Err` (clean fail) or it returns bytes that pass
         // verify (correct construction). There is no third state.
         //
@@ -848,7 +1119,8 @@ mod tests {
                     // Clean fail — acceptable.
                 }
                 Ok(bytes) => {
-                    verify_nipopow_proof_bytes_no_pow(&bytes).unwrap_or_else(|e| panic!(
+                    let context = verification_context(&chain, 2, 2);
+                    verify_nipopow_proof_bytes_no_pow(&bytes, &context).unwrap_or_else(|e| panic!(
                         "build_nipopow_proof returned Ok with bytes that fail verify (silent corruption): {e:?}"
                     ));
                 }

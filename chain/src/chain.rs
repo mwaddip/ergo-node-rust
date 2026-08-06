@@ -410,6 +410,11 @@ impl HeaderChain {
         &self.config
     }
 
+    /// Configured genesis trust anchor, if this deployment defines one.
+    pub fn configured_genesis_id(&self) -> Option<BlockId> {
+        self.config.genesis_id
+    }
+
     /// Number of headers in the chain.
     pub fn len(&self) -> usize {
         self.by_id.len()

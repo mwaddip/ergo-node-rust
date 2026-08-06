@@ -1093,57 +1093,54 @@ JVM reference: `ergo-core/src/main/scala/org/ergoplatform/modifiers/history/popo
   **Verified by**: integration test `tests/nipopow_serve_integration.rs`
   in the main crate, which sends `GetNipopowProof(m=6, k=6)` to a running
   node and verifies the response round-trips through
-  `verify_nipopow_proof_bytes`. The chain crate's
+  `verify_nipopow_proof_bytes` against the requested `m`/`k` and canonical
+  testnet genesis. The chain crate's
   `build_proof_skips_loader_for_genesis` unit test fixtures a chain
   whose loader has no entry for `h=1` and asserts the build still
   succeeds — a black-box check that the reader's genesis synthesis path
   is wired correctly.
 
-### `verify_nipopow_proof_bytes(bytes: &[u8]) -> Result<NipopowVerificationResult>`
+### `verify_nipopow_proof_bytes(bytes, context) -> Result<NipopowVerificationResult>`
+
 - **Precondition**: `bytes` is the inner NiPoPoW proof payload (the main
-  crate has already stripped the message envelope).
-- **Postcondition**: Returns `NipopowVerificationResult` if the proof is
-  structurally valid AND `is_valid` returns true (heights consistent,
-  connections valid, PoW valid for each header, difficulty headers present
-  in continuous mode). The result includes the full extracted header chain
-  (`prefix` + `suffix_head.header` + `suffix_tail`, in height order) so the
-  caller can install it via [`HeaderChain::install_from_nipopow_proof`]
-  without re-parsing the bytes.
-- **Validation checks** (mirrors `NipopowProof.isValid`):
-  1. Headers parse cleanly via `ergo_nipopow::NipopowProofSerializer`.
-  2. Heights are strictly increasing across `headersChain`.
-  3. Each header's PoW passes `verify_pow`.
-  4. Parent connections in the chain are consistent
-     (`NipopowProof::has_valid_connections`).
-  5. (Continuous mode only) Difficulty-recalculation headers are present.
-- **Does NOT** apply the proof to local chain state. Returning the headers
-  inline is a convenience to avoid double parsing — the chain is mutated
-  only via the explicit `install_from_nipopow_proof` call.
+  crate has already stripped the message envelope). `context` carries the
+  exact requested `m` and `k` plus the deployment's configured genesis ID.
+- **Postcondition**: the proof has passed canonical sigma-rust validation,
+  matches the requested security parameters, starts at the configured
+  genesis, and every extracted header passes `verify_pow`. The returned
+  value preserves the parser's exact `prefix` / `suffix_head` /
+  `suffix_tail` boundary so the installer never reconstructs it from a
+  flattened vector.
+- **Validation checks**:
+  1. The Scorex core parses from an explicitly tracked cursor. No remainder
+     is accepted except one JVM terminal mode byte (`0` or `1`).
+  2. `NipopowProof::validate()` enforces the proof's canonical structural,
+     connection, interlinks-proof, height, and suffix-cardinality invariants.
+  3. Proof `m` and `k` equal the values in `context`.
+  4. The first proof-chain header equals `context.expected_genesis_id`.
+  5. Every prefix, suffix-head, and suffix-tail header passes `verify_pow`.
+- **Does NOT** apply the proof to local chain state. Chain mutation remains
+  an explicit consumer operation.
 
 ### `NipopowVerificationResult`
 
 ```rust
 pub struct NipopowVerificationResult {
-    /// Height of the suffix tip (the highest header in the proof).
-    pub suffix_tip_height: u32,
-    /// Total number of headers in the proof (prefix + suffix).
-    pub total_headers: usize,
-    /// Whether the proof is in continuous mode (carries difficulty headers).
-    pub continuous: bool,
-    /// Headers extracted from the verified proof, in strictly-increasing
-    /// height order: `prefix.iter().map(|p| p.header).chain(once(suffix_head.header)).chain(suffix_tail)`.
-    /// The light-client install path passes `headers.last()` as `suffix_head`
-    /// and the `k - 1` headers preceding it as `suffix_tail`. Callers that
-    /// only want metadata (the existing serve-side log path) can ignore the
-    /// field at zero parsing cost — it's already materialized.
-    pub headers: Vec<Header>,
+    pub m: u32,
+    pub k: u32,
+    /// JVM terminal mode, or `None` for a Rust-core-only payload.
+    pub continuous: Option<bool>,
+    pub prefix: Vec<Header>,
+    pub suffix_head: Header,
+    pub suffix_tail: Vec<Header>,
 }
 ```
 
-Renamed from `NipopowProofMeta` (which only carried metadata) to reflect the
-new return shape. The serve-side log path in the main crate is the only
-existing call site and just gets the field rename plus an unused-headers
-field; no semantic change for that consumer.
+`total_headers()` and `suffix_tip_height()` are derived from these exact
+segments rather than stored as duplicable metadata. The separate
+`NipopowInspection` type contains diagnostic metadata but no headers; the
+unsolicited code-91 log path may use it, but bootstrap selection and
+installation must not.
 
 ### `install_from_nipopow_proof(suffix_head: Header, suffix_tail: Vec<Header>) -> Result<Vec<InstalledHeader>>`
 

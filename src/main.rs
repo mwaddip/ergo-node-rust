@@ -526,15 +526,16 @@ async fn handle_nipopow_event(
                 }
             };
 
-            // Verify is a pure function over the proof bytes — no chain access needed.
-            match enr_chain::verify_nipopow_proof_bytes(&proof_bytes) {
+            // Diagnostic-only inspection: this unsolicited/log-only path has
+            // no request context and never authorizes bootstrap installation.
+            match enr_chain::inspect_nipopow_proof_bytes(&proof_bytes) {
                 Ok(meta) => {
                     tracing::info!(
                         peer = %peer_id,
                         suffix_tip_height = meta.suffix_tip_height,
                         total_headers = meta.total_headers,
-                        continuous = meta.continuous,
-                        "received and verified NiPoPoW proof (logged only — light-client mode pending)"
+                        continuous = ?meta.continuous,
+                        "received and inspected NiPoPoW proof (diagnostic only)"
                     );
                 }
                 Err(e) => {

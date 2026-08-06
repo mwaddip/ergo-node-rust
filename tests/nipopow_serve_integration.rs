@@ -57,6 +57,18 @@ const FULL_CHAIN_BUILD_TIMEOUT_SECS: u64 = 10;
 // `chain too short` (must be >= m + k).
 const ANCHOR_HEIGHT: u32 = 200;
 const DEFAULT_TARGET: &str = "127.0.0.1:9030";
+/// Canonical testnet height-1 header ID from the reference node config.
+const TESTNET_GENESIS_ID: &str = "ab19bb59871e86507defb9a7769841b1130aad4d8c1ea8b0e01e0dee9e97a27e";
+
+fn testnet_verification_context(m: u32, k: u32) -> enr_chain::NipopowVerificationContext {
+    enr_chain::NipopowVerificationContext {
+        expected_m: m,
+        expected_k: k,
+        expected_genesis_id: TESTNET_GENESIS_ID
+            .parse()
+            .expect("canonical testnet genesis ID must parse"),
+    }
+}
 
 #[tokio::test]
 #[ignore = "requires a running ergo-node-rust on NIPOPOW_TARGET (default 127.0.0.1:9030)"]
@@ -140,23 +152,26 @@ async fn nipopow_serve_round_trip_against_running_node() {
 
     eprintln!("got NipopowProof inner bytes: {} bytes", proof_bytes.len());
 
-    let meta = enr_chain::verify_nipopow_proof_bytes(&proof_bytes)
+    let context = testnet_verification_context(6, 6);
+    let result = enr_chain::verify_nipopow_proof_bytes(&proof_bytes, &context)
         .expect("verify_nipopow_proof_bytes failed");
 
     eprintln!(
-        "verified: suffix_tip_height={} total_headers={} continuous={}",
-        meta.suffix_tip_height, meta.total_headers, meta.continuous
+        "verified: suffix_tip_height={} total_headers={} continuous={:?}",
+        result.suffix_tip_height(),
+        result.total_headers(),
+        result.continuous
     );
 
     // m=6 k=6 means at minimum the proof carries the k-suffix (6 headers).
     // The prefix can be empty on a short chain, so 6 is the floor we can rely on.
     assert!(
-        meta.total_headers >= 6,
+        result.total_headers() >= 6,
         "expected at least k=6 headers in the proof, got {}",
-        meta.total_headers
+        result.total_headers()
     );
     assert!(
-        meta.suffix_tip_height > 0,
+        result.suffix_tip_height() > 0,
         "suffix tip height should be > 0"
     );
 }
@@ -272,23 +287,27 @@ async fn nipopow_serve_full_chain_round_trip() {
         elapsed.as_secs_f64()
     );
 
-    let meta = enr_chain::verify_nipopow_proof_bytes(&proof_bytes)
+    let context = testnet_verification_context(6, 6);
+    let result = enr_chain::verify_nipopow_proof_bytes(&proof_bytes, &context)
         .expect("verify_nipopow_proof_bytes failed");
 
     eprintln!(
-        "[full-chain] verified: suffix_tip_height={} total_headers={} continuous={} wall_time={:.3}s",
-        meta.suffix_tip_height, meta.total_headers, meta.continuous, elapsed.as_secs_f64()
+        "[full-chain] verified: suffix_tip_height={} total_headers={} continuous={:?} wall_time={:.3}s",
+        result.suffix_tip_height(),
+        result.total_headers(),
+        result.continuous,
+        elapsed.as_secs_f64()
     );
 
     assert!(
-        meta.total_headers >= 6,
+        result.total_headers() >= 6,
         "expected at least k=6 headers in the proof, got {}",
-        meta.total_headers
+        result.total_headers()
     );
     assert!(
-        meta.suffix_tip_height > 200,
+        result.suffix_tip_height() > 200,
         "full-chain suffix tip height should be much larger than the 200-anchor test, got {}",
-        meta.suffix_tip_height
+        result.suffix_tip_height()
     );
 }
 
@@ -362,24 +381,25 @@ async fn nipopow_serve_no_anchor_repro() {
     .await
     .expect("timed out waiting for NipopowProof response");
 
-    let meta = enr_chain::verify_nipopow_proof_bytes(&proof_bytes)
+    let context = testnet_verification_context(6, 10);
+    let result = enr_chain::verify_nipopow_proof_bytes(&proof_bytes, &context)
         .expect("verify_nipopow_proof_bytes failed (regression: tolerant lookback?)");
 
     eprintln!(
         "[no-anchor] verified OK: proof_bytes={} suffix_tip_height={} total_headers={}",
         proof_bytes.len(),
-        meta.suffix_tip_height,
-        meta.total_headers,
+        result.suffix_tip_height(),
+        result.total_headers(),
     );
 
     assert!(
-        meta.total_headers >= 10,
+        result.total_headers() >= 10,
         "expected at least k=10 headers in the proof, got {}",
-        meta.total_headers
+        result.total_headers()
     );
     assert!(
-        meta.suffix_tip_height > 200,
+        result.suffix_tip_height() > 200,
         "no-anchor request should resolve to a deep tip, got {}",
-        meta.suffix_tip_height
+        result.suffix_tip_height()
     );
 }

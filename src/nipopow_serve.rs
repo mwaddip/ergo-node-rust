@@ -6,9 +6,10 @@
 //!   We build it from the local chain via `enr_chain::build_nipopow_proof`
 //!   and respond with a code 91 message.
 //!
-//! - **91 (`NipopowProof`)**: peer sends us a proof. We verify it via
-//!   `enr_chain::verify_nipopow_proof_bytes` and log the result. The proof
-//!   is NOT applied to chain state — light-client mode is a separate session.
+//! - **91 (`NipopowProof`)**: peer sends us an unsolicited proof. We inspect it
+//!   via `enr_chain::inspect_nipopow_proof_bytes` and log only diagnostic
+//!   metadata. This path has no request context and cannot authorize bootstrap
+//!   selection or installation.
 //!
 //! Both codes use VLQ-encoded integer fields with a `putUShort(0)` pad-length
 //! footer for forward compatibility (the JVM convention for new message
@@ -382,13 +383,13 @@ mod tests {
         let inner = parse_nipopow_proof(&envelope).unwrap();
         assert_eq!(inner, garbage_inner);
         // Now verify — scorex_parse_bytes should fail, not panic.
-        let result = enr_chain::verify_nipopow_proof_bytes(&inner);
+        let result = enr_chain::inspect_nipopow_proof_bytes(&inner);
         assert!(result.is_err());
     }
 
     #[test]
     fn verify_nipopow_empty_inner_bytes_returns_error() {
-        let result = enr_chain::verify_nipopow_proof_bytes(&[]);
+        let result = enr_chain::inspect_nipopow_proof_bytes(&[]);
         assert!(result.is_err());
     }
 
@@ -402,7 +403,7 @@ mod tests {
         inner.put_u32(10).unwrap(); // k
         inner.put_u32(0x7FFF_FFFF).unwrap(); // num_prefixes = 2 billion
 
-        let result = enr_chain::verify_nipopow_proof_bytes(&inner);
+        let result = enr_chain::inspect_nipopow_proof_bytes(&inner);
         assert!(result.is_err());
     }
 
@@ -419,7 +420,7 @@ mod tests {
         inner.put_u32(1).unwrap(); // suffix_head_size
         inner.push(0x00); // bogus header byte (will fail parse)
 
-        let result = enr_chain::verify_nipopow_proof_bytes(&inner);
+        let result = enr_chain::inspect_nipopow_proof_bytes(&inner);
         assert!(result.is_err());
     }
 

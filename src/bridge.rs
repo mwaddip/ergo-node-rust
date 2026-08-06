@@ -154,8 +154,16 @@ impl SyncChain for SharedChain {
         // sync stays codec-free.
         let inner = crate::nipopow_serve::parse_nipopow_proof(envelope_body)
             .map_err(|e| ChainError::Nipopow(format!("envelope parse: {e}")))?;
-        let result = enr_chain::verify_nipopow_proof_bytes(&inner)?;
-        Ok(result.headers)
+        let context = {
+            let chain = self.chain.lock().await;
+            enr_chain::NipopowVerificationContext::from_chain(&chain, 6, 10)?
+        };
+        let result = enr_chain::verify_nipopow_proof_bytes(&inner, &context)?;
+        let mut headers = Vec::with_capacity(result.total_headers());
+        headers.extend(result.prefix);
+        headers.push(result.suffix_head);
+        headers.extend(result.suffix_tail);
+        Ok(headers)
     }
 
     async fn is_better_nipopow(
