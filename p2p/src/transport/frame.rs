@@ -26,6 +26,7 @@ const HEADER_SIZE: usize = 13;
 ///   - `Modifiers` messages: up to `maxMsgSizeWithReserve` (~8.4 MB payload)
 ///   - UTXO snapshot manifest / chunk messages: up to ~4 MB
 ///   - Inv / Request / Sync / Peers: kilobytes
+///
 /// Also bounds per-peer buffering: 30 peers × 16 MB ≈ 480 MB worst-case.
 const MAX_BODY_SIZE: u32 = 16_388_608;
 
