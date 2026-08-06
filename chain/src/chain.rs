@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -100,6 +100,13 @@ pub struct HeaderChain {
     /// source for [`Self::height`] / [`Self::len`] — chain length is
     /// `by_id.len()` and the tip height is `base_height + by_id.len() - 1`.
     by_id: HashMap<BlockId, u32>,
+    /// Legacy V1 sparse epoch-boundary headers selected by height. They are
+    /// difficulty-context mechanics only: never best-chain entries, score
+    /// contributors, reorg anchors, or proof of branch membership.
+    nipopow_difficulty_headers: BTreeMap<u32, Header>,
+    /// A restored light chain cannot accept successors or reorgs until its
+    /// suffix-bound sparse context has been validated.
+    nipopow_difficulty_context_ready: bool,
     /// Currently active blockchain parameters (Phase 6: Soft-Fork Voting).
     /// Updated only at epoch-boundary block validation via
     /// [`Self::apply_epoch_boundary_parameters`].
@@ -134,16 +141,11 @@ pub struct HeaderChain {
     /// before calling [`Self::recompute_active_parameters_from_storage`]
     /// or [`crate::nipopow_proof::build_nipopow_proof`].
     extension_loader: Option<ExtensionLoader>,
-    /// Set to `true` by [`Self::install_from_nipopow_proof`] and never
-    /// reset. When `true`, [`Self::validate_child`] and (under `cfg(test)`)
-    /// `validate_child_no_pow` skip the `expected_difficulty` recalculation
-    /// and the `header.n_bits` comparison.
-    ///
-    /// Standard SPV behavior — light clients can't recompute
-    /// `expected_difficulty` because the recalc reads
-    /// `use_last_epochs * epoch_length` headers of pre-install history that
-    /// they don't have. PoW verification, parent linkage, and timestamp
-    /// bounds remain in force. See `facts/chain.md` Phase 6 invariants.
+    /// Set to `true` when the best-chain origin was installed from a NiPoPoW
+    /// suffix. It controls the reorg floor and restart contract only; it does
+    /// not relax expected-difficulty validation. The legacy V1 bootstrap
+    /// verifier is disabled because the sparse headers above are not
+    /// branch-authenticated.
     light_client_mode: bool,
     /// Lazy header/score store. After v0.5.0 this is the sole source
     /// of truth for both header and cumulative-score reads at heights
@@ -177,6 +179,8 @@ impl HeaderChain {
             config,
             base_height: None,
             by_id: HashMap::new(),
+            nipopow_difficulty_headers: BTreeMap::new(),
+            nipopow_difficulty_context_ready: false,
             active_parameters,
             active_proposed_update_bytes,
             extension_loader: None,
@@ -197,11 +201,11 @@ impl HeaderChain {
     ///   returned and the partially-built chain is discarded.
     /// - A duplicate height OR a duplicate header id is reported as
     ///   [`RestoreError::DuplicateHeight`] for the offending height.
-    /// - `light_client_mode` is derived from the first entry's height:
-    ///   a chain starting above height 1 must have been installed from
-    ///   a NiPoPoW proof, and the SPV difficulty skip is preserved
-    ///   across restart. (A chain whose store index starts at height 1
-    ///   is treated as a normal full chain.)
+    /// - `light_client_mode` is derived from the first entry's height. A chain
+    ///   starting above height 1 must have been installed from a NiPoPoW proof.
+    ///   Its sparse difficulty context starts unready; the integrator must call
+    ///   [`Self::restore_nipopow_difficulty_context`] before any mutation. A
+    ///   chain whose store index starts at height 1 is a normal full chain.
     /// - `active_parameters` and `active_proposed_update_bytes` are
     ///   left at construction defaults. The integrator must call
     ///   [`Self::recompute_active_parameters_from_storage`] after
@@ -257,6 +261,8 @@ impl HeaderChain {
             config,
             base_height,
             by_id,
+            nipopow_difficulty_headers: BTreeMap::new(),
+            nipopow_difficulty_context_ready: false,
             active_parameters,
             active_proposed_update_bytes,
             extension_loader: None,
@@ -369,6 +375,19 @@ impl HeaderChain {
         Some(header)
     }
 
+    /// Header lookup used only by difficulty recalculation. Legacy V1 anchors
+    /// below the install boundary are not part of the best chain and are not
+    /// branch-authenticated; the public V1 bootstrap verifier is disabled.
+    pub(crate) fn difficulty_header_at(&self, height: u32) -> Option<Header> {
+        self.header_at(height)
+            .or_else(|| self.nipopow_difficulty_headers.get(&height).cloned())
+    }
+
+    /// Sparse continuous-proof difficulty context, sorted by height.
+    pub fn nipopow_difficulty_headers(&self) -> Vec<Header> {
+        self.nipopow_difficulty_headers.values().cloned().collect()
+    }
+
     /// Whether this header ID is part of the validated chain.
     pub fn contains(&self, header_id: &BlockId) -> bool {
         self.by_id.contains_key(header_id)
@@ -408,6 +427,11 @@ impl HeaderChain {
     /// The chain configuration.
     pub fn config(&self) -> &ChainConfig {
         &self.config
+    }
+
+    /// Configured genesis trust anchor, if this deployment defines one.
+    pub fn configured_genesis_id(&self) -> Option<BlockId> {
+        self.config.genesis_id
     }
 
     /// Number of headers in the chain.
@@ -969,15 +993,17 @@ impl HeaderChain {
 
     // --- Light-client install ---
 
-    /// Install a verified NiPoPoW proof's suffix as the chain's starting
+    /// Install an externally authorized NiPoPoW suffix as the chain's starting
     /// point for light-client mode.
     ///
     /// **Precondition**: chain is empty ([`Self::is_empty`] returns `true`).
-    /// The headers in `suffix_head` + `suffix_tail` MUST already have been
-    /// validated by the caller via
-    /// [`crate::nipopow_proof::verify_nipopow_proof_bytes`]. This function
-    /// does NOT re-verify the proof; it assumes the caller has done so and
-    /// is installing the trusted suffix.
+    /// `difficulty_headers`, `suffix_head`, and `suffix_tail` MUST come from
+    /// one branch-authenticated format and authorization result. This function
+    /// does NOT verify branch membership. Legacy V1 cannot satisfy this
+    /// precondition and [`crate::nipopow_proof::verify_nipopow_proof_bytes`]
+    /// always returns [`ChainError::NipopowBootstrapDisabled`]. The method is
+    /// retained as the install seam for a future authenticated format and for
+    /// isolated install-mechanics tests.
     ///
     /// **Postcondition on Ok**: chain contains `suffix_head` followed by
     /// every header in `suffix_tail`, in order. `tip()` returns the last
@@ -990,7 +1016,9 @@ impl HeaderChain {
     /// - [`ChainError::ChainNotEmpty`] if the chain already contains headers.
     /// - [`ChainError::ParentNotFound`] if any header in `suffix_tail` does
     ///   not link to its predecessor's id.
-    /// - PoW failure on any header.
+    /// - Missing, duplicate, or unexpected difficulty context.
+    /// - Wrong expected difficulty in the suffix.
+    /// - PoW failure on any context or suffix header.
     ///
     /// The genesis-parent check is bypassed — light clients install at
     /// arbitrary heights. `scores[0]` is initialized to 0 because cumulative
@@ -1004,21 +1032,178 @@ impl HeaderChain {
     /// "Light-client parameter limitation".
     pub fn install_from_nipopow_proof(
         &mut self,
+        difficulty_headers: Vec<Header>,
         suffix_head: Header,
         suffix_tail: Vec<Header>,
     ) -> Result<Vec<InstalledHeader>, ChainError> {
-        self.install_from_nipopow_proof_impl(suffix_head, suffix_tail, true)
+        self.install_from_nipopow_proof_impl(
+            difficulty_headers,
+            suffix_head,
+            suffix_tail,
+            true,
+            true,
+            true,
+        )
+    }
+
+    fn validate_nipopow_difficulty_context(
+        &self,
+        suffix_head_height: u32,
+        difficulty_headers: Vec<Header>,
+        verify_pow: bool,
+    ) -> Result<BTreeMap<u32, Header>, ChainError> {
+        let epoch_length = self
+            .config
+            .eip37_epoch_length
+            .unwrap_or(self.config.epoch_length);
+        let required_heights = crate::difficulty::heights_for_next_recalculation(
+            suffix_head_height,
+            epoch_length,
+            self.config.use_last_epochs,
+        )?
+        .into_iter()
+        .filter(|height| *height > 0 && *height < suffix_head_height)
+        .collect::<Vec<_>>();
+        if required_heights.len() > crate::difficulty::MAX_DIFFICULTY_EPOCHS as usize + 1 {
+            return Err(ChainError::Nipopow(format!(
+                "continuous difficulty context requires {} headers, above cap {}",
+                required_heights.len(),
+                crate::difficulty::MAX_DIFFICULTY_EPOCHS as usize + 1
+            )));
+        }
+        if difficulty_headers.len() != required_heights.len() {
+            return Err(ChainError::Nipopow(format!(
+                "continuous difficulty context count mismatch: expected {}, got {}",
+                required_heights.len(),
+                difficulty_headers.len()
+            )));
+        }
+
+        let mut difficulty_context = BTreeMap::new();
+        for header in difficulty_headers {
+            if !required_heights.contains(&header.height) {
+                return Err(ChainError::Nipopow(format!(
+                    "unexpected continuous difficulty header at height {}",
+                    header.height
+                )));
+            }
+            if difficulty_context
+                .insert(header.height, header.clone())
+                .is_some()
+            {
+                return Err(ChainError::Nipopow(format!(
+                    "duplicate continuous difficulty header at height {}",
+                    header.height
+                )));
+            }
+            if verify_pow {
+                crate::verify_pow(&header)?;
+            }
+        }
+        for required_height in &required_heights {
+            if !difficulty_context.contains_key(required_height) {
+                return Err(ChainError::Nipopow(format!(
+                    "continuous difficulty header at height {required_height} is missing"
+                )));
+            }
+        }
+        Ok(difficulty_context)
+    }
+
+    /// Reattach a persisted continuous-proof difficulty context to a restored
+    /// light chain. The record must name the exact suffix-head entry in the
+    /// restored best-chain index and contain the complete configured anchor
+    /// set. Validation completes before state is mutated.
+    pub fn restore_nipopow_difficulty_context(
+        &mut self,
+        suffix_head_height: u32,
+        suffix_head_id: BlockId,
+        difficulty_headers: Vec<Header>,
+    ) -> Result<(), ChainError> {
+        self.restore_nipopow_difficulty_context_impl(
+            suffix_head_height,
+            suffix_head_id,
+            difficulty_headers,
+            true,
+        )
+    }
+
+    fn restore_nipopow_difficulty_context_impl(
+        &mut self,
+        suffix_head_height: u32,
+        suffix_head_id: BlockId,
+        difficulty_headers: Vec<Header>,
+        verify_pow: bool,
+    ) -> Result<(), ChainError> {
+        let base_height = self.base_height.ok_or_else(|| {
+            ChainError::Nipopow(
+                "cannot restore continuous difficulty context on an empty chain".into(),
+            )
+        })?;
+        if !self.light_client_mode {
+            return Err(ChainError::Nipopow(
+                "cannot restore continuous difficulty context on a full chain".into(),
+            ));
+        }
+        if suffix_head_height != base_height {
+            return Err(ChainError::Nipopow(format!(
+                "continuous difficulty context suffix-head height {suffix_head_height} does not match restored base {base_height}"
+            )));
+        }
+        if self.height_of(&suffix_head_id) != Some(base_height) {
+            return Err(ChainError::Nipopow(format!(
+                "continuous difficulty context suffix-head id {suffix_head_id} does not match restored base"
+            )));
+        }
+
+        let context = self.validate_nipopow_difficulty_context(
+            suffix_head_height,
+            difficulty_headers,
+            verify_pow,
+        )?;
+        self.nipopow_difficulty_headers = context;
+        self.nipopow_difficulty_context_ready = true;
+        Ok(())
+    }
+
+    /// No-PoW restore seam for synthetic continuous-context fixtures.
+    #[cfg(test)]
+    pub(crate) fn restore_nipopow_difficulty_context_no_pow(
+        &mut self,
+        suffix_head_height: u32,
+        suffix_head_id: BlockId,
+        difficulty_headers: Vec<Header>,
+    ) -> Result<(), ChainError> {
+        self.restore_nipopow_difficulty_context_impl(
+            suffix_head_height,
+            suffix_head_id,
+            difficulty_headers,
+            false,
+        )
     }
 
     fn install_from_nipopow_proof_impl(
         &mut self,
+        difficulty_headers: Vec<Header>,
         suffix_head: Header,
         suffix_tail: Vec<Header>,
         verify_pow: bool,
+        require_difficulty_context: bool,
+        verify_difficulty: bool,
     ) -> Result<Vec<InstalledHeader>, ChainError> {
         if !self.is_empty() {
             return Err(ChainError::ChainNotEmpty);
         }
+
+        let difficulty_context = if require_difficulty_context {
+            self.validate_nipopow_difficulty_context(
+                suffix_head.height,
+                difficulty_headers,
+                verify_pow,
+            )?
+        } else {
+            BTreeMap::new()
+        };
 
         // Verify PoW on suffix_head before mutating any state. The validator
         // contract says the caller already verified the proof, but PoW is
@@ -1037,6 +1222,8 @@ impl HeaderChain {
         // — see doc above.
         let head_id = suffix_head.id;
         let head_height = suffix_head.height;
+        self.nipopow_difficulty_headers = difficulty_context;
+        self.nipopow_difficulty_context_ready = true;
         self.base_height = Some(head_height);
         self.by_id.insert(head_id, head_height);
         self.lazy.put(head_height, suffix_head, BigUint::ZERO);
@@ -1066,6 +1253,24 @@ impl HeaderChain {
                     got: header.height,
                 });
             }
+            if verify_difficulty {
+                let expected_n_bits = match crate::difficulty::expected_difficulty(&tip, self) {
+                    Ok(expected) => expected,
+                    Err(error) => {
+                        self.rollback_install();
+                        return Err(error);
+                    }
+                };
+                if header.n_bits != expected_n_bits {
+                    let error = ChainError::WrongDifficulty {
+                        height: header.height,
+                        expected: expected_n_bits,
+                        got: header.n_bits,
+                    };
+                    self.rollback_install();
+                    return Err(error);
+                }
+            }
             if verify_pow {
                 if let Err(e) = crate::verify_pow(&header) {
                     self.rollback_install();
@@ -1092,22 +1297,48 @@ impl HeaderChain {
         Ok(installed)
     }
 
-    /// Test variant of [`Self::install_from_nipopow_proof`] that skips the
-    /// per-header PoW check. Used by unit tests on synthetic chains where
-    /// headers don't carry real Autolykos solutions.
+    /// Legacy test seam that skips PoW, sparse-context, and suffix-difficulty
+    /// checks. Used only to construct unrelated synthetic voting/reorg chains.
     #[cfg(test)]
     pub(crate) fn install_from_nipopow_proof_no_pow(
         &mut self,
         suffix_head: Header,
         suffix_tail: Vec<Header>,
     ) -> Result<Vec<InstalledHeader>, ChainError> {
-        self.install_from_nipopow_proof_impl(suffix_head, suffix_tail, false)
+        self.install_from_nipopow_proof_impl(
+            Vec::new(),
+            suffix_head,
+            suffix_tail,
+            false,
+            false,
+            false,
+        )
+    }
+
+    /// Context-aware no-PoW install seam for continuous-proof fixtures.
+    #[cfg(test)]
+    pub(crate) fn install_from_nipopow_proof_no_pow_with_context(
+        &mut self,
+        difficulty_headers: Vec<Header>,
+        suffix_head: Header,
+        suffix_tail: Vec<Header>,
+    ) -> Result<Vec<InstalledHeader>, ChainError> {
+        self.install_from_nipopow_proof_impl(
+            difficulty_headers,
+            suffix_head,
+            suffix_tail,
+            false,
+            true,
+            true,
+        )
     }
 
     /// Roll back a partial light-client install. Used internally only.
     fn rollback_install(&mut self) {
         self.base_height = None;
         self.by_id.clear();
+        self.nipopow_difficulty_headers.clear();
+        self.nipopow_difficulty_context_ready = false;
         self.light_client_mode = false;
         self.lazy.clear();
     }
@@ -1128,11 +1359,20 @@ impl HeaderChain {
         self.base_height.unwrap_or(1)
     }
 
-    /// Whether this chain has been installed from a NiPoPoW proof and is
-    /// running in light-client mode (no block bodies, no transaction
-    /// validation, no expected-difficulty recalculation).
+    /// Whether this chain originated from an externally authorized NiPoPoW
+    /// suffix and is running without block-body or transaction validation.
+    /// Legacy V1 cannot enter this mode through the public verifier.
     pub fn light_client_mode(&self) -> bool {
         self.light_client_mode
+    }
+
+    fn require_nipopow_difficulty_context(&self) -> Result<(), ChainError> {
+        if self.light_client_mode && !self.nipopow_difficulty_context_ready {
+            return Err(ChainError::Nipopow(
+                "continuous difficulty context was not restored for light mode".into(),
+            ));
+        }
+        Ok(())
     }
 
     // --- Best-chain consistency ---
@@ -1393,6 +1633,7 @@ impl HeaderChain {
         continuation: Header,
         verify_pow: bool,
     ) -> Result<BlockId, ChainError> {
+        self.require_nipopow_difficulty_context()?;
         // Need at least 2 headers — can't reorg genesis.
         if self.by_id.len() < 2 {
             return Err(ChainError::Reorg(
@@ -1461,6 +1702,7 @@ impl HeaderChain {
         new_branch: Vec<Header>,
         verify_pow: bool,
     ) -> Result<Vec<BlockId>, ChainError> {
+        self.require_nipopow_difficulty_context()?;
         if new_branch.is_empty() {
             return Err(ChainError::Reorg("new branch is empty".into()));
         }
@@ -1722,6 +1964,7 @@ impl HeaderChain {
 
     #[cfg(test)]
     fn validate_child_no_pow(&self, header: &Header) -> Result<(), ChainError> {
+        self.require_nipopow_difficulty_context()?;
         let tip = self.tip();
 
         if header.parent_id != tip.id {
@@ -1740,16 +1983,15 @@ impl HeaderChain {
                 got: header.timestamp,
             });
         }
-        // Skip difficulty check in light-client mode — see `validate_child`.
-        if !self.light_client_mode {
-            let expected_n_bits = crate::difficulty::expected_difficulty(&tip, self)?;
-            if header.n_bits != expected_n_bits {
-                return Err(ChainError::WrongDifficulty {
-                    height: header.height,
-                    expected: expected_n_bits,
-                    got: header.n_bits,
-                });
-            }
+        // This validates post-install difficulty mechanics. Legacy V1 cannot
+        // reach installation because its sparse anchors lack branch proofs.
+        let expected_n_bits = crate::difficulty::expected_difficulty(&tip, self)?;
+        if header.n_bits != expected_n_bits {
+            return Err(ChainError::WrongDifficulty {
+                height: header.height,
+                expected: expected_n_bits,
+                got: header.n_bits,
+            });
         }
         // JVM validateVotes (rules 212-214): reject malformed vote fields.
         crate::voting::check_header_votes(header.votes.0)?;
@@ -1795,6 +2037,7 @@ impl HeaderChain {
     }
 
     fn validate_child(&self, header: &Header) -> Result<(), ChainError> {
+        self.require_nipopow_difficulty_context()?;
         let tip = self.tip();
 
         if header.parent_id != tip.id {
@@ -1828,18 +2071,15 @@ impl HeaderChain {
             });
         }
 
-        // SPV: light clients cannot recompute expected_difficulty because
-        // they lack the historical epoch boundaries the recalc depends on.
-        // See `facts/chain.md` Phase 6 light_client_mode invariant.
-        if !self.light_client_mode {
-            let expected_n_bits = crate::difficulty::expected_difficulty(&tip, self)?;
-            if header.n_bits != expected_n_bits {
-                return Err(ChainError::WrongDifficulty {
-                    height: header.height,
-                    expected: expected_n_bits,
-                    got: header.n_bits,
-                });
-            }
+        // Continuous-proof anchors make the pre-install recalculation window
+        // available even when the best-chain index starts at the suffix head.
+        let expected_n_bits = crate::difficulty::expected_difficulty(&tip, self)?;
+        if header.n_bits != expected_n_bits {
+            return Err(ChainError::WrongDifficulty {
+                height: header.height,
+                expected: expected_n_bits,
+                got: header.n_bits,
+            });
         }
 
         crate::verify_pow(header)?;

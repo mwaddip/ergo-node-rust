@@ -180,8 +180,11 @@ Where `I: IntoIterator<Item = (u32, BlockId)>`.
   - `base_height = first entry's height` (or `None` if `entries` is empty).
   - `height() = last entry's height` (or `0` if empty).
   - `light_client_mode = (base_height.unwrap_or(1) > 1)` — a chain
-    starting above height 1 must have been installed from a NiPoPoW
-    proof and the SPV difficulty skip is preserved.
+    starting above height 1 must have been installed from a NiPoPoW proof.
+    Its sparse difficulty context is initially unready. The integrator MUST
+    load the versioned context record and call
+    `restore_nipopow_difficulty_context` before allowing any successor or
+    reorg; absence, corruption, or a suffix-head mismatch is fatal.
   - `active_parameters` / `active_proposed_update_bytes` are at
     construction defaults. The integrator must call
     `recompute_active_parameters_from_storage(height())` after
@@ -301,9 +304,10 @@ links are consistent.
   Does not need AD proofs.
 - `Digest` — maintain only the AVL+ tree root hash, validate state transitions via
   authenticated dictionary proofs (AD proofs). Requires downloading AD proofs from peers.
-- `Light` — NiPoPoW light-client mode. Downloads NO block bodies. Bootstraps the
-  header chain from a verified NiPoPoW proof's suffix and follows the tip
-  thereafter. No transaction validation runs in this mode.
+- `Light` — NiPoPoW light-client mode. Downloads NO block bodies and runs no
+  transaction validation. New legacy V1 bootstraps are currently disabled;
+  the retained tip-following machinery requires a future externally
+  authorized chain origin.
 
 Mirrors JVM's `StateType` enum (`Utxo`/`Digest`). The `Light` variant is a
 Rust-side addition that has no direct JVM analog — JVM expresses light-client
@@ -1000,14 +1004,16 @@ boundary's `compute_expected_parameters` call — which is what JVM
   BOTH `active_parameters` AND `active_proposed_update_bytes` to the
   values at the new tip (recompute or store per-height snapshots).
 
-## Phase 6: NiPoPoW Proofs (build + verify + install)
+## Phase 6: NiPoPoW Proofs (build + inspect; V1 bootstrap disabled)
 
-Build NiPoPoW proofs from the local chain on request, verify proofs received
-from peers, and install a verified proof's suffix as the chain's starting
-point for light-client mode. Wraps `ergo-nipopow`.
+Build and serve NiPoPoW proofs from the local chain, and inspect received
+proofs with bounded structural and PoW checks. Legacy V1 cannot authorize
+light-client bootstrap because its sparse difficulty headers are not
+authenticated as members of the proved branch. The public bootstrap verifier
+therefore fails closed before candidate comparison or installation.
 
-The serve-side (build + verify-only) shipped first; the install path lands
-with light-client bootstrap. Both consumers share the same primitives.
+The low-level install and persistence mechanics remain isolated and tested for
+a future branch-authenticated format. They are not a V1 authorization path.
 
 JVM reference: `ergo-core/src/main/scala/org/ergoplatform/modifiers/history/popow/NipopowProof.scala`,
 `NipopowAlgos.scala`, and `nodeView/history/storage/modifierprocessors/PopowProcessor.scala`
@@ -1053,17 +1059,13 @@ JVM reference: `ergo-core/src/main/scala/org/ergoplatform/modifiers/history/popo
   the JVM's `PoPowAlgosWithDBSpec` takes with `DefaultFakePowScheme`.
   Use `prove_with_reader` for any production path; the in-memory
   `prove` is only appropriate for test scenarios with synthetic chains.
-- **Non-scope**: JVM's `continuous = true` mode (which interleaves
-  difficulty-recalculation-boundary headers into the prefix so that
-  light clients can self-validate difficulty for blocks after the
-  suffix) is NOT supported. sigma-rust's `NipopowProof` struct has no
-  `continuous` field — adding it requires a separate change to the
-  struct, serializer, and on-wire format. `build_nipopow_proof`
-  produces non-continuous proofs. JVM peers applying non-continuous
-  proofs still succeed (`applyPopowProof` doesn't strictly require the
-  flag); they just can't self-validate post-suffix difficulty until
-  they sync more headers. This is fine for P2P serve. Tracked as
-  follow-up in the roadmap.
+- **Continuous mode**: the producer mirrors the JVM database prover. It adds
+  every historical height returned by `heightsForNextRecalculation` that is
+  below the suffix head to the proof prefix, validates the enriched proof,
+  and appends the JVM terminal byte `1`. The sigma-rust 0.28 core type remains
+  unchanged; the node adapter owns this terminal byte and enrichment. These
+  height-selected headers are useful interoperability data, but V1 does not
+  bind them to the proved branch and they cannot authorize installation.
 - **Genesis (height 1) special case**: The genesis block's interlinks
   vector is canonical and MUST NOT be read from the extension loader. The
   **reader implementation** (not `build_nipopow_proof` directly) is
@@ -1092,63 +1094,58 @@ JVM reference: `ergo-core/src/main/scala/org/ergoplatform/modifiers/history/popo
 
   **Verified by**: integration test `tests/nipopow_serve_integration.rs`
   in the main crate, which sends `GetNipopowProof(m=6, k=6)` to a running
-  node and verifies the response round-trips through
-  `verify_nipopow_proof_bytes`. The chain crate's
+  node, inspects the response, and separately asserts that
+  `verify_nipopow_proof_bytes` returns the V1 bootstrap-disabled error. The
+  chain crate's
   `build_proof_skips_loader_for_genesis` unit test fixtures a chain
   whose loader has no entry for `h=1` and asserts the build still
   succeeds — a black-box check that the reader's genesis synthesis path
   is wired correctly.
 
-### `verify_nipopow_proof_bytes(bytes: &[u8]) -> Result<NipopowVerificationResult>`
+### `verify_nipopow_proof_bytes(bytes, context) -> Result<NipopowVerificationResult>`
+
 - **Precondition**: `bytes` is the inner NiPoPoW proof payload (the main
-  crate has already stripped the message envelope).
-- **Postcondition**: Returns `NipopowVerificationResult` if the proof is
-  structurally valid AND `is_valid` returns true (heights consistent,
-  connections valid, PoW valid for each header, difficulty headers present
-  in continuous mode). The result includes the full extracted header chain
-  (`prefix` + `suffix_head.header` + `suffix_tail`, in height order) so the
-  caller can install it via [`HeaderChain::install_from_nipopow_proof`]
-  without re-parsing the bytes.
-- **Validation checks** (mirrors `NipopowProof.isValid`):
-  1. Headers parse cleanly via `ergo_nipopow::NipopowProofSerializer`.
-  2. Heights are strictly increasing across `headersChain`.
-  3. Each header's PoW passes `verify_pow`.
-  4. Parent connections in the chain are consistent
-     (`NipopowProof::has_valid_connections`).
-  5. (Continuous mode only) Difficulty-recalculation headers are present.
-- **Does NOT** apply the proof to local chain state. Returning the headers
-  inline is a convenience to avoid double parsing — the chain is mutated
-  only via the explicit `install_from_nipopow_proof` call.
+  crate has already stripped the message envelope). `context` carries the
+  exact requested `m` and `k`, the deployment's configured genesis ID, and
+  the configured difficulty epoch/use-last-epochs values.
+- **Postcondition**: after validating the local context bounds, the function
+  returns `ChainError::NipopowBootstrapDisabled`. It never returns an
+  authorizing V1 result and never mutates chain state.
+- **Reason**: V1 can show that each sparse header has its own PoW and occurs at
+  a requested height, but it cannot show that the header belongs to the branch
+  selected by the NiPoPoW proof. Its self-declared `nBits` therefore cannot be
+  trusted as difficulty-transition evidence.
+- **Diagnostics**: `inspect_nipopow_proof_bytes` retains bounded parsing,
+  canonical structural validation, terminal-mode parsing, and per-header PoW
+  checks. Its `NipopowInspection` result contains no headers, request binding,
+  or configured-genesis binding and cannot authorize bootstrap.
 
 ### `NipopowVerificationResult`
 
 ```rust
 pub struct NipopowVerificationResult {
-    /// Height of the suffix tip (the highest header in the proof).
-    pub suffix_tip_height: u32,
-    /// Total number of headers in the proof (prefix + suffix).
-    pub total_headers: usize,
-    /// Whether the proof is in continuous mode (carries difficulty headers).
-    pub continuous: bool,
-    /// Headers extracted from the verified proof, in strictly-increasing
-    /// height order: `prefix.iter().map(|p| p.header).chain(once(suffix_head.header)).chain(suffix_tail)`.
-    /// The light-client install path passes `headers.last()` as `suffix_head`
-    /// and the `k - 1` headers preceding it as `suffix_tail`. Callers that
-    /// only want metadata (the existing serve-side log path) can ignore the
-    /// field at zero parsing cost — it's already materialized.
-    pub headers: Vec<Header>,
+    pub m: u32,
+    pub k: u32,
+    /// JVM terminal mode parsed by the legacy internal verifier.
+    pub continuous: Option<bool>,
+    pub prefix: Vec<Header>,
+    /// Legacy V1 height-selected subset; not branch-authenticated.
+    pub difficulty_headers: Vec<Header>,
+    pub suffix_head: Header,
+    pub suffix_tail: Vec<Header>,
 }
 ```
 
-Renamed from `NipopowProofMeta` (which only carried metadata) to reflect the
-new return shape. The serve-side log path in the main crate is the only
-existing call site and just gets the field rename plus an unused-headers
-field; no semantic change for that consumer.
+The type and its exact prefix/suffix boundary remain for internal regression
+fixtures and a future authenticated format. The public V1 verifier does not
+construct it. The separate `NipopowInspection` type contains diagnostic
+metadata but no headers; bootstrap selection and installation must not use it.
 
-### `install_from_nipopow_proof(suffix_head: Header, suffix_tail: Vec<Header>) -> Result<Vec<InstalledHeader>>`
+### `install_from_nipopow_proof(difficulty_headers: Vec<Header>, suffix_head: Header, suffix_tail: Vec<Header>) -> Result<Vec<InstalledHeader>>`
 
-Install a verified NiPoPoW proof's suffix as the chain's starting point for
-light-client mode.
+Install an externally authorized NiPoPoW suffix as the chain's starting point
+for light-client mode. This is a low-level future-format/test seam, not a V1
+authorization path.
 
 ```rust
 pub struct InstalledHeader {
@@ -1158,11 +1155,10 @@ pub struct InstalledHeader {
 }
 ```
 
-- **Precondition**: Chain is empty (`is_empty() == true`). The headers in
-  `suffix_head` + `suffix_tail` MUST already have been validated by the
-  caller via `verify_nipopow_proof_bytes`. This function does NOT re-verify
-  the proof; it assumes the caller has done so and is installing the
-  trusted suffix.
+- **Precondition**: Chain is empty (`is_empty() == true`). All three arguments
+  MUST come directly from one branch-authenticated authorization result. The
+  installer does not prove sparse-header branch membership. Legacy V1 cannot
+  satisfy this precondition; its public verifier always fails closed.
 - **Postcondition on Ok**: Chain now contains `suffix_head` followed by every
   header in `suffix_tail`, in order. `tip()` returns the last header in
   `suffix_tail` (or `suffix_head` if `suffix_tail` is empty). `height()`
@@ -1175,7 +1171,9 @@ pub struct InstalledHeader {
   header). The integrator persists these by calling
   `store.put_header(id, height, fork=0, score=score_be, data=...)` for
   each — without this write the store's score loader will return `None`
-  on later queries and the chain's score-dependent paths break.
+  on later queries and the chain's score-dependent paths break. The sparse
+  context is retained separately from best-chain state and never contributes
+  a score or becomes a reorg anchor.
 - **Postcondition on Err**: Chain is unchanged (rolled back). Possible errors:
   - Chain not empty.
   - `suffix_head.parent_id` is anything other than what the caller expects
@@ -1183,18 +1181,14 @@ pub struct InstalledHeader {
     (the suffix head is rarely actually genesis), but it MUST be self-
     consistent with `suffix_tail` (each header's `parent_id` is the previous
     header's `id`).
-  - Any header's PoW fails `verify_pow`.
-  - Note: the `expected_difficulty` check is NOT performed on suffix
-    headers, and is permanently disabled for `try_append` after install
-    via the `light_client_mode` flag. See the "Light-client difficulty
-    checking" invariant below for the full rationale — light clients
-    cannot independently recompute difficulty and must trust the
-    `n_bits` values in incoming headers, validated only by self-contained
-    PoW verification.
+  - Required anchor count/height mismatch, duplicate anchor, or missing anchor.
+  - Any context or suffix header's PoW fails `verify_pow`.
+  - Any suffix header's `n_bits` differs from `expected_difficulty` computed
+    with the sparse anchors and already-installed suffix history.
 - **Behavior**:
-  - Sets `light_client_mode = true` on the chain — this flag persists for
-    the chain's lifetime and disables the difficulty-target check on all
-    subsequent `try_append` calls (see invariant below).
+  - Sets `light_client_mode = true` and marks the sparse difficulty context
+    ready. The flag controls the reorg floor and restart contract; it does not
+    disable difficulty-target checks.
   - `suffix_head` is pushed via the same internal `push_header` path used
     by `try_append`'s tip-extension branch, but the genesis-validation check
     is bypassed.
@@ -1207,7 +1201,7 @@ pub struct InstalledHeader {
     scores are returned to the integrator in the `Vec<InstalledHeader>`
     result; the chain itself does NOT persist them, only emits them.
   - For each header in `suffix_tail`, validate parent linkage (`parent_id ==
-    previous.id`), validate PoW, and push. Skip the difficulty-target check.
+    previous.id`), expected difficulty, and PoW before pushing.
   - `active_parameters` is left at `default_parameters(network)` — light
     clients have no source for voted parameters because they don't download
     block extensions. See "Light-client parameter limitation" below.
@@ -1257,16 +1251,17 @@ peer on demand. Tracked as a follow-up.
 
 ### NiPoPoW invariants
 
-- `build_nipopow_proof` and `verify_nipopow_proof_bytes` are pure functions
-  over chain state (modulo `&self` for chain access in `build`).
-- Building and verifying do NOT modify chain state.
+- `build_nipopow_proof`, `inspect_nipopow_proof_bytes`, and
+  `verify_nipopow_proof_bytes` are pure functions over chain state (modulo
+  `&self` for chain access in `build`).
+- Building, inspection, and the fail-closed authorization check do NOT modify
+  chain state.
 - `install_from_nipopow_proof` IS a state mutation, but only legal on an
   empty chain. Calling it on a non-empty chain is an error, not a
   destructive overwrite.
-- Verification rejects any proof whose internal PoW checks fail —
-  consensus-critical.
-- Building never produces a proof that would fail verification on the same
-  implementation.
+- Inspection rejects any proof whose internal PoW checks fail.
+- Building produces V1 bytes that round-trip through bounded inspection; this
+  is an interoperability property, not bootstrap authorization.
 - The `PopowHeaderReader` implementation used by `build_nipopow_proof`
   MUST synthesize the genesis `PoPowHeader` in-process — the extension
   loader MUST NOT be called for `height == 1` or for the genesis block
@@ -1275,14 +1270,11 @@ peer on demand. Tracked as a follow-up.
   reader); it is consensus-critical because real genesis extensions are
   empty and cannot produce the canonical `interlinks = [genesis_id]`
   vector via the loader path.
-- **`light_client_mode` flag skips `expected_difficulty`.** `HeaderChain`
-  gains an internal `light_client_mode: bool` flag, set to `true` during
-  `install_from_nipopow_proof` and `false` otherwise. When true,
-  `validate_child` and `validate_child_no_pow` skip the
-  `expected_difficulty` check. PoW verification (`verify_pow`) and
-  parent-linkage checks remain in force. Standard SPV behavior — light
-  clients can't recompute `expected_difficulty` because they don't have
-  the historical epoch boundaries the recalc depends on.
+- **Legacy V1 is non-authorizing.** Its recalculation-height headers are not
+  branch-authenticated, so the public verifier always returns
+  `NipopowBootstrapDisabled` before selection or installation. The sparse-map,
+  suffix validation, and restart codec remain tested mechanics for a future
+  authenticated format; their own validation does not repair V1.
 - `reorg_floor()` is consulted before any reorg execution. Reorgs whose
   fork point falls below the floor are rejected.
 

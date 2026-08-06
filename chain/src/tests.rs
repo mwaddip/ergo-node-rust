@@ -3,7 +3,7 @@ mod parse_tests {
     use crate::{parse_header, ChainError};
     use sigma_ser::ScorexSerializable;
 
-    fn v2_header_json() -> &'static str {
+    pub(super) fn v2_header_json() -> &'static str {
         r#"{
             "extensionId": "d16f25b14457186df4c5f6355579cc769261ce1aebc8209949ca6feadbac5a3f",
             "difficulty": "626412390187008",
@@ -126,7 +126,7 @@ mod parse_tests {
 
 #[cfg(test)]
 mod pow_tests {
-    use crate::verify_pow;
+    use crate::{verify_pow, ChainError};
 
     /// Valid V2 header at height 614400 (first N increase) — known-good PoW from sigma-rust tests.
     #[test]
@@ -157,6 +157,21 @@ mod pow_tests {
         let header: ergo_chain_types::Header = serde_json::from_str(json).unwrap();
         let result = verify_pow(&header);
         assert!(result.is_ok(), "valid PoW should pass: {result:?}");
+    }
+
+    #[test]
+    fn verify_pow_rejects_zero_decoded_target_without_panic() {
+        let mut header: ergo_chain_types::Header =
+            serde_json::from_str(super::parse_tests::v2_header_json()).unwrap();
+        header.n_bits = 0;
+
+        let result = std::panic::catch_unwind(|| verify_pow(&header));
+
+        assert!(result.is_ok(), "zero decoded target must not panic");
+        assert!(matches!(
+            result.unwrap(),
+            Err(ChainError::InvalidPowTarget { n_bits: 0 })
+        ));
     }
 
     /// Invalid V2 header at height 2870 — PoW doesn't meet difficulty target.
@@ -3036,6 +3051,28 @@ mod light_client_install_tests {
         ChainConfig::testnet()
     }
 
+    fn difficulty_context(config: &ChainConfig, suffix_head_height: u32) -> Vec<Header> {
+        let epoch_length = config.eip37_epoch_length.unwrap_or(config.epoch_length);
+        crate::difficulty::heights_for_next_recalculation(
+            suffix_head_height,
+            epoch_length,
+            config.use_last_epochs,
+        )
+        .expect("valid test configuration")
+        .into_iter()
+        .filter(|height| *height > 0 && *height < suffix_head_height)
+        .map(|height| {
+            make_chain_header_with_nonce(
+                height,
+                BlockId(Digest32::from([0xD1; 32])),
+                1_000_000 + u64::from(height) * 50_000,
+                config.initial_n_bits,
+                height.to_be_bytes().repeat(2),
+            )
+        })
+        .collect()
+    }
+
     /// Build a synthetic "suffix" — k headers starting at `start_height`
     /// with the given parent_id, all with the same n_bits.
     fn build_suffix(
@@ -3200,6 +3237,308 @@ mod light_client_install_tests {
     }
 
     #[test]
+    fn continuous_install_rejects_one_missing_difficulty_header_without_mutation() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let parent = BlockId(Digest32::from([0x77; 32]));
+        let head = make_chain_header(375, parent, 1_000_000 + 375 * 50_000, config.initial_n_bits);
+        let mut context = difficulty_context(&config, head.height);
+        assert_eq!(
+            context
+                .iter()
+                .map(|header| header.height)
+                .collect::<Vec<_>>(),
+            vec![128, 256]
+        );
+        context.remove(0);
+
+        let err = chain
+            .install_from_nipopow_proof_no_pow_with_context(context, head, vec![])
+            .expect_err("one missing authenticated anchor must fail");
+        assert!(matches!(err, ChainError::Nipopow(ref msg) if msg.contains("count mismatch")));
+        assert!(chain.is_empty());
+        assert!(chain.nipopow_difficulty_headers().is_empty());
+    }
+
+    #[test]
+    fn continuous_install_rejects_duplicate_difficulty_height_without_mutation() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let parent = BlockId(Digest32::from([0x77; 32]));
+        let head = make_chain_header(375, parent, 1_000_000 + 375 * 50_000, config.initial_n_bits);
+        let mut context = difficulty_context(&config, head.height);
+        context[1] = context[0].clone();
+
+        let err = chain
+            .install_from_nipopow_proof_no_pow_with_context(context, head, vec![])
+            .expect_err("duplicate authenticated anchor height must fail");
+        assert!(matches!(err, ChainError::Nipopow(ref msg) if msg.contains("duplicate")));
+        assert!(chain.is_empty());
+        assert!(chain.nipopow_difficulty_headers().is_empty());
+    }
+
+    #[test]
+    fn continuous_install_rejects_unexpected_difficulty_height_without_mutation() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let parent = BlockId(Digest32::from([0x77; 32]));
+        let head = make_chain_header(375, parent, 1_000_000 + 375 * 50_000, config.initial_n_bits);
+        let mut context = difficulty_context(&config, head.height);
+        context[1] = make_chain_header_with_nonce(
+            129,
+            BlockId(Digest32::from([0xD2; 32])),
+            1_000_000 + 129 * 50_000,
+            config.initial_n_bits,
+            vec![0xD2; 8],
+        );
+
+        let err = chain
+            .install_from_nipopow_proof_no_pow_with_context(context, head, vec![])
+            .expect_err("unexpected authenticated anchor height must fail");
+        assert!(matches!(err, ChainError::Nipopow(ref msg) if msg.contains("unexpected")));
+        assert!(chain.is_empty());
+        assert!(chain.nipopow_difficulty_headers().is_empty());
+    }
+
+    #[test]
+    fn continuous_install_rejects_bad_context_pow_without_mutation() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let parent = BlockId(Digest32::from([0x77; 32]));
+        let head = make_chain_header(375, parent, 1_000_000 + 375 * 50_000, config.initial_n_bits);
+        let mut context = difficulty_context(&config, head.height);
+        context[0] = make_chain_header_with_nonce(
+            context[0].height,
+            BlockId(Digest32::from([0xD3; 32])),
+            context[0].timestamp,
+            72_286_528,
+            vec![0xD3; 8],
+        );
+
+        let err = chain
+            .install_from_nipopow_proof(context, head, vec![])
+            .expect_err("invalid authenticated anchor PoW must fail");
+        assert!(matches!(
+            err,
+            ChainError::PowInvalid { .. } | ChainError::PowCompute(_)
+        ));
+        assert!(chain.is_empty());
+        assert!(chain.nipopow_difficulty_headers().is_empty());
+    }
+
+    #[test]
+    fn continuous_install_rejects_wrong_suffix_difficulty_and_rolls_back() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let parent = BlockId(Digest32::from([0x77; 32]));
+        let head = make_chain_header(375, parent, 1_000_000 + 375 * 50_000, config.initial_n_bits);
+        let bad_tail = make_chain_header_with_nonce(
+            376,
+            head.id,
+            head.timestamp + 50_000,
+            config.initial_n_bits + 1,
+            vec![0xB4; 8],
+        );
+        let context = difficulty_context(&config, head.height);
+
+        let err = chain
+            .install_from_nipopow_proof_no_pow_with_context(context, head, vec![bad_tail])
+            .expect_err("wrong suffix nBits must fail");
+        assert!(matches!(
+            err,
+            ChainError::WrongDifficulty { height: 376, .. }
+        ));
+        assert!(chain.is_empty());
+        assert!(chain.nipopow_difficulty_headers().is_empty());
+    }
+
+    #[test]
+    fn continuous_context_validates_first_post_install_recalculation() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let parent = BlockId(Digest32::from([0x77; 32]));
+        let suffix = build_suffix(
+            375,
+            parent,
+            1_000_000 + 375 * 50_000,
+            config.initial_n_bits,
+            10,
+        );
+        let head = suffix[0].clone();
+        let context = difficulty_context(&config, head.height);
+        chain
+            .install_from_nipopow_proof_no_pow_with_context(context, head, suffix[1..].to_vec())
+            .expect("continuous suffix install");
+        assert_eq!(chain.height(), 384);
+
+        let tip = chain.tip();
+        let expected = crate::difficulty::expected_difficulty(&tip, &chain)
+            .expect("sparse anchors complete the recalculation window");
+        let wrong = make_chain_header_with_nonce(
+            385,
+            tip.id,
+            tip.timestamp + 50_000,
+            expected.wrapping_add(1),
+            vec![0xC1; 8],
+        );
+        let err = chain
+            .try_append_no_pow(wrong)
+            .expect_err("wrong boundary difficulty must fail");
+        assert!(matches!(
+            err,
+            ChainError::WrongDifficulty { height: 385, .. }
+        ));
+        assert_eq!(chain.height(), 384);
+
+        let correct = make_chain_header_with_nonce(
+            385,
+            tip.id,
+            tip.timestamp + 50_000,
+            expected,
+            vec![0xC2; 8],
+        );
+        assert!(matches!(
+            chain
+                .try_append_no_pow(correct)
+                .expect("correct boundary child"),
+            AppendResult::Extended
+        ));
+        assert_eq!(chain.height(), 385);
+    }
+
+    #[test]
+    fn restored_continuous_context_is_bound_to_the_installed_suffix_head() {
+        let config = testnet_config();
+        let parent = BlockId(Digest32::from([0x77; 32]));
+        let suffix = build_suffix(
+            375,
+            parent,
+            1_000_000 + 375 * 50_000,
+            config.initial_n_bits,
+            10,
+        );
+        let entries = suffix.iter().map(|header| (header.height, header.id));
+        let mut restored =
+            HeaderChain::restore(config.clone(), entries).expect("restore suffix index");
+        let context = difficulty_context(&config, suffix[0].height);
+
+        let err = restored
+            .restore_nipopow_difficulty_context_no_pow(
+                suffix[0].height + 1,
+                suffix[0].id,
+                context.clone(),
+            )
+            .expect_err("stale suffix-head height binding must fail");
+        assert!(matches!(err, ChainError::Nipopow(ref msg) if msg.contains("suffix-head height")));
+        assert!(restored.nipopow_difficulty_headers().is_empty());
+
+        let err = restored
+            .restore_nipopow_difficulty_context_no_pow(
+                suffix[0].height,
+                BlockId(Digest32::from([0x99; 32])),
+                context.clone(),
+            )
+            .expect_err("stale suffix-head binding must fail");
+        assert!(matches!(err, ChainError::Nipopow(ref msg) if msg.contains("suffix-head id")));
+        assert!(restored.nipopow_difficulty_headers().is_empty());
+
+        restored
+            .restore_nipopow_difficulty_context_no_pow(
+                suffix[0].height,
+                suffix[0].id,
+                context.clone(),
+            )
+            .expect("matching persisted context");
+        assert_eq!(restored.nipopow_difficulty_headers(), context);
+    }
+
+    #[test]
+    fn restored_continuous_context_rejects_missing_anchor_without_mutation() {
+        let config = testnet_config();
+        let suffix = build_suffix(
+            375,
+            BlockId(Digest32::from([0x77; 32])),
+            1_000_000 + 375 * 50_000,
+            config.initial_n_bits,
+            2,
+        );
+        let entries = suffix.iter().map(|header| (header.height, header.id));
+        let mut restored =
+            HeaderChain::restore(config.clone(), entries).expect("restore suffix index");
+        let mut context = difficulty_context(&config, suffix[0].height);
+        context.remove(0);
+
+        let err = restored
+            .restore_nipopow_difficulty_context_no_pow(suffix[0].height, suffix[0].id, context)
+            .expect_err("missing persisted anchor must fail closed");
+        assert!(matches!(err, ChainError::Nipopow(ref msg) if msg.contains("count mismatch")));
+        assert!(restored.nipopow_difficulty_headers().is_empty());
+    }
+
+    #[test]
+    fn restored_light_chain_rejects_children_until_context_is_ready() {
+        let config = testnet_config();
+        let suffix = build_suffix(
+            375,
+            BlockId(Digest32::from([0x77; 32])),
+            1_000_000 + 375 * 50_000,
+            config.initial_n_bits,
+            2,
+        );
+        let entries = suffix.iter().map(|header| (header.height, header.id));
+        let mut restored =
+            HeaderChain::restore(config.clone(), entries).expect("restore suffix index");
+        let stored_headers = suffix
+            .iter()
+            .cloned()
+            .map(|header| (header.height, header))
+            .collect::<std::collections::HashMap<_, _>>();
+        restored.set_header_loader(move |height| stored_headers.get(&height).cloned());
+        restored.set_score_loader(|_| Some(crate::BigUint::default()));
+        let tip = suffix.last().expect("fixture tip");
+        let child = make_chain_header_with_nonce(
+            tip.height + 1,
+            tip.id,
+            tip.timestamp + 50_000,
+            tip.n_bits,
+            vec![0xC3; 8],
+        );
+
+        let alternative = make_chain_header_with_nonce(
+            suffix[1].height,
+            suffix[0].id,
+            suffix[1].timestamp + 1,
+            suffix[1].n_bits,
+            vec![0xC4; 8],
+        );
+        let err = restored
+            .try_reorg_deep_no_pow(suffix[0].height, vec![alternative])
+            .expect_err("unrestored light context must block every reorg");
+        assert!(matches!(err, ChainError::Nipopow(ref msg) if msg.contains("not restored")));
+        assert_eq!(restored.height(), tip.height);
+
+        let err = restored
+            .try_append_no_pow(child.clone())
+            .expect_err("unrestored light context must block every child");
+        assert!(matches!(err, ChainError::Nipopow(ref msg) if msg.contains("not restored")));
+        assert_eq!(restored.height(), tip.height);
+
+        restored
+            .restore_nipopow_difficulty_context_no_pow(
+                suffix[0].height,
+                suffix[0].id,
+                difficulty_context(&config, suffix[0].height),
+            )
+            .expect("restore authenticated context");
+        assert!(matches!(
+            restored
+                .try_append_no_pow(child)
+                .expect("context-ready child"),
+            AppendResult::Extended
+        ));
+    }
+
+    #[test]
     fn install_rejects_bad_pow_via_real_path() {
         // Real install_from_nipopow_proof (with PoW) must reject synthetic
         // headers when the difficulty target is meaningful. Note that the
@@ -3215,12 +3554,12 @@ mod light_client_install_tests {
 
         let high_n_bits = 72286528u32;
         let parent = BlockId(Digest32::from([0x77; 32]));
-        let suffix = build_suffix(1000, parent, 5_000_000, high_n_bits, 3);
+        let suffix = build_suffix(100, parent, 5_000_000, high_n_bits, 3);
         let suffix_head = suffix[0].clone();
         let suffix_tail: Vec<Header> = suffix[1..].to_vec();
 
         let err = chain
-            .install_from_nipopow_proof(suffix_head, suffix_tail)
+            .install_from_nipopow_proof(vec![], suffix_head, suffix_tail)
             .unwrap_err();
         assert!(
             matches!(err, ChainError::PowInvalid { .. } | ChainError::PowCompute(_)),
@@ -3234,9 +3573,8 @@ mod light_client_install_tests {
 
     #[test]
     fn try_append_after_install_extends_tip() {
-        // Key test: post-install, a valid child of the suffix tip is
-        // accepted by try_append_no_pow. Difficulty check is skipped because
-        // light_client_mode is set.
+        // Post-install, a valid child of the suffix tip is accepted while the
+        // same difficulty predicate remains active in light-client mode.
         let config = testnet_config();
         let mut chain = HeaderChain::new(config.clone());
         let parent = BlockId(Digest32::from([0x77; 32]));
@@ -3265,13 +3603,12 @@ mod light_client_install_tests {
         assert_eq!(chain.height(), 1003);
     }
 
-    // --- light_client_mode skip tests ---
+    // --- light-client difficulty tests ---
 
     #[test]
-    fn light_mode_accepts_wrong_n_bits_post_install() {
-        // In normal (full) mode, a child header with a deliberately wrong
-        // n_bits is rejected. After install, the same kind of mismatch is
-        // accepted because light mode skips the difficulty check entirely.
+    fn light_mode_rejects_wrong_n_bits_post_install() {
+        // Continuous bootstrap preserves enough history to keep the same
+        // difficulty predicate active after installation.
         let config = testnet_config();
 
         // 1) Normal-mode rejection: build a chain at genesis, try a child
@@ -3287,9 +3624,8 @@ mod light_client_install_tests {
             "full mode must reject wrong n_bits"
         );
 
-        // 2) Light-mode acceptance: install a fresh chain from a synthetic
-        //    1-header suffix and try the same kind of "wrong n_bits" child.
-        //    The difficulty check is skipped, so it should be accepted.
+        // 2) Light-mode rejection: install a fresh chain from a synthetic
+        //    1-header suffix and try the same kind of wrong child.
         let mut light_chain = HeaderChain::new(config.clone());
         let parent = BlockId(Digest32::from([0x42; 32]));
         let head = make_chain_header_with_nonce(
@@ -3304,9 +3640,8 @@ mod light_client_install_tests {
         light_chain
             .install_from_nipopow_proof_no_pow(head, vec![])
             .expect("install");
-        // Append a child with deliberately-wrong n_bits — would be a
-        // WrongDifficulty error in full mode. Light mode trusts whatever
-        // n_bits the network sent.
+        // Append a child with deliberately wrong n_bits. Continuous light
+        // mode must reject it under the same predicate as full mode.
         let child = make_chain_header_with_nonce(
             5001,
             head_id,
@@ -3314,11 +3649,11 @@ mod light_client_install_tests {
             config.initial_n_bits + 1, // wrong on purpose
             vec![0xC1; 8],
         );
-        let result = light_chain
+        let err = light_chain
             .try_append_no_pow(child)
-            .expect("light mode must accept wrong n_bits");
-        assert!(matches!(result, AppendResult::Extended));
-        assert_eq!(light_chain.height(), 5001);
+            .expect_err("light mode must reject wrong n_bits");
+        assert!(matches!(err, ChainError::WrongDifficulty { .. }));
+        assert_eq!(light_chain.height(), 5000);
     }
 
     // --- reorg_floor tests ---
@@ -3801,8 +4136,8 @@ mod restore_tests {
     #[test]
     fn restore_single_entry_above_genesis_implies_light_mode() {
         // A chain whose store index starts above height 1 must have been
-        // installed from a NiPoPoW proof — the SPV difficulty skip is
-        // preserved across restart.
+        // installed from a NiPoPoW proof. Its sparse difficulty context is
+        // restored separately before the chain may accept successors.
         let entries = vec![(5_000_000u32, id_at(5_000_000))];
         let chain = HeaderChain::restore(testnet_config(), entries)
             .expect("single-entry restore at h=5M must succeed");

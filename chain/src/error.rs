@@ -13,6 +13,10 @@ pub enum ChainError {
     #[error("PoW verification failed: hit {hit} >= target {target}")]
     PowInvalid { hit: String, target: String },
 
+    /// Header's compact difficulty decodes to an unusable zero target.
+    #[error("invalid PoW target: nBits {n_bits} decodes to zero")]
+    InvalidPowTarget { n_bits: u32 },
+
     /// Error computing proof-of-work hit.
     #[error("PoW computation error: {0}")]
     PowCompute(#[from] AutolykosPowSchemeError),
@@ -76,6 +80,14 @@ pub enum ChainError {
     /// NiPoPoW proof error.
     #[error("nipopow error: {0}")]
     Nipopow(String),
+
+    /// Legacy NiPoPoW V1 proofs do not authenticate sparse difficulty
+    /// headers as members of the proved branch, so they cannot authorize a
+    /// variable-difficulty bootstrap installation.
+    #[error(
+        "NiPoPoW V1 bootstrap disabled: sparse difficulty headers are not branch-authenticated"
+    )]
+    NipopowBootstrapDisabled,
 
     /// `install_from_nipopow_proof` was called on a chain that already
     /// contains headers. The install API only accepts an empty chain.

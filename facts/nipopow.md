@@ -1,10 +1,11 @@
-# NiPoPoW Serve + Light-Client Bootstrap Contract (in-repo side)
+# NiPoPoW Serve + Fail-Closed V1 Bootstrap Contract (in-repo side)
 
 ## Scope
 
 This contract covers the **in-repo (main crate) side** of NiPoPoW proof
-handling. The chain submodule owns proof construction, verification, and
-the install path (see `facts/chain.md` Phase 6: NiPoPoW Proofs). The main
+handling. The chain submodule owns proof construction, inspection,
+authorization, and the dormant install seam (see `facts/chain.md` Phase 6:
+NiPoPoW Proofs). The main
 crate owns the P2P message envelope, event dispatch, and the
 light-client bootstrap state machine.
 
@@ -15,20 +16,21 @@ What ships in this contract:
 2. A handler in `src/main.rs` that subscribes to `ProtocolEvent`s,
    filters for codes 90 and 91, parses the envelopes, calls into chain,
    and sends responses via `p2p.send_to`.
-3. Verification of incoming proofs (logged in non-light mode; routed to
-   the bootstrap state machine in `StateType::Light` mode).
+3. Diagnostic inspection of incoming proofs, plus a public V1 bootstrap
+   authorization entry point that returns a typed disabled error.
 4. **Outbound `GetNipopowProof` requests** for light-client bootstrap.
    The serializer for code 90 (`serialize_get_nipopow_proof`) is added
    alongside the existing code 91 serializer.
-5. **Light-client bootstrap state machine** in `sync/` (see
+5. **Fail-closed light-client bootstrap state machine** in `sync/` (see
    `facts/sync.md` "Light-Client Bootstrap" section). The main crate's
    role is to wire the bootstrap entry point into startup when
    `state_type == Light`.
 
 What does NOT ship:
 
-- Multi-peer best-arg proof comparison (KMZ17 §4.3) — single-peer
-  bootstrap only for first release.
+- An authorizing V1 bootstrap path. V1 does not authenticate its sparse
+  difficulty headers as members of the selected branch.
+- A V2 proof format or re-enabled multi-peer selection/install path.
 - In-extension parameter recovery for light clients — `active_parameters`
   stays at network defaults in light mode (documented limitation in
   `facts/chain.md`).
@@ -95,8 +97,10 @@ future_pad_length: u16 (VLQ — JVM putUShort)
 **Validation**:
 - Total body size MUST be ≤ 2,000,000 bytes (reject before allocating).
 - `proof_length` MUST be > 0 AND < 2,000,000.
-- `proof_bytes` is the inner NiPoPoW proof — passed verbatim to
-  `chain.verify_nipopow_proof_bytes(proof_bytes)`.
+- `proof_bytes` is the inner NiPoPoW proof. The V1 bootstrap path passes it to
+  the context-bound authorization entry point, which returns the typed
+  bootstrap-disabled error; the unsolicited log path uses diagnostic-only
+  inspection.
 
 ## Module: `src/nipopow_handler` (or inline in main.rs)
 
@@ -113,17 +117,16 @@ messages. Mirrors the snapshot sync handler structure.
        calls `p2p.send_to(from, ProtocolMessage::Custom(91, body))`.
      - On error, log + drop. (Do NOT send an error message — the JVM doesn't
        expect one and will time out instead.)
-  3. On every `ProtocolEvent::Message { from, code, body }` with `code == 91`:
+  3. On an unsolicited `ProtocolEvent::Message` with `code == 91`:
      - Parses `body` to extract the inner proof bytes.
-     - Acquires the chain lock, calls `chain.verify_nipopow_proof_bytes(...)`.
-     - In `StateType::Utxo`/`Digest` modes: logs the result and drops it
-       (the existing serve-side observation path — verifies for visibility,
-       does not mutate state).
-     - In `StateType::Light` mode: routes the verified result to the
-       light-client bootstrap state machine via a one-shot channel
-       established at bootstrap start. The bootstrap waits for exactly
-       one such verified result from its requested peer; subsequent code
-       91 messages from other peers (if any) are logged and dropped.
+     - Calls `inspect_nipopow_proof_bytes` and logs header-free metadata.
+       This diagnostic path has no request context and never authorizes
+       bootstrap selection or installation.
+  4. The light-bootstrap session processes responses to its own code-90
+     broadcast separately. It accepts code-91 responses only from peers that
+     received that request and calls `SyncChain::verify_nipopow_envelope`.
+     Legacy V1 returns `NipopowBootstrapDisabled`; sync propagates the
+     capability error before comparison or installation.
 - **Invariant**: The handler never blocks the event loop — long-running chain
   operations happen on a `tokio::task::block_in_place` boundary or in a
   spawned task, mirroring the existing pattern from snapshot sync.
@@ -162,19 +165,20 @@ pub enum NipopowError {
 ```
 
 Note: there is no `NipopowProofResponse` struct — `parse_nipopow_proof`
-returns the inner `Vec<u8>` directly because every consumer immediately
-hands it to `chain.verify_nipopow_proof_bytes`. Wrapping it in a struct
-adds no value.
+returns the inner `Vec<u8>` directly because consumers immediately hand it to
+diagnostic inspection or the fail-closed authorization entry point. Wrapping
+it in a struct adds no value.
 
 ### Sigma-rust integration
 
-The chain submodule's `build_nipopow_proof`, `verify_nipopow_proof_bytes`,
-and `install_from_nipopow_proof` wrap `ergo_nipopow::NipopowAlgos` and
+The chain submodule's `build_nipopow_proof`, diagnostic
+`inspect_nipopow_proof_bytes`, fail-closed
+`verify_nipopow_proof_bytes`, and dormant `install_from_nipopow_proof` seam wrap
+`ergo_nipopow::NipopowAlgos` and
 `ergo_nipopow::NipopowProofSerializer`. The main crate does NOT import
-`ergo-nipopow` directly — that's the chain's job. The main crate only
-sees `Vec<u8>` (proof bytes), the `NipopowVerificationResult` struct
-returned from `verify_nipopow_proof_bytes`, and `Header` (for installing
-the suffix into the chain via `install_from_nipopow_proof`).
+`ergo-nipopow` directly — that's the chain's job. Legacy V1 produces no
+`NipopowVerificationResult` on the public authorization path, so selection and
+installation are unreachable.
 
 ## Routing behavior (current limitation)
 
@@ -243,33 +247,28 @@ hard limit). Lower values are valid for resource-constrained nodes.
 
 ### Integration (light-client bootstrap)
 
-9. **Bootstrap, single peer happy path**: Start a Rust node configured
-   with `state_type = "light"` against a single peer (the test server's
-   Rust node, which has full chain). Verify the light client:
+9. **Bootstrap, conforming V1 peer fail-close**: Start a Rust node configured
+   with `state_type = "light"` against a single peer. Verify the light client:
    - Sends exactly one `GetNipopowProof(m=6, k=10, header_id=None)`.
    - Receives the response within 30s.
-   - Verifies the proof.
-   - Installs the suffix into `HeaderChain` (chain becomes non-empty).
-   - Transitions to normal sync and starts following the tip.
+   - Returns `LightBootstrapError::BootstrapDisabled`.
+   - Performs no candidate comparison or suffix installation.
 10. **Bootstrap, peer stall**: Start a light client against a peer that
     accepts the request but never responds. Verify timeout fires at 30s,
     no second request to the same peer, and the bootstrap surfaces
     `LightBootstrapError::AllPeersStalled` after 3 retries (when only
     one peer is configured, all 3 attempts go to the same peer; verify
     the error is reached).
-11. **Bootstrap, hostile peer**: Inject a peer that returns a malformed
-    proof (mutated bytes). Verify the verifier rejects it and the
-    bootstrap surfaces `LightBootstrapError::AllPeersHostile`.
-12. **Bootstrap, install failure**: Inject a verified-but-self-
-    inconsistent proof (parent linkage mismatch within the suffix that
-    `verify_nipopow_proof_bytes` somehow accepted — this requires
-    constructing a specially-crafted proof, may need to mock). Verify
-    `install_from_nipopow_proof` rejects it and bootstrap surfaces
-    `LightBootstrapError::InstallFailed`.
-13. **Bootstrap restart idempotence**: Run a successful bootstrap, kill
-    the node, restart with the same `state_type = "light"` config and
-    a non-empty chain on disk. Verify bootstrap is skipped and the node
-    enters normal sync immediately.
+11. **Malformed V1 remains non-authorizing**: The public bootstrap verifier
+    returns `BootstrapDisabled` without treating malformed V1 bytes as a peer
+    verdict. Exercise malformed framing and proof bytes separately through
+    `inspect_nipopow_proof_bytes`, which must reject them.
+12. **Dormant install mechanics**: Through an isolated trusted test seam,
+    inject parent, difficulty, PoW, and sparse-context faults one at a time and
+    verify `install_from_nipopow_proof` rejects each without partial mutation.
+13. **Legacy restart context**: Keep codec and suffix-head-binding regressions
+    for compatibility evidence, but do not treat a V1 record as proof of
+    branch membership or as authorization for a new bootstrap.
 
 ## Cross-references
 

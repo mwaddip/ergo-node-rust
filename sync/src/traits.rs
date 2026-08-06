@@ -190,40 +190,46 @@ pub trait SyncChain {
         &self,
     ) -> impl std::future::Future<Output = Vec<u8>> + Send;
 
-    /// Strip a `NipopowProof` (P2P code 91) message envelope and verify the
-    /// inner proof bytes via [`enr_chain::verify_nipopow_proof_bytes`].
-    /// Returns the extracted header chain in strictly-increasing height order
-    /// on success.
+    /// Strip a `NipopowProof` (P2P code 91) message envelope and ask the chain
+    /// crate to authorize its inner bytes for bootstrap.
+    ///
+    /// The legacy V1 implementation always returns
+    /// [`enr_chain::ChainError::NipopowBootstrapDisabled`], because sparse
+    /// difficulty headers are not branch-authenticated.
     ///
     /// Used by the light-client bootstrap state machine. The bridge wraps
     /// `nipopow_serve::parse_nipopow_proof` (envelope strip) +
-    /// `enr_chain::verify_nipopow_proof_bytes` (verify).
+    /// `enr_chain::verify_nipopow_proof_bytes` (authorization gate).
     fn verify_nipopow_envelope(
         &self,
         envelope_body: &[u8],
-    ) -> impl std::future::Future<Output = Result<Vec<Header>, enr_chain::ChainError>> + Send;
+    ) -> impl std::future::Future<
+        Output = Result<enr_chain::NipopowVerificationResult, enr_chain::ChainError>,
+    > + Send;
 
     /// Compare two NiPoPoW proofs (raw P2P code-91 envelope bodies) and
     /// return `true` if `this` is better than `that` per KMZ17 §4.3.
     ///
     /// Used by the light-client bootstrap to pick the best proof from
-    /// multiple peers. Both envelopes must be parseable (they should have
-    /// already passed [`Self::verify_nipopow_envelope`]).
+    /// multiple peers. Both envelopes must already have passed
+    /// [`Self::verify_nipopow_envelope`] in the same bootstrap session and
+    /// therefore against the same request/genesis context.
     fn is_better_nipopow(
         &self,
         this_envelope: &[u8],
         than_envelope: &[u8],
     ) -> impl std::future::Future<Output = Result<bool, enr_chain::ChainError>> + Send;
 
-    /// Install a verified NiPoPoW proof's suffix as the chain's starting
+    /// Install an already authorized NiPoPoW suffix as the chain's starting
     /// point for light-client mode. Wraps
     /// [`enr_chain::HeaderChain::install_from_nipopow_proof`].
     ///
-    /// Precondition: chain must be empty. The headers MUST already be
-    /// verified via [`Self::verify_nipopow_envelope`] — this function does
-    /// NOT re-verify.
+    /// Precondition: chain must be empty and the headers must come from a
+    /// branch-authenticated proof format. Legacy V1 cannot satisfy this
+    /// precondition and never reaches this method in production.
     fn install_nipopow_suffix(
         &self,
+        difficulty_headers: Vec<Header>,
         suffix_head: Header,
         suffix_tail: Vec<Header>,
     ) -> impl std::future::Future<Output = Result<(), enr_chain::ChainError>> + Send;

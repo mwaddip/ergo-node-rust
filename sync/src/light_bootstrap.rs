@@ -1,15 +1,16 @@
 //! NiPoPoW light-client bootstrap state machine.
 //!
 //! Runs once at startup when `state_type == StateType::Light` and the chain
-//! is empty. Broadcasts `GetNipopowProof` to all outbound peers, collects
-//! valid proofs within a timeout window, compares them via KMZ17 §4.3
-//! (`is_better_than`), and installs the best as the chain's starting point.
-//! Subsequent tip-following uses the existing header sync loop.
+//! is empty. Legacy V1 responses currently terminate with
+//! [`LightBootstrapError::BootstrapDisabled`] before comparison or install,
+//! because V1 does not branch-authenticate its sparse difficulty headers.
+//! The bounded request/collection and dormant selection/install mechanics are
+//! retained for a future proof format that can satisfy that authorization.
 //!
 //! JVM reference: `ErgoNodeViewSynchronizer.scala:1032` (outbound request),
 //! `PopowProcessor.applyPopowProof` (install side).
 
-use enr_chain::{BlockId, Header};
+use enr_chain::{BlockId, ChainError, NipopowVerificationResult};
 use enr_p2p::protocol::messages::ProtocolMessage;
 use enr_p2p::protocol::peer::ProtocolEvent;
 use enr_p2p::types::PeerId;
@@ -49,6 +50,11 @@ pub enum LightBootstrapError {
     #[error("all {0} attempted peers returned invalid proofs")]
     AllPeersHostile(usize),
 
+    #[error(
+        "NiPoPoW V1 bootstrap is disabled: sparse difficulty headers are not branch-authenticated"
+    )]
+    BootstrapDisabled,
+
     #[error("install failed: {0}")]
     InstallFailed(enr_chain::ChainError),
 
@@ -85,15 +91,13 @@ fn build_get_nipopow_proof_body(m: i32, k: i32, header_id: Option<&BlockId>) -> 
 ///
 /// Idempotent: returns immediately if `chain.chain_height() > 0`.
 ///
-/// Top-level state machine (KMZ17 §4.3 multi-peer comparison):
+/// Top-level state machine:
 /// 1. Wait for at least one outbound peer (60s deadline).
 /// 2. Broadcast `GetNipopowProof(m=6, k=10)` to ALL outbound peers.
-/// 3. Collect valid proofs within a 30s window. Verify each on arrival.
-/// 4. If multiple valid proofs, compare pairwise via `is_better_than`
-///    and pick the best. If one valid proof, use it.
-/// 5. Split the best proof's headers into (suffix_head, suffix_tail)
-///    and install.
-/// 6. No valid proofs → return error.
+/// 3. The V1 authorization verifier returns a typed capability error.
+/// 4. Propagate `BootstrapDisabled` before comparison or installation.
+///
+/// Candidate comparison and installation remain unreachable for V1.
 pub async fn run_light_bootstrap<T: SyncTransport, C: SyncChain>(
     transport: &mut T,
     chain: &C,
@@ -184,17 +188,24 @@ pub async fn run_light_bootstrap<T: SyncTransport, C: SyncChain>(
         responded += 1;
 
         match chain.verify_nipopow_envelope(&body).await {
-            Ok(headers) => {
+            Ok(verification) => {
                 tracing::info!(
                     peer = ?peer_id,
-                    header_count = headers.len(),
+                    header_count = verification.total_headers(),
                     "light bootstrap: valid proof received"
                 );
                 valid_proofs.push(ValidProof {
                     peer: peer_id,
-                    headers,
+                    verification,
                     envelope: body,
                 });
+            }
+            Err(ChainError::NipopowBootstrapDisabled) => {
+                tracing::warn!(
+                    peer = ?peer_id,
+                    "light bootstrap: V1 bootstrap capability is disabled"
+                );
+                return Err(LightBootstrapError::BootstrapDisabled);
             }
             Err(e) => {
                 tracing::warn!(
@@ -222,28 +233,28 @@ pub async fn run_light_bootstrap<T: SyncTransport, C: SyncChain>(
 
     tracing::info!(
         peer = ?best.peer,
-        header_count = best.headers.len(),
+        header_count = best.verification.total_headers(),
         "light bootstrap: selected best proof"
     );
 
-    // Step 5: split into (suffix_head, suffix_tail) and install.
-    let k = P2P_NIPOPOW_K as usize;
-    if best.headers.len() < k {
-        return Err(LightBootstrapError::AllPeersHostile(1));
-    }
-    let split_idx = best.headers.len() - k;
-    let mut suffix: Vec<Header> = best.headers.into_iter().skip(split_idx).collect();
-    let suffix_head = suffix.remove(0);
-    let suffix_tail = suffix;
+    // Step 5: install the verifier's exact parsed suffix. Do not reconstruct
+    // this boundary from a flattened header vector or a local k constant.
+    let NipopowVerificationResult {
+        difficulty_headers,
+        suffix_head,
+        suffix_tail,
+        ..
+    } = best.verification;
 
     tracing::info!(
         suffix_head_height = suffix_head.height,
+        difficulty_header_count = difficulty_headers.len(),
         suffix_tail_len = suffix_tail.len(),
         "light bootstrap: installing suffix"
     );
 
     chain
-        .install_nipopow_suffix(suffix_head, suffix_tail)
+        .install_nipopow_suffix(difficulty_headers, suffix_head, suffix_tail)
         .await
         .map_err(LightBootstrapError::InstallFailed)?;
 
@@ -258,7 +269,7 @@ pub async fn run_light_bootstrap<T: SyncTransport, C: SyncChain>(
 /// A verified proof from a peer, kept alive for comparison.
 struct ValidProof {
     peer: PeerId,
-    headers: Vec<Header>,
+    verification: NipopowVerificationResult,
     /// Raw P2P code-91 envelope body — retained for KMZ17 comparison.
     envelope: Vec<u8>,
 }
@@ -305,6 +316,7 @@ async fn pick_best_proof<C: SyncChain>(
 mod tests {
     use super::*;
     use enr_chain::ChainError;
+    use enr_chain::Header;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -344,6 +356,30 @@ mod tests {
         (1..=count as u32).map(fake_header).collect()
     }
 
+    fn verification_result(
+        prefix: Vec<Header>,
+        suffix_head: Header,
+        suffix_tail: Vec<Header>,
+    ) -> NipopowVerificationResult {
+        let difficulty_headers = prefix.first().cloned().into_iter().collect();
+        NipopowVerificationResult {
+            m: P2P_NIPOPOW_M as u32,
+            k: P2P_NIPOPOW_K as u32,
+            continuous: Some(true),
+            prefix,
+            difficulty_headers,
+            suffix_head,
+            suffix_tail,
+        }
+    }
+
+    fn standard_verification_result() -> NipopowVerificationResult {
+        let mut headers = fake_headers(15);
+        let suffix_tail = headers.split_off(6);
+        let suffix_head = headers.pop().expect("fixture has suffix head");
+        verification_result(headers, suffix_head, suffix_tail)
+    }
+
     /// Mock transport that delivers scripted events.
     struct MockTransport {
         outbound: Vec<PeerId>,
@@ -380,11 +416,18 @@ mod tests {
         }
     }
 
-    /// Verify outcome: Ok(headers) or Err(reason).
+    /// Verify outcome: Ok(context-bound result) or Err(reason).
     #[derive(Clone)]
     enum VerifyResult {
-        Ok(Vec<Header>),
+        Ok(Box<NipopowVerificationResult>),
         Err(String),
+        Disabled,
+    }
+
+    impl VerifyResult {
+        fn ok(result: NipopowVerificationResult) -> Self {
+            Self::Ok(Box::new(result))
+        }
     }
 
     /// Compare outcome for is_better_nipopow. `Worse` is the matching
@@ -401,13 +444,17 @@ mod tests {
     /// `(this_envelope, than_envelope, scripted_result)` triples.
     type ScriptedComparison = (Vec<u8>, Vec<u8>, CompareResult);
 
+    /// Exact authenticated context and suffix carried into installation.
+    type InstalledProof = (Vec<Header>, Header, Vec<Header>);
+
     /// Mock chain that returns scripted verification and comparison results.
     struct MockChain {
         /// Map envelope body → verification result.
         verify_results: Mutex<Vec<(Vec<u8>, VerifyResult)>>,
         /// Pairwise comparison results: (this, that) → result.
         compare_results: Mutex<Vec<ScriptedComparison>>,
-        installed: Mutex<Option<(Header, Vec<Header>)>>,
+        comparison_calls: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
+        installed: Mutex<Option<InstalledProof>>,
     }
 
     impl MockChain {
@@ -415,6 +462,7 @@ mod tests {
             Self {
                 verify_results: Mutex::new(Vec::new()),
                 compare_results: Mutex::new(Vec::new()),
+                comparison_calls: Mutex::new(Vec::new()),
                 installed: Mutex::new(None),
             }
         }
@@ -427,8 +475,12 @@ mod tests {
             self.compare_results.lock().unwrap().push((this, than, result));
         }
 
-        fn installed(&self) -> Option<(Header, Vec<Header>)> {
+        fn installed(&self) -> Option<InstalledProof> {
             self.installed.lock().unwrap().clone()
+        }
+
+        fn comparison_calls(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+            self.comparison_calls.lock().unwrap().clone()
         }
     }
 
@@ -465,13 +517,14 @@ mod tests {
         async fn verify_nipopow_envelope(
             &self,
             envelope_body: &[u8],
-        ) -> Result<Vec<Header>, ChainError> {
+        ) -> Result<NipopowVerificationResult, ChainError> {
             let results = self.verify_results.lock().unwrap();
             for (body, result) in results.iter() {
                 if body == envelope_body {
                     return match result {
-                        VerifyResult::Ok(h) => Ok(h.clone()),
+                        VerifyResult::Ok(result) => Ok(result.as_ref().clone()),
                         VerifyResult::Err(e) => Err(ChainError::Nipopow(e.clone())),
+                        VerifyResult::Disabled => Err(ChainError::NipopowBootstrapDisabled),
                     };
                 }
             }
@@ -483,6 +536,10 @@ mod tests {
             this_envelope: &[u8],
             than_envelope: &[u8],
         ) -> Result<bool, ChainError> {
+            self.comparison_calls
+                .lock()
+                .unwrap()
+                .push((this_envelope.to_vec(), than_envelope.to_vec()));
             let results = self.compare_results.lock().unwrap();
             for (this, than, result) in results.iter() {
                 if this == this_envelope && than == than_envelope {
@@ -498,10 +555,11 @@ mod tests {
 
         async fn install_nipopow_suffix(
             &self,
+            difficulty_headers: Vec<Header>,
             suffix_head: Header,
             suffix_tail: Vec<Header>,
         ) -> Result<(), ChainError> {
-            *self.installed.lock().unwrap() = Some((suffix_head, suffix_tail));
+            *self.installed.lock().unwrap() = Some((difficulty_headers, suffix_head, suffix_tail));
             Ok(())
         }
 
@@ -555,12 +613,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_propagates_v1_disabled_without_comparison_or_install() {
+        let peer = PeerId(1);
+        let body = vec![0xd1];
+        let chain = MockChain::new();
+        chain.add_verify(body.clone(), VerifyResult::Disabled);
+        let mut transport = MockTransport::new(vec![peer], vec![proof_event(peer, body)]);
+
+        let err = run_light_bootstrap(&mut transport, &chain)
+            .await
+            .expect_err("V1 capability failure must terminate bootstrap");
+
+        assert!(matches!(&err, LightBootstrapError::BootstrapDisabled));
+        assert!(
+            err.to_string().contains("bootstrap is disabled"),
+            "unexpected capability error: {err}"
+        );
+        assert!(chain.comparison_calls().is_empty());
+        assert!(chain.installed().is_none());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_unrequested_k_failure_cannot_select_or_install() {
+        let peer = PeerId(1);
+        let body = vec![0xa1];
+        let chain = MockChain::new();
+        chain.add_verify(
+            body.clone(),
+            VerifyResult::Err("expected k 10, got 9".into()),
+        );
+        let mut transport = MockTransport::new(vec![peer], vec![proof_event(peer, body)]);
+
+        let result = run_light_bootstrap(&mut transport, &chain).await;
+
+        assert!(matches!(
+            result,
+            Err(LightBootstrapError::AllPeersHostile(1))
+        ));
+        assert!(chain.comparison_calls().is_empty());
+        assert!(chain.installed().is_none());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_wrong_genesis_never_enters_selection() {
+        let hostile_peer = PeerId(1);
+        let valid_peer = PeerId(2);
+        let hostile_body = vec![0xa1];
+        let valid_body = vec![0xb2];
+        let expected = standard_verification_result();
+        let expected_head = expected.suffix_head.clone();
+        let chain = MockChain::new();
+        chain.add_verify(
+            hostile_body.clone(),
+            VerifyResult::Err("proof genesis does not match configured genesis".into()),
+        );
+        chain.add_verify(valid_body.clone(), VerifyResult::ok(expected));
+        let mut transport = MockTransport::new(
+            vec![hostile_peer, valid_peer],
+            vec![
+                proof_event(hostile_peer, hostile_body),
+                proof_event(valid_peer, valid_body),
+            ],
+        );
+
+        let result = run_light_bootstrap(&mut transport, &chain).await;
+
+        assert!(result.is_ok());
+        assert!(chain.comparison_calls().is_empty());
+        assert_eq!(
+            chain.installed().expect("valid proof installed").1,
+            expected_head
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_compares_only_results_from_the_shared_context() {
+        let peer_a = PeerId(1);
+        let hostile_peer = PeerId(2);
+        let peer_c = PeerId(3);
+        let body_a = vec![0xa1];
+        let hostile_body = vec![0xb2];
+        let body_c = vec![0xc3];
+        let proof_a = standard_verification_result();
+        let proof_c = verification_result(
+            (101..=105).map(fake_header).collect(),
+            fake_header(106),
+            (107..=115).map(fake_header).collect(),
+        );
+        let expected_head = proof_c.suffix_head.clone();
+        let chain = MockChain::new();
+        chain.add_verify(body_a.clone(), VerifyResult::ok(proof_a));
+        chain.add_verify(
+            hostile_body.clone(),
+            VerifyResult::Err("verification context mismatch".into()),
+        );
+        chain.add_verify(body_c.clone(), VerifyResult::ok(proof_c));
+        chain.add_compare(body_c.clone(), body_a.clone(), CompareResult::Better);
+        let mut transport = MockTransport::new(
+            vec![peer_a, hostile_peer, peer_c],
+            vec![
+                proof_event(peer_a, body_a.clone()),
+                proof_event(hostile_peer, hostile_body),
+                proof_event(peer_c, body_c.clone()),
+            ],
+        );
+
+        let result = run_light_bootstrap(&mut transport, &chain).await;
+
+        assert!(result.is_ok());
+        assert_eq!(chain.comparison_calls(), vec![(body_c, body_a)]);
+        assert_eq!(
+            chain.installed().expect("best proof installed").1,
+            expected_head
+        );
+    }
+
+    #[tokio::test]
     async fn bootstrap_single_valid_proof_installs() {
         let peer_a = PeerId(1);
         let body_a = vec![0xaa];
-        let headers = fake_headers(15); // 15 > k=10
+        let proof = standard_verification_result();
+        let expected_context = proof.difficulty_headers.clone();
+        let expected_head = proof.suffix_head.clone();
+        let expected_tail = proof.suffix_tail.clone();
         let chain = MockChain::new();
-        chain.add_verify(body_a.clone(), VerifyResult::Ok(headers.clone()));
+        chain.add_verify(body_a.clone(), VerifyResult::ok(proof));
 
         let mut transport = MockTransport::new(
             vec![peer_a],
@@ -569,10 +746,10 @@ mod tests {
 
         let result = run_light_bootstrap(&mut transport, &chain).await;
         assert!(result.is_ok());
-        let (head, tail) = chain.installed().expect("should have installed");
-        // suffix_head is the (len-k)th header, tail is the remaining k-1
-        assert_eq!(head.height, 6); // headers[5] (0-indexed), height 6
-        assert_eq!(tail.len(), P2P_NIPOPOW_K as usize - 1);
+        let (context, head, tail) = chain.installed().expect("should have installed");
+        assert_eq!(context, expected_context);
+        assert_eq!(head, expected_head);
+        assert_eq!(tail, expected_tail);
     }
 
     #[tokio::test]
@@ -581,10 +758,10 @@ mod tests {
         let peer_b = PeerId(2);
         let body_a = vec![0xaa];
         let body_b = vec![0xbb];
-        let headers = fake_headers(15);
+        let proof = standard_verification_result();
         let chain = MockChain::new();
         chain.add_verify(body_a.clone(), VerifyResult::Err("invalid".into()));
-        chain.add_verify(body_b.clone(), VerifyResult::Ok(headers));
+        chain.add_verify(body_b.clone(), VerifyResult::ok(proof));
 
         let mut transport = MockTransport::new(
             vec![peer_a, peer_b],
@@ -605,11 +782,11 @@ mod tests {
         let peer_b = PeerId(2);
         let body_a = vec![0xaa];
         let body_b = vec![0xbb];
-        let headers_a = fake_headers(15);
-        let headers_b = fake_headers(15);
+        let proof_a = standard_verification_result();
+        let proof_b = standard_verification_result();
         let chain = MockChain::new();
-        chain.add_verify(body_a.clone(), VerifyResult::Ok(headers_a));
-        chain.add_verify(body_b.clone(), VerifyResult::Ok(headers_b));
+        chain.add_verify(body_a.clone(), VerifyResult::ok(proof_a));
+        chain.add_verify(body_b.clone(), VerifyResult::ok(proof_b));
         // Peer B's proof is better than A's.
         chain.add_compare(body_b.clone(), body_a.clone(), CompareResult::Better);
 
@@ -633,11 +810,11 @@ mod tests {
         let peer_b = PeerId(2);
         let body_a = vec![0xaa];
         let body_b = vec![0xbb];
-        let headers_a = fake_headers(15);
-        let headers_b = fake_headers(15);
+        let proof_a = standard_verification_result();
+        let proof_b = standard_verification_result();
         let chain = MockChain::new();
-        chain.add_verify(body_a.clone(), VerifyResult::Ok(headers_a));
-        chain.add_verify(body_b.clone(), VerifyResult::Ok(headers_b));
+        chain.add_verify(body_a.clone(), VerifyResult::ok(proof_a));
+        chain.add_verify(body_b.clone(), VerifyResult::ok(proof_b));
         // Comparison fails — should fall back to incumbent (peer A, first valid).
         chain.add_compare(body_b.clone(), body_a.clone(), CompareResult::Err("parse failed".into()));
 
@@ -680,9 +857,9 @@ mod tests {
         let peer_rogue = PeerId(99);
         let body_a = vec![0xaa];
         let body_rogue = vec![0xff];
-        let headers = fake_headers(15);
+        let proof = standard_verification_result();
         let chain = MockChain::new();
-        chain.add_verify(body_a.clone(), VerifyResult::Ok(headers));
+        chain.add_verify(body_a.clone(), VerifyResult::ok(proof));
         // Don't add verify for rogue — it should never be called.
 
         let mut transport = MockTransport::new(
@@ -704,9 +881,9 @@ mod tests {
     async fn bootstrap_ignores_non_proof_messages() {
         let peer_a = PeerId(1);
         let body_a = vec![0xaa];
-        let headers = fake_headers(15);
+        let proof = standard_verification_result();
         let chain = MockChain::new();
-        chain.add_verify(body_a.clone(), VerifyResult::Ok(headers));
+        chain.add_verify(body_a.clone(), VerifyResult::ok(proof));
 
         let mut transport = MockTransport::new(
             vec![peer_a],
@@ -734,13 +911,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_proof_too_few_headers_for_k() {
+    async fn bootstrap_installs_verifier_exact_suffix_without_len_k_reconstruction() {
         let peer_a = PeerId(1);
         let body_a = vec![0xaa];
-        // Only 5 headers — less than k=10.
-        let headers = fake_headers(5);
+        // Contract sentinel: a real verifier enforces suffix cardinality, but
+        // this test double deliberately makes the old `len-k` split choose a
+        // prefix header. The consumer must treat the typed result's parsed
+        // boundary as authoritative instead of reinterpreting it.
+        let exact_head = fake_header(200);
+        let exact_tail = vec![fake_header(201), fake_header(202)];
+        let proof = verification_result(fake_headers(15), exact_head.clone(), exact_tail.clone());
+        let exact_context = proof.difficulty_headers.clone();
         let chain = MockChain::new();
-        chain.add_verify(body_a.clone(), VerifyResult::Ok(headers));
+        chain.add_verify(body_a.clone(), VerifyResult::ok(proof));
 
         let mut transport = MockTransport::new(
             vec![peer_a],
@@ -748,9 +931,11 @@ mod tests {
         );
 
         let result = run_light_bootstrap(&mut transport, &chain).await;
-        // Proof with fewer headers than k is treated as hostile.
-        assert!(matches!(result, Err(LightBootstrapError::AllPeersHostile(_))));
-        assert!(chain.installed().is_none());
+        assert!(result.is_ok());
+        assert_eq!(
+            chain.installed(),
+            Some((exact_context, exact_head, exact_tail))
+        );
     }
 
     #[tokio::test]
@@ -783,15 +968,23 @@ mod tests {
                 &self, _p: ergo_validation::Parameters, _pu: Vec<u8>,
             ) {}
             async fn active_proposed_update_bytes(&self) -> Vec<u8> { Vec::new() }
-            async fn verify_nipopow_envelope(&self, _b: &[u8]) -> Result<Vec<Header>, ChainError> {
+            async fn verify_nipopow_envelope(
+                &self,
+                _b: &[u8],
+            ) -> Result<NipopowVerificationResult, ChainError> {
                 unimplemented!()
             }
             async fn is_better_nipopow(&self, _a: &[u8], _b: &[u8]) -> Result<bool, ChainError> {
                 unimplemented!()
             }
             async fn install_nipopow_suffix(
-                &self, _h: Header, _t: Vec<Header>,
-            ) -> Result<(), ChainError> { unimplemented!() }
+                &self,
+                _d: Vec<Header>,
+                _h: Header,
+                _t: Vec<Header>,
+            ) -> Result<(), ChainError> {
+                unimplemented!()
+            }
             async fn voting_length(&self) -> u32 { 1024 }
         }
 
@@ -803,9 +996,9 @@ mod tests {
     async fn bootstrap_broadcasts_to_all_peers() {
         let peers = vec![PeerId(1), PeerId(2), PeerId(3)];
         let body = vec![0xaa];
-        let headers = fake_headers(15);
+        let proof = standard_verification_result();
         let chain = MockChain::new();
-        chain.add_verify(body.clone(), VerifyResult::Ok(headers));
+        chain.add_verify(body.clone(), VerifyResult::ok(proof));
 
         let mut transport = MockTransport::new(
             peers.clone(),

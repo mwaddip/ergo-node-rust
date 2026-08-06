@@ -36,8 +36,11 @@ pub use sync_info::{build_sync_info, parse_sync_info, SyncInfo};
 pub use num_bigint::{BigInt, BigUint};
 pub use tracker::HeaderTracker;
 pub use nipopow_proof::{
-    build_nipopow_proof, compare_nipopow_proof_bytes, popow_header_by_id,
-    verify_nipopow_proof_bytes, NipopowVerificationResult,
+    build_nipopow_proof, compare_nipopow_proof_bytes, inspect_nipopow_proof_bytes,
+    parse_nipopow_difficulty_context, popow_header_by_id, serialize_nipopow_difficulty_context,
+    verify_nipopow_proof_bytes, NipopowInspection, NipopowVerificationContext,
+    NipopowVerificationResult, PersistedNipopowDifficultyContext,
+    NIPOPOW_DIFFICULTY_CONTEXT_META_KEY,
 };
 pub use voting::{
     check_fork_vote, compute_boundary_parameters, encode_validation_settings_update,

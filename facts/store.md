@@ -396,6 +396,11 @@ Stable keys, opaque to the store, consumed by higher-level crates
 |---|---|---|
 | `b"scores_migrated_v1"` | `[1u8]` once migration completes; absent before | Empty-placeholder → real scores migration |
 | `b"validated_height"` | 4-byte big-endian `u32`: highest height at which state.redb was flushed with `Durability::Immediate`. Absent ⇒ fresh install or pre-handshake upgrade. | sync's flush pair (see `facts/sync.md` "Cross-DB Durability Handshake") |
+| `b"nipopow_difficulty_context_v1"` | Legacy V1 versioned/bounded codec for a suffix-head binding and height-selected sparse difficulty headers. The binding does not authenticate branch membership. Production V1 bootstrap is disabled and does not write this record; the codec remains for compatibility, tests, and future migration decisions. | Dormant `SharedChain::install_nipopow_suffix` seam |
+
+Pre-metadata or legacy V1 light-client databases have no branch-authenticated
+difficulty source and are not upgraded into an authorized chain. A future
+format or explicit migration design must define their recovery path.
 
 ## Peer DB key encoding
 
