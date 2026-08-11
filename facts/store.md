@@ -570,6 +570,39 @@ overwrites BEST_CHAIN at each height. This is the single write path
 for main-chain headers and keeps the invariant "main-chain is
 authoritative for its height slot" without a second atomic-swap API.
 
+## Page cache (added 2026-08-12)
+
+### `RedbModifierStore::new(path: &Path, cache_bytes: usize) -> Result<Self, StoreError>`
+
+`cache_bytes` sizes the redb page cache via `Builder::set_cache_size`.
+
+This constructor previously called bare `Database::create`, which inherits
+redb's default of **1 GiB per handle** (`Builder::new()` ends with
+`set_cache_size(1024*1024*1024)` — `patches/redb/src/db.rs:1143`). That
+gigabyte was never chosen by anyone, was invisible to `/debug/memory`, and
+heap profiling during the 2026-08-11 genesis resync put **89.3%** of
+header-phase growth under `put_batch` →
+`redb::tree_store::btree::BtreeMut::insert`.
+
+`cache_bytes` is a plain byte count, deliberately **not** `state/`'s
+`CacheSize` enum: `store/` does not depend on `state/` and must not acquire
+that dependency to share a type. The caller computes the split.
+
+### `RedbModifierStore::cache_bytes_used(&self) -> u64`
+
+`Database::cache_stats().used_bytes()`.
+
+### `RedbModifierStore::cache_evictions(&self) -> u64`
+
+`Database::cache_stats().evictions()`. A rising count is the signal that the
+cache is undersized; without it, an undersized cache is indistinguishable from
+a comfortable one.
+
+Both require redb's `cache_metrics` feature, declared in this crate's
+`Cargo.toml` as well as the workspace root — a root-only declaration is not
+unified into a standalone `cargo test -p enr-store` build, and the accessors
+would silently return 0.
+
 ## Open-time cost
 
 `RedbModifierStore::new` must run in single-digit seconds even on a

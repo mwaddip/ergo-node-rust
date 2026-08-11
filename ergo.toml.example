@@ -146,8 +146,22 @@ protocol_version = "6.0.3"
 
 # ── Cold-sync memory (in use until chain reaches tip) ───────────────────
 
-# redb cache size in megabytes.
-# cache_mb = 256
+# TOTAL redb page cache across BOTH databases, in megabytes.
+#
+# BREAKING CHANGE: this previously sized state.redb's cache alone, while
+# modifiers.redb silently took redb's built-in 1 GiB default. A config saying
+# 1024 actually used 2048 MB. It now means what it says.
+# cache_mb = 512
+
+# Percentage of `cache_mb` given to modifiers.redb; the remainder goes to
+# state.redb. Valid range 1-99 — a zero share means a database with no page
+# cache at all, which is a configuration mistake rather than a tuning choice,
+# so the node refuses to start rather than running badly.
+#
+# 50 is provisional. The two databases have very different access patterns
+# (modifiers is write-heavy sequential during sync; state carries the AVL
+# tree) and the right split is a measurement, not a guess.
+# cache_store_pct = 50
 
 # Live-heap threshold (MB) above which the validation sweep commits the
 # redb write transaction mid-sweep. 0 disables the memory trigger and

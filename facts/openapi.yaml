@@ -2313,6 +2313,33 @@ components:
           format: int64
           minimum: 0
           description: Chain length. A count, not an estimate.
+        storeCacheBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            `modifiers.redb` page cache occupancy, from redb's own
+            `cache_stats()`. OMITTED — never zero — when unavailable; a zero
+            would assert the cache is empty.
+
+            Historically the largest single consumer during cold sync and
+            entirely invisible here: it took redb's unconfigured 1 GiB default
+            until the cache budget landed.
+        stateCacheBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            `state.redb` page cache occupancy. OMITTED, never zero, when
+            unavailable.
+        storeCacheEvictions:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Cumulative `modifiers.redb` cache evictions. A rising count is the
+            signal that the cache is undersized — otherwise indistinguishable
+            from one that is comfortably large. OMITTED when unavailable.
         mempoolTxCount:
           type: integer
           format: int64

@@ -110,6 +110,22 @@ integration seam — it is not licence to reintroduce sizing arithmetic here.
 Any future per-component memory field follows the same rule: the crate that
 owns the structure computes the figure; this crate transports it.
 
+**Extended 2026-08-12** with `storeCacheBytes`, `stateCacheBytes` and
+`storeCacheEvictions`, sourced from `redb::Database::cache_stats()` in `store/`
+and `state/` respectively, reached through `StoreAccess::cache_bytes_used`,
+`StoreAccess::cache_evictions` and `UtxoAccess::cache_bytes_used`.
+
+redb was the single largest consumer during a genesis sync and was entirely
+invisible to this endpoint — 2701 MB of a 2859 MB process was unattributed,
+which is what made the 2026-08-11 investigation take a day.
+
+All three accessors return `Option<u64>` and the fields are omitted when the
+value is `None`. Reporting `0` would assert an empty cache, the same class of
+falsehood as the removed `chainHeaderEstimateBytes`. The traits declare these
+methods **without default bodies**: a default would let an implementor silently
+return a wrong value, which is structurally how `AVG_HEADER_BYTES` survived
+four months.
+
 ### State Context Lifecycle
 
 `state_context` is rebuilt whenever the validated tip advances:

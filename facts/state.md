@@ -292,6 +292,22 @@ the canonical height is `block_height()`.
 Returns an iterator over ADDigests that `rollback()` can restore to.
 Ordered newest-first. Length bounded by `keep_versions`.
 
+## Page cache observability (added 2026-08-12)
+
+### `RedbAVLStorage::cache_bytes_used(&self) -> u64`
+
+`Database::cache_stats().used_bytes()` for `state.redb`, surfaced by
+`GET /debug/memory` as `stateCacheBytes`.
+
+Requires redb's `cache_metrics` feature, declared in this crate's `Cargo.toml`
+as well as the workspace root — a root-only declaration is not unified into a
+standalone `cargo test -p enr-state` build, and the accessor would silently
+return 0.
+
+`open()` already takes a `CacheSize` and needs no signature change; only the
+value the caller passes changes, since `cache_mb` now describes a total shared
+with `modifiers.redb` rather than this database alone.
+
 ## Struct: `RedbAVLStorage`
 
 ```rust
