@@ -603,6 +603,12 @@ Both require redb's `cache_metrics` feature, declared in this crate's
 unified into a standalone `cargo test -p enr-store` build, and the accessors
 would silently return 0.
 
+**`cache_bytes` is not one cache.** `set_cache_size(n)` splits it 90% read /
+10% write (`patches/redb/src/db.rs:1177`), and `used_bytes()` reports the sum.
+The store has no in-place resize path, so both halves are fixed at `new()` —
+unlike `state/`, where an at-tip resize moves only the read half. See
+`facts/state.md` § "An in-place resize moves only 90% of the budget".
+
 ## Open-time cost
 
 `RedbModifierStore::new` must run in single-digit seconds even on a

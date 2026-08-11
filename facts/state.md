@@ -898,6 +898,39 @@ the state crate's contract enables it through three guarantees:
    (versions live in the persisted UNDO_TABLE, not in `RedbAVLStorage`
    in-memory state). A reopen does not invalidate `rollback_versions`.
 
+### ⚠ An in-place resize moves only 90% of the budget (found 2026-08-12)
+
+`Builder::set_cache_size(n)` does **not** set one cache. It splits the budget
+(`patches/redb/src/db.rs:1177`):
+
+```rust
+self.read_cache_size_bytes  = bytes / 10 * 9;   // 90%
+self.write_cache_size_bytes = bytes / 10;       // 10%
+```
+
+The in-place path (`resize_cache` → `Database::set_read_cache_limit`) reaches
+**only the read half**. `max_write_buffer_bytes` is fixed at `open()` and there
+is no setter — redb carries a `TODO: allow dynamic expansion of the read/write
+cache` immediately above `set_cache_size`.
+
+Consequences, both real:
+
+- After an at-tip resize, the process still holds a write buffer sized from the
+  **original** cold-sync `cache_mb`, not from `synced_cache_mb`. An operator
+  setting `synced_cache_mb = 128` gets roughly 115 MB of read cache plus 10% of
+  whatever the cold-sync total was — not 128 MB.
+- `stateCacheBytes` on `/debug/memory` is `read_cache_bytes +
+  write_buffer_bytes`, so after a resize it reports a figure that the current
+  limit does not bound. Read it as "occupancy", never as "within the configured
+  ceiling".
+
+A full drop-and-reopen (guarantee 1 above) *does* move both halves, because the
+new `open()` re-runs `set_cache_size`. Only the in-place path is partial.
+
+Not fixed here: bounding the write half at runtime needs a redb patch, which is
+out of scope for the cache-budget work. Documented so the budget arithmetic and
+the endpoint are both read correctly.
+
 The integrator side: main repo holds a `SwappableReader` (a
 `parking_lot::RwLock<Option<Arc<SnapshotReader>>>`) shared with
 mempool, REST API, and the snapshot dump trigger. To reopen:
