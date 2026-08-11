@@ -645,7 +645,12 @@ mod tests {
         let (delivery_data_tx, delivery_data_rx) = mpsc::channel(64);
         let chain = Arc::new(Mutex::new(HeaderChain::new(ChainConfig::testnet())));
         let dir = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(RedbModifierStore::new(&dir.path().join("test.redb")).unwrap());
+        // 8 MiB: a test fixture has no working set worth caching, and taking
+        // redb's 1 GiB default per test store is what this parameter exists
+        // to stop.
+        let store = Arc::new(
+            RedbModifierStore::new(&dir.path().join("test.redb"), 8 * 1024 * 1024).unwrap(),
+        );
         let pipeline = ValidationPipeline::new(rx, chain, store, progress_tx, delivery_control_tx, delivery_data_tx);
         (pipeline, tx, progress_rx, delivery_control_rx, delivery_data_rx, dir)
     }

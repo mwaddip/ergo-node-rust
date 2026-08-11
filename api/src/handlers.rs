@@ -1272,11 +1272,17 @@ pub async fn get_debug_memory(State(state): State<ApiState>) -> Json<DebugMemory
     let chain_header_count = state.chain.height();
     let mempool_tx_count = state.mempool.lock().await.len() as u32;
 
+    // Transported verbatim from the owning crates — no arithmetic here. A
+    // `None` becomes an absent key, never a zero: a zero would assert the
+    // cache is empty, which is how a wrong figure hides in plain sight.
     let components = ComponentMemory {
         chain_index_bytes: chain_memory.index_bytes,
         chain_header_cache_bytes: chain_memory.header_cache_bytes,
         chain_score_cache_bytes: chain_memory.score_cache_bytes,
         chain_header_count,
+        store_cache_bytes: state.store.cache_bytes_used(),
+        state_cache_bytes: state.utxo_reader.cache_bytes_used(),
+        store_cache_evictions: state.store.cache_evictions(),
         mempool_tx_count,
     };
 
@@ -2249,10 +2255,14 @@ mod tests {
         }
     }
 
-    fn debug_memory_components(chain: Arc<dyn ChainAccess>) -> serde_json::Value {
+    fn debug_memory_components_of(state: ApiState) -> serde_json::Value {
         let rt = build_runtime();
-        let Json(body) = rt.block_on(get_debug_memory(State(test_state(chain))));
+        let Json(body) = rt.block_on(get_debug_memory(State(state)));
         serde_json::to_value(&body).unwrap()["components"].clone()
+    }
+
+    fn debug_memory_components(chain: Arc<dyn ChainAccess>) -> serde_json::Value {
+        debug_memory_components_of(test_state(chain))
     }
 
     /// The point of the whole change: what `ChainAccess::memory_estimate()`
@@ -2280,6 +2290,30 @@ mod tests {
         assert_eq!(c["mempoolTxCount"], serde_json::json!(0));
     }
 
+    /// An accessor reporting `None` must produce JSON with NO such key — not
+    /// a zero, which would assert "the cache is empty". redb was the largest
+    /// single consumer during the 2026-08-11 genesis sync and a zero here
+    /// would have read as "not it", exactly the wrong answer.
+    #[test]
+    fn debug_memory_omits_cache_fields_when_unavailable() {
+        let c = debug_memory_components_of(test_state_with_cache(None, None, None));
+        assert!(c.get("storeCacheBytes").is_none());
+        assert!(c.get("stateCacheBytes").is_none());
+        assert!(c.get("storeCacheEvictions").is_none());
+    }
+
+    /// Three distinct values deliberately: a copy-paste wiring error where
+    /// all three fields read the same accessor would pass with identical
+    /// values and fail here. Also pins the three serialized key names
+    /// empirically rather than trusting what `rename_all` is assumed to do.
+    #[test]
+    fn debug_memory_transports_cache_figures_unmodified() {
+        let c = debug_memory_components_of(test_state_with_cache(Some(111), Some(222), Some(333)));
+        assert_eq!(c["storeCacheBytes"], serde_json::json!(111));
+        assert_eq!(c["stateCacheBytes"], serde_json::json!(222));
+        assert_eq!(c["storeCacheEvictions"], serde_json::json!(333));
+    }
+
     /// Pins the serialized key set empirically rather than trusting what
     /// `rename_all = "camelCase"` is assumed to produce, and keeps
     /// `chainHeaderEstimateBytes` from returning — including as an alias. It
@@ -2287,16 +2321,38 @@ mod tests {
     /// a `Vec<Header>` that `chain/` retired in Phase 3.
     #[test]
     fn debug_memory_component_keys_are_exactly_the_contract() {
-        let c = debug_memory_components(Arc::new(MemoryChain));
-        let mut keys: Vec<&str> = c
-            .as_object()
-            .expect("components serializes as object")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
+        fn sorted_keys(c: &serde_json::Value) -> Vec<&str> {
+            let mut keys: Vec<&str> = c
+                .as_object()
+                .expect("components serializes as object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            keys
+        }
+
         assert_eq!(
-            keys,
+            sorted_keys(&debug_memory_components_of(test_state_with_cache(
+                Some(1),
+                Some(2),
+                Some(3)
+            ))),
+            [
+                "chainHeaderCacheBytes",
+                "chainHeaderCount",
+                "chainIndexBytes",
+                "chainScoreCacheBytes",
+                "mempoolTxCount",
+                "stateCacheBytes",
+                "storeCacheBytes",
+                "storeCacheEvictions",
+            ],
+            "component key set must match facts/openapi.yaml § ComponentMemory"
+        );
+
+        assert_eq!(
+            sorted_keys(&debug_memory_components(Arc::new(MemoryChain))),
             [
                 "chainHeaderCacheBytes",
                 "chainHeaderCount",
@@ -2304,7 +2360,7 @@ mod tests {
                 "chainScoreCacheBytes",
                 "mempoolTxCount",
             ],
-            "component key set must match facts/openapi.yaml § ComponentMemory"
+            "the three cache keys are the only optional ones; the rest are required"
         );
     }
 
@@ -2610,22 +2666,41 @@ mod tests {
     };
     use std::sync::atomic::AtomicU32;
 
-    /// Empty UTXO reader — every lookup returns None.
-    struct EmptyUtxoReader;
+    /// Empty UTXO reader — every lookup returns None. `cache_bytes` is
+    /// configurable so `/debug/memory` can be exercised both with redb stats
+    /// available and without; `Default` is the unavailable case.
+    #[derive(Default)]
+    struct EmptyUtxoReader {
+        cache_bytes: Option<u64>,
+    }
     impl UtxoAccess for EmptyUtxoReader {
         fn box_by_id(&self, _id: &[u8; 32]) -> Option<ergo_validation::ErgoBox> {
             None
         }
+        fn cache_bytes_used(&self) -> Option<u64> {
+            self.cache_bytes
+        }
     }
 
-    /// Empty store — every lookup returns None.
-    struct EmptyStore;
+    /// Empty store — every lookup returns None. Cache figures configurable,
+    /// `Default` reporting neither.
+    #[derive(Default)]
+    struct EmptyStore {
+        cache_bytes: Option<u64>,
+        cache_evictions: Option<u64>,
+    }
     impl StoreAccess for EmptyStore {
         fn get(&self, _type_id: u8, _id: &[u8; 32]) -> Option<Vec<u8>> {
             None
         }
         fn get_at_height(&self, _type_id: u8, _height: u32) -> Option<Vec<u8>> {
             None
+        }
+        fn cache_bytes_used(&self) -> Option<u64> {
+            self.cache_bytes
+        }
+        fn cache_evictions(&self) -> Option<u64> {
+            self.cache_evictions
         }
     }
 
@@ -2646,11 +2721,11 @@ mod tests {
         let (_tx, rx) = tokio::sync::watch::channel(0u32);
         ApiState {
             chain,
-            store: Arc::new(EmptyStore),
+            store: Arc::new(EmptyStore::default()),
             mempool: Arc::new(tokio::sync::Mutex::new(ergo_mempool::Mempool::new(
                 ergo_mempool::types::MempoolConfig::default(),
             ))),
-            utxo_reader: Arc::new(EmptyUtxoReader),
+            utxo_reader: Arc::new(EmptyUtxoReader::default()),
             state_context: Arc::new(tokio::sync::RwLock::new(None)),
             peer_count: Arc::new(|| PeerCounts { connected: 0 }),
             node_info: Arc::new(NodeMeta {
@@ -2681,6 +2756,25 @@ mod tests {
             stats_enabled: false,
             capture: None,
         }
+    }
+
+    /// `test_state` over `MemoryChain`, with the store/state redb cache
+    /// figures forced to the given values. `None` models redb stats being
+    /// unavailable, which must omit the field rather than report a zero.
+    fn test_state_with_cache(
+        store_bytes: Option<u64>,
+        state_bytes: Option<u64>,
+        evictions: Option<u64>,
+    ) -> ApiState {
+        let mut state = test_state(Arc::new(MemoryChain));
+        state.store = Arc::new(EmptyStore {
+            cache_bytes: store_bytes,
+            cache_evictions: evictions,
+        });
+        state.utxo_reader = Arc::new(EmptyUtxoReader {
+            cache_bytes: state_bytes,
+        });
+        state
     }
 
     /// Mock chain that returns a configurable list of header IDs.
@@ -3224,6 +3318,13 @@ mod tests {
             self.by_key.get(&(type_id, *id)).cloned()
         }
         fn get_at_height(&self, _t: u8, _h: u32) -> Option<Vec<u8>> {
+            None
+        }
+        /// Models no cache: unavailable, not empty.
+        fn cache_bytes_used(&self) -> Option<u64> {
+            None
+        }
+        fn cache_evictions(&self) -> Option<u64> {
             None
         }
     }

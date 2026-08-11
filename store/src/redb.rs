@@ -189,20 +189,34 @@ impl From<::redb::CommitError> for StoreError {
 }
 
 impl RedbModifierStore {
-    /// Opens or creates a redb database at the given path.
+    /// Opens or creates a redb database at the given path with an
+    /// explicitly sized page cache.
+    ///
+    /// `cache_bytes` is handed to `Builder::set_cache_size`, which splits
+    /// it 90/10 between the read and write caches. There is no default:
+    /// redb's own is 1 GiB per handle, which nobody chose, no config
+    /// controlled, and `/debug/memory` could not see — during the
+    /// 2026-08-11 genesis resync, heap profiling put 89.3% of header-phase
+    /// growth under `put_batch` → `BtreeMut::insert`. Every caller now has
+    /// to state a number.
+    ///
+    /// A plain byte count, deliberately not `state/`'s `CacheSize` enum:
+    /// this crate does not depend on `state/` and must not acquire that
+    /// dependency to share a type. The caller computes the split.
     ///
     /// Per-step durations are logged at `info` level on every open
     /// (`tracing::info!`). Operators can grep for `"store open:"` in
     /// node logs to diagnose slow startups; the cost is essentially
     /// free since each step would already be timed by anyone trying
     /// to debug it.
-    pub fn new(path: &Path) -> Result<Self, StoreError> {
+    pub fn new(path: &Path, cache_bytes: usize) -> Result<Self, StoreError> {
         let t_total = Instant::now();
 
         let t = Instant::now();
-        let db = Database::create(path)?;
+        let db = Database::builder().set_cache_size(cache_bytes).create(path)?;
         tracing::info!(
             elapsed_ms = t.elapsed().as_millis() as u64,
+            cache_bytes,
             "store open: Database::create"
         );
 
@@ -239,6 +253,28 @@ impl RedbModifierStore {
         );
 
         Ok(store)
+    }
+
+    /// Current page cache occupancy in bytes (read cache + write cache).
+    ///
+    /// Bounded by the `cache_bytes` passed to [`Self::new`]. Requires
+    /// redb's `cache_metrics` feature — without it this reports 0, which
+    /// is why the feature is declared in this crate's own `Cargo.toml`
+    /// and not only at the workspace root.
+    pub fn cache_bytes_used(&self) -> u64 {
+        self.db.cache_stats().used_bytes() as u64
+    }
+
+    /// Cumulative page cache evictions since open.
+    ///
+    /// A rising count means the cache is undersized; without it an
+    /// undersized cache is indistinguishable from a comfortable one.
+    /// Occupancy alone cannot tell them apart — it tracks the live
+    /// working set, not the ceiling, and sits well below `cache_bytes`
+    /// in both cases (measured ~830 KB under a 15.6 MiB write load at
+    /// both an 8 MiB and a 1 GiB ceiling; only the eviction count moved).
+    pub fn cache_evictions(&self) -> u64 {
+        self.db.cache_stats().evictions()
     }
 
     /// Reconstructs the per-type tip cache from HEIGHT_INDEX.
@@ -1024,9 +1060,15 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Page cache size for tests that don't care about the number.
+    /// Small on purpose: these stores hold a handful of rows, and the
+    /// constructor no longer has a default to fall back on.
+    const TEST_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
     fn test_store() -> (RedbModifierStore, TempDir) {
         let dir = TempDir::new().unwrap();
-        let store = RedbModifierStore::new(&dir.path().join("test.redb")).unwrap();
+        let store =
+            RedbModifierStore::new(&dir.path().join("test.redb"), TEST_CACHE_BYTES).unwrap();
         (store, dir)
     }
 
@@ -1253,7 +1295,7 @@ mod tests {
 
         // Session 1: heights 1..=100
         {
-            let store = RedbModifierStore::new(&path).unwrap();
+            let store = RedbModifierStore::new(&path, TEST_CACHE_BYTES).unwrap();
             let entries: Vec<ModifierBatchEntry> = (1..=100u32)
                 .map(|h| (101, test_id(h as u8), h, format!("h{h}").into_bytes(), s()))
                 .collect();
@@ -1262,7 +1304,7 @@ mod tests {
 
         // Session 2: restart, write heights 101..=200
         {
-            let store = RedbModifierStore::new(&path).unwrap();
+            let store = RedbModifierStore::new(&path, TEST_CACHE_BYTES).unwrap();
             assert_eq!(
                 store.best_header_tip().unwrap(),
                 Some((100, test_id(100))),
@@ -1276,7 +1318,7 @@ mod tests {
 
         // Session 3: restart, verify BEST_CHAIN is dense 1..=200
         {
-            let store = RedbModifierStore::new(&path).unwrap();
+            let store = RedbModifierStore::new(&path, TEST_CACHE_BYTES).unwrap();
             assert_eq!(
                 store.best_header_tip().unwrap(),
                 Some((200, test_id(200))),
@@ -1309,7 +1351,7 @@ mod tests {
 
         // Phase 1: fresh start, sync 100 main-chain headers via put_batch.
         {
-            let store = RedbModifierStore::new(&path).unwrap();
+            let store = RedbModifierStore::new(&path, TEST_CACHE_BYTES).unwrap();
             let entries: Vec<ModifierBatchEntry> = (1..=100u32)
                 .map(|h| (101, test_id(h as u8), h, format!("h{h}").into_bytes(), s()))
                 .collect();
@@ -1318,7 +1360,7 @@ mod tests {
 
         // Phase 2: restart, fork header arrives, then more main-chain via put_batch.
         {
-            let store = RedbModifierStore::new(&path).unwrap();
+            let store = RedbModifierStore::new(&path, TEST_CACHE_BYTES).unwrap();
             assert_eq!(store.best_header_tip().unwrap(), Some((100, test_id(100))));
 
             // A fork header arrives at height 50 (a height that already has
@@ -1341,7 +1383,7 @@ mod tests {
 
         // Phase 3: restart, verify the new heights reached BEST_CHAIN.
         {
-            let store = RedbModifierStore::new(&path).unwrap();
+            let store = RedbModifierStore::new(&path, TEST_CACHE_BYTES).unwrap();
             assert_eq!(
                 store.best_header_tip().unwrap(),
                 Some((200, test_id(200))),
@@ -1430,7 +1472,7 @@ mod tests {
         }
 
         // Phase 2: open with RedbModifierStore — triggers migration.
-        let store = RedbModifierStore::new(&path).unwrap();
+        let store = RedbModifierStore::new(&path, TEST_CACHE_BYTES).unwrap();
 
         // New tables populated
         for h in 1..=3u32 {
@@ -1954,7 +1996,7 @@ mod tests {
             write_txn.commit().unwrap();
         }
 
-        let store = RedbModifierStore::new(&path).unwrap();
+        let store = RedbModifierStore::new(&path, TEST_CACHE_BYTES).unwrap();
         let listed = store.list_peers().unwrap();
         assert_eq!(listed, vec![(good, b"good-record".to_vec())]);
     }
@@ -1993,7 +2035,7 @@ mod tests {
         // Phase 1 — exercise every write path that should carry the
         // quick-repair flag.
         {
-            let store = RedbModifierStore::new(&path).unwrap();
+            let store = RedbModifierStore::new(&path, TEST_CACHE_BYTES).unwrap();
             store
                 .put_batch(&[(101, test_id(1), 1, b"h1".to_vec(), Some(vec![0x01]))])
                 .unwrap();
@@ -2032,7 +2074,7 @@ mod tests {
         // Phase 3 — reopen via the store and verify every write round-
         // trips. Catches the case where set_quick_repair flips some
         // bit redb doesn't expect at our use scale.
-        let store = RedbModifierStore::new(&path).unwrap();
+        let store = RedbModifierStore::new(&path, TEST_CACHE_BYTES).unwrap();
         assert_eq!(
             store.get(101, &test_id(1)).unwrap(),
             Some(b"h1".to_vec())
@@ -2063,7 +2105,7 @@ mod tests {
         // across all three non-header types. Use put_batch so the
         // HEIGHT_INDEX rows exist exactly as they would in a real run.
         {
-            let store = RedbModifierStore::new(&path).unwrap();
+            let store = RedbModifierStore::new(&path, TEST_CACHE_BYTES).unwrap();
             // Non-header entries — score is None for non-header types.
             let entries: Vec<ModifierBatchEntry> = vec![
                 (102, test_id(1), 10, b"bt-low".to_vec(), None),
@@ -2084,7 +2126,7 @@ mod tests {
         // Session 2: reopen. `load_tips` runs and rebuilds the cache
         // from HEIGHT_INDEX via the per-type backward range scan.
         {
-            let store = RedbModifierStore::new(&path).unwrap();
+            let store = RedbModifierStore::new(&path, TEST_CACHE_BYTES).unwrap();
             assert_eq!(store.tip(102).unwrap(), Some((50, test_id(2))));
             assert_eq!(store.tip(104).unwrap(), Some((99, test_id(5))));
             assert_eq!(store.tip(108).unwrap(), Some((1, test_id(6))));
@@ -2126,7 +2168,7 @@ mod tests {
             write_txn.commit().unwrap();
         }
 
-        let store = RedbModifierStore::new(&path).unwrap();
+        let store = RedbModifierStore::new(&path, TEST_CACHE_BYTES).unwrap();
 
         // Header tip comes from BEST_CHAIN via the legacy migration.
         assert_eq!(store.tip(101).unwrap(), Some((5, test_id(5))));
@@ -2179,7 +2221,7 @@ mod tests {
 
         // Build the store.
         {
-            let store = RedbModifierStore::new(&path).unwrap();
+            let store = RedbModifierStore::new(&path, TEST_CACHE_BYTES).unwrap();
             for type_id in [102u8, 104, 108] {
                 let entries: Vec<ModifierBatchEntry> = (1..=PER_TYPE)
                     .map(|h| {
@@ -2226,7 +2268,7 @@ mod tests {
         // tracing instrumentation logs each step's duration as well;
         // here we capture only the wall-clock for the assertion.
         let t = Instant::now();
-        let _store = RedbModifierStore::new(&path).unwrap();
+        let _store = RedbModifierStore::new(&path, TEST_CACHE_BYTES).unwrap();
         let full_open_ms = t.elapsed().as_millis();
 
         eprintln!(
@@ -2503,5 +2545,67 @@ mod tests {
             .put_header(&test_id(5), 5, 0, &[0x05], b"h5")
             .unwrap();
         assert_eq!(store.min_height_present(101).unwrap(), Some(5));
+    }
+
+    // --- Page cache sizing + occupancy reporting (facts/store.md
+    //     § "Page cache (added 2026-08-12)"). ---
+
+    /// Writes ~15.6 MiB of headers through `put_batch` and returns
+    /// `(used_bytes, evictions)` for a store opened with `cache_bytes`.
+    ///
+    /// 40 commits rather than 4000 single-entry ones: the byte volume is
+    /// what pressures the cache, and the transaction overhead is what
+    /// makes a test slow. This shape runs in ~450ms.
+    fn cache_probe(cache_bytes: usize) -> (u64, u64) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("m.redb");
+        let store = RedbModifierStore::new(&path, cache_bytes).unwrap();
+
+        let mut height = 0u32;
+        for _ in 0..40 {
+            let mut entries: Vec<ModifierBatchEntry> = Vec::with_capacity(100);
+            for _ in 0..100 {
+                height += 1;
+                let mut id = [0u8; 32];
+                id[..4].copy_from_slice(&height.to_be_bytes());
+                entries.push((101, id, height, vec![7u8; 4096], s()));
+            }
+            store.put_batch(&entries).unwrap();
+        }
+
+        (store.cache_bytes_used(), store.cache_evictions())
+    }
+
+    /// Both accessors report, and the configured ceiling is actually in
+    /// force — an 8 MiB cache evicts under a ~15.6 MiB write load while
+    /// redb's 1 GiB default does not.
+    ///
+    /// Note what is *not* asserted: an upper bound on `used_bytes`.
+    /// Occupancy is governed by the live working set, not the ceiling —
+    /// measured at ~830 KB for 8 MiB and ~905 KB for 1 GiB under this
+    /// same load. Any "used <= N" bound large enough to hold for a
+    /// correct store also holds for one that ignores `cache_bytes`
+    /// entirely, so it would assert nothing. Evictions are the only
+    /// observable that responds to the parameter; don't swap them back
+    /// out for an occupancy ceiling.
+    #[test]
+    fn cache_size_is_honoured_and_stats_reported() {
+        let (used, evictions) = cache_probe(8 * 1024 * 1024);
+        assert!(used > 0, "cache_metrics disabled? used_bytes was 0");
+        assert!(
+            evictions > 0,
+            "8 MiB cache took ~15.6 MiB of writes without evicting — \
+             cache_bytes not reaching Builder::set_cache_size? evictions={evictions}"
+        );
+
+        // Control: same load, redb's default ceiling. If this ever starts
+        // evicting, the load outgrew the default rather than the store
+        // regressing, and the assertion above stops meaning anything.
+        let (_, default_evictions) = cache_probe(1024 * 1024 * 1024);
+        assert_eq!(
+            default_evictions, 0,
+            "control load now evicts at 1 GiB too — the 8 MiB assertion \
+             no longer discriminates and this test needs re-tuning"
+        );
     }
 }

@@ -689,6 +689,48 @@ fn cache_size_percent_returns_fraction_of_ram() {
     assert!(resolved < 1024 * 1024 * 1024 * 1024, "half of RAM unexpectedly large: {resolved}");
 }
 
+#[test]
+fn cache_occupancy_is_reported() {
+    let dir = tempdir().unwrap();
+    let storage = RedbAVLStorage::open(
+        &dir.path().join("s.redb"),
+        params(),
+        32,
+        CacheSize::Bytes(8 * 1024 * 1024),
+    )
+    .unwrap();
+    assert!(
+        storage.cache_bytes_used() > 0,
+        "cache_metrics disabled? used_bytes was 0"
+    );
+}
+
+#[test]
+fn snapshot_reader_reports_the_same_cache_occupancy() {
+    // The API's only handle on state is a SnapshotReader, so the figure has to
+    // be reachable from there — and it must be the same database, not a
+    // second one that happens to also report a number.
+    let dir = tempdir().unwrap();
+    let storage = RedbAVLStorage::open(
+        &dir.path().join("s.redb"),
+        params(),
+        32,
+        CacheSize::Bytes(8 * 1024 * 1024),
+    )
+    .unwrap();
+    let reader = storage.snapshot_reader();
+
+    assert!(
+        reader.cache_bytes_used() > 0,
+        "cache_metrics disabled? used_bytes was 0"
+    );
+    assert_eq!(
+        reader.cache_bytes_used(),
+        storage.cache_bytes_used(),
+        "reader and storage disagree — not the same Arc<Database>?"
+    );
+}
+
 // ── block_height persistence ─────────────────────────────────────────
 
 #[test]

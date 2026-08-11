@@ -191,6 +191,21 @@ pub struct ComponentMemory {
     pub chain_score_cache_bytes: u64,
     /// Chain length. A count, not an estimate.
     pub chain_header_count: u32,
+    /// `modifiers.redb` page cache occupancy, from redb's own `cache_stats()`.
+    /// Omitted — never zero — when unavailable; a zero would assert the cache
+    /// is empty. Historically the largest single consumer during cold sync and
+    /// entirely invisible here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store_cache_bytes: Option<u64>,
+    /// `state.redb` page cache occupancy. Omitted, never zero, when
+    /// unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_cache_bytes: Option<u64>,
+    /// Cumulative `modifiers.redb` cache evictions. A rising count is the
+    /// signal that the cache is undersized — otherwise indistinguishable from
+    /// one that is comfortably large. Omitted when unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store_cache_evictions: Option<u64>,
     /// Mempool transaction count.
     pub mempool_tx_count: u32,
 }

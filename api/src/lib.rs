@@ -253,12 +253,38 @@ pub trait StoreAccess: Send + Sync {
     /// Get raw modifier bytes by type ID and block height.
     /// Looks up the modifier ID at that height first, then fetches the data.
     fn get_at_height(&self, type_id: u8, height: u32) -> Option<Vec<u8>>;
+
+    /// `modifiers.redb` page cache occupancy, `None` when unavailable.
+    ///
+    /// NEVER return 0 for "unknown" — a zero asserts the cache is empty, the
+    /// same class of falsehood as the removed `chainHeaderEstimateBytes`.
+    /// `GET /debug/memory` omits the field entirely when this is `None`.
+    ///
+    /// Deliberately has no default body: a default would let an implementor
+    /// that forgot to override it silently report a wrong value, which is
+    /// structurally how `AVG_HEADER_BYTES` survived four months describing a
+    /// struct that had been deleted. A compile error at every implementation
+    /// site is the point.
+    fn cache_bytes_used(&self) -> Option<u64>;
+
+    /// Cumulative `modifiers.redb` cache evictions, `None` when unavailable.
+    ///
+    /// A rising count is the signal that the cache is undersized — otherwise
+    /// an undersized cache is indistinguishable from a comfortably large one.
+    /// No default body, for the reason given on [`StoreAccess::cache_bytes_used`].
+    fn cache_evictions(&self) -> Option<u64>;
 }
 
 /// Trait for UTXO lookups.
 pub trait UtxoAccess: Send + Sync {
     /// Look up a box by its ID in the confirmed UTXO set.
     fn box_by_id(&self, box_id: &[u8; 32]) -> Option<ergo_validation::ErgoBox>;
+
+    /// `state.redb` page cache occupancy, `None` when unavailable.
+    ///
+    /// NEVER return 0 for "unknown". No default body, for the reason given on
+    /// [`StoreAccess::cache_bytes_used`].
+    fn cache_bytes_used(&self) -> Option<u64>;
 }
 
 /// Trait for submitting locally-mined blocks to the node's processing pipeline.

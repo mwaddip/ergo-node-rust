@@ -598,6 +598,22 @@ that dependency to share a type. The caller computes the split.
 cache is undersized; without it, an undersized cache is indistinguishable from
 a comfortable one.
 
+**Evictions are the only accessor that responds to `cache_bytes` (measured
+2026-08-12).** `used_bytes()` reports the live working set, not the configured
+ceiling: under an identical 2000 x 256 B load it returned 798,720 bytes at both
+an 8 MiB and a 1 GiB cache, with zero evictions in each. Any `used <= N`
+assertion loose enough to pass for a correctly-configured store therefore also
+passes for one that ignores `cache_bytes` completely.
+
+Consequences:
+
+- A test that the budget is in force must drive enough data to exceed the small
+  cache and assert `evictions > 0`, with a large-cache control asserting zero.
+- **`storeCacheBytes` on `/debug/memory` is not evidence that the configured
+  budget is being applied.** It answers "how much is cached right now", not
+  "is the ceiling what I set". `storeCacheEvictions` is the field to read for
+  the latter.
+
 Both require redb's `cache_metrics` feature, declared in this crate's
 `Cargo.toml` as well as the workspace root — a root-only declaration is not
 unified into a standalone `cargo test -p enr-store` build, and the accessors

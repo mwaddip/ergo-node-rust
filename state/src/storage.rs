@@ -272,6 +272,14 @@ impl RedbAVLStorage {
         self.db.clear_read_cache();
     }
 
+    /// Page cache occupancy.  Requires redb's `cache_metrics` feature, which
+    /// this crate's `Cargo.toml` declares unconditionally — without it redb
+    /// reports 0 and `/debug/memory` would attribute nothing to what is
+    /// usually the process's largest consumer during sync.
+    pub fn cache_bytes_used(&self) -> u64 {
+        self.db.cache_stats().used_bytes() as u64
+    }
+
     /// Create a read-only snapshot reader that shares the database handle.
     /// Call this BEFORE handing the storage to PersistentBatchAVLProver.
     pub fn snapshot_reader(&self) -> SnapshotReader {
@@ -563,6 +571,18 @@ impl RedbAVLStorage {
 // ── SnapshotReader ───────────────────────────────────────────────────
 
 impl SnapshotReader {
+    /// Page cache occupancy — the same figure as
+    /// [`RedbAVLStorage::cache_bytes_used`], because this reader shares the
+    /// owning storage's `Arc<Database>`.
+    ///
+    /// Exists because the API cannot see the storage: `RedbAVLStorage` is
+    /// moved into the validator at startup, and `ergo_api::UtxoAccess` only
+    /// ever holds a reader.  A reader that exists has a database, so this is
+    /// live even mid-swap.
+    pub fn cache_bytes_used(&self) -> u64 {
+        self.db.cache_stats().used_bytes() as u64
+    }
+
     /// Dump the AVL+ tree as a snapshot manifest + chunks.
     ///
     /// Opens a single read transaction for consistency. Walks the tree in

@@ -304,6 +304,21 @@ as well as the workspace root — a root-only declaration is not unified into a
 standalone `cargo test -p enr-state` build, and the accessor would silently
 return 0.
 
+### `SnapshotReader::cache_bytes_used(&self) -> u64`
+
+Same figure, reachable from a reader rather than the storage.
+
+Required because the API's only handle on state is `SwappableReader →
+Arc<SnapshotReader>`; `RedbAVLStorage` itself is moved into the validator at
+startup and is not reachable from `ergo_api::UtxoAccess`. `SnapshotReader`
+already holds the same `Arc<Database>`, so this is the same `cache_stats()`
+call from the type the API can actually see.
+
+Returns the live figure even mid-swap: a reader that exists has a database.
+When no reader exists at all (`SwappableReader::current()` is `None`), the
+adapter reports `None` and the field is omitted — consistent with every other
+lookup through that reader returning `None` during the reopen window.
+
 `open()` already takes a `CacheSize` and needs no signature change; only the
 value the caller passes changes, since `cache_mb` now describes a total shared
 with `modifiers.redb` rather than this database alone.

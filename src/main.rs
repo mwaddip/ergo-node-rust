@@ -678,6 +678,17 @@ impl ergo_api::StoreAccess for StoreAdapter {
         let modifier_id = self.store.get_id_at(type_id, height).ok().flatten()?;
         self.store.get(type_id, &modifier_id).ok().flatten()
     }
+
+    /// Always available — the store handle outlives the adapter.
+    fn cache_bytes_used(&self) -> Option<u64> {
+        Some(self.store.cache_bytes_used())
+    }
+
+    /// Evictions, not occupancy, are what respond to the configured cache
+    /// size. See facts/store.md.
+    fn cache_evictions(&self) -> Option<u64> {
+        Some(self.store.cache_evictions())
+    }
 }
 
 /// Adapter: SwappableReader → UtxoAccess for the API crate.
@@ -694,6 +705,13 @@ impl ergo_api::UtxoAccess for ApiUtxoReader {
         let reader = self.swap_reader.current()?;
         let value_bytes = reader.lookup_key(box_id)?;
         ergo_validation::deserialize_box(&value_bytes).ok()
+    }
+
+    /// `None` during the reopen window, when no reader exists — the same
+    /// condition under which every other lookup here returns `None`. Omitting
+    /// the field is correct then; reporting 0 would claim an empty cache.
+    fn cache_bytes_used(&self) -> Option<u64> {
+        Some(self.swap_reader.current()?.cache_bytes_used())
     }
 }
 
@@ -845,9 +863,17 @@ struct NodeConfig {
     /// If no peer reports a tip within this window, fastsync is skipped.
     #[serde(default = "default_fastsync_peer_wait_timeout_sec")]
     fastsync_peer_wait_timeout_sec: u64,
-    /// redb cache size in megabytes (default: 256).
+    /// TOTAL redb page cache across BOTH databases, in megabytes (default: 512).
+    ///
+    /// Breaking change: this previously sized `state.redb` alone while
+    /// `modifiers.redb` silently took redb's built-in 1 GiB default, so a
+    /// config saying 1024 actually used 2048 MB.
     #[serde(default = "default_cache_mb")]
     cache_mb: u64,
+    /// Percentage of `cache_mb` given to `modifiers.redb`; the remainder goes
+    /// to `state.redb`. Valid 1-99, validated at startup.
+    #[serde(default = "default_cache_store_pct")]
+    cache_store_pct: u32,
     /// Live-heap threshold (MB) above which the validation sweep commits
     /// the redb write transaction mid-sweep. 0 disables the memory trigger
     /// and flushes degenerate to every `flush_max_blocks`. Default tuned to
@@ -926,6 +952,7 @@ impl Default for NodeConfig {
             fastsync_threshold_blocks: default_fastsync_threshold_blocks(),
             fastsync_peer_wait_timeout_sec: default_fastsync_peer_wait_timeout_sec(),
             cache_mb: default_cache_mb(),
+            cache_store_pct: default_cache_store_pct(),
             flush_heap_threshold_mb: default_flush_heap_threshold_mb(),
             flush_max_blocks: default_flush_max_blocks(),
             flush_min_blocks: default_flush_min_blocks(),
@@ -973,7 +1000,50 @@ fn default_fastsync_peer_wait_timeout_sec() -> u64 {
     30
 }
 fn default_cache_mb() -> u64 {
-    256
+    512
+}
+
+fn default_cache_store_pct() -> u32 {
+    50
+}
+
+/// One-shot maintenance subcommands open the store to touch a handful of keys
+/// and exit. They have no working set worth caching, so they take a small
+/// fixed budget rather than the operator's configured total — 256 MB to delete
+/// one chain-meta key would be absurd.
+const MAINTENANCE_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Reject a split that starves either database. A zero share means a database
+/// with no page cache at all, which is a configuration mistake rather than a
+/// tuning choice, and should fail at startup rather than produce a node that
+/// technically runs.
+fn validate_cache_split(cfg: &NodeConfig) -> Result<(), String> {
+    if !(1..=99).contains(&cfg.cache_store_pct) {
+        return Err(format!(
+            "cache_store_pct must be 1-99, got {}",
+            cfg.cache_store_pct
+        ));
+    }
+    Ok(())
+}
+
+/// `(modifiers_bytes, state_bytes)`. Integer split with the remainder given to
+/// state, so the two always sum to exactly `cache_mb` regardless of rounding.
+///
+/// Note that redb splits whatever it receives a further 90% read / 10% write
+/// (`patches/redb/src/db.rs:1177`), and an at-tip in-place resize moves only
+/// the read half — see `facts/state.md`.
+fn cache_split_bytes(cfg: &NodeConfig) -> (usize, usize) {
+    split_cache_mb(cfg.cache_mb, cfg.cache_store_pct)
+}
+
+/// Split an arbitrary MB budget by the store percentage. Used for both the
+/// cold-sync `cache_mb` and the at-tip `synced_cache_mb`, so the ratio is one
+/// concept rather than two.
+fn split_cache_mb(total_mb: u64, store_pct: u32) -> (usize, usize) {
+    let total = total_mb as usize * 1024 * 1024;
+    let store = total * store_pct as usize / 100;
+    (store, total - store)
 }
 fn default_flush_heap_threshold_mb() -> u64 {
     4096
@@ -1185,7 +1255,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let root_config: RootConfig = toml::from_str(&config_content)?;
         let node_config = root_config.node.unwrap_or_default();
         let data_dir = std::path::PathBuf::from(node_config.data_dir);
-        let store = RedbModifierStore::new(&data_dir.join("modifiers.redb"))?;
+        // Deliberately small: this path deletes one chain-meta key and exits.
+        let store =
+            RedbModifierStore::new(&data_dir.join("modifiers.redb"), MAINTENANCE_CACHE_BYTES)?;
         store.chain_meta_delete(b"scores_migrated_v1")?;
         store.flush()?;
         tracing::info!("scores-migration sentinel cleared; next normal start will re-run the migration");
@@ -1388,10 +1460,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(miner_pk = %pk_hex, votes = %node_config.mining.votes, "mining configured");
     }
 
+    validate_cache_split(&node_config).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let (store_cache_bytes, state_cache_bytes) = cache_split_bytes(&node_config);
+
     let data_dir = std::path::PathBuf::from(node_config.data_dir);
     std::fs::create_dir_all(&data_dir)?;
-    tracing::info!(path = %data_dir.join("modifiers.redb").display(), "opening modifier store");
-    let store = Arc::new(RedbModifierStore::new(&data_dir.join("modifiers.redb"))?);
+    tracing::info!(
+        path = %data_dir.join("modifiers.redb").display(),
+        cache_bytes = store_cache_bytes,
+        "opening modifier store"
+    );
+    let store = Arc::new(RedbModifierStore::new(
+        &data_dir.join("modifiers.redb"),
+        store_cache_bytes,
+    )?);
     tracing::info!("modifier store opened");
 
     // One-shot scores backfill migration. v0.4.x stored empty
@@ -1845,10 +1927,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let keep_versions = 256u32;
             tracing::info!(
                 path = %state_path.display(),
-                cache_mb = node_config.cache_mb,
+                // The split, not the configured total — logging cache_mb here
+                // would claim this database got the whole budget.
+                cache_bytes = state_cache_bytes,
                 "opening UTXO state storage"
             );
-            let mut storage = RedbAVLStorage::open(&state_path, params, keep_versions, CacheSize::Bytes(node_config.cache_mb as usize * 1024 * 1024))
+            let mut storage = RedbAVLStorage::open(&state_path, params, keep_versions, CacheSize::Bytes(state_cache_bytes))
                 .expect("failed to open UTXO state storage");
 
             // `revalidate` in UTXO mode: the state tree cannot be rolled back
@@ -1869,7 +1953,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &state_path,
                     AVLTreeParams { key_length: 32, value_length: None },
                     keep_versions,
-                    CacheSize::Bytes(node_config.cache_mb as usize * 1024 * 1024),
+                    CacheSize::Bytes(state_cache_bytes),
                 )
                 .expect("revalidate: failed to re-open UTXO state storage");
             }
@@ -2323,10 +2407,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // synced() entry — no second Database handle, no mmap coherency bug.
     if state_type == StateType::Utxo {
         if let Some(synced_cache_mb) = node_config.synced_cache_mb {
-            let cache_bytes = synced_cache_mb as usize * 1024 * 1024;
-            sync.set_at_tip_cache(cache_bytes);
+            // `synced_cache_mb` is the at-tip TOTAL, mirroring `cache_mb`, so
+            // the same store/state split applies. Only the state side is
+            // resizable in place — the modifier store has no resize path.
+            //
+            // Note this moves less than it appears to: redb splits its budget
+            // 90% read / 10% write, and the in-place resize reaches only the
+            // read half. See facts/state.md § "An in-place resize moves only
+            // 90% of the budget".
+            let (_, synced_state_bytes) =
+                split_cache_mb(synced_cache_mb, node_config.cache_store_pct);
+            sync.set_at_tip_cache(synced_state_bytes);
             tracing::info!(
                 synced_cache_mb,
+                synced_state_bytes,
                 "at-tip cache resize wired; will fire on first synced() entry"
             );
         }
@@ -2356,7 +2450,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
 
                     let params = AVLTreeParams { key_length: 32, value_length: None };
-                    let mut storage = RedbAVLStorage::open(&state_path, params, 256, CacheSize::Bytes(node_config.cache_mb as usize * 1024 * 1024))
+                    let mut storage = RedbAVLStorage::open(&state_path, params, 256, CacheSize::Bytes(state_cache_bytes))
                         .expect("failed to open state storage for snapshot");
 
                     let root_hash = snapshot_data.root_hash;
@@ -3197,6 +3291,59 @@ mod tests {
     use ergo_avltree_rust::batch_node::{AVLTree, Node, NodeHeader};
     use ergo_avltree_rust::operation::{KeyValue, Operation};
     use std::sync::Arc;
+
+    #[test]
+    fn cache_store_pct_out_of_range_is_rejected() {
+        for pct in [0u32, 100, 250] {
+            let cfg = NodeConfig {
+                cache_store_pct: pct,
+                ..NodeConfig::default()
+            };
+            assert!(
+                validate_cache_split(&cfg).is_err(),
+                "cache_store_pct {pct} should be rejected — a zero share means a \
+                 database with no page cache at all"
+            );
+        }
+        for pct in [1u32, 50, 99] {
+            let cfg = NodeConfig {
+                cache_store_pct: pct,
+                ..NodeConfig::default()
+            };
+            assert!(validate_cache_split(&cfg).is_ok(), "pct {pct} should be accepted");
+        }
+    }
+
+    #[test]
+    fn cache_split_divides_the_total_exactly() {
+        let cfg = NodeConfig {
+            cache_mb: 512,
+            cache_store_pct: 25,
+            ..NodeConfig::default()
+        };
+        let (store, state) = cache_split_bytes(&cfg);
+        assert_eq!(store, 128 * 1024 * 1024);
+        assert_eq!(state, 384 * 1024 * 1024);
+        assert_eq!(
+            store + state,
+            512 * 1024 * 1024,
+            "the split must sum to cache_mb exactly"
+        );
+    }
+
+    #[test]
+    fn cache_split_rounding_loses_no_bytes() {
+        // 333 is deliberately awkward: 777 MB * 33% does not divide evenly.
+        // The remainder must land in state rather than vanishing, or the
+        // configured total silently under-delivers.
+        let cfg = NodeConfig {
+            cache_mb: 777,
+            cache_store_pct: 33,
+            ..NodeConfig::default()
+        };
+        let (store, state) = cache_split_bytes(&cfg);
+        assert_eq!(store + state, 777 * 1024 * 1024);
+    }
 
     #[test]
     fn testnet_genesis_boxes_produce_correct_digest() {

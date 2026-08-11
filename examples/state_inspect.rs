@@ -145,7 +145,10 @@ fn main() {
     if args.len() >= 3 {
         let modifiers_path = PathBuf::from(&args[2]);
         println!("\n=== cross-check vs modifiers.redb ({}) ===", modifiers_path.display());
-        let store = RedbModifierStore::new(&modifiers_path).expect("open modifiers");
+        // Read-only inspection of a handful of keys; 16 MiB is ample and
+        // avoids handing an offline tool the node's full cache budget.
+        let store =
+            RedbModifierStore::new(&modifiers_path, 16 * 1024 * 1024).expect("open modifiers");
 
         match store.best_header_tip() {
             Ok(Some((tip_h, _))) => println!("  best_header_tip height = {}", tip_h),
