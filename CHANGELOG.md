@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **BREAKING — `cache_mb` now means the TOTAL redb page cache across both
+  databases**, split by the new `cache_store_pct` (default 50, valid 1–99).
+  It previously sized `state.redb` alone while `modifiers.redb` silently took
+  redb's built-in 1 GiB default, so a config saying `cache_mb = 1024` actually
+  used 2048 MB. Existing configs will use **less** memory than before; raise
+  `cache_mb` if sync throughput regresses. `synced_cache_mb` is likewise a
+  total and the same split applies to the at-tip resize.
+
+- Default `cache_mb` is now 512. In real terms that is a reduction: the old
+  effective default was 256 (state) + 1024 (modifiers, unchosen) = 1280 MB.
+
+- jemalloc now runs with `background_thread:true` and 5 s decay windows.
+  Without a background thread an arena's dirty pages decay only when a thread
+  next touches that arena, and with 4 × ncpu arenas the quiet ones never get
+  touched — measured at 1021 MB of freed-but-unreturned memory during a
+  genesis sync.
+
+### Added
+
+- `/debug/memory` reports `storeCacheBytes`, `stateCacheBytes` and
+  `storeCacheEvictions`. redb was the largest single consumer during cold sync
+  and was entirely invisible to this endpoint.
+
+  Read `storeCacheEvictions`, not `storeCacheBytes`, to tell whether a cache
+  is under pressure: occupancy tracks the live working set, not the configured
+  ceiling, and reads identically at 8 MiB and 1 GiB under the same load.
+
+### Known limitation
+
+- An **in-place** at-tip cache resize moves only ~90% of the budget.
+  `set_cache_size` splits its argument 90% read / 10% write, and the in-place
+  path reaches only the read half; the write buffer is fixed at open time and
+  redb exposes no setter for it. `synced_cache_mb = 128` therefore yields
+  roughly 115 MB of read cache plus a write buffer sized from the cold-sync
+  total. A full restart applies both halves.
+
 ## v0.7.11 — 2026-08-03
 
 - **Fix demoted headers clobbering `BEST_CHAIN` after a reorg — the node
