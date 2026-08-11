@@ -1563,6 +1563,7 @@ components:
         - unconfirmedCount
         - isMining
         - currentTime
+        - launchTime
         - journalEventsVersion
       properties:
         name:
@@ -1612,6 +1613,29 @@ components:
           type: integer
           format: int64
           description: Local clock in Unix epoch milliseconds.
+        launchTime:
+          type: integer
+          format: int64
+          description: |
+            Unix epoch milliseconds at which this process began serving.
+            Constant for the process lifetime; `currentTime - launchTime`
+            is uptime. Present for JVM parity.
+        maxPeerHeight:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Highest header height announced by any peer in a SyncInfo message
+            since process start. Monotonic high-water mark — never decreases,
+            including on peer disconnect or reorg.
+
+            OMITTED (not zero) until the first SyncInfo is parsed: a zero would
+            assert the network is at height 0. Consumers must treat absence as
+            unknown.
+
+            Peer-supplied and unverified — advisory display data only
+            (`headersHeight / maxPeerHeight` = sync progress). Never an input
+            to consensus, validation, or storage decisions.
         journalEventsVersion:
           type: string
           description: |
@@ -2241,16 +2265,54 @@ components:
 
     ComponentMemory:
       type: object
-      required: [chainHeaderEstimateBytes, chainHeaderCount, mempoolTxCount]
+      description: |
+        Per-component memory attribution. Every `*Bytes` field is a FORMULA
+        over a live count or capacity, never a measurement — ground truth for
+        "where did the memory go" is a heap profile, not this endpoint.
+
+        Each formula is computed by the crate that owns the structure it
+        models and passed to the API layer. It is never computed in the API
+        layer from a constant describing another crate's internals: the
+        removed `chainHeaderEstimateBytes` sized a `Vec<Header>` that `chain/`
+        retired, and reported 1.48 GB for a structure that no longer existed.
+
+        Headers themselves are NOT resident — they have been served lazily
+        from storage since the Phase 3 retirement of the header Vec. Do not
+        reintroduce a field claiming to size resident headers.
+      required:
+        - chainIndexBytes
+        - chainHeaderCacheBytes
+        - chainScoreCacheBytes
+        - chainHeaderCount
+        - mempoolTxCount
       properties:
-        chainHeaderEstimateBytes:
+        chainIndexBytes:
           type: integer
           format: int64
           minimum: 0
+          description: |
+            `HeaderChain::by_id` (BlockId → height). **Unbounded** — grows with
+            chain length for the life of the node and is never evicted. The
+            one chain structure whose growth an operator must plan for.
+        chainHeaderCacheBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            `LazyHeaderStore` header LRU, current occupancy. Bounded by the
+            configured cache capacity.
+        chainScoreCacheBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            `LazyHeaderStore` cumulative-score LRU, current occupancy. Bounded
+            by the configured cache capacity.
         chainHeaderCount:
           type: integer
           format: int64
           minimum: 0
+          description: Chain length. A count, not an estimate.
         mempoolTxCount:
           type: integer
           format: int64

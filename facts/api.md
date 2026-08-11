@@ -86,6 +86,30 @@ lives at `api/src/lib.rs::ApiState`. The roles, summarized:
 - Optional P2P-capture handle (`None` when `[debug.p2p_capture]` is off)
 - Mining state and block submitter (`None` outside UTXO mode with a miner PK)
 
+### Component memory attribution (added 2026-08-11)
+
+`ChainAccess` carries a `memory_estimate()` returning an api-local
+`ChainMemory { index_bytes, header_cache_bytes, score_cache_bytes }`, surfaced
+by `GET /debug/memory` as `chainIndexBytes` / `chainHeaderCacheBytes` /
+`chainScoreCacheBytes`.
+
+**The API layer must not compute these numbers.** It reports what the owning
+crate tells it. The removed `chainHeaderEstimateBytes` was computed here from
+a local `AVG_HEADER_BYTES = 800` describing a `Vec<Header>` inside `chain/`;
+when `chain/` retired that Vec in Phase 3, this constant kept multiplying it
+by the header count and reported ~1.48 GB for a structure that did not exist —
+a figure exceeding total process RSS, which went unnoticed because nothing
+cross-checked the two crates.
+
+This crate deliberately does not depend on `enr-chain`; it reaches the chain
+only through `ChainAccess`. `ChainMemory` is therefore an api-local type, and
+the integrator's adapter in the main crate maps `chain/`'s
+`ChainMemoryEstimate` onto it. That mapping is the adapter's job as the
+integration seam — it is not licence to reintroduce sizing arithmetic here.
+
+Any future per-component memory field follows the same rule: the crate that
+owns the structure computes the figure; this crate transports it.
+
 ### State Context Lifecycle
 
 `state_context` is rebuilt whenever the validated tip advances:
@@ -257,6 +281,28 @@ hit the cap must check the returned length against the requested limit.
   exist in the store. Rust-specific addition used by fastsync; after a state
   wipe `fullHeight` resets to 0 while `downloadedHeight` reflects what is
   still on disk.
+- `maxPeerHeight` — highest header height announced by **any** peer in a
+  `SyncInfo` message since process start. Present for JVM parity; consumers
+  compute sync progress as `headersHeight / maxPeerHeight`.
+
+`maxPeerHeight` has three properties a consumer must account for:
+
+1. **Monotonic within a process.** It never decreases, including when the
+   announcing peer disconnects or the chain reorgs below it. It is a
+   high-water mark, not a live poll of current peers.
+2. **Absent until the first `SyncInfo` is parsed**, rather than reported as
+   `0`. A zero would assert "the network is at height 0", which is false and
+   worse than saying nothing. Consumers must treat absence as "unknown" —
+   the JVM types this field optional and so do we.
+3. **Peer-supplied and unverified.** A peer announcing a bogus height inflates
+   it for the lifetime of the process. It is advisory display data and must
+   never feed a consensus, validation, or storage decision. The value that
+   *does* drive behaviour (the fastsync gap) reads the same underlying atomic
+   but is bounded by a threshold check.
+
+`launchTime` — Unix epoch milliseconds at which this process began serving.
+Constant for the process lifetime. Present for JVM parity; consumers derive
+uptime as `currentTime - launchTime`.
 
 `/info/wait?after=H` long-polls until `fullHeight > H` (30s deadline, then
 204).

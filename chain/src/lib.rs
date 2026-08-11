@@ -20,7 +20,7 @@ mod tracker;
 pub mod voting;
 
 pub use cache::{HeaderLoader, ScoreLoader, DEFAULT_CACHE_CAPACITY};
-pub use chain::{AppendResult, HeaderChain, InstalledHeader};
+pub use chain::{AppendResult, ChainMemoryEstimate, HeaderChain, InstalledHeader};
 pub use config::{ChainConfig, Network};
 pub use ergo_chain_types::autolykos_pow_scheme::decode_compact_bits;
 pub use ergo_chain_types::{ADDigest, BlockId, Header};

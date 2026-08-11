@@ -27,6 +27,16 @@ pub struct NodeInfo {
     pub unconfirmed_count: usize,
     pub is_mining: bool,
     pub current_time: u64,
+    /// Unix epoch ms at which this process began serving. Constant for the
+    /// process lifetime; consumers derive uptime as `currentTime - launchTime`.
+    pub launch_time: u64,
+    /// Highest header height announced by any peer in a `SyncInfo` since
+    /// process start. Omitted — not reported as `0` — until the first
+    /// `SyncInfo` is parsed, because a zero would assert the network is at
+    /// height 0. Peer-supplied and unverified: advisory display data only.
+    /// See `facts/api.md` § "Synced-state semantics".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_peer_height: Option<u32>,
     /// Always present — see `facts/journal-events.md`.
     pub journal_events_version: String,
     /// Present only when the operator stats endpoint is enabled — see `facts/stats.md`.
@@ -155,13 +165,31 @@ pub struct JemallocMemory {
     pub metadata_bytes: u64,
 }
 
+/// Per-component memory attribution.
+///
+/// Every `*Bytes` field is a FORMULA over a live count or capacity, never a
+/// measurement — ground truth for "where did the memory go" is a heap profile,
+/// not this endpoint. Each formula is computed by the crate that owns the
+/// structure it models and is transported here unmodified; this crate performs
+/// no arithmetic on them. See `facts/api.md` § "Component memory attribution".
+///
+/// Headers themselves are NOT resident — they have been served lazily from
+/// storage since `chain/` retired the header `Vec` in Phase 3. Do not
+/// reintroduce a field claiming to size resident headers.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ComponentMemory {
-    /// Estimated bytes held by the in-memory header chain
-    /// (`chain.by_height.len() * avg_header_bytes`). Coarse — real headers
-    /// vary in size from ~220 bytes to ~1 KB depending on interlink vector.
-    pub chain_header_estimate_bytes: u64,
+    /// `HeaderChain::by_id` (BlockId → height). **Unbounded** — grows with
+    /// chain length for the life of the node and is never evicted. The one
+    /// chain structure whose growth an operator must plan for.
+    pub chain_index_bytes: u64,
+    /// `LazyHeaderStore` header LRU, current occupancy. Bounded by the
+    /// configured cache capacity.
+    pub chain_header_cache_bytes: u64,
+    /// `LazyHeaderStore` cumulative-score LRU, current occupancy. Bounded by
+    /// the configured cache capacity.
+    pub chain_score_cache_bytes: u64,
+    /// Chain length. A count, not an estimate.
     pub chain_header_count: u32,
     /// Mempool transaction count.
     pub mempool_tx_count: u32,

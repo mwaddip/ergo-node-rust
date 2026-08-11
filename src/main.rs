@@ -608,6 +608,19 @@ impl ergo_api::ChainAccess for HeaderChainAdapter {
             if h == 0 { None } else { c.header_at(h) }
         })
     }
+    /// Maps `chain/`'s estimate onto the api-local mirror type. `api/`
+    /// deliberately does not depend on `enr-chain`, so this adapter is the
+    /// single seam between the two — and it stays a pure field mapping. Any
+    /// arithmetic here would recreate the split that let `AVG_HEADER_BYTES`
+    /// go stale against a structure `chain/` had already retired.
+    fn memory_estimate(&self) -> ergo_api::ChainMemory {
+        let e = self.with_chain(|c| c.memory_estimate());
+        ergo_api::ChainMemory {
+            index_bytes: e.index_bytes,
+            header_cache_bytes: e.header_cache_bytes,
+            score_cache_bytes: e.score_cache_bytes,
+        }
+    }
     fn build_nipopow_proof(
         &self,
         m: u32,
@@ -1277,6 +1290,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         enr_p2p::types::Network::Testnet => ChainConfig::testnet(),
         enr_p2p::types::Network::Mainnet => ChainConfig::mainnet(),
     };
+
+    // Wall-clock start, surfaced as `launchTime` on GET /info (see
+    // ../facts/api.md). Epoch milliseconds rather than Instant because it
+    // leaves the process; consumers derive uptime as currentTime - launchTime.
+    let launch_time_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -2882,6 +2903,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
             validated_height: shared_validated_height.clone(),
             downloaded_height: api_downloaded_height.clone(),
+            // Same atomic the fastsync gap decision reads — sync maintains it
+            // as a monotonic max over every peer's SyncInfo. Advisory only.
+            max_peer_height: peer_chain_tip.clone(),
             peer_api_urls: Arc::new(move || {
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current()
@@ -2970,6 +2994,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             node_info: std::sync::Arc::new(ergo_api::NodeMeta {
                 name: "ergo-node-rust".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                launch_time: launch_time_ms,
                 network: match network {
                     enr_p2p::types::Network::Testnet => "testnet".to_string(),
                     enr_p2p::types::Network::Mainnet => "mainnet".to_string(),

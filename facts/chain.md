@@ -1286,6 +1286,50 @@ peer on demand. Tracked as a follow-up.
 - `reorg_floor()` is consulted before any reorg execution. Reorgs whose
   fork point falls below the floor are rejected.
 
+## Memory attribution (added 2026-08-11)
+
+### `HeaderChain::memory_estimate() -> ChainMemoryEstimate`
+
+```rust
+pub struct ChainMemoryEstimate {
+    /// `by_id` (BlockId → height). Unbounded — grows with chain length.
+    pub index_bytes: u64,
+    /// `LazyHeaderStore` header LRU, current occupancy. Bounded by capacity.
+    pub header_cache_bytes: u64,
+    /// `LazyHeaderStore` score LRU, current occupancy. Bounded by capacity.
+    pub score_cache_bytes: u64,
+}
+```
+
+Reported by `GET /debug/memory` via `ChainAccess::memory_estimate`.
+
+**This function must live in this crate, beside the fields it models.** It
+replaces a constant (`AVG_HEADER_BYTES = 800`) that sat in `api/` and sized
+the `Vec<Header>` retired in Phase 3. Nothing connected the two, so after the
+retirement the endpoint reported ~1.48 GB for a structure that no longer
+existed — larger than the entire process RSS — and that figure was quoted as a
+leading suspect during a real memory investigation.
+
+The invariant is therefore not "use the right constant" but **the formula
+lives with the data**. A future refactor that retires or reshapes a field will
+be editing this file, with the estimate visible in it.
+
+Requirements:
+
+- Every returned value is a **formula over live counts and capacities**, never
+  a measurement. Callers must treat it as attribution guidance, not truth; a
+  heap profile is the ground truth.
+- Cache figures are **current occupancy**, not capacity ceilings — an LRU that
+  is half full must not report as if it were full.
+- `index_bytes` must account for real map overhead (control bytes and load
+  factor), not just `entries × (key + value)`. Under-reporting the one
+  unbounded structure is the failure mode that matters here.
+- Constant-time. `/debug/memory` is an operator diagnostic and must not walk
+  the chain, the caches, or storage to answer.
+- Headers themselves are **not resident** and must not appear in the result.
+  If a future change makes them resident again, that is a new field with a new
+  name, decided deliberately.
+
 ## Does NOT own
 
 - Block bodies, transactions, AD proofs — that's `ergo-validation`.

@@ -57,6 +57,14 @@ pub struct ApiState {
     pub validated_height: Arc<AtomicU32>,
     /// Highest height with all block sections downloaded (updated by sync layer).
     pub downloaded_height: Arc<AtomicU32>,
+    /// Highest header height announced by any peer in a `SyncInfo` since
+    /// process start (updated by the sync layer). Monotonic high-water mark —
+    /// never decreases, including on peer disconnect or reorg. `0` means no
+    /// `SyncInfo` has been parsed yet; `/info` reports that as an absent
+    /// field rather than height 0. Peer-supplied and unverified — advisory
+    /// display data only, never an input to a consensus, validation, or
+    /// storage decision.
+    pub max_peer_height: Arc<AtomicU32>,
     /// Peer REST URL callback — returns connected peers with their socket addr and REST URL.
     pub peer_api_urls: Arc<dyn Fn() -> Vec<PeerRestInfo> + Send + Sync>,
     /// All known peers (connected + disconnected). For `GET /peers/all`.
@@ -112,6 +120,9 @@ pub struct NodeMeta {
     pub version: String,
     pub network: String,
     pub state_type: String,
+    /// Unix epoch ms at which this process began serving. Constant for the
+    /// process lifetime — consumers derive uptime as `currentTime - launchTime`.
+    pub launch_time: u64,
 }
 
 /// Peer count summary.
@@ -148,6 +159,34 @@ pub struct PeerStatusSummary {
 pub struct SnapshotInfoEntry {
     pub height: u32,
     pub digest: [u8; 32],
+}
+
+/// Memory attribution for the header chain's in-process structures, as
+/// reported by the crate that owns them.
+///
+/// Every field is a formula over a live count or capacity — never a
+/// measurement — and it is computed by `chain/`, not here. The API layer
+/// transports these numbers into `GET /debug/memory`; it must never derive
+/// them from a local constant describing another crate's internals. The
+/// removed `chainHeaderEstimateBytes` did exactly that (`header_count * 800`
+/// for a `Vec<Header>` that `chain/` retired in Phase 3) and reported 1.48 GB
+/// for a structure that no longer existed.
+///
+/// Deliberately api-local: this crate does not depend on `enr-chain`, and it
+/// does not acquire that dependency just to share a struct. The main crate's
+/// adapter maps `chain/`'s `ChainMemoryEstimate` onto this type — that mapping
+/// is the integration seam, not licence to reintroduce sizing arithmetic here.
+/// See `facts/api.md` § "Component memory attribution".
+pub struct ChainMemory {
+    /// `HeaderChain::by_id` (BlockId → height). Unbounded — grows with chain
+    /// length for the life of the node and is never evicted.
+    pub index_bytes: u64,
+    /// `LazyHeaderStore` header LRU, current occupancy. Bounded by the
+    /// configured cache capacity.
+    pub header_cache_bytes: u64,
+    /// `LazyHeaderStore` cumulative-score LRU, current occupancy. Bounded by
+    /// the configured cache capacity.
+    pub score_cache_bytes: u64,
 }
 
 /// Trait for chain access — avoids API depending on enr-chain internals.
@@ -196,6 +235,15 @@ pub trait ChainAccess: Send + Sync {
     /// - `Ok(None)` — header not in chain (handler returns 404).
     /// - `Err(reason)` — chain-internal failure (e.g., extension missing for an interlink ancestor); handler returns 500.
     fn popow_header_by_id(&self, id: &[u8; 32]) -> Result<Option<Vec<u8>>, String>;
+
+    /// Memory attribution for the chain's in-process structures.
+    ///
+    /// The implementor computes these figures; `GET /debug/memory` reports
+    /// them verbatim and performs no arithmetic on them. Deliberately has no
+    /// default body — a default would let an implementor that forgot to
+    /// override it silently report zeros, which is precisely how the wrong
+    /// `chainHeaderEstimateBytes` survived unnoticed.
+    fn memory_estimate(&self) -> ChainMemory;
 }
 
 /// Trait for block store access.

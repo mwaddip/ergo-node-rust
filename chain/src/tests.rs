@@ -3396,6 +3396,7 @@ mod light_client_install_tests {
 
 #[cfg(test)]
 mod lazy_cache_tests {
+    use std::mem::size_of;
     use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -3404,6 +3405,7 @@ mod lazy_cache_tests {
     use num_bigint::BigUint;
     use sigma_ser::ScorexSerializable;
 
+    use crate::cache::{header_entry_bytes, score_entry_bytes};
     use crate::{ChainConfig, HeaderChain};
 
     fn testnet_config() -> ChainConfig {
@@ -3747,6 +3749,96 @@ mod lazy_cache_tests {
             BigUint::ZERO,
             "install-boundary score must be zero in cache"
         );
+    }
+
+    // ---- memory_estimate ----
+
+    #[test]
+    fn memory_estimate_on_empty_chain_is_all_zeros() {
+        let chain = HeaderChain::new(testnet_config());
+        let est = chain.memory_estimate();
+
+        // A `HashMap::new()` has not allocated, and both LRUs are empty.
+        assert_eq!(est.index_bytes, 0, "unallocated index holds nothing");
+        assert_eq!(est.header_cache_bytes, 0);
+        assert_eq!(est.score_cache_bytes, 0);
+    }
+
+    #[test]
+    fn index_bytes_grow_with_the_chain_and_beat_the_naive_bound() {
+        let mut chain = HeaderChain::new(testnet_config());
+        let built = build_chain(&mut chain, 50);
+        let at_50 = chain.memory_estimate().index_bytes;
+        assert!(at_50 > 0, "50 headers must account for something");
+
+        // Keep appending on the SAME chain — the figure must track the
+        // index growing, not just be re-derived from a constant.
+        let mut prev = built.last().unwrap().clone();
+        for h in 51..=200u32 {
+            let hdr = make_header(h, prev.id, 1_000_000 + h as u64 * 45_000, prev.n_bits);
+            prev = hdr.clone();
+            chain.try_append_no_pow(hdr).unwrap();
+        }
+        let at_200 = chain.memory_estimate().index_bytes;
+
+        assert_eq!(chain.len(), 200);
+        assert!(
+            at_200 > at_50,
+            "index_bytes must grow with chain length ({at_50} -> {at_200})"
+        );
+
+        // The naive accounting — `entries x (32-byte BlockId + 4-byte
+        // height)` — ignores hashbrown's per-bucket control byte and the
+        // 12.5% of slots its load factor keeps empty. `by_id` is the one
+        // unbounded structure here, so under-reporting it is the failure
+        // that matters; the estimate must clear this lower bound.
+        let naive = 200 * size_of::<(BlockId, u32)>() as u64;
+        assert!(
+            at_200 > naive,
+            "index_bytes {at_200} must exceed the naive entries x {} bound of {naive}",
+            size_of::<(BlockId, u32)>()
+        );
+    }
+
+    #[test]
+    fn cache_bytes_track_occupancy_not_capacity() {
+        let capacity = 64usize;
+        let cap = NonZeroUsize::new(capacity).unwrap();
+
+        let mut chain = HeaderChain::new(testnet_config());
+        chain.set_cache_capacity(cap);
+        let fresh = chain.memory_estimate();
+        assert_eq!(fresh.header_cache_bytes, 0, "fresh cache holds nothing");
+        assert_eq!(fresh.score_cache_bytes, 0, "fresh cache holds nothing");
+
+        // 10 of 64 slots occupied: the figure is occupancy-derived.
+        build_chain(&mut chain, 10);
+        let partial = chain.memory_estimate();
+        assert_eq!(chain.lazy().header_cache_len(), 10);
+        assert_eq!(chain.lazy().score_cache_len(), 10);
+        assert_eq!(partial.header_cache_bytes, 10 * header_entry_bytes());
+        assert_eq!(partial.score_cache_bytes, 10 * score_entry_bytes());
+
+        let header_ceiling = capacity as u64 * header_entry_bytes();
+        let score_ceiling = capacity as u64 * score_entry_bytes();
+        assert!(
+            partial.header_cache_bytes < header_ceiling,
+            "a 10/64-full cache must not report as full"
+        );
+        assert!(partial.score_cache_bytes < score_ceiling);
+
+        // Push well past capacity: the LRU evicts, so occupancy — and
+        // therefore the estimate — pins at the ceiling and never above.
+        let mut chain = HeaderChain::new(testnet_config());
+        chain.set_cache_capacity(cap);
+        build_chain(&mut chain, 250);
+        let full = chain.memory_estimate();
+        assert_eq!(full.header_cache_bytes, header_ceiling);
+        assert_eq!(full.score_cache_bytes, score_ceiling);
+
+        // ...while the index kept every one of the 250 headers.
+        assert_eq!(chain.len(), 250);
+        assert!(full.index_bytes > 250 * size_of::<(BlockId, u32)>() as u64);
     }
 }
 

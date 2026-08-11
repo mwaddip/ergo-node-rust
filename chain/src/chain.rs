@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -94,11 +95,14 @@ pub struct HeaderChain {
     base_height: Option<u32>,
     /// Map from header ID to height for O(1) containment / height
     /// lookup. Kept as an in-memory index because hitting storage on
-    /// every `contains()` / `height_of()` check is not worth the save
-    /// (~64 MB at mainnet scale — an order of magnitude below the
-    /// retired header Vec, which was ~1.4 GB). Also the canonical
-    /// source for [`Self::height`] / [`Self::len`] — chain length is
-    /// `by_id.len()` and the tip height is `base_height + by_id.len() - 1`.
+    /// every `contains()` / `height_of()` check is not worth the save —
+    /// it costs ~75 MB at mainnet scale, an order of magnitude below
+    /// the retired header Vec's ~1.4 GB. That figure is derived, not
+    /// asserted: [`by_id_bytes`] computes it from this map's live
+    /// capacity, and it is the unbounded term in
+    /// [`HeaderChain::memory_estimate`]. Also the canonical source for
+    /// [`Self::height`] / [`Self::len`] — chain length is `by_id.len()`
+    /// and the tip height is `base_height + by_id.len() - 1`.
     by_id: HashMap<BlockId, u32>,
     /// Currently active blockchain parameters (Phase 6: Soft-Fork Voting).
     /// Updated only at epoch-boundary block validation via
@@ -154,6 +158,77 @@ pub struct HeaderChain {
     /// returns `None`) is treated as "absent" exactly as the contract
     /// specifies.
     lazy: LazyHeaderStore,
+}
+
+/// Estimated in-memory footprint of a [`HeaderChain`], broken down by
+/// the structure that holds it.
+///
+/// **Every field is a formula over live counts and capacities, never a
+/// measurement.** Read it as attribution guidance — *which structure is
+/// the memory in* — not as truth; a heap profile is the ground truth.
+/// Each field names the member it models, so a grep for that member
+/// reaches the formula.
+///
+/// Headers themselves are **not resident** — they are served by the
+/// registered `HeaderLoader` through the LRU — and so do not appear
+/// here. If a future change makes them resident again, that is a new
+/// field with a new name, decided deliberately; it is not slack folded
+/// into one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChainMemoryEstimate {
+    /// `HeaderChain::by_id` — the `HashMap<BlockId, u32>` header index.
+    /// The only unbounded structure in this crate: it grows with chain
+    /// length and is never evicted, so it is the figure an operator
+    /// actually needs. See `by_id_bytes` for the accounting.
+    pub index_bytes: u64,
+    /// The header LRU inside `LazyHeaderStore`, at its current
+    /// occupancy. Bounded by the cache capacity
+    /// ([`crate::DEFAULT_CACHE_CAPACITY`] unless retuned).
+    pub header_cache_bytes: u64,
+    /// The cumulative-score LRU inside `LazyHeaderStore`, at its
+    /// current occupancy. Bounded by the same capacity.
+    pub score_cache_bytes: u64,
+}
+
+/// Buckets `std::collections::HashMap` has allocated for a table
+/// reporting `capacity` usable slots.
+///
+/// `capacity()` is the only O(1) window into the allocation from
+/// outside hashbrown, and it reports the *usable* slot count, not the
+/// allocated one. hashbrown sizes tables in powers of two and keeps
+/// 12.5% of the slots empty above 8 buckets (`capacity = buckets / 8 *
+/// 7`); at or below that it reserves exactly one (`capacity = buckets -
+/// 1`). Inverting both branches recovers the bucket count exactly.
+///
+/// Saturates rather than panicking on a capacity no real chain can
+/// reach — this backs an operator diagnostic, which must not be the
+/// thing that takes the node down.
+fn hashbrown_buckets(capacity: usize) -> usize {
+    let unrounded = match capacity {
+        0 => return 0,
+        c if c < 8 => c + 1,
+        c => c.div_ceil(7).saturating_mul(8),
+    };
+    unrounded.checked_next_power_of_two().unwrap_or(usize::MAX)
+}
+
+/// Estimated bytes held by [`HeaderChain::by_id`].
+///
+/// Formula, not a measurement: `buckets × (slot + 1 control byte)`,
+/// where `slot` is the `(BlockId, u32)` pair hashbrown stores per
+/// bucket and the bucket count comes from [`hashbrown_buckets`].
+///
+/// Counting `entries × size_of::<(BlockId, u32)>()` instead would
+/// under-report by the control bytes and by the 12.5% of slots the load
+/// factor keeps empty — and under-reporting the one unbounded structure
+/// is the failure mode that matters here. Note also that the map never
+/// shrinks on removal, so a chain that reorged down still holds its
+/// high-water allocation; reporting from `capacity()` rather than
+/// `len()` is what makes that visible.
+fn by_id_bytes(by_id: &HashMap<BlockId, u32>) -> u64 {
+    let buckets = hashbrown_buckets(by_id.capacity()) as u64;
+    let slot_bytes = size_of::<(BlockId, u32)>() as u64;
+    buckets * (slot_bytes + 1)
 }
 
 /// All-zeros parent ID expected for the genesis header.
@@ -418,6 +493,32 @@ impl HeaderChain {
     /// Whether the chain is empty.
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
+    }
+
+    /// Estimated in-memory footprint of this chain, by structure.
+    ///
+    /// Constant time: reads `HashMap::capacity` and `LruCache::len`, and
+    /// walks neither the chain, the caches, nor storage. Backs
+    /// `GET /debug/memory` through the integrator's `ChainAccess`.
+    ///
+    /// The values are formulas — see [`ChainMemoryEstimate`] for what
+    /// that does and does not entitle a caller to conclude.
+    ///
+    /// This lives here, beside the fields it models, deliberately. The
+    /// previous arrangement kept a constant (`AVG_HEADER_BYTES = 800`)
+    /// in the API crate sizing a `Vec<Header>` that this crate had
+    /// already retired; nothing connected the two, so the endpoint went
+    /// on reporting ~1.48 GB for a structure that no longer existed —
+    /// more than the whole process RSS — and that figure was taken as a
+    /// leading suspect during a real memory investigation. A refactor
+    /// that reshapes `by_id` or the caches is now editing the same
+    /// files as the estimate.
+    pub fn memory_estimate(&self) -> ChainMemoryEstimate {
+        ChainMemoryEstimate {
+            index_bytes: by_id_bytes(&self.by_id),
+            header_cache_bytes: self.lazy.header_cache_bytes(),
+            score_cache_bytes: self.lazy.score_cache_bytes(),
+        }
     }
 
     /// Cumulative difficulty score at the chain tip.

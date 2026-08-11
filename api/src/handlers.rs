@@ -165,6 +165,21 @@ fn subtle_constant_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 // GET /info
 // ---------------------------------------------------------------------------
 
+/// Map the raw `max_peer_height` atomic onto the `/info` field.
+///
+/// `0` is an unambiguous "not known yet" sentinel: the sync layer only ever
+/// stores a value strictly greater than the previous one, and Ergo's genesis
+/// is height 1, so a genuinely announced height is never 0. Reporting `0`
+/// would assert the network is at height 0 — omitting the field says
+/// "unknown", which is the truth. See `facts/api.md` § "Synced-state
+/// semantics".
+fn max_peer_height_field(raw: u32) -> Option<u32> {
+    match raw {
+        0 => None,
+        h => Some(h),
+    }
+}
+
 pub async fn get_info(State(state): State<ApiState>) -> Json<NodeInfo> {
     let headers_height = state.chain.height();
     let full_height = state
@@ -203,6 +218,12 @@ pub async fn get_info(State(state): State<ApiState>) -> Json<NodeInfo> {
         unconfirmed_count: pool_size,
         is_mining: false,
         current_time: now,
+        launch_time: state.node_info.launch_time,
+        max_peer_height: max_peer_height_field(
+            state
+                .max_peer_height
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
         journal_events_version: crate::JOURNAL_EVENTS_VERSION.to_string(),
         stats_version: state
             .stats_enabled
@@ -1221,12 +1242,15 @@ pub async fn info_wait(
 // GET /debug/memory
 // ---------------------------------------------------------------------------
 
-/// Average bytes per header in the in-memory chain. Real headers vary with
-/// interlink vector size; 800 is a coarse working estimate. Good enough to
-/// know whether chain is 0.5 GB or 2 GB of the total — don't use for anything
-/// that requires precision.
-const AVG_HEADER_BYTES: u64 = 800;
-
+/// Memory breakdown: kernel counters, allocator counters, and per-component
+/// figures reported by the crates that own the structures.
+///
+/// The component figures are transported, not computed. This handler must
+/// never size another crate's structure from a constant of its own: the
+/// removed `chainHeaderEstimateBytes` multiplied the header count by a local
+/// 800-bytes-per-header constant describing a `Vec<Header>` that `chain/`
+/// retired in Phase 3, and reported 1.48 GB for a structure that did not exist.
+/// See `facts/api.md` § "Component memory attribution".
 pub async fn get_debug_memory(State(state): State<ApiState>) -> Json<DebugMemory> {
     // Process memory from /proc/self/status. Fall back to zeros if any field
     // is missing — the endpoint is diagnostic, not mission-critical.
@@ -1244,11 +1268,14 @@ pub async fn get_debug_memory(State(state): State<ApiState>) -> Json<DebugMemory
         }
     });
 
+    let chain_memory = state.chain.memory_estimate();
     let chain_header_count = state.chain.height();
     let mempool_tx_count = state.mempool.lock().await.len() as u32;
 
     let components = ComponentMemory {
-        chain_header_estimate_bytes: chain_header_count as u64 * AVG_HEADER_BYTES,
+        chain_index_bytes: chain_memory.index_bytes,
+        chain_header_cache_bytes: chain_memory.header_cache_bytes,
+        chain_score_cache_bytes: chain_memory.score_cache_bytes,
         chain_header_count,
         mempool_tx_count,
     };
@@ -2116,10 +2143,176 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // GET /info — launchTime / maxPeerHeight
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn max_peer_height_zero_means_unknown() {
+        // The sync layer stores a strict monotonic max and Ergo's genesis is
+        // height 1, so 0 can only mean "no SyncInfo parsed yet".
+        assert_eq!(max_peer_height_field(0), None);
+    }
+
+    #[test]
+    fn max_peer_height_nonzero_is_reported() {
+        assert_eq!(max_peer_height_field(1), Some(1));
+        assert_eq!(max_peer_height_field(1_500_000), Some(1_500_000));
+        assert_eq!(max_peer_height_field(u32::MAX), Some(u32::MAX));
+    }
+
+    #[test]
+    fn info_omits_max_peer_height_when_atomic_is_zero() {
+        let state = empty_state();
+        state
+            .max_peer_height
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let rt = build_runtime();
+        let Json(info) = rt.block_on(get_info(State(state)));
+        let json = serde_json::to_value(&info).unwrap();
+        let obj = json.as_object().expect("NodeInfo serializes as object");
+        assert!(
+            !obj.contains_key("maxPeerHeight"),
+            "maxPeerHeight must be absent — not 0 — before the first SyncInfo: {json}"
+        );
+    }
+
+    #[test]
+    fn info_emits_max_peer_height_when_atomic_is_set() {
+        let state = empty_state();
+        state
+            .max_peer_height
+            .store(1_500_000, std::sync::atomic::Ordering::Relaxed);
+        let rt = build_runtime();
+        let Json(info) = rt.block_on(get_info(State(state)));
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["maxPeerHeight"], serde_json::json!(1_500_000));
+    }
+
+    #[test]
+    fn info_always_emits_launch_time() {
+        let state = empty_state();
+        let rt = build_runtime();
+        let Json(info) = rt.block_on(get_info(State(state)));
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["launchTime"], serde_json::json!(TEST_LAUNCH_TIME));
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /debug/memory — component attribution
+    // -----------------------------------------------------------------------
+
+    /// Chain double for `/debug/memory`. Every reported figure is a distinct
+    /// nonzero value, so a handler that swapped two fields, dropped one, or
+    /// did arithmetic on any of them cannot produce a passing assertion.
+    struct MemoryChain;
+
+    impl MemoryChain {
+        const HEIGHT: u32 = 1_234_567;
+        const INDEX_BYTES: u64 = 111_000_111;
+        const HEADER_CACHE_BYTES: u64 = 222_000_222;
+        const SCORE_CACHE_BYTES: u64 = 333_000_333;
+    }
+
+    impl ChainAccess for MemoryChain {
+        fn height(&self) -> u32 {
+            Self::HEIGHT
+        }
+        fn header_at(&self, _h: u32) -> Option<Header> {
+            None
+        }
+        fn header_by_id(&self, _id: &[u8; 32]) -> Option<Header> {
+            None
+        }
+        fn tip(&self) -> Option<Header> {
+            None
+        }
+        fn build_nipopow_proof(
+            &self,
+            _m: u32,
+            _k: u32,
+            _id: Option<[u8; 32]>,
+        ) -> Result<Vec<u8>, String> {
+            Err("unused".into())
+        }
+        fn header_ids(&self, _offset: u32, _limit: u32) -> Vec<[u8; 32]> {
+            vec![]
+        }
+        fn popow_header_by_id(&self, _id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
+            Ok(None)
+        }
+        fn memory_estimate(&self) -> ChainMemory {
+            ChainMemory {
+                index_bytes: Self::INDEX_BYTES,
+                header_cache_bytes: Self::HEADER_CACHE_BYTES,
+                score_cache_bytes: Self::SCORE_CACHE_BYTES,
+            }
+        }
+    }
+
+    fn debug_memory_components(chain: Arc<dyn ChainAccess>) -> serde_json::Value {
+        let rt = build_runtime();
+        let Json(body) = rt.block_on(get_debug_memory(State(test_state(chain))));
+        serde_json::to_value(&body).unwrap()["components"].clone()
+    }
+
+    /// The point of the whole change: what `ChainAccess::memory_estimate()`
+    /// reports is what the JSON carries — same values, same fields, no
+    /// arithmetic in this crate.
+    #[test]
+    fn debug_memory_transports_chain_figures_unmodified() {
+        let c = debug_memory_components(Arc::new(MemoryChain));
+        assert_eq!(
+            c["chainIndexBytes"],
+            serde_json::json!(MemoryChain::INDEX_BYTES)
+        );
+        assert_eq!(
+            c["chainHeaderCacheBytes"],
+            serde_json::json!(MemoryChain::HEADER_CACHE_BYTES)
+        );
+        assert_eq!(
+            c["chainScoreCacheBytes"],
+            serde_json::json!(MemoryChain::SCORE_CACHE_BYTES)
+        );
+        assert_eq!(
+            c["chainHeaderCount"],
+            serde_json::json!(MemoryChain::HEIGHT)
+        );
+        assert_eq!(c["mempoolTxCount"], serde_json::json!(0));
+    }
+
+    /// Pins the serialized key set empirically rather than trusting what
+    /// `rename_all = "camelCase"` is assumed to produce, and keeps
+    /// `chainHeaderEstimateBytes` from returning — including as an alias. It
+    /// was not a misnamed field, it was a wrong number: 1.48 GB attributed to
+    /// a `Vec<Header>` that `chain/` retired in Phase 3.
+    #[test]
+    fn debug_memory_component_keys_are_exactly_the_contract() {
+        let c = debug_memory_components(Arc::new(MemoryChain));
+        let mut keys: Vec<&str> = c
+            .as_object()
+            .expect("components serializes as object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "chainHeaderCacheBytes",
+                "chainHeaderCount",
+                "chainIndexBytes",
+                "chainScoreCacheBytes",
+                "mempoolTxCount",
+            ],
+            "component key set must match facts/openapi.yaml § ComponentMemory"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // NiPoPoW handler tests
     // -----------------------------------------------------------------------
 
-    use crate::ChainAccess;
+    use crate::{ChainAccess, ChainMemory};
     use ergo_chain_types::{
         ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint, Header, Votes,
     };
@@ -2167,6 +2360,21 @@ mod tests {
         }
         fn popow_header_by_id(&self, _id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
             Ok(None)
+        }
+        fn memory_estimate(&self) -> ChainMemory {
+            unreported_memory()
+        }
+    }
+
+    /// `ChainMemory` for doubles that never serve `/debug/memory`. The
+    /// transport assertions live on `MemoryChain`, which reports a distinct
+    /// nonzero value per field — zeros here mean "this double is not the one
+    /// under test", not "the chain uses no memory".
+    fn unreported_memory() -> ChainMemory {
+        ChainMemory {
+            index_bytes: 0,
+            header_cache_bytes: 0,
+            score_cache_bytes: 0,
         }
     }
 
@@ -2428,6 +2636,10 @@ mod tests {
         }
     }
 
+    /// Fixed `launch_time` for `test_state`, so `/info` assertions have
+    /// something deterministic to compare against.
+    const TEST_LAUNCH_TIME: u64 = 1_700_000_000_000;
+
     /// Build a minimal `ApiState` suitable for unit-testing handlers.
     /// Callers override the relevant fields before invoking handlers.
     fn test_state(chain: Arc<dyn ChainAccess>) -> ApiState {
@@ -2446,11 +2658,13 @@ mod tests {
                 version: "0.0.0".into(),
                 network: "testnet".into(),
                 state_type: "utxo".into(),
+                launch_time: TEST_LAUNCH_TIME,
             }),
             mining: None,
             block_submitter: Some(Arc::new(UnusedSubmitter)),
             validated_height: Arc::new(AtomicU32::new(0)),
             downloaded_height: Arc::new(AtomicU32::new(0)),
+            max_peer_height: Arc::new(AtomicU32::new(0)),
             peer_api_urls: Arc::new(Vec::<PeerRestInfo>::new) as _,
             peer_all: Arc::new(Vec::<PeerInfo>::new) as _,
             peer_status: Arc::new(|| PeerStatusSummary {
@@ -2504,6 +2718,9 @@ mod tests {
         }
         fn popow_header_by_id(&self, _id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
             Ok(None)
+        }
+        fn memory_estimate(&self) -> ChainMemory {
+            unreported_memory()
         }
     }
 
@@ -2992,6 +3209,9 @@ mod tests {
         }
         fn popow_header_by_id(&self, _id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
             Ok(None)
+        }
+        fn memory_estimate(&self) -> ChainMemory {
+            unreported_memory()
         }
     }
 
@@ -3634,6 +3854,9 @@ mod tests {
         fn popow_header_by_id(&self, _id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
             Ok(None)
         }
+        fn memory_estimate(&self) -> ChainMemory {
+            unreported_memory()
+        }
     }
 
     /// Submitter that accepts everything — the happy-path stand-in.
@@ -3853,6 +4076,9 @@ mod tests {
         }
         fn popow_header_by_id(&self, _id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
             Ok(None)
+        }
+        fn memory_estimate(&self) -> ChainMemory {
+            unreported_memory()
         }
     }
 
