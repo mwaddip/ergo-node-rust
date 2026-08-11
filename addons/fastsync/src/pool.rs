@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use ergo_chain_types::Header;
+use reqwest::Client;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
@@ -83,6 +84,14 @@ pub struct PeerPool {
     /// None when peers came from `--peer-url` (single-peer mode).
     node_url: Option<String>,
     last_refresh: Instant,
+    /// Client for the peer-discovery query, built once.
+    ///
+    /// Previously `maybe_refresh()` constructed a fresh `Client` on every
+    /// call. Each one owns a connection pool, and reqwest's documentation is
+    /// explicit that a single client should be reused — at one refresh per
+    /// 30 s that was ~480 pools created and dropped over a 4-hour header
+    /// phase.
+    refresh_client: Client,
 }
 
 /// Minimum time between /peers/api-urls refresh queries.
@@ -112,6 +121,10 @@ impl PeerPool {
             last_refresh: Instant::now()
                 .checked_sub(Duration::from_secs(3600))
                 .unwrap_or_else(Instant::now),
+            refresh_client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .context("build peer-refresh client")?,
         })
     }
 
@@ -136,14 +149,8 @@ impl PeerPool {
         }
         self.last_refresh = Instant::now();
 
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-        {
-            Ok(c) => c,
-            Err(_) => return 0,
-        };
-        let resp = match client
+        let resp = match self
+            .refresh_client
             .get(format!("{node_url}/peers/api-urls"))
             .send()
             .await
@@ -528,9 +535,20 @@ impl PeerPool {
     ///
     /// Batches are distributed round-robin across healthy peers. Order
     /// doesn't matter for block sections — the node accepts them in any order.
+    /// Takes `header_ids` BY VALUE and moves the strings into the batch queue.
+    ///
+    /// It previously took a slice and cloned every id, so the caller's
+    /// `Vec<(u32, String)>` and the queue's copies were alive simultaneously
+    /// for the whole of phase 2 — at 1.82M headers that is ~167 MiB plus a
+    /// ~153 MiB duplicate. Consuming the vec moves each `String` instead
+    /// (pointer move, no heap copy) and frees the tuple array as the
+    /// iterator drains.
+    ///
+    /// Nothing needs the ids after this call; the caller's only other use is
+    /// a `len()` for a log line, which it now captures beforehand.
     pub async fn fetch_blocks(
         &mut self,
-        header_ids: &[(u32, String)],
+        header_ids: Vec<(u32, String)>,
         ingest: &IngestClient,
     ) -> Result<u32> {
         let batch_size = block_batch_size();
@@ -538,12 +556,16 @@ impl PeerPool {
         let phase_start = Instant::now();
         let mut last_log = phase_start;
 
-        // Pre-build owned batches: (min_height, max_height, header_ids)
+        // Build owned batches: (min_height, max_height, header_ids).
+        // The queue is still materialised up front because a failed batch is
+        // re-queued for another peer, so the ids must outlive their task.
         let mut queue: VecDeque<(u32, u32, Vec<String>)> = VecDeque::new();
-        for chunk in header_ids.chunks(batch_size) {
+        let mut it = header_ids.into_iter().peekable();
+        while it.peek().is_some() {
+            let chunk: Vec<(u32, String)> = it.by_ref().take(batch_size).collect();
             let min_h = chunk.first().map(|(h, _)| *h).unwrap_or(0);
             let max_h = chunk.last().map(|(h, _)| *h).unwrap_or(0);
-            let ids: Vec<String> = chunk.iter().map(|(_, id)| id.clone()).collect();
+            let ids: Vec<String> = chunk.into_iter().map(|(_, id)| id).collect();
             queue.push_back((min_h, max_h, ids));
         }
         let total_batches = queue.len() as u32;

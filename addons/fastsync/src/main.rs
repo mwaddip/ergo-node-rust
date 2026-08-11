@@ -188,10 +188,13 @@ async fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    info!(blocks = header_ids.len(), "phase 2: fetching block sections");
+    let block_count = header_ids.len();
+    info!(blocks = block_count, "phase 2: fetching block sections");
 
     let phase2_start = Instant::now();
-    let sections_pushed = pool.fetch_blocks(&header_ids, &ingest).await?;
+    // Moved, not borrowed — `fetch_blocks` drains the ids into its batch queue
+    // rather than cloning them, so only one copy of the id list exists.
+    let sections_pushed = pool.fetch_blocks(header_ids, &ingest).await?;
     let phase2_elapsed = phase2_start.elapsed();
 
     info!(

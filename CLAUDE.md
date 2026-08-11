@@ -26,12 +26,13 @@ Full Ergo blockchain node in Rust. Not a port of the JVM node — a ground-up im
 
 **Main session does not edit crate-internal source files.** All work
 inside `sync/`, `validation/`, `state/`, `store/`, `mempool/`, `api/`,
-`mining/`, `p2p/`, `chain/`, or `addons/*/` is dispatched to a
+`mining/`, `p2p/`, or `chain/` is dispatched to a
 per-crate Claude session via the `dispatching-prompts` skill. Main
 session edits are limited to top-level orchestration: `Cargo.toml`
 (workspace), `README.md`, `CHANGELOG.md`, `LICENSE`, `build-deb`,
 `deploy/`, `man/`, top-level docs, scripts under repo root, the
-prompt files in `prompts/`, **and the `facts/` directory** — the
+prompt files in `prompts/`, **the `addons/` tree** (see below),
+**and the `facts/` directory** — the
 contracts are main session's responsibility. Dispatched sessions
 read contracts via `../facts/` and deliver code that conforms to
 them; they do not edit those contracts. When a contract needs
@@ -42,6 +43,17 @@ The dispatched session runs in `cd <crate>` and operates within that
 directory's boundary — it does not edit parent or sibling
 directories. The repo-root `facts/` directory is the single source
 of truth for cross-crate contracts.
+
+**`addons/` is main session's, including source.** `addons/fastsync`
+and `addons/indexer` are small, focused packages that don't warrant
+their own session and the scaffolding it needs — and they have none
+of it: no per-crate `CLAUDE.md`, no `SPECIAL.md`, no contract in
+`facts/`. They are also `exclude`d from the workspace with their own
+lockfiles. Dispatching into them would land a session in a directory
+with none of the context the dispatch protocol assumes. Main session
+edits them directly, source included. (Their version bumps and
+lockfile re-syncs at release time were always main's anyway, under
+the mechanical-housekeeping exception below.)
 
 **Exception — mechanical housekeeping crosses boundaries.** Uniform,
 cross-cutting metadata edits applied identically across the workspace —
