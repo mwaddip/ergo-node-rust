@@ -232,6 +232,19 @@ block_height to `0`.
 **Postconditions on Err:**
 - Storage is unchanged
 
+⚠ **Invariant — the returned `NodeId` must be a fresh allocation.** Step 6
+deserializes the root out of storage bytes (`tree.unpack`). It must never hand
+back a cached live `Rc`, however tempting a node-level cache looks on the
+short-circuit path. The prover's `modified_nodes` map is keyed by node
+*address*, and `on_node_visit` inserts every **visited** node rather than only
+modified ones, so a recycled handle is restored into a map that still holds its
+stale entry; `pack_tree` then expands nodes it should have labelled and the
+prover emits **a different proof for identical tree state** — upstream measured
+740 vs 735 bytes at the same digest. Caching the packed *bytes* is safe and
+carries none of this. This is the reason `rollback()` may not return a handle it
+already holds. Cross-reference: `facts/validation.md` § "Err leaves the prover
+clean".
+
 ### `version()` — current ADDigest
 
 Returns `None` if no updates have been applied (empty storage).

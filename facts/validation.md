@@ -205,15 +205,30 @@ operation. Both paths work, for different reasons; do not collapse them.
 Precondition: `storage.current_version` must be `Some`, which
 `UtxoValidator::new` already documents and guarantees.
 
-⚠ **`restore_root` does not clear `base.modified_nodes`.** It clears the
-changed-node buffers and directions and rebases `old_top_node`, but leaves the
-address-keyed map `pack_tree` gates on holding every node the failed block
-touched. Not a correctness bug — each entry owns an `Rc`, so a live address
-cannot be recycled and nothing is misidentified — but an unbounded retention,
-and inline mode promotes it from never-happens to once per hostile block.
-Cleared in `rollback_prover_to` as a local workaround; **the proper home is
-`restore_root` itself in the `mwaddip/ergo_avltree_rust` fork**, beside the
-three clears it already performs.
+**`restore_root` clears `base.modified_nodes`** as of the fork rev this
+workspace pins — `b955790`, in the `[patch.crates-io]` table of the root
+`Cargo.toml`. Revs before it cleared the changed-node buffers and directions
+and rebased `old_top_node` but left the address-keyed map `pack_tree` gates on
+holding every node the failed block touched: not a correctness bug, since each
+entry owns an `Rc` and a live address cannot be recycled, but an unbounded
+retention that inline mode promotes from never-happens to once per hostile
+block. `rollback_prover_to` carried a local `modified_nodes.clear()` for that;
+it is redundant at this rev. Anyone reading an older tree should not conclude
+the clear is load-bearing.
+
+⚠ **The upstream fix carries a precondition on `state/`.** The same defect has
+a worse form that we are exempt from *by construction, not by luck*: two
+provers driven to identical tree state emitting **740 vs 735 proof bytes** —
+same digest, different proof. `on_node_visit` keys every **visited** node, not
+only modified ones, so a storage layer whose `rollback` hands back a **live**
+`NodeId` restores a root whose nodes are still keyed in the stale map, and
+`pack_tree` then expands nodes it should have labelled. Both
+`RedbAVLStorage::rollback` paths end at `tree.unpack` of bytes freshly copied
+out of a redb read transaction (`state/src/storage.rs:1042`, `:1140`), so the
+restored root is always a fresh allocation and the divergence is unreachable
+here. **A node-level cache in `state/` returning live `Rc` handles from
+`rollback` would make a wrong proof reachable.** Caching the *bytes* is fine;
+caching the *handles* is a consensus bug.
 
 ### Open: inline discards the block cost
 
