@@ -256,6 +256,22 @@ pub struct SyncConfig {
     /// budget at ~70 evals, nowhere near this count. Drop either and one
     /// regime goes unbounded.
     pub eval_backlog_max_blocks: u32,
+    /// Height at or below which the validator skips ErgoScript evaluation.
+    /// `0` (default) means no checkpoint and the frontier floor is a no-op.
+    ///
+    /// Sync does not use this to decide anything about validation — it never
+    /// sees an eval for these heights in the first place. It uses it as the
+    /// floor for `script_verified_height`: without it, a node with a checkpoint
+    /// above its start height has a frontier that can never reach the
+    /// checkpoint, because the results that would fill the gap are never
+    /// produced. See ../facts/sync.md § "Checkpoint frontier hole".
+    ///
+    /// MUST be fed from the same expression the validator is constructed with
+    /// (`configured_checkpoint.unwrap_or(0)` in `src/main.rs`). Two
+    /// independently-derived checkpoints that disagree put the floor and the
+    /// eval-skip boundary at different heights, which reopens this hole one
+    /// block wide and far harder to see.
+    pub checkpoint_height: u32,
 }
 
 impl Default for SyncConfig {
@@ -293,6 +309,10 @@ impl Default for SyncConfig {
             // field OOM at ~2.4% of the 10.62 GiB anon-rss it reached.
             eval_backlog_max_mb: 256,
             eval_backlog_max_blocks: 256,
+            // 0 = no checkpoint, which is the default node. The main crate
+            // overrides from the same `configured_checkpoint.unwrap_or(0)` it
+            // builds the validator with.
+            checkpoint_height: 0,
         }
     }
 }
@@ -509,6 +529,11 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         let initial_validated = validator.as_ref().map_or(0, |v| v.validated_height());
         let (eval_tx, eval_rx) = mpsc::unbounded_channel();
         let last_flush_height = initial_validated;
+        // Read before `config` is moved into the struct below. The frontier
+        // starts on the floor rather than being lifted onto it later — a fresh
+        // node with a checkpoint has never verified anything below it and never
+        // will. See [`Self::set_script_frontier`].
+        let initial_script_verified = initial_validated.max(config.checkpoint_height);
         Self {
             config,
             transport,
@@ -529,7 +554,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             sync_sent_count: 0,
             downloaded_height: initial_validated,
             state_applied_height: initial_validated,
-            script_verified_height: initial_validated,
+            script_verified_height: initial_script_verified,
             evals_in_flight: 0,
             eval_bytes_in_flight: 0,
             eval_generation: 0,
@@ -740,7 +765,10 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         // proved state correctness. Proof boxes aren't available without
         // re-running apply_state, so re-evaluation isn't feasible here.
         if let Some(persisted_svh) = self.store.script_verified_height().await {
-            self.script_verified_height = persisted_svh.min(self.state_applied_height);
+            // Floored: a persisted watermark written before the operator
+            // configured a checkpoint — or by a build predating the floor —
+            // would otherwise reload below it and park there permanently.
+            self.set_script_frontier(persisted_svh.min(self.state_applied_height));
             if persisted_svh < self.state_applied_height {
                 let gap = self.state_applied_height - persisted_svh;
                 tracing::info!(
@@ -751,7 +779,11 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 );
                 // Advance to match — the gap blocks' state transitions are
                 // already proven correct by the AVL digest check in apply_state.
-                self.script_verified_height = self.state_applied_height;
+                // Routed through the setter for the floor only; whether this
+                // gap SHOULD be advanced over is a separate and still-open
+                // question (../facts/sync.md § "Startup gap handling"), and
+                // nothing here decides it either way.
+                self.set_script_frontier(self.state_applied_height);
                 // Lock in the new floor durably so a restart before the next
                 // flush doesn't re-discover the same gap. Without this the
                 // persisted SVH stays stuck at the old value across restarts.
@@ -1651,7 +1683,13 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 (true, false) => "bytes",
                 _ => "blocks",
             },
-            "deferred eval backlog at bound — draining to half"
+            // Marker per `../facts/journal-events.md` § `deferred_eval_gate_engaged`.
+            // It must not begin with `deferred_eval_backlog`'s marker — a prefix
+            // parser keyed on the shorter one matched both events and then failed
+            // looking for `eval_lag`, which only the backlog record carries — and
+            // the matched portion is ASCII, so the em dash lives in the suffix
+            // where a parser never has to reproduce it.
+            "eval dispatch gate engaged — draining to half"
         );
 
         let pre_tip = self.validator.as_ref().map(|v| v.validated_height());
@@ -1734,8 +1772,42 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         self.advance_script_frontier().await;
     }
 
+    /// Move `script_verified_height` to `height`, never below
+    /// `config.checkpoint_height`.
+    ///
+    /// Every non-advancing write to the frontier goes through here, and that is
+    /// the point: the floor is not a startup fixup, it is an invariant. Heights
+    /// at or below the checkpoint never dispatch an eval, so no result can ever
+    /// arrive to carry the frontier across them — a frontier parked below the
+    /// checkpoint is parked permanently. Startup closing the hole is not enough
+    /// on its own, because a rollback or a reorg to a fork point below the
+    /// checkpoint would reopen it, and then it stays open for the life of the
+    /// process. Routing the writes through one setter is also what keeps a
+    /// *future* write site from quietly reintroducing it.
+    ///
+    /// `0` (the default, no checkpoint) makes this `height.max(0)` — a no-op.
+    ///
+    /// The floor can transiently put the frontier above `state_applied_height`,
+    /// which the contract's ordering invariant does not otherwise allow: a reorg
+    /// to a fork point below the checkpoint retreats state below the floor while
+    /// the frontier stays on it. That is correct rather than merely tolerated —
+    /// the new branch's sub-checkpoint blocks skip evaluation exactly as the old
+    /// branch's did, so no script work is owed down there either — and it
+    /// resolves as the sweep re-applies. `eval_lag()` saturates meanwhile.
+    /// See ../facts/sync.md § "Checkpoint frontier hole".
+    ///
+    /// Does NOT persist; callers that need durability call
+    /// `store.set_script_verified_height` afterwards as they always did.
+    fn set_script_frontier(&mut self, height: u32) {
+        self.script_verified_height = height.max(self.config.checkpoint_height);
+    }
+
     /// Step `script_verified_height` over every contiguous height the reorder
     /// buffer holds, then persist if it moved.
+    ///
+    /// Not routed through [`Self::set_script_frontier`]: this only ever
+    /// increments from the current value, so it cannot land below a floor the
+    /// current value already respects.
     async fn advance_script_frontier(&mut self) {
         let prev = self.script_verified_height;
         while self.eval_verified.remove(&(self.script_verified_height + 1)) {
@@ -1767,10 +1839,27 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             let hole = self.script_verified_height + 1;
             if self.eval_frontier_hole != Some(hole) {
                 self.eval_frontier_hole = Some(hole);
+                // The applied tip read from the validator, NOT from
+                // `self.state_applied_height`. That field is a cache reconciled
+                // only after the sweep loop, so mid-sweep — which is exactly
+                // when the dispatch gate's drain lands here — it is frozen at
+                // the pre-sweep tip and would understate the span. Same trap,
+                // and the same resolution, as `deferred_eval_backlog`'s field
+                // of this name (`../facts/journal-events.md`). Falls back to the
+                // cache in light mode, where there is no validator to ask and no
+                // eval is ever dispatched anyway.
+                let state_applied_height = self
+                    .validator
+                    .as_ref()
+                    .map_or(self.state_applied_height, |v| v.validated_height());
                 tracing::warn!(
                     script_verified_height = self.script_verified_height,
                     hole,
                     buffered = self.eval_verified.len(),
+                    // The severity number: how far state has run ahead of a
+                    // frontier that cannot move, i.e. how large a span this
+                    // leaves unattested.
+                    state_applied_height,
                     "no eval outstanding below the script frontier — it cannot advance past this height"
                 );
             }
@@ -1817,7 +1906,11 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         self.invalidate_pending_evals();
 
         self.state_applied_height = rollback_to;
-        self.script_verified_height = rollback_to;
+        // Floored. `failed_height` had an eval dispatched, so it is above the
+        // checkpoint and `rollback_to` is at or above it — the floor is inert
+        // on this path today. It goes through the setter anyway: the property
+        // that keeps it inert lives in `validation/`, not here.
+        self.set_script_frontier(rollback_to);
         self.store.set_script_verified_height(self.script_verified_height).await;
         if self.downloaded_height > rollback_to {
             self.downloaded_height = rollback_to;
@@ -1892,7 +1985,13 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     if rolled_back {
                         self.invalidate_pending_evals();
                         self.state_applied_height = fork_point;
-                        self.script_verified_height = fork_point;
+                        // Floored. This is the site that makes the floor an
+                        // invariant rather than a startup fixup: a reorg to a
+                        // fork point below the checkpoint would drop the
+                        // frontier into a region no eval will ever report on,
+                        // reopening for the life of the process the hole
+                        // startup had closed.
+                        self.set_script_frontier(fork_point);
                         self.store.set_script_verified_height(self.script_verified_height).await;
                     }
                 }
@@ -3140,15 +3239,14 @@ mod blocks_to_keep_tests {
     //!
     //! See `../facts/sync.md` § "Block Body Retention".
     use super::*;
+    use crate::test_support::capture_warn;
     use enr_chain::{ChainError, SyncInfo};
     use ergo_chain_types::{ADDigest, Header};
     use ergo_validation::{
         ApplyStateOutcome, BlockValidator, Parameters, ValidationError,
     };
-    use std::io;
     use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicBool, AtomicU32};
-    use tracing_subscriber::fmt::MakeWriter;
 
     /// Mock store recording prune + min_height calls in addition to the
     /// flush-pair calls. Tests assert on the recorded sequence.
@@ -3600,57 +3698,6 @@ mod blocks_to_keep_tests {
 
     // ----- startup WARN capture -----
 
-    #[derive(Clone, Default)]
-    struct CaptureWriter {
-        buf: Arc<Mutex<Vec<u8>>>,
-    }
-
-    impl CaptureWriter {
-        fn captured(&self) -> String {
-            String::from_utf8(self.buf.lock().unwrap().clone()).unwrap()
-        }
-    }
-
-    impl io::Write for CaptureWriter {
-        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-            self.buf.lock().unwrap().extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for CaptureWriter {
-        type Writer = CaptureWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    // Takes the future directly rather than a closure so the caller can
-    // pass `sync.maybe_warn_reclaimable_bodies()` — a future borrowing
-    // `&mut sync` — without wrapping it in `move || async move {…}` to
-    // satisfy capture rules. The subscriber's `_guard` outlives the
-    // `await`, so emits from the future are captured.
-    async fn capture_warn<Fut>(f: Fut) -> String
-    where
-        Fut: std::future::Future<Output = ()>,
-    {
-        let writer = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(writer.clone())
-            .without_time()
-            .with_ansi(false)
-            .with_target(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        f.await;
-        drop(_guard);
-        writer.captured()
-    }
-
     #[tokio::test]
     async fn startup_warn_fires_when_archive_predates_horizon() {
         // blocks_to_keep=100, validator at 1000, voting_length=1024.
@@ -3762,11 +3809,13 @@ mod sweep_resume_tests {
     //! directly and assert the sweep resumes at `applied_tip + 1` and
     //! applies the intervening on-disk blocks instead of wedging.
     use super::*;
+    use crate::test_support::capture_async;
     use enr_chain::{ChainError, SyncInfo};
     use ergo_chain_types::{ADDigest, Header};
     use ergo_validation::{ApplyStateOutcome, BlockValidator, Parameters, ValidationError};
     use std::sync::atomic::{AtomicBool, AtomicU32};
     use std::sync::Arc;
+    use tracing::level_filters::LevelFilter;
 
     fn fake_header(height: u32) -> Header {
         use ergo_chain_types::*;
@@ -4763,6 +4812,310 @@ mod sweep_resume_tests {
             "healthy sweep caught up to the downloaded tip"
         );
         assert_eq!(sync.sweep_backoff.consecutive(), 0, "progress arms no backoff");
+    }
+
+    // ---- journal-event conformance (`../facts/journal-events.md`) ----
+    //
+    // Every assertion below runs the REAL emit site through this module's
+    // harness and reads the rendered line. That distinction is the whole point
+    // of the section: the conformance tests these replace called `info!()` with
+    // their own copy of the marker and then asserted the output contained that
+    // copy, which tests `tracing`'s formatter against itself and cannot fail
+    // when an emit site drifts. Two of the events below shipped not matching
+    // the contract under a green suite for exactly that reason.
+    //
+    // Break a marker or drop a field in `src/state.rs` and these go red.
+
+    /// Assert `output` renders `key=value` as a **whole field**.
+    ///
+    /// `contains("height=1785500")` is not sufficient and the difference is not
+    /// pedantic: it also matches `tip_height=1785500` — a renamed field, which
+    /// breaks a consumer exactly as hard as a dropped one — and it matches
+    /// `height=17855001`. Fields in the default formatter follow the message
+    /// and are space-separated, so a real field is a whole whitespace token,
+    /// which is also how a consumer's parser has to find it. Values containing
+    /// spaces (a Display-formatted error) need a substring assertion instead.
+    fn has_field(output: &str, key: &str, value: &str) -> bool {
+        let want = format!("{key}={value}");
+        output.split_whitespace().any(|token| token == want)
+    }
+
+    #[track_caller]
+    fn assert_field(output: &str, key: &str, value: &str) {
+        assert!(
+            has_field(output, key, value),
+            "missing field {key}={value}: {output}"
+        );
+    }
+
+    #[test]
+    fn has_field_rejects_a_renamed_or_truncated_field() {
+        // The self-check for the assertion helper: without it these three all
+        // look like a present `height=1785500`.
+        assert!(has_field(" INFO chain tip reached height=1785500", "height", "1785500"));
+        assert!(
+            !has_field(" INFO chain tip reached tip_height=1785500", "height", "1785500"),
+            "a renamed field must not satisfy the assertion"
+        );
+        assert!(
+            !has_field(" INFO chain tip reached height=17855001", "height", "1785500"),
+            "a different value must not satisfy the assertion"
+        );
+    }
+
+    /// `deferred_eval_gate_engaged` — DEBUG, per the contract. Note the level:
+    /// the shared capture defaults to INFO, under which this event renders to
+    /// nothing and looks exactly like an event that was never emitted.
+    #[tokio::test]
+    async fn journal_deferred_eval_gate_engaged_conforms() {
+        let mut sync = build_sync_with_config(SweepValidator::at(3600), backlog_config(1, 8));
+        sync.script_verified_height = 3000;
+        dispatch_stub(&mut sync, 8);
+        for h in 3001..=3008 {
+            send_ok(&sync, h);
+        }
+
+        let output = capture_async(
+            LevelFilter::DEBUG,
+            sync.await_eval_capacity(STUB_EVAL_BYTES),
+        )
+        .await;
+
+        const MARKER: &str = "eval dispatch gate engaged";
+
+        let line = output
+            .lines()
+            .find(|l| l.contains(MARKER))
+            .unwrap_or_else(|| panic!("missing marker {MARKER:?}: {output}"));
+        // The defect that broke consumers: the marker used to begin with the
+        // whole of `deferred_eval_backlog`'s, so a parser keyed on the shorter
+        // prefix matched this event too and then failed looking for `eval_lag`.
+        assert!(
+            !line.contains("deferred eval backlog"),
+            "no marker may begin with another event's marker: {line}"
+        );
+        // And the matched portion is ASCII. The em dash is legal in the
+        // free-text suffix — it is still there — but a parser must never have
+        // to reproduce one inside the part it matches on.
+        let matched = &line[..line.find(MARKER).unwrap() + MARKER.len()];
+        assert!(
+            matched.is_ascii(),
+            "the matched prefix must survive being retyped from a report, a \
+             terminal, or a grep: {matched:?}"
+        );
+        assert!(
+            line.contains('—'),
+            "the em dash belongs in the suffix, not nowhere: {line}"
+        );
+
+        assert_field(&output, "evals_in_flight", "8");
+        assert_field(
+            &output,
+            "eval_bytes_in_flight",
+            &(8 * STUB_EVAL_BYTES).to_string(),
+        );
+        // The eval that did not fit — explains why *this* block tripped it.
+        assert_field(&output, "incoming_bytes", &STUB_EVAL_BYTES.to_string());
+        // The two limits are deliberately NOT fields: they are static and the
+        // operator already has them. Only what varies is emitted.
+        assert!(
+            !output.contains("eval_backlog_max"),
+            "configured limits are not fields of this event: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_gate_engaged_names_which_bound_tripped() {
+        // `bound` exists so an operator re-tuning one limit knows which regime
+        // the host is in, rather than inferring it from the two numbers.
+        async fn bound_field(config: SyncConfig, stubs: u32) -> String {
+            let mut sync = build_sync_with_config(SweepValidator::at(3600), config);
+            sync.script_verified_height = 3000;
+            dispatch_stub(&mut sync, stubs);
+            for h in 3001..=(3000 + stubs) {
+                send_ok(&sync, h);
+            }
+            capture_async(
+                LevelFilter::DEBUG,
+                sync.await_eval_capacity(STUB_EVAL_BYTES),
+            )
+            .await
+        }
+
+        // 8 stubs is exactly 1 MiB, so one more breaches the byte bound; with
+        // the count bound at 8 it breaches that too.
+        assert_field(&bound_field(backlog_config(1, 0), 8).await, "bound", "\"bytes\"");
+        assert_field(&bound_field(backlog_config(0, 8), 8).await, "bound", "\"blocks\"");
+        assert_field(&bound_field(backlog_config(1, 8), 8).await, "bound", "\"both\"");
+    }
+
+    /// `eval_frontier_hole` — WARN, latched once per distinct hole.
+    #[tokio::test]
+    async fn journal_eval_frontier_hole_conforms() {
+        let mut sync = build_sync(SweepValidator::at(3560));
+        sync.script_verified_height = 3521;
+        sync.state_applied_height = 3560;
+
+        // 3522's eval was never dispatched — the checkpoint case. Everything
+        // above it reports Ok and piles up behind the hole.
+        let output = capture_async(LevelFilter::WARN, async {
+            for h in 3523..=3560 {
+                dispatch_stub(&mut sync, 1);
+                send_ok(&sync, h);
+                sync.drain_eval_results(DrainTarget::Available).await;
+            }
+        })
+        .await;
+
+        assert!(
+            output.contains("no eval outstanding below the script frontier"),
+            "missing marker: {output}"
+        );
+        // Where the frontier is stuck, and the height it cannot pass.
+        assert_field(&output, "script_verified_height", "3521");
+        assert_field(&output, "hole", "3522");
+        // The reorder-buffer entries discarded at this point: 3523 was drained
+        // first, the 37 above it landed on later drains once the latch was set.
+        assert_field(&output, "buffered", "1");
+        // The severity number: how far state ran ahead of a frontier that
+        // cannot move, i.e. the size of the span this leaves unattested.
+        assert_field(&output, "state_applied_height", "3560");
+        assert_eq!(
+            output
+                .matches("no eval outstanding below the script frontier")
+                .count(),
+            1,
+            "latched: once per distinct hole, not once per block — otherwise \
+             this is a WARN on every block for the life of the process: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_eval_frontier_hole_reports_the_validator_tip_not_the_stale_cache() {
+        // The trap `deferred_eval_backlog` documents for its field of this
+        // name, and this drain hits it harder: the dispatch gate's drain runs
+        // MID-sweep, where `state_applied_height` is still frozen at the
+        // pre-sweep tip. Reading the cache would understate the unattested
+        // span by the whole sweep.
+        let mut sync = build_sync(SweepValidator::at(3560));
+        sync.script_verified_height = 3521;
+        sync.state_applied_height = 3000; // pre-sweep cache, 560 blocks stale
+
+        let output = capture_async(LevelFilter::WARN, async {
+            dispatch_stub(&mut sync, 1);
+            send_ok(&sync, 3523);
+            sync.drain_eval_results(DrainTarget::Available).await;
+        })
+        .await;
+
+        assert!(
+            has_field(&output, "state_applied_height", "3560"),
+            "must report the validator's applied tip, not the stale cache \
+             (3000): {output}"
+        );
+    }
+
+    /// `validation_rollback_failed` — ERROR, `path="eval_failure"`.
+    #[tokio::test]
+    async fn journal_validation_rollback_failed_conforms() {
+        let mut sync = build_sync(SweepValidator::at(2670).failing_reset());
+        sync.state_applied_height = 2670;
+        sync.script_verified_height = 2670;
+        sync.downloaded_height = 2670;
+
+        let output =
+            capture_async(LevelFilter::ERROR, sync.handle_eval_failure(2669)).await;
+
+        assert!(
+            output.contains("validation rollback failed"),
+            "missing marker: {output}"
+        );
+        // The rollback TARGET (failed_height - 1), not the failing block.
+        assert_field(&output, "height", "2668");
+        assert_field(&output, "path", "\"eval_failure\"");
+        // `ValidationError`'s Display, not the bare message the validator
+        // constructed — the mirror this replaces asserted the bare string and
+        // passed, because it was matching its own `info!()` rather than the
+        // emit. The contract says "Display-formatted"; this is what that is.
+        assert!(
+            output.contains(
+                "error=UTXO state operation failed: rollback to height 2668 failed"
+            ),
+            "missing the Display-formatted underlying error: {output}"
+        );
+    }
+
+    /// `validation_sweep_started` / `block_applied` / `validation_sweep_complete`
+    /// in one pass — they are emitted by one sweep and a test that drives the
+    /// sweep gets all three.
+    #[tokio::test]
+    async fn journal_sweep_and_block_applied_conform() {
+        // The sweep markers are gated on `sweep_size > 100`, so the window has
+        // to be a real catch-up sweep rather than a tip follow.
+        let mut sync = build_sync(SweepValidator::at(1000));
+        sync.downloaded_height = 1150;
+
+        let output = capture_async(
+            LevelFilter::INFO,
+            sync.advance_state_applied_height(),
+        )
+        .await;
+
+        assert!(
+            output.contains("VALIDATION SWEEP STARTED"),
+            "missing started marker: {output}"
+        );
+        assert!(
+            output.contains("VALIDATION SWEEP COMPLETE"),
+            "missing complete marker: {output}"
+        );
+        // The marker is the literal prefix. The emit shape was once
+        // "=== VALIDATION SWEEP STARTED ===", which prefix-matches nothing.
+        assert!(
+            !output.contains("==="),
+            "markers are plain text, not decorated: {output}"
+        );
+        assert_field(&output, "from", "1001");
+        assert_field(&output, "to", "1150");
+        assert_field(&output, "blocks", "150");
+
+        // `block applied` once per block that advanced the tip, carrying the
+        // height and the 32-byte hex id. `fake_header` derives the id from the
+        // height, so this pins the Display rendering of a real `BlockId`.
+        assert_eq!(
+            output.matches("block applied").count(),
+            150,
+            "one per applied block: {output}"
+        );
+        let applied = output
+            .lines()
+            .find(|l| l.contains("block applied"))
+            .expect("counted above");
+        assert_field(applied, "height", "1001");
+        // fake_header(1001): BlockId(Digest32::from([1001 as u8; 32])) → 0xe9.
+        assert_field(applied, "id", &"e9".repeat(32));
+    }
+
+    /// `chain_tip_reached` — INFO, emitted on entry to `synced()`.
+    ///
+    /// `synced()` is a `select!` loop, but it is driveable here: the first
+    /// `ticker.tick()` completes immediately, finds `outbound_peers()` empty,
+    /// and returns. The emit is above the loop, so it has already fired.
+    #[tokio::test]
+    async fn journal_chain_tip_reached_conforms() {
+        let mut sync = build_sync_with_chain(
+            SweepValidator::at(1_785_500),
+            SweepChain::at_tip(1_785_500),
+        );
+        sync.downloaded_height = 1_785_500;
+
+        let output = capture_async(LevelFilter::INFO, sync.synced()).await;
+
+        assert!(
+            output.contains("chain tip reached"),
+            "missing marker: {output}"
+        );
+        assert_field(&output, "height", "1785500");
     }
 }
 

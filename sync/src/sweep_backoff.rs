@@ -225,46 +225,12 @@ fn delay_for(consecutive: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Captures the rendered `validation_stuck` line. WARN is above the INFO
+    // default, so the shared INFO capture sees it.
+    use crate::test_support::capture;
 
     fn now() -> Instant {
         Instant::from_std(std::time::Instant::now())
-    }
-
-    /// Capture the default tracing fmt output produced by `f`, so a test
-    /// can assert the rendered `validation_stuck` line.
-    fn capture<F: FnOnce()>(f: F) -> String {
-        use std::io;
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::fmt::MakeWriter;
-
-        #[derive(Clone, Default)]
-        struct W(Arc<Mutex<Vec<u8>>>);
-        impl io::Write for W {
-            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> MakeWriter<'a> for W {
-            type Writer = W;
-            fn make_writer(&'a self) -> W {
-                self.clone()
-            }
-        }
-
-        let w = W::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(w.clone())
-            .without_time()
-            .with_ansi(false)
-            .with_target(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        let bytes = w.0.lock().unwrap().clone();
-        String::from_utf8(bytes).unwrap()
     }
 
     #[test]

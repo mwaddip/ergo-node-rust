@@ -58,6 +58,21 @@ breaking them on 2026-08-12:
   shipped with a U+2014 inside its marker while this document specified a
   hyphen, so the documented literal matched nothing.
 
+One field-level convention, which applies to **every** event that carries it:
+
+- **`state_applied_height` is always `validator.validated_height()`, never
+  `HeaderSync`'s struct field of the same name.** That field is a cache
+  reconciled at sweep *end*; any event emitted mid-sweep reads it frozen at the
+  pre-sweep tip. This is stated once here rather than per entry because it has
+  now caught two events — `deferred_eval_backlog`, where the stale read would
+  peg `eval_lag` at 0 by saturation and report a healthy node while the queue
+  grew, and `eval_frontier_hole`, which is reached from the dispatch gate's
+  mid-sweep drain. Assume the next event that carries the field has the same
+  trap.
+
+A parser consuming these cannot tell a stale value from a fresh one, which is
+why the rule lives in the contract rather than in a comment at each emit site.
+
 Example emit:
 
 ```rust

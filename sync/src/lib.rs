@@ -11,6 +11,8 @@ mod retention;
 pub mod snapshot;
 mod state;
 mod sweep_backoff;
+#[cfg(test)]
+mod test_support;
 mod traits;
 
 pub use state::{HeaderSync, SyncConfig};

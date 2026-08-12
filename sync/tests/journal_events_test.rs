@@ -1,192 +1,46 @@
-//! Verifies that the sync crate's journal-events emissions render with
-//! the marker prefixes and named fields promised in
-//! `facts/journal-events.md`. The Doctor adapter and other downstream
-//! consumers parse on these strings — drift here is silent breakage
+//! Journal-event conformance for the sync crate — `facts/journal-events.md`.
+//!
+//! The Doctor adapter and other downstream consumers parse on the marker
+//! prefixes and field names this crate emits; drift here is silent breakage
 //! over there.
 //!
-//! These tests assert the SHAPE of the emit, mirroring the per-event
-//! tracing calls in `src/state.rs`. They don't drive the state machine
-//! end-to-end — that's covered by the integration tests under `tests/`
-//! and the live mainnet run. The contract anchor is the rendered line.
-
-use std::io;
-use std::sync::{Arc, Mutex};
-use tracing::{error, info, warn};
-use tracing_subscriber::fmt::MakeWriter;
-
-#[derive(Clone, Default)]
-struct CaptureWriter {
-    buf: Arc<Mutex<Vec<u8>>>,
-}
-
-impl CaptureWriter {
-    fn captured(&self) -> String {
-        String::from_utf8(self.buf.lock().unwrap().clone()).unwrap()
-    }
-}
-
-impl io::Write for CaptureWriter {
-    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-        self.buf.lock().unwrap().extend_from_slice(b);
-        Ok(b.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for CaptureWriter {
-    type Writer = CaptureWriter;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-fn capture<F: FnOnce()>(f: F) -> String {
-    let writer = CaptureWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(writer.clone())
-        .without_time()
-        .with_ansi(false)
-        .with_target(false)
-        .finish();
-    tracing::subscriber::with_default(subscriber, f);
-    writer.captured()
-}
-
-#[test]
-fn validation_sweep_started_has_marker_and_named_fields() {
-    let sweep_from: u64 = 1_000_000;
-    let sweep_to: u64 = 1_000_500;
-    let sweep_size: u64 = 500;
-    let output = capture(|| {
-        info!(
-            from = sweep_from,
-            to = sweep_to,
-            blocks = sweep_size,
-            "VALIDATION SWEEP STARTED"
-        );
-    });
-    assert!(
-        output.contains("VALIDATION SWEEP STARTED"),
-        "missing marker: {output}"
-    );
-    // The contract pins the marker as the literal prefix — no decorative
-    // ===, no embedded values. The old emit shape was
-    // "=== VALIDATION SWEEP STARTED ===" which prefix-matches the
-    // contract regex but is noisier than necessary.
-    assert!(
-        !output.contains("==="),
-        "marker should be plain text, not decorated: {output}"
-    );
-    assert!(
-        output.contains("from=1000000"),
-        "missing from field: {output}"
-    );
-    assert!(
-        output.contains("to=1000500"),
-        "missing to field: {output}"
-    );
-    assert!(
-        output.contains("blocks=500"),
-        "missing blocks field: {output}"
-    );
-}
-
-#[test]
-fn validation_sweep_complete_has_marker_and_named_fields() {
-    let sweep_from: u64 = 1_000_000;
-    let validated_to: u64 = 1_000_500;
-    let advanced: u64 = 500;
-    let output = capture(|| {
-        info!(
-            from = sweep_from,
-            to = validated_to,
-            blocks = advanced,
-            elapsed = "0m42s",
-            rate = "12/s",
-            "VALIDATION SWEEP COMPLETE"
-        );
-    });
-    assert!(
-        output.contains("VALIDATION SWEEP COMPLETE"),
-        "missing marker: {output}"
-    );
-    assert!(
-        !output.contains("==="),
-        "marker should be plain text, not decorated: {output}"
-    );
-    assert!(
-        output.contains("from=1000000"),
-        "missing from field: {output}"
-    );
-    assert!(output.contains("to=1000500"), "missing to field: {output}");
-    assert!(
-        output.contains("blocks=500"),
-        "missing blocks field: {output}"
-    );
-}
-
-#[test]
-fn block_applied_has_marker_and_named_fields() {
-    // Mirrors the emit at apply_state success in `src/state.rs`. The
-    // contract says `height` is u64 and `id` is a 32-byte hex string.
-    let height: u64 = 1_785_000;
-    // BlockId Display impl renders as lowercase hex. Synthesize a
-    // sentinel string so the test isn't dependent on the actual type.
-    let block_id = "0000abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345";
-    let output = capture(|| {
-        info!(
-            height = height,
-            id = %block_id,
-            "block applied"
-        );
-    });
-    assert!(
-        output.contains("block applied"),
-        "missing marker: {output}"
-    );
-    assert!(
-        output.contains("height=1785000"),
-        "missing height field: {output}"
-    );
-    assert!(
-        output.contains(&format!("id={block_id}")),
-        "missing id field rendered via Display: {output}"
-    );
-}
-
-#[test]
-fn chain_tip_reached_has_marker_and_named_fields() {
-    let tip_height: u64 = 1_785_500;
-    let output = capture(|| {
-        info!(height = tip_height, "chain tip reached");
-    });
-    assert!(
-        output.contains("chain tip reached"),
-        "missing marker: {output}"
-    );
-    assert!(
-        output.contains("height=1785500"),
-        "missing height field: {output}"
-    );
-}
-
-// -------------------------------------------------------------------
-// `validation_stuck` (contract since 1.1, broadened to v1.3 —
-// `facts/journal-events.md`)
-//
-// The emission now lives in the sweep backoff — the single emitter for
-// BOTH the apply_state and deferred-eval stall modes. Its firing behavior
-// (fires on the 5th consecutive frontier stall, once per frontier, re-arms
-// on progress / frontier change) and the rendered shape are covered by
-// `ergo_sync::sweep_backoff`'s own unit tests, which capture the REAL emit.
-//
-// Kept here, the contract-shape anchor file: the apply_state error
-// classifier that feeds `error_kind`/`missing_key`, plus an inline mirror of
-// the emitted line so the Doctor-adapter contract shape is pinned alongside
-// the other journal events.
-// -------------------------------------------------------------------
+//! ## Why this file is an index and not a test suite
+//!
+//! Every one of this crate's contract events is emitted from a private method
+//! (`HeaderSync::advance_script_frontier`, `::await_eval_capacity`,
+//! `::handle_eval_failure`, the sweep loop) or a private module
+//! (`sweep_backoff`, `eval_backlog`), and setting one up means writing the
+//! struct's private watermark fields. None of that is reachable from an
+//! integration test, which sees only `ergo_sync`'s public API.
+//!
+//! This file used to paper over that with **inline mirrors**: each test called
+//! `info!(…)` with its own copy of the marker and fields, then asserted the
+//! captured output contained that same copy. That tests `tracing`'s formatter
+//! against itself. It cannot fail when an emit site drifts, because it never
+//! invokes one — which is precisely how `deferred_eval_gate_engaged` and
+//! `eval_frontier_hole` both shipped not matching the contract under a green
+//! suite on 2026-08-12, and how the `validation_rollback_failed` mirror came to
+//! assert an `error=` value the real emit never produced.
+//!
+//! The conformance tests therefore live beside the harness that can drive the
+//! real emit, and this file records where. Each entry below names the test that
+//! renders that event from its actual emit site:
+//!
+//! | Contract event | Driven by |
+//! |---|---|
+//! | `validation_sweep_started` | `state::sweep_resume_tests::journal_sweep_and_block_applied_conform` |
+//! | `validation_sweep_complete` | ditto |
+//! | `block_applied` | ditto |
+//! | `chain_tip_reached` | `state::sweep_resume_tests::journal_chain_tip_reached_conforms` |
+//! | `validation_stuck` | `sweep_backoff::tests::validation_stuck_fires_on_fifth_*_stall` |
+//! | `validation_rollback_failed` | `state::sweep_resume_tests::journal_validation_rollback_failed_conforms` |
+//! | `deferred_eval_backlog` | `eval_backlog::tests::*` (marker, every field, both probe branches) |
+//! | `deferred_eval_gate_engaged` | `state::sweep_resume_tests::journal_deferred_eval_gate_engaged_conforms`, `::journal_gate_engaged_names_which_bound_tripped` |
+//! | `eval_frontier_hole` | `state::sweep_resume_tests::journal_eval_frontier_hole_conforms`, `::journal_eval_frontier_hole_reports_the_validator_tip_not_the_stale_cache` |
+//!
+//! What remains here is what an integration test *can* exercise for real: the
+//! public classifier that produces `validation_stuck`'s `error_kind` and
+//! `missing_key` field values.
 
 use bytes::Bytes;
 use ergo_sync::apply_state_error::classify_apply_state_error;
@@ -220,145 +74,4 @@ fn classify_other_for_non_missing_key_error() {
     let (kind, hex) = classify_apply_state_error("validator state root mismatch");
     assert_eq!(kind, "other");
     assert!(hex.is_none());
-}
-
-#[test]
-fn validation_stuck_renders_marker_and_named_fields() {
-    // Inline mirror of `sweep_backoff::emit_validation_stuck` (the missing_key
-    // branch). The contract pins marker "validation stuck" and fields height
-    // (u64), attempts (u64), error_kind (string), missing_key (hex, optional).
-    // The real emit is exercised end-to-end in the sweep_backoff unit tests;
-    // this is the contract-shape anchor beside the other journal events.
-    let key_hex: String = AVL_KEY.iter().map(|b| format!("{b:02x}")).collect();
-    let output = capture(|| {
-        warn!(
-            height = 1_783_677u64,
-            attempts = 5u64,
-            error_kind = "missing_key",
-            missing_key = %key_hex,
-            "validation stuck"
-        );
-    });
-    assert!(output.contains("validation stuck"), "missing marker: {output}");
-    assert!(output.contains("height=1783677"), "missing height: {output}");
-    assert!(output.contains("attempts=5"), "missing attempts: {output}");
-    assert!(
-        output.contains("error_kind=\"missing_key\""),
-        "missing error_kind: {output}"
-    );
-    assert!(
-        output.contains(&format!("missing_key={key_hex}")),
-        "missing key hex: {output}"
-    );
-}
-
-#[test]
-fn validation_rollback_failed_renders_marker_and_named_fields() {
-    // Inline mirror of the `validation rollback failed` ERROR emitted by
-    // `handle_eval_failure` and the reorg arm in `src/state.rs` when
-    // `BlockValidator::reset_to` returns Err (validator unmoved, watermarks
-    // held in place). Fields: height (u64, the rollback TARGET), path
-    // (string: "eval_failure" | "reorg"), error (Display). Not yet listed
-    // in `facts/journal-events.md` — contract addition owed by the main
-    // session; this pins the shape the entry must describe.
-    let output = capture(|| {
-        error!(
-            height = 2668u64,
-            path = "eval_failure",
-            error = %"rollback to height 2668 failed: simulated storage failure",
-            "validation rollback failed"
-        );
-    });
-    assert!(
-        output.contains("validation rollback failed"),
-        "missing marker: {output}"
-    );
-    assert!(output.contains("height=2668"), "missing height: {output}");
-    assert!(
-        output.contains("path=\"eval_failure\""),
-        "missing path: {output}"
-    );
-    assert!(
-        output.contains("error=rollback to height 2668 failed"),
-        "missing error field: {output}"
-    );
-}
-
-// -------------------------------------------------------------------
-// `deferred eval backlog` (contract: `facts/sync.md` § "Catch-up progress
-// instrumentation", added 2026-08-12)
-//
-// The emission lives in `ergo_sync::eval_backlog`, whose own unit tests
-// capture the REAL emit and cover the firing policy (5s elapsed-time gate,
-// suppressed at tip, probe untouched while gated). Kept here — the
-// contract-shape anchor file — as an inline mirror, so the operator-facing
-// field names are pinned beside the other journal events.
-//
-// Not yet listed in `facts/journal-events.md`: contract addition owed by
-// the main session, same as `validation rollback failed` above. This pins
-// the shape that entry must describe.
-// -------------------------------------------------------------------
-
-#[test]
-fn deferred_eval_backlog_renders_marker_and_named_fields() {
-    // Numbers from the 2026-08-12 field OOM: ~27,000 queued evals at
-    // ~410 KB worst case, killed at validation height 1,779,387.
-    let output = capture(|| {
-        info!(
-            evals_in_flight = 27_000u64,
-            state_applied_height = 1_779_387u64,
-            script_verified_height = 1_752_387u64,
-            eval_lag = 27_000u64,
-            jemalloc_allocated = 11_402_000_000u64,
-            "deferred eval backlog"
-        );
-    });
-    assert!(
-        output.contains("deferred eval backlog"),
-        "missing marker: {output}"
-    );
-    assert!(
-        output.contains("evals_in_flight=27000"),
-        "missing evals_in_flight: {output}"
-    );
-    assert!(
-        output.contains("state_applied_height=1779387"),
-        "missing state_applied_height: {output}"
-    );
-    assert!(
-        output.contains("script_verified_height=1752387"),
-        "missing script_verified_height: {output}"
-    );
-    assert!(
-        output.contains("eval_lag=27000"),
-        "missing eval_lag: {output}"
-    );
-    assert!(
-        output.contains("jemalloc_allocated=11402000000"),
-        "missing jemalloc_allocated: {output}"
-    );
-}
-
-#[test]
-fn deferred_eval_backlog_omits_heap_field_without_jemalloc() {
-    // `jemalloc_allocated` is absent — not rendered as `None` — when the
-    // build has no heap probe wired, matching how `validation_stuck`
-    // handles its optional `missing_key`.
-    let output = capture(|| {
-        info!(
-            evals_in_flight = 64u64,
-            state_applied_height = 1_000u64,
-            script_verified_height = 936u64,
-            eval_lag = 64u64,
-            "deferred eval backlog"
-        );
-    });
-    assert!(
-        output.contains("deferred eval backlog"),
-        "missing marker: {output}"
-    );
-    assert!(
-        !output.contains("jemalloc_allocated"),
-        "heap field should be absent, not None: {output}"
-    );
 }

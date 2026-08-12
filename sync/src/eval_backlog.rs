@@ -178,6 +178,8 @@ fn emit_eval_backlog(depth: BacklogDepth, jemalloc_allocated: Option<u64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Captures the rendered `deferred_eval_backlog` record, which is INFO.
+    use crate::test_support::capture;
     use std::cell::Cell;
 
     fn now() -> Instant {
@@ -208,43 +210,6 @@ mod tests {
             state_applied_height: applied,
             script_verified_height: verified,
         }
-    }
-
-    /// Capture the default tracing fmt output produced by `f`, so a test can
-    /// assert the rendered record.
-    fn capture<F: FnOnce()>(f: F) -> String {
-        use std::io;
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::fmt::MakeWriter;
-
-        #[derive(Clone, Default)]
-        struct W(Arc<Mutex<Vec<u8>>>);
-        impl io::Write for W {
-            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> MakeWriter<'a> for W {
-            type Writer = W;
-            fn make_writer(&'a self) -> W {
-                self.clone()
-            }
-        }
-
-        let w = W::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(w.clone())
-            .without_time()
-            .with_ansi(false)
-            .with_target(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        let bytes = w.0.lock().unwrap().clone();
-        String::from_utf8(bytes).unwrap()
     }
 
     // ---- the interval gate ----
@@ -451,9 +416,16 @@ mod tests {
 
     #[test]
     fn record_carries_jemalloc_allocated_when_a_probe_is_wired() {
+        // The 2026-08-12 field OOM: killed at validation height 1,779,387 with
+        // anon-rss 10.62 GiB. The depth is ≈3,000 evals, NOT the ≈27,000 an
+        // earlier revision quoted — that figure came from a per-item estimate
+        // 6–8× too low. anon-rss is the measured quantity; the queue depth is
+        // derived, and reconciling the two is precisely what this record's
+        // `eval_bytes_in_flight`/`jemalloc_allocated` pairing exists to do.
+        // See the module doc.
         let mut r = EvalBacklogReporter::default();
         let output = capture(|| {
-            r.maybe_emit(now(), CATCH_UP, depth(27_000, 1_779_387, 1_752_387), || {
+            r.maybe_emit(now(), CATCH_UP, depth(3_000, 1_779_387, 1_776_387), || {
                 Some(11_402_000_000)
             });
         });
