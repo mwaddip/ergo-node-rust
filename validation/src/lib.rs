@@ -1,6 +1,8 @@
 mod digest;
 mod sections;
 mod state_changes;
+#[cfg(test)]
+mod test_support;
 mod tx_validation;
 mod utxo;
 mod voting;
@@ -27,6 +29,31 @@ pub use ergo_lib::chain::parameters::{Parameter, Parameters};
 pub use ergo_lib::chain::transaction::Transaction;
 pub use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
 
+/// When a validator evaluates a block's ErgoScript spending proofs.
+///
+/// Fixed at construction, for the validator's life. The caller must be
+/// configured to match: `Inline` with a caller that waits for eval results
+/// freezes the sync frontier (none ever arrive), `Deferred` with a caller that
+/// never evaluates advances it over unverified blocks. Both validators take
+/// the mode and behave the same way under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScriptEvalMode {
+    /// `apply_state` returns the block's [`DeferredEval`] and the caller
+    /// evaluates it, typically on a background pool. Buys sync throughput at
+    /// the cost of a crash-consistency window: the block is persisted before
+    /// its scripts are checked, so an unclean shutdown leaves
+    /// applied-but-unverified state on disk for `sync/` to reconcile at
+    /// startup.
+    #[default]
+    Deferred,
+    /// `apply_state` evaluates the scripts itself — after the state-root
+    /// check, before persisting — and returns `deferred_eval = None`. `Ok`
+    /// therefore *means* the scripts passed, nothing unverified reaches
+    /// storage, and there is no gap to reconcile. Costs the block's script
+    /// evaluation on the applying thread.
+    Inline,
+}
+
 /// Outcome of a successful state application.
 #[derive(Debug)]
 pub struct ApplyStateOutcome {
@@ -41,10 +68,15 @@ pub struct ApplyStateOutcome {
     /// passes this to `chain.apply_epoch_boundary_parameters` alongside
     /// the parameters so both advance atomically.
     pub epoch_boundary_proposed_update: Option<Vec<u8>>,
-    /// `Some` if script evaluation is needed (height > checkpoint).
-    /// The caller should pass this to `evaluate_scripts()` — either
-    /// inline or on a background thread; on success it returns the
-    /// block-accumulated transaction cost.
+    /// `Some` if the caller still owes this block a script evaluation —
+    /// i.e. the validator is in [`ScriptEvalMode::Deferred`] and the height
+    /// is above its checkpoint. Pass it to `evaluate_scripts()`, which
+    /// returns the block-accumulated transaction cost.
+    ///
+    /// `None` means nothing is owed, for either of two reasons: the height
+    /// is at or below the checkpoint, or the validator is in
+    /// [`ScriptEvalMode::Inline`] and already evaluated them — in which case
+    /// this `Ok` *is* the verdict that they passed.
     pub deferred_eval: Option<DeferredEval>,
 }
 
@@ -234,16 +266,23 @@ impl DeferredEval {
 /// returned `ApplyStateOutcome::epoch_boundary_params` carries the parsed
 /// parameters for the caller to apply via `chain.apply_epoch_boundary_parameters`.
 ///
-/// Script evaluation is NOT performed by `apply_state`. Instead, the caller
-/// receives a `DeferredEval` and runs `evaluate_scripts()` — either inline
-/// or on a background thread — which returns the block-accumulated cost
-/// on success.
+/// Who evaluates the block's scripts is a construction-time choice — see
+/// [`ScriptEvalMode`]. In `Deferred` mode the caller receives a
+/// `DeferredEval` and runs `evaluate_scripts()` itself; in `Inline` mode
+/// `apply_state` runs it before persisting and an `Ok` already means the
+/// scripts passed.
 pub trait BlockValidator {
     /// Apply state transition: parse sections, compute state changes,
-    /// apply AVL operations, verify digest, persist.
+    /// apply AVL operations, verify digest, evaluate scripts (inline mode
+    /// only), persist.
     ///
-    /// After Ok, state has advanced to this block's height.
-    /// Script evaluation is deferred — see `ApplyStateOutcome::deferred_eval`.
+    /// After Ok, state has advanced to this block's height. Whether the
+    /// caller still owes the block a script evaluation is answered by
+    /// `ApplyStateOutcome::deferred_eval`.
+    ///
+    /// On Err nothing moved: `validated_height()`, `current_digest()`, and
+    /// the underlying prover are exactly as they were on entry, so the
+    /// caller may retry the block or move on to another candidate.
     #[allow(clippy::too_many_arguments)]
     fn apply_state(
         &mut self,

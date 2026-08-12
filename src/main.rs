@@ -822,6 +822,12 @@ struct NodeConfig {
     data_dir: String,
     #[serde(default = "default_state_type")]
     state_type: String,
+    /// Where ErgoScript evaluation happens: `"deferred"` (background pool,
+    /// faster, leaves a crash-consistency window) or `"inline"` (inside
+    /// apply_state before persisting, so nothing unverified reaches disk).
+    /// See facts/validation.md § "Script evaluation modes".
+    #[serde(default = "default_script_eval")]
+    script_eval: String,
     #[serde(default = "default_verify_transactions")]
     verify_transactions: bool,
     #[serde(default = "default_blocks_to_keep")]
@@ -966,6 +972,7 @@ impl Default for NodeConfig {
         Self {
             data_dir: default_data_dir(),
             state_type: default_state_type(),
+            script_eval: default_script_eval(),
             verify_transactions: default_verify_transactions(),
             blocks_to_keep: default_blocks_to_keep(),
             revalidate: false,
@@ -1003,6 +1010,12 @@ fn default_data_dir() -> String {
 }
 fn default_state_type() -> String {
     "utxo".to_string()
+}
+/// Deferred until a slow box tells us what inline actually costs. Changing
+/// this default is a durability decision, not a tuning one — see
+/// facts/validation.md § "Script evaluation modes".
+fn default_script_eval() -> String {
+    "deferred".to_string()
 }
 fn default_verify_transactions() -> bool {
     true
@@ -1448,6 +1461,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let capture_tap = capture_handle.as_ref().map(|h| h.tap());
     let capture_access: Option<Arc<dyn enr_p2p::capture::CaptureAccess>> =
         capture_handle.as_ref().map(|h| h.clone() as Arc<dyn enr_p2p::capture::CaptureAccess>);
+    // THE binding for the script-evaluation mode. Every validator constructor
+    // and `SyncConfig` must be fed from this one value — two independently
+    // derived copies that disagree either freeze the sync frontier waiting for
+    // results nothing dispatches, or advance it over blocks nothing verified.
+    // `checkpoint_height` had exactly this hazard and it went wrong in one of
+    // four branches; see `resolve_checkpoint` below.
+    let script_eval_mode = match node_config.script_eval.as_str() {
+        "deferred" => ergo_validation::ScriptEvalMode::Deferred,
+        "inline" => ergo_validation::ScriptEvalMode::Inline,
+        other => {
+            return Err(format!(
+                "unknown script_eval '{other}' (expected 'deferred' or 'inline')"
+            )
+            .into());
+        }
+    };
     let state_type = match node_config.state_type.as_str() {
         "utxo" => StateType::Utxo,
         "digest" => StateType::Digest,
@@ -1467,6 +1496,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         state_type = ?state_type, verify_transactions, blocks_to_keep, revalidate,
         checkpoint_height = ?configured_checkpoint,
+        // Visible at startup because it is a durability choice, not a tuning
+        // one: deferred persists blocks before their scripts are checked.
+        script_eval = ?script_eval_mode,
         storing_snapshots = node_config.storing_snapshots,
         snapshot_interval = node_config.snapshot_interval,
         cache_mb = node_config.cache_mb,
@@ -2137,7 +2169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     generator: g.clone(),
                 });
                 Some(Validator::new(
-                    ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint)),
+                    ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint, script_eval_mode)),
                     shared_validated_height.clone(),
                     shared_state_context.clone(),
                     block_applied_tx.clone(),
@@ -2203,7 +2235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 Some(Validator::new(
                     ValidatorInner::Utxo({
-                        let mut uv = UtxoValidator::new(storage, prover, 0, checkpoint);
+                        let mut uv = UtxoValidator::new(storage, prover, 0, checkpoint, script_eval_mode);
                         // Diagnostic: regenerate historical ADProofs that UTXO mode does
                         // not store. Set ENR_DUMP_ADPROOFS_AT=h1,h2,... for a one-shot
                         // genesis replay; writes adproofs-<H>.104 (raw type-104 section)
@@ -2249,7 +2281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // publish the resume height so startup-time readers
                 // don't see 0.
                 shared_validated_height.store(height, std::sync::atomic::Ordering::Relaxed);
-                DigestValidator::from_state(digest, height, checkpoint)
+                DigestValidator::from_state(digest, height, checkpoint, script_eval_mode)
             } else if revalidate && chain_guard.height() > 0 {
                 let checkpoint = resolve_checkpoint(configured_checkpoint.unwrap_or(0));
                 let chain_height = chain_guard.height();
@@ -2273,7 +2305,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if start_from == 0 {
                     tracing::warn!("revalidate: no complete blocks found in store, starting from genesis");
-                    DigestValidator::new(genesis_digest, checkpoint)
+                    DigestValidator::new(genesis_digest, checkpoint, script_eval_mode)
                 } else {
                     let prev_height = start_from - 1;
                     let digest = if prev_height == 0 {
@@ -2291,12 +2323,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // height to prev_height — publish it so the
                     // atomic doesn't lie about the node's state.
                     shared_validated_height.store(prev_height, std::sync::atomic::Ordering::Relaxed);
-                    DigestValidator::from_state(digest, prev_height, checkpoint)
+                    DigestValidator::from_state(digest, prev_height, checkpoint, script_eval_mode)
                 }
             } else {
                 let checkpoint = resolve_checkpoint(configured_checkpoint.unwrap_or(0));
                 tracing::info!(checkpoint, "block validator starting from genesis (digest mode)");
-                DigestValidator::new(genesis_digest, checkpoint)
+                DigestValidator::new(genesis_digest, checkpoint, script_eval_mode)
             };
             Some(Validator::new(
                 ValidatorInner::Digest(validator),
@@ -2590,7 +2622,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     prover.restore_root(root, tree_h);
 
                     let validator = Validator::new(
-                        ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint)),
+                        ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint, script_eval_mode)),
                         shared_validated_height.clone(),
                         shared_state_context.clone(),
                         block_applied_tx.clone(),

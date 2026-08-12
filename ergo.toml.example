@@ -89,6 +89,26 @@ protocol_version = "6.0.3"
 # Validate transactions during sync. Requires state_type = "utxo".
 # verify_transactions = true
 
+# WHERE ErgoScript evaluation happens. This is a durability choice, not a
+# performance dial — read both options before changing it.
+#
+#   "deferred" — evaluation runs on a background pool while state
+#                application moves on. Faster, and the default. The block is
+#                PERSISTED BEFORE ITS SCRIPTS ARE CHECKED, so an unclean
+#                shutdown can leave applied-but-unverified blocks on disk;
+#                the node accepts that gap at startup rather than re-verifying.
+#
+#   "inline"    — evaluation runs inside block application, after the state
+#                 root check and before anything is written. Nothing
+#                 unverified ever reaches state.redb, so the gap above cannot
+#                 occur. Costs throughput, and the cost is largest on hosts
+#                 where evaluation and state application take similar time.
+#
+# The JVM reference node has no equivalent of "deferred" — it validates
+# scripts before touching its tree and has no verified-height watermark at
+# all. "inline" is the shape that matches it.
+# script_eval = "deferred"
+
 # Block history retention:
 #   -1 = keep all blocks from genesis (full archival)
 #    0 = keep only the at-tip working set (pruned)

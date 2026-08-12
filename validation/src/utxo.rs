@@ -17,7 +17,7 @@ use crate::sections::{parse_block_transactions, parse_extension};
 use crate::state_changes::{compute_state_changes, transactions_to_summaries};
 use crate::tx_validation;
 use crate::voting;
-use crate::{ApplyStateOutcome, BlockValidator, ValidationError};
+use crate::{ApplyStateOutcome, BlockValidator, ScriptEvalMode, ValidationError};
 
 /// UTXO-mode block validator.
 ///
@@ -39,6 +39,9 @@ pub struct UtxoValidator {
     prover: BatchAVLProver,
     validated_height: u32,
     checkpoint_height: u32,
+    /// Whether `apply_state` evaluates this block's scripts itself or hands
+    /// the caller a `DeferredEval` to do it. Fixed at construction.
+    script_eval_mode: ScriptEvalMode,
     current_digest: ADDigest,
     /// Current emission box ID (changes every block). None if all ERG emitted.
     emission_box_id: Option<[u8; 32]>,
@@ -57,11 +60,17 @@ impl UtxoValidator {
     /// match `storage.version()`: either by calling `storage.rollback(&version)`
     /// and installing the returned root, or by performing the genesis-bootstrap
     /// insertions plus a first `storage.update_with_height(&mut prover, vec![], 0)`.
+    ///
+    /// `script_eval_mode` is spelled out at every call site on purpose rather
+    /// than defaulted: it must agree with the sync layer's own configuration,
+    /// and a knob that can be forgotten silently is how the `resize_cache`
+    /// no-op survived a whole feature's lifetime (facts/validation.md).
     pub fn new(
         storage: RedbAVLStorage,
         prover: BatchAVLProver,
         height: u32,
         checkpoint_height: u32,
+        script_eval_mode: ScriptEvalMode,
     ) -> Self {
         let digest_bytes = prover.digest().expect("prover has no root");
         let digest = bytes_to_ad_digest(&digest_bytes);
@@ -85,6 +94,7 @@ impl UtxoValidator {
             prover,
             validated_height: height,
             checkpoint_height,
+            script_eval_mode,
             current_digest: digest,
             emission_box_id: None,
             emission_tree_bytes,
@@ -116,13 +126,28 @@ impl BlockValidator for UtxoValidator {
         expected_boundary_params: Option<&Parameters>,
         expected_proposed_update: Option<&[u8]>,
     ) -> Result<ApplyStateOutcome, ValidationError> {
-        // The op loop in apply_state_internal mutates the in-memory prover.
-        // An early-return after partial mutation leaves the prover dirty;
-        // sync's retry then re-enters with a half-applied tree and surfaces
-        // a different error on a different op number, burying the original
-        // failure cause. Roll the prover back to pre-block state on any
-        // failure so retries are deterministic and the original error
-        // survives.
+        // Every Err leaves the prover byte-for-byte as it was on entry
+        // (facts/validation.md, "Err leaves the prover clean"). This wrapper
+        // is the only thing that makes that true: apply_state_internal
+        // mutates the prover in step 4 and every Err return below it — the
+        // digest check, box deserialization, inline script evaluation, the
+        // persist, the proof-digest check — is a bare `return`/`?` that undoes
+        // nothing on its own.
+        //
+        // Two failure regions, one mechanism:
+        //   - before `update_with_height`: storage's current_version is still
+        //     `saved_digest`, so `rollback` short-circuits to a re-read of the
+        //     persisted root (state/src/storage.rs, the current_version ==
+        //     version branch). No undo log involved — this block was never a
+        //     version.
+        //   - after it (the proof-digest check): the block *is* the newest
+        //     version, and the same call walks the undo log back one step.
+        //
+        // Without it, sync's retry re-enters on a half-applied tree and fails
+        // on a different op with a different error, burying the real cause —
+        // and in inline mode, where a rejected block is routine rather than
+        // near-unreachable, the tree would carry a rejected block's mutations
+        // into the next candidate.
         let saved_digest = self.current_digest;
 
         match self.apply_state_internal(
@@ -315,7 +340,25 @@ impl UtxoValidator {
             });
         }
 
-        // 6. Build DeferredEval for deferred script verification
+        // 6. Script evaluation — bundled for the caller, or run right here.
+        //
+        // Inline evaluation sits between the digest check and persistence,
+        // not before the prover mutations. The JVM checks scripts before
+        // touching its AVL tree, but it reads each input box via boxById and
+        // pays a second traversal to remove it; step 4 above captures the box
+        // from the removal's own return value, so copying that ordering would
+        // buy a read per input and nothing else. Persistence is the boundary
+        // that matters, because persistence is what survives a crash:
+        // everything up to `update_with_height` below is in memory, and an
+        // Err from here rewinds the prover (see `apply_state`), so no
+        // unverified state ever reaches state.redb.
+        //
+        // Both modes go through `evaluate_scripts`, which means both modes
+        // evaluate identically — the alternative, calling the underlying
+        // validator directly here, is a second entry point that can drift on
+        // a consensus path. The bundle's `approx_heap_bytes` is dead weight
+        // inline (nothing queues the value; it is dropped at the end of this
+        // expression), and that is the price of the single path.
         let deferred_eval = if validate_txs {
             let mut proof_boxes = HashMap::with_capacity(proof_box_bytes.len());
             // Summed inside the loop that already runs — the serialized size
@@ -326,7 +369,7 @@ impl UtxoValidator {
                 proof_boxes.insert(*id, tx_validation::deserialize_box(bytes)?);
             }
 
-            Some(crate::DeferredEval::new(
+            let eval = crate::DeferredEval::new(
                 header.height,
                 parsed_txs.transactions,
                 proof_boxes,
@@ -335,7 +378,18 @@ impl UtxoValidator {
                 active_params.clone(),
                 block_txs,
                 serialized_box_bytes,
-            ))
+            );
+
+            match self.script_eval_mode {
+                ScriptEvalMode::Deferred => Some(eval),
+                ScriptEvalMode::Inline => {
+                    // The cost is discarded, not unchecked: the maxBlockCost
+                    // consensus gate runs inside evaluate_scripts. Sync
+                    // discards it on the deferred path too.
+                    tx_validation::evaluate_scripts(&eval)?;
+                    None
+                }
+            }
         } else {
             None
         };
@@ -481,6 +535,25 @@ impl UtxoValidator {
         match self.storage.rollback(&avl_digest) {
             Ok((root, tree_height)) => {
                 self.prover.restore_root(root, tree_height);
+
+                // `restore_root` clears the changed-node buffers and the
+                // directions and rebases `old_top_node`, but leaves
+                // `modified_nodes` — the address-keyed map `pack_tree` gates
+                // on — holding every node the failed block touched. Nothing
+                // is misidentified afterwards, because each entry owns an Rc
+                // and a live address cannot be recycled; the cost is that
+                // those entries pin the touched subtree for the life of the
+                // process. Deferred mode reaches this path about never.
+                // Inline mode reaches it once per rejected block, i.e. as
+                // often as a peer cares to send one, which turns an
+                // accounting wart into an unbounded retention.
+                //
+                // The proper home for this is `restore_root` itself, next to
+                // the other three clears it already does — an upstream change
+                // in the ergo_avltree_rust fork. Until that lands, clearing
+                // here is what makes "the prover is as it was on entry" true
+                // of the whole prover rather than just its tree.
+                self.prover.base.modified_nodes.clear();
             }
             Err(e) => {
                 tracing::error!(
@@ -586,4 +659,329 @@ fn bytes_to_ad_digest(bytes: &Bytes) -> ADDigest {
     let mut arr = [0u8; 33];
     arr.copy_from_slice(bytes);
     ADDigest::from(arr)
+}
+
+#[cfg(test)]
+mod tests {
+    //! UTXO-mode script evaluation modes, and the Err postcondition that
+    //! makes a rejected block survivable: *the prover* is byte-for-byte as it
+    //! was on entry (facts/validation.md, "Err leaves the prover clean").
+    //!
+    //! These live inside the crate rather than in `tests/` for one reason: the
+    //! postcondition is about `self.prover`, and from outside the only view of
+    //! the tree is `proofs_for_transactions`, which builds its own prover from
+    //! *storage*. Storage is untouched on the pre-persist failure paths, so an
+    //! out-of-crate test would report "unchanged" no matter how dirty the
+    //! in-memory tree was — a test that cannot fail. Here we read
+    //! `prover.digest()` directly.
+
+    use super::*;
+    use crate::test_support::*;
+    use crate::{ErgoBox, ScriptEvalMode};
+    use enr_state::{AVLTreeParams, CacheSize, RedbAVLStorage};
+    use ergo_chain_types::Digest32;
+    use ergo_lib::chain::transaction::Transaction;
+    use tempfile::TempDir;
+
+    const KEY_LEN: usize = 32;
+
+    fn open_storage(dir: &TempDir) -> RedbAVLStorage {
+        RedbAVLStorage::open(
+            &dir.path().join("state.redb"),
+            AVLTreeParams {
+                key_length: KEY_LEN,
+                value_length: None,
+            },
+            10,
+            CacheSize::default(),
+        )
+        .expect("fresh redb opens")
+    }
+
+    /// Seed a storage/prover pair with `boxes` committed at `SEED_HEIGHT`,
+    /// left in the cycle state a steady-state validator is in: the storage
+    /// commit clears the dirty-node bookkeeping, and the trailing
+    /// `generate_proof` rebases the proof baseline exactly as step 8 of a
+    /// completed `apply_state` does. Without that rebase the next block's
+    /// internally generated proof would be packed from a stale root and every
+    /// test here would fail on the proof-digest check for the wrong reason.
+    fn seed(storage: &mut RedbAVLStorage, boxes: &[ErgoBox]) -> BatchAVLProver {
+        let tree = AVLTree::with_resolver(storage.resolver(), KEY_LEN, None);
+        let mut prover = BatchAVLProver::new(tree, true);
+        for b in boxes {
+            prover
+                .perform_one_operation(&Operation::Insert(KeyValue {
+                    key: Bytes::copy_from_slice(&box_key(b)),
+                    value: Bytes::from(serialized_box(b)),
+                }))
+                .expect("seed insert");
+        }
+        storage
+            .update_with_height(&mut prover, vec![], SEED_HEIGHT)
+            .expect("seed commit");
+        let _ = prover.generate_proof();
+        prover
+    }
+
+    fn seeded_validator(boxes: &[ErgoBox], mode: ScriptEvalMode) -> (UtxoValidator, TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut storage = open_storage(&dir);
+        let prover = seed(&mut storage, boxes);
+        (
+            UtxoValidator::new(storage, prover, SEED_HEIGHT, 0, mode),
+            dir,
+        )
+    }
+
+    /// What the block under test must claim to be accepted: the post-block
+    /// state root, and the digest of the proof the validator will generate
+    /// internally. Computed by replaying the identical sequence — seed,
+    /// commit, rebase, block operations, commit, proof — on an independent
+    /// storage/prover pair, in the same order `apply_state_internal` uses.
+    fn oracle(boxes: &[ErgoBox], ops: &[Operation]) -> (ADDigest, Digest32) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut storage = open_storage(&dir);
+        let mut prover = seed(&mut storage, boxes);
+
+        for op in ops {
+            prover.perform_one_operation(op).expect("oracle operation");
+        }
+        let state_root = bytes_to_ad_digest(&prover.digest().expect("oracle has a root"));
+        storage
+            .update_with_height(&mut prover, vec![], BLOCK_HEIGHT)
+            .expect("oracle commit");
+        let proof = prover.generate_proof();
+
+        (state_root, blake2b256_hash(proof.as_ref()))
+    }
+
+    fn prover_digest(validator: &UtxoValidator) -> ADDigest {
+        bytes_to_ad_digest(&validator.prover.digest().expect("prover has a root"))
+    }
+
+    /// Everything an `apply_state` call needs for a one-transaction block.
+    struct Block {
+        header: Header,
+        txs: Vec<u8>,
+        extension: Vec<u8>,
+        preceding: Vec<Header>,
+    }
+
+    impl Block {
+        fn new(transactions: &[Transaction], state_root: ADDigest, ad_root: Digest32) -> Self {
+            let (txs, extension) = sections(transactions);
+            Self {
+                header: make_header(BLOCK_HEIGHT, state_root, ad_root),
+                txs,
+                extension,
+                preceding: preceding_headers(),
+            }
+        }
+
+        fn apply(&self, validator: &mut UtxoValidator) -> Result<ApplyStateOutcome, ValidationError> {
+            validator.apply_state(
+                &self.header,
+                &self.txs,
+                None,
+                &self.extension,
+                &self.preceding,
+                &Parameters::default(),
+                None,
+                None,
+            )
+        }
+    }
+
+    /// A rejected block must leave nothing of itself behind. The digest check
+    /// fires after step 4 has applied every operation, so this is the path
+    /// where "nothing undoes them" would show up.
+    #[test]
+    fn digest_mismatch_leaves_the_prover_clean() {
+        let input = make_box(true, 1);
+        let tx = spend_tx(std::slice::from_ref(&input));
+        let ops = block_operations(std::slice::from_ref(&tx));
+
+        let (mut validator, _dir) = seeded_validator(
+            std::slice::from_ref(&input),
+            ScriptEvalMode::Deferred,
+        );
+        let before = prover_digest(&validator);
+
+        // Not a vacuous test: this block really does move the tree, so an
+        // un-rewound prover would be observably different afterwards.
+        let (real_state_root, _) = oracle(std::slice::from_ref(&input), &ops);
+        assert_ne!(
+            real_state_root, before,
+            "fixture is degenerate — the block changes nothing, so no rewind is needed"
+        );
+
+        // The block claims the tree did not change. Every operation is applied
+        // before that claim is checked.
+        let block = Block::new(std::slice::from_ref(&tx), before, Digest32::zero());
+        let err = block
+            .apply(&mut validator)
+            .expect_err("a wrong state root must be rejected");
+        assert!(
+            matches!(err, ValidationError::StateRootMismatch { .. }),
+            "unexpected error variant: {err:?}"
+        );
+
+        assert_eq!(validator.validated_height(), SEED_HEIGHT);
+        assert_eq!(*validator.current_digest(), before);
+        assert_eq!(
+            prover_digest(&validator),
+            before,
+            "the prover kept the rejected block's mutations"
+        );
+        assert!(
+            validator.prover.base.modified_nodes.is_empty(),
+            "the rejected block's touched nodes are still pinned in the proof-cycle map"
+        );
+    }
+
+    /// Inline mode's own rejection path — the one that turns the case above
+    /// from near-unreachable into routine. The block is otherwise perfectly
+    /// well-formed; only its script fails.
+    #[test]
+    fn inline_script_failure_leaves_the_prover_clean_and_storage_untouched() {
+        let input = make_box(false, 2);
+        let tx = spend_tx(std::slice::from_ref(&input));
+        let ops = block_operations(std::slice::from_ref(&tx));
+        let (state_root, ad_root) = oracle(std::slice::from_ref(&input), &ops);
+
+        let (mut validator, _dir) =
+            seeded_validator(std::slice::from_ref(&input), ScriptEvalMode::Inline);
+        let before = prover_digest(&validator);
+        let block = Block::new(std::slice::from_ref(&tx), state_root, ad_root);
+
+        let err = block
+            .apply(&mut validator)
+            .expect_err("an unsatisfied script must be rejected inline");
+        assert!(
+            matches!(err, ValidationError::TransactionInvalid { .. }),
+            "expected a script failure, got: {err:?}"
+        );
+
+        assert_eq!(validator.validated_height(), SEED_HEIGHT);
+        assert_eq!(*validator.current_digest(), before);
+        assert_eq!(
+            prover_digest(&validator),
+            before,
+            "the prover kept the rejected block's mutations"
+        );
+        assert!(
+            validator.prover.base.modified_nodes.is_empty(),
+            "the rejected block's touched nodes are still pinned in the proof-cycle map"
+        );
+
+        // The whole point of evaluating before `update_with_height`: the
+        // rejected block never reached storage. `proofs_for_transactions`
+        // reads the tree back out of storage, so this observes the durable
+        // side specifically, not the in-memory one asserted above.
+        let (_, storage_digest) = validator
+            .proofs_for_transactions(&[])
+            .expect("UTXO mode computes proofs")
+            .expect("empty-operation proof");
+        assert_eq!(
+            storage_digest, before,
+            "an unverified block reached state.redb"
+        );
+    }
+
+    /// The same failing block under `Deferred`: applied and persisted, with
+    /// the verdict handed to the caller instead. Proves the two modes differ
+    /// in *who evaluates* and that the block above fails for a script reason
+    /// rather than something incidental to the fixture.
+    #[test]
+    fn deferred_defers_the_same_failing_block() {
+        let input = make_box(false, 2);
+        let tx = spend_tx(std::slice::from_ref(&input));
+        let ops = block_operations(std::slice::from_ref(&tx));
+        let (state_root, ad_root) = oracle(std::slice::from_ref(&input), &ops);
+
+        let (mut validator, _dir) =
+            seeded_validator(std::slice::from_ref(&input), ScriptEvalMode::Deferred);
+        let block = Block::new(std::slice::from_ref(&tx), state_root, ad_root);
+
+        let outcome = block
+            .apply(&mut validator)
+            .expect("deferred mode does not evaluate scripts, so this block applies");
+        assert_eq!(validator.validated_height(), BLOCK_HEIGHT);
+
+        let eval = outcome
+            .deferred_eval
+            .expect("deferred mode owes the caller an evaluation");
+        let err = crate::evaluate_scripts(&eval)
+            .expect_err("the deferred verdict is the same rejection, just later");
+        assert!(
+            matches!(err, ValidationError::TransactionInvalid { .. }),
+            "expected a script failure, got: {err:?}"
+        );
+    }
+
+    /// A block that is valid in every respect: both modes accept it, advance
+    /// to the same state, and differ only in whether they hand back an
+    /// evaluation to run. `sync/` keys on exactly this.
+    #[test]
+    fn a_valid_block_differs_only_in_who_owes_the_evaluation() {
+        let input = make_box(true, 3);
+        let tx = spend_tx(std::slice::from_ref(&input));
+        let ops = block_operations(std::slice::from_ref(&tx));
+        let (state_root, ad_root) = oracle(std::slice::from_ref(&input), &ops);
+        let block = Block::new(std::slice::from_ref(&tx), state_root, ad_root);
+
+        let (mut deferred, _d1) =
+            seeded_validator(std::slice::from_ref(&input), ScriptEvalMode::Deferred);
+        let deferred_outcome = block.apply(&mut deferred).expect("valid block applies");
+        assert!(
+            deferred_outcome.deferred_eval.is_some(),
+            "deferred mode must hand the evaluation back"
+        );
+        assert_eq!(deferred.validated_height(), BLOCK_HEIGHT);
+        assert_eq!(*deferred.current_digest(), state_root);
+
+        let (mut inline, _d2) =
+            seeded_validator(std::slice::from_ref(&input), ScriptEvalMode::Inline);
+        let inline_outcome = block.apply(&mut inline).expect("valid block applies");
+        assert!(
+            inline_outcome.deferred_eval.is_none(),
+            "inline mode already evaluated; Ok is the verdict"
+        );
+        assert_eq!(inline.validated_height(), BLOCK_HEIGHT);
+        assert_eq!(*inline.current_digest(), state_root);
+
+        // And the evaluation deferred mode handed back really is the one
+        // inline mode ran: it passes.
+        crate::evaluate_scripts(&deferred_outcome.deferred_eval.unwrap())
+            .expect("the block's scripts are satisfied");
+    }
+
+    /// Below the checkpoint neither mode evaluates — the state-root check
+    /// alone is the guarantee, and `deferred_eval` is None in both.
+    #[test]
+    fn the_checkpoint_still_outranks_the_mode() {
+        let input = make_box(false, 4);
+        let tx = spend_tx(std::slice::from_ref(&input));
+        let ops = block_operations(std::slice::from_ref(&tx));
+        let (state_root, ad_root) = oracle(std::slice::from_ref(&input), &ops);
+        let block = Block::new(std::slice::from_ref(&tx), state_root, ad_root);
+
+        for mode in [ScriptEvalMode::Deferred, ScriptEvalMode::Inline] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut storage = open_storage(&dir);
+            let prover = seed(&mut storage, std::slice::from_ref(&input));
+            // Checkpoint at the block's own height: `height > checkpoint` is
+            // false, so the unsatisfiable script is never looked at.
+            let mut validator =
+                UtxoValidator::new(storage, prover, SEED_HEIGHT, BLOCK_HEIGHT, mode);
+
+            let outcome = block
+                .apply(&mut validator)
+                .expect("checkpointed block applies without script evaluation");
+            assert!(
+                outcome.deferred_eval.is_none(),
+                "{mode:?}: nothing is owed below the checkpoint"
+            );
+        }
+    }
 }
