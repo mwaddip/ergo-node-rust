@@ -1322,6 +1322,18 @@ no-op.
 for a checkpoint, so if it fires at all it now indicates a genuine defect in
 frontier accounting — which is a better signal than the one it replaced.
 
+**Plumbing.** `sync/` does not currently see the checkpoint at all — it travels
+from `src/main.rs` into the validator and nowhere else. It reaches `sync/` as a
+new `SyncConfig` field, `checkpoint_height: u32`, defaulting to `0` (no
+checkpoint, floor is a no-op), wired from the same
+`configured_checkpoint.unwrap_or(0)` the validator is built with. Both must be
+fed from that one expression: two independently-derived checkpoints that
+disagree would put the frontier floor and the eval-skip boundary at different
+heights, which reintroduces exactly the hole this closes, one block wide and
+far harder to see. Adding a trait method to `BlockValidator` was the
+alternative and is worse — it makes a `validation/` contract change out of a
+value `main` already holds.
+
 ### Why startup gap handling does NOT get the same treatment
 
 The two look like one question — *may the watermark advance over heights whose
