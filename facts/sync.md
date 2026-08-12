@@ -1007,6 +1007,39 @@ persisted separately and loaded on startup.
   + scripts)" until 2026-08-12; that was stronger than any consumer required
   and stronger than a checkpointed node could honour.
 
+### Script evaluation mode (added 2026-08-12)
+
+`SyncConfig` carries `script_eval_inline: bool`, default `false`. It selects
+between the two modes in `facts/validation.md` § "Script evaluation modes".
+
+⚠ **It must be fed from the same expression that constructs the validator's
+mode, in `src/main.rs`.** Two independently-derived copies that disagree put
+sync into deferred bookkeeping while the validator evaluates inline, or the
+reverse — the frontier would then either freeze forever waiting for results
+that are never dispatched, or advance over blocks nothing verified. This is the
+identical hazard as `checkpoint_height`, whose plumbing note is below, and it
+went wrong there first.
+
+**In inline mode everything in the rest of this section is inert.**
+`apply_state` returns `deferred_eval = None`, so nothing is dispatched, the
+gate never engages, `evals_in_flight` and `eval_bytes_in_flight` stay at zero,
+and neither backlog event fires.
+
+Two consequences the implementation must handle rather than inherit:
+
+- **`script_verified_height` advances with `state_applied_height`.** In inline
+  mode an `Ok` from `apply_state` *means* the scripts passed, so the watermark
+  is no longer derived from drained results — it is set directly on each
+  successful apply. Left alone it would freeze at its startup value and
+  `eval_frontier_hole` would fire on every drain.
+- **The startup gap cannot occur.** Nothing unverified is ever persisted, so a
+  crash cannot leave applied-but-unverified blocks. The open question in
+  "Startup gap handling" is moot in this mode — not answered, *unreachable*.
+  It remains open for deferred mode.
+
+The checkpoint floor still applies in both modes: heights at or below
+`checkpoint_height` skip evaluation regardless of where evaluation happens.
+
 ### Eval dispatch
 
 Script evaluation is dispatched to the rayon thread pool via `rayon::spawn`.

@@ -82,7 +82,10 @@ pub trait BlockValidator {
     ///     an epoch-boundary block with verified parameters
     ///
     /// Postconditions on Err:
-    ///   - State is unchanged. validated_height and current_digest are unmodified.
+    ///   - State is unchanged: validated_height, current_digest, AND THE
+    ///     PROVER are exactly as before the call. See "Err leaves the prover
+    ///     clean" below — this was aspirational until 2026-08-12 and the
+    ///     digest-mismatch path violated it.
     ///   - The error describes which check failed.
     fn apply_state(
         &mut self,
@@ -130,6 +133,68 @@ pub trait BlockValidator {
     fn emission_box_id(&self) -> Option<[u8; 32]>;
 }
 ```
+
+## Script evaluation modes (added 2026-08-12)
+
+`UtxoValidator` is constructed with a mode, alongside `checkpoint_height`:
+
+| Mode | Behaviour |
+|---|---|
+| `Deferred` (default) | `apply_state` returns `ApplyStateOutcome.deferred_eval = Some(..)`. The caller evaluates on a background pool. Current behaviour. |
+| `Inline` | `apply_state` evaluates scripts itself and returns `deferred_eval = None`. `Ok` therefore means *scripts passed*. |
+
+**Inline evaluation happens before persistence, not before application.** The
+JVM validates scripts before touching its AVL tree, but it can afford to: it
+reads each input box via `boxById` and removes it afterwards, paying two
+traversals. Ours captures the box from the removal's own return value, so a
+literal copy would add a read per input for no gain.
+
+The boundary that actually matters is **persistence**, because persistence is
+what survives a crash. Everything from the first prover operation to just
+before `storage.update_with_height` is in-memory only. Evaluating in that
+window means nothing unverified ever reaches `state.redb`, which closes the
+startup-gap hole in `facts/sync.md` at the source rather than repairing it
+afterwards.
+
+Ordering: apply operations and capture boxes → verify digest → **evaluate
+scripts** → persist. The digest check stays first because it is cheap and
+rejects malformed blocks before the expensive step.
+
+### Err leaves the prover clean — including today's digest-mismatch path
+
+⚠ **This is a live defect, independent of which mode ships.** Step 5's
+`StateRootMismatch` does a bare `return Err` after step 4 has already applied
+every operation to the prover. Nothing undoes them. `validated_height` and
+`current_digest` are untouched, so the trait's Err postcondition reads as
+satisfied while the tree carries a rejected block's mutations.
+
+It is nearly unreachable today — a digest mismatch means the block is bogus or
+our state is corrupt, and the node wedges either way. **Inline evaluation
+promotes it from unreachable to routine:** a peer sends a block with an
+unsatisfied script, we reject it, and we must carry on with the next candidate.
+That demands a genuinely clean prover, every time.
+
+**Requirement:** every `Err` from `apply_state` leaves the prover byte-for-byte
+as it was on entry. Both the script-failure path and the existing
+digest-mismatch path must satisfy it.
+
+**The mechanism is `validation/`'s choice** — it owns the prover and its
+storage interaction, and the main session is not in a position to specify one
+it cannot stand behind. Two shapes are known to work in principle:
+
+- *Undo after applying.* `reset_to` is the existing route, but it goes through
+  `storage.rollback(digest)` against a **persisted** version, and at the
+  evaluation point this block was never persisted. Whether rollback to the
+  previous digest is sound from that state is a `state/` question that must be
+  answered, not assumed.
+- *Read before applying.* Hoist the box reads ahead of the mutating operations,
+  evaluate, then apply. Nothing to undo because nothing was applied. Costs a
+  traversal per input, partly offset because the operation set already contains
+  `Lookup`s and a lookup warms the path the later remove walks.
+
+Whichever is chosen, say in the completion report **why**, and prove the
+postcondition with a test that fails a block mid-`apply_state` and asserts the
+prover digest is unchanged.
 
 ## New Types
 
