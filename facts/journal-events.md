@@ -43,6 +43,21 @@ human-readable subscriber. The line carries:
 - Optional **free-text suffix** after the marker, for human
   readability. Parsers MUST tolerate arbitrary suffix content.
 
+Two rules follow from parsers matching on the *prefix*, both learned by
+breaking them on 2026-08-12:
+
+- **No marker may be a prefix of another marker.** A parser keyed on the
+  shorter one matches both events and then fails looking for fields that only
+  the shorter one carries. `"deferred eval backlog at bound …"` began with the
+  whole of `"deferred eval backlog"` and did exactly this; it became
+  `"eval dispatch gate engaged"`. When adding an event, check its marker
+  against every existing one in both directions.
+- **Markers are ASCII.** The free-text suffix may contain anything — an em dash
+  there is fine and several markers have one — but the matched portion must
+  survive being retyped from a report, a terminal, or a grep. The same event
+  shipped with a U+2014 inside its marker while this document specified a
+  hyphen, so the documented literal matched nothing.
+
 Example emit:
 
 ```rust
@@ -297,14 +312,25 @@ phase's `_started`.
 
 #### `deferred_eval_gate_engaged`
 - **Level:** DEBUG
-- **Marker:** `"deferred eval backlog at bound - draining to half"`
+- **Marker:** `"eval dispatch gate engaged"`
 - **Fields:** `evals_in_flight` (u64), `eval_bytes_in_flight` (u64),
-  `eval_backlog_max_mb` (u64), `eval_backlog_max_blocks` (u32)
+  `incoming_bytes` (u64: `approx_heap_bytes` of the eval that did not fit —
+  explains why *this* block tripped it), `bound` (string:
+  `bytes`|`blocks`|`both` — which bound tripped, named rather than left to be
+  inferred from the two numbers, since the operator re-tuning one needs to know
+  which regime the host is in)
 - **Since:** 1.6 (added 2026-08-12)
 - **Stability:** stable
 - **Emitted:** when the dispatch gate blocks because adding an eval would
   exceed the byte bound or the count bound, immediately before it drains to
   half of each enabled bound.
+- *The marker was `"deferred eval backlog at bound — draining to half"` in the
+  first draft of this entry. Changed before release for two reasons: it began
+  with `deferred_eval_backlog`'s entire marker, so a prefix parser matched both
+  events and then failed looking for `eval_lag`; and it carried a U+2014 em
+  dash inside the matched portion. The configured limits were also documented
+  as fields — dropped, because they are static and the operator already has
+  them; the emitted set above is the one that varies.*
 - **Why it exists:** the gate blocking is the node deliberately trading sync
   throughput for bounded memory, and it is otherwise invisible — the operator
   sees only that catch-up got slower. DEBUG rather than INFO because on a host
@@ -317,13 +343,18 @@ phase's `_started`.
 - **Level:** WARN
 - **Marker:** `"no eval outstanding below the script frontier"`
 - **Fields:** `script_verified_height` (u64: where the frontier is stuck),
-  `state_applied_height` (u64)
+  `hole` (u64: the height it cannot pass, `script_verified_height + 1`),
+  `buffered` (u64: reorder-buffer entries discarded at this point — the number
+  that would otherwise have grown by one per block forever),
+  `state_applied_height` (u64: how far state has run ahead, i.e. the size of
+  the span this leaves unattested)
 - **Since:** 1.6 (added 2026-08-12)
 - **Stability:** stable
-- **Emitted:** once per occurrence, when a drain finds nothing in flight below
-  the frontier — i.e. no result can ever arrive to advance it. The reorder
-  buffer is dropped at the same point so it stops accumulating one `u32` per
-  block for the life of the process.
+- **Emitted:** when a drain finds nothing in flight below the frontier — i.e.
+  no result can ever arrive to advance it. **Latched: once per distinct hole,
+  not once per occurrence**, re-arming when the frontier moves; otherwise this
+  is a WARN on every block for the life of the process. The reorder buffer is
+  dropped at the same point so it stops accumulating one `u32` per block.
 - **Why it exists:** the expected cause is a `checkpoint_height` configured
   above the node's start height. Heights at or below the checkpoint never
   dispatch an eval, so the frontier can never reach it and `eval_lag` is
