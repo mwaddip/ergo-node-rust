@@ -110,5 +110,5 @@ secp256k1 = "0.29"
 # breath. The durable fix is santa-run deriving this whole table from the staged
 # enr's manifest; until that lands, this comment is the only guardrail.
 [patch.crates-io]
-ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "568e7c3" }
+ergo_avltree_rust = { git = "https://github.com/mwaddip/ergo_avltree_rust.git", rev = "b955790" }
 redb = { path = "patches/redb" }

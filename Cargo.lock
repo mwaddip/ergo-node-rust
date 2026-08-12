@@ -923,7 +923,7 @@ dependencies = [
 [[package]]
 name = "ergo_avltree_rust"
 version = "0.1.1"
-source = "git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=568e7c3#568e7c31e6efeaeba1dbdd2ed5a52fb93e920d80"
+source = "git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=b955790#b95579006eb5629d154293c449210053afbf49a4"
 dependencies = [
  "anyhow",
  "base16",
