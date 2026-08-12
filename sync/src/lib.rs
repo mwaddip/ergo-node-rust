@@ -5,6 +5,7 @@
 
 pub mod apply_state_error;
 pub mod delivery;
+mod eval_backlog;
 pub mod light_bootstrap;
 mod retention;
 pub mod snapshot;

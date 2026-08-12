@@ -283,3 +283,82 @@ fn validation_rollback_failed_renders_marker_and_named_fields() {
         "missing error field: {output}"
     );
 }
+
+// -------------------------------------------------------------------
+// `deferred eval backlog` (contract: `facts/sync.md` § "Catch-up progress
+// instrumentation", added 2026-08-12)
+//
+// The emission lives in `ergo_sync::eval_backlog`, whose own unit tests
+// capture the REAL emit and cover the firing policy (5s elapsed-time gate,
+// suppressed at tip, probe untouched while gated). Kept here — the
+// contract-shape anchor file — as an inline mirror, so the operator-facing
+// field names are pinned beside the other journal events.
+//
+// Not yet listed in `facts/journal-events.md`: contract addition owed by
+// the main session, same as `validation rollback failed` above. This pins
+// the shape that entry must describe.
+// -------------------------------------------------------------------
+
+#[test]
+fn deferred_eval_backlog_renders_marker_and_named_fields() {
+    // Numbers from the 2026-08-12 field OOM: ~27,000 queued evals at
+    // ~410 KB worst case, killed at validation height 1,779,387.
+    let output = capture(|| {
+        info!(
+            evals_in_flight = 27_000u64,
+            state_applied_height = 1_779_387u64,
+            script_verified_height = 1_752_387u64,
+            eval_lag = 27_000u64,
+            jemalloc_allocated = 11_402_000_000u64,
+            "deferred eval backlog"
+        );
+    });
+    assert!(
+        output.contains("deferred eval backlog"),
+        "missing marker: {output}"
+    );
+    assert!(
+        output.contains("evals_in_flight=27000"),
+        "missing evals_in_flight: {output}"
+    );
+    assert!(
+        output.contains("state_applied_height=1779387"),
+        "missing state_applied_height: {output}"
+    );
+    assert!(
+        output.contains("script_verified_height=1752387"),
+        "missing script_verified_height: {output}"
+    );
+    assert!(
+        output.contains("eval_lag=27000"),
+        "missing eval_lag: {output}"
+    );
+    assert!(
+        output.contains("jemalloc_allocated=11402000000"),
+        "missing jemalloc_allocated: {output}"
+    );
+}
+
+#[test]
+fn deferred_eval_backlog_omits_heap_field_without_jemalloc() {
+    // `jemalloc_allocated` is absent — not rendered as `None` — when the
+    // build has no heap probe wired, matching how `validation_stuck`
+    // handles its optional `missing_key`.
+    let output = capture(|| {
+        info!(
+            evals_in_flight = 64u64,
+            state_applied_height = 1_000u64,
+            script_verified_height = 936u64,
+            eval_lag = 64u64,
+            "deferred eval backlog"
+        );
+    });
+    assert!(
+        output.contains("deferred eval backlog"),
+        "missing marker: {output}"
+    );
+    assert!(
+        !output.contains("jemalloc_allocated"),
+        "heap field should be absent, not None: {output}"
+    );
+}

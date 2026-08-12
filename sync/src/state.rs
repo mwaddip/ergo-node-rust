@@ -320,6 +320,11 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     eval_tx: CrossbeamSender<(u32, Result<(), ergo_validation::ValidationError>)>,
     /// Channel for receiving eval results.
     eval_rx: CrossbeamReceiver<(u32, Result<(), ergo_validation::ValidationError>)>,
+    /// Interval gate for the periodic deferred-eval backlog record. The queue
+    /// above it is unbounded and invisible; this makes its depth observable
+    /// during catch-up. In-memory — a restart re-baselines. Diagnostic only:
+    /// it does not bound anything. See [`crate::eval_backlog`].
+    eval_backlog: crate::eval_backlog::EvalBacklogReporter,
     /// Shared downloaded_height for the API (read by fastsync to avoid redundant work).
     shared_downloaded_height: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Gate controlling whether block/header/tx ModifierRequest sends actually fire.
@@ -413,6 +418,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             evals_in_flight: 0,
             eval_tx,
             eval_rx,
+            eval_backlog: crate::eval_backlog::EvalBacklogReporter::default(),
             shared_downloaded_height,
             block_request_gate,
             peer_chain_tip,
@@ -1235,6 +1241,33 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         stall_detail = StallDetail::script_eval();
                         break;
                     }
+
+                    // Periodic depth report for the deferred-eval queue —
+                    // dispatched-minus-drained, which nothing else exposes and
+                    // which has no cap. Placed after the drain so the count is
+                    // this block's true depth, and before the flush below so
+                    // the heap reading is the pre-flush peak that the OOM story
+                    // is about. Time-gated and catch-up-only inside
+                    // `maybe_emit`; the probe closure runs only when a record
+                    // actually fires. Diagnostic, not a bound — see
+                    // [`crate::eval_backlog`] and `../facts/sync.md`.
+                    //
+                    // `state_applied_height` is read from the validator tip,
+                    // not `self.state_applied_height`: that field is a cache
+                    // reconciled after the loop, so mid-sweep it is frozen at
+                    // the pre-sweep tip while `script_verified_height` climbs
+                    // past it — reporting it would peg `eval_lag` at 0 for the
+                    // whole sweep and measure nothing.
+                    self.eval_backlog.maybe_emit(
+                        Instant::now(),
+                        sweep_size,
+                        crate::eval_backlog::BacklogDepth {
+                            evals_in_flight: self.evals_in_flight,
+                            state_applied_height: post_drain_tip,
+                            script_verified_height: self.script_verified_height,
+                        },
+                        || self.config.flush_probe.as_ref().map(|probe| probe()),
+                    );
 
                     // Progress report every 1000 blocks during large sweeps
                     let done = height - applied_tip;
@@ -3825,6 +3858,85 @@ mod sweep_resume_tests {
         assert_eq!(sync.state_applied_height, 2670, "state watermark NOT retreated");
         assert_eq!(sync.script_verified_height, 2670, "script watermark NOT retreated");
         assert_eq!(sync.downloaded_height, 2670, "download watermark NOT retreated");
+    }
+
+    /// ⚠ CHARACTERIZATION TEST — pins a DEFECT, not desired behaviour. The
+    /// fix inverts the final assertion to 3525.
+    ///
+    /// `drain_eval_results` builds its reorder buffer, `verified`, as a
+    /// function-local `BTreeSet` and drops it on return. A result whose
+    /// predecessor is still running is therefore drained, found
+    /// non-contiguous, and **discarded** — the channel will never resend it,
+    /// so `script_verified_height` can never pass the hole.
+    ///
+    /// Replays the live wedge from the 2026-08-12 genesis resync
+    /// (`RAYON_NUM_THREADS=2`, mainnet): block 3522 carries 3 txs / 17 inputs
+    /// while 3521, 3523 and 3524 are coinbase-only (1 input). Eval 3523
+    /// overtakes the ~17× heavier eval 3522 on the second rayon thread, is
+    /// drained alone, and is dropped. The journal froze at exactly
+    /// `script_verified_height=3522` and stayed there for 158,000 blocks.
+    #[tokio::test]
+    async fn out_of_order_eval_result_is_dropped_and_wedges_the_frontier() {
+        let mut sync = build_sync(SweepValidator::at(3525));
+        sync.state_applied_height = 3525;
+        sync.script_verified_height = 3521;
+        sync.downloaded_height = 3525;
+
+        // 3522 (17 inputs) and 3523 (coinbase) both in flight; the light one
+        // finishes first and lands alone in the channel.
+        sync.evals_in_flight = 2;
+        sync.eval_tx.send((3523, Ok(()))).unwrap();
+        sync.drain_eval_results(false).await;
+        assert_eq!(
+            sync.script_verified_height, 3521,
+            "3522 still running — the frontier legitimately cannot advance yet"
+        );
+        assert_eq!(sync.evals_in_flight, 1, "3522 still outstanding");
+
+        // 3522 lands on the next block's drain. The frontier steps to 3522 —
+        // and stops, because 3523's Ok died with the previous call's set.
+        sync.eval_tx.send((3522, Ok(()))).unwrap();
+        sync.drain_eval_results(false).await;
+        assert_eq!(sync.script_verified_height, 3522);
+
+        // Everything after arrives strictly in order and all report Ok.
+        for h in 3524..=3525 {
+            sync.evals_in_flight += 1;
+            sync.eval_tx.send((h, Ok(()))).unwrap();
+            sync.drain_eval_results(false).await;
+        }
+
+        assert_eq!(
+            sync.script_verified_height, 3522,
+            "DEFECT: every height 3522..=3525 reported Ok, but the frontier is \
+             wedged at 3522 forever — 3523's result was discarded by the drain \
+             that could not place it"
+        );
+    }
+
+    /// The control for the test above: the same two results, out of order,
+    /// but both already in the channel when the drain runs. The `BTreeSet`
+    /// reorders them correctly and the frontier clears both.
+    ///
+    /// So the defect is not the reordering logic — it is the buffer's
+    /// *lifetime*. Out-of-order arrival is handled within one call and lost
+    /// across two.
+    #[tokio::test]
+    async fn out_of_order_within_a_single_drain_is_reordered_correctly() {
+        let mut sync = build_sync(SweepValidator::at(3525));
+        sync.state_applied_height = 3525;
+        sync.script_verified_height = 3521;
+        sync.downloaded_height = 3525;
+
+        sync.evals_in_flight = 2;
+        sync.eval_tx.send((3523, Ok(()))).unwrap();
+        sync.eval_tx.send((3522, Ok(()))).unwrap();
+        sync.drain_eval_results(false).await;
+
+        assert_eq!(
+            sync.script_verified_height, 3523,
+            "both results present in one call — the set reorders and clears them"
+        );
     }
 
     #[tokio::test]
