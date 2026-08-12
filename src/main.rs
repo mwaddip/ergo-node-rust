@@ -371,6 +371,19 @@ impl BlockValidator for Validator {
         }
     }
 
+    /// Forwarding this was missed when `resize_cache` was added to the trait,
+    /// so every at-tip resize fell through to the trait's do-nothing default,
+    /// returned `Ok(())`, and logged success. `UtxoValidator::resize_cache`
+    /// was correct the whole time and simply unreachable through this wrapper
+    /// — the at-tip cache resize has never once reached `state.redb`.
+    /// Reported by @odiseusme 2026-08-12 against 036a3eb, confirmed here.
+    fn resize_cache(&self, cache_bytes: usize) -> Result<(), ValidationError> {
+        match &self.inner {
+            ValidatorInner::Digest(v) => v.resize_cache(cache_bytes),
+            ValidatorInner::Utxo(v) => v.resize_cache(cache_bytes),
+        }
+    }
+
     fn proofs_for_transactions(
         &self,
         txs: &[ergo_validation::Transaction],

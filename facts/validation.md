@@ -32,6 +32,29 @@ transaction validation: S9  P8 E6 C5 I8 A7 L8
 
 ## Trait: `BlockValidator`
 
+⚠ **No method on this trait may carry a do-nothing default body.** Three did —
+`flush`, `resize_cache`, `proofs_for_transactions` — and it cost us a bug that
+ran undetected for the life of the feature.
+
+`impl BlockValidator for Validator` (the enum wrapper in `src/main.rs`) is pure
+delegation: every method must forward to the active variant. When
+`resize_cache` was added, the wrapper was not updated. It compiled, because the
+trait supplied a default returning `Ok(())`. So the at-tip cache resize called
+into the wrapper, hit the default, did nothing, returned `Ok`, and **logged
+success** — `UtxoValidator::resize_cache` was correct throughout and simply
+unreachable. The resize never once reached `state.redb`. Found by @odiseusme on
+2026-08-12 by reading `main.rs` rather than trusting the metrics; confirmed
+independently before the fix.
+
+`flush` is the same shape and far worse: a forgotten forward there means state
+is never persisted while every caller is told it was.
+
+A defaulted method turns "forgot to delegate" into silence. Declare every
+method, and let implementations that genuinely do nothing — digest-mode
+`resize_cache`, for instance — say so explicitly in one line. The compiler then
+catches the next wrapper that forgets, which is the only thing that reliably
+will.
+
 ```rust
 pub trait BlockValidator {
     /// Apply state transition: parse sections, compute state changes,
