@@ -1,29 +1,40 @@
 //! Periodic depth report for the deferred script-eval queue.
 //!
 //! `apply_state` hands each block's script evaluation to the rayon pool and
-//! moves on; results come back through a crossbeam channel and are drained
-//! non-blocking between blocks. The counter tracking that queue,
-//! `evals_in_flight`, has **no cap** — it is written only by `+= 1` at
-//! dispatch, `-= 1` at drain, and reset-to-zero on rollback. During catch-up
-//! the sweep-end drain does not block (`blocking = sweep_size <= 1`), so a
-//! 192-block sweep dispatches up to 192 evals and moves on. On a host where
-//! verification is slower than state application the queue grows across
-//! sweeps without limit.
+//! moves on; results come back through a channel and are drained non-blocking
+//! between blocks. During catch-up the sweep-end drain does not drain to zero,
+//! so a 192-block sweep dispatches up to 192 evals and keeps going. On a host
+//! where verification is slower than state application the queue grows across
+//! sweeps — and until 2026-08-12 nothing bounded it and nothing exposed it.
 //!
-//! Nothing exposed that depth, which is why the failure mode below took a
-//! field OOM to surface: a 4-thread 1.8 GHz node on v0.7.11 was killed
-//! mid-sweep on 2026-08-12 at **anon-rss 10.62 GiB, file-rss 2.4 MB** — heap,
-//! not page cache — after 26h of entirely steady cadence. At the ~410 KB
-//! worst-case cost of a queued `DeferredEval` that is ≈27,000 evals, roughly
-//! 140 sweeps of backlog. On a high-core-count host rayon keeps pace and the
-//! queue stays shallow, so the same binary looks fine there.
+//! Which is why the failure mode took a field OOM to surface: a 4-thread
+//! 1.8 GHz node on v0.7.11 was killed mid-sweep on 2026-08-12 at **anon-rss
+//! 10.62 GiB, file-rss 2.4 MB** — heap, not page cache — after 26h of entirely
+//! steady cadence. That anon-rss is the measured quantity and the one to quote.
+//! Converting it to a queue depth requires a per-item estimate that has already
+//! moved by 8× once (≈27,000 evals became ≈3,000 purely by correcting the
+//! per-item figure) and will move again once `eval_bytes_in_flight` has been
+//! compared against jemalloc; the diagnosis is the same at either number. On a
+//! high-core-count host rayon keeps pace and the queue stays shallow, so the
+//! same binary looks fine there.
 //!
-//! This module makes the depth observable. It is **not** a fix: bounding the
-//! queue is a separate design question that interacts with
-//! `flush_heap_threshold_mb`, with sweep size, and with how much pipelining is
-//! worth keeping on a host that *can* keep up — and a cap added now would
-//! destroy the measurement this exists to take. See `../facts/sync.md`
-//! § "Catch-up progress instrumentation".
+//! The queue now **is** bounded — `eval_backlog_max_mb` / `eval_backlog_max_blocks`,
+//! enforced at dispatch (`../facts/sync.md` § "Eval backpressure"). This module
+//! did not become redundant when that landed; it sits alongside the bound
+//! rather than in place of one, and it answers questions the bound cannot:
+//!
+//! - **Is the bound binding, and which half of it?** `evals_in_flight` and
+//!   `eval_bytes_in_flight` against their configured limits say whether this
+//!   host is pipelining freely or running at the gate all sweep.
+//! - **Is the byte accounting real?** `approx_heap_bytes` is theory-grounded
+//!   from sigma-rust struct shapes and has never been checked against a running
+//!   allocator. `eval_bytes_in_flight` beside `jemalloc_allocated` — which this
+//!   record already carried — makes the estimator falsifiable on the next
+//!   catch-up run. If the two do not move together, the accounting in
+//!   `facts/validation.md` is wrong and the byte bound is calibrated against
+//!   fiction. Cheap to emit: the gate has to maintain the sum regardless.
+//!
+//! See `../facts/sync.md` § "Catch-up progress instrumentation".
 //!
 //! ## Policy
 //!
@@ -56,9 +67,13 @@ const REPORT_INTERVAL: Duration = Duration::from_secs(5);
 /// whether or not the record is emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BacklogDepth {
-    /// Eval tasks dispatched to rayon but not yet drained. The unbounded
-    /// quantity; the one the OOM hypothesis is about.
+    /// Eval tasks dispatched to rayon but not yet drained — the quantity the
+    /// OOM hypothesis is about, and the guardrail half of the bound.
     pub evals_in_flight: u32,
+    /// Σ `approx_heap_bytes()` of those same tasks — the quantity the primary
+    /// bound gates on, and the only thing that ever checks the estimator. See
+    /// the module doc.
+    pub eval_bytes_in_flight: u64,
     /// Highest height where `apply_state()` returned Ok.
     ///
     /// Read from the validator's own `validated_height()`, NOT from
@@ -142,6 +157,7 @@ fn emit_eval_backlog(depth: BacklogDepth, jemalloc_allocated: Option<u64>) {
     match jemalloc_allocated {
         Some(bytes) => tracing::info!(
             evals_in_flight = depth.evals_in_flight as u64,
+            eval_bytes_in_flight = depth.eval_bytes_in_flight,
             state_applied_height = depth.state_applied_height as u64,
             script_verified_height = depth.script_verified_height as u64,
             eval_lag = depth.eval_lag() as u64,
@@ -150,6 +166,7 @@ fn emit_eval_backlog(depth: BacklogDepth, jemalloc_allocated: Option<u64>) {
         ),
         None => tracing::info!(
             evals_in_flight = depth.evals_in_flight as u64,
+            eval_bytes_in_flight = depth.eval_bytes_in_flight,
             state_applied_height = depth.state_applied_height as u64,
             script_verified_height = depth.script_verified_height as u64,
             eval_lag = depth.eval_lag() as u64,
@@ -170,9 +187,24 @@ mod tests {
     /// A catch-up sweep: anything above the tip's single block.
     const CATCH_UP: u32 = 192;
 
+    /// `approx_heap_bytes` of an ordinary (~20-tx) block, per
+    /// `facts/validation.md`. Lets `depth` derive a plausible byte figure from
+    /// the count so the tests that do not care about bytes stay unchanged.
+    const ORDINARY_BLOCK_BYTES: u64 = 195 * 1024;
+
     fn depth(in_flight: u32, applied: u32, verified: u32) -> BacklogDepth {
+        depth_bytes(
+            in_flight,
+            in_flight as u64 * ORDINARY_BLOCK_BYTES,
+            applied,
+            verified,
+        )
+    }
+
+    fn depth_bytes(in_flight: u32, bytes: u64, applied: u32, verified: u32) -> BacklogDepth {
         BacklogDepth {
             evals_in_flight: in_flight,
+            eval_bytes_in_flight: bytes,
             state_applied_height: applied,
             script_verified_height: verified,
         }
@@ -379,6 +411,43 @@ mod tests {
     }
 
     // ---- the heap probe ----
+
+    #[test]
+    fn record_carries_eval_bytes_beside_jemalloc_allocated() {
+        // The pairing is the point: `approx_heap_bytes` has never been checked
+        // against a running allocator, and these two fields side by side in one
+        // record are what makes it falsifiable. A record carrying only one of
+        // them settles nothing.
+        let mut r = EvalBacklogReporter::default();
+        let output = capture(|| {
+            r.maybe_emit(
+                now(),
+                CATCH_UP,
+                depth_bytes(70, 268_435_456, 1_779_387, 1_779_317),
+                || Some(11_402_000_000),
+            );
+        });
+        assert!(
+            output.contains("eval_bytes_in_flight=268435456"),
+            "missing byte accumulator: {output}"
+        );
+        assert!(
+            output.contains("jemalloc_allocated=11402000000"),
+            "missing heap field: {output}"
+        );
+    }
+
+    #[test]
+    fn record_carries_eval_bytes_without_a_probe() {
+        let mut r = EvalBacklogReporter::default();
+        let output = capture(|| {
+            r.maybe_emit(now(), CATCH_UP, depth_bytes(3, 10_752, 1_000, 997), || None);
+        });
+        assert!(
+            output.contains("eval_bytes_in_flight=10752"),
+            "the byte accumulator does not depend on the probe: {output}"
+        );
+    }
 
     #[test]
     fn record_carries_jemalloc_allocated_when_a_probe_is_wired() {

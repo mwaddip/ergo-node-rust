@@ -889,6 +889,23 @@ struct NodeConfig {
     #[serde(default = "default_flush_min_blocks")]
     flush_min_blocks: u32,
 
+    // ── Deferred-eval backpressure ───────────────────────────────────────
+    // Bounds the queue of script evaluations dispatched to rayon but not
+    // yet drained. Governs a pool of memory DISJOINT from the redb dirty
+    // pages that flush_heap_threshold_mb controls — flushing redb does not
+    // free a queued eval, so the two must not share a budget.
+    /// Ceiling (MB) on the summed heap of dispatched-not-drained script
+    /// evaluations. 0 disables the byte bound. Governs dense blocks, where
+    /// a single queued eval can be megabytes.
+    #[serde(default = "default_eval_backlog_max_mb")]
+    eval_backlog_max_mb: u64,
+    /// Ceiling on the *count* of dispatched-not-drained evaluations.
+    /// 0 disables the count bound. Not redundant with the byte bound: it
+    /// governs ordinary and coinbase-only blocks, where tens of thousands
+    /// could queue inside the byte budget while paying per-item overhead.
+    #[serde(default = "default_eval_backlog_max_blocks")]
+    eval_backlog_max_blocks: u32,
+
     // ── At-tip memory mirrors ────────────────────────────────────────────
     // These take effect once chain sync reaches tip. Until then the cold-
     // sync values above are used. The transition swaps flush settings live
@@ -956,6 +973,8 @@ impl Default for NodeConfig {
             flush_heap_threshold_mb: default_flush_heap_threshold_mb(),
             flush_max_blocks: default_flush_max_blocks(),
             flush_min_blocks: default_flush_min_blocks(),
+            eval_backlog_max_mb: default_eval_backlog_max_mb(),
+            eval_backlog_max_blocks: default_eval_backlog_max_blocks(),
             synced_cache_mb: None,
             synced_flush_heap_threshold_mb: None,
             synced_flush_max_blocks: None,
@@ -1056,6 +1075,19 @@ fn default_flush_min_blocks() -> u32 {
 }
 fn default_reconciliation_trust_threshold() -> u32 {
     100
+}
+/// 256 MB never binds on a host that keeps pace — observed depth on a
+/// 32-core box is 1-3 evals — so the bound is inert exactly where it is not
+/// needed, while capping the 2026-08-12 field OOM at ~2.4% of the 10.62 GiB
+/// it reached. See facts/sync.md § "Eval backpressure".
+fn default_eval_backlog_max_mb() -> u64 {
+    256
+}
+/// Paired with the byte bound above; the two govern disjoint block shapes.
+/// Must match `SyncConfig`'s own default so a config that omits both and a
+/// config that states the defaults behave identically.
+fn default_eval_backlog_max_blocks() -> u32 {
+    256
 }
 
 /// Top-level config wrapper.
@@ -2284,6 +2316,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         flush_heap_threshold_mb: node_config.flush_heap_threshold_mb,
         flush_max_blocks: node_config.flush_max_blocks,
         flush_min_blocks: node_config.flush_min_blocks,
+        eval_backlog_max_mb: node_config.eval_backlog_max_mb,
+        eval_backlog_max_blocks: node_config.eval_backlog_max_blocks,
         synced_flush_heap_threshold_mb: node_config.synced_flush_heap_threshold_mb,
         synced_flush_max_blocks: node_config.synced_flush_max_blocks,
         synced_flush_min_blocks: node_config.synced_flush_min_blocks,

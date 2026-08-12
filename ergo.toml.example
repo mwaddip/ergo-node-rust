@@ -175,6 +175,37 @@ protocol_version = "6.0.3"
 # Lower bound on blocks between flushes (prevents storm-flushing).
 # flush_min_blocks = 5
 
+# ── Deferred-eval backpressure ──────────────────────────────────────────
+#
+# Script evaluation runs on the rayon pool while state application moves
+# on. On a host where verification is slower than state application, that
+# queue grows every sweep. It was unbounded until v0.8.0, and a 4-thread
+# 1.8 GHz node was OOM-killed at 10.62 GiB of anonymous RSS because of it.
+#
+# This budget is DELIBERATELY separate from flush_heap_threshold_mb above.
+# That one bounds redb's dirty pages; this one bounds queued evaluations.
+# Flushing redb does not free a queued eval, so a single shared threshold
+# would spin the flush controller against pressure it cannot relieve.
+#
+# The two bounds below are not redundant — they govern different block
+# shapes, and removing either leaves one shape unbounded:
+#
+#   ordinary blocks (~195 KB each) -> the COUNT bound binds, at ~50 MB
+#   dense blocks    (~3.6 MB each) -> the BYTE bound binds, at ~70 evals
+#
+# On a host that keeps pace neither binds: observed queue depth on a
+# 32-core box is 1-3 evals. If you see the node reporting the gate
+# engaging continuously, it is verification-bound — that is the condition
+# these exist for, not a fault.
+
+# Ceiling (MB) on the summed heap of dispatched-not-drained evaluations.
+# 0 disables the byte bound.
+# eval_backlog_max_mb = 256
+
+# Ceiling on the COUNT of dispatched-not-drained evaluations.
+# 0 disables the count bound.
+# eval_backlog_max_blocks = 256
+
 # ── At-tip memory mirrors (in use once chain reaches tip) ───────────────
 #
 # Once synced, per-block updates are tiny (~1 block / 2 min on mainnet).
