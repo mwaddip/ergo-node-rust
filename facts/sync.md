@@ -985,6 +985,49 @@ sweep, and blocking after the sweep completes.
 
 No backpressure. Memory per DeferredEval is ~25KB typical, ~410KB worst case.
 
+**The per-item cost is bounded; the aggregate is not.** `evals_in_flight` has
+no cap — it is written only by `+= 1` at dispatch, `-= 1` at drain, and
+reset-to-zero on rollback. During catch-up `blocking = sweep_size <= 1` is
+false, so a 192-block sweep dispatches up to 192 evals and never waits for
+them. If script verification is slower than state application the queue grows
+across sweeps without limit.
+
+Consistent with a field OOM on 2026-08-12 (4-thread 1.8 GHz host, v0.7.11):
+**anon-rss 10.62 GiB, file-rss 2.4 MB**, killed mid-sweep during catch-up.
+10.62 GiB / 410 KB ≈ 27,000 queued evals, roughly 140 sweeps of backlog.
+
+This is invisible on high-core-count hosts, where Rayon keeps pace and the
+queue stays shallow. It is not a hypothetical on small ones.
+
+### Catch-up progress instrumentation (added 2026-08-12)
+
+Because the queue depth is the quantity that matters and nothing exposes it,
+the sync layer emits a periodic INFO record during catch-up:
+
+| Field | Source |
+|---|---|
+| `evals_in_flight` | the counter itself |
+| `state_applied_height` | existing watermark |
+| `script_verified_height` | existing watermark |
+| `eval_lag` | `state_applied_height - script_verified_height` |
+| `jemalloc_allocated` | the existing probe, `None` without the jemalloc feature |
+
+Requirements:
+
+- **Time-based, not per-block.** At 192 blocks/second through the early chain a
+  per-block record is unusable; the interval must be seconds, not blocks.
+- Emitted only while catching up. At tip the queue is drained synchronously
+  every sweep and the record would be noise.
+- `eval_lag` is derived rather than left to the reader: it is the number the
+  backlog hypothesis predicts will climb, and a reader computing it by hand
+  from two other fields will not do it consistently.
+- Must not perturb what it measures — no allocation in the hot path beyond the
+  log record itself.
+
+This is diagnostic, not a fix. Bounding the queue is a separate design
+question: a cap interacts with `flush_heap_threshold_mb`, with sweep size, and
+with how much pipelining is worth keeping on a host that *can* keep up.
+
 ### At chain tip
 
 When `sweep_size == 1`, drain the eval channel synchronously after applying
