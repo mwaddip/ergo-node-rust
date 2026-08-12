@@ -1,6 +1,6 @@
 # Journal Events Contract
 
-Version: 1.5.0
+Version: 1.6.0
 
 Stable contract for parseable events in the node's structured log
 output. Consumers (e.g. the Ergo Node Doctor adapter) write parsers
@@ -261,32 +261,78 @@ phase's `_started`.
   from the validator — see the warning below), `script_verified_height` (u64),
   `eval_lag` (u64: applied tip − script_verified_height),
   `jemalloc_allocated` (u64, **omitted entirely** when no heap probe is wired,
-  same convention as `validation_stuck`'s optional `missing_key`)
-- **Since:** 1.5 (added 2026-08-12)
+  same convention as `validation_stuck`'s optional `missing_key`),
+  `eval_bytes_in_flight` (u64: Σ `approx_heap_bytes` of dispatched-not-drained
+  evals — the accumulator the byte bound gates on; **added 1.6**)
+- **Since:** 1.5 (added 2026-08-12); `eval_bytes_in_flight` since 1.6
 - **Stability:** stable
 - **Emitted:** at most once per 5 s during catch-up, from the sweep loop after
   the non-blocking drain and before the flush — so the count is post-drain and
   the heap reading is pre-flush. **Not emitted at chain tip**, where a
   single-block sweep drains synchronously every time and the record would be
   noise.
-- **Why it exists:** `evals_in_flight` has no cap. During catch-up the
-  sweep-end drain never blocks, so if script verification is slower than state
-  application the queue grows across sweeps without limit. At the documented
-  ~410 KB worst case per queued eval, that is how a 4-thread host reached
-  10.62 GiB of anonymous RSS and was OOM-killed on 2026-08-12.
-- ⚠ **Read `evals_in_flight` for queue depth. `eval_lag` is currently
-  meaningless.** It derives from `script_verified_height`, which freezes on the
-  first out-of-order eval result (see `facts/sync.md` — a non-contiguous result
-  is drained and discarded, and the frontier never recovers). Measured live:
-  `eval_lag=187711` while `evals_in_flight=1` and jemalloc `allocated` flat at
-  ~1.14 GB across 190,000 blocks. The field is retained because it will become
-  meaningful once the watermark is fixed, and because its divergence from
-  `evals_in_flight` is itself a signal that the watermark is broken.
+- **Why it exists:** the queue was unbounded until 2026-08-12. During catch-up
+  the sweep-end drain never blocked, so if script verification was slower than
+  state application the queue grew across sweeps without limit — which is how a
+  4-thread host reached 10.62 GiB of anonymous RSS and was OOM-killed on
+  2026-08-12. It is now bounded by `eval_backlog_max_mb` /
+  `eval_backlog_max_blocks`; the record remains the way an operator sees depth
+  approaching those bounds. (An earlier revision of this entry derived an eval
+  count from a ~410 KB per-item figure that was 6–8× too low. Quote the
+  anon-rss; see `facts/sync.md`.)
+- ⚠ **`eval_lag` was meaningless before 1.6** — it derives from
+  `script_verified_height`, which used to freeze on the first out-of-order eval
+  result. Measured live: `eval_lag=187711` while `evals_in_flight=1` and
+  jemalloc `allocated` flat at ~1.14 GB across 190,000 blocks. The watermark is
+  fixed and the field now tracks reality, **except** on a node configured with
+  `checkpoint_height` above its start height, where heights at or below the
+  checkpoint never dispatch an eval and `eval_lag` is permanently large by that
+  offset. Anything quoting `eval_lag` from a pre-1.6 run is quoting a frozen
+  number.
 - ⚠ **`state_applied_height` is the validator's `validated_height()`, not the
   sync struct's field of the same name.** That field is a cache reconciled only
   after the sweep loop; mid-sweep it is frozen at the pre-sweep tip, which
   would peg `eval_lag` at 0 by saturation and report a healthy system while the
   queue grew.
+
+#### `deferred_eval_gate_engaged`
+- **Level:** DEBUG
+- **Marker:** `"deferred eval backlog at bound - draining to half"`
+- **Fields:** `evals_in_flight` (u64), `eval_bytes_in_flight` (u64),
+  `eval_backlog_max_mb` (u64), `eval_backlog_max_blocks` (u32)
+- **Since:** 1.6 (added 2026-08-12)
+- **Stability:** stable
+- **Emitted:** when the dispatch gate blocks because adding an eval would
+  exceed the byte bound or the count bound, immediately before it drains to
+  half of each enabled bound.
+- **Why it exists:** the gate blocking is the node deliberately trading sync
+  throughput for bounded memory, and it is otherwise invisible — the operator
+  sees only that catch-up got slower. DEBUG rather than INFO because on a host
+  that genuinely cannot keep up this fires continuously; it is a diagnostic for
+  "why is catch-up slow", not a health signal. Sustained engagement means the
+  host is verification-bound, which is the condition the bound exists for and
+  not in itself a fault.
+
+#### `eval_frontier_hole`
+- **Level:** WARN
+- **Marker:** `"no eval outstanding below the script frontier"`
+- **Fields:** `script_verified_height` (u64: where the frontier is stuck),
+  `state_applied_height` (u64)
+- **Since:** 1.6 (added 2026-08-12)
+- **Stability:** stable
+- **Emitted:** once per occurrence, when a drain finds nothing in flight below
+  the frontier — i.e. no result can ever arrive to advance it. The reorder
+  buffer is dropped at the same point so it stops accumulating one `u32` per
+  block for the life of the process.
+- **Why it exists:** the expected cause is a `checkpoint_height` configured
+  above the node's start height. Heights at or below the checkpoint never
+  dispatch an eval, so the frontier can never reach it and `eval_lag` is
+  permanently large by that offset. **This is configuration, not backlog** —
+  read `evals_in_flight` and `eval_bytes_in_flight` for real depth. If it fires
+  on a node with **no** checkpoint configured, that is a genuine defect in
+  frontier accounting and should be reported. See `facts/sync.md`
+  § "Checkpoint frontier hole", which records the open question of whether the
+  frontier should advance over deliberately-skipped heights.
 
 #### `validation_rollback_failed`
 - **Level:** ERROR

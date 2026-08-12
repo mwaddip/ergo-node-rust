@@ -127,8 +127,63 @@ pub struct DeferredEval {
     pub header: Header,
     pub preceding_headers: Vec<Header>,
     pub parameters: Parameters,
+    /// PRIVATE — read via `approx_heap_bytes()`. See below for why.
+    approx_heap_bytes: usize,
+}
+
+impl DeferredEval {
+    /// The only way to build one. Derives `approx_heap_bytes` from the
+    /// serialized sizes the caller already holds.
+    pub fn new(/* ..., block_txs: &[u8], proof_box_bytes: usize */) -> Self;
+
+    /// Estimated retained heap of this value, in bytes.
+    pub fn approx_heap_bytes(&self) -> usize;
 }
 ```
+
+### `approx_heap_bytes` (added 2026-08-12)
+
+The sync layer bounds its deferred-eval queue by **bytes in flight**, not by
+item count, because per-item weight varies by three orders of magnitude:
+`proof_boxes` holds every input and data-input box of the block, so a
+coinbase-only block is a few KB and a dense late-chain block is megabytes. A
+count cap bounds the number that isn't the problem. `sync/` cannot compute this
+itself — it never sees the boxes — so `validation/` must supply it.
+
+Semantics and required properties:
+
+- **It is an estimate, and the name says so.** Callers use it as a budget
+  input, never as a measurement. Nothing may assert on its exact value.
+- **Computed at construction**, in the pass that already builds `proof_boxes`.
+  It must not cost a second walk over the data, and specifically must not
+  serialize anything solely in order to measure it. Serialized lengths already
+  on hand at construction are the intended source; the in-memory form is a
+  bounded multiple of them, and a documented inflation factor is acceptable.
+- **Monotone in the block's real weight** — more/larger boxes and transactions
+  must not produce a smaller figure.
+- **Never zero when the block carries any transaction.** A zero would silently
+  disable the caller's bound, which is the one failure mode that turns this
+  field into a liability rather than a safeguard.
+
+Under-estimation costs memory headroom; over-estimation costs throughput. Prefer
+over-estimation — the bound exists for hosts that OOM, and on those the
+throughput is already gone.
+
+**The field is private and the constructor is public — deliberately, and this
+supersedes the first draft of this section, which had a `pub` field.** With the
+field public, any out-of-crate struct literal can set it to zero, and the
+"never zero" invariant above is then enforced by nothing but the hope that
+nobody writes one. An invariant described as the difference between a safeguard
+and a liability should not rest on that. A private field makes out-of-crate
+literal construction impossible, so `new` is the only path in and the estimator
+is unbypassable. Callers read through `approx_heap_bytes()`.
+
+`new` is public rather than `pub(crate)` because the startup re-evaluation path
+— rebuilding a `DeferredEval` for gap blocks from stored sections — is a
+documented future caller that may not live in this crate. `pub(crate)` would
+force whoever writes it to either move into `validation/` or reconstruct the
+estimator, and a second estimator is exactly the drift this design exists to
+prevent.
 
 ## Free Function
 
