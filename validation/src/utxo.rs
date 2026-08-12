@@ -534,26 +534,19 @@ impl UtxoValidator {
 
         match self.storage.rollback(&avl_digest) {
             Ok((root, tree_height)) => {
-                self.prover.restore_root(root, tree_height);
-
-                // `restore_root` clears the changed-node buffers and the
-                // directions and rebases `old_top_node`, but leaves
-                // `modified_nodes` — the address-keyed map `pack_tree` gates
-                // on — holding every node the failed block touched. Nothing
-                // is misidentified afterwards, because each entry owns an Rc
-                // and a live address cannot be recycled; the cost is that
-                // those entries pin the touched subtree for the life of the
-                // process. Deferred mode reaches this path about never.
-                // Inline mode reaches it once per rejected block, i.e. as
-                // often as a peer cares to send one, which turns an
-                // accounting wart into an unbounded retention.
+                // `restore_root` is the entire cleanup: it installs the
+                // on-disk root and drops the abandoned cycle's bookkeeping —
+                // the changed-node buffers, the directions, and
+                // `modified_nodes`, the address-keyed map `pack_tree` gates
+                // on. That last clear used to be a separate line here; it
+                // moved *into* `restore_root` in fork rev b955790, so it is
+                // upstream now rather than gone. Do not reinstate it.
                 //
-                // The proper home for this is `restore_root` itself, next to
-                // the other three clears it already does — an upstream change
-                // in the ergo_avltree_rust fork. Until that lands, clearing
-                // here is what makes "the prover is as it was on entry" true
-                // of the whole prover rather than just its tree.
-                self.prover.base.modified_nodes.clear();
+                // The `modified_nodes.is_empty()` assertions in this file's
+                // rejection tests are what makes that upstream guarantee
+                // observable — they fail first if the pin ever moves back
+                // below b955790.
+                self.prover.restore_root(root, tree_height);
             }
             Err(e) => {
                 tracing::error!(
