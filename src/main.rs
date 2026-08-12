@@ -2391,6 +2391,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // mode constructs no validator and leaves this 0, which is correct:
         // nothing is script-verified there, so the floor is a no-op.
         checkpoint_height: effective_checkpoint.get(),
+        // Derived from THE mode binding, never re-parsed from node_config —
+        // sync doing deferred bookkeeping while the validator evaluates
+        // inline freezes the frontier; the reverse advances it over blocks
+        // nothing verified. Note this literal ends in `..SyncConfig::default()`,
+        // so omitting this line would have compiled and silently left sync in
+        // deferred mode forever.
+        script_eval_inline: matches!(script_eval_mode, ergo_validation::ScriptEvalMode::Inline),
         synced_flush_heap_threshold_mb: node_config.synced_flush_heap_threshold_mb,
         synced_flush_max_blocks: node_config.synced_flush_max_blocks,
         synced_flush_min_blocks: node_config.synced_flush_min_blocks,

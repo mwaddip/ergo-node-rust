@@ -272,6 +272,26 @@ pub struct SyncConfig {
     /// eval-skip boundary at different heights, which reopens this hole one
     /// block wide and far harder to see.
     pub checkpoint_height: u32,
+    /// The validator evaluates ErgoScript inside `apply_state` rather than
+    /// handing sync a `DeferredEval` to dispatch. `false` (default) is deferred
+    /// mode, which is what every node shipped before 2026-08-12.
+    ///
+    /// Sync does not choose where evaluation happens — the validator does. This
+    /// says which of the two shapes to expect back, and the only thing it
+    /// decides here is where `script_verified_height` comes from: under inline
+    /// an `Ok` from `apply_state` already *means* the scripts passed, so the
+    /// frontier is set on each successful apply instead of being derived from
+    /// drained results. Nothing is dispatched, so nothing would ever arrive to
+    /// move it otherwise.
+    ///
+    /// MUST be fed from the same expression the validator's mode is built from
+    /// in `src/main.rs`. Two independently-derived copies that disagree either
+    /// freeze the frontier forever waiting on results that are never
+    /// dispatched, or advance it over blocks nothing verified — the identical
+    /// hazard to `checkpoint_height` above, which is where it went wrong first.
+    ///
+    /// See ../facts/sync.md § "Script evaluation mode".
+    pub script_eval_inline: bool,
 }
 
 impl Default for SyncConfig {
@@ -313,6 +333,11 @@ impl Default for SyncConfig {
             // overrides from the same `configured_checkpoint.unwrap_or(0)` it
             // builds the validator with.
             checkpoint_height: 0,
+            // Deferred: the pre-existing behaviour, and the mode the rest of
+            // the eval machinery in this file is written for. The main crate
+            // overrides from the same binding it constructs the validator's
+            // `ScriptEvalMode` with.
+            script_eval_inline: false,
         }
     }
 }
@@ -1359,6 +1384,27 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                             drop(eval);
                             let _ = tx.send(EvalResult { height, generation, bytes, outcome });
                         });
+                    }
+
+                    // The inline counterpart to the dispatch above, and the one
+                    // thing about inline mode that does not work by itself. The
+                    // validator ran this block's scripts before it persisted, so
+                    // the `Ok` in hand already means they passed; there is no
+                    // result to wait for and — since nothing was dispatched —
+                    // nothing that could ever arrive to carry the frontier
+                    // forward. Left out, the watermark sits at its startup value
+                    // for the life of the process while state runs away from it.
+                    //
+                    // Through the setter so `checkpoint_height` still floors it,
+                    // and persisted on the same cadence the drained path uses:
+                    // WAL-only under Durability::None, fsynced by the paired
+                    // `store.flush()` at the next state-flush point.
+                    // See `../facts/sync.md` § "Script evaluation mode".
+                    if self.config.script_eval_inline {
+                        self.set_script_frontier(height);
+                        self.store
+                            .set_script_verified_height(self.script_verified_height)
+                            .await;
                     }
 
                     // Non-blocking drain of completed eval results. A
@@ -5070,6 +5116,149 @@ mod sweep_resume_tests {
             "a hole above the checkpoint is still a hole: {output}"
         );
         assert_eq!(sync.eval_frontier_hole, Some(3522));
+    }
+
+    // ---- inline script evaluation (`../facts/sync.md` § "Script evaluation
+    //      mode") ----
+    //
+    // Under `script_eval_inline` the validator evaluates scripts itself and
+    // returns `deferred_eval = None`, so sync dispatches nothing, drains
+    // nothing, and would learn nothing. Everything else in the eval machinery
+    // goes quiet on its own; the frontier is the one thing that does not, and
+    // these tests are about that one thing.
+    //
+    // `SweepValidator` already returns `deferred_eval: None` from every apply,
+    // which is exactly the inline shape — so the only difference between these
+    // tests and the deferred ones above is the config flag, which is the point.
+
+    fn inline_config() -> SyncConfig {
+        SyncConfig { script_eval_inline: true, ..SyncConfig::default() }
+    }
+
+    #[tokio::test]
+    async fn inline_frontier_tracks_the_applied_tip() {
+        // The whole task in one assertion. Without the set-on-apply the
+        // watermark stays at its construction value (3510) while state runs to
+        // 3530, and stays there for the life of the process.
+        let mut sync = build_sync_with_config(SweepValidator::at(3510), inline_config());
+        sync.downloaded_height = 3530;
+
+        sync.advance_state_applied_height().await;
+
+        assert_eq!(sync.state_applied_height, 3530, "the sweep applied 3511..=3530");
+        assert_eq!(
+            sync.script_verified_height, 3530,
+            "inline: an Ok from apply_state means the scripts passed, so the \
+             frontier is the applied tip"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_mode_does_not_advance_the_frontier_on_apply() {
+        // The control, and what keeps the flag from being decorative. Same
+        // validator, same blocks, `script_eval_inline: false`: applying a block
+        // says nothing about its scripts, so the frontier must not move. (This
+        // validator dispatches nothing either — under deferred that is a node
+        // whose evals are all skipped, and the frontier correctly stays put.)
+        let mut sync = build_sync(SweepValidator::at(3510));
+        sync.downloaded_height = 3530;
+
+        sync.advance_state_applied_height().await;
+
+        assert_eq!(sync.state_applied_height, 3530, "state still advanced");
+        assert_eq!(
+            sync.script_verified_height, 3510,
+            "deferred: the frontier moves only when a result says a height verified"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_frontier_respects_the_checkpoint_floor() {
+        // A checkpointed node syncing up to and then through its checkpoint,
+        // in two sweeps, because one end-state assertion cannot separate both
+        // ways of getting this wrong:
+        //
+        //   sweep 1 (3511..=3515, all below the checkpoint) pins the floor —
+        //     an unfloored `self.script_verified_height = height` reads 3515
+        //     and parks the frontier under a checkpoint nothing will ever carry
+        //     it across.
+        //   sweep 2 (3516..=3525, crossing it) pins the advance — setting
+        //     nothing at all also leaves 3521 after sweep 1, and only the
+        //     second sweep tells the two apart.
+        let mut sync = build_sync_with_config(
+            SweepValidator::at(3510),
+            SyncConfig { script_eval_inline: true, ..checkpoint_config(3521) },
+        );
+        sync.downloaded_height = 3515;
+
+        sync.advance_state_applied_height().await;
+
+        assert_eq!(sync.state_applied_height, 3515, "state applied under the checkpoint");
+        assert_eq!(
+            sync.script_verified_height, 3521,
+            "the frontier holds on the floor, not on the applied tip — the \
+             transient above-the-tip frontier `set_script_frontier` documents"
+        );
+
+        sync.downloaded_height = 3525;
+        sync.advance_state_applied_height().await;
+
+        assert_eq!(sync.state_applied_height, 3525);
+        assert_eq!(
+            sync.script_verified_height, 3525,
+            "and climbs off the floor once state passes the checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_sweep_never_latches_a_frontier_hole() {
+        // The regression this task exists to prevent, and it needs a checkpoint
+        // to have teeth. Three implementations, three outcomes:
+        //
+        //   - set nothing            → frontier stuck on the floor at 3521
+        //   - buffer + advance       → 3511 lands in `eval_verified`, is not
+        //                              3522, and `advance_script_frontier`
+        //                              latches the hole and WARNs
+        //   - set the frontier       → both assertions hold
+        //
+        // Note what does NOT make this test fail: the WARN half alone. It needs
+        // `eval_verified` non-empty, and inline mode never inserts into it, so
+        // the "set nothing" implementation is caught by the frontier assertion
+        // rather than by the WARN. Both assertions are load-bearing.
+        let mut sync = build_sync_with_config(
+            SweepValidator::at(3510),
+            SyncConfig { script_eval_inline: true, ..checkpoint_config(3521) },
+        );
+        sync.downloaded_height = 3530;
+
+        let output =
+            capture_async(LevelFilter::WARN, sync.advance_state_applied_height()).await;
+
+        assert!(
+            !output.contains("no eval outstanding below the script frontier"),
+            "inline dispatches nothing, so there is no hole to name: {output}"
+        );
+        assert_eq!(sync.eval_frontier_hole, None, "and none was latched");
+        assert_eq!(
+            sync.script_verified_height, 3530,
+            "the frontier climbed off the floor with the applied tip"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_leaves_the_backpressure_accumulators_at_zero() {
+        // The claim the rest of this file rests on: nothing is dispatched, so
+        // the gate never engages and neither accumulator ever moves. Pins it
+        // rather than asserting it in a comment.
+        let mut sync = build_sync_with_config(SweepValidator::at(3510), inline_config());
+        sync.downloaded_height = 3530;
+
+        sync.advance_state_applied_height().await;
+
+        assert_eq!(sync.evals_in_flight, 0);
+        assert_eq!(sync.eval_bytes_in_flight, 0);
+        assert!(sync.eval_verified.is_empty(), "nothing was ever drained into the buffer");
+        assert_eq!(sync.eval_generation, 0, "and nothing rolled back");
     }
 
     // ---- journal-event conformance (`../facts/journal-events.md`) ----
