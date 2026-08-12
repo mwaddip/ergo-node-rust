@@ -1007,10 +1007,17 @@ the sync layer emits a periodic INFO record during catch-up:
 | Field | Source |
 |---|---|
 | `evals_in_flight` | the counter itself |
-| `state_applied_height` | existing watermark |
+| `state_applied_height` | **the applied tip — `validator.validated_height()`**, NOT the struct field |
 | `script_verified_height` | existing watermark |
-| `eval_lag` | `state_applied_height - script_verified_height` |
-| `jemalloc_allocated` | the existing probe, `None` without the jemalloc feature |
+| `eval_lag` | applied tip − `script_verified_height` |
+| `jemalloc_allocated` | the existing probe; the field is **omitted** when no probe is wired |
+
+⚠ **`self.state_applied_height` is the wrong source and would silently measure
+nothing.** It is a cache reconciled only *after* the sweep loop, so mid-sweep it
+stays frozen at the pre-sweep tip while `script_verified_height` climbs past it.
+A record built from the literal field pegs `eval_lag` at 0 by saturation for
+the entire sweep — the instrumentation would run, log, and report a healthy
+system while the queue grew. Read the validator's `validated_height()` instead.
 
 Requirements:
 

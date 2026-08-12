@@ -1,6 +1,6 @@
 # Journal Events Contract
 
-Version: 1.3.0
+Version: 1.5.0
 
 Stable contract for parseable events in the node's structured log
 output. Consumers (e.g. the Ergo Node Doctor adapter) write parsers
@@ -252,6 +252,34 @@ phase's `_started`.
   resets the counter. **Before 1.3** this fired only on the
   `apply_state` path — a deferred eval-failure stall (the loop that
   hammered on a wrongly-rejected script) did not emit it.
+
+#### `deferred_eval_backlog`
+- **Level:** INFO
+- **Marker:** `"deferred eval backlog"`
+- **Fields:** `evals_in_flight` (u64: script evaluations dispatched to Rayon
+  and not yet drained), `state_applied_height` (u64: the **applied tip**, read
+  from the validator — see the warning below), `script_verified_height` (u64),
+  `eval_lag` (u64: applied tip − script_verified_height),
+  `jemalloc_allocated` (u64, **omitted entirely** when no heap probe is wired,
+  same convention as `validation_stuck`'s optional `missing_key`)
+- **Since:** 1.5 (added 2026-08-12)
+- **Stability:** stable
+- **Emitted:** at most once per 5 s during catch-up, from the sweep loop after
+  the non-blocking drain and before the flush — so the count is post-drain and
+  the heap reading is pre-flush. **Not emitted at chain tip**, where a
+  single-block sweep drains synchronously every time and the record would be
+  noise.
+- **Why it exists:** `evals_in_flight` has no cap. During catch-up the
+  sweep-end drain never blocks, so if script verification is slower than state
+  application the queue grows across sweeps without limit. At the documented
+  ~410 KB worst case per queued eval, that is how a 4-thread host reached
+  10.62 GiB of anonymous RSS and was OOM-killed on 2026-08-12. `eval_lag` is
+  the field that climbs without bound if that is happening.
+- ⚠ **`state_applied_height` is the validator's `validated_height()`, not the
+  sync struct's field of the same name.** That field is a cache reconciled only
+  after the sweep loop; mid-sweep it is frozen at the pre-sweep tip, which
+  would peg `eval_lag` at 0 by saturation and report a healthy system while the
+  queue grew.
 
 #### `validation_rollback_failed`
 - **Level:** ERROR
