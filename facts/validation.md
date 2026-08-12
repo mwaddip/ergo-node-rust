@@ -377,7 +377,10 @@ DigestValidator::new(
 
 - `script_verified_height <= state_applied_height <= downloaded_height <= chain_height`
 - `state_applied_height` is monotonically increasing (except on reorg/eval-failure reset)
-- Heights at or below `script_verified_height` are fully validated (state + scripts)
+- Heights at or below `script_verified_height` have had their state applied,
+  and their scripts either verified or explicitly skipped by
+  `checkpoint_height`. Authoritative wording and rationale live in
+  `facts/sync.md` § "Checkpoint frontier hole"; `sync/` owns the watermark.
 
 ### `advance_state_applied_height()`
 

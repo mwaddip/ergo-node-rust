@@ -999,7 +999,13 @@ persisted separately and loaded on startup.
 
 - `script_verified_height <= state_applied_height <= downloaded_height <= chain_height`
 - `state_applied_height` is monotonically increasing (except on reorg or eval failure)
-- Heights at or below `script_verified_height` are fully validated (state + scripts)
+- Heights at or below `script_verified_height` have had their state applied,
+  and their scripts either **verified** or **explicitly skipped by
+  `checkpoint_height` configuration**. See "Checkpoint frontier hole" — the
+  watermark means "no further script work is owed below here", which is what
+  all three of its consumers actually need. It did read "fully validated (state
+  + scripts)" until 2026-08-12; that was stronger than any consumer required
+  and stronger than a checkpointed node could honour.
 
 ### Eval dispatch
 
@@ -1270,7 +1276,12 @@ value was wrong-low while scripts really had been evaluated, so the startup
 "repair" was usually correcting bookkeeping rather than laundering a real gap.
 With the watermark fixed, a gap now means what it says, and the dangerous case
 is the honest one — an unclean shutdown with evals genuinely in flight.
-**Open decision; see the checkpoint hole below, which is the same question.**
+
+**Still open, deliberately.** The checkpoint hole below looked like the same
+question and was resolved on 2026-08-12; this one was not. A checkpoint is a
+feature the operator configured and thereby consented to; a startup gap is an
+accident of shutdown timing with nothing to gate on. See "Why startup gap
+handling does NOT get the same treatment".
 
 ### Checkpoint frontier hole
 
@@ -1283,29 +1294,50 @@ checkpoint, because the results that would fill the gap are never produced.
 `checkpoint_height` is `Option<u32>` and defaults to `None`, so this affects
 only operators who opt in.
 
-As built: the frontier is **not** advanced over skipped heights. A drain that
-finds nothing in flight below the frontier drops the reorder buffer and names
-the height once at WARN. That stops the hoisted buffer accumulating one `u32`
-per block forever — which it otherwise would, for the life of the process —
-without changing what the watermark means.
+**Resolution (decided 2026-08-12): `script_verified_height` is floored at
+`checkpoint_height`.**
 
-The invariant is why: *heights at or below `script_verified_height` are fully
-validated (state + scripts)*. Advancing over deliberately-skipped scripts makes
-that false unless it is reworded.
+The floor applies **everywhere the watermark is set** — startup init, rollback,
+reorg — not only at startup. A reorg that resets the frontier to a fork point
+below the checkpoint would otherwise re-open the hole that startup had closed.
 
-**Open decision.** This and startup gap handling are one question wearing two
-hats: *may the watermark advance over heights whose scripts were never
-evaluated?* They plausibly have different answers, and the difference is
-consent —
+The decision rests on what actually consumes this watermark, which is less than
+the old invariant implied. Outside `sync/` there is exactly one consumer:
+`src/bridge.rs`, which persists and reloads it. **It is on no REST endpoint,
+not in `/info`, and is read by neither mempool, mining, nor api** —
+`facts/validation.md` calls it "internal bookkeeping" and means it. Its three
+real jobs are: where the frontier retreats to on eval failure, where to resume
+verification after restart, and `eval_lag`. All three want *the highest height
+below which no further script work is owed*, which is exactly what the floor
+gives. Nothing wanted the stronger claim, and a checkpointed node could not
+honour it anyway.
 
-- **Checkpoint:** the operator explicitly asked for the skip. Advancing records
-  a declared policy, and the honest form is to reword the invariant to "scripts
-  verified, or explicitly skipped by configuration".
-- **Startup gap:** nobody asked. The skip is an artefact of shutdown timing,
-  and advancing launders an accident into a claim of verification.
+Under a checkpoint the operator has declared they do not require verification
+below that height. The frontier starting there is not a silent skip; it is the
+configured feature doing what it says. `checkpoint_height` is `Option<u32>`
+defaulting to `None`, so an unconfigured node is unaffected and the floor is a
+no-op.
 
-Deciding either in isolation risks two mechanisms that silently advance the
-frontier for unrelated reasons. Decide them together.
+`eval_frontier_hole` stays. With the floor in place it should no longer fire
+for a checkpoint, so if it fires at all it now indicates a genuine defect in
+frontier accounting — which is a better signal than the one it replaced.
+
+### Why startup gap handling does NOT get the same treatment
+
+The two look like one question — *may the watermark advance over heights whose
+scripts were never evaluated?* — and they get opposite answers, because only
+one of them has a feature behind it.
+
+A checkpoint is an operator declaration: someone configured a height and
+accepted what that means. There is a feature to gate on, and gating on it is
+honest.
+
+A startup gap is an artefact of when the process happened to die. Nobody
+declared anything, nothing requires the relaxation, and there is no flag to
+gate on. Advancing there converts shutdown timing into a claim of
+verification — and it is the one case where the claim is load-bearing, because
+an unclean shutdown with evals genuinely in flight is precisely when blocks
+went unverified. **Still open; see "Startup gap handling" above.**
 
 ### Watermark scanner
 
