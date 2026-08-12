@@ -1322,17 +1322,31 @@ no-op.
 for a checkpoint, so if it fires at all it now indicates a genuine defect in
 frontier accounting — which is a better signal than the one it replaced.
 
-**Plumbing.** `sync/` does not currently see the checkpoint at all — it travels
-from `src/main.rs` into the validator and nowhere else. It reaches `sync/` as a
-new `SyncConfig` field, `checkpoint_height: u32`, defaulting to `0` (no
-checkpoint, floor is a no-op), wired from the same
-`configured_checkpoint.unwrap_or(0)` the validator is built with. Both must be
-fed from that one expression: two independently-derived checkpoints that
-disagree would put the frontier floor and the eval-skip boundary at different
-heights, which reintroduces exactly the hole this closes, one block wide and
-far harder to see. Adding a trait method to `BlockValidator` was the
+**Plumbing.** `sync/` does not see the checkpoint at all — it travels from
+`src/main.rs` into the validator and nowhere else. It reaches `sync/` as a
+`SyncConfig` field, `checkpoint_height: u32`, defaulting to `0` (no checkpoint,
+floor is a no-op). Adding a trait method to `BlockValidator` was the
 alternative and is worse — it makes a `validation/` contract change out of a
 value `main` already holds.
+
+⚠ **Wire the checkpoint the validator was actually built with, not
+`configured_checkpoint.unwrap_or(0)`.** There is no single expression: the
+validator is constructed in four branches, and **digest mode resuming from a
+stored tip defaults to `height - 100`, not 0**. Wiring the `unwrap_or(0)` form
+would set the floor up to an entire chain below the eval-skip boundary on an
+unconfigured digest node — reopening this hole at full width, in the one mode
+where nobody would think to look for it.
+
+`src/main.rs` captures the value through a `resolve_checkpoint` recorder that
+every branch calls, so a future branch computing a checkpoint directly is
+visibly different from its neighbours. The snapshot-bootstrap path builds a
+validator *after* `sync_config` exists and is deliberately not routed; it is
+safe only because it repeats the `unwrap_or(0)` its match branch already
+recorded, and carries a comment saying so.
+
+The general rule: **the floor and the eval-skip boundary are the same number by
+construction, or they are a bug.** Anything that changes how one is derived
+must change the other in the same edit.
 
 ### Why startup gap handling does NOT get the same treatment
 

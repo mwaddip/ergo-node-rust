@@ -759,38 +759,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             self.advance_downloaded_height().await;
         }
 
-        // Startup: load persisted script_verified_height.
-        // If there's a gap (state applied but scripts not verified from a
-        // previous unclean shutdown), accept it — the AVL digest already
-        // proved state correctness. Proof boxes aren't available without
-        // re-running apply_state, so re-evaluation isn't feasible here.
-        if let Some(persisted_svh) = self.store.script_verified_height().await {
-            // Floored: a persisted watermark written before the operator
-            // configured a checkpoint — or by a build predating the floor —
-            // would otherwise reload below it and park there permanently.
-            self.set_script_frontier(persisted_svh.min(self.state_applied_height));
-            if persisted_svh < self.state_applied_height {
-                let gap = self.state_applied_height - persisted_svh;
-                tracing::info!(
-                    persisted_svh,
-                    state_applied_height = self.state_applied_height,
-                    gap,
-                    "startup: accepting script verification gap (AVL digest verified)"
-                );
-                // Advance to match — the gap blocks' state transitions are
-                // already proven correct by the AVL digest check in apply_state.
-                // Routed through the setter for the floor only; whether this
-                // gap SHOULD be advanced over is a separate and still-open
-                // question (../facts/sync.md § "Startup gap handling"), and
-                // nothing here decides it either way.
-                self.set_script_frontier(self.state_applied_height);
-                // Lock in the new floor durably so a restart before the next
-                // flush doesn't re-discover the same gap. Without this the
-                // persisted SVH stays stuck at the old value across restarts.
-                self.store.set_script_verified_height(self.script_verified_height).await;
-                self.store.flush().await;
-            }
-        }
+        self.restore_script_frontier().await;
 
         // Startup WARN: surface bodies older than the configured retention
         // horizon so the operator knows to run `sharpen prune` to reclaim
@@ -1770,6 +1739,50 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         }
 
         self.advance_script_frontier().await;
+    }
+
+    /// Startup: load the persisted `script_verified_height`.
+    ///
+    /// If there's a gap (state applied but scripts not verified from a previous
+    /// unclean shutdown), accept it — the AVL digest already proved state
+    /// correctness. Proof boxes aren't available without re-running
+    /// `apply_state`, so re-evaluation isn't feasible here.
+    ///
+    /// Extracted from `run_inner` so it can be driven directly. It could not be
+    /// before: `run()` races `run_inner()` against the shutdown receiver in an
+    /// unbiased `select!`, so a test that pre-signals shutdown to make `run()`
+    /// terminate may never reach this code at all. Same reason
+    /// [`Self::maybe_warn_reclaimable_bodies`] is its own function. Pure
+    /// extraction — no behaviour change.
+    async fn restore_script_frontier(&mut self) {
+        let Some(persisted_svh) = self.store.script_verified_height().await else {
+            return;
+        };
+        // Floored: a persisted watermark written before the operator configured
+        // a checkpoint — or by a build predating the floor — would otherwise
+        // reload below it and park there permanently.
+        self.set_script_frontier(persisted_svh.min(self.state_applied_height));
+        if persisted_svh < self.state_applied_height {
+            let gap = self.state_applied_height - persisted_svh;
+            tracing::info!(
+                persisted_svh,
+                state_applied_height = self.state_applied_height,
+                gap,
+                "startup: accepting script verification gap (AVL digest verified)"
+            );
+            // Advance to match — the gap blocks' state transitions are already
+            // proven correct by the AVL digest check in apply_state. Routed
+            // through the setter for the floor only; whether this gap SHOULD be
+            // advanced over is a separate and still-open question
+            // (../facts/sync.md § "Startup gap handling"), and nothing here
+            // decides it either way.
+            self.set_script_frontier(self.state_applied_height);
+            // Lock in the new floor durably so a restart before the next flush
+            // doesn't re-discover the same gap. Without this the persisted SVH
+            // stays stuck at the old value across restarts.
+            self.store.set_script_verified_height(self.script_verified_height).await;
+            self.store.flush().await;
+        }
     }
 
     /// Move `script_verified_height` to `height`, never below
@@ -4035,7 +4048,13 @@ mod sweep_resume_tests {
     }
 
     /// Store where every requested section is "on disk".
-    struct SweepStore;
+    ///
+    /// `persisted_svh` is what a restart reads back; `None` (the default) is a
+    /// store that has never recorded one.
+    #[derive(Default)]
+    struct SweepStore {
+        persisted_svh: Option<u32>,
+    }
 
     impl SyncStore for SweepStore {
         async fn has_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> bool {
@@ -4045,7 +4064,7 @@ mod sweep_resume_tests {
             Some(vec![0])
         }
         async fn script_verified_height(&self) -> Option<u32> {
-            None
+            self.persisted_svh
         }
         async fn set_script_verified_height(&self, _height: u32) {}
         async fn validated_height(&self) -> Option<u32> {
@@ -4141,6 +4160,18 @@ mod sweep_resume_tests {
         build_sync_full(validator, SweepChain::unbounded(), config)
     }
 
+    /// A sync whose store hands back `persisted_svh` on restart, for driving
+    /// [`HeaderSync::restore_script_frontier`].
+    fn build_sync_restarted(
+        validator: SweepValidator,
+        config: SyncConfig,
+        persisted_svh: u32,
+    ) -> SweepSync {
+        let mut sync = build_sync_full(validator, SweepChain::unbounded(), config);
+        sync.store.persisted_svh = Some(persisted_svh);
+        sync
+    }
+
     fn build_sync_full(
         validator: SweepValidator,
         chain: SweepChain,
@@ -4154,7 +4185,7 @@ mod sweep_resume_tests {
             config,
             SweepTransport,
             chain,
-            SweepStore,
+            SweepStore::default(),
             Some(validator),
             progress_rx,
             delivery_control_rx,
@@ -4812,6 +4843,233 @@ mod sweep_resume_tests {
             "healthy sweep caught up to the downloaded tip"
         );
         assert_eq!(sync.sweep_backoff.consecutive(), 0, "progress arms no backoff");
+    }
+
+    // ---- checkpoint frontier floor (`../facts/sync.md` § "Checkpoint
+    //      frontier hole") ----
+    //
+    // Heights at or below `checkpoint_height` never dispatch an eval, so no
+    // result can ever arrive to carry `script_verified_height` across them. A
+    // frontier left below the checkpoint is stuck there permanently. The floor
+    // is what keeps that from happening, and it has to hold at every write —
+    // startup, restart, rollback, reorg — because one unfloored write reopens
+    // the hole for the life of the process.
+
+    fn checkpoint_config(checkpoint_height: u32) -> SyncConfig {
+        SyncConfig { checkpoint_height, ..SyncConfig::default() }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_floors_the_frontier_at_construction() {
+        // The documented case: a checkpoint above the node's start height. A
+        // fresh node has verified nothing and never will below 3521.
+        let sync = build_sync_with_config(SweepValidator::at(0), checkpoint_config(3521));
+
+        assert_eq!(
+            sync.script_verified_height, 3521,
+            "the frontier starts on the floor, not at the validator tip"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_checkpoint_leaves_the_frontier_at_the_validator_tip() {
+        // `0` is the default node and the floor must be a no-op there —
+        // `height.max(0)` — not a behaviour change for everyone.
+        let sync = build_sync(SweepValidator::at(2665));
+
+        assert_eq!(sync.config.checkpoint_height, 0, "default is no checkpoint");
+        assert_eq!(sync.script_verified_height, 2665);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_floors_a_persisted_watermark_below_it() {
+        // Restart reading back a watermark written before the operator
+        // configured the checkpoint — or by a build predating the floor —
+        // on a node still catching up toward that checkpoint.
+        let mut sync =
+            build_sync_restarted(SweepValidator::at(3000), checkpoint_config(3521), 500);
+        sync.state_applied_height = 3000;
+
+        sync.restore_script_frontier().await;
+
+        assert_eq!(
+            sync.script_verified_height, 3521,
+            "a persisted value below the checkpoint must not reload below it"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_restart_below_the_checkpoint_floors_the_reloaded_frontier() {
+        // The ordinary restart of a checkpointed node still catching up: the
+        // persisted watermark equals the applied tip, so there is no gap and
+        // the gap-advance branch is not taken. That makes the reload itself the
+        // only thing standing between the frontier and a permanent park below
+        // the checkpoint — and it is a distinct site from the gap advance,
+        // which is what
+        // `checkpoint_floors_a_persisted_watermark_below_it` covers.
+        let mut sync =
+            build_sync_restarted(SweepValidator::at(3000), checkpoint_config(3521), 3000);
+        sync.state_applied_height = 3000;
+
+        sync.restore_script_frontier().await;
+
+        assert_eq!(
+            sync.script_verified_height, 3521,
+            "no gap to advance over, so the reload's own floor is what lifts it"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_floor_is_a_lower_bound_and_does_not_hold_the_frontier_down() {
+        // Same restart with state already past the checkpoint: the existing
+        // gap advance takes the frontier to the applied tip, well above the
+        // floor. `max` is a floor, not a pin — and this is the assertion that
+        // catches someone "fixing" it into one.
+        //
+        // Whether the gap SHOULD be advanced over is the separate open
+        // question in ../facts/sync.md § "Startup gap handling"; this only
+        // pins that the floor did not change the answer.
+        let mut sync =
+            build_sync_restarted(SweepValidator::at(3560), checkpoint_config(3521), 500);
+        sync.state_applied_height = 3560;
+
+        sync.restore_script_frontier().await;
+
+        assert_eq!(sync.script_verified_height, 3560);
+    }
+
+    #[tokio::test]
+    async fn restart_without_a_checkpoint_reloads_the_persisted_watermark() {
+        // Control for the above: the floor must not disturb an ordinary
+        // restart, including the gap advance it is layered on top of.
+        let mut sync = build_sync_restarted(SweepValidator::at(3560), SyncConfig::default(), 500);
+        sync.state_applied_height = 3560;
+
+        sync.restore_script_frontier().await;
+
+        assert_eq!(
+            sync.script_verified_height, 3560,
+            "gap advance still takes the frontier to the applied tip"
+        );
+    }
+
+    #[tokio::test]
+    async fn reorg_below_the_checkpoint_does_not_drop_the_frontier_under_it() {
+        // The site that makes the floor an invariant rather than a startup
+        // fixup. Without it, one deep reorg reopens the hole permanently.
+        let mut sync = build_sync_full(
+            SweepValidator::at(3560),
+            SweepChain::at_tip(3560),
+            checkpoint_config(3521),
+        );
+        sync.state_applied_height = 3560;
+        sync.downloaded_height = 3560;
+
+        sync.handle_control_event(
+            DeliveryControl::Reorg { fork_point: 3000, old_tip: 3560, new_tip: 3561 },
+            PeerId(0),
+        )
+        .await;
+
+        assert_eq!(
+            sync.validator.as_ref().unwrap().resets,
+            vec![3000],
+            "the reorg really did roll the validator back below the checkpoint"
+        );
+        assert_eq!(
+            sync.script_verified_height, 3521,
+            "the frontier holds at the floor even though state retreated under it"
+        );
+    }
+
+    #[tokio::test]
+    async fn eval_failure_rollback_respects_the_floor() {
+        // The input is deliberately one production cannot currently produce: a
+        // failure reported for a height at or below the checkpoint. No eval is
+        // dispatched down there, so no failure can come back from there, and
+        // `rollback_to` therefore always lands above the floor today.
+        //
+        // Asserting only the reachable case would give a test that cannot fail
+        // — it would pass just as well with the floor deleted from this site.
+        // The property that keeps this path safe lives in `validation/`'s
+        // eval-skip boundary, not here, so the site is pinned against the day
+        // that boundary moves.
+        let mut sync =
+            build_sync_with_config(SweepValidator::at(3560), checkpoint_config(3521));
+        sync.state_applied_height = 3560;
+        sync.downloaded_height = 3560;
+
+        sync.handle_eval_failure(3000).await;
+
+        assert_eq!(
+            sync.validator.as_ref().unwrap().resets,
+            vec![2999],
+            "the rollback really did target a height below the checkpoint"
+        );
+        assert_eq!(
+            sync.state_applied_height, 2999,
+            "state follows the rollback under the checkpoint"
+        );
+        assert_eq!(
+            sync.script_verified_height, 3521,
+            "but the frontier holds at the floor"
+        );
+    }
+
+    #[tokio::test]
+    async fn frontier_hole_does_not_fire_for_a_checkpoint_the_floor_covers() {
+        // The upgrade this buys: with the floor in place `eval_frontier_hole`
+        // no longer fires for a configuration artefact, so if it fires at all
+        // it now means a genuine defect in frontier accounting.
+        //
+        // State has caught up past the checkpoint and 3522 is the first height
+        // that ever dispatched an eval. Pre-floor the frontier sat at 0 here,
+        // 3522 could not be placed, and the WARN fired on a healthy node.
+        let mut sync = build_sync_with_config(SweepValidator::at(0), checkpoint_config(3521));
+        sync.state_applied_height = 3560;
+        sync.downloaded_height = 3560;
+
+        let output = capture_async(LevelFilter::WARN, async {
+            for h in 3522..=3530 {
+                dispatch_stub(&mut sync, 1);
+                send_ok(&sync, h);
+                sync.drain_eval_results(DrainTarget::Available).await;
+            }
+        })
+        .await;
+
+        assert!(
+            !output.contains("no eval outstanding below the script frontier"),
+            "a checkpoint the floor covers is not a frontier hole: {output}"
+        );
+        assert_eq!(
+            sync.script_verified_height, 3530,
+            "the frontier advances straight off the floor"
+        );
+        assert_eq!(sync.eval_frontier_hole, None, "and no hole was ever latched");
+    }
+
+    #[tokio::test]
+    async fn frontier_hole_still_fires_above_the_checkpoint() {
+        // The other side of the upgrade: the WARN must not have been silenced,
+        // only made meaningful. 3522 is above the checkpoint, so its eval was
+        // dispatched and its absence is a real accounting defect.
+        let mut sync = build_sync_with_config(SweepValidator::at(3560), checkpoint_config(3000));
+        sync.script_verified_height = 3521;
+        sync.state_applied_height = 3560;
+
+        let output = capture_async(LevelFilter::WARN, async {
+            dispatch_stub(&mut sync, 1);
+            send_ok(&sync, 3523);
+            sync.drain_eval_results(DrainTarget::Available).await;
+        })
+        .await;
+
+        assert!(
+            output.contains("no eval outstanding below the script frontier"),
+            "a hole above the checkpoint is still a hole: {output}"
+        );
+        assert_eq!(sync.eval_frontier_hole, Some(3522));
     }
 
     // ---- journal-event conformance (`../facts/journal-events.md`) ----

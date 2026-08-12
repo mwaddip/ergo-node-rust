@@ -1952,6 +1952,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let swap_reader = Arc::new(ergo_node_rust::SwappableReader::empty());
 
+    // The checkpoint the validator is ACTUALLY constructed with, captured from
+    // whichever branch below runs. `sync` floors `script_verified_height` at
+    // this value (facts/sync.md § "Checkpoint frontier hole") and the two must
+    // be the same number: at or below the validator's checkpoint no eval is
+    // ever dispatched, so a floor set any lower leaves exactly the permanent
+    // frontier hole the floor was added to close.
+    //
+    // This is deliberately NOT `configured_checkpoint.unwrap_or(0)`. Digest
+    // mode resuming from a stored tip defaults to `height - 100`, not 0 — so
+    // that one expression would put the floor up to a whole chain below the
+    // eval-skip boundary on an unconfigured digest node.
+    //
+    // Every branch obtains its checkpoint through `resolve_checkpoint` so a
+    // future branch computing one directly stands out from its neighbours.
+    let effective_checkpoint = std::cell::Cell::new(0u32);
+    let resolve_checkpoint = |checkpoint: u32| -> u32 {
+        effective_checkpoint.set(checkpoint);
+        checkpoint
+    };
+
     let mut validator: Option<Validator> = match state_type {
         StateType::Utxo => {
             let state_path = data_dir.join("state.redb");
@@ -1990,7 +2010,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .expect("revalidate: failed to re-open UTXO state storage");
             }
 
-            let checkpoint = configured_checkpoint.unwrap_or(0);
+            let checkpoint = resolve_checkpoint(configured_checkpoint.unwrap_or(0));
 
             if let Some(current_version) = storage.version() {
                 // Resume branch: storage has data, load its root into a fresh
@@ -2202,7 +2222,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let tip = chain_guard.tip();
                 let height = chain_guard.height();
                 let digest = tip.state_root;
-                let checkpoint = configured_checkpoint.unwrap_or_else(|| height.saturating_sub(100));
+                let checkpoint =
+                    resolve_checkpoint(configured_checkpoint.unwrap_or_else(|| {
+                        height.saturating_sub(100)
+                    }));
                 tracing::info!(
                     height,
                     checkpoint,
@@ -2215,7 +2238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 shared_validated_height.store(height, std::sync::atomic::Ordering::Relaxed);
                 DigestValidator::from_state(digest, height, checkpoint)
             } else if revalidate && chain_guard.height() > 0 {
-                let checkpoint = configured_checkpoint.unwrap_or(0);
+                let checkpoint = resolve_checkpoint(configured_checkpoint.unwrap_or(0));
                 let chain_height = chain_guard.height();
 
                 // Scan forward to find the first height with all required sections.
@@ -2258,7 +2281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     DigestValidator::from_state(digest, prev_height, checkpoint)
                 }
             } else {
-                let checkpoint = configured_checkpoint.unwrap_or(0);
+                let checkpoint = resolve_checkpoint(configured_checkpoint.unwrap_or(0));
                 tracing::info!(checkpoint, "block validator starting from genesis (digest mode)");
                 DigestValidator::new(genesis_digest, checkpoint)
             };
@@ -2318,6 +2341,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         flush_min_blocks: node_config.flush_min_blocks,
         eval_backlog_max_mb: node_config.eval_backlog_max_mb,
         eval_backlog_max_blocks: node_config.eval_backlog_max_blocks,
+        // The value the validator was actually built with, not the raw config
+        // option — see `resolve_checkpoint` above for why those differ. Light
+        // mode constructs no validator and leaves this 0, which is correct:
+        // nothing is script-verified there, so the floor is a no-op.
+        checkpoint_height: effective_checkpoint.get(),
         synced_flush_heap_threshold_mb: node_config.synced_flush_heap_threshold_mb,
         synced_flush_max_blocks: node_config.synced_flush_max_blocks,
         synced_flush_min_blocks: node_config.synced_flush_min_blocks,
@@ -2468,6 +2496,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(snapshot_rx) = snapshot_rx {
         let state_path = data_dir.join("state.redb");
         let validator_tx = validator_tx_send.unwrap();
+        // Not routed through `resolve_checkpoint`: this validator is built
+        // after `sync_config` already exists, so recording here would be too
+        // late to reach it. Safe because this is the UTXO snapshot path, whose
+        // match branch above recorded the identical `unwrap_or(0)`. If this
+        // ever gains a different default the way digest-resume has, the floor
+        // and the eval-skip boundary diverge and `sync` must be told directly.
         let checkpoint = configured_checkpoint.unwrap_or(0);
         let shared_validated_height = shared_validated_height.clone();
         let shared_state_context = shared_state_context.clone();
