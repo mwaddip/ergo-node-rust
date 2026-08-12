@@ -152,49 +152,76 @@ literal copy would add a read per input for no gain.
 The boundary that actually matters is **persistence**, because persistence is
 what survives a crash. Everything from the first prover operation to just
 before `storage.update_with_height` is in-memory only. Evaluating in that
-window means nothing unverified ever reaches `state.redb`, which closes the
-startup-gap hole in `facts/sync.md` at the source rather than repairing it
-afterwards.
+window means no block whose **scripts** are unverified reaches `state.redb`,
+which closes the startup-gap hole in `facts/sync.md` at the source rather than
+repairing it afterwards.
 
 Ordering: apply operations and capture boxes → verify digest → **evaluate
 scripts** → persist. The digest check stays first because it is cheap and
 rejects malformed blocks before the expensive step.
 
-### Err leaves the prover clean — including today's digest-mismatch path
+⚠ **Inline closes the script gap only. It does not make `apply_state`
+crash-atomic.** The proof-digest consensus check still runs *after*
+`update_with_height`, so a post-persist `Err` remains reachable and a crash in
+that window can still leave a persisted block that failed a later check. Moving
+proof generation earlier does not fix it and has already been tried: reverted
+in `96a0186`, because `removed_nodes()` then returns empty and superseded nodes
+stop being deleted — the orphan-growth bug that reached 235 GB.
 
-⚠ **This is a live defect, independent of which mode ships.** Step 5's
-`StateRootMismatch` does a bare `return Err` after step 4 has already applied
-every operation to the prover. Nothing undoes them. `validated_height` and
-`current_digest` are untouched, so the trait's Err postcondition reads as
-satisfied while the tree carries a rejected block's mutations.
+So the two windows are different sizes and only one of them closes. Anyone
+citing "nothing unverified is persisted" should say **scripts**, or they are
+overstating it.
 
-It is nearly unreachable today — a digest mismatch means the block is bogus or
-our state is corrupt, and the node wedges either way. **Inline evaluation
-promotes it from unreachable to routine:** a peer sends a block with an
-unsatisfied script, we reject it, and we must carry on with the next candidate.
-That demands a genuinely clean prover, every time.
+### Err leaves the prover clean
 
 **Requirement:** every `Err` from `apply_state` leaves the prover byte-for-byte
-as it was on entry. Both the script-failure path and the existing
-digest-mismatch path must satisfy it.
+as it was on entry. Script failure, digest mismatch, box deserialization, the
+persist, and the post-persist proof-digest check all have to satisfy it.
 
-**The mechanism is `validation/`'s choice** — it owns the prover and its
-storage interaction, and the main session is not in a position to specify one
-it cannot stand behind. Two shapes are known to work in principle:
+**This already worked** and has since `2992645`. `apply_state` is a wrapper
+around `apply_state_internal` that calls `rollback_prover_to` on any `Err`;
+every bare `return`/`?` inside `_internal` undoes nothing on its own and does
+not need to. Inline evaluation is one more `Err` arm under the same wrapper.
 
-- *Undo after applying.* `reset_to` is the existing route, but it goes through
-  `storage.rollback(digest)` against a **persisted** version, and at the
-  evaluation point this block was never persisted. Whether rollback to the
-  previous digest is sound from that state is a `state/` question that must be
-  answered, not assumed.
-- *Read before applying.* Hoist the box reads ahead of the mutating operations,
-  evaluate, then apply. Nothing to undo because nothing was applied. Costs a
-  traversal per input, partly offset because the operation set already contains
-  `Lookup`s and a lookup warms the path the later remove walks.
+*An earlier draft of this section asserted the opposite — that the
+digest-mismatch path returned `Err` with the prover dirty and needed fixing.
+That was wrong: it read `apply_state_internal`'s bare `return Err` and
+attributed it to the public entry point. Recorded because the mistake is
+repeatable — in a file with a `_internal` split, the enclosing function is part
+of what a line means, and a grep result does not carry it.*
 
-Whichever is chosen, say in the completion report **why**, and prove the
-postcondition with a test that fails a block mid-`apply_state` and asserts the
-prover digest is unchanged.
+**Why the rollback is sound before persistence**, which is the part that is
+genuinely non-obvious: at the evaluation point the undo log does not run at
+all. `RedbAVLStorage` sets `current_version` only after a successful commit
+(`state/src/storage.rs:1002`), so it still equals the pre-block digest, and
+`rollback()` takes its short-circuit branch (`storage.rs:1034-1044`) — re-read
+`META_TOP_NODE_HASH` from redb, unpack, return. No write transaction, no undo
+record, no version-chain mutation. It is a persisted-root re-read.
+
+The undo-log walk runs only for the **post-persist** proof-digest check, where
+the block genuinely is the newest committed version and the walk is the correct
+operation. Both paths work, for different reasons; do not collapse them.
+
+Precondition: `storage.current_version` must be `Some`, which
+`UtxoValidator::new` already documents and guarantees.
+
+⚠ **`restore_root` does not clear `base.modified_nodes`.** It clears the
+changed-node buffers and directions and rebases `old_top_node`, but leaves the
+address-keyed map `pack_tree` gates on holding every node the failed block
+touched. Not a correctness bug — each entry owns an `Rc`, so a live address
+cannot be recycled and nothing is misidentified — but an unbounded retention,
+and inline mode promotes it from never-happens to once per hostile block.
+Cleared in `rollback_prover_to` as a local workaround; **the proper home is
+`restore_root` itself in the `mwaddip/ergo_avltree_rust` fork**, beside the
+three clears it already performs.
+
+### Open: inline discards the block cost
+
+`evaluate_scripts` returns the block-accumulated transaction cost, and inline
+mode drops it. Nothing is unenforced — the `maxBlockCost` gate runs inside
+`evaluate_scripts` either way — but the figure is observable in deferred mode
+and invisible in inline. If `ApplyStateOutcome` should carry it, that is a
+contract addition and has not been decided.
 
 ## New Types
 

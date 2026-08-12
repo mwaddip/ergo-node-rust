@@ -1032,10 +1032,23 @@ Two consequences the implementation must handle rather than inherit:
   is no longer derived from drained results — it is set directly on each
   successful apply. Left alone it would freeze at its startup value and
   `eval_frontier_hole` would fire on every drain.
-- **The startup gap cannot occur.** Nothing unverified is ever persisted, so a
-  crash cannot leave applied-but-unverified blocks. The open question in
-  "Startup gap handling" is moot in this mode — not answered, *unreachable*.
-  It remains open for deferred mode.
+- **A startup gap can still appear, but it is no longer dangerous.** An earlier
+  draft of this section claimed the gap "cannot occur"; that was too strong.
+  `apply_state` persists and *then* runs the proof-digest check, so a crash in
+  that window leaves a persisted block for which `apply_state` never returned
+  `Ok` and the watermark was never advanced — a gap, on restart, in inline
+  mode.
+
+  What changes is what the gap *means*. Scripts ran before the persist, so
+  every block below the gap has been script-verified; the missing watermark is
+  bookkeeping, and advancing over it asserts something true. In deferred mode
+  the same gap means the scripts were never run at all, and advancing over it
+  asserts something nobody checked.
+
+  So "Startup gap handling" stays open **for deferred mode only**. Under inline
+  the existing accept-and-advance behaviour is correct, and for the first time
+  the justification in that section — that the state transition was already
+  proven — is actually the whole story.
 
 The checkpoint floor still applies in both modes: heights at or below
 `checkpoint_height` skip evaluation regardless of where evaluation happens.
