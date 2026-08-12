@@ -318,18 +318,24 @@ impl UtxoValidator {
         // 6. Build DeferredEval for deferred script verification
         let deferred_eval = if validate_txs {
             let mut proof_boxes = HashMap::with_capacity(proof_box_bytes.len());
+            // Summed inside the loop that already runs — the serialized size
+            // feeds DeferredEval::new's heap estimate at no extra walk.
+            let mut serialized_box_bytes = 0usize;
             for (id, bytes) in &proof_box_bytes {
+                serialized_box_bytes = serialized_box_bytes.saturating_add(bytes.len());
                 proof_boxes.insert(*id, tx_validation::deserialize_box(bytes)?);
             }
 
-            Some(crate::DeferredEval {
-                height: header.height,
-                transactions: parsed_txs.transactions,
+            Some(crate::DeferredEval::new(
+                header.height,
+                parsed_txs.transactions,
                 proof_boxes,
-                header: header.clone(),
-                preceding_headers: preceding_headers.to_vec(),
-                parameters: active_params.clone(),
-            })
+                header.clone(),
+                preceding_headers.to_vec(),
+                active_params.clone(),
+                block_txs,
+                serialized_box_bytes,
+            ))
         } else {
             None
         };
