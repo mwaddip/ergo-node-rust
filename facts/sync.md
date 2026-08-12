@@ -964,7 +964,27 @@ The sync machine tracks three watermarks:
   External consumers (API, mempool, mining) see this height.
 - **`script_verified_height`** — highest height where `evaluate_scripts()` has
   completed successfully. Internal bookkeeping for rollback decisions.
-  Advances in-order as eval results arrive via crossbeam channel.
+
+  ⚠ **KNOWN BROKEN (found 2026-08-12, not yet fixed).** The documented
+  behaviour — "advances in-order as eval results arrive" — is false. It
+  advances only for as long as **no result ever overtakes its predecessor**.
+
+  `verified` (`src/state.rs:1422`) is a function-local `BTreeSet` dropped when
+  `drain_eval_results` returns. A result whose predecessor is still running is
+  drained, found non-contiguous, and **discarded**. The channel never resends
+  it, so the frontier can never advance past that hole for the life of the
+  process.
+
+  Observed live: block 3522 is 3 txs / 17 inputs — the first block in that
+  region that is not coinbase-only. With two Rayon threads the trivial eval for
+  3523 overtook it, was drained alone, and was dropped. The watermark froze at
+  3522 and stayed there through 190,000 further blocks.
+
+  **Scripts are still evaluated and failures still roll back** — the `Err`
+  branch does not depend on contiguity — so this is bookkeeping, not a
+  verification skip. But any consumer treating this watermark as "fully
+  validated up to here" is being lied to after the first overtake, which on a
+  low-thread host is almost immediate.
 
 `downloaded_height` and `state_applied_height` are initialized from
 `validator.validated_height()` on startup. `script_verified_height` is
@@ -1009,8 +1029,18 @@ the sync layer emits a periodic INFO record during catch-up:
 | `evals_in_flight` | the counter itself |
 | `state_applied_height` | **the applied tip — `validator.validated_height()`**, NOT the struct field |
 | `script_verified_height` | existing watermark |
-| `eval_lag` | applied tip − `script_verified_height` |
+| `eval_lag` | applied tip − `script_verified_height` — ⚠ **currently useless, see below** |
 | `jemalloc_allocated` | the existing probe; the field is **omitted** when no probe is wired |
+
+⚠ **Trust `evals_in_flight`. Do NOT read `eval_lag` as queue depth until the
+watermark bug above is fixed.** `eval_lag` is derived from
+`script_verified_height`, which freezes on the first out-of-order result. In a
+live run it read **187,711** while `evals_in_flight` was **1** and jemalloc
+`allocated` was flat at ~1.14 GB across 190,000 blocks — an enormous apparent
+backlog with no backlog and no memory growth whatsoever.
+
+`evals_in_flight` is the honest depth signal. `eval_lag` measures the distance
+to a frozen number.
 
 ⚠ **`self.state_applied_height` is the wrong source and would silently measure
 nothing.** It is a cache reconciled only *after* the sweep loop, so mid-sweep it

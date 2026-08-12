@@ -273,8 +273,15 @@ phase's `_started`.
   sweep-end drain never blocks, so if script verification is slower than state
   application the queue grows across sweeps without limit. At the documented
   ~410 KB worst case per queued eval, that is how a 4-thread host reached
-  10.62 GiB of anonymous RSS and was OOM-killed on 2026-08-12. `eval_lag` is
-  the field that climbs without bound if that is happening.
+  10.62 GiB of anonymous RSS and was OOM-killed on 2026-08-12.
+- ⚠ **Read `evals_in_flight` for queue depth. `eval_lag` is currently
+  meaningless.** It derives from `script_verified_height`, which freezes on the
+  first out-of-order eval result (see `facts/sync.md` — a non-contiguous result
+  is drained and discarded, and the frontier never recovers). Measured live:
+  `eval_lag=187711` while `evals_in_flight=1` and jemalloc `allocated` flat at
+  ~1.14 GB across 190,000 blocks. The field is retained because it will become
+  meaningful once the watermark is fixed, and because its divergence from
+  `evals_in_flight` is itself a signal that the watermark is broken.
 - ⚠ **`state_applied_height` is the validator's `validated_height()`, not the
   sync struct's field of the same name.** That field is a cache reconciled only
   after the sweep loop; mid-sweep it is frozen at the pre-sweep tip, which
