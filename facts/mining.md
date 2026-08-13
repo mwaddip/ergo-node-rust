@@ -388,6 +388,35 @@ sharing the storage backend.
 
 ## Candidate Assembly
 
+### Ownership — `generate_candidate` is the only entry point
+
+**Callers ask `mining` for a candidate. They do not assemble one.**
+`ergo_mining::generate_candidate` performs steps 1–8 below and is the sole
+supported path; constructing a `CandidateBlock` field-by-field outside this
+crate is a contract violation regardless of whether the result happens to be
+well-formed.
+
+⚠ **As of v0.8.0 this was violated, and the violation is what made steps 3 and
+4 dead code.** `src/main.rs` built `CandidateBlock { .. }` inline — parent,
+n_bits, state root, AD proofs, its own copy of the
+`max(now, parent.timestamp + 1)` rule, `transactions: vec![emission_tx]` — and
+never called `generate_candidate`. So the crate's entry point had no production
+caller, and `select_transactions` and `build_fee_tx` had none either: the path
+that would have called them was not the path that ran. Mined blocks carried the
+emission transaction alone and miners collected no fees.
+
+The lesson generalises past mining: **a crate function with no caller outside
+its own tests is not "not yet wired", it is a second implementation waiting to
+diverge.** Here the timestamp rule already existed twice.
+
+`generate_candidate` therefore needs everything steps 3–4 require, passed in
+rather than reached for — the caller owns the mempool and the UTXO set, the
+crate owns the assembly:
+
+- the candidate transactions, prioritised (`mempool.all_prioritized()`)
+- the active `Parameters`, for `max_block_cost` and `max_block_size`
+- a UTXO lookup, for validating each candidate against accumulated state
+
 ### Overview
 
 ```
@@ -488,13 +517,8 @@ protocol limits.
 
 3. Get prioritized transactions from mempool: `mempool.all_prioritized()`.
 
-⚠ **NOT WIRED AS OF v0.8.0.** `select_transactions` implements this sequence
-and is bounded by both limits, but nothing calls it: `generate_candidate`
-builds `vec![emission_tx]` directly. Mined blocks therefore contain the
-emission transaction only — no mempool transactions and no fee transaction, so
-a miner collects no fees. The steps below describe the implemented function and
-are correct; what is missing is the integration, which needs mempool access,
-the active `Parameters`, and a UTXO lookup in `generate_candidate`'s scope.
+`select_transactions` implements this sequence and is bounded by both limits.
+See "Ownership" above for why it spent v0.8.0 development with no caller.
 
 4. For each candidate transaction (in priority order):
    a. Check cumulative size: if adding this tx exceeds `max_block_size`,
