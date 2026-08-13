@@ -1,6 +1,28 @@
 # Changelog
 
-## Unreleased
+## v0.8.0 — 2026-08-13
+
+### Removed
+
+- **BREAKING — deferred script evaluation is gone.** `apply_state` now always
+  evaluates a block's scripts itself, after the state-root check and **before
+  persisting**, so `Ok` means the scripts passed and no block whose scripts are
+  unverified reaches `state.redb`. The config key **`script_eval` is removed**
+  (a node whose `ergo.toml` still sets it will fail to start with an unknown-key
+  error), along with `eval_backlog_max_mb` and `eval_backlog_max_blocks`, which
+  bounded a queue that no longer exists.
+
+  This release both bounded that queue and then deleted it; only the deletion is
+  in the product. Deferred evaluation let application run ahead of verification,
+  which bought sync throughput and cost a crash-consistency window plus a second
+  source of truth for how far the chain was verified. Every bug in it had that
+  one root: a drain-local reorder buffer that froze a watermark for 190,000
+  blocks; an in-flight counter zeroed while its tasks still held their heap; and
+  an unbounded backlog that killed a 4-thread 1.8 GHz host at 10.62 GiB. The
+  lag is gone, so the class is gone.
+
+  Nodes upgrading keep a stale `script_verified_height` key in `chain_meta`.
+  Nothing reads it; there is no migration step.
 
 ### Changed
 
@@ -20,6 +42,49 @@
   next touches that arena, and with 4 × ncpu arenas the quiet ones never get
   touched — measured at 1021 MB of freed-but-unreturned memory during a
   genesis sync.
+
+- **BREAKING — the journal-events contract is 2.0** (`journalEventsVersion` in
+  `/info`). Three **stable** events were removed — `deferred_eval_backlog`
+  (replaced by `catchup_progress`), `deferred_eval_gate_engaged` and
+  `eval_frontier_hole` — and two field domains narrowed:
+  `validation_rollback_failed.path` loses `eval_failure`, and
+  `validation_stuck.error_kind` loses `script_eval` in favour of
+  `transaction_invalid`. All of them described the deferred queue.
+
+  **Consumers pinned to major 1 will refuse to parse a v0.8.0 node until they
+  are updated**, the Ergo Node Doctor adapter among them. The contract's own
+  rules also call for a deprecation release, which this did not get: emitting a
+  deprecated `eval_frontier_hole` from a node that has no frontier would mean
+  fabricating its fields.
+
+- `validation_stuck.error_kind` is now derived from the `ValidationError`
+  **variant** rather than by matching its `Display` string. The string-based
+  classifier is why the script-failure case silently stopped being distinguished
+  when deferred evaluation was removed — nothing referenced the variant, so
+  nothing broke. `missing_key` reaches the classifier through two variants and
+  means different things in each: local storage damage in UTXO mode, a deficient
+  proof in digest mode. Check `stateType` before recommending a resync on it.
+
+- `BlockValidator` is split into three traits: the consensus core, plus
+  `StatePersistence` (`flush`, `resize_cache`) and `MiningState`
+  (`proofs_for_transactions`, `emission_box_id`), both implemented only by the
+  UTXO validator. Digest mode signals itself by *not* implementing them rather
+  than by returning a harmless value — the shape that let a missing
+  `resize_cache` forward return `Ok(())` and log success for a resize that never
+  happened. Affects anyone building against `ergo-validation`.
+
+### Fixed
+
+- `ergo_avltree_rust` moves to fork rev `b955790`. `BatchAVLProver::restore_root`
+  now clears `base.modified_nodes` itself, and `PersistentBatchAVLProver::rollback`
+  delegates to it rather than hand-rolling a second rewind. Previously every
+  rejected block pinned its touched node set for the life of the process.
+  Upstream as PR #27.
+
+- `addons/indexer/Cargo.lock` recorded `0.2.7` against a manifest at `0.2.8`,
+  left behind by the previous release. The addons are excluded from the
+  workspace with their own lockfiles, so no workspace build would ever have
+  caught it.
 
 ### Added
 
