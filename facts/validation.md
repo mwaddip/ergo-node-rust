@@ -30,30 +30,53 @@ transaction validation: S9  P8 E6 C5 I8 A7 L8
   validated height. Blocks must be validated in order. On reorg, the caller
   resets the validator to the fork point.
 
-## Trait: `BlockValidator`
+## Traits: `BlockValidator`, `StatePersistence`, `MiningState`
 
-⚠ **No method on this trait may carry a do-nothing default body.** Three did —
-`flush`, `resize_cache`, `proofs_for_transactions` — and it cost us a bug that
-ran undetected for the life of the feature.
+**Split in v0.8.0.** Until then this was one trait whose last four methods
+carried do-nothing default bodies, and that shape cost us a bug that ran
+undetected for the life of the feature.
 
 `impl BlockValidator for Validator` (the enum wrapper in `src/main.rs`) is pure
-delegation: every method must forward to the active variant. When
+delegation: every method had to forward to the active variant. When
 `resize_cache` was added, the wrapper was not updated. It compiled, because the
 trait supplied a default returning `Ok(())`. So the at-tip cache resize called
 into the wrapper, hit the default, did nothing, returned `Ok`, and **logged
 success** — `UtxoValidator::resize_cache` was correct throughout and simply
 unreachable. The resize never once reached `state.redb`. Found by @odiseusme on
 2026-08-12 by reading `main.rs` rather than trusting the metrics; confirmed
-independently before the fix.
+independently before the fix. `flush` is the same shape and far worse: a
+forgotten forward there means state is never persisted while every caller is
+told it was.
 
-`flush` is the same shape and far worse: a forgotten forward there means state
-is never persisted while every caller is told it was.
+The first fix considered was "declare every method, no defaults, let the
+compiler catch the next wrapper that forgets." That works, but it still relies
+on someone reading nine compiler errors correctly the next time a method is
+added, and it costs 24 explicit no-op bodies across the workspace — 20 of them
+in `sync/`'s test stubs.
 
-A defaulted method turns "forgot to delegate" into silence. Declare every
-method, and let implementations that genuinely do nothing — digest-mode
-`resize_cache`, for instance — say so explicitly in one line. The compiler then
-catches the next wrapper that forgets, which is the only thing that reliably
-will.
+**The split removes the failure mode instead of detecting it.** The four
+methods had one consumer each and did not share it:
+
+| Method | Consumer |
+|---|---|
+| `flush`, `resize_cache` | `sync/` — sweep flush points and at-tip cache tuning |
+| `proofs_for_transactions`, `emission_box_id` | `main` — `Validator::update_mining_proofs` |
+
+So they become two traits, each implemented **only by `UtxoValidator`**. There
+is no per-method forwarding left in the wrapper to forget: it exposes one
+accessor per trait, and a method added to either trait needs no wrapper change
+at all.
+
+⚠ **The absence of an impl is the mode signal.** `DigestValidator` does not
+implement either new trait. Do not reintroduce "digest mode returns a harmless
+value" anywhere — that is precisely the shape that produced the bug above.
+
+**This split also disambiguates two overloaded `None`s.**
+`proofs_for_transactions` returned `Option<Result<..>>` where the outer `Option`
+meant "wrong mode"; that layer is gone. `emission_box_id` returned `None` for
+*either* "digest mode" *or* "all ERG emitted" — two unrelated facts wearing one
+value, which `update_mining_proofs` then early-returned on identically. It now
+means only **all ERG emitted**.
 
 ```rust
 pub trait BlockValidator {
@@ -96,6 +119,7 @@ pub trait BlockValidator {
         preceding_headers: &[Header],
         active_params: &Parameters,
         expected_boundary_params: Option<&Parameters>,
+        expected_proposed_update: Option<&[u8]>,
     ) -> Result<ApplyStateOutcome, ValidationError>;
 
     /// Current validated height. 0 means no blocks validated yet
@@ -124,15 +148,82 @@ pub trait BlockValidator {
     ///     always Ok.
     fn reset_to(&mut self, height: u32, digest: ADDigest) -> Result<(), ValidationError>;
 
-    /// Compute AD proofs for transactions without modifying state.
-    /// None for digest-mode validators (mining requires UTXO mode).
-    fn proofs_for_transactions(&self, txs: &[Transaction])
-        -> Option<Result<(Vec<u8>, ADDigest), ValidationError>>;
+}
 
-    /// Current emission box ID. None if digest mode or all ERG emitted.
+/// Storage lifecycle. Implemented by `UtxoValidator` only — a validator that
+/// owns no persistent state does not implement it, and the caller handles
+/// that case explicitly rather than being handed a successful no-op.
+pub trait StatePersistence {
+    /// Force a durable commit (fsync) of all outstanding storage writes.
+    /// Called at sweep flush points (bounds crash data loss) and on
+    /// graceful shutdown.
+    ///
+    /// Postconditions on Ok: every write issued before this call is durable.
+    /// Postconditions on Err: durability is UNKNOWN. The caller must not
+    /// advance any watermark that assumes persistence — see facts/sync.md
+    /// § "Flush ordering".
+    fn flush(&self) -> Result<(), ValidationError>;
+
+    /// Resize the storage read cache at runtime (e.g. on reaching the tip).
+    ///
+    /// ⚠ Read cache only. `stateCacheBytes` covers read + write, so a 64 MB
+    /// resize gives roughly a 128 MB envelope, not 64.
+    fn resize_cache(&self, cache_bytes: usize) -> Result<(), ValidationError>;
+}
+
+/// Mining support. Implemented by `UtxoValidator` only — candidate assembly
+/// requires a live UTXO set, so digest mode does not implement it and
+/// `main` skips mining rather than receiving a `None` that means "wrong mode".
+pub trait MiningState {
+    /// Compute AD proofs and the resulting state root for a set of
+    /// transactions WITHOUT modifying persistent state.
+    fn proofs_for_transactions(&self, txs: &[Transaction])
+        -> Result<(Vec<u8>, ADDigest), ValidationError>;
+
+    /// Current emission box ID in the UTXO set, updated after each block.
+    ///
+    /// `None` means **all ERG has been emitted** — nothing else. It no
+    /// longer doubles as the digest-mode signal.
     fn emission_box_id(&self) -> Option<[u8; 32]>;
 }
 ```
+
+### Who implements what
+
+| Type | `BlockValidator` | `StatePersistence` | `MiningState` |
+|---|---|---|---|
+| `UtxoValidator` | ✅ | ✅ | ✅ |
+| `DigestValidator` | ✅ | — | — |
+| `Validator` (enum wrapper, `src/main.rs`) | ✅ | via accessor | via accessor |
+| `sync/` test stubs | ✅ | only those exercising flush | — |
+
+### How callers reach the split traits
+
+The wrapper exposes one accessor per trait, each a match over
+`ValidatorInner` — not a per-method forward:
+
+```rust
+impl Validator {
+    fn state_persistence(&self) -> Option<&dyn StatePersistence>;
+    fn mining_state(&self) -> Option<&dyn MiningState>;
+}
+```
+
+`None` means the active variant is digest mode. Both borrow from `&self`, so
+the returned reference cannot outlive the caller's guard — relevant because
+`UtxoValidator` holds `Rc`s through the AVL prover and the wrapper carries a
+hand-written `Send` assertion (`src/main.rs`, see its SAFETY comment). Check
+that reasoning rather than inheriting it.
+
+### No behavioural delta
+
+The split changes no runtime behaviour. Digest mode previously returned
+`Ok(())` from the defaulted `flush`/`resize_cache`; it now yields `None` from
+`state_persistence()`, and **the caller treats that as the existing
+"nothing to persist" arm, not as a failure** — `sync/` already models this
+(`FlushOutcome`, the no-validator case). A flush that cannot happen must not
+be reported as a flush that failed; nothing may be pruned or advanced on the
+strength of it either way.
 
 ## Script evaluation modes (added 2026-08-12)
 

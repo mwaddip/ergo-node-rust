@@ -59,9 +59,12 @@ How the sync machine queries persistent storage.
 
 #### `set_validated_height(height)`
 - Persist `validated_height` to `chain_meta` with `Durability::Immediate`.
-- **Precondition**: caller MUST have called `validator.flush()` before
-  invoking this — see the flush ordering rule under "Cross-DB
-  Durability Handshake" below.
+- **Precondition**: caller MUST have flushed the validator before invoking
+  this — see the flush ordering rule under "Cross-DB Durability Handshake"
+  below. Since v0.8.0 that flush is reached through
+  `validator.state_persistence()`, which is `None` in digest mode; see
+  "Flushing a validator that owns no state" below for what the precondition
+  means there.
 
 ### `SyncChain`
 
@@ -95,6 +98,12 @@ How the sync machine queries and updates chain state.
   download phase is a no-op without special-casing in the sync loop.
 - `store`: `SyncStore` for checking modifier existence
 - `validator`: `Option<BlockValidator>` for digest/UTXO-mode block validation.
+  Since v0.8.0 the storage-lifecycle methods live on a separate
+  `StatePersistence` trait reached through `state_persistence()`, so there are
+  two independent "absent" signals and they are **not** interchangeable: no
+  validator at all (light mode, below) bypasses the watermark scanner
+  entirely, while a validator whose `state_persistence()` is `None` (digest
+  mode) validates normally and merely has nothing to fsync.
   **`None` in `StateType::Light`** — the main crate's startup wiring branches
   on `state_type` and constructs no validator for light mode. The watermark
   scanner (`advance_state_applied_height`) is bypassed entirely when `validator`
@@ -324,8 +333,10 @@ channels are consumed and re-entries are no-ops.
 
 **Sequence:**
 
-1. `validator.flush()` to persist any in-memory write-tx state.
-   Failure reinstates the old validator and skips the rebuild.
+1. `validator.state_persistence()` → `flush()` to persist any in-memory
+   write-tx state. Failure reinstates the old validator and skips the
+   rebuild; `None` (digest mode) proceeds — there is no write-tx state to
+   lose, and the reopen is a cache-size change either way.
 2. `drop(validator)` — releases the AVL storage `Arc<Database>`.
    All other holders (mempool, REST API, mining) must release
    their `Arc<SnapshotReader>`s in parallel for redb's exclusive
@@ -362,8 +373,9 @@ can leave them on different durability horizons.
 
 On every flush point in the sync sweep loop:
 
-1. `validator.flush()` — state.redb fsync with `Durability::Immediate`.
-   State is now durable at height M = `validator.validated_height()`.
+1. `validator.state_persistence()` → `flush()` — state.redb fsync with
+   `Durability::Immediate`. State is now durable at height
+   M = `validator.validated_height()`.
 2. `store.set_validated_height(M)` — modifiers.redb chain_meta write
    with `Durability::Immediate`. Records that state was durable at M.
 3. `store.flush()` — modifiers.redb fsync covering section writes and
@@ -374,6 +386,27 @@ of the recorded `validated_height` — handled by startup reconciliation
 below. A crash between (2) and (3) is covered by (2)'s Immediate
 commit; only ancillary modifier writes get rolled back, which sync
 re-fetches naturally.
+
+### Flushing a validator that owns no state (added v0.8.0)
+
+`state_persistence()` returns `None` in digest mode, because
+`DigestValidator` owns no redb and has nothing to fsync. That is **not** a
+flush failure and must not be treated as one.
+
+Three distinct cases, and the middle one is the new spelling of what used to
+be a defaulted `Ok(())`:
+
+| Case | Meaning | Effect on step (2)/(3) and pruning |
+|---|---|---|
+| `Some(p)`, `p.flush()` → `Ok` | state durable at M | proceed |
+| `None` | nothing to persist | proceed — step (1) is vacuously satisfied |
+| `Some(p)`, `p.flush()` → `Err` | durability UNKNOWN | **stop**: no `set_validated_height`, no prune |
+
+⚠ The `None` and `Err` arms must not be collapsed. "Nothing to flush" and
+"the flush failed" differ by exactly the bug this split was made to prevent —
+a validator reporting success for work it never did. `sync/` already models
+the shape (`FlushOutcome`, and the no-validator case in `StateType::Light`);
+digest mode joins that arm rather than growing a new one.
 
 ### Startup reconciliation
 
@@ -596,14 +629,17 @@ unclean shutdowns; clean shutdowns should preserve everything.
 In all three cases `run()` MUST flush before returning, using the same
 sequence as the per-flush-trigger ordering (see "Flush ordering"):
 
-1. `validator.flush()` — state.redb fsync with `Durability::Immediate`.
-2. `store.set_validated_height(M)` if (1) succeeded, where M is the
-   validator's reported `validated_height()` after flushing.
+1. `validator.state_persistence()` → `flush()` — state.redb fsync with
+   `Durability::Immediate`.
+2. `store.set_validated_height(M)` if (1) succeeded **or was vacuous**
+   (`state_persistence()` was `None`), where M is the validator's reported
+   `validated_height()` after flushing.
 3. `store.flush()` — modifiers.redb fsync.
 
-Failure of `validator.flush()` is logged but MUST NOT block return —
-the host must be able to exit. The next startup's reconciliation
-re-validates whatever gap results.
+A flush *failure* is logged but MUST NOT block return — the host must be able
+to exit, and the next startup's reconciliation re-validates whatever gap
+results. A `None` is not a failure and is not logged as one; see "Flushing a
+validator that owns no state".
 
 The structural pattern: `run_inner` owns the loop body; `run` wraps the
 `run_inner` call in `tokio::select!` against the shutdown receiver,
