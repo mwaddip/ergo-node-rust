@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use enr_p2p::protocol::messages::ProtocolMessage;
@@ -282,62 +282,17 @@ pub struct SyncConfig {
     ///
     /// See ../facts/sync.md § "Block Body Retention".
     pub blocks_to_keep: i32,
-    /// Primary bound on the deferred-eval queue: Σ `approx_heap_bytes()` of
-    /// evals dispatched to rayon but not yet drained. `0` disables.
-    ///
-    /// Deliberately **not** `flush_heap_threshold_mb` and deliberately not
-    /// derived from it. Flushing redb frees dirty pages; it does nothing for a
-    /// queued `DeferredEval`. One threshold driving both would fire the flush
-    /// controller over and over against pressure it cannot relieve while the
-    /// queue that is actually growing stays unbounded.
-    ///
-    /// See ../facts/sync.md § "Eval backpressure".
-    pub eval_backlog_max_mb: u64,
-    /// Backstop bound on the deferred-eval queue: number of evals dispatched
-    /// but not yet drained. `0` disables.
-    ///
-    /// Not redundant with `eval_backlog_max_mb` — the two govern disjoint
-    /// regimes. Ordinary blocks (~195 KB each) hit this one at ~50 MB, nowhere
-    /// near the byte budget; dense late-chain blocks (~3.6 MB) hit the byte
-    /// budget at ~70 evals, nowhere near this count. Drop either and one
-    /// regime goes unbounded.
-    pub eval_backlog_max_blocks: u32,
-    /// Height at or below which the validator skips ErgoScript evaluation.
-    /// `0` (default) means no checkpoint and the frontier floor is a no-op.
-    ///
-    /// Sync does not use this to decide anything about validation — it never
-    /// sees an eval for these heights in the first place. It uses it as the
-    /// floor for `script_verified_height`: without it, a node with a checkpoint
-    /// above its start height has a frontier that can never reach the
-    /// checkpoint, because the results that would fill the gap are never
-    /// produced. See ../facts/sync.md § "Checkpoint frontier hole".
-    ///
-    /// MUST be fed from the same expression the validator is constructed with
-    /// (`configured_checkpoint.unwrap_or(0)` in `src/main.rs`). Two
-    /// independently-derived checkpoints that disagree put the floor and the
-    /// eval-skip boundary at different heights, which reopens this hole one
-    /// block wide and far harder to see.
-    pub checkpoint_height: u32,
-    /// The validator evaluates ErgoScript inside `apply_state` rather than
-    /// handing sync a `DeferredEval` to dispatch. `false` (default) is deferred
-    /// mode, which is what every node shipped before 2026-08-12.
-    ///
-    /// Sync does not choose where evaluation happens — the validator does. This
-    /// says which of the two shapes to expect back, and the only thing it
-    /// decides here is where `script_verified_height` comes from: under inline
-    /// an `Ok` from `apply_state` already *means* the scripts passed, so the
-    /// frontier is set on each successful apply instead of being derived from
-    /// drained results. Nothing is dispatched, so nothing would ever arrive to
-    /// move it otherwise.
-    ///
-    /// MUST be fed from the same expression the validator's mode is built from
-    /// in `src/main.rs`. Two independently-derived copies that disagree either
-    /// freeze the frontier forever waiting on results that are never
-    /// dispatched, or advance it over blocks nothing verified — the identical
-    /// hazard to `checkpoint_height` above, which is where it went wrong first.
-    ///
-    /// See ../facts/sync.md § "Script evaluation mode".
-    pub script_eval_inline: bool,
+    // `eval_backlog_max_mb`, `eval_backlog_max_blocks`, `checkpoint_height`
+    // and `script_eval_inline` were removed in v0.8.0 with deferred
+    // evaluation. The first two bounded a queue that no longer exists; the
+    // last two existed only to tell sync where `script_verified_height` came
+    // from and how far down it had to be floored, and that watermark is gone.
+    //
+    // The checkpoint itself still matters — heights at or below it skip
+    // evaluation — but that is entirely `validation/`'s business now, fed
+    // straight from the node config to the validator. Sync never had an
+    // opinion about it beyond the floor. See `../facts/sync.md`
+    // § "Block Assembly (state_applied_height)".
 }
 
 impl Default for SyncConfig {
@@ -370,80 +325,8 @@ impl Default for SyncConfig {
             // crate overrides from the node config's `blocks_to_keep` knob
             // when the operator opts in.
             blocks_to_keep: -1,
-            // 256 MB / 256 blocks. Inert on a host that keeps pace — observed
-            // depth on a 32-core box is 1–3 evals — and caps the 2026-08-12
-            // field OOM at ~2.4% of the 10.62 GiB anon-rss it reached.
-            eval_backlog_max_mb: 256,
-            eval_backlog_max_blocks: 256,
-            // 0 = no checkpoint, which is the default node. The main crate
-            // overrides from the same `configured_checkpoint.unwrap_or(0)` it
-            // builds the validator with.
-            checkpoint_height: 0,
-            // Deferred: the pre-existing behaviour, and the mode the rest of
-            // the eval machinery in this file is written for. The main crate
-            // overrides from the same binding it constructs the validator's
-            // `ScriptEvalMode` with.
-            script_eval_inline: false,
         }
     }
-}
-
-/// One completed deferred script evaluation, as it comes back off the rayon
-/// pool.
-///
-/// Was a bare `(height, Result)` tuple. It carries two more fields now because
-/// the dispatch gate has to answer questions the tuple could not: how much heap
-/// this task was holding, and whether the chain it was evaluating still exists.
-#[derive(Debug)]
-struct EvalResult {
-    height: u32,
-    /// The dispatch generation this eval belongs to. Bumped by
-    /// [`HeaderSync::invalidate_pending_evals`] on every rollback that actually
-    /// moved the validator; a result arriving with a stale generation describes
-    /// a height that is no longer applied and must not reach the frontier.
-    ///
-    /// A rayon task cannot be cancelled, so a rollback cannot make outstanding
-    /// results go away — it can only make them wrong. Tagging is the only
-    /// mechanism that distinguishes "wrong" from "not yet arrived"; the counter
-    /// reset it replaces conflated the two.
-    generation: u64,
-    /// `approx_heap_bytes()` of the `DeferredEval` this task held, captured at
-    /// dispatch. Travels with the result so the byte accumulator gives back
-    /// exactly what dispatch took — a side table keyed by height would have to
-    /// be pruned on every rollback, and any entry missed there is a permanent
-    /// leak in the budget.
-    bytes: u64,
-    outcome: Result<(), ergo_validation::ValidationError>,
-}
-
-/// How far [`HeaderSync::drain_eval_results`] must get before it may return.
-///
-/// Replaces a `blocking: bool` whose `true` arm meant drain-to-zero. That was
-/// tolerable while the only blocking caller was the at-tip sweep, where the
-/// queue is empty anyway; as the backpressure gate's release condition it would
-/// throw away the entire pipeline every time the gate fired.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DrainTarget {
-    /// Take whatever has already arrived, then return. Never waits.
-    Available,
-    /// Wait until at most `evals` tasks and `bytes` bytes are still in flight.
-    ///
-    /// `AtMost { evals: 0, bytes: 0 }` is the old `blocking = true`: drain to
-    /// zero, used at tip where the blocking drain is what guarantees this
-    /// block's scripts are checked before the next one is accepted.
-    AtMost { evals: u32, bytes: u64 },
-}
-
-/// Result of the dispatch gate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GateOutcome {
-    /// There is room; dispatch.
-    Clear,
-    /// The gate's blocking drain hit a failed eval and the validator retreated
-    /// to the carried height. The block the caller was about to dispatch is no
-    /// longer applied — it must abandon the sweep rather than queue an
-    /// evaluation for state that no longer exists.
-    RolledBack(u32),
 }
 
 /// Header chain sync state machine.
@@ -482,55 +365,18 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     /// Highest height where ALL required block sections are in the store.
     downloaded_height: u32,
     /// Highest height where apply_state() returned Ok (state advanced).
+    ///
+    /// Since v0.8.0 the only watermark the sweep keeps besides
+    /// `downloaded_height`. `apply_state` evaluates scripts before it persists,
+    /// so an `Ok` already means they passed and there is nothing left for a
+    /// second, trailing watermark to say. See `../facts/sync.md`
+    /// § "Block Assembly (state_applied_height)" for what the trailing one cost
+    /// before it was removed.
     state_applied_height: u32,
-    /// Highest height where evaluate_scripts() completed successfully.
-    /// Advances in-order as results arrive. Persisted for startup re-eval.
-    script_verified_height: u32,
-    /// Number of eval tasks dispatched but not yet drained from the channel.
-    ///
-    /// Counts *outstanding rayon tasks*, not "results we still care about".
-    /// A rollback makes results wrong, it does not make them stop arriving, and
-    /// the heap they hold is live either way — so this is decremented only by a
-    /// message actually coming off the channel, never reset in bulk. See
-    /// [`HeaderSync::invalidate_pending_evals`].
-    evals_in_flight: u32,
-    /// Σ `approx_heap_bytes()` of the same set of tasks — the quantity the
-    /// primary bound gates on, and the quantity the count alone cannot stand in
-    /// for: per-item weight spans three orders of magnitude between a
-    /// coinbase-only block and a dense late-chain one.
-    eval_bytes_in_flight: u64,
-    /// Dispatch generation. Every eval is tagged with the value current at its
-    /// dispatch; a rollback that moves the validator bumps it, which
-    /// retroactively marks every outstanding eval stale without lying about how
-    /// many are running or how much heap they hold.
-    eval_generation: u64,
-    /// Reorder buffer for eval results that arrived ahead of their predecessor.
-    ///
-    /// A struct field rather than a `drain_eval_results` local, which is the
-    /// whole of the 2026-08-12 frontier-freeze bug: a result whose predecessor
-    /// was still running got drained, found non-contiguous, and dropped with
-    /// the local set, and the channel never resends. On a 2-thread host the
-    /// first overtake happened at block 3522 and the watermark never moved
-    /// again. Cleared on rollback — see [`HeaderSync::invalidate_pending_evals`].
-    eval_verified: BTreeSet<u32>,
-    /// Height of the frontier hole most recently found to be unfillable, if
-    /// any. Purely a WARN latch: without it the diagnostic below re-fires for
-    /// every block of a stalled catch-up.
-    eval_frontier_hole: Option<u32>,
-    /// Channel for sending eval results from rayon pool.
-    ///
-    /// A tokio channel, not crossbeam: the drain is an `async fn` and its
-    /// blocking arm is now the steady state throughout catch-up rather than a
-    /// rarity at tip, so a blocking `recv()` would park a runtime worker on
-    /// every gated block. `UnboundedSender::send` is sync and lock-free, so the
-    /// rayon side is unchanged.
-    eval_tx: mpsc::UnboundedSender<EvalResult>,
-    /// Channel for receiving eval results.
-    eval_rx: mpsc::UnboundedReceiver<EvalResult>,
-    /// Interval gate for the periodic deferred-eval backlog record. Diagnostic
-    /// only — the bound is the dispatch gate, not this. In-memory: a restart
-    /// re-baselines. See [`crate::eval_backlog`].
-    eval_backlog: crate::eval_backlog::EvalBacklogReporter,
+    /// Interval gate for the periodic catch-up progress record. Diagnostic
+    /// only. In-memory: a restart re-baselines. See
+    /// [`crate::catchup_progress`].
+    catchup_progress: crate::catchup_progress::CatchUpProgressReporter,
     /// Shared downloaded_height for the API (read by fastsync to avoid redundant work).
     shared_downloaded_height: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Gate controlling whether block/header/tx ModifierRequest sends actually fire.
@@ -554,10 +400,11 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     /// existing storage handle (no reopen, no second mmap).
     synced_cache_bytes: Option<usize>,
     /// Exponential backoff gating the validation sweep when the applied
-    /// tip fails to advance — a deterministic block failure (apply_state
-    /// error OR a deferred-eval rollback; both leave `validated_height()`
-    /// pinned). Derived purely from the validator's applied tip, so its
-    /// stall detection is blind to which subsystem rejected the block. Also
+    /// tip fails to advance — a deterministic `apply_state` failure, which
+    /// since v0.8.0 includes the script rejections that used to come back
+    /// asynchronously and roll the tip back from a drain. Derived purely from
+    /// the validator's applied tip, so its stall detection is blind to which
+    /// subsystem rejected the block. Also
     /// the single emitter of the contract `validation_stuck` event, fired
     /// once a frontier has stalled 5 sweeps in a row (the caller hands in
     /// the `error_kind`/`missing_key` label). Resets on real progress or a
@@ -598,13 +445,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     ) -> Self {
         let tracker = DeliveryTracker::with_config(config.delivery_timeout, config.max_delivery_checks);
         let initial_validated = validator.as_ref().map_or(0, |v| v.validated_height());
-        let (eval_tx, eval_rx) = mpsc::unbounded_channel();
         let last_flush_height = initial_validated;
-        // Read before `config` is moved into the struct below. The frontier
-        // starts on the floor rather than being lifted onto it later — a fresh
-        // node with a checkpoint has never verified anything below it and never
-        // will. See [`Self::set_script_frontier`].
-        let initial_script_verified = initial_validated.max(config.checkpoint_height);
         Self {
             config,
             transport,
@@ -625,15 +466,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             sync_sent_count: 0,
             downloaded_height: initial_validated,
             state_applied_height: initial_validated,
-            script_verified_height: initial_script_verified,
-            evals_in_flight: 0,
-            eval_bytes_in_flight: 0,
-            eval_generation: 0,
-            eval_verified: BTreeSet::new(),
-            eval_frontier_hole: None,
-            eval_tx,
-            eval_rx,
-            eval_backlog: crate::eval_backlog::EvalBacklogReporter::default(),
+            catchup_progress: crate::catchup_progress::CatchUpProgressReporter::default(),
             shared_downloaded_height,
             block_request_gate,
             peer_chain_tip,
@@ -829,8 +662,6 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         if tip > 0 {
             self.advance_downloaded_height().await;
         }
-
-        self.restore_script_frontier().await;
 
         // Startup WARN: surface bodies older than the configured retention
         // horizon so the operator knows to run `sharpen prune` to reclaim
@@ -1225,8 +1056,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         // atomically with the AVL prover, so it is the single source of
         // truth for what state has actually been applied. The sweep MUST
         // resume from there, never from `state_applied_height`, which is a
-        // cache that a mid-sweep deferred-eval rollback can leave stale
-        // (ahead of the real tip). Deriving the start from the prover tip
+        // cache a reorg rollback can leave stale (ahead of the real tip).
+        // Deriving the start from the prover tip
         // makes it impossible to feed `apply_state` a non-consecutive block
         // — that was the wedge where the sweep skipped on-disk blocks and
         // looped forever on a `HeightMismatch`. See `../facts/sync.md`.
@@ -1391,124 +1222,25 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         "block applied"
                     );
 
-                    // Spawn deferred script evaluation on the rayon pool, gated
-                    // by the backlog bounds. The gate runs BEFORE the spawn:
-                    // gating after it would admit the very allocation the bound
-                    // exists to refuse, so a host already over budget would
-                    // still push one more `DeferredEval` onto the heap for
-                    // every block it applied. See `../facts/sync.md`
-                    // § "Eval backpressure".
-                    if let Some(eval) = outcome.deferred_eval {
-                        let bytes = eval.approx_heap_bytes() as u64;
-                        if let GateOutcome::RolledBack(tip) =
-                            self.await_eval_capacity(bytes).await
-                        {
-                            tracing::warn!(
-                                validated_to,
-                                rolled_back_to = tip,
-                                "eval failure rolled back state at the dispatch gate — aborting"
-                            );
-                            validated_to = tip;
-                            stall_detail = StallDetail::script_eval();
-                            break;
-                        }
-
-                        let tx = self.eval_tx.clone();
-                        let generation = self.eval_generation;
-                        self.evals_in_flight += 1;
-                        self.eval_bytes_in_flight += bytes;
-                        rayon::spawn(move || {
-                            let height = eval.height;
-                            let outcome =
-                                ergo_validation::evaluate_scripts(&eval).map(|_cost| ());
-                            // Explicit, and before the send: the drain gives
-                            // `bytes` back to the budget the moment this message
-                            // lands, so the heap it accounts for must already be
-                            // released. Dropping at end of scope instead leaves
-                            // a window where the budget under-reports live
-                            // memory by one whole eval.
-                            drop(eval);
-                            let _ = tx.send(EvalResult { height, generation, bytes, outcome });
-                        });
-                    }
-
-                    // The inline counterpart to the dispatch above, and the one
-                    // thing about inline mode that does not work by itself. The
-                    // validator ran this block's scripts before it persisted, so
-                    // the `Ok` in hand already means they passed; there is no
-                    // result to wait for and — since nothing was dispatched —
-                    // nothing that could ever arrive to carry the frontier
-                    // forward. Left out, the watermark sits at its startup value
-                    // for the life of the process while state runs away from it.
+                    // Periodic catch-up record. Placed before the flush below so
+                    // the heap reading is the pre-flush peak. Time-gated and
+                    // catch-up-only inside `maybe_emit`; the probe closure runs
+                    // only when a record actually fires. See
+                    // [`crate::catchup_progress`] and `../facts/sync.md`.
                     //
-                    // Through the setter so `checkpoint_height` still floors it,
-                    // and persisted on the same cadence the drained path uses:
-                    // WAL-only under Durability::None, fsynced by the paired
-                    // `store.flush()` at the next state-flush point.
-                    // See `../facts/sync.md` § "Script evaluation mode".
-                    if self.config.script_eval_inline {
-                        self.set_script_frontier(height);
-                        self.store
-                            .set_script_verified_height(self.script_verified_height)
-                            .await;
-                    }
-
-                    // Non-blocking drain of completed eval results. A
-                    // deferred-eval failure inside the drain rolls the
-                    // validator back (and lowers `state_applied_height`).
-                    // Detect it by the validator's own tip moving backwards
-                    // across the drain — NOT by `state_applied_height` dipping
-                    // below its pre-sweep value, which misses a rollback that
-                    // lands exactly on the pre-sweep tip (the common case: the
-                    // failing block was applied earlier in THIS sweep). On any
-                    // backwards move, abort: continuing would feed `apply_state`
-                    // a block past the rolled-back tip and surface a misleading
-                    // `HeightMismatch`.
-                    let pre_drain_tip =
-                        self.validator.as_ref().map_or(validated_to, |v| v.validated_height());
-                    self.drain_eval_results(DrainTarget::Available).await;
-                    let post_drain_tip =
-                        self.validator.as_ref().map_or(pre_drain_tip, |v| v.validated_height());
-
-                    if post_drain_tip < pre_drain_tip {
-                        tracing::warn!(
-                            validated_to,
-                            rolled_back_to = post_drain_tip,
-                            "eval failure rolled back state during sweep — aborting"
-                        );
-                        validated_to = post_drain_tip;
-                        // If this rollback pins the frontier, the backoff's
-                        // validation_stuck must name the deferred-eval mode —
-                        // the path the retired apply_state tracker never saw.
-                        stall_detail = StallDetail::script_eval();
-                        break;
-                    }
-
-                    // Periodic depth report for the deferred-eval queue —
-                    // dispatched-minus-drained, which nothing else exposes and
-                    // which has no cap. Placed after the drain so the count is
-                    // this block's true depth, and before the flush below so
-                    // the heap reading is the pre-flush peak that the OOM story
-                    // is about. Time-gated and catch-up-only inside
-                    // `maybe_emit`; the probe closure runs only when a record
-                    // actually fires. Diagnostic, not a bound — see
-                    // [`crate::eval_backlog`] and `../facts/sync.md`.
-                    //
-                    // `state_applied_height` is read from the validator tip,
-                    // not `self.state_applied_height`: that field is a cache
+                    // The height is read from the validator tip, not
+                    // `self.state_applied_height`: that field is a cache
                     // reconciled after the loop, so mid-sweep it is frozen at
-                    // the pre-sweep tip while `script_verified_height` climbs
-                    // past it — reporting it would peg `eval_lag` at 0 for the
-                    // whole sweep and measure nothing.
-                    self.eval_backlog.maybe_emit(
+                    // the pre-sweep tip and this record would report a height
+                    // the sweep passed some time ago.
+                    let applied = self
+                        .validator
+                        .as_ref()
+                        .map_or(validated_to, |v| v.validated_height());
+                    self.catchup_progress.maybe_emit(
                         Instant::now(),
                         sweep_size,
-                        crate::eval_backlog::BacklogDepth {
-                            evals_in_flight: self.evals_in_flight,
-                            eval_bytes_in_flight: self.eval_bytes_in_flight,
-                            state_applied_height: post_drain_tip,
-                            script_verified_height: self.script_verified_height,
-                        },
+                        applied,
                         || self.config.flush_probe.as_ref().map(|probe| probe()),
                     );
 
@@ -1579,13 +1311,11 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         // Drive the sweep backoff off the authoritative applied tip. If the
         // sweep moved the tip past where it started, that is real progress —
         // clear any backoff. If it did not, the frontier is failing
-        // deterministically (apply_state error, or an eval rollback that
-        // pulled the tip back to where it began); arm/escalate the
-        // exponential delay so the next retry is throttled, and — once the
+        // deterministically on `apply_state` — which since v0.8.0 includes the
+        // script failures that used to come back asynchronously; arm/escalate
+        // the exponential delay so the next retry is throttled, and — once the
         // frontier has stalled 5 sweeps in a row — emit the contract
-        // `validation_stuck` event, labelled by `stall_detail`. The backoff
-        // owns that emission for BOTH modes now (apply_state and the
-        // deferred-eval rollback the retired tracker never saw). This
+        // `validation_stuck` event, labelled by `stall_detail`. This
         // per-engage WARN is the finer-grained signal — once per actual retry,
         // distinct from `validation_stuck` and deliberately not doubling it.
         if let Some(stall) =
@@ -1627,8 +1357,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     );
                 }
             } else {
-                // Cache was stale-ahead of the prover (e.g. a mid-sweep eval
-                // rollback) — pulled back down to the truth.
+                // Cache was stale-ahead of the prover (a reorg rollback that
+                // landed after the cache was last written) — pulled back down
+                // to the truth.
                 tracing::debug!(
                     state_applied_height = true_tip,
                     previous = prev,
@@ -1636,18 +1367,6 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 );
             }
         }
-
-        // After sweep: drain remaining eval results.
-        // At chain tip (single block), drain to zero so scripts are verified
-        // before the next peer block is accepted. Mid-catch-up the queue is
-        // the pipeline — take what has arrived and keep going; the dispatch
-        // gate, not this, is what keeps it from growing without limit.
-        let target = if sweep_size <= 1 {
-            DrainTarget::AtMost { evals: 0, bytes: 0 }
-        } else {
-            DrainTarget::Available
-        };
-        self.drain_eval_results(target).await;
 
         // Durable flush at sweep end — catches the tail of blocks that
         // didn't hit a heap-threshold or max-blocks trigger mid-sweep. The
@@ -1663,370 +1382,6 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         }
     }
 
-    /// Give one arrived result's cost back to both accumulators.
-    ///
-    /// Called for every message that comes off the channel, stale generation or
-    /// not: the task has finished and dropped its `DeferredEval` either way, so
-    /// the budget must give the bytes back either way. Saturating because an
-    /// accumulator that has somehow drifted must not panic a syncing node — and
-    /// because a drift to zero stops the blocking drain instead of hanging it.
-    fn retire_eval(&mut self, bytes: u64) {
-        self.evals_in_flight = self.evals_in_flight.saturating_sub(1);
-        self.eval_bytes_in_flight = self.eval_bytes_in_flight.saturating_sub(bytes);
-    }
-
-    /// Mark every currently-outstanding eval stale and drop the reorder buffer.
-    ///
-    /// Called only where a rollback actually moved the validator. It does not —
-    /// cannot — stop the rayon tasks; it marks their results so a later drain
-    /// retires their memory without letting a height the validator no longer
-    /// holds reach the frontier.
-    ///
-    /// This replaces `evals_in_flight = 0`, which was wrong in both directions
-    /// at once: it told the dispatch gate the queue was empty while up to
-    /// `eval_backlog_max_blocks` blocks' worth of heap was still live, and it
-    /// let the tasks' eventual sends be consumed by a later drain as if they
-    /// were results that drain had itself dispatched — an undercounted gate
-    /// opening early is precisely the failure the bound exists to prevent.
-    ///
-    /// The buffer goes with it: every height in it is above the rollback point
-    /// and will be re-applied and re-dispatched, so a surviving entry would
-    /// resurrect a rolled-back height at the frontier.
-    fn invalidate_pending_evals(&mut self) {
-        self.eval_generation = self.eval_generation.wrapping_add(1);
-        self.eval_verified.clear();
-        self.eval_frontier_hole = None;
-    }
-
-    /// Bound the deferred-eval queue before one more evaluation is dispatched.
-    ///
-    /// If admitting `incoming_bytes` would breach either bound, drain until
-    /// **both** are back under **half** their limit. The low-water mark is
-    /// hysteresis and is load-bearing: releasing at the limit itself puts the
-    /// gate on the boundary again on the very next block, converting the
-    /// pipeline into a lockstep one-in-one-out and taking the pipelining away
-    /// from hosts that were never the problem.
-    ///
-    /// Each bound is disabled by `0` independently, so a disabled bound gets a
-    /// low-water mark of "never" rather than of zero — otherwise disabling the
-    /// count would silently turn every byte-triggered gate into a drain-to-zero.
-    ///
-    /// Deliberately not scaled by the rayon pool size. `evaluate_scripts`
-    /// `par_iter`s over the block's own transactions on the same global pool, so
-    /// one queued eval can already occupy every thread: queue depth is not what
-    /// keeps the pool fed, intra-block width is. A thread-scaled budget would
-    /// grow on exactly the hosts with the least memory per core.
-    async fn await_eval_capacity(&mut self, incoming_bytes: u64) -> GateOutcome {
-        let max_bytes = self.config.eval_backlog_max_mb.saturating_mul(1024 * 1024);
-        let max_evals = self.config.eval_backlog_max_blocks;
-
-        let over_bytes =
-            max_bytes != 0 && self.eval_bytes_in_flight.saturating_add(incoming_bytes) > max_bytes;
-        let over_count = max_evals != 0 && self.evals_in_flight.saturating_add(1) > max_evals;
-        if !over_bytes && !over_count {
-            return GateOutcome::Clear;
-        }
-
-        let target = DrainTarget::AtMost {
-            evals: if max_evals == 0 { u32::MAX } else { max_evals / 2 },
-            bytes: if max_bytes == 0 { u64::MAX } else { max_bytes / 2 },
-        };
-        tracing::debug!(
-            evals_in_flight = self.evals_in_flight,
-            eval_bytes_in_flight = self.eval_bytes_in_flight,
-            incoming_bytes,
-            // Which bound bound, named rather than left to be inferred from
-            // the two numbers: the whole reason both exist is that they govern
-            // different block shapes, and an operator re-tuning one needs to
-            // know which regime this host is actually in.
-            bound = match (over_bytes, over_count) {
-                (true, true) => "both",
-                (true, false) => "bytes",
-                _ => "blocks",
-            },
-            // Marker per `../facts/journal-events.md` § `deferred_eval_gate_engaged`.
-            // It must not begin with `deferred_eval_backlog`'s marker — a prefix
-            // parser keyed on the shorter one matched both events and then failed
-            // looking for `eval_lag`, which only the backlog record carries — and
-            // the matched portion is ASCII, so the em dash lives in the suffix
-            // where a parser never has to reproduce it.
-            "eval dispatch gate engaged — draining to half"
-        );
-
-        let pre_tip = self.validator.as_ref().map(|v| v.validated_height());
-        self.drain_eval_results(target).await;
-        let post_tip = self.validator.as_ref().map(|v| v.validated_height());
-
-        match (pre_tip, post_tip) {
-            (Some(before), Some(after)) if after < before => GateOutcome::RolledBack(after),
-            _ => GateOutcome::Clear,
-        }
-    }
-
-    /// Drain completed script evaluation results from the channel up to
-    /// `target`, advancing `script_verified_height` over every contiguous run
-    /// the results allow.
-    ///
-    /// The blocking arm awaits an async channel rather than blocking on a
-    /// crossbeam one. That was survivable while the only blocking caller was
-    /// the at-tip sweep, whose queue is empty by construction; with the
-    /// dispatch gate as a second caller it is the steady state through
-    /// catch-up, and a blocking `recv()` inside an `async fn` would park a
-    /// runtime worker on every gated block.
-    async fn drain_eval_results(&mut self, target: DrainTarget) {
-        loop {
-            // Nothing outstanding means nothing can arrive — checked before
-            // every wait, so the blocking arm cannot hang on an empty queue.
-            if self.evals_in_flight == 0 {
-                break;
-            }
-            let msg = match target {
-                DrainTarget::Available => match self.eval_rx.try_recv() {
-                    Ok(msg) => msg,
-                    Err(_) => break,
-                },
-                DrainTarget::AtMost { evals, bytes } => {
-                    if self.evals_in_flight <= evals && self.eval_bytes_in_flight <= bytes {
-                        break;
-                    }
-                    match self.eval_rx.recv().await {
-                        Some(msg) => msg,
-                        // Unreachable while `self.eval_tx` is alive; treated as
-                        // end-of-stream rather than asserted on.
-                        None => break,
-                    }
-                }
-            };
-
-            // Unconditional: the task has finished and its `DeferredEval` is
-            // dropped whatever generation the result belongs to.
-            self.retire_eval(msg.bytes);
-
-            if msg.generation != self.eval_generation {
-                // Dispatched before a rollback. The height it describes is no
-                // longer applied, so it must not touch the frontier — but its
-                // memory is genuinely gone, which is why it was retired above.
-                tracing::debug!(
-                    height = msg.height,
-                    generation = msg.generation,
-                    current_generation = self.eval_generation,
-                    "discarding eval result from before a rollback"
-                );
-                continue;
-            }
-
-            match msg.outcome {
-                Ok(()) => {
-                    self.eval_verified.insert(msg.height);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        height = msg.height, error = %e,
-                        "script evaluation failed — rolling back"
-                    );
-                    self.handle_eval_failure(msg.height).await;
-                    return;
-                }
-            }
-        }
-
-        self.advance_script_frontier().await;
-    }
-
-    /// Startup: load the persisted `script_verified_height`.
-    ///
-    /// If there's a gap (state applied but scripts not verified from a previous
-    /// unclean shutdown), accept it — the AVL digest already proved state
-    /// correctness. Proof boxes aren't available without re-running
-    /// `apply_state`, so re-evaluation isn't feasible here.
-    ///
-    /// Extracted from `run_inner` so it can be driven directly. It could not be
-    /// before: `run()` races `run_inner()` against the shutdown receiver in an
-    /// unbiased `select!`, so a test that pre-signals shutdown to make `run()`
-    /// terminate may never reach this code at all. Same reason
-    /// [`Self::maybe_warn_reclaimable_bodies`] is its own function. Pure
-    /// extraction — no behaviour change.
-    async fn restore_script_frontier(&mut self) {
-        let Some(persisted_svh) = self.store.script_verified_height().await else {
-            return;
-        };
-        // Floored: a persisted watermark written before the operator configured
-        // a checkpoint — or by a build predating the floor — would otherwise
-        // reload below it and park there permanently.
-        self.set_script_frontier(persisted_svh.min(self.state_applied_height));
-        if persisted_svh < self.state_applied_height {
-            let gap = self.state_applied_height - persisted_svh;
-            tracing::info!(
-                persisted_svh,
-                state_applied_height = self.state_applied_height,
-                gap,
-                "startup: accepting script verification gap (AVL digest verified)"
-            );
-            // Advance to match — the gap blocks' state transitions are already
-            // proven correct by the AVL digest check in apply_state. Routed
-            // through the setter for the floor only; whether this gap SHOULD be
-            // advanced over is a separate and still-open question
-            // (../facts/sync.md § "Startup gap handling"), and nothing here
-            // decides it either way.
-            self.set_script_frontier(self.state_applied_height);
-            // Lock in the new floor durably so a restart before the next flush
-            // doesn't re-discover the same gap. Without this the persisted SVH
-            // stays stuck at the old value across restarts.
-            self.store.set_script_verified_height(self.script_verified_height).await;
-            self.store.flush().await;
-        }
-    }
-
-    /// Move `script_verified_height` to `height`, never below
-    /// `config.checkpoint_height`.
-    ///
-    /// Every non-advancing write to the frontier goes through here, and that is
-    /// the point: the floor is not a startup fixup, it is an invariant. Heights
-    /// at or below the checkpoint never dispatch an eval, so no result can ever
-    /// arrive to carry the frontier across them — a frontier parked below the
-    /// checkpoint is parked permanently. Startup closing the hole is not enough
-    /// on its own, because a rollback or a reorg to a fork point below the
-    /// checkpoint would reopen it, and then it stays open for the life of the
-    /// process. Routing the writes through one setter is also what keeps a
-    /// *future* write site from quietly reintroducing it.
-    ///
-    /// `0` (the default, no checkpoint) makes this `height.max(0)` — a no-op.
-    ///
-    /// The floor can transiently put the frontier above `state_applied_height`,
-    /// which the contract's ordering invariant does not otherwise allow: a reorg
-    /// to a fork point below the checkpoint retreats state below the floor while
-    /// the frontier stays on it. That is correct rather than merely tolerated —
-    /// the new branch's sub-checkpoint blocks skip evaluation exactly as the old
-    /// branch's did, so no script work is owed down there either — and it
-    /// resolves as the sweep re-applies. `eval_lag()` saturates meanwhile.
-    /// See ../facts/sync.md § "Checkpoint frontier hole".
-    ///
-    /// Does NOT persist; callers that need durability call
-    /// `store.set_script_verified_height` afterwards as they always did.
-    fn set_script_frontier(&mut self, height: u32) {
-        self.script_verified_height = height.max(self.config.checkpoint_height);
-    }
-
-    /// Step `script_verified_height` over every contiguous height the reorder
-    /// buffer holds, then persist if it moved.
-    ///
-    /// Not routed through [`Self::set_script_frontier`]: this only ever
-    /// increments from the current value, so it cannot land below a floor the
-    /// current value already respects.
-    async fn advance_script_frontier(&mut self) {
-        let prev = self.script_verified_height;
-        while self.eval_verified.remove(&(self.script_verified_height + 1)) {
-            self.script_verified_height += 1;
-        }
-
-        if self.script_verified_height > prev {
-            self.eval_frontier_hole = None;
-            // Persist on every advance. With Durability::None the write hits
-            // the redb WAL only and gets fsynced when the paired store.flush()
-            // runs at the next state-flush point — so persisted SVH always
-            // tracks persisted state without an extra fsync per block.
-            self.store.set_script_verified_height(self.script_verified_height).await;
-            return;
-        }
-
-        // Buffered results with nothing in flight below them: the hole at
-        // `script_verified_height + 1` belongs to a height that will never
-        // report. Either it was deliberately skipped (`deferred_eval` is `None`
-        // at or below the validator's checkpoint) or its eval failed and the
-        // rollback did not move the validator. Nothing that could fill it is
-        // running, so the buffer can only grow from here — one `u32` per block
-        // for the rest of the sync — while buying nothing.
-        //
-        // Dropping it is lossless for the frontier, which could not have
-        // advanced past the hole in any case. The latch keeps this to one WARN
-        // per hole instead of one per block; it re-arms when the frontier moves.
-        if self.evals_in_flight == 0 && !self.eval_verified.is_empty() {
-            let hole = self.script_verified_height + 1;
-            if self.eval_frontier_hole != Some(hole) {
-                self.eval_frontier_hole = Some(hole);
-                // The applied tip read from the validator, NOT from
-                // `self.state_applied_height`. That field is a cache reconciled
-                // only after the sweep loop, so mid-sweep — which is exactly
-                // when the dispatch gate's drain lands here — it is frozen at
-                // the pre-sweep tip and would understate the span. Same trap,
-                // and the same resolution, as `deferred_eval_backlog`'s field
-                // of this name (`../facts/journal-events.md`). Falls back to the
-                // cache in light mode, where there is no validator to ask and no
-                // eval is ever dispatched anyway.
-                let state_applied_height = self
-                    .validator
-                    .as_ref()
-                    .map_or(self.state_applied_height, |v| v.validated_height());
-                tracing::warn!(
-                    script_verified_height = self.script_verified_height,
-                    hole,
-                    buffered = self.eval_verified.len(),
-                    // The severity number: how far state has run ahead of a
-                    // frontier that cannot move, i.e. how large a span this
-                    // leaves unattested.
-                    state_applied_height,
-                    "no eval outstanding below the script frontier — it cannot advance past this height"
-                );
-            }
-            self.eval_verified.clear();
-        }
-    }
-
-    /// Handle a deferred script evaluation failure by rolling back state.
-    async fn handle_eval_failure(&mut self, failed_height: u32) {
-        // Deliberately does NOT drain-and-discard the channel or zero the
-        // counters. The rayon tasks for every other in-flight height are still
-        // running and still holding their `DeferredEval`; discarding their
-        // results here would leave the gate blind to live heap it must account
-        // for. Staleness is handled by the generation tag below — but only on
-        // the Ok path, because on Err nothing moved and the outstanding results
-        // are still describing blocks the validator still holds.
-        let rollback_to = failed_height - 1;
-
-        if let Some(v) = self.validator.as_mut() {
-            if let Some(header) = self.chain.header_at(rollback_to).await {
-                if let Err(e) = v.reset_to(rollback_to, header.state_root) {
-                    // The rollback failed — the validator did NOT move
-                    // (contract: validated_height/digest/prover unchanged on
-                    // Err). Every watermark stays in place: retreating them
-                    // onto un-rolled state is the gap-wedge hole. The sweep
-                    // backoff retries the resulting stall; no separate retry
-                    // mechanism here. See `../facts/sync.md`.
-                    tracing::error!(
-                        height = rollback_to as u64,
-                        path = "eval_failure",
-                        error = %e,
-                        "validation rollback failed"
-                    );
-                    return;
-                }
-            } else {
-                tracing::error!(rollback_to, "cannot find header for rollback");
-                return;
-            }
-        }
-
-        // The validator moved (or there is none to move, in light mode). Every
-        // outstanding eval now describes a height above the new tip.
-        self.invalidate_pending_evals();
-
-        self.state_applied_height = rollback_to;
-        // Floored. `failed_height` had an eval dispatched, so it is above the
-        // checkpoint and `rollback_to` is at or above it — the floor is inert
-        // on this path today. It goes through the setter anyway: the property
-        // that keeps it inert lives in `validation/`, not here.
-        self.set_script_frontier(rollback_to);
-        self.store.set_script_verified_height(self.script_verified_height).await;
-        if self.downloaded_height > rollback_to {
-            self.downloaded_height = rollback_to;
-        }
-
-        tracing::warn!(
-            rollback_to,
-            "state rolled back due to script eval failure"
-        );
-    }
-
     /// Handle a control-plane event (Reorg or NeedModifier).
     async fn handle_control_event(&mut self, ctrl: DeliveryControl, peer: PeerId) {
         match ctrl {
@@ -2037,13 +1392,12 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             DeliveryControl::Reorg { fork_point, old_tip, new_tip } => {
                 tracing::info!(fork_point, old_tip, new_tip, "reorg: adjusting section queue and watermark");
 
-                // In-flight evals are invalidated below, and only if the
-                // validator actually rolled back. The unconditional
-                // drain-and-discard + `evals_in_flight = 0` this replaces threw
-                // away valid results on a reorg that never moved the state
-                // watermark, and — worse — told the dispatch gate the queue was
-                // empty while every one of those rayon tasks was still running
-                // and still holding its `DeferredEval`.
+                // Nothing to drain. Since v0.8.0 a reorg cannot arrive between
+                // a block's application and its verification, because there is
+                // no gap between them — `apply_state` evaluates before it
+                // persists. The generation tagging, the reorder-buffer purge
+                // and the conditional invalidation this replaces all existed to
+                // decide which in-flight results a rollback had made wrong.
 
                 // Reset watermarks if they were above the fork point
                 if self.downloaded_height > fork_point {
@@ -2055,12 +1409,12 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     self.downloaded_height = fork_point;
                 }
                 if self.state_applied_height > fork_point {
-                    // The state watermarks may only retreat if the validator
+                    // The state watermark may only retreat if the validator
                     // actually rolled back — on a failed rollback the state
                     // genuinely sits where it was, and retreating the
-                    // watermarks onto un-rolled state is the gap-wedge hole
+                    // watermark onto un-rolled state is the gap-wedge hole
                     // (see `../facts/sync.md`). No validator (light mode) =
-                    // nothing to roll, watermarks are sync-local.
+                    // nothing to roll, the watermark is sync-local.
                     let rolled_back = match self.validator.as_mut() {
                         Some(v) => match self.chain.header_at(fork_point).await {
                             Some(fork_header) => {
@@ -2088,16 +1442,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         None => true,
                     };
                     if rolled_back {
-                        self.invalidate_pending_evals();
                         self.state_applied_height = fork_point;
-                        // Floored. This is the site that makes the floor an
-                        // invariant rather than a startup fixup: a reorg to a
-                        // fork point below the checkpoint would drop the
-                        // frontier into a region no eval will ever report on,
-                        // reopening for the life of the process the hole
-                        // startup had closed.
-                        self.set_script_frontier(fork_point);
-                        self.store.set_script_verified_height(self.script_verified_height).await;
                     }
                 }
 
@@ -2804,14 +2149,6 @@ mod cross_db_flush_tests {
             unimplemented!("not called in flush-ordering tests")
         }
 
-        async fn script_verified_height(&self) -> Option<u32> {
-            unimplemented!("not called in flush-ordering tests")
-        }
-
-        async fn set_script_verified_height(&self, _height: u32) {
-            unimplemented!("not called in flush-ordering tests")
-        }
-
         async fn validated_height(&self) -> Option<u32> {
             *self.validated_height.lock().unwrap()
         }
@@ -3109,14 +2446,6 @@ mod shutdown_flush_tests {
 
         async fn get_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> Option<Vec<u8>> {
             unreachable!("not called in shutdown-flush tests")
-        }
-
-        async fn script_verified_height(&self) -> Option<u32> {
-            None
-        }
-
-        async fn set_script_verified_height(&self, _height: u32) {
-            unreachable!("not called when script_verified_height returns None")
         }
 
         async fn validated_height(&self) -> Option<u32> {
@@ -3518,14 +2847,6 @@ mod blocks_to_keep_tests {
 
         async fn get_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> Option<Vec<u8>> {
             unreachable!("not called in blocks_to_keep tests")
-        }
-
-        async fn script_verified_height(&self) -> Option<u32> {
-            None
-        }
-
-        async fn set_script_verified_height(&self, _height: u32) {
-            unreachable!("not called when script_verified_height returns None")
         }
 
         async fn validated_height(&self) -> Option<u32> {
@@ -4122,12 +3443,17 @@ mod sweep_resume_tests {
     //!
     //! The bug: the sweep derived its start height from
     //! `state_applied_height` (a cache) instead of the validator's true
-    //! applied tip (`validated_height()`). A mid-sweep deferred-eval
-    //! rollback could leave the cache ahead of the prover; every later
-    //! sweep then fed `apply_state` a non-consecutive block, which the
-    //! validator's consecutiveness guard correctly rejected
-    //! (`expected N, got N+k`), looping forever even though the skipped
-    //! blocks were on disk.
+    //! applied tip (`validated_height()`). A rollback could leave the cache
+    //! ahead of the prover; every later sweep then fed `apply_state` a
+    //! non-consecutive block, which the validator's consecutiveness guard
+    //! correctly rejected (`expected N, got N+k`), looping forever even
+    //! though the skipped blocks were on disk.
+    //!
+    //! The rollback in question was a mid-sweep deferred-eval one when this
+    //! wedge was found. That path is gone as of v0.8.0, but the reorg
+    //! rollback reaches the same state and the anchoring is what prevents it
+    //! either way, so these tests outlive the mechanism that first exposed
+    //! them.
     //!
     //! The fix anchors both the sweep start AND the post-sweep cache on
     //! `validated_height()`. These tests construct the desynced state
@@ -4251,7 +3577,6 @@ mod sweep_resume_tests {
             Ok(ApplyStateOutcome {
                 epoch_boundary_params: None,
                 epoch_boundary_proposed_update: None,
-                deferred_eval: None,
             })
         }
 
@@ -4368,13 +3693,7 @@ mod sweep_resume_tests {
     }
 
     /// Store where every requested section is "on disk".
-    ///
-    /// `persisted_svh` is what a restart reads back; `None` (the default) is a
-    /// store that has never recorded one.
-    #[derive(Default)]
-    struct SweepStore {
-        persisted_svh: Option<u32>,
-    }
+    struct SweepStore;
 
     impl SyncStore for SweepStore {
         async fn has_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> bool {
@@ -4383,10 +3702,6 @@ mod sweep_resume_tests {
         async fn get_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> Option<Vec<u8>> {
             Some(vec![0])
         }
-        async fn script_verified_height(&self) -> Option<u32> {
-            self.persisted_svh
-        }
-        async fn set_script_verified_height(&self, _height: u32) {}
         async fn validated_height(&self) -> Option<u32> {
             None
         }
@@ -4424,72 +3739,12 @@ mod sweep_resume_tests {
 
     type SweepSync = HeaderSync<SweepTransport, SweepChain, SweepStore, SweepValidator>;
 
-    /// `approx_heap_bytes` stamped on every stub eval. 128 KiB so that eight of
-    /// them are exactly 1 MiB — the byte-bound tests configure
-    /// `eval_backlog_max_mb: 1` and can then reason in whole evals.
-    const STUB_EVAL_BYTES: u64 = 128 * 1024;
-
-    /// Pretend `n` evals were dispatched: exactly what the dispatch site does
-    /// to the two accumulators, minus the rayon spawn. Paired with [`send_ok`] /
-    /// [`send_err`], which stamp the same per-eval cost, so the accumulators
-    /// balance the way they do in production.
-    fn dispatch_stub(sync: &mut SweepSync, n: u32) {
-        sync.evals_in_flight += n;
-        sync.eval_bytes_in_flight += n as u64 * STUB_EVAL_BYTES;
-    }
-
-    fn send_result(
-        sync: &SweepSync,
-        height: u32,
-        generation: u64,
-        outcome: Result<(), ValidationError>,
-    ) {
-        sync.eval_tx
-            .send(EvalResult { height, generation, bytes: STUB_EVAL_BYTES, outcome })
-            .expect("receiver is owned by the same struct");
-    }
-
-    fn send_ok(sync: &SweepSync, height: u32) {
-        send_result(sync, height, sync.eval_generation, Ok(()));
-    }
-
-    /// An Ok result from a generation other than the current one — what a
-    /// rayon task dispatched before a rollback sends when it finally finishes.
-    fn send_ok_at_generation(sync: &SweepSync, height: u32, generation: u64) {
-        send_result(sync, height, generation, Ok(()));
-    }
-
-    fn send_err(sync: &SweepSync, height: u32) {
-        send_result(
-            sync,
-            height,
-            sync.eval_generation,
-            Err(ValidationError::StateRootMismatch { expected: Vec::new(), got: Vec::new() }),
-        );
-    }
-
     fn build_sync(validator: SweepValidator) -> SweepSync {
         build_sync_with_chain(validator, SweepChain::unbounded())
     }
 
     fn build_sync_with_chain(validator: SweepValidator, chain: SweepChain) -> SweepSync {
         build_sync_full(validator, chain, SyncConfig::default())
-    }
-
-    fn build_sync_with_config(validator: SweepValidator, config: SyncConfig) -> SweepSync {
-        build_sync_full(validator, SweepChain::unbounded(), config)
-    }
-
-    /// A sync whose store hands back `persisted_svh` on restart, for driving
-    /// [`HeaderSync::restore_script_frontier`].
-    fn build_sync_restarted(
-        validator: SweepValidator,
-        config: SyncConfig,
-        persisted_svh: u32,
-    ) -> SweepSync {
-        let mut sync = build_sync_full(validator, SweepChain::unbounded(), config);
-        sync.store.persisted_svh = Some(persisted_svh);
-        sync
     }
 
     fn build_sync_full(
@@ -4505,7 +3760,7 @@ mod sweep_resume_tests {
             config,
             SweepTransport,
             chain,
-            SweepStore::default(),
+            SweepStore,
             Some(validator),
             progress_rx,
             delivery_control_rx,
@@ -4595,472 +3850,13 @@ mod sweep_resume_tests {
     }
 
     #[tokio::test]
-    async fn eval_failure_rollback_ok_retreats_watermarks() {
-        // The normal eval-failure path: scripts failed at 2669, the storage
-        // rollback succeeds, and all three watermarks retreat to 2668 with
-        // the validator.
-        let mut sync = build_sync(SweepValidator::at(2670));
-        sync.state_applied_height = 2670;
-        sync.script_verified_height = 2670;
-        sync.downloaded_height = 2670;
-
-        sync.handle_eval_failure(2669).await;
-
-        let v = sync.validator.as_ref().unwrap();
-        assert_eq!(v.resets, vec![2668], "rollback targeted failed_height - 1");
-        assert_eq!(v.validated_height(), 2668, "validator rolled back");
-        assert_eq!(sync.state_applied_height, 2668);
-        assert_eq!(sync.script_verified_height, 2668);
-        assert_eq!(sync.downloaded_height, 2668);
-    }
-
-    #[tokio::test]
-    async fn eval_failure_rollback_err_leaves_watermarks_untouched() {
-        // The gap-wedge hole, closed: the storage rollback FAILS, so the
-        // validator did not move — every watermark must stay exactly where
-        // it was. Retreating them would make sync believe state sits at
-        // 2668 while the prover still holds 2670 (the old logged-and-
-        // swallowed behavior). The sweep backoff owns the retry; this
-        // handler just logs loud and returns.
-        let mut sync = build_sync(SweepValidator::at(2670).failing_reset());
-        sync.state_applied_height = 2670;
-        sync.script_verified_height = 2670;
-        sync.downloaded_height = 2670;
-
-        sync.handle_eval_failure(2669).await;
-
-        let v = sync.validator.as_ref().unwrap();
-        assert_eq!(v.resets, vec![2668], "rollback was attempted");
-        assert_eq!(v.validated_height(), 2670, "validator unmoved on Err");
-        assert_eq!(sync.state_applied_height, 2670, "state watermark NOT retreated");
-        assert_eq!(sync.script_verified_height, 2670, "script watermark NOT retreated");
-        assert_eq!(sync.downloaded_height, 2670, "download watermark NOT retreated");
-    }
-
-    /// Was a ⚠ characterization test pinning the frontier-freeze defect; the
-    /// final assertion is now inverted to 3525, which is what the fix bought.
-    ///
-    /// The defect: `drain_eval_results` built its reorder buffer as a
-    /// function-local `BTreeSet` and dropped it on return, so a result whose
-    /// predecessor was still running was drained, found non-contiguous, and
-    /// **discarded**. The channel never resends, so `script_verified_height`
-    /// could never pass the hole. The buffer is a struct field now.
-    ///
-    /// Replays the live wedge from the 2026-08-12 genesis resync
-    /// (`RAYON_NUM_THREADS=2`, mainnet): block 3522 carries 3 txs / 17 inputs
-    /// while 3521, 3523 and 3524 are coinbase-only (1 input). Eval 3523
-    /// overtakes the ~17× heavier eval 3522 on the second rayon thread and is
-    /// drained alone. The journal froze at exactly
-    /// `script_verified_height=3522` and stayed there for 158,000 blocks.
-    #[tokio::test]
-    async fn out_of_order_eval_result_survives_across_drains() {
-        let mut sync = build_sync(SweepValidator::at(3525));
-        sync.state_applied_height = 3525;
-        sync.script_verified_height = 3521;
-        sync.downloaded_height = 3525;
-
-        // 3522 (17 inputs) and 3523 (coinbase) both in flight; the light one
-        // finishes first and lands alone in the channel.
-        dispatch_stub(&mut sync, 2);
-        send_ok(&sync, 3523);
-        sync.drain_eval_results(DrainTarget::Available).await;
-        assert_eq!(
-            sync.script_verified_height, 3521,
-            "3522 still running — the frontier legitimately cannot advance yet"
-        );
-        assert_eq!(sync.evals_in_flight, 1, "3522 still outstanding");
-        assert_eq!(
-            sync.eval_verified.iter().copied().collect::<Vec<_>>(),
-            vec![3523],
-            "3523 is held, not dropped: the buffer outlives the call now"
-        );
-
-        // 3522 lands on the next block's drain. The frontier steps over BOTH:
-        // 3523's Ok is still in the buffer where the previous call left it.
-        send_ok(&sync, 3522);
-        sync.drain_eval_results(DrainTarget::Available).await;
-        assert_eq!(sync.script_verified_height, 3523);
-
-        // Everything after arrives strictly in order and all report Ok.
-        for h in 3524..=3525 {
-            dispatch_stub(&mut sync, 1);
-            send_ok(&sync, h);
-            sync.drain_eval_results(DrainTarget::Available).await;
-        }
-
-        assert_eq!(
-            sync.script_verified_height, 3525,
-            "every height 3522..=3525 reported Ok, so the frontier reaches 3525"
-        );
-        assert!(sync.eval_verified.is_empty(), "buffer fully consumed");
-    }
-
-    /// The control for the test above, kept unchanged: the same two results,
-    /// out of order, but both already in the channel when the drain runs. This
-    /// always passed — the defect was never the reordering logic, only the
-    /// buffer's lifetime.
-    #[tokio::test]
-    async fn out_of_order_within_a_single_drain_is_reordered_correctly() {
-        let mut sync = build_sync(SweepValidator::at(3525));
-        sync.state_applied_height = 3525;
-        sync.script_verified_height = 3521;
-        sync.downloaded_height = 3525;
-
-        dispatch_stub(&mut sync, 2);
-        send_ok(&sync, 3523);
-        send_ok(&sync, 3522);
-        sync.drain_eval_results(DrainTarget::Available).await;
-
-        assert_eq!(
-            sync.script_verified_height, 3523,
-            "both results present in one call — the set reorders and clears them"
-        );
-    }
-
-    /// A hole no in-flight eval can fill (here: 3522's eval was never
-    /// dispatched, as happens for every height at or below the validator's
-    /// checkpoint) drops the buffer instead of accumulating one `u32` per block
-    /// for the rest of the sync. The frontier stays put either way — it could
-    /// never have advanced past the hole — so the drop costs nothing and the
-    /// WARN names the height an operator would otherwise have to infer.
-    #[tokio::test]
-    async fn a_permanently_unfillable_hole_drops_the_buffer_instead_of_growing_it() {
-        let mut sync = build_sync(SweepValidator::at(3600));
-        sync.script_verified_height = 3521;
-
-        for h in 3523..=3560 {
-            dispatch_stub(&mut sync, 1);
-            send_ok(&sync, h);
-            sync.drain_eval_results(DrainTarget::Available).await;
-        }
-
-        assert_eq!(sync.script_verified_height, 3521, "the hole at 3522 holds");
-        assert_eq!(sync.evals_in_flight, 0, "nothing outstanding to fill it");
-        assert!(
-            sync.eval_verified.is_empty(),
-            "38 unplaceable results must not still be buffered"
-        );
-        assert_eq!(sync.eval_frontier_hole, Some(3522), "the hole is named once");
-    }
-
-    // ---- eval backpressure (facts/sync.md § "Eval backpressure") ----
-
-    /// Bounds sized in whole stub evals: `eval_backlog_max_mb: 1` is exactly
-    /// 8 × [`STUB_EVAL_BYTES`], so "half the byte budget" is 4 evals and the
-    /// arithmetic in each assertion is visible rather than derived.
-    fn backlog_config(max_mb: u64, max_blocks: u32) -> SyncConfig {
-        SyncConfig {
-            eval_backlog_max_mb: max_mb,
-            eval_backlog_max_blocks: max_blocks,
-            ..SyncConfig::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn gate_is_clear_below_both_bounds_and_drains_nothing() {
-        // The bound must be inert where it is not needed — on a host that keeps
-        // pace the observed depth is 1–3 evals and the gate should never touch
-        // the pipeline.
-        let mut sync = build_sync_with_config(SweepValidator::at(3600), backlog_config(1, 8));
-        sync.script_verified_height = 3000;
-        dispatch_stub(&mut sync, 3);
-        send_ok(&sync, 3001);
-
-        let outcome = sync.await_eval_capacity(STUB_EVAL_BYTES).await;
-
-        assert_eq!(outcome, GateOutcome::Clear);
-        assert_eq!(sync.evals_in_flight, 3, "the gate drained nothing");
-        assert_eq!(
-            sync.script_verified_height, 3000,
-            "and did not advance the frontier — the result is still queued"
-        );
-    }
-
-    #[tokio::test]
-    async fn gate_blocks_at_the_count_bound_and_releases_at_half() {
-        // Bytes disabled: this is the count guardrail acting alone, the regime
-        // of a long run of coinbase-only blocks.
-        let mut sync = build_sync_with_config(SweepValidator::at(3600), backlog_config(0, 8));
-        sync.script_verified_height = 3000;
-        dispatch_stub(&mut sync, 8);
-        for h in 3001..=3008 {
-            send_ok(&sync, h);
-        }
-
-        let outcome = sync.await_eval_capacity(STUB_EVAL_BYTES).await;
-
-        assert_eq!(outcome, GateOutcome::Clear);
-        assert_eq!(
-            sync.evals_in_flight, 4,
-            "drained to half the count bound, not to zero: draining to the \
-             limit itself would put the gate on the boundary again next block \
-             and degenerate the pipeline to lockstep"
-        );
-        assert_eq!(sync.script_verified_height, 3004, "the drained four advanced the frontier");
-    }
-
-    #[tokio::test]
-    async fn gate_blocks_at_the_byte_bound_and_releases_at_half() {
-        // Count disabled: the byte bound acting alone, the regime of dense
-        // late-chain blocks where a handful of evals is megabytes.
-        let mut sync = build_sync_with_config(SweepValidator::at(3600), backlog_config(1, 0));
-        sync.script_verified_height = 3000;
-        dispatch_stub(&mut sync, 8);
-        assert_eq!(sync.eval_bytes_in_flight, 1024 * 1024, "exactly at the 1 MiB bound");
-        for h in 3001..=3008 {
-            send_ok(&sync, h);
-        }
-
-        let outcome = sync.await_eval_capacity(STUB_EVAL_BYTES).await;
-
-        assert_eq!(outcome, GateOutcome::Clear);
-        assert_eq!(
-            sync.eval_bytes_in_flight,
-            512 * 1024,
-            "drained to half the byte budget"
-        );
-        assert_eq!(sync.evals_in_flight, 4);
-    }
-
-    #[tokio::test]
-    async fn a_disabled_bound_does_not_drag_the_other_one_to_zero() {
-        // The trap in "drain until both are under half": a disabled bound has
-        // no half. Reading its limit as 0 would silently turn every
-        // byte-triggered gate into a drain-to-zero.
-        let mut sync = build_sync_with_config(SweepValidator::at(3600), backlog_config(1, 0));
-        sync.script_verified_height = 3000;
-        dispatch_stub(&mut sync, 9);
-        for h in 3001..=3009 {
-            send_ok(&sync, h);
-        }
-
-        sync.await_eval_capacity(STUB_EVAL_BYTES).await;
-
-        assert_eq!(sync.evals_in_flight, 4, "released on bytes alone");
-    }
-
-    #[tokio::test]
-    async fn both_bounds_zero_disables_the_gate_entirely() {
-        let mut sync = build_sync_with_config(SweepValidator::at(3600), backlog_config(0, 0));
-        sync.script_verified_height = 3000;
-        dispatch_stub(&mut sync, 10_000);
-
-        let outcome = sync.await_eval_capacity(STUB_EVAL_BYTES).await;
-
-        assert_eq!(outcome, GateOutcome::Clear);
-        assert_eq!(sync.evals_in_flight, 10_000, "nothing drained, nothing awaited");
-    }
-
-    #[tokio::test]
-    async fn gate_reports_a_rollback_so_the_caller_does_not_dispatch_onto_dead_state() {
-        // The gate's drain is the one drain that can run *before* a dispatch,
-        // so it is the one that can roll the validator back out from under the
-        // block the sweep is holding. Reported, not swallowed.
-        let mut sync = build_sync_with_config(SweepValidator::at(3008), backlog_config(0, 8));
-        sync.state_applied_height = 3008;
-        sync.script_verified_height = 3000;
-        sync.downloaded_height = 3008;
-        dispatch_stub(&mut sync, 8);
-        send_err(&sync, 3001);
-        for h in 3002..=3008 {
-            send_ok(&sync, h);
-        }
-
-        let outcome = sync.await_eval_capacity(STUB_EVAL_BYTES).await;
-
-        assert_eq!(outcome, GateOutcome::RolledBack(3000));
-        assert_eq!(sync.validator.as_ref().unwrap().validated_height(), 3000);
-    }
-
-    // ---- counter discipline across a rollback ----
-
-    #[tokio::test]
-    async fn eval_failure_keeps_counting_the_tasks_that_are_still_running() {
-        // `handle_eval_failure` used to set `evals_in_flight = 0` while its
-        // rayon tasks were still executing and still holding their
-        // `DeferredEval`. An undercounted gate opens early, which is exactly
-        // the failure the bound exists to prevent — and at tip the blocking
-        // drain is what guarantees scripts are checked before the next block is
-        // accepted, so an undercount lets it return before they are.
-        let mut sync = build_sync(SweepValidator::at(3008));
-        sync.state_applied_height = 3008;
-        sync.script_verified_height = 3000;
-        sync.downloaded_height = 3008;
-
-        dispatch_stub(&mut sync, 3);
-        send_err(&sync, 3001);
-        sync.drain_eval_results(DrainTarget::Available).await;
-
-        assert_eq!(sync.validator.as_ref().unwrap().validated_height(), 3000, "rolled back");
-        assert_eq!(
-            sync.evals_in_flight, 2,
-            "two rayon tasks are still running — the queue is not empty"
-        );
-        assert_eq!(
-            sync.eval_bytes_in_flight,
-            2 * STUB_EVAL_BYTES,
-            "and their heap is still live, so the byte budget still owes it"
-        );
-
-        // Those two land later, tagged with the pre-rollback generation.
-        send_ok(&sync, 3002);
-        send_ok_at_generation(&sync, 3003, sync.eval_generation - 1);
-        sync.drain_eval_results(DrainTarget::Available).await;
-
-        assert_eq!(sync.evals_in_flight, 0, "both retired");
-        assert_eq!(sync.eval_bytes_in_flight, 0, "and both gave their bytes back");
-        assert_eq!(
-            sync.script_verified_height, 3000,
-            "neither resurrected a rolled-back height at the frontier"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_stale_ok_cannot_walk_the_frontier_over_a_rolled_back_height() {
-        // The other half of the same hazard: not the count, the watermark. A
-        // pre-rollback Ok landing after the rollback would otherwise be
-        // indistinguishable from a fresh result for the same height.
-        let mut sync = build_sync(SweepValidator::at(3008));
-        sync.state_applied_height = 3008;
-        sync.script_verified_height = 3000;
-        sync.downloaded_height = 3008;
-
-        dispatch_stub(&mut sync, 2);
-        let stale = sync.eval_generation;
-        send_err(&sync, 3001);
-        sync.drain_eval_results(DrainTarget::Available).await;
-        assert_eq!(sync.script_verified_height, 3000);
-
-        // 3001 is re-applied and re-dispatched under the new generation; the
-        // stale result for it arrives too.
-        send_ok_at_generation(&sync, 3001, stale);
-        dispatch_stub(&mut sync, 1);
-        send_ok(&sync, 3001);
-        sync.drain_eval_results(DrainTarget::Available).await;
-
-        assert_eq!(
-            sync.script_verified_height, 3001,
-            "the fresh result advances the frontier exactly one step — the \
-             stale duplicate neither advances it twice nor blocks it"
-        );
-        assert_eq!(sync.evals_in_flight, 0);
-        assert_eq!(sync.eval_bytes_in_flight, 0);
-    }
-
-    #[tokio::test]
-    async fn failed_rollback_leaves_outstanding_evals_valid() {
-        // On Err the validator did NOT move, so the blocks the outstanding
-        // evals describe are still applied. Bumping the generation here would
-        // discard results that are still true — and the frontier would then
-        // stall below a hole nothing will ever refill.
-        let mut sync = build_sync(SweepValidator::at(3008).failing_reset());
-        sync.state_applied_height = 3008;
-        sync.script_verified_height = 3000;
-        sync.downloaded_height = 3008;
-
-        dispatch_stub(&mut sync, 2);
-        let generation_before = sync.eval_generation;
-        send_err(&sync, 3005);
-        sync.drain_eval_results(DrainTarget::Available).await;
-
-        assert_eq!(sync.validator.as_ref().unwrap().validated_height(), 3008, "unmoved");
-        assert_eq!(sync.eval_generation, generation_before, "nothing invalidated");
-        assert_eq!(sync.evals_in_flight, 1);
-
-        send_ok(&sync, 3001);
-        sync.drain_eval_results(DrainTarget::Available).await;
-        assert_eq!(sync.script_verified_height, 3001, "still counted");
-    }
-
-    #[tokio::test]
-    async fn drain_to_zero_waits_for_every_outstanding_eval() {
-        // The at-tip contract: `AtMost { 0, 0 }` must not return while a task
-        // is still running, because that blocking drain is the only thing
-        // guaranteeing this block's scripts are checked before the next peer
-        // block is accepted. The sender fires from another task, so a drain
-        // that merely took what had already arrived would return at 3001.
-        let mut sync = build_sync(SweepValidator::at(3003));
-        sync.script_verified_height = 3000;
-        dispatch_stub(&mut sync, 3);
-        send_ok(&sync, 3001);
-
-        let tx = sync.eval_tx.clone();
-        let generation = sync.eval_generation;
-        tokio::spawn(async move {
-            for height in 3002..=3003 {
-                tokio::task::yield_now().await;
-                let _ = tx.send(EvalResult {
-                    height,
-                    generation,
-                    bytes: STUB_EVAL_BYTES,
-                    outcome: Ok(()),
-                });
-            }
-        });
-
-        sync.drain_eval_results(DrainTarget::AtMost { evals: 0, bytes: 0 }).await;
-
-        assert_eq!(sync.evals_in_flight, 0);
-        assert_eq!(sync.eval_bytes_in_flight, 0);
-        assert_eq!(sync.script_verified_height, 3003, "waited for all three");
-    }
-
-    #[tokio::test]
-    async fn reorg_without_a_state_rollback_keeps_its_evals() {
-        // The reorg handler used to discard in-flight results and zero the
-        // counters unconditionally, including on a reorg whose fork point sits
-        // at or above the applied tip and rolls nothing back.
-        let mut sync = build_sync_with_chain(SweepValidator::at(3008), SweepChain::at_tip(3008));
-        sync.state_applied_height = 3008;
-        sync.script_verified_height = 3000;
-        sync.downloaded_height = 3008;
-        dispatch_stub(&mut sync, 2);
-        let generation_before = sync.eval_generation;
-
-        sync.handle_control_event(
-            DeliveryControl::Reorg { fork_point: 3008, old_tip: 3008, new_tip: 3009 },
-            PeerId(1),
-        )
-        .await;
-
-        assert_eq!(sync.eval_generation, generation_before, "nothing invalidated");
-        assert_eq!(sync.evals_in_flight, 2, "the tasks are still running");
-        assert_eq!(sync.eval_bytes_in_flight, 2 * STUB_EVAL_BYTES);
-    }
-
-    #[tokio::test]
-    async fn reorg_with_a_state_rollback_invalidates_its_evals() {
-        let mut sync = build_sync_with_chain(SweepValidator::at(3008), SweepChain::at_tip(3008));
-        sync.state_applied_height = 3008;
-        sync.script_verified_height = 3008;
-        sync.downloaded_height = 3008;
-        dispatch_stub(&mut sync, 2);
-        sync.eval_verified.insert(3007);
-        let generation_before = sync.eval_generation;
-
-        sync.handle_control_event(
-            DeliveryControl::Reorg { fork_point: 3000, old_tip: 3008, new_tip: 3009 },
-            PeerId(1),
-        )
-        .await;
-
-        assert_eq!(sync.eval_generation, generation_before + 1, "outstanding evals invalidated");
-        assert!(sync.eval_verified.is_empty(), "reorder buffer dropped with them");
-        assert_eq!(
-            sync.evals_in_flight, 2,
-            "but still counted: the rayon tasks did not stop and their heap is live"
-        );
-    }
-
-    #[tokio::test]
     async fn reorg_rollback_ok_resets_then_revalidates_new_branch() {
         // Successful reorg rollback: validator rolls to the fork point, the
-        // state watermarks follow, and the handler's immediate rescan
+        // state watermark follows, and the handler's immediate rescan
         // re-applies the new branch's on-disk blocks from fork_point + 1.
         let mut sync =
             build_sync_with_chain(SweepValidator::at(2670), SweepChain::at_tip(2670));
         sync.state_applied_height = 2670;
-        sync.script_verified_height = 2670;
         sync.downloaded_height = 2670;
 
         sync.handle_control_event(
@@ -5077,26 +3873,21 @@ mod sweep_resume_tests {
             "rescan re-applied the new branch from fork_point + 1"
         );
         assert_eq!(sync.state_applied_height, 2670, "sweep re-advanced after the rollback");
-        assert_eq!(
-            sync.script_verified_height, 2667,
-            "scripts above the fork point re-verify only via real evals"
-        );
     }
 
     #[tokio::test]
     async fn reorg_rollback_err_keeps_state_watermarks() {
         // Same reorg, but the storage rollback fails: the validator stays
-        // at 2670, so state_applied/script_verified MUST NOT retreat to the
-        // fork point — and nothing may be re-applied onto the un-rolled
-        // state. (downloaded_height legitimately resets and rescans: it
-        // tracks the store against the already-switched header chain, not
-        // the prover — facts/validation.md reorg steps 2 vs 5.)
+        // at 2670, so state_applied_height MUST NOT retreat to the fork
+        // point — and nothing may be re-applied onto the un-rolled state.
+        // (downloaded_height legitimately resets and rescans: it tracks the
+        // store against the already-switched header chain, not the prover —
+        // facts/validation.md reorg steps 2 vs 5.)
         let mut sync = build_sync_with_chain(
             SweepValidator::at(2670).failing_reset(),
             SweepChain::at_tip(2670),
         );
         sync.state_applied_height = 2670;
-        sync.script_verified_height = 2670;
         sync.downloaded_height = 2670;
 
         sync.handle_control_event(
@@ -5110,16 +3901,15 @@ mod sweep_resume_tests {
         assert_eq!(v.validated_height(), 2670, "validator unmoved on Err");
         assert!(v.applied.is_empty(), "nothing re-applied onto un-rolled state");
         assert_eq!(sync.state_applied_height, 2670, "state watermark NOT retreated");
-        assert_eq!(sync.script_verified_height, 2670, "script watermark NOT retreated");
     }
 
     #[tokio::test]
     async fn stalled_sweep_arms_backoff_and_gate_suppresses_retry() {
         // Frontier 2665 is wedged: block 2666 fails apply_state every attempt
-        // (modelling a deterministic divergence — equally an eval rollback,
-        // since the backoff keys on the tip stall, not the error). Blocks
-        // 2666..=2670 are all on disk, so without the gate the sweep would
-        // re-run at full tilt.
+        // (modelling a deterministic divergence — since v0.8.0 that includes a
+        // script rejection, which now comes back as an `apply_state` Err like
+        // any other). Blocks 2666..=2670 are all on disk, so without the gate
+        // the sweep would re-run at full tilt.
         let mut sync = build_sync(SweepValidator::at(2665).failing_at(2666));
         sync.downloaded_height = 2670;
 
@@ -5163,376 +3953,6 @@ mod sweep_resume_tests {
             "healthy sweep caught up to the downloaded tip"
         );
         assert_eq!(sync.sweep_backoff.consecutive(), 0, "progress arms no backoff");
-    }
-
-    // ---- checkpoint frontier floor (`../facts/sync.md` § "Checkpoint
-    //      frontier hole") ----
-    //
-    // Heights at or below `checkpoint_height` never dispatch an eval, so no
-    // result can ever arrive to carry `script_verified_height` across them. A
-    // frontier left below the checkpoint is stuck there permanently. The floor
-    // is what keeps that from happening, and it has to hold at every write —
-    // startup, restart, rollback, reorg — because one unfloored write reopens
-    // the hole for the life of the process.
-
-    fn checkpoint_config(checkpoint_height: u32) -> SyncConfig {
-        SyncConfig { checkpoint_height, ..SyncConfig::default() }
-    }
-
-    #[tokio::test]
-    async fn checkpoint_floors_the_frontier_at_construction() {
-        // The documented case: a checkpoint above the node's start height. A
-        // fresh node has verified nothing and never will below 3521.
-        let sync = build_sync_with_config(SweepValidator::at(0), checkpoint_config(3521));
-
-        assert_eq!(
-            sync.script_verified_height, 3521,
-            "the frontier starts on the floor, not at the validator tip"
-        );
-    }
-
-    #[tokio::test]
-    async fn no_checkpoint_leaves_the_frontier_at_the_validator_tip() {
-        // `0` is the default node and the floor must be a no-op there —
-        // `height.max(0)` — not a behaviour change for everyone.
-        let sync = build_sync(SweepValidator::at(2665));
-
-        assert_eq!(sync.config.checkpoint_height, 0, "default is no checkpoint");
-        assert_eq!(sync.script_verified_height, 2665);
-    }
-
-    #[tokio::test]
-    async fn checkpoint_floors_a_persisted_watermark_below_it() {
-        // Restart reading back a watermark written before the operator
-        // configured the checkpoint — or by a build predating the floor —
-        // on a node still catching up toward that checkpoint.
-        let mut sync =
-            build_sync_restarted(SweepValidator::at(3000), checkpoint_config(3521), 500);
-        sync.state_applied_height = 3000;
-
-        sync.restore_script_frontier().await;
-
-        assert_eq!(
-            sync.script_verified_height, 3521,
-            "a persisted value below the checkpoint must not reload below it"
-        );
-    }
-
-    #[tokio::test]
-    async fn clean_restart_below_the_checkpoint_floors_the_reloaded_frontier() {
-        // The ordinary restart of a checkpointed node still catching up: the
-        // persisted watermark equals the applied tip, so there is no gap and
-        // the gap-advance branch is not taken. That makes the reload itself the
-        // only thing standing between the frontier and a permanent park below
-        // the checkpoint — and it is a distinct site from the gap advance,
-        // which is what
-        // `checkpoint_floors_a_persisted_watermark_below_it` covers.
-        let mut sync =
-            build_sync_restarted(SweepValidator::at(3000), checkpoint_config(3521), 3000);
-        sync.state_applied_height = 3000;
-
-        sync.restore_script_frontier().await;
-
-        assert_eq!(
-            sync.script_verified_height, 3521,
-            "no gap to advance over, so the reload's own floor is what lifts it"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_floor_is_a_lower_bound_and_does_not_hold_the_frontier_down() {
-        // Same restart with state already past the checkpoint: the existing
-        // gap advance takes the frontier to the applied tip, well above the
-        // floor. `max` is a floor, not a pin — and this is the assertion that
-        // catches someone "fixing" it into one.
-        //
-        // Whether the gap SHOULD be advanced over is the separate open
-        // question in ../facts/sync.md § "Startup gap handling"; this only
-        // pins that the floor did not change the answer.
-        let mut sync =
-            build_sync_restarted(SweepValidator::at(3560), checkpoint_config(3521), 500);
-        sync.state_applied_height = 3560;
-
-        sync.restore_script_frontier().await;
-
-        assert_eq!(sync.script_verified_height, 3560);
-    }
-
-    #[tokio::test]
-    async fn restart_without_a_checkpoint_reloads_the_persisted_watermark() {
-        // Control for the above: the floor must not disturb an ordinary
-        // restart, including the gap advance it is layered on top of.
-        let mut sync = build_sync_restarted(SweepValidator::at(3560), SyncConfig::default(), 500);
-        sync.state_applied_height = 3560;
-
-        sync.restore_script_frontier().await;
-
-        assert_eq!(
-            sync.script_verified_height, 3560,
-            "gap advance still takes the frontier to the applied tip"
-        );
-    }
-
-    #[tokio::test]
-    async fn reorg_below_the_checkpoint_does_not_drop_the_frontier_under_it() {
-        // The site that makes the floor an invariant rather than a startup
-        // fixup. Without it, one deep reorg reopens the hole permanently.
-        let mut sync = build_sync_full(
-            SweepValidator::at(3560),
-            SweepChain::at_tip(3560),
-            checkpoint_config(3521),
-        );
-        sync.state_applied_height = 3560;
-        sync.downloaded_height = 3560;
-
-        sync.handle_control_event(
-            DeliveryControl::Reorg { fork_point: 3000, old_tip: 3560, new_tip: 3561 },
-            PeerId(0),
-        )
-        .await;
-
-        assert_eq!(
-            sync.validator.as_ref().unwrap().resets,
-            vec![3000],
-            "the reorg really did roll the validator back below the checkpoint"
-        );
-        assert_eq!(
-            sync.script_verified_height, 3521,
-            "the frontier holds at the floor even though state retreated under it"
-        );
-    }
-
-    #[tokio::test]
-    async fn eval_failure_rollback_respects_the_floor() {
-        // The input is deliberately one production cannot currently produce: a
-        // failure reported for a height at or below the checkpoint. No eval is
-        // dispatched down there, so no failure can come back from there, and
-        // `rollback_to` therefore always lands above the floor today.
-        //
-        // Asserting only the reachable case would give a test that cannot fail
-        // — it would pass just as well with the floor deleted from this site.
-        // The property that keeps this path safe lives in `validation/`'s
-        // eval-skip boundary, not here, so the site is pinned against the day
-        // that boundary moves.
-        let mut sync =
-            build_sync_with_config(SweepValidator::at(3560), checkpoint_config(3521));
-        sync.state_applied_height = 3560;
-        sync.downloaded_height = 3560;
-
-        sync.handle_eval_failure(3000).await;
-
-        assert_eq!(
-            sync.validator.as_ref().unwrap().resets,
-            vec![2999],
-            "the rollback really did target a height below the checkpoint"
-        );
-        assert_eq!(
-            sync.state_applied_height, 2999,
-            "state follows the rollback under the checkpoint"
-        );
-        assert_eq!(
-            sync.script_verified_height, 3521,
-            "but the frontier holds at the floor"
-        );
-    }
-
-    #[tokio::test]
-    async fn frontier_hole_does_not_fire_for_a_checkpoint_the_floor_covers() {
-        // The upgrade this buys: with the floor in place `eval_frontier_hole`
-        // no longer fires for a configuration artefact, so if it fires at all
-        // it now means a genuine defect in frontier accounting.
-        //
-        // State has caught up past the checkpoint and 3522 is the first height
-        // that ever dispatched an eval. Pre-floor the frontier sat at 0 here,
-        // 3522 could not be placed, and the WARN fired on a healthy node.
-        let mut sync = build_sync_with_config(SweepValidator::at(0), checkpoint_config(3521));
-        sync.state_applied_height = 3560;
-        sync.downloaded_height = 3560;
-
-        let output = capture_async(LevelFilter::WARN, async {
-            for h in 3522..=3530 {
-                dispatch_stub(&mut sync, 1);
-                send_ok(&sync, h);
-                sync.drain_eval_results(DrainTarget::Available).await;
-            }
-        })
-        .await;
-
-        assert!(
-            !output.contains("no eval outstanding below the script frontier"),
-            "a checkpoint the floor covers is not a frontier hole: {output}"
-        );
-        assert_eq!(
-            sync.script_verified_height, 3530,
-            "the frontier advances straight off the floor"
-        );
-        assert_eq!(sync.eval_frontier_hole, None, "and no hole was ever latched");
-    }
-
-    #[tokio::test]
-    async fn frontier_hole_still_fires_above_the_checkpoint() {
-        // The other side of the upgrade: the WARN must not have been silenced,
-        // only made meaningful. 3522 is above the checkpoint, so its eval was
-        // dispatched and its absence is a real accounting defect.
-        let mut sync = build_sync_with_config(SweepValidator::at(3560), checkpoint_config(3000));
-        sync.script_verified_height = 3521;
-        sync.state_applied_height = 3560;
-
-        let output = capture_async(LevelFilter::WARN, async {
-            dispatch_stub(&mut sync, 1);
-            send_ok(&sync, 3523);
-            sync.drain_eval_results(DrainTarget::Available).await;
-        })
-        .await;
-
-        assert!(
-            output.contains("no eval outstanding below the script frontier"),
-            "a hole above the checkpoint is still a hole: {output}"
-        );
-        assert_eq!(sync.eval_frontier_hole, Some(3522));
-    }
-
-    // ---- inline script evaluation (`../facts/sync.md` § "Script evaluation
-    //      mode") ----
-    //
-    // Under `script_eval_inline` the validator evaluates scripts itself and
-    // returns `deferred_eval = None`, so sync dispatches nothing, drains
-    // nothing, and would learn nothing. Everything else in the eval machinery
-    // goes quiet on its own; the frontier is the one thing that does not, and
-    // these tests are about that one thing.
-    //
-    // `SweepValidator` already returns `deferred_eval: None` from every apply,
-    // which is exactly the inline shape — so the only difference between these
-    // tests and the deferred ones above is the config flag, which is the point.
-
-    fn inline_config() -> SyncConfig {
-        SyncConfig { script_eval_inline: true, ..SyncConfig::default() }
-    }
-
-    #[tokio::test]
-    async fn inline_frontier_tracks_the_applied_tip() {
-        // The whole task in one assertion. Without the set-on-apply the
-        // watermark stays at its construction value (3510) while state runs to
-        // 3530, and stays there for the life of the process.
-        let mut sync = build_sync_with_config(SweepValidator::at(3510), inline_config());
-        sync.downloaded_height = 3530;
-
-        sync.advance_state_applied_height().await;
-
-        assert_eq!(sync.state_applied_height, 3530, "the sweep applied 3511..=3530");
-        assert_eq!(
-            sync.script_verified_height, 3530,
-            "inline: an Ok from apply_state means the scripts passed, so the \
-             frontier is the applied tip"
-        );
-    }
-
-    #[tokio::test]
-    async fn deferred_mode_does_not_advance_the_frontier_on_apply() {
-        // The control, and what keeps the flag from being decorative. Same
-        // validator, same blocks, `script_eval_inline: false`: applying a block
-        // says nothing about its scripts, so the frontier must not move. (This
-        // validator dispatches nothing either — under deferred that is a node
-        // whose evals are all skipped, and the frontier correctly stays put.)
-        let mut sync = build_sync(SweepValidator::at(3510));
-        sync.downloaded_height = 3530;
-
-        sync.advance_state_applied_height().await;
-
-        assert_eq!(sync.state_applied_height, 3530, "state still advanced");
-        assert_eq!(
-            sync.script_verified_height, 3510,
-            "deferred: the frontier moves only when a result says a height verified"
-        );
-    }
-
-    #[tokio::test]
-    async fn inline_frontier_respects_the_checkpoint_floor() {
-        // A checkpointed node syncing up to and then through its checkpoint,
-        // in two sweeps, because one end-state assertion cannot separate both
-        // ways of getting this wrong:
-        //
-        //   sweep 1 (3511..=3515, all below the checkpoint) pins the floor —
-        //     an unfloored `self.script_verified_height = height` reads 3515
-        //     and parks the frontier under a checkpoint nothing will ever carry
-        //     it across.
-        //   sweep 2 (3516..=3525, crossing it) pins the advance — setting
-        //     nothing at all also leaves 3521 after sweep 1, and only the
-        //     second sweep tells the two apart.
-        let mut sync = build_sync_with_config(
-            SweepValidator::at(3510),
-            SyncConfig { script_eval_inline: true, ..checkpoint_config(3521) },
-        );
-        sync.downloaded_height = 3515;
-
-        sync.advance_state_applied_height().await;
-
-        assert_eq!(sync.state_applied_height, 3515, "state applied under the checkpoint");
-        assert_eq!(
-            sync.script_verified_height, 3521,
-            "the frontier holds on the floor, not on the applied tip — the \
-             transient above-the-tip frontier `set_script_frontier` documents"
-        );
-
-        sync.downloaded_height = 3525;
-        sync.advance_state_applied_height().await;
-
-        assert_eq!(sync.state_applied_height, 3525);
-        assert_eq!(
-            sync.script_verified_height, 3525,
-            "and climbs off the floor once state passes the checkpoint"
-        );
-    }
-
-    #[tokio::test]
-    async fn inline_sweep_never_latches_a_frontier_hole() {
-        // The regression this task exists to prevent, and it needs a checkpoint
-        // to have teeth. Three implementations, three outcomes:
-        //
-        //   - set nothing            → frontier stuck on the floor at 3521
-        //   - buffer + advance       → 3511 lands in `eval_verified`, is not
-        //                              3522, and `advance_script_frontier`
-        //                              latches the hole and WARNs
-        //   - set the frontier       → both assertions hold
-        //
-        // Note what does NOT make this test fail: the WARN half alone. It needs
-        // `eval_verified` non-empty, and inline mode never inserts into it, so
-        // the "set nothing" implementation is caught by the frontier assertion
-        // rather than by the WARN. Both assertions are load-bearing.
-        let mut sync = build_sync_with_config(
-            SweepValidator::at(3510),
-            SyncConfig { script_eval_inline: true, ..checkpoint_config(3521) },
-        );
-        sync.downloaded_height = 3530;
-
-        let output =
-            capture_async(LevelFilter::WARN, sync.advance_state_applied_height()).await;
-
-        assert!(
-            !output.contains("no eval outstanding below the script frontier"),
-            "inline dispatches nothing, so there is no hole to name: {output}"
-        );
-        assert_eq!(sync.eval_frontier_hole, None, "and none was latched");
-        assert_eq!(
-            sync.script_verified_height, 3530,
-            "the frontier climbed off the floor with the applied tip"
-        );
-    }
-
-    #[tokio::test]
-    async fn inline_leaves_the_backpressure_accumulators_at_zero() {
-        // The claim the rest of this file rests on: nothing is dispatched, so
-        // the gate never engages and neither accumulator ever moves. Pins it
-        // rather than asserting it in a comment.
-        let mut sync = build_sync_with_config(SweepValidator::at(3510), inline_config());
-        sync.downloaded_height = 3530;
-
-        sync.advance_state_applied_height().await;
-
-        assert_eq!(sync.evals_in_flight, 0);
-        assert_eq!(sync.eval_bytes_in_flight, 0);
-        assert!(sync.eval_verified.is_empty(), "nothing was ever drained into the buffer");
-        assert_eq!(sync.eval_generation, 0, "and nothing rolled back");
     }
 
     // ---- journal-event conformance (`../facts/journal-events.md`) ----
@@ -5584,176 +4004,38 @@ mod sweep_resume_tests {
         );
     }
 
-    /// `deferred_eval_gate_engaged` — DEBUG, per the contract. Note the level:
-    /// the shared capture defaults to INFO, under which this event renders to
-    /// nothing and looks exactly like an event that was never emitted.
-    #[tokio::test]
-    async fn journal_deferred_eval_gate_engaged_conforms() {
-        let mut sync = build_sync_with_config(SweepValidator::at(3600), backlog_config(1, 8));
-        sync.script_verified_height = 3000;
-        dispatch_stub(&mut sync, 8);
-        for h in 3001..=3008 {
-            send_ok(&sync, h);
-        }
-
-        let output = capture_async(
-            LevelFilter::DEBUG,
-            sync.await_eval_capacity(STUB_EVAL_BYTES),
-        )
-        .await;
-
-        const MARKER: &str = "eval dispatch gate engaged";
-
-        let line = output
-            .lines()
-            .find(|l| l.contains(MARKER))
-            .unwrap_or_else(|| panic!("missing marker {MARKER:?}: {output}"));
-        // The defect that broke consumers: the marker used to begin with the
-        // whole of `deferred_eval_backlog`'s, so a parser keyed on the shorter
-        // prefix matched this event too and then failed looking for `eval_lag`.
-        assert!(
-            !line.contains("deferred eval backlog"),
-            "no marker may begin with another event's marker: {line}"
-        );
-        // And the matched portion is ASCII. The em dash is legal in the
-        // free-text suffix — it is still there — but a parser must never have
-        // to reproduce one inside the part it matches on.
-        let matched = &line[..line.find(MARKER).unwrap() + MARKER.len()];
-        assert!(
-            matched.is_ascii(),
-            "the matched prefix must survive being retyped from a report, a \
-             terminal, or a grep: {matched:?}"
-        );
-        assert!(
-            line.contains('—'),
-            "the em dash belongs in the suffix, not nowhere: {line}"
-        );
-
-        assert_field(&output, "evals_in_flight", "8");
-        assert_field(
-            &output,
-            "eval_bytes_in_flight",
-            &(8 * STUB_EVAL_BYTES).to_string(),
-        );
-        // The eval that did not fit — explains why *this* block tripped it.
-        assert_field(&output, "incoming_bytes", &STUB_EVAL_BYTES.to_string());
-        // The two limits are deliberately NOT fields: they are static and the
-        // operator already has them. Only what varies is emitted.
-        assert!(
-            !output.contains("eval_backlog_max"),
-            "configured limits are not fields of this event: {output}"
-        );
-    }
-
-    #[tokio::test]
-    async fn journal_gate_engaged_names_which_bound_tripped() {
-        // `bound` exists so an operator re-tuning one limit knows which regime
-        // the host is in, rather than inferring it from the two numbers.
-        async fn bound_field(config: SyncConfig, stubs: u32) -> String {
-            let mut sync = build_sync_with_config(SweepValidator::at(3600), config);
-            sync.script_verified_height = 3000;
-            dispatch_stub(&mut sync, stubs);
-            for h in 3001..=(3000 + stubs) {
-                send_ok(&sync, h);
-            }
-            capture_async(
-                LevelFilter::DEBUG,
-                sync.await_eval_capacity(STUB_EVAL_BYTES),
-            )
-            .await
-        }
-
-        // 8 stubs is exactly 1 MiB, so one more breaches the byte bound; with
-        // the count bound at 8 it breaches that too.
-        assert_field(&bound_field(backlog_config(1, 0), 8).await, "bound", "\"bytes\"");
-        assert_field(&bound_field(backlog_config(0, 8), 8).await, "bound", "\"blocks\"");
-        assert_field(&bound_field(backlog_config(1, 8), 8).await, "bound", "\"both\"");
-    }
-
-    /// `eval_frontier_hole` — WARN, latched once per distinct hole.
-    #[tokio::test]
-    async fn journal_eval_frontier_hole_conforms() {
-        let mut sync = build_sync(SweepValidator::at(3560));
-        sync.script_verified_height = 3521;
-        sync.state_applied_height = 3560;
-
-        // 3522's eval was never dispatched — the checkpoint case. Everything
-        // above it reports Ok and piles up behind the hole.
-        let output = capture_async(LevelFilter::WARN, async {
-            for h in 3523..=3560 {
-                dispatch_stub(&mut sync, 1);
-                send_ok(&sync, h);
-                sync.drain_eval_results(DrainTarget::Available).await;
-            }
-        })
-        .await;
-
-        assert!(
-            output.contains("no eval outstanding below the script frontier"),
-            "missing marker: {output}"
-        );
-        // Where the frontier is stuck, and the height it cannot pass.
-        assert_field(&output, "script_verified_height", "3521");
-        assert_field(&output, "hole", "3522");
-        // The reorder-buffer entries discarded at this point: 3523 was drained
-        // first, the 37 above it landed on later drains once the latch was set.
-        assert_field(&output, "buffered", "1");
-        // The severity number: how far state ran ahead of a frontier that
-        // cannot move, i.e. the size of the span this leaves unattested.
-        assert_field(&output, "state_applied_height", "3560");
-        assert_eq!(
-            output
-                .matches("no eval outstanding below the script frontier")
-                .count(),
-            1,
-            "latched: once per distinct hole, not once per block — otherwise \
-             this is a WARN on every block for the life of the process: {output}"
-        );
-    }
-
-    #[tokio::test]
-    async fn journal_eval_frontier_hole_reports_the_validator_tip_not_the_stale_cache() {
-        // The trap `deferred_eval_backlog` documents for its field of this
-        // name, and this drain hits it harder: the dispatch gate's drain runs
-        // MID-sweep, where `state_applied_height` is still frozen at the
-        // pre-sweep tip. Reading the cache would understate the unattested
-        // span by the whole sweep.
-        let mut sync = build_sync(SweepValidator::at(3560));
-        sync.script_verified_height = 3521;
-        sync.state_applied_height = 3000; // pre-sweep cache, 560 blocks stale
-
-        let output = capture_async(LevelFilter::WARN, async {
-            dispatch_stub(&mut sync, 1);
-            send_ok(&sync, 3523);
-            sync.drain_eval_results(DrainTarget::Available).await;
-        })
-        .await;
-
-        assert!(
-            has_field(&output, "state_applied_height", "3560"),
-            "must report the validator's applied tip, not the stale cache \
-             (3000): {output}"
-        );
-    }
-
-    /// `validation_rollback_failed` — ERROR, `path="eval_failure"`.
+    /// `validation_rollback_failed` — ERROR, `path="reorg"`.
+    ///
+    /// ⚠ The contract lists `path` as `eval_failure|reorg`. The
+    /// `eval_failure` emit site went with deferred evaluation in v0.8.0 —
+    /// `handle_eval_failure` was the only producer of that value — so the
+    /// reorg path is now the event's sole emitter. `facts/journal-events.md`
+    /// still documents both values and needs the narrowing; flagged to main.
     #[tokio::test]
     async fn journal_validation_rollback_failed_conforms() {
-        let mut sync = build_sync(SweepValidator::at(2670).failing_reset());
+        let mut sync = build_sync_with_chain(
+            SweepValidator::at(2670).failing_reset(),
+            SweepChain::at_tip(2670),
+        );
         sync.state_applied_height = 2670;
-        sync.script_verified_height = 2670;
         sync.downloaded_height = 2670;
 
-        let output =
-            capture_async(LevelFilter::ERROR, sync.handle_eval_failure(2669)).await;
+        let output = capture_async(
+            LevelFilter::ERROR,
+            sync.handle_control_event(
+                DeliveryControl::Reorg { fork_point: 2668, old_tip: 2670, new_tip: 2671 },
+                PeerId(0),
+            ),
+        )
+        .await;
 
         assert!(
             output.contains("validation rollback failed"),
             "missing marker: {output}"
         );
-        // The rollback TARGET (failed_height - 1), not the failing block.
+        // The rollback TARGET (the fork point), not the tip it failed to leave.
         assert_field(&output, "height", "2668");
-        assert_field(&output, "path", "\"eval_failure\"");
+        assert_field(&output, "path", "\"reorg\"");
         // `ValidationError`'s Display, not the bare message the validator
         // constructed — the mirror this replaces asserted the bare string and
         // passed, because it was matching its own `info!()` rather than the
@@ -6079,10 +4361,6 @@ mod serve_continuation_tests {
         async fn get_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> Option<Vec<u8>> {
             unreachable!("not called in serve tests")
         }
-        async fn script_verified_height(&self) -> Option<u32> {
-            None
-        }
-        async fn set_script_verified_height(&self, _height: u32) {}
         async fn validated_height(&self) -> Option<u32> {
             None
         }

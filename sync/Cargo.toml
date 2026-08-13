@@ -9,7 +9,6 @@ description = "Chain sync state machine for the Ergo Rust node"
 enr-p2p = { path = "../p2p" }
 enr-chain = { path = "../chain" }
 ergo-validation = { path = "../validation" }
-rayon = "1"
 blake2 = "0.10"
 redb = "4"
 thiserror = "2"

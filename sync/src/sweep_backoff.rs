@@ -6,19 +6,18 @@
 //! *deterministically* — a consensus divergence, a corrupt-but-on-disk
 //! block, or (the motivating case) a script the evaluator wrongly
 //! rejects. Left ungated, the sweep re-runs every couple of seconds: the
-//! deferred-eval-failure path rolls the validator back and pulls
-//! `downloaded_height` down, then the section ticker re-advances it over
-//! the still-on-disk sections and re-runs the sweep. That pegs a core and
-//! floods the journal for as long as the condition holds — which, being
-//! deterministic, is until the binary, the data, or the chain changes. A
-//! testnet node spun this way ~every 10s for 13h on a since-fixed
-//! `tree_version` script bug.
+//! tip stays pinned, the section ticker re-advances `downloaded_height`
+//! over the still-on-disk sections, and the sweep runs again. That pegs a
+//! core and floods the journal for as long as the condition holds — which,
+//! being deterministic, is until the binary, the data, or the chain
+//! changes. A testnet node spun this way ~every 10s for 13h on a
+//! since-fixed `tree_version` script bug.
 //!
 //! The gate derives entirely from authoritative state — the applied tip —
 //! not from a parallel failure counter. A sweep that does not move
-//! `validated_height()` past `frontier` is a stall, full stop, whether the
-//! failure surfaced as an `apply_state` error or a deferred-eval rollback;
-//! the stall *detection* is deliberately blind to which. Consecutive stalls
+//! `validated_height()` past `frontier` is a stall, full stop, whatever
+//! rejected the block; the stall *detection* is deliberately blind to
+//! which. Consecutive stalls
 //! at the same frontier ramp an exponential delay ([`BASE_DELAY`], doubling,
 //! capped at [`MAX_DELAY`]). The instant the tip advances (real progress)
 //! or the frontier changes (reorg / rollback to a different height), the
@@ -42,7 +41,10 @@
 //! retired per-`apply_state` tracker owned this emission and the
 //! deferred-eval wedge bypassed it entirely (it never fired during the
 //! 13h stall above); folding it onto the mode-agnostic frontier count
-//! closes that gap, so eval-failure stalls now alarm too.
+//! closed that gap. Deferred evaluation itself is gone as of v0.8.0 — a
+//! script rejection is an `apply_state` `Err` now — but the frontier-keyed
+//! detection is what makes this robust to the next mechanism too, which is
+//! why it is written that way rather than against a list of error kinds.
 //!
 //! Backoff state is in-memory and resets on restart; a restart is a
 //! legitimate reset (the operator may have swapped the binary or the data
@@ -72,8 +74,13 @@ const STUCK_THRESHOLD: u32 = 5;
 #[derive(Debug, Clone)]
 pub(crate) struct StallDetail {
     /// `validation_stuck.error_kind`: an `apply_state` error kind
-    /// (`"missing_key"` / `"other"`), or `"script_eval"` for a
-    /// deferred-eval rejection.
+    /// (`"missing_key"` / `"other"`).
+    ///
+    /// The `"script_eval"` value went with deferred evaluation in v0.8.0.
+    /// Script rejections now come back as an `apply_state` `Err` like any
+    /// other, so they are classified by
+    /// [`crate::apply_state_error::classify_apply_state_error`] and land under
+    /// `"other"` unless that classifier learns to name them.
     pub error_kind: &'static str,
     /// `validation_stuck.missing_key` — present only for the `apply_state`
     /// `missing_key` case (a 32-byte AVL key, hex).
@@ -81,11 +88,6 @@ pub(crate) struct StallDetail {
 }
 
 impl StallDetail {
-    /// A deferred script-eval rejection rolled the tip back.
-    pub(crate) fn script_eval() -> Self {
-        Self { error_kind: "script_eval", missing_key: None }
-    }
-
     /// A non-specific stall: the sweep broke before/around `apply_state`
     /// for a reason without a richer label (a header/section gap, an
     /// epoch-boundary processing error). Reuses the `apply_state`
@@ -347,26 +349,27 @@ mod tests {
     }
 
     #[test]
-    fn validation_stuck_fires_on_fifth_eval_failure_stall() {
-        // The path the retired apply_state tracker missed: a deferred-eval
-        // rollback pins the frontier. error_kind is `script_eval`, no key.
+    fn validation_stuck_fires_on_fifth_keyless_stall() {
+        // The other emission arm: a stall whose detail carries no key —
+        // everything that is not the AVL missing-key case, which since v0.8.0
+        // includes the script rejections that used to arrive as `script_eval`
+        // from a deferred-eval rollback. `missing_key` must be absent from the
+        // record entirely, not rendered as `None`.
         let mut b = SweepBackoff::default();
         let now = now();
         let mut fired = Vec::new();
         let output = capture(|| {
             for _ in 0..5 {
-                let s = b
-                    .record(100, 100, now, StallDetail::script_eval())
-                    .expect("stall");
+                let s = b.record(100, 100, now, StallDetail::other()).expect("stall");
                 fired.push(s.stuck_fired);
             }
         });
         assert_eq!(fired, vec![false, false, false, false, true]);
         assert_eq!(output.matches("validation stuck").count(), 1, "{output}");
-        assert!(output.contains("error_kind=\"script_eval\""), "{output}");
+        assert!(output.contains("error_kind=\"other\""), "{output}");
         assert!(
             !output.contains("missing_key"),
-            "eval stalls carry no key: {output}"
+            "keyless stalls carry no key: {output}"
         );
     }
 
@@ -378,7 +381,7 @@ mod tests {
         let output = capture(|| {
             for _ in 0..10 {
                 if b
-                    .record(100, 100, now, StallDetail::script_eval())
+                    .record(100, 100, now, StallDetail::other())
                     .unwrap()
                     .stuck_fired
                 {
@@ -399,15 +402,15 @@ mod tests {
         let now = now();
         let output = capture(|| {
             for _ in 0..5 {
-                b.record(100, 100, now, StallDetail::script_eval());
+                b.record(100, 100, now, StallDetail::other());
             }
             assert!(
-                b.record(100, 150, now, StallDetail::script_eval()).is_none(),
+                b.record(100, 150, now, StallDetail::other()).is_none(),
                 "advancing tip clears the backoff"
             );
             assert_eq!(b.consecutive(), 0);
             for _ in 0..5 {
-                b.record(150, 150, now, StallDetail::script_eval());
+                b.record(150, 150, now, StallDetail::other());
             }
         });
         assert_eq!(output.matches("validation stuck").count(), 2, "{output}");

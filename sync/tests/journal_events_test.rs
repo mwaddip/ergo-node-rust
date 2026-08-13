@@ -7,9 +7,8 @@
 //! ## Why this file is an index and not a test suite
 //!
 //! Every one of this crate's contract events is emitted from a private method
-//! (`HeaderSync::advance_script_frontier`, `::await_eval_capacity`,
-//! `::handle_eval_failure`, the sweep loop) or a private module
-//! (`sweep_backoff`, `eval_backlog`), and setting one up means writing the
+//! (`HeaderSync::handle_control_event`, the sweep loop) or a private module
+//! (`sweep_backoff`, `catchup_progress`), and setting one up means writing the
 //! struct's private watermark fields. None of that is reachable from an
 //! integration test, which sees only `ergo_sync`'s public API.
 //!
@@ -34,9 +33,18 @@
 //! | `chain_tip_reached` | `state::sweep_resume_tests::journal_chain_tip_reached_conforms` |
 //! | `validation_stuck` | `sweep_backoff::tests::validation_stuck_fires_on_fifth_*_stall` |
 //! | `validation_rollback_failed` | `state::sweep_resume_tests::journal_validation_rollback_failed_conforms` |
-//! | `deferred_eval_backlog` | `eval_backlog::tests::*` (marker, every field, both probe branches) |
-//! | `deferred_eval_gate_engaged` | `state::sweep_resume_tests::journal_deferred_eval_gate_engaged_conforms`, `::journal_gate_engaged_names_which_bound_tripped` |
-//! | `eval_frontier_hole` | `state::sweep_resume_tests::journal_eval_frontier_hole_conforms`, `::journal_eval_frontier_hole_reports_the_validator_tip_not_the_stale_cache` |
+//! | catch-up progress | `catchup_progress::tests::*` (marker, both fields, both probe branches) |
+//!
+//! ## v0.8.0 — events that went with deferred evaluation
+//!
+//! `deferred_eval_backlog`, `deferred_eval_gate_engaged` and
+//! `eval_frontier_hole` no longer exist; nothing emits them. The first was
+//! reduced to a two-field `catch-up progress` record (the four dropped fields
+//! all described the queue); the other two described the dispatch gate and the
+//! script frontier, neither of which survives. `validation_rollback_failed`
+//! keeps its `reorg` path and loses its `eval_failure` one.
+//! `facts/journal-events.md` still carries all four as written and needs the
+//! update — that file is the main session's.
 //!
 //! What remains here is what an integration test *can* exercise for real: the
 //! public classifier that produces `validation_stuck`'s `error_kind` and

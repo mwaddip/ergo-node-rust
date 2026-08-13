@@ -4,8 +4,8 @@
 //! header chain from genesis to the network tip.
 
 pub mod apply_state_error;
+mod catchup_progress;
 pub mod delivery;
-mod eval_backlog;
 pub mod light_bootstrap;
 mod retention;
 pub mod snapshot;
