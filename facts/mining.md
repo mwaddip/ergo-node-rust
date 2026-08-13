@@ -489,16 +489,36 @@ protocol limits.
 3. Get prioritized transactions from mempool: `mempool.all_prioritized()`.
 
 4. For each candidate transaction (in priority order):
-   a. Check cumulative cost: if adding this tx exceeds `max_block_cost`,
-      skip.
-   b. Check cumulative size: if adding this tx exceeds `max_block_size`,
-      skip.
-   c. Validate the transaction against the "accumulated state" — the UTXO
+   a. Check cumulative size: if adding this tx exceeds `max_block_size`,
+      skip. Size is known from the serialized bytes without validating.
+   b. Validate the transaction against the "accumulated state" — the UTXO
       set augmented with outputs from the emission tx and already-selected
       transactions. Use `validate_single_transaction()` with the upcoming
-      state context.
-   d. If validation fails: record tx ID for mempool elimination, skip.
-   e. If valid: add to selected set, accumulate cost and size.
+      state context. **It returns the transaction's cost** — that return
+      value is the only source of the number step (d) needs.
+   c. If validation fails: record tx ID for mempool elimination, skip.
+   d. Check cumulative cost: if `accumulated_cost + tx_cost` would exceed
+      `max_block_cost`, skip **this** transaction — do not stop the scan, a
+      later cheaper transaction may still fit.
+   e. Otherwise add to selected set and accumulate both cost and size.
+
+   ⚠ **The cost check cannot precede validation**, and an earlier draft of
+   this list had it first. A transaction's cost is produced *by*
+   `validate_single_transaction`; there is nothing to check against before
+   that call returns.
+
+   ⚠ **Bound at `accumulated + tx_cost <= max_block_cost`, with NO safety
+   margin.** The JVM subtracts a `safeGap` first — 0 below a 1M limit,
+   150,000 below 5M, 500,000 above (`CandidateGenerator.scala:585`) —
+   because, in its own words, "different interpreter version can estimate
+   cost differently due to bugs in AOT costing". That guards against *its
+   own* historical costing divergence. Ours were closed and are graded by
+   SANTA, so we bound exactly, and the comparator matches our validator's:
+   `validation/src/tx_validation.rs` rejects on `total > max_cost`, and the
+   JVM's own validation accepts on `maxCost >= startCost` — the same
+   semantics. **Do not reintroduce a gap by citing the JVM generator**; its
+   strict `<` at `CandidateGenerator.scala:831` is generator conservatism,
+   not a consensus rule.
 
 5. Stop when limits are reached or all mempool transactions are checked.
 
