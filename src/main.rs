@@ -800,6 +800,7 @@ impl ergo_api::BlockSubmitter for MinedBlockSubmitter {
 
 /// Mining config parsed from `[node.mining]` in ergo.toml.
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 struct MiningConfig {
     /// Miner public key (hex-encoded compressed EC point, 33 bytes).
     /// Empty = mining disabled.
@@ -822,6 +823,7 @@ fn default_candidate_ttl() -> u64 { 15 }
 
 /// Node-level config parsed from the `[node]` section of ergo.toml.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NodeConfig {
     #[serde(default = "default_data_dir")]
     data_dir: String,
@@ -1289,6 +1291,11 @@ fn default_reconciliation_trust_threshold() -> u32 {
     100
 }
 /// Top-level config wrapper.
+// ⚠ NO `deny_unknown_fields` here, deliberately. This same file is parsed a
+// second time into `enr_p2p`'s own `Config` for [proxy], [listen.*],
+// [outbound] and [identity] — sections RootConfig does not declare. Denying
+// unknown fields at THIS level would reject every real config at startup.
+// The nested sections below are wholly owned by this crate and do deny.
 #[derive(Debug, Deserialize)]
 struct RootConfig {
     #[serde(default)]
@@ -1301,6 +1308,7 @@ struct RootConfig {
 
 /// `[debug]` toml section — opt-in container for diagnostic subsystems.
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 struct DebugConfig {
     #[serde(default)]
     p2p_capture: Option<enr_p2p::capture::CaptureConfig>,
@@ -1308,6 +1316,7 @@ struct DebugConfig {
 
 /// `[stats]` toml section — opt-in. See `facts/stats.md`.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 struct StatsConfig {
     #[serde(default = "default_stats_bind")]
     bind_address: std::net::SocketAddr,
