@@ -600,6 +600,21 @@ See "Ownership" above for why it spent v0.8.0 development with no caller.
    deterministic and computable, so counting it is accuracy, not headroom, and
    the no-`safeGap` decision above is untouched.
 
+   ⚠ **An UNRESOLVABLE input is skipped, not evicted — and that applies to
+   data inputs too.** A box that cannot be resolved is not evidence the
+   transaction is invalid; it may be a reorg race, a fastsync gap, or the
+   at-tip storage swap window, and the box may resolve on the next rebuild 15
+   seconds later. Evicting there removes a valid transaction from the mempool
+   for the invalidation TTL.
+
+   This must hold for **both** input kinds. Resolving data inputs with a
+   filter that silently drops misses produces a short `data_boxes`, which
+   `TransactionContext::new` rejects deterministically as
+   `DataInputBoxNotFound` — so the transaction is reported *invalid* rather
+   than *skipped*, and the caller evicts it. The truncation is caught, so
+   nothing is validated against a mismatched context; the damage is the wrong
+   verdict, not a wrong evaluation.
+
    ⚠ **A double-spend loser is skipped, not evicted.** Two mempool
    transactions spending the same box both validate in isolation — validation
    sees one transaction at a time and the box is unspent on chain — so
