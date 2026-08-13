@@ -2,7 +2,7 @@
 //!
 //! Everything here builds *real* artefacts — real `ErgoTree`s, real
 //! transactions, real serialized sections — because the properties under test
-//! (does the prover rewind, does inline mode actually evaluate) are only
+//! (does the prover rewind, does `apply_state` actually evaluate) are only
 //! observable when the prover really mutates and the interpreter really runs.
 //! A stubbed block proves nothing.
 //!
@@ -167,7 +167,7 @@ pub fn make_header(height: u32, state_root: ADDigest, ad_proofs_root: Digest32) 
 }
 
 /// Ten preceding headers. Non-empty on purpose: `validate_transactions`
-/// short-circuits to `Ok(0)` without them, which would let an "inline mode
+/// short-circuits to `Ok(0)` without them, which would let an "apply_state
 /// rejects a bad script" test pass while evaluating nothing at all.
 pub fn preceding_headers() -> Vec<Header> {
     (0..10)

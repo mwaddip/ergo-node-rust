@@ -18,7 +18,7 @@ use ergo_chain_types::{ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint, 
 use ergo_lib::chain::parameters::Parameter;
 use ergo_validation::{
     serialize_ad_proofs, serialize_block_transactions, serialize_extension, BlockValidator,
-    DigestValidator, Parameters, ScriptEvalMode, ValidationError,
+    DigestValidator, Parameters, ValidationError,
 };
 
 fn make_header(height: u32, version: u8) -> Header {
@@ -78,7 +78,7 @@ fn mid_epoch_version_divergence_not_checked() {
     // epoch boundaries), so neither do we: the flow proceeds and fails
     // downstream at the AD-proofs digest check, proving no version gate
     // fired on the way.
-    let mut validator = DigestValidator::new(ADDigest::zero(), 0, ScriptEvalMode::Deferred);
+    let mut validator = DigestValidator::new(ADDigest::zero(), 0);
     let header = make_header(1, 4);
     let fx = make_sections();
     let ext = serialize_extension(&[0u8; 32], &[]).expect("empty extension");
@@ -99,7 +99,7 @@ fn boundary_mismatch_rejected_against_recomputed_set() {
     // blockVersion 3, header.version is 4. `active_params` deliberately
     // says 4 — if the gate (wrongly) consulted it, the gate would pass
     // and the test would see ProofDigestMismatch.
-    let mut validator = DigestValidator::new(ADDigest::zero(), 0, ScriptEvalMode::Deferred);
+    let mut validator = DigestValidator::new(ADDigest::zero(), 0);
     let header = make_header(1, 4);
     let fx = make_sections();
     let ext = serialize_extension(
@@ -135,7 +135,7 @@ fn boundary_mismatch_rejected_against_recomputed_set() {
 
 #[test]
 fn matching_version_passes_gate_at_boundary() {
-    let mut validator = DigestValidator::new(ADDigest::zero(), 0, ScriptEvalMode::Deferred);
+    let mut validator = DigestValidator::new(ADDigest::zero(), 0);
     let header = make_header(1, 4);
     let fx = make_sections();
     let ext = serialize_extension(
@@ -172,7 +172,7 @@ fn absent_block_version_at_boundary_rejects_without_panicking() {
     // `Parameters::block_version()` would panic on this table. An empty
     // expected set passes the v6 subset check trivially (zero entries to
     // compare), so the gate is what must catch it: reject, not panic.
-    let mut validator = DigestValidator::new(ADDigest::zero(), 0, ScriptEvalMode::Deferred);
+    let mut validator = DigestValidator::new(ADDigest::zero(), 0);
     let header = make_header(1, 4);
     let fx = make_sections();
     let ext = serialize_extension(

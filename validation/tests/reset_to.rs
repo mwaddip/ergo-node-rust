@@ -14,7 +14,7 @@ use ergo_avltree_rust::batch_node::AVLTree;
 use ergo_avltree_rust::operation::{KeyValue, Operation};
 use ergo_chain_types::ADDigest;
 use ergo_validation::{
-    BlockValidator, DigestValidator, MiningState, ScriptEvalMode, UtxoValidator, ValidationError,
+    BlockValidator, DigestValidator, MiningState, UtxoValidator, ValidationError,
 };
 use tempfile::TempDir;
 
@@ -75,7 +75,7 @@ fn utxo_validator_with_history() -> (UtxoValidator, ADDigest, ADDigest, TempDir)
     storage.update_with_height(&mut prover, vec![], 2).unwrap();
     let digest_h2 = prover_ad_digest(&prover);
 
-    let validator = UtxoValidator::new(storage, prover, 2, 0, ScriptEvalMode::Deferred);
+    let validator = UtxoValidator::new(storage, prover, 2, 0);
     (validator, digest_h1, digest_h2, dir)
 }
 
@@ -127,7 +127,7 @@ fn utxo_reset_to_err_leaves_state_unchanged() {
 #[test]
 fn digest_reset_to_always_ok() {
     let genesis = ADDigest::from([0x01u8; 33]);
-    let mut validator = DigestValidator::from_state(genesis, 10, 0, ScriptEvalMode::Deferred);
+    let mut validator = DigestValidator::from_state(genesis, 10, 0);
 
     let target = ADDigest::from([0x07u8; 33]);
     validator

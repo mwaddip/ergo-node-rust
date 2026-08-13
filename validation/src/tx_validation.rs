@@ -205,7 +205,7 @@ fn enforce_block_cost(costs: &[u64], max_cost: u64) -> Result<u64, ValidationErr
 /// Uses rayon par_iter internally for intra-block parallelism.
 /// On success returns the block-accumulated transaction cost (Σ per-tx
 /// costs, enforced ≤ `parameters.max_block_cost()`).
-pub fn evaluate_scripts(eval: &crate::DeferredEval) -> Result<u64, crate::ValidationError> {
+pub fn evaluate_scripts(eval: &crate::ScriptEvalInputs) -> Result<u64, crate::ValidationError> {
     validate_transactions(
         &eval.transactions,
         &eval.proof_boxes,

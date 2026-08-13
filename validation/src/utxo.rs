@@ -18,7 +18,7 @@ use crate::state_changes::{compute_state_changes, transactions_to_summaries};
 use crate::tx_validation;
 use crate::voting;
 use crate::{
-    ApplyStateOutcome, BlockValidator, MiningState, ScriptEvalMode, StatePersistence,
+    ApplyStateOutcome, BlockValidator, MiningState, ScriptEvalInputs, StatePersistence,
     ValidationError,
 };
 
@@ -42,9 +42,6 @@ pub struct UtxoValidator {
     prover: BatchAVLProver,
     validated_height: u32,
     checkpoint_height: u32,
-    /// Whether `apply_state` evaluates this block's scripts itself or hands
-    /// the caller a `DeferredEval` to do it. Fixed at construction.
-    script_eval_mode: ScriptEvalMode,
     current_digest: ADDigest,
     /// Current emission box ID (changes every block). None if all ERG emitted.
     emission_box_id: Option<[u8; 32]>,
@@ -64,16 +61,15 @@ impl UtxoValidator {
     /// and installing the returned root, or by performing the genesis-bootstrap
     /// insertions plus a first `storage.update_with_height(&mut prover, vec![], 0)`.
     ///
-    /// `script_eval_mode` is spelled out at every call site on purpose rather
-    /// than defaulted: it must agree with the sync layer's own configuration,
-    /// and a knob that can be forgotten silently is how the `resize_cache`
-    /// no-op survived a whole feature's lifetime (facts/validation.md).
+    /// `checkpoint_height` is the only thing that changes whether a block's
+    /// scripts are evaluated: at or below it they are skipped, above it they
+    /// always run. There is no mode to configure and no way for a caller to
+    /// end up holding an evaluation this validator did not perform.
     pub fn new(
         storage: RedbAVLStorage,
         prover: BatchAVLProver,
         height: u32,
         checkpoint_height: u32,
-        script_eval_mode: ScriptEvalMode,
     ) -> Self {
         let digest_bytes = prover.digest().expect("prover has no root");
         let digest = bytes_to_ad_digest(&digest_bytes);
@@ -97,7 +93,6 @@ impl UtxoValidator {
             prover,
             validated_height: height,
             checkpoint_height,
-            script_eval_mode,
             current_digest: digest,
             emission_box_id: None,
             emission_tree_bytes,
@@ -133,9 +128,9 @@ impl BlockValidator for UtxoValidator {
         // (facts/validation.md, "Err leaves the prover clean"). This wrapper
         // is the only thing that makes that true: apply_state_internal
         // mutates the prover in step 4 and every Err return below it — the
-        // digest check, box deserialization, inline script evaluation, the
-        // persist, the proof-digest check — is a bare `return`/`?` that undoes
-        // nothing on its own.
+        // digest check, box deserialization, script evaluation, the persist,
+        // the proof-digest check — is a bare `return`/`?` that undoes nothing
+        // on its own.
         //
         // Two failure regions, one mechanism:
         //   - before `update_with_height`: storage's current_version is still
@@ -148,9 +143,9 @@ impl BlockValidator for UtxoValidator {
         //
         // Without it, sync's retry re-enters on a half-applied tree and fails
         // on a different op with a different error, burying the real cause —
-        // and in inline mode, where a rejected block is routine rather than
-        // near-unreachable, the tree would carry a rejected block's mutations
-        // into the next candidate.
+        // and since script evaluation now runs here, a rejected block is
+        // routine rather than near-unreachable, so the tree would carry that
+        // block's mutations into the next candidate.
         let saved_digest = self.current_digest;
 
         match self.apply_state_internal(
@@ -353,59 +348,42 @@ impl UtxoValidator {
             });
         }
 
-        // 6. Script evaluation — bundled for the caller, or run right here.
+        // 6. Script evaluation. Always here, never the caller's — the block's
+        // scripts are checked before anything about it is persisted, so an Ok
+        // from this function already means they passed.
         //
-        // Inline evaluation sits between the digest check and persistence,
-        // not before the prover mutations. The JVM checks scripts before
-        // touching its AVL tree, but it reads each input box via boxById and
-        // pays a second traversal to remove it; step 4 above captures the box
-        // from the removal's own return value, so copying that ordering would
-        // buy a read per input and nothing else. Persistence is the boundary
-        // that matters, because persistence is what survives a crash:
-        // everything up to `update_with_height` below is in memory, and an
-        // Err from here rewinds the prover (see `apply_state`), so no
-        // unverified state ever reaches state.redb.
+        // Evaluation sits between the digest check and persistence, not
+        // before the prover mutations. The JVM checks scripts before touching
+        // its AVL tree, but it reads each input box via boxById and pays a
+        // second traversal to remove it; step 4 above captures the box from
+        // the removal's own return value, so copying that ordering would buy
+        // a read per input and nothing else. Persistence is the boundary that
+        // matters, because persistence is what survives a crash: everything
+        // up to `update_with_height` below is in memory, and an Err from here
+        // rewinds the prover (see `apply_state`), so no block whose scripts
+        // are unverified ever reaches state.redb.
         //
-        // Both modes go through `evaluate_scripts`, which means both modes
-        // evaluate identically — the alternative, calling the underlying
-        // validator directly here, is a second entry point that can drift on
-        // a consensus path. The bundle's `approx_heap_bytes` is dead weight
-        // inline (nothing queues the value; it is dropped at the end of this
-        // expression), and that is the price of the single path.
-        let deferred_eval = if validate_txs {
+        // The digest check stays ahead of it because it is cheap and rejects
+        // malformed blocks before the expensive step.
+        if validate_txs {
             let mut proof_boxes = HashMap::with_capacity(proof_box_bytes.len());
-            // Summed inside the loop that already runs — the serialized size
-            // feeds DeferredEval::new's heap estimate at no extra walk.
-            let mut serialized_box_bytes = 0usize;
             for (id, bytes) in &proof_box_bytes {
-                serialized_box_bytes = serialized_box_bytes.saturating_add(bytes.len());
                 proof_boxes.insert(*id, tx_validation::deserialize_box(bytes)?);
             }
 
-            let eval = crate::DeferredEval::new(
-                header.height,
-                parsed_txs.transactions,
+            let eval = ScriptEvalInputs {
+                height: header.height,
+                transactions: parsed_txs.transactions,
                 proof_boxes,
-                header.clone(),
-                preceding_headers.to_vec(),
-                active_params.clone(),
-                block_txs,
-                serialized_box_bytes,
-            );
+                header: header.clone(),
+                preceding_headers: preceding_headers.to_vec(),
+                parameters: active_params.clone(),
+            };
 
-            match self.script_eval_mode {
-                ScriptEvalMode::Deferred => Some(eval),
-                ScriptEvalMode::Inline => {
-                    // The cost is discarded, not unchecked: the maxBlockCost
-                    // consensus gate runs inside evaluate_scripts. Sync
-                    // discards it on the deferred path too.
-                    tx_validation::evaluate_scripts(&eval)?;
-                    None
-                }
-            }
-        } else {
-            None
-        };
+            // The cost is discarded, not unchecked: the maxBlockCost
+            // consensus gate runs inside evaluate_scripts.
+            tx_validation::evaluate_scripts(&eval)?;
+        }
 
         // 7. Persist state changes atomically with block_height.
         //    Must precede generate_proof(): update_internal builds its delete
@@ -529,7 +507,6 @@ impl UtxoValidator {
         Ok(ApplyStateOutcome {
             epoch_boundary_params,
             epoch_boundary_proposed_update,
-            deferred_eval,
         })
     }
 
@@ -669,9 +646,9 @@ fn bytes_to_ad_digest(bytes: &Bytes) -> ADDigest {
 
 #[cfg(test)]
 mod tests {
-    //! UTXO-mode script evaluation modes, and the Err postcondition that
-    //! makes a rejected block survivable: *the prover* is byte-for-byte as it
-    //! was on entry (facts/validation.md, "Err leaves the prover clean").
+    //! UTXO-mode script evaluation, and the Err postcondition that makes a
+    //! rejected block survivable: *the prover* is byte-for-byte as it was on
+    //! entry (facts/validation.md, "Err leaves the prover clean").
     //!
     //! These live inside the crate rather than in `tests/` for one reason: the
     //! postcondition is about `self.prover`, and from outside the only view of
@@ -683,7 +660,7 @@ mod tests {
 
     use super::*;
     use crate::test_support::*;
-    use crate::{ErgoBox, ScriptEvalMode};
+    use crate::ErgoBox;
     use enr_state::{AVLTreeParams, CacheSize, RedbAVLStorage};
     use ergo_chain_types::Digest32;
     use ergo_lib::chain::transaction::Transaction;
@@ -729,14 +706,11 @@ mod tests {
         prover
     }
 
-    fn seeded_validator(boxes: &[ErgoBox], mode: ScriptEvalMode) -> (UtxoValidator, TempDir) {
+    fn seeded_validator(boxes: &[ErgoBox]) -> (UtxoValidator, TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut storage = open_storage(&dir);
         let prover = seed(&mut storage, boxes);
-        (
-            UtxoValidator::new(storage, prover, SEED_HEIGHT, 0, mode),
-            dir,
-        )
+        (UtxoValidator::new(storage, prover, SEED_HEIGHT, 0), dir)
     }
 
     /// What the block under test must claim to be accepted: the post-block
@@ -807,10 +781,7 @@ mod tests {
         let tx = spend_tx(std::slice::from_ref(&input));
         let ops = block_operations(std::slice::from_ref(&tx));
 
-        let (mut validator, _dir) = seeded_validator(
-            std::slice::from_ref(&input),
-            ScriptEvalMode::Deferred,
-        );
+        let (mut validator, _dir) = seeded_validator(std::slice::from_ref(&input));
         let before = prover_digest(&validator);
 
         // Not a vacuous test: this block really does move the tree, so an
@@ -845,24 +816,23 @@ mod tests {
         );
     }
 
-    /// Inline mode's own rejection path — the one that turns the case above
+    /// The script-failure rejection path — the one that turns the case above
     /// from near-unreachable into routine. The block is otherwise perfectly
     /// well-formed; only its script fails.
     #[test]
-    fn inline_script_failure_leaves_the_prover_clean_and_storage_untouched() {
+    fn script_failure_leaves_the_prover_clean_and_storage_untouched() {
         let input = make_box(false, 2);
         let tx = spend_tx(std::slice::from_ref(&input));
         let ops = block_operations(std::slice::from_ref(&tx));
         let (state_root, ad_root) = oracle(std::slice::from_ref(&input), &ops);
 
-        let (mut validator, _dir) =
-            seeded_validator(std::slice::from_ref(&input), ScriptEvalMode::Inline);
+        let (mut validator, _dir) = seeded_validator(std::slice::from_ref(&input));
         let before = prover_digest(&validator);
         let block = Block::new(std::slice::from_ref(&tx), state_root, ad_root);
 
         let err = block
             .apply(&mut validator)
-            .expect_err("an unsatisfied script must be rejected inline");
+            .expect_err("an unsatisfied script must be rejected");
         assert!(
             matches!(err, ValidationError::TransactionInvalid { .. }),
             "expected a script failure, got: {err:?}"
@@ -893,100 +863,48 @@ mod tests {
         );
     }
 
-    /// The same failing block under `Deferred`: applied and persisted, with
-    /// the verdict handed to the caller instead. Proves the two modes differ
-    /// in *who evaluates* and that the block above fails for a script reason
-    /// rather than something incidental to the fixture.
+    /// The accept arm. Both rejection tests above prove the validator says no
+    /// to something; this proves it still says yes to a block that deserves
+    /// it, and that an Ok really does advance both height and digest.
     #[test]
-    fn deferred_defers_the_same_failing_block() {
-        let input = make_box(false, 2);
-        let tx = spend_tx(std::slice::from_ref(&input));
-        let ops = block_operations(std::slice::from_ref(&tx));
-        let (state_root, ad_root) = oracle(std::slice::from_ref(&input), &ops);
-
-        let (mut validator, _dir) =
-            seeded_validator(std::slice::from_ref(&input), ScriptEvalMode::Deferred);
-        let block = Block::new(std::slice::from_ref(&tx), state_root, ad_root);
-
-        let outcome = block
-            .apply(&mut validator)
-            .expect("deferred mode does not evaluate scripts, so this block applies");
-        assert_eq!(validator.validated_height(), BLOCK_HEIGHT);
-
-        let eval = outcome
-            .deferred_eval
-            .expect("deferred mode owes the caller an evaluation");
-        let err = crate::evaluate_scripts(&eval)
-            .expect_err("the deferred verdict is the same rejection, just later");
-        assert!(
-            matches!(err, ValidationError::TransactionInvalid { .. }),
-            "expected a script failure, got: {err:?}"
-        );
-    }
-
-    /// A block that is valid in every respect: both modes accept it, advance
-    /// to the same state, and differ only in whether they hand back an
-    /// evaluation to run. `sync/` keys on exactly this.
-    #[test]
-    fn a_valid_block_differs_only_in_who_owes_the_evaluation() {
+    fn a_valid_block_is_accepted_and_advances_state() {
         let input = make_box(true, 3);
         let tx = spend_tx(std::slice::from_ref(&input));
         let ops = block_operations(std::slice::from_ref(&tx));
         let (state_root, ad_root) = oracle(std::slice::from_ref(&input), &ops);
         let block = Block::new(std::slice::from_ref(&tx), state_root, ad_root);
 
-        let (mut deferred, _d1) =
-            seeded_validator(std::slice::from_ref(&input), ScriptEvalMode::Deferred);
-        let deferred_outcome = block.apply(&mut deferred).expect("valid block applies");
-        assert!(
-            deferred_outcome.deferred_eval.is_some(),
-            "deferred mode must hand the evaluation back"
-        );
-        assert_eq!(deferred.validated_height(), BLOCK_HEIGHT);
-        assert_eq!(*deferred.current_digest(), state_root);
+        let (mut validator, _dir) = seeded_validator(std::slice::from_ref(&input));
+        block.apply(&mut validator).expect("valid block applies");
 
-        let (mut inline, _d2) =
-            seeded_validator(std::slice::from_ref(&input), ScriptEvalMode::Inline);
-        let inline_outcome = block.apply(&mut inline).expect("valid block applies");
-        assert!(
-            inline_outcome.deferred_eval.is_none(),
-            "inline mode already evaluated; Ok is the verdict"
-        );
-        assert_eq!(inline.validated_height(), BLOCK_HEIGHT);
-        assert_eq!(*inline.current_digest(), state_root);
-
-        // And the evaluation deferred mode handed back really is the one
-        // inline mode ran: it passes.
-        crate::evaluate_scripts(&deferred_outcome.deferred_eval.unwrap())
-            .expect("the block's scripts are satisfied");
+        assert_eq!(validator.validated_height(), BLOCK_HEIGHT);
+        assert_eq!(*validator.current_digest(), state_root);
     }
 
-    /// Below the checkpoint neither mode evaluates — the state-root check
-    /// alone is the guarantee, and `deferred_eval` is None in both.
+    /// At or below the checkpoint nothing is evaluated — the state-root check
+    /// alone is the guarantee. This block carries the same unsatisfiable
+    /// script the rejection test above uses and is accepted anyway, which is
+    /// the whole observable: the skip is what separates the two outcomes.
     #[test]
-    fn the_checkpoint_still_outranks_the_mode() {
+    fn the_checkpoint_skips_evaluation_entirely() {
         let input = make_box(false, 4);
         let tx = spend_tx(std::slice::from_ref(&input));
         let ops = block_operations(std::slice::from_ref(&tx));
         let (state_root, ad_root) = oracle(std::slice::from_ref(&input), &ops);
         let block = Block::new(std::slice::from_ref(&tx), state_root, ad_root);
 
-        for mode in [ScriptEvalMode::Deferred, ScriptEvalMode::Inline] {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let mut storage = open_storage(&dir);
-            let prover = seed(&mut storage, std::slice::from_ref(&input));
-            // Checkpoint at the block's own height: `height > checkpoint` is
-            // false, so the unsatisfiable script is never looked at.
-            let mut validator =
-                UtxoValidator::new(storage, prover, SEED_HEIGHT, BLOCK_HEIGHT, mode);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut storage = open_storage(&dir);
+        let prover = seed(&mut storage, std::slice::from_ref(&input));
+        // Checkpoint at the block's own height: `height > checkpoint` is
+        // false, so the unsatisfiable script is never looked at.
+        let mut validator = UtxoValidator::new(storage, prover, SEED_HEIGHT, BLOCK_HEIGHT);
 
-            let outcome = block
-                .apply(&mut validator)
-                .expect("checkpointed block applies without script evaluation");
-            assert!(
-                outcome.deferred_eval.is_none(),
-                "{mode:?}: nothing is owed below the checkpoint"
-            );
-        }
+        block
+            .apply(&mut validator)
+            .expect("checkpointed block applies without script evaluation");
+
+        assert_eq!(validator.validated_height(), BLOCK_HEIGHT);
+        assert_eq!(*validator.current_digest(), state_root);
     }
 }
