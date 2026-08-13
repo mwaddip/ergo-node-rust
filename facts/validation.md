@@ -426,6 +426,40 @@ is a plain input bundle that never leaves the stack frame that built it, so it
 no longer needs to be `Send`, no longer needs to weigh itself, and no longer
 carries a name describing a deferral that does not happen.
 
+## Free Function: proofs without a validator
+
+```rust
+/// Compute AD proofs and the resulting state root for `txs` against a
+/// committed tree, without a `UtxoValidator` and without touching any
+/// live prover.
+pub fn proofs_from_storage(
+    resolver: Resolver,
+    root: Option<(Digest32, usize)>,
+    txs: &[Transaction],
+) -> Result<(Vec<u8>, ADDigest), ValidationError>;
+```
+
+`UtxoValidator::compute_proofs` delegates to this; the logic is unchanged and
+lives in one place.
+
+**Why it exists.** Mining assembles a candidate and needs proofs for it, but the
+validator is owned by `sync/` and is `!Sync`, so the mining task cannot reach
+it. `compute_proofs` never needed the validator's live prover — it deliberately
+builds a separate one from storage so mining cannot disturb validation — so the
+dependency was always storage access, not validator access. `SnapshotReader`
+now supplies both inputs (`facts/state.md`).
+
+⚠ **The resolver must be independent.** Every node it resolves must be a fresh
+handle, never shared with another prover's tree. `state/` guarantees this
+structurally — no caching, a fresh read transaction per resolve — and the
+guarantee is load-bearing here: a prover working over nodes still keyed in
+another prover's address-keyed map emits a **different proof for identical tree
+state**. Same digest, different bytes. Do not add a node cache between these.
+
+⚠ **This is a read path.** It computes what proofs *would* be; it applies
+nothing, persists nothing, and advances no watermark. A caller that treats its
+success as evidence a block is valid has misread it.
+
 ## Free Function
 
 ```rust
