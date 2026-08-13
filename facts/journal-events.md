@@ -38,9 +38,9 @@ major is for.
 | `deferred_eval_gate_engaged` removed | 1.6 |
 | `eval_frontier_hole` removed | 1.6 |
 | `validation_rollback_failed.path` loses `eval_failure` | now only `reorg` |
-| `validation_stuck.error_kind` loses `script_eval` | now classifies as `other` |
+| `validation_stuck.error_kind` loses `script_eval` | replaced by `transaction_invalid` |
 
-All five describe deferred script evaluation, which no longer exists:
+The first four describe deferred script evaluation, which no longer exists:
 `apply_state` evaluates before persisting, so there is no queue to report on,
 no dispatch gate to engage, and no verification frontier to fall behind.
 
@@ -304,12 +304,28 @@ phase's `_started`.
   via `classify_apply_state_error`; `missing_key` is present only for
   the `apply_state` `missing_key` case.
 
-  ⚠ **`error_kind` no longer takes the value `script_eval`.** It named
-  the deferred eval-failure path, which no longer exists; a wedged
-  script failure now classifies as `other`. Restoring the distinction
-  means teaching `classify_apply_state_error` to recognise a script
-  rejection, which is a separate change and has not been made — the
-  Doctor adapter loses that discrimination until it is. Surfaces the silent retry loop that previously
+  **`error_kind` domain as of 2.0:** `missing_key` (the AVL tree lacks a
+  key the block spends — a state-DB problem), `transaction_invalid` (the
+  block was rejected because a transaction in it did not validate — a
+  consensus problem), `other` (everything else). `missing_key` is
+  accompanied by the `missing_key` field; the others are not.
+
+  *`script_eval` is gone and `transaction_invalid` is not a rename of it.*
+  The old value named the deferred eval-failure **path**, which no longer
+  exists. The new one names the **fact** — `ValidationError::TransactionInvalid`
+  — which covers a failed script and equally a failed ERG or token
+  preservation check. That is the distinction the Doctor actually needs: is
+  this node stuck because its state store is damaged, or because it keeps
+  refusing a block the network accepted?
+
+  ⚠ **Classification is on the error variant, not on its Display string.**
+  `classify_apply_state_error` took a `&str` and grepped it for
+  `"does not exist"`, while its caller held the typed `ValidationError` and
+  stringified it one line earlier. That is why the distinction disappeared
+  silently when deferred evaluation was removed — nothing referenced the
+  variant, so nothing broke. It now takes `&ValidationError`. The one place
+  a string is still parsed is inside `missing_key`, where the key really
+  does arrive as prose from the storage layer. Surfaces the silent retry loop that previously
   buried a stuck frontier in INFO-level logs. The Doctor adapter
   treats this as a primary "node stuck" signal. Emitted at most once
   per height; re-emits when the height changes or after real progress
