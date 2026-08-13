@@ -70,17 +70,20 @@ const STUCK_THRESHOLD: u32 = 5;
 /// inspects this — it is purely the mode label the caller, which caught the
 /// failure, hands in so the emitted contract event names the mode. See
 /// [`crate::apply_state_error::classify_apply_state_error`] for the
-/// `apply_state` path that produces `error_kind` / `missing_key`.
+/// `apply_state` path that produces `error_kind` / `missing_key`, and for
+/// why it classifies on the error variant and not on its Display string.
 #[derive(Debug, Clone)]
 pub(crate) struct StallDetail {
     /// `validation_stuck.error_kind`: an `apply_state` error kind
-    /// (`"missing_key"` / `"other"`).
+    /// (`"missing_key"` / `"transaction_invalid"` / `"other"`).
     ///
-    /// The `"script_eval"` value went with deferred evaluation in v0.8.0.
-    /// Script rejections now come back as an `apply_state` `Err` like any
-    /// other, so they are classified by
-    /// [`crate::apply_state_error::classify_apply_state_error`] and land under
-    /// `"other"` unless that classifier learns to name them.
+    /// The `"script_eval"` value went with deferred evaluation in v0.8.0 and
+    /// `"transaction_invalid"` is not a rename of it — the old value named
+    /// the deferred eval-failure path, the new one names
+    /// `ValidationError::TransactionInvalid`, which covers a failed script
+    /// and equally a failed ERG or token preservation check. Produced by
+    /// [`crate::apply_state_error::classify_apply_state_error`], which
+    /// matches on the error variant rather than on its Display string.
     pub error_kind: &'static str,
     /// `validation_stuck.missing_key` — present only for the `apply_state`
     /// `missing_key` case (a 32-byte AVL key, hex).
@@ -351,10 +354,9 @@ mod tests {
     #[test]
     fn validation_stuck_fires_on_fifth_keyless_stall() {
         // The other emission arm: a stall whose detail carries no key —
-        // everything that is not the AVL missing-key case, which since v0.8.0
-        // includes the script rejections that used to arrive as `script_eval`
-        // from a deferred-eval rollback. `missing_key` must be absent from the
-        // record entirely, not rendered as `None`.
+        // every kind but the AVL missing-key case, `transaction_invalid`
+        // included. `missing_key` must be absent from the record entirely,
+        // not rendered as `None`.
         let mut b = SweepBackoff::default();
         let now = now();
         let mut fired = Vec::new();

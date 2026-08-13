@@ -21,6 +21,13 @@
 //! suite on 2026-08-12, and how the `validation_rollback_failed` mirror came to
 //! assert an `error=` value the real emit never produced.
 //!
+//! The tests below are the same hazard one level down. They used to hand the
+//! classifier **string literals** — a hand-written copy of what a
+//! `ValidationError` renders to. That cannot fail when the error type changes,
+//! which is exactly how `error_kind` lost its script-failure value in v0.8.0
+//! under a green suite. They now build the real `ValidationError` values, so
+//! the classifier and its tests move together or neither compiles.
+//!
 //! The conformance tests therefore live beside the harness that can drive the
 //! real emit, and this file records where. Each entry below names the test that
 //! renders that event from its actual emit site:
@@ -43,8 +50,8 @@
 //! all described the queue); the other two described the dispatch gate and the
 //! script frontier, neither of which survives. `validation_rollback_failed`
 //! keeps its `reorg` path and loses its `eval_failure` one.
-//! `facts/journal-events.md` still carries all four as written and needs the
-//! update — that file is the main session's.
+//! `facts/journal-events.md` was updated to match in contract 2.0 (`5706fbf`,
+//! `0477774`, `c3277d8`).
 //!
 //! What remains here is what an integration test *can* exercise for real: the
 //! public classifier that produces `validation_stuck`'s `error_kind` and
@@ -52,6 +59,7 @@
 
 use bytes::Bytes;
 use ergo_sync::apply_state_error::classify_apply_state_error;
+use ergo_validation::ValidationError;
 
 /// A realistic 32-byte AVL key with the three byte categories the
 /// `bytes::Bytes` Debug impl renders differently: printable ASCII
@@ -63,23 +71,90 @@ const AVL_KEY: [u8; 32] = [
     0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0, 0xf0, 0xff,
 ];
 
-#[test]
-fn classify_extracts_hex_from_avl_missing_key_error() {
+/// The AVL layer's own message, as `ergo_avltree_rust`'s `operation.rs`
+/// raises it. `validation/` wraps this verbatim into whichever variant the
+/// mode uses, so this is the real payload the classifier parses.
+fn avl_missing_key_message() -> String {
     let key = Bytes::copy_from_slice(&AVL_KEY);
-    let err = format!("Key {key:?} does not exists");
+    format!("operation 3 failed: Key {key:?} does not exists")
+}
+
+fn avl_key_hex() -> String {
+    AVL_KEY.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// UTXO mode: the persistent prover's failure arrives as
+/// `StateOperationFailed`.
+#[test]
+fn classify_extracts_hex_from_utxo_mode_missing_key_error() {
+    let err = ValidationError::StateOperationFailed(avl_missing_key_message());
     let (kind, hex) = classify_apply_state_error(&err);
     assert_eq!(kind, "missing_key");
-    let expected: String = AVL_KEY.iter().map(|b| format!("{b:02x}")).collect();
+    let expected = avl_key_hex();
     assert_eq!(
         hex.as_deref(),
         Some(expected.as_str()),
-        "expected hex {expected} from error {err:?}, got {hex:?}"
+        "expected hex {expected} from error {err}, got {hex:?}"
     );
+}
+
+/// Digest mode: the same `operation.rs` error, reached through the batch
+/// verifier instead, arrives as `ProofVerificationFailed`. Both channels
+/// must classify — a node running in digest mode is no less stuck.
+#[test]
+fn classify_extracts_hex_from_digest_mode_missing_key_error() {
+    let err = ValidationError::ProofVerificationFailed(avl_missing_key_message());
+    let (kind, hex) = classify_apply_state_error(&err);
+    assert_eq!(kind, "missing_key");
+    assert_eq!(hex.as_deref(), Some(avl_key_hex().as_str()));
+}
+
+/// The kind that went missing when deferred evaluation was removed. It is a
+/// consensus signal, not a state-DB one, and it is keyed on the variant —
+/// a preservation failure reads the same as a script failure here, which is
+/// the point.
+#[test]
+fn classify_transaction_invalid_for_a_rejected_transaction() {
+    let err = ValidationError::TransactionInvalid {
+        index: 7,
+        reason: "script evaluation returned false".to_string(),
+    };
+    let (kind, hex) = classify_apply_state_error(&err);
+    assert_eq!(kind, "transaction_invalid");
+    assert!(hex.is_none(), "only the missing-key case carries a key");
 }
 
 #[test]
 fn classify_other_for_non_missing_key_error() {
-    let (kind, hex) = classify_apply_state_error("validator state root mismatch");
+    let err = ValidationError::StateRootMismatch {
+        expected: vec![0u8; 33],
+        got: vec![1u8; 33],
+    };
+    let (kind, hex) = classify_apply_state_error(&err);
     assert_eq!(kind, "other");
     assert!(hex.is_none());
+}
+
+/// The contract's 2.0 domain is exactly three values, `script_eval` no longer
+/// among them. A sampling guard, not a proof: it covers the variants an
+/// `apply_state` failure realistically produces, so a fourth kind reachable
+/// only from some variant not listed here would still slip past.
+#[test]
+fn error_kind_domain_is_closed() {
+    let cases = [
+        ValidationError::StateOperationFailed(avl_missing_key_message()),
+        ValidationError::ProofVerificationFailed(avl_missing_key_message()),
+        ValidationError::TransactionInvalid { index: 0, reason: "nope".to_string() },
+        ValidationError::MissingProof,
+        ValidationError::HeightMismatch { expected: 2666, got: 2668 },
+        ValidationError::BlockCostExceeded { cost: 2, max_cost: 1 },
+        ValidationError::IntraBlockDoubleSpend("box".to_string()),
+    ];
+    for err in &cases {
+        let (kind, _) = classify_apply_state_error(err);
+        assert!(
+            matches!(kind, "missing_key" | "transaction_invalid" | "other"),
+            "{err} produced out-of-domain error_kind {kind:?}"
+        );
+    }
 }

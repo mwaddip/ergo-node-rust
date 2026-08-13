@@ -1285,13 +1285,18 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     }
                 }
                 Err(e) => {
-                    let err_msg = e.to_string();
                     // Label the stall so the backoff's validation_stuck — if
                     // this frontier wedges for 5 sweeps — names the apply_state
                     // error kind and, for the AVL missing-key case, the key.
-                    let (error_kind, missing_key) = classify_apply_state_error(&err_msg);
+                    //
+                    // Classified from the typed error, never from the rendered
+                    // string below. The string is for the human reading the log;
+                    // routing a contract field through it is how the
+                    // script-failure kind went missing without a compile error
+                    // when deferred evaluation was removed.
+                    let (error_kind, missing_key) = classify_apply_state_error(&e);
                     stall_detail = StallDetail { error_kind, missing_key };
-                    tracing::error!(height, error = %err_msg, "apply_state failed");
+                    tracing::error!(height, error = %e, "apply_state failed");
                     break;
                 }
             }
