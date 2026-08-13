@@ -92,7 +92,7 @@ Single-repo, multi-session development:
 | Block/modifier storage | `store/` | **Done** | redb backend, height-indexed |
 | Mempool | `mempool/` | **Done** | Validate-on-entry, replace-by-fee |
 | REST API | `api/` | **Done** | 43 endpoints — 38 JVM-compatible + `/debug/memory`, 3 × `/debug/p2p-capture/*`, `/stats/p2p` |
-| Mining | `mining/` | **Done** | Autolykos v2 candidate assembly |
+| Mining | `mining/` | **Partial** | Autolykos v2 candidate assembly. `select_transactions` is implemented, contract-conformant and cost/size-bounded, but **has no caller** — `generate_candidate` builds `vec![emission_tx]`, so mined blocks carry no mempool transactions and no fee tx |
 | Soft-fork voting | (in `chain/`, `validation/`) | **Done** | Epoch-boundary parameter tracking, v6.0.3-compatible |
 | At-tip memory tuning | (in `sync/`) | **Done** | Runtime AVL DB cache resize on synced() (v0.4.0+) |
 | Contracts | `facts/` | — | Per-component contract markdown |

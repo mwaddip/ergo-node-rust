@@ -488,6 +488,14 @@ protocol limits.
 
 3. Get prioritized transactions from mempool: `mempool.all_prioritized()`.
 
+⚠ **NOT WIRED AS OF v0.8.0.** `select_transactions` implements this sequence
+and is bounded by both limits, but nothing calls it: `generate_candidate`
+builds `vec![emission_tx]` directly. Mined blocks therefore contain the
+emission transaction only — no mempool transactions and no fee transaction, so
+a miner collects no fees. The steps below describe the implemented function and
+are correct; what is missing is the integration, which needs mempool access,
+the active `Parameters`, and a UTXO lookup in `generate_candidate`'s scope.
+
 4. For each candidate transaction (in priority order):
    a. Check cumulative size: if adding this tx exceeds `max_block_size`,
       skip. Size is known from the serialized bytes without validating.

@@ -13,7 +13,7 @@ Validated from genesis through mainnet with no checkpoints.
 - **REST API** — 38 JVM-compatible endpoints (blocks, transactions, UTXO, peers, mining, NiPoPoW) plus `/debug/memory`. `/info` advertises `journalEventsVersion` (always) and `statsVersion` (when the optional `[stats]` section is configured) so downstream tooling can detect contract drift.
 - **Operator stats endpoint** — opt-in `[stats]` section binds a loopback-only `/stats/p2p` endpoint with cumulative P2P traffic counters by message type. Supports external diagnostics (e.g. the Ergo Node Doctor) and an RRD harness under `tools/`.
 - **Stable journal-event contract** — `facts/journal-events.md` names a versioned set of structured tracing events (startup phases, validation sweeps, reorgs, peer penalties, etc.) so log-parsing tools don't break on refactors.
-- **Mining** — Autolykos v2 candidate assembly with EIP-27 re-emission, solution validation
+- **Mining** — Autolykos v2 candidate assembly with EIP-27 re-emission, solution validation. ⚠ **Candidates currently contain the emission transaction only** — mempool transaction selection is implemented and bounded by both protocol limits, but is not yet wired into candidate assembly, so a miner collects no transaction fees
 - **Soft-fork voting** — epoch-boundary parameter tracking, v6.0.3-compatible
 - **NiPoPoW** — build and verify proofs, light-client bootstrap mode
 - **UTXO snapshot sync** — bootstrap from peer snapshots; serve snapshots to peers
