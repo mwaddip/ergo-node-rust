@@ -30,10 +30,14 @@ pub struct AVLTreeParams {
 
 /// Lightweight read-only handle for snapshot operations.
 /// Shares the underlying redb `Database` with `RedbAVLStorage` via `Arc`.
+///
+/// Carries the owning storage's tree parameters so that a resolver built from
+/// a reader unpacks nodes exactly the way the storage's own resolver does.
 #[derive(Clone)]
 pub struct SnapshotReader {
     db: Arc<Database>,
     key_length: usize,
+    value_length: Option<usize>,
 }
 
 /// A serialized snapshot of the AVL+ tree, split into manifest and chunks.
@@ -141,6 +145,86 @@ fn read_memtotal() -> Option<usize> {
         }
     }
     None
+}
+
+/// Build a `Resolver` closure over `db` that loads nodes from the `nodes`
+/// table on demand.  Misses log WARN with the digest hex and return a
+/// `LabelOnly` placeholder that preserves the requested label.
+///
+/// **Every call allocates.**  `unpack` builds a fresh `NodeId`, and what the
+/// closure returns is a clone of that node, so no handle is ever shared with
+/// another tree.  Nothing here caches, and nothing here may start to: a
+/// prover restored onto nodes still keyed in *another* prover's address-keyed
+/// map emits a different proof for identical tree state — same digest,
+/// different bytes.  That is the hazard recorded under `rollback()` in
+/// `facts/state.md`, and a read-only prover is exactly where someone would
+/// later be tempted to add a shared node cache "for performance".
+///
+/// Single implementation behind both [`RedbAVLStorage::resolver`] and
+/// [`SnapshotReader::resolver`] — two copies would drift, and drift here is
+/// the wrong-proof hazard above.
+fn make_resolver(db: Arc<Database>, key_length: usize, value_length: Option<usize>) -> Resolver {
+    Arc::new(move |digest: &Digest32| {
+        let read_txn = match db.begin_read() {
+            Ok(txn) => txn,
+            Err(e) => {
+                error!(error = %e, "resolver: begin_read failed");
+                log_resolver_miss(digest, "begin_read_error");
+                return Node::LabelOnly(NodeHeader::new(Some(*digest), None));
+            }
+        };
+        let table = match read_txn.open_table(NODES_TABLE) {
+            Ok(t) => t,
+            Err(e) => {
+                error!(error = %e, "resolver: open_table failed");
+                log_resolver_miss(digest, "open_table_error");
+                return Node::LabelOnly(NodeHeader::new(Some(*digest), None));
+            }
+        };
+        match table.get(digest.as_slice()) {
+            Ok(Some(data)) => {
+                let bytes: &[u8] = data.value();
+                let dummy: Resolver = Arc::new(|_| panic!("resolver called during unpack"));
+                let tree = AVLTree::with_resolver(dummy, key_length, value_length);
+                let node_id = tree.unpack(&Bytes::copy_from_slice(bytes));
+                let node = node_id.borrow().clone();
+                node
+            }
+            Ok(None) => {
+                log_resolver_miss(digest, "not_in_storage");
+                Node::LabelOnly(NodeHeader::new(Some(*digest), None))
+            }
+            Err(e) => {
+                error!(error = %e, "resolver: table.get failed");
+                log_resolver_miss(digest, "table_get_error");
+                Node::LabelOnly(NodeHeader::new(Some(*digest), None))
+            }
+        }
+    })
+}
+
+/// Read top node hash and height from the `meta` table.
+///
+/// Returns `None` if storage is empty.  This is the *committed* root: a redb
+/// read transaction cannot observe a prover's uncommitted in-memory state.
+///
+/// Single implementation behind both [`RedbAVLStorage::root_state`] and
+/// [`SnapshotReader::root_state`].
+fn read_root_state(db: &Database) -> Option<(Digest32, usize)> {
+    let read_txn = db.begin_read().ok()?;
+    let meta = read_txn.open_table(META_TABLE).ok()?;
+
+    let hash_guard = meta.get(META_TOP_NODE_HASH).ok()??;
+    let hash_bytes: &[u8] = hash_guard.value();
+    let mut hash: Digest32 = [0u8; 32];
+    hash.copy_from_slice(hash_bytes);
+    drop(hash_guard);
+
+    let height_guard = meta.get(META_TOP_NODE_HEIGHT).ok()??;
+    let height_bytes: &[u8] = height_guard.value();
+    let height = u32::from_be_bytes(height_bytes.try_into().ok()?) as usize;
+
+    Some((hash, height))
 }
 
 /// Persistent, versioned, crash-safe AVL+ authenticated dictionary over redb.
@@ -286,53 +370,18 @@ impl RedbAVLStorage {
         SnapshotReader {
             db: Arc::clone(&self.db),
             key_length: self.tree_params.key_length,
+            value_length: self.tree_params.value_length,
         }
     }
 
     /// Create a Resolver closure that reads nodes from storage on demand.
     /// Misses log WARN with the digest hex for post-failure diagnostics.
     pub fn resolver(&self) -> Resolver {
-        let db = Arc::clone(&self.db);
-        let key_length = self.tree_params.key_length;
-        let value_length = self.tree_params.value_length;
-
-        Arc::new(move |digest: &Digest32| {
-            let read_txn = match db.begin_read() {
-                Ok(txn) => txn,
-                Err(e) => {
-                    error!(error = %e, "resolver: begin_read failed");
-                    log_resolver_miss(digest, "begin_read_error");
-                    return Node::LabelOnly(NodeHeader::new(Some(*digest), None));
-                }
-            };
-            let table = match read_txn.open_table(NODES_TABLE) {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(error = %e, "resolver: open_table failed");
-                    log_resolver_miss(digest, "open_table_error");
-                    return Node::LabelOnly(NodeHeader::new(Some(*digest), None));
-                }
-            };
-            match table.get(digest.as_slice()) {
-                Ok(Some(data)) => {
-                    let bytes: &[u8] = data.value();
-                    let dummy: Resolver = Arc::new(|_| panic!("resolver called during unpack"));
-                    let tree = AVLTree::with_resolver(dummy, key_length, value_length);
-                    let node_id = tree.unpack(&Bytes::copy_from_slice(bytes));
-                    let node = node_id.borrow().clone();
-                    node
-                }
-                Ok(None) => {
-                    log_resolver_miss(digest, "not_in_storage");
-                    Node::LabelOnly(NodeHeader::new(Some(*digest), None))
-                }
-                Err(e) => {
-                    error!(error = %e, "resolver: table.get failed");
-                    log_resolver_miss(digest, "table_get_error");
-                    Node::LabelOnly(NodeHeader::new(Some(*digest), None))
-                }
-            }
-        })
+        make_resolver(
+            Arc::clone(&self.db),
+            self.tree_params.key_length,
+            self.tree_params.value_length,
+        )
     }
 
     /// Read a single node's packed bytes by label.
@@ -350,22 +399,7 @@ impl RedbAVLStorage {
 
     /// Read top node hash and height from metadata.
     pub fn root_state(&self) -> Option<(Digest32, usize)> {
-        let read_txn = self.db.begin_read().ok()?;
-        let meta = read_txn.open_table(META_TABLE).ok()?;
-
-        let hash_guard = meta.get(META_TOP_NODE_HASH).ok()??;
-        let hash_bytes: &[u8] = hash_guard.value();
-        let mut hash: Digest32 = [0u8; 32];
-        hash.copy_from_slice(hash_bytes);
-        drop(hash_guard);
-
-        let height_guard = meta.get(META_TOP_NODE_HEIGHT).ok()??;
-        let height_bytes: &[u8] = height_guard.value();
-        let height = u32::from_be_bytes(
-            height_bytes.try_into().ok()?,
-        ) as usize;
-
-        Some((hash, height))
+        read_root_state(&self.db)
     }
 
     // ── helpers ────────────────────────────────────────────────────────
@@ -581,6 +615,34 @@ impl SnapshotReader {
     /// live even mid-swap.
     pub fn cache_bytes_used(&self) -> u64 {
         self.db.cache_stats().used_bytes() as u64
+    }
+
+    /// The same resolver [`RedbAVLStorage::resolver`] hands out, reachable
+    /// from a reader.  Together with [`SnapshotReader::root_state`] it is
+    /// everything needed to stand up a **read-only prover** over the
+    /// committed tree.
+    ///
+    /// Exists because mining must compute AD proofs for a candidate without
+    /// touching the live prover, and cannot reach the validator that already
+    /// knows how (owned by `sync/`, and `!Sync`).  A second `RedbAVLStorage`
+    /// on the same file is not an option either — redb holds an exclusive
+    /// file lock, which is why this reader type exists at all.
+    ///
+    /// Read-only: the closure only ever opens read transactions.  Nodes it
+    /// resolves are freshly allocated per call and shared with no other
+    /// tree — see [`make_resolver`] for why that is load-bearing rather than
+    /// incidental.
+    pub fn resolver(&self) -> Resolver {
+        make_resolver(Arc::clone(&self.db), self.key_length, self.value_length)
+    }
+
+    /// The committed root hash and tree height — the same figure
+    /// [`RedbAVLStorage::root_state`] reports, reachable from a reader.
+    ///
+    /// A reader that exists has a database, so there is no liveness check:
+    /// `None` means the tree is empty, never that the handle went stale.
+    pub fn root_state(&self) -> Option<(Digest32, usize)> {
+        read_root_state(&self.db)
     }
 
     /// Dump the AVL+ tree as a snapshot manifest + chunks.

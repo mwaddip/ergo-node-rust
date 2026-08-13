@@ -3,9 +3,10 @@ use bytes::Bytes;
 use enr_state::{AVLTreeParams, CacheSize, RedbAVLStorage, SnapshotReader};
 use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
-use ergo_avltree_rust::batch_node::{AVLTree, Blake2b256};
+use ergo_avltree_rust::batch_node::{AVLTree, Blake2b256, Node, NodeId};
 use ergo_avltree_rust::operation::{Digest32, KeyValue, Operation};
 use ergo_avltree_rust::versioned_avl_storage::VersionedAVLStorage;
+use std::rc::Rc;
 use tempfile::tempdir;
 
 const KEY_LEN: usize = 32;
@@ -1340,4 +1341,197 @@ fn compaction_stats_are_reported() {
     assert_eq!(stats.block_height, 5);
     // The AVL digest is the 32-byte root label plus the tree height byte.
     assert_eq!(stats.digest.len(), 33);
+}
+
+// ── SnapshotReader: read-only prover access ──────────────────────────
+//
+// resolver() + root_state() are everything mining needs to stand up a
+// read-only prover over the committed tree without reaching the validator.
+
+/// Storage with an internal root node — a single-key tree roots on a leaf,
+/// which has no child handles to compare.
+fn storage_with_internal_root() -> (RedbAVLStorage, tempfile::TempDir) {
+    let (mut storage, mut prover, dir) = setup(10);
+    for seed in 1..=8u8 {
+        prover
+            .perform_one_operation(&Operation::Insert(KeyValue {
+                key: make_key(seed),
+                value: make_value(seed, 64),
+            }))
+            .unwrap();
+    }
+    storage.update(&mut prover, vec![]).unwrap();
+    (storage, dir)
+}
+
+/// Left/right child handles of an internal node, or a failure naming what
+/// came back instead.
+fn child_handles(node: &Node) -> (NodeId, NodeId) {
+    match node {
+        Node::Internal(internal) => (internal.left.clone(), internal.right.clone()),
+        Node::Leaf(_) => panic!("expected an internal root, got a leaf"),
+        Node::LabelOnly(_) => panic!("resolver miss: node was not in storage"),
+    }
+}
+
+#[test]
+fn reader_resolver_returns_the_same_node_as_the_storage_resolver() {
+    let (storage, _dir) = storage_with_internal_root();
+    let (root, _) = storage.root_state().expect("no root state");
+
+    let via_storage = (storage.resolver())(&root);
+    let via_reader = (storage.snapshot_reader().resolver())(&root);
+
+    let (s_left, s_right) = child_handles(&via_storage);
+    let (r_left, r_right) = child_handles(&via_reader);
+
+    assert_eq!(s_left.borrow().get_label(), r_left.borrow().get_label());
+    assert_eq!(s_right.borrow().get_label(), r_right.borrow().get_label());
+}
+
+#[test]
+fn reader_resolver_hands_out_independent_node_handles() {
+    // The invariant that fails silently.  A reader resolver that shared node
+    // handles with the validator's prover would let a restored prover walk
+    // nodes still keyed in another prover's address-keyed map, and emit a
+    // *different proof for identical tree state* — same digest, different
+    // bytes.  Equal labels above prove it is the same node; distinct
+    // allocations here prove it is not the same memory.
+    let (storage, _dir) = storage_with_internal_root();
+    let (root, _) = storage.root_state().expect("no root state");
+
+    let (s_left, s_right) = child_handles(&(storage.resolver())(&root));
+    let (r_left, r_right) = child_handles(&(storage.snapshot_reader().resolver())(&root));
+
+    assert!(
+        !Rc::ptr_eq(&s_left, &r_left),
+        "reader and storage resolvers share a node handle"
+    );
+    assert!(
+        !Rc::ptr_eq(&s_right, &r_right),
+        "reader and storage resolvers share a node handle"
+    );
+}
+
+#[test]
+fn reader_resolver_allocates_fresh_handles_per_call() {
+    // Same guard, one resolver.  Caching resolved nodes is the "for
+    // performance" change that would break the invariant above from the
+    // inside, and it would keep every existing test green.
+    let (storage, _dir) = storage_with_internal_root();
+    let (root, _) = storage.root_state().expect("no root state");
+    let resolver = storage.snapshot_reader().resolver();
+
+    let (first, _) = child_handles(&resolver(&root));
+    let (second, _) = child_handles(&resolver(&root));
+
+    assert_eq!(first.borrow().get_label(), second.borrow().get_label());
+    assert!(
+        !Rc::ptr_eq(&first, &second),
+        "resolver is caching node handles between calls"
+    );
+}
+
+#[test]
+fn reader_resolver_survives_a_miss_with_the_label_intact() {
+    // A miss must still name the node the caller asked for, or a failed
+    // lookup loses the one piece of evidence that identifies it.
+    let (storage, _dir) = storage_with_internal_root();
+    let absent: Digest32 = [0xAB; 32];
+
+    let node = (storage.snapshot_reader().resolver())(&absent);
+
+    match node {
+        Node::LabelOnly(hdr) => assert_eq!(hdr.label, Some(absent)),
+        other => panic!("expected LabelOnly for an absent node, got {other:?}"),
+    }
+}
+
+#[test]
+fn reader_root_state_matches_storage_root_state() {
+    let (storage, _dir) = storage_with_internal_root();
+
+    assert_eq!(
+        storage.snapshot_reader().root_state(),
+        storage.root_state(),
+        "reader and storage disagree on the committed root"
+    );
+}
+
+#[test]
+fn reader_root_state_is_none_on_an_empty_tree() {
+    // A reader that exists has a database, so None means "empty", never
+    // "stale handle" — there is no liveness check to confuse it with.
+    let dir = tempdir().unwrap();
+    let storage = RedbAVLStorage::open(
+        &dir.path().join("state.redb"),
+        params(),
+        10,
+        CacheSize::default(),
+    )
+    .unwrap();
+
+    assert_eq!(storage.snapshot_reader().root_state(), None);
+}
+
+#[test]
+fn reader_root_state_ignores_uncommitted_prover_state() {
+    // root_state() is the committed root.  A prover mid-batch has a newer
+    // tree in memory; a reader must not see it, or mining would build a
+    // candidate on a root no peer has.
+    let (mut storage, mut prover, _dir) = setup(10);
+    prover
+        .perform_one_operation(&Operation::Insert(KeyValue {
+            key: make_key(1),
+            value: make_value(1, 64),
+        }))
+        .unwrap();
+    storage.update(&mut prover, vec![]).unwrap();
+    prover.base.tree.reset();
+    prover.base.changed_nodes_buffer.clear();
+    prover.base.changed_nodes_buffer_to_check.clear();
+
+    let reader = storage.snapshot_reader();
+    let committed = reader.root_state().expect("no root state");
+
+    // Uncommitted: performed on the prover, never handed to update().
+    prover
+        .perform_one_operation(&Operation::Insert(KeyValue {
+            key: make_key(2),
+            value: make_value(2, 64),
+        }))
+        .unwrap();
+    assert_ne!(
+        prover.digest().unwrap()[..32],
+        committed.0[..],
+        "test is not exercising anything — the prover root did not move"
+    );
+
+    assert_eq!(
+        reader.root_state(),
+        Some(committed),
+        "reader observed uncommitted prover state"
+    );
+}
+
+#[test]
+fn reader_resolver_is_read_only() {
+    // Resolving must not touch the tree, the version chain, or metadata.
+    let (storage, _dir) = storage_with_internal_root();
+    let before_root = storage.root_state();
+    let before_version = storage.version();
+    let before_targets: Vec<_> = storage.rollback_versions().collect();
+
+    let resolver = storage.snapshot_reader().resolver();
+    let (root, _) = before_root.expect("no root state");
+    for _ in 0..16 {
+        let _ = resolver(&root);
+    }
+
+    assert_eq!(storage.root_state(), before_root);
+    assert_eq!(storage.version(), before_version);
+    assert_eq!(
+        storage.rollback_versions().collect::<Vec<_>>(),
+        before_targets
+    );
 }
