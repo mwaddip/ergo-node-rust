@@ -224,7 +224,6 @@ impl Validator {
     /// for. See facts/validation.md § "How callers reach the split traits" —
     /// the asymmetry with `state_persistence` follows the consumers and is
     /// deliberate.
-    #[allow(dead_code)] // wired into update_mining_proofs in step D of the split
     fn mining_state(&self) -> Option<&dyn MiningState> {
         match &self.inner {
             ValidatorInner::Digest(_) => None,
@@ -239,10 +238,19 @@ impl Validator {
             None => return,
         };
 
-        let next_height = header.height + 1;
-        let emission_id = match self.emission_box_id() {
-            Some(id) => id,
+        // Digest mode implements no MiningState — candidate assembly needs a
+        // live UTXO set. `self.mining` is already None there, so this arm is
+        // belt-and-braces; the point is that "wrong mode" and "all ERG
+        // emitted" are now two distinct returns instead of one shared None.
+        let mining_state = match self.mining_state() {
+            Some(s) => s,
             None => return,
+        };
+
+        let next_height = header.height + 1;
+        let emission_id = match mining_state.emission_box_id() {
+            Some(id) => id,
+            None => return, // all ERG emitted — and now that is all it means
         };
 
         let box_bytes = match mining.snapshot_reader.lookup_key(&emission_id) {
@@ -275,14 +283,14 @@ impl Validator {
             }
         };
 
-        let (ad_proof_bytes, state_root) = match self.proofs_for_transactions(std::slice::from_ref(&emission_tx)) {
-            Some(Ok(result)) => result,
-            Some(Err(e)) => {
-                tracing::warn!("mining: proof computation failed: {e}");
-                return;
-            }
-            None => return, // digest mode
-        };
+        let (ad_proof_bytes, state_root) =
+            match mining_state.proofs_for_transactions(std::slice::from_ref(&emission_tx)) {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::warn!("mining: proof computation failed: {e}");
+                    return;
+                }
+            };
 
         let mut guard = mining.proof_cache.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(MiningProofData {
@@ -384,47 +392,14 @@ impl BlockValidator for Validator {
         result
     }
 
-    fn flush(&self) -> Result<(), ValidationError> {
-        match &self.inner {
-            ValidatorInner::Digest(v) => v.flush(),
-            // Qualified: UtxoValidator implements flush on both traits during
-            // the split, and the BlockValidator one is a shim step E deletes.
-            ValidatorInner::Utxo(v) => StatePersistence::flush(v),
-        }
-    }
-
-    /// Forwarding this was missed when `resize_cache` was added to the trait,
-    /// so every at-tip resize fell through to the trait's do-nothing default,
-    /// returned `Ok(())`, and logged success. `UtxoValidator::resize_cache`
-    /// was correct the whole time and simply unreachable through this wrapper
-    /// — the at-tip cache resize has never once reached `state.redb`.
-    /// Reported by @odiseusme 2026-08-12 against 036a3eb, confirmed here.
-    fn resize_cache(&self, cache_bytes: usize) -> Result<(), ValidationError> {
-        match &self.inner {
-            ValidatorInner::Digest(v) => v.resize_cache(cache_bytes),
-            ValidatorInner::Utxo(v) => StatePersistence::resize_cache(v, cache_bytes),
-        }
-    }
-
-    fn proofs_for_transactions(
-        &self,
-        txs: &[ergo_validation::Transaction],
-    ) -> Option<Result<(Vec<u8>, ADDigest), ValidationError>> {
-        match &self.inner {
-            // The outer Some is this shim's whole job: MiningState returns a
-            // bare Result, and the "wrong mode" Option layer dies with the
-            // shim in step E.
-            ValidatorInner::Utxo(v) => Some(MiningState::proofs_for_transactions(v, txs)),
-            ValidatorInner::Digest(_) => None,
-        }
-    }
-
-    fn emission_box_id(&self) -> Option<[u8; 32]> {
-        match &self.inner {
-            ValidatorInner::Utxo(v) => MiningState::emission_box_id(v),
-            ValidatorInner::Digest(_) => None,
-        }
-    }
+    // The four forwards that used to live here — flush, resize_cache,
+    // proofs_for_transactions, emission_box_id — are gone. One of them was
+    // silently missing for the life of the feature; the narrative is kept in
+    // facts/validation.md § "Traits", where it documents why the split
+    // happened rather than sitting next to code that no longer exists.
+    //
+    // Storage and mining are reached through the two accessors below. There
+    // is no per-method forwarding left to forget.
 
     /// The active variant's storage lifecycle. `None` in digest mode, which
     /// owns no redb.
