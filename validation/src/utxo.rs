@@ -1,14 +1,16 @@
 //! UtxoValidator: persistent AVL+ tree state verification via BatchAVLProver.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use bytes::Bytes;
 use enr_state::RedbAVLStorage;
 use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
-use ergo_avltree_rust::batch_node::AVLTree;
-use ergo_avltree_rust::operation::{KeyValue, Operation};
+use ergo_avltree_rust::batch_node::{AVLTree, Node, Resolver};
+use ergo_avltree_rust::operation::{Digest32, KeyValue, Operation};
 use ergo_avltree_rust::versioned_avl_storage::VersionedAVLStorage;
 use ergo_chain_types::{blake2b256_hash, ADDigest, Header};
 use ergo_lib::chain::parameters::Parameters;
@@ -551,91 +553,107 @@ impl UtxoValidator {
     /// Compute AD proofs and new state root for a set of transactions
     /// without modifying persistent state.
     ///
-    /// Builds a **separate** prover from storage (fresh tree, no shared Rc
-    /// nodes).  The main prover's tree is never touched — the old path of
-    /// calling `prover.generate_proof_for_operations()` cloned the tree
-    /// shallowly (`Rc<RefCell<Node>>`) and operations on the clone mutated
-    /// shared nodes (visited flags + children pointers during restructuring),
-    /// corrupting the main prover for the next block apply (state-root
-    /// mismatch on the first attempt; self-healing retry after rollback).
+    /// The work is [`proofs_from_storage`]'s; this only supplies the two
+    /// storage accessors it takes. The validator was never the dependency —
+    /// see that function's documentation.
     fn compute_proofs(
         &self,
         txs: &[ergo_lib::chain::transaction::Transaction],
     ) -> Result<(Vec<u8>, ADDigest), ValidationError> {
-        use crate::state_changes::{compute_state_changes, transactions_to_summaries};
-
-        // 1. Convert transactions to state changes
-        let summaries = transactions_to_summaries(txs)?;
-        let changes = compute_state_changes(summaries)?;
-
-        // 2. Build AVL operations (same order as validate_block)
-        let mut operations: Vec<Operation> = Vec::new();
-        for lookup_id in &changes.lookups {
-            operations.push(Operation::Lookup(Bytes::copy_from_slice(lookup_id)));
-        }
-        for removal_id in &changes.removals {
-            operations.push(Operation::Remove(Bytes::copy_from_slice(removal_id)));
-        }
-        for (insert_id, insert_value) in &changes.insertions {
-            operations.push(Operation::Insert(KeyValue {
-                key: Bytes::copy_from_slice(insert_id),
-                value: Bytes::copy_from_slice(insert_value),
-            }));
-        }
-
-        // 3. Build a separate prover from storage — do NOT touch self.prover.
-        //    generate_proof_for_operations clones the tree shallowly (Rc)
-        //    and operations on the clone mutate shared nodes, corrupting the
-        //    main prover.  Instead, load the current root from storage into a
-        //    fresh tree with its own resolver — every resolved node is a new
-        //    Rc<RefCell<Node>>, independent of the main prover.
-        let (root_label, tree_height) = self
-            .storage
-            .root_state()
-            .ok_or_else(|| {
-                ValidationError::StateOperationFailed(
-                    "no root state for mining proof computation".to_string(),
-                )
-            })?;
-        let root_bytes = self
-            .storage
-            .get_node(&root_label)
-            .map_err(|e| {
-                ValidationError::StateOperationFailed(format!(
-                    "mining proof: failed to read root node: {e}"
-                ))
-            })?
-            .ok_or_else(|| {
-                ValidationError::StateOperationFailed(
-                    "mining proof: root node not found in storage".to_string(),
-                )
-            })?;
-
-        let mut tree = AVLTree::with_resolver(self.storage.resolver(), 32, None);
-        let root_node = tree.unpack(&root_bytes);
-        tree.root = Some(root_node);
-        tree.height = tree_height;
-
-        let mut temp_prover = BatchAVLProver::new(tree, false);
-        for op in &operations {
-            temp_prover
-                .perform_one_operation(op)
-                .map_err(|e| {
-                    ValidationError::StateOperationFailed(format!(
-                        "mining proof operation failed: {e}"
-                    ))
-                })?;
-        }
-        let proof_bytes = temp_prover.generate_proof();
-        let new_digest = temp_prover.digest().ok_or_else(|| {
-            ValidationError::StateOperationFailed(
-                "temp prover has no root after mining operations".to_string(),
-            )
-        })?;
-
-        let ad_digest = bytes_to_ad_digest(&new_digest);
-        Ok((proof_bytes.to_vec(), ad_digest))
+        proofs_from_storage(self.storage.resolver(), self.storage.root_state(), txs)
     }
+}
+
+/// Compute AD proofs and the resulting state root for `txs` against a
+/// committed tree, without a [`UtxoValidator`] and without touching any live
+/// prover.
+///
+/// `resolver` and `root` are exactly what `RedbAVLStorage` and
+/// `SnapshotReader` both hand out (facts/state.md). Mining holds the latter,
+/// which is the point: the validator is owned by `sync/` and is `!Sync`, so
+/// the mining task cannot reach it — but this path never needed it. It
+/// deliberately builds a **separate** prover from storage, because the old
+/// approach of calling `prover.generate_proof_for_operations()` on the live
+/// prover cloned the tree shallowly (`Rc<RefCell<Node>>`) and operations on
+/// the clone mutated shared nodes (visited flags + children pointers during
+/// restructuring), corrupting the main prover for the next block apply
+/// (state-root mismatch on the first attempt; self-healing retry after
+/// rollback). So the dependency was always storage access.
+///
+/// ⚠ **The resolver must hand out fresh node handles.** `state/` guarantees
+/// that structurally — no cache, a fresh read transaction per resolve — and
+/// nothing may be inserted between it and the prover here. A prover working
+/// over nodes still keyed in another prover's address-keyed map emits a
+/// *different proof for identical tree state*: same digest, different bytes
+/// (facts/state.md, under `rollback()`).
+///
+/// ⚠ **Read path.** It reports what proofs *would* be. It applies nothing,
+/// persists nothing, and advances no watermark; success is not evidence that
+/// a block is valid.
+pub fn proofs_from_storage(
+    resolver: Resolver,
+    root: Option<(Digest32, usize)>,
+    txs: &[ergo_lib::chain::transaction::Transaction],
+) -> Result<(Vec<u8>, ADDigest), ValidationError> {
+    // 1. Convert transactions to state changes
+    let summaries = transactions_to_summaries(txs)?;
+    let changes = compute_state_changes(summaries)?;
+
+    // 2. Build AVL operations (same order as validate_block)
+    let mut operations: Vec<Operation> = Vec::new();
+    for lookup_id in &changes.lookups {
+        operations.push(Operation::Lookup(Bytes::copy_from_slice(lookup_id)));
+    }
+    for removal_id in &changes.removals {
+        operations.push(Operation::Remove(Bytes::copy_from_slice(removal_id)));
+    }
+    for (insert_id, insert_value) in &changes.insertions {
+        operations.push(Operation::Insert(KeyValue {
+            key: Bytes::copy_from_slice(insert_id),
+            value: Bytes::copy_from_slice(insert_value),
+        }));
+    }
+
+    // 3. Load the committed root into a fresh tree with its own resolver —
+    //    every node it resolves is a new Rc<RefCell<Node>>, independent of
+    //    any other prover's tree.
+    let (root_label, tree_height) = root.ok_or_else(|| {
+        ValidationError::StateOperationFailed(
+            "no root state for mining proof computation".to_string(),
+        )
+    })?;
+
+    // The resolver is the way in: it unpacks the stored bytes exactly as
+    // `AVLTree::unpack` does, and `unpack` itself never yields a LabelOnly —
+    // so that variant IS the miss. A redb read error arrives here the same
+    // way (`state/` logs the cause at ERROR with the digest), which is why one
+    // message covers both.
+    let root_node = (resolver)(&root_label);
+    if matches!(root_node, Node::LabelOnly(_)) {
+        return Err(ValidationError::StateOperationFailed(
+            "mining proof: root node not found in storage".to_string(),
+        ));
+    }
+
+    let mut tree = AVLTree::with_resolver(resolver, 32, None);
+    tree.root = Some(Rc::new(RefCell::new(root_node)));
+    tree.height = tree_height;
+
+    let mut temp_prover = BatchAVLProver::new(tree, false);
+    for op in &operations {
+        temp_prover.perform_one_operation(op).map_err(|e| {
+            ValidationError::StateOperationFailed(format!("mining proof operation failed: {e}"))
+        })?;
+    }
+    let proof_bytes = temp_prover.generate_proof();
+    let new_digest = temp_prover.digest().ok_or_else(|| {
+        ValidationError::StateOperationFailed(
+            "temp prover has no root after mining operations".to_string(),
+        )
+    })?;
+
+    let ad_digest = bytes_to_ad_digest(&new_digest);
+    Ok((proof_bytes.to_vec(), ad_digest))
 }
 
 fn bytes_to_ad_digest(bytes: &Bytes) -> ADDigest {
@@ -906,5 +924,58 @@ mod tests {
 
         assert_eq!(validator.validated_height(), BLOCK_HEIGHT);
         assert_eq!(*validator.current_digest(), state_root);
+    }
+
+    /// The extraction's whole contract: the free function and the method agree
+    /// on the proof *bytes*, not merely on the digest. Same-digest-different-
+    /// bytes is precisely the hazard this path lives in (facts/state.md, under
+    /// `rollback()`), so a digest-only assertion would pass straight through
+    /// the failure it exists to catch.
+    ///
+    /// Not tautological despite the delegation: the free function is reached
+    /// here through a `SnapshotReader` — a second handle on the same database,
+    /// and the route mining will actually take — while the method goes through
+    /// the validator's own `RedbAVLStorage`. Two accessor pairs, one answer.
+    #[test]
+    fn proofs_from_storage_matches_the_validator_byte_for_byte() {
+        let input = make_box(true, 5);
+        let tx = spend_tx(std::slice::from_ref(&input));
+
+        let (validator, _dir) = seeded_validator(std::slice::from_ref(&input));
+        let before = prover_digest(&validator);
+
+        let (method_proof, method_root) = validator
+            .compute_proofs(std::slice::from_ref(&tx))
+            .expect("the validator computes proofs");
+
+        let reader = validator.storage.snapshot_reader();
+        let (free_proof, free_root) = proofs_from_storage(
+            reader.resolver(),
+            reader.root_state(),
+            std::slice::from_ref(&tx),
+        )
+        .expect("the free function computes proofs");
+
+        assert_eq!(
+            free_proof, method_proof,
+            "same tree, same transactions, different proof bytes — the two \
+             provers are not seeing independent nodes"
+        );
+        assert_eq!(free_root, method_root, "the two paths disagree on the root");
+
+        // Not a vacuous fixture: this transaction really does move the tree,
+        // so an equality that held for a no-op would not hold here.
+        assert_ne!(
+            free_root, before,
+            "fixture is degenerate — the transaction changes nothing"
+        );
+
+        // And neither call disturbed the live prover, which is the reason
+        // this path is safe to run from another task at all.
+        assert_eq!(
+            prover_digest(&validator),
+            before,
+            "computing mining proofs moved the validator's own prover"
+        );
     }
 }

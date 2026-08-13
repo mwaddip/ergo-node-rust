@@ -20,7 +20,7 @@ pub use state_changes::{StateChanges, compute_state_changes, transactions_to_sum
 pub use tx_validation::{
     build_state_context, deserialize_box, evaluate_scripts, validate_single_transaction,
 };
-pub use utxo::UtxoValidator;
+pub use utxo::{proofs_from_storage, UtxoValidator};
 pub use voting::{pack_parameters, parse_parameters_from_extension};
 
 // Re-export types needed by mempool callers
