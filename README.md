@@ -7,7 +7,7 @@ Validated from genesis through mainnet with no checkpoints.
 ## Features
 
 - **Full validation** — UTXO mode (persistent AVL+ tree) and digest mode (AD-proof verification)
-- **Parallel validation** — concurrent transaction evaluation within blocks, pipelined across blocks
+- **Parallel validation** — transactions within a block are evaluated concurrently. Script evaluation runs *inside* block application, before anything is persisted, so a block that reaches `state.redb` has already had its scripts checked
 - **P2P** — IPv4/IPv6, peer discovery, deep reorg support
 - **Mempool** — validate-on-entry, replace-by-fee, family weighting, fee statistics, P2P relay
 - **REST API** — 38 JVM-compatible endpoints (blocks, transactions, UTXO, peers, mining, NiPoPoW) plus `/debug/memory`. `/info` advertises `journalEventsVersion` (always) and `statsVersion` (when the optional `[stats]` section is configured) so downstream tooling can detect contract drift.
@@ -17,7 +17,7 @@ Validated from genesis through mainnet with no checkpoints.
 - **Soft-fork voting** — epoch-boundary parameter tracking, v6.0.3-compatible
 - **NiPoPoW** — build and verify proofs, light-client bootstrap mode
 - **UTXO snapshot sync** — bootstrap from peer snapshots; serve snapshots to peers
-- **At-tip memory tuning** — opt-in `synced_*` config swaps to a smaller redb cache once at tip (~80% RSS reduction on mainnet, 7.3 GB → 1.35 GB)
+- **At-tip memory tuning** — opt-in `synced_*` config swaps to a smaller redb cache once at tip. Measured on mainnet at 1.85M blocks with `cache_mb = 1024` / `synced_cache_mb = 128`: **1.9 GB during cold sync → 950 MB at tip**
 - **Fast crash recovery** — header chain state is reconstructable from the store; redb writes use `quick_repair` so `Database::open` after `kill -9` skips the full-file allocator scan. Restart-to-API on a fully-synced mainnet node is sub-second.
 
 ## Addons
@@ -136,8 +136,12 @@ network = "mainnet"
 data_dir = "/var/lib/ergo-node/data"
 state_type = "utxo"             # "utxo" | "digest" | "light"
 
-# Cold-sync (initial sync from genesis or snapshot)
+# Cold-sync (initial sync from genesis or snapshot).
+# cache_mb is the TOTAL redb page cache across both databases,
+# split by cache_store_pct (modifiers.redb gets that %, state.redb
+# the rest). It sized state.redb alone before v0.8.0.
 cache_mb = 1024
+cache_store_pct = 50
 flush_heap_threshold_mb = 2048
 
 # At-tip mirrors. Once sync reaches tip, the AVL state DB reopens
@@ -179,27 +183,37 @@ The node depends on two upstream Rust crates for consensus-critical primitives, 
 
 [`mwaddip/sigma-rust`](https://github.com/mwaddip/sigma-rust) — `ergo-chain-types`, `ergo-lib`, `ergo-nipopow`, `sigma-ser`
 
-Open PRs against [ergoplatform/sigma-rust](https://github.com/ergoplatform/sigma-rust):
+**45 open, 10 merged** against [ergoplatform/sigma-rust](https://github.com/ergoplatform/sigma-rust) —
+[live list](https://github.com/ergoplatform/sigma-rust/pulls?q=is%3Apr+author%3Amwaddip).
+They are not enumerated here because the set turns over faster than a README
+does; the query above is always current.
 
-- [#847](https://github.com/ergoplatform/sigma-rust/pull/847) — Fix panic in `gen_indexes` when index modulo N equals zero
-- [#848](https://github.com/ergoplatform/sigma-rust/pull/848) — `ErgoTreePredef` port + genesis construction
-- [#850](https://github.com/ergoplatform/sigma-rust/pull/850) — Soft-fork parameter variants
-- [#851](https://github.com/ergoplatform/sigma-rust/pull/851) — `NipopowAlgos::prove_with_reader` for efficient proof serving
-- [#852](https://github.com/ergoplatform/sigma-rust/pull/852) — NiPoPoW `has_valid_connections` tolerates skipped prefix entries
-- [#854](https://github.com/ergoplatform/sigma-rust/pull/854) — Port JIT costing from sigmastate-interpreter
-- [#855](https://github.com/ergoplatform/sigma-rust/pull/855) — Allocation bomb guard for VLQ-decoded message sizes
-- [#857](https://github.com/ergoplatform/sigma-rust/pull/857) — BigInt modulo semantics (`mod` vs `rem`)
-- [#858](https://github.com/ergoplatform/sigma-rust/pull/858) — Lazy constant resolution in ErgoTree evaluation
-- [#859](https://github.com/ergoplatform/sigma-rust/pull/859) — Pre-JIT ErgoScript leniency for v0/v1 scripts
-- [#860](https://github.com/ergoplatform/sigma-rust/pull/860) — Parse-time `SOption(T)` leniency in `check_post_eval_tpe` (matches JVM `OneArgumentOperationSerializer`)
+Merged so far: NiPoPoW prefix-connection lookback (#852) and `pack_interlinks`
+key encoding (#866), non-pair tuple rejection (#868), `Global.powHit` return
+type (#877), checked ERG summation (#891), `Option` data non-zero tag (#895),
+`checkType` ingress divergences (#897), context-extension key domain (#906),
+signed header-version gate (#909), and v0.30.0 style gating (#915).
+
+⚠ Upstream's `develop` branch is frozen; **`v0.30.0` is the live integration
+branch**, and every merge above landed there. Open PRs still target `develop`,
+so GitHub reporting them all as `MERGEABLE` means only "mergeable into a branch
+nobody moves" — it is not a readiness signal.
 
 ### ergo_avltree_rust
 
 [`mwaddip/ergo_avltree_rust`](https://github.com/mwaddip/ergo_avltree_rust)
 
-- [#10](https://github.com/ergoplatform/ergo_avltree_rust/pull/10) — `Resolver` type change to support disk-backed storage
-- [#11](https://github.com/ergoplatform/ergo_avltree_rust/pull/11) — `VersionedAVLStorage::flush()` for durable commits on demand
-- [#13](https://github.com/ergoplatform/ergo_avltree_rust/pull/13) — `contains_recursive` fail-safes on unresolvable `LabelOnly` (prevents `removed_nodes()` over-deletion with persistent backends)
+**5 open, 6 merged** against [ergoplatform/ergo_avltree_rust](https://github.com/ergoplatform/ergo_avltree_rust) —
+[live list](https://github.com/ergoplatform/ergo_avltree_rust/pulls?q=is%3Apr+author%3Amwaddip).
+
+- [#27](https://github.com/ergoplatform/ergo_avltree_rust/pull/27) — persistent-prover support: proof cycle, rewind path, storage flush. Supersedes #11/#18/#19/#22 and carries the `restore_root` fix this node pins for
+- [#13](https://github.com/ergoplatform/ergo_avltree_rust/pull/13) — `contains_recursive` fail-safes on unresolvable `LabelOnly`
+- [#14](https://github.com/ergoplatform/ergo_avltree_rust/pull/14), [#24](https://github.com/ergoplatform/ergo_avltree_rust/pull/24) — `Err` instead of abort on malformed proofs and out-of-range params
+- [#16](https://github.com/ergoplatform/ergo_avltree_rust/pull/16) — `Resolver` as `Arc<dyn Fn>` with a non-breaking constructor
+
+Merged: JVM-oracle proof comparison tests (#17), proof-deserialization input
+guards (#20), `is_new = false` on deserialized nodes (#21), rustfmt (#23), and
+checked `UpdateLongBy` delta (#25).
 
 ## Credits
 
