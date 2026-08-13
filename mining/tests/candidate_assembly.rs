@@ -191,6 +191,41 @@ fn expected_ids(groups: &[&Vec<Token>], cap: usize) -> Vec<TokenId> {
         .collect()
 }
 
+/// Every token the fee boxes offer, in the traversal order the reward box must
+/// take them in.
+fn ordered_tokens(groups: &[Vec<Token>]) -> Vec<Token> {
+    groups.iter().flat_map(|g| g.iter().cloned()).collect()
+}
+
+/// A box's serialized length as a validator counts it — `ErgoBox` bytes,
+/// transaction id and output index included, which is what `txBoxSize` is
+/// measured against. The candidate body is 33 bytes shorter and would let a
+/// box over the window look like it fits.
+fn box_bytes(b: &ErgoBox) -> usize {
+    b.sigma_serialize_bytes().unwrap().len()
+}
+
+/// The same box re-measured with one more token on it.
+///
+/// Built here from the shipped box rather than from anything the crate
+/// returns, so "the cut is tight" is checked against the serializer directly
+/// and not against the arithmetic under test.
+fn box_bytes_with(b: &ErgoBox, extra: &Token) -> usize {
+    let mut tokens: Vec<Token> = match b.tokens.as_ref() {
+        Some(t) => <BoxTokens as AsRef<[Token]>>::as_ref(t).to_vec(),
+        None => Vec::new(),
+    };
+    tokens.push(*extra);
+    let candidate = ErgoBoxCandidate {
+        value: b.value,
+        ergo_tree: b.ergo_tree.clone(),
+        tokens: Some(BoxTokens::from_vec(tokens).unwrap()),
+        additional_registers: NonMandatoryRegisters::empty(),
+        creation_height: b.creation_height,
+    };
+    box_bytes(&ErgoBox::from_box_candidate(&candidate, b.transaction_id, b.index).unwrap())
+}
+
 fn spend_into(src: &ErgoBox, out_tree: ErgoTree) -> Transaction {
     // Tokens carry through unchanged: the whole box goes to the one output, so
     // preservation holds without a change box.
@@ -701,21 +736,20 @@ fn fee_box_tokens_are_collected_onto_the_miner_box() {
     assert!(generated.invalid_txs.is_empty());
 }
 
-/// Past `MAX_TOKENS_COUNT` distinct tokens the miner box cannot be built at
-/// all (`BoxTokens` is a bounded vec), and an unbuilt fee box means the block
-/// ships collecting **no fees** — the miner loses the whole block's revenue,
-/// not just the excess tokens. Truncating burns the excess and keeps the ERG,
-/// which is what the JVM does (`CandidateGenerator.scala:811`,
-/// `.take(MaxAssetsPerBox)`): a plain take, no reordering by value.
+/// The cap on aggregated fee tokens is the reward box's MEASURED serialized
+/// size — `out.bytes.length <= MaxBoxSize` (4096), JVM rule `txBoxSize`,
+/// `ErgoTransaction.scala:175`, ergo-lib `BoxSizeExceeded` — and never a token
+/// count. A 255-token reward box is roughly 8.5 KB, so `MAX_TOKENS_COUNT` can
+/// only move the failure from "box will not build" to "box will not validate";
+/// see `fee_tokens_past_the_box_window_are_capped_and_the_fees_collected`.
 ///
-/// Asserted against `build_fee_tx` directly rather than through
-/// `generate_candidate`, because a 255-token box does not survive validation
-/// either — see `fee_tokens_past_the_box_window_still_lose_the_fees`.
+/// The survivors are however many fit, in first-seen traversal order — a plain
+/// take, no reordering by value, no hash-map iteration. Asserted on the
+/// serialized length and on the tightness of the cut; the count is the measure
+/// this change established is the wrong one.
 #[test]
 fn fee_tokens_are_capped_at_one_box_worth_in_traversal_order() {
     const PER_BOX: usize = 100;
-    const CAP: usize = ErgoBox::MAX_TOKENS_COUNT;
-    const { assert!(3 * PER_BOX > CAP, "fixture must overflow the token cap") };
 
     let groups = [
         distinct_tokens(0x10, PER_BOX),
@@ -738,16 +772,43 @@ fn fee_tokens_are_capped_at_one_box_worth_in_traversal_order() {
     .expect("three fee boxes must produce a fee transaction");
 
     let miner_box = fee_tx.outputs.get(0).unwrap();
+    let ordered = ordered_tokens(&groups);
+    let kept = token_ids(miner_box).len();
+
+    let size = box_bytes(miner_box);
+    assert!(
+        size <= ErgoBox::MAX_BOX_SIZE,
+        "the reward box is {size} bytes against a {}-byte window: it cannot \
+         validate, and a fee box that cannot validate collects nothing",
+        ErgoBox::MAX_BOX_SIZE
+    );
+    assert!(
+        kept < ordered.len(),
+        "fixture must overflow the box window: all {} tokens fit",
+        ordered.len()
+    );
+    assert!(
+        kept < ErgoBox::MAX_TOKENS_COUNT,
+        "{kept} tokens in a {}-byte box — MAX_TOKENS_COUNT cannot be what bound, \
+         so the cap has regressed to a count",
+        ErgoBox::MAX_BOX_SIZE
+    );
+    assert!(
+        box_bytes_with(miner_box, &ordered[kept]) > ErgoBox::MAX_BOX_SIZE,
+        "the cut is loose: token {kept} still fits in {} bytes, so the cap \
+         burned a token it did not have to",
+        ErgoBox::MAX_BOX_SIZE
+    );
+    assert_eq!(
+        token_ids(miner_box),
+        expected_ids(&groups.iter().collect::<Vec<_>>(), kept),
+        "the survivors are the first {kept} in traversal order — a plain take, \
+         no reordering by value, no hash-map iteration"
+    );
     assert_eq!(
         miner_box.value.as_i64(),
         3 * 2_000_000,
         "capping tokens must not cost the miner any ERG"
-    );
-    assert_eq!(
-        token_ids(miner_box),
-        expected_ids(&groups.iter().collect::<Vec<_>>(), CAP),
-        "the survivors are the first {CAP} in traversal order — a plain take, \
-         no reordering by value, no hash-map iteration"
     );
     assert_eq!(
         fee_tx.inputs.len(),
@@ -757,27 +818,22 @@ fn fee_tokens_are_capped_at_one_box_worth_in_traversal_order() {
     );
 }
 
-/// ⚠ **The cap above is necessary but not sufficient, and this pins why.**
+/// ⚠ **The whole point, end to end.** 140 distinct tokens is *under*
+/// `MAX_TOKENS_COUNT` and *over* the box window, so a count cap is never even
+/// reached: the reward box built, failed `txBoxSize` at validation, and the
+/// block shipped collecting nothing. That is what the JVM does — it caps by
+/// the same wrong constant (`.take(MaxAssetsPerBox)`,
+/// `CandidateGenerator.scala:811`) and loses the same fees.
 ///
-/// `MAX_TOKENS_COUNT` is not the binding limit on a box's tokens; the
-/// consensus rule is `MAX_BOX_SIZE` — `out.bytes.length <= MaxBoxSize` (4096),
-/// JVM rule `txBoxSize`, `ErgoTransaction.scala:175`, and ergo-lib's
-/// `BoxSizeExceeded`. A minimal token costs 33 bytes, so a miner reward box
-/// holds **122** of them, and a 255-token box is 8476 bytes — over by more
-/// than double. The cap therefore moves the failure from "box will not build"
-/// to "box will not validate"; it does not restore the fees.
-///
-/// 140 distinct tokens is under the cap and over the window, so the cap is not
-/// even reached here: the fee transaction is dropped and the block ships
-/// collecting nothing. Matching the JVM, which caps by the same wrong constant
-/// and loses the same fees.
-///
-/// Fixing this means capping by serialized box size rather than token count —
-/// a divergence from the reference on what lands in a consensus-visible box,
-/// which is above this crate's pay grade. Flip this test when that decision
-/// is made.
+/// **We diverge deliberately.** Which fee boxes a miner collects is miner
+/// policy, not consensus: the rule constrains the box a miner produces, not
+/// the choice of what to put in it, and uncollected fee boxes stay spendable
+/// later. So the fee transaction is now built, valid, and collecting — asserted
+/// through `generate_candidate` with every assembled transaction re-validated,
+/// because "the box serializes small enough" and "the block a peer receives is
+/// accepted" are not the same claim.
 #[test]
-fn fee_tokens_past_the_box_window_still_lose_the_fees() {
+fn fee_tokens_past_the_box_window_are_capped_and_the_fees_collected() {
     const PER_BOX: usize = 70;
     const {
         assert!(
@@ -786,9 +842,13 @@ fn fee_tokens_past_the_box_window_still_lose_the_fees() {
         )
     };
 
+    let groups = [
+        distinct_tokens(0x10, PER_BOX),
+        distinct_tokens(0x20, PER_BOX),
+    ];
     let srcs = vec![
-        token_source_box(0xC1, 2_000_000, &distinct_tokens(0x10, PER_BOX)),
-        token_source_box(0xC2, 3_000_000, &distinct_tokens(0x20, PER_BOX)),
+        token_source_box(0xC1, 2_000_000, &groups[0]),
+        token_source_box(0xC2, 3_000_000, &groups[1]),
     ];
     let txs = vec![fee_paying_tx(&srcs[0]), fee_paying_tx(&srcs[1])];
 
@@ -796,17 +856,49 @@ fn fee_tokens_past_the_box_window_still_lose_the_fees() {
     let generated = generate(&candidates(&txs), &params, &srcs);
     let assembled = &generated.block.transactions;
 
-    assert_eq!(
-        assembled.len(),
-        3,
-        "[emission, tx, tx] — the fee transaction is missing, and 5,000,000 \
-         nanoERG of fees goes uncollected"
-    );
+    assert_eq!(assembled.len(), 4, "[emission, tx, tx, fee]");
+    let fee_tx = assembled.last().unwrap();
     assert!(
-        !is_fee_tx(assembled.last().unwrap()),
-        "no fee transaction: a {} -token miner box is over MAX_BOX_SIZE",
+        is_fee_tx(fee_tx),
+        "the fee transaction must ship: {} distinct tokens is a reason to burn \
+         the excess, not to hand the block's whole revenue back",
         2 * PER_BOX
     );
+
+    let miner_box = fee_tx.outputs.get(0).unwrap();
+    assert_eq!(
+        miner_box.value.as_i64(),
+        5_000_000,
+        "every nanoERG of fee collected — the tokens are what got capped"
+    );
+
+    let ordered = ordered_tokens(&groups);
+    let kept = token_ids(miner_box).len();
+    let size = box_bytes(miner_box);
+    assert!(
+        size <= ErgoBox::MAX_BOX_SIZE,
+        "the reward box is {size} bytes against a {}-byte window",
+        ErgoBox::MAX_BOX_SIZE
+    );
+    assert!(
+        kept < ordered.len(),
+        "fixture must overflow the box window: all {} tokens fit",
+        ordered.len()
+    );
+    assert!(
+        box_bytes_with(miner_box, &ordered[kept]) > ErgoBox::MAX_BOX_SIZE,
+        "the cut is loose: token {kept} still fits, so the cap burned a token \
+         it did not have to"
+    );
+    assert_eq!(
+        token_ids(miner_box),
+        expected_ids(&groups.iter().collect::<Vec<_>>(), kept),
+        "the survivors are the first {kept} in traversal order"
+    );
+
+    // Re-validates every assembled transaction. The reward box that used to
+    // fail `txBoxSize` right here is the reason this test exists.
+    measure_block(&generated.block, &srcs, &block_context(&params));
     assert!(
         generated.invalid_txs.is_empty(),
         "the fee boxes' creators are perfectly valid transactions"

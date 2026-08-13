@@ -6,8 +6,13 @@ use ergo_lib::chain::transaction::input::prover_result::ProverResult;
 use ergo_lib::chain::transaction::{Input, Transaction};
 use ergo_lib::ergotree_interpreter::sigma_protocol::prover::ProofBytes;
 use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
-use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
+use ergo_lib::ergotree_ir::chain::ergo_box::box_value::BoxValue;
+use ergo_lib::ergotree_ir::chain::ergo_box::{
+    BoxTokens, ErgoBox, ErgoBoxCandidate, NonMandatoryRegisters,
+};
 use ergo_lib::ergotree_ir::chain::token::{Token, TokenId};
+use ergo_lib::ergotree_ir::chain::tx_id::TxId;
+use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
 use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use std::collections::{HashMap, HashSet};
@@ -28,9 +33,10 @@ use crate::MiningError;
 /// height the block will have (JVM `collectRewards`, `nextHeight`).
 ///
 /// Tokens carried by the fee boxes are aggregated onto the miner box and
-/// capped at `ErgoBox::MAX_TOKENS_COUNT`; the excess is burned rather than
-/// allowed to make the box unbuildable and cost the miner every fee in the
-/// block. See the truncation site below.
+/// capped by the reward box's MEASURED serialized size, not by a token count;
+/// the excess is burned rather than allowed to make the box unbuildable — or,
+/// worse, buildable but invalid — and cost the miner every fee in the block.
+/// See [`fit_tokens`].
 ///
 /// Returns None if total fee is zero or no fee boxes exist — a zero-fee block
 /// is a normal outcome, not an error.
@@ -115,27 +121,29 @@ pub fn build_fee_tx(
         }
     }
 
-    // Cap at what one box can hold. Past `MAX_TOKENS_COUNT` the reward box
-    // does not build at all (`BoxTokens` is a bounded vec), and an unbuildable
-    // fee box means the block ships collecting NO fees — the miner loses the
-    // whole block's revenue over the excess tokens, not just the excess.
-    //
-    // The JVM truncates for the same reason and in the same way:
-    // `feeBoxes.toArray.toColl.flatMap(_.additionalTokens).take(MaxAssetsPerBox)`
-    // (`CandidateGenerator.scala:811`) — a plain take, no ordering by value.
-    //
-    // The dropped tokens are burned: their fee boxes are still spent as inputs
-    // and Ergo permits an output carrying fewer tokens than its inputs. The
-    // JVM's `take` burns them too.
-    if aggregated.len() > ErgoBox::MAX_TOKENS_COUNT {
+    // Build the miner reward output.
+    let reward_script =
+        ergo_tree_predef::reward_output_script(reward_delay, miner_pk.clone())
+            .map_err(|e| MiningError::Emission(format!("reward script: {e}")))?;
+    let reward_value: BoxValue = (total_fee as u64)
+        .try_into()
+        .map_err(|e| MiningError::Emission(format!("fee value: {e}")))?;
+
+    // Cap at what one box can hold, measured rather than counted — see
+    // `fit_tokens`. The dropped tokens are burned: their fee boxes are still
+    // spent as inputs and Ergo permits an output carrying fewer tokens than
+    // its inputs. The JVM's `take(MaxAssetsPerBox)` burns them too, just at
+    // the wrong limit.
+    let kept = fit_tokens(&aggregated, reward_value, &reward_script, height)?;
+    if kept.len() < aggregated.len() {
         tracing::warn!(
             height,
             distinct_tokens = aggregated.len(),
-            burned = aggregated.len() - ErgoBox::MAX_TOKENS_COUNT,
-            "mining: fee boxes carry more distinct tokens than one box holds; \
-             burning the excess so the block still collects its fees"
+            collected = kept.len(),
+            burned = aggregated.len() - kept.len(),
+            "mining: fee boxes carry more distinct tokens than one reward box \
+             holds; burning the excess so the block still collects its fees"
         );
-        aggregated.truncate(ErgoBox::MAX_TOKENS_COUNT);
     }
 
     // Build inputs from fee boxes (empty proofs — fee proposition allows same-block spending)
@@ -152,27 +160,10 @@ pub fn build_fee_tx(
         })
         .collect();
 
-    // Build miner reward output
-    let reward_script =
-        ergo_tree_predef::reward_output_script(reward_delay, miner_pk.clone())
-            .map_err(|e| MiningError::Emission(format!("reward script: {e}")))?;
-
-    let mut reward_builder = ErgoBoxCandidateBuilder::new(
-        (total_fee as u64)
-            .try_into()
-            .map_err(|e| MiningError::Emission(format!("fee value: {e}")))?,
-        reward_script,
-        height,
-    );
-
-    // Add aggregated tokens to reward box
-    for (token_id, amount) in aggregated {
-        reward_builder.add_token(Token {
-            token_id,
-            amount: amount
-                .try_into()
-                .map_err(|e| MiningError::Emission(format!("fee token amount: {e}")))?,
-        });
+    let mut reward_builder =
+        ErgoBoxCandidateBuilder::new(reward_value, reward_script, height);
+    for token in kept {
+        reward_builder.add_token(token);
     }
 
     let reward_candidate = reward_builder
@@ -183,4 +174,93 @@ pub fn build_fee_tx(
         .map_err(|e| MiningError::Emission(format!("fee transaction: {e}")))?;
 
     Ok(Some(tx))
+}
+
+/// The longest PREFIX of `aggregated` that keeps the reward box inside the
+/// box-size window — measured, not derived.
+///
+/// The rule is `txBoxSize`: `out.bytes.length <= MaxBoxSize` (4096), JVM
+/// `ErgoTransaction.scala:175`, ergo-lib `BoxSizeExceeded`. It is checked
+/// against the bytes a validator counts — `ErgoBox::sigma_serialize`,
+/// transaction id and output index included, not the candidate body, which is
+/// 33 bytes shorter and would put the cut one token too high.
+///
+/// ⚠ Nothing here is arithmetic over assumed widths. The reward tree's length
+/// is a function of `reward_delay` and the miner key; a token entry is 32
+/// bytes plus a VLQ amount, not a fixed 33. A table of constants would have to
+/// be re-derived every time either moved, and being wrong by one byte means a
+/// box that cannot validate and a block that collects nothing — the exact
+/// failure this cap exists to prevent.
+///
+/// ⚠ A prefix, not a greedy fill. The surviving set stays a plain take in
+/// first-seen traversal order, which is what makes two runs over identical fee
+/// boxes produce identical box bytes — hence the same box id, transaction id,
+/// and transactions root the miner is handed to hash.
+///
+/// The other rule on an output box — dust,
+/// `out.value >= out.bytes.length * minValuePerByte` — cannot bind here and is
+/// deliberately not checked. Every fee box collected is an output of a
+/// transaction this node already validated, so it cleared that same rule
+/// carrying those same tokens under a **105-byte** fee proposition; the reward
+/// box carries them under a **54-byte** reward script. Values add across fee
+/// boxes while the box overhead is paid once, and a token in two fee boxes
+/// becomes one entry here, freeing 32 bytes against at most a byte or two of
+/// VLQ growth on the summed amount. The reward box is therefore strictly
+/// cheaper per byte than the boxes that fed it. A guard here would be
+/// unreachable, and — pinned to a constant rather than the block's voted
+/// `minValuePerByte`, which this function is not given — could only ever fire
+/// wrongly, burning tokens that would have validated.
+fn fit_tokens(
+    aggregated: &[(TokenId, u64)],
+    value: BoxValue,
+    script: &ErgoTree,
+    height: u32,
+) -> Result<Vec<Token>, MiningError> {
+    let mut kept: Vec<Token> = Vec::new();
+    // `BoxTokens` is a bounded vec. The size rule stops the loop long before
+    // this — 255 minimal tokens are 8415 bytes on their own — but the bound is
+    // structural, not a consequence of the loop.
+    for (token_id, amount) in aggregated.iter().take(ErgoBox::MAX_TOKENS_COUNT) {
+        kept.push(Token {
+            token_id: *token_id,
+            amount: (*amount)
+                .try_into()
+                .map_err(|e| MiningError::Emission(format!("fee token amount: {e}")))?,
+        });
+        if reward_box_size(value, script, &kept, height)? > ErgoBox::MAX_BOX_SIZE {
+            kept.pop();
+            break;
+        }
+    }
+    Ok(kept)
+}
+
+/// Serialized length of the reward box exactly as a validator measures it.
+///
+/// The placeholder transaction id measures the real box to the byte: an id is
+/// a 32-byte digest whatever its value, and the index is 0 either way — the
+/// reward box is the fee transaction's only output.
+fn reward_box_size(
+    value: BoxValue,
+    script: &ErgoTree,
+    tokens: &[Token],
+    height: u32,
+) -> Result<usize, MiningError> {
+    let candidate = ErgoBoxCandidate {
+        value,
+        ergo_tree: script.clone(),
+        tokens: match tokens {
+            [] => None,
+            t => Some(
+                BoxTokens::from_vec(t.to_vec())
+                    .map_err(|e| MiningError::Emission(format!("fee tokens: {e}")))?,
+            ),
+        },
+        additional_registers: NonMandatoryRegisters::empty(),
+        creation_height: height,
+    };
+    ErgoBox::from_box_candidate(&candidate, TxId::zero(), 0)
+        .and_then(|b| b.sigma_serialize_bytes())
+        .map(|bytes| bytes.len())
+        .map_err(|e| MiningError::Emission(format!("fee reward box measure: {e}")))
 }
