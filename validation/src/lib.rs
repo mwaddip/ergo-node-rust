@@ -18,7 +18,8 @@ pub use sections::{
 };
 pub use state_changes::{compute_state_changes, transactions_to_summaries, StateChanges};
 pub use tx_validation::{
-    build_state_context, deserialize_box, evaluate_scripts, validate_single_transaction,
+    build_state_context, build_upcoming_state_context, deserialize_box, evaluate_scripts,
+    validate_single_transaction,
 };
 pub use utxo::{proofs_from_storage, UtxoValidator};
 pub use voting::{pack_parameters, parse_parameters_from_extension};

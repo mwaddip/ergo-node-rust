@@ -10,7 +10,7 @@ use std::io::Cursor;
 
 use rayon::prelude::*;
 
-use ergo_chain_types::{Header, PreHeader};
+use ergo_chain_types::{ec_point, Header, PreHeader, Votes};
 use ergo_lib::chain::ergo_state_context::{ErgoStateContext, Headers};
 use ergo_lib::chain::parameters::Parameters;
 use ergo_lib::chain::transaction::Transaction;
@@ -55,6 +55,103 @@ pub fn build_state_context(
     let pre_header = PreHeader::from(header.clone());
     let headers = Headers::from_vec(preceding_headers.iter().take(10).cloned().collect())
         .expect("build_state_context requires at least one preceding header (caller-guarded)");
+    ErgoStateContext::new(pre_header, headers, parameters.clone())
+}
+
+/// Build an ErgoStateContext for a transaction that is **not yet in a block** —
+/// the mempool and API-submitted transactions. The preheader describes the
+/// *next* block, the one built on `last_header`.
+///
+/// `build_state_context` puts the block's own header in the preheader, which is
+/// right for a block that exists and wrong for one that does not: a wallet sets
+/// `creationHeight` to the block it expects to land in, ergo-lib enforces
+/// `creation_height <= pre_header.height` (`tx_context.rs` `verify_output`), so
+/// a preheader sitting at the tip rejects every well-formed transaction on the
+/// network by exactly one block. Which builder you call is a correctness
+/// decision (facts/validation.md, "Free Functions: state context").
+///
+/// # Caller contract
+///
+/// `preceding_headers` are the headers **strictly before `last_header`**,
+/// newest first — the same slice `build_state_context` takes for the block at
+/// `last_header`, so the two builders are interchangeable at a call site. It
+/// must NOT contain `last_header`; this function puts it at the head of the
+/// window itself, because for the *upcoming* block the tip is the newest
+/// preceding header.
+///
+/// That placement is load-bearing. ergo-lib derives `lastBlockUtxoRoot` from
+/// the newest header in the window (`signing.rs` `make_context`), and for an
+/// unconfirmed transaction that has to be the UTXO root *after* the tip, i.e.
+/// `last_header.state_root`. Pass a window whose head is the tip's parent and
+/// every mempool script reading the UTXO root sees the state of one block ago,
+/// silently and with no error anywhere.
+///
+/// Unlike `build_state_context` there is no non-empty requirement:
+/// `preceding_headers` may be empty (height 1), since `last_header` alone
+/// already satisfies the `Headers` lower bound. The window is `last_header`
+/// plus up to 9 of them — 10 total, the JVM's `LastHeadersInContext`.
+///
+/// # JVM reference
+///
+/// `ErgoStateContext.simplifiedUpcoming()` (`ErgoStateContext.scala:140`)
+/// composed with `PreHeader.apply` (`PreHeader.scala:49-63`) and
+/// `AutolykosPowScheme.derivedHeaderFields` (`AutolykosPowScheme.scala:455`).
+/// `UpcomingStateContext` overrides `sigmaLastHeaders` to the whole
+/// `lastHeaders` with no `drop(1)` (`ErgoStateContext.scala:46`) — that missing
+/// drop is precisely why the tip stays in the window here while block
+/// validation excludes its own header.
+///
+/// Two deliberate divergences, both recorded in the contract:
+/// - `parameters` are the caller's, active for `last_header`. The JVM
+///   recomputes them for `height + 1` inside `simplifiedUpcoming()`; the two
+///   differ only on a block that crosses an epoch boundary.
+/// - `votes` is `[0, 0, 0]` where the JVM passes an empty array. `Votes` is
+///   three fixed bytes and cannot represent empty; a script reading
+///   `CONTEXT.preHeader.votes` sees a 3-byte zero collection instead of an
+///   empty one. (The JVM's own `PreHeader.fake` uses three zero bytes.)
+///
+/// **Mining does not use this builder, deliberately** — it synthesizes a stub
+/// header at `height + 1` with a real wall-clock timestamp and a real miner key
+/// and feeds that to `build_state_context`. A miner knows both; the mempool
+/// knows neither.
+pub fn build_upcoming_state_context(
+    last_header: &Header,
+    preceding_headers: &[Header],
+    parameters: &Parameters,
+) -> ErgoStateContext {
+    debug_assert!(
+        preceding_headers
+            .first()
+            .is_none_or(|h| h.id != last_header.id),
+        "preceding_headers must hold only headers strictly before last_header — \
+         build_upcoming_state_context prepends last_header itself"
+    );
+
+    let pre_header = PreHeader {
+        version: last_header.version,
+        parent_id: last_header.id,
+        // The JVM's literal `lastHeader.timestamp + 1`, not wall clock: the
+        // mempool cannot know when the next block is mined. Saturating because
+        // a partial function has no business on a mempool-facing path — the
+        // input is chain data, but nothing here needs to be able to panic.
+        timestamp: last_header.timestamp.saturating_add(1),
+        n_bits: last_header.n_bits,
+        height: last_header.height.saturating_add(1),
+        // The next block's miner is unknown, so the group generator stands in.
+        // A script reading `CONTEXT.preHeader.minerPk` therefore sees a
+        // placeholder in the mempool and the real key once mined — the same
+        // divergence the JVM has, and the reason a transaction can pass here
+        // and still fail in a block.
+        miner_pk: Box::new(ec_point::generator()),
+        votes: Votes([0, 0, 0]),
+    };
+
+    let mut window = Vec::with_capacity(1 + preceding_headers.len().min(9));
+    window.push(last_header.clone());
+    window.extend(preceding_headers.iter().take(9).cloned());
+    let headers =
+        Headers::from_vec(window).expect("window always holds last_header, so it is never empty");
+
     ErgoStateContext::new(pre_header, headers, parameters.clone())
 }
 
@@ -1015,6 +1112,211 @@ mod state_context_window_tests {
         assert_eq!(ctx.headers.len(), 10);
         assert_eq!(ctx.headers.first().height, 19);
         assert_eq!(ctx.headers.last().height, 10);
+    }
+}
+
+#[cfg(test)]
+mod upcoming_state_context_tests {
+    use super::*;
+
+    use ergo_chain_types::{ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint};
+    use ergo_lib::chain::transaction::input::prover_result::ProverResult;
+    use ergo_lib::chain::transaction::input::Input;
+    use ergo_lib::ergotree_ir::chain::ergo_box::{ErgoBoxCandidate, NonMandatoryRegisters};
+    use ergotree_interpreter::sigma_protocol::prover::ProofBytes;
+    use ergotree_ir::chain::context_extension::ContextExtension;
+
+    use crate::test_support::{make_box, sigma_bool_tree, SEED_HEIGHT};
+
+    fn tagged(height: u32) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&height.to_le_bytes());
+        bytes
+    }
+
+    fn tagged_root(height: u32) -> [u8; 33] {
+        let mut bytes = [0u8; 33];
+        bytes[..4].copy_from_slice(&height.to_le_bytes());
+        bytes
+    }
+
+    /// `id`, `parent_id` and `state_root` are all distinct per height — those
+    /// are exactly the fields a wrong window silently swaps.
+    fn header_at(height: u32) -> Header {
+        Header {
+            version: 3,
+            id: BlockId(Digest32::from(tagged(height))),
+            parent_id: BlockId(Digest32::from(tagged(height.wrapping_sub(1)))),
+            ad_proofs_root: Digest32::from([0u8; 32]),
+            state_root: ADDigest::from(tagged_root(height)),
+            transaction_root: Digest32::from([0u8; 32]),
+            timestamp: 1_600_000_000_000 + height as u64,
+            n_bits: 118_099_735,
+            height,
+            extension_root: Digest32::from([0u8; 32]),
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce: vec![0u8; 8],
+                pow_distance: None,
+            },
+            votes: Votes([0, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        }
+    }
+
+    /// What a wallet builds: spend one box, create one output declaring the
+    /// block it expects to land in.
+    fn tx_creating_at(creation_height: u32, source: &ErgoBox) -> Transaction {
+        let output = ErgoBoxCandidate {
+            value: source.value,
+            ergo_tree: sigma_bool_tree(true),
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height,
+        };
+        let input = Input::new(
+            source.box_id(),
+            ProverResult {
+                proof: ProofBytes::Empty,
+                extension: ContextExtension::empty(),
+            },
+        );
+        Transaction::new_from_vec(vec![input], vec![], vec![output]).expect("transaction")
+    }
+
+    /// The preheader is the *next* block: height `tip + 1`, parented on the tip
+    /// itself rather than on the tip's parent.
+    #[test]
+    fn preheader_describes_the_next_block() {
+        let last = header_at(1_850_410);
+        let ctx =
+            build_upcoming_state_context(&last, &[header_at(1_850_409)], &Parameters::default());
+
+        assert_eq!(ctx.pre_header.height, last.height + 1);
+        assert_eq!(
+            ctx.pre_header.parent_id, last.id,
+            "the next block is parented on the tip"
+        );
+        assert_ne!(
+            ctx.pre_header.parent_id, last.parent_id,
+            "PreHeader::from(Header) would have copied the tip's own parent"
+        );
+        assert_eq!(ctx.pre_header.version, last.version);
+        assert_eq!(ctx.pre_header.n_bits, last.n_bits);
+        assert_eq!(
+            ctx.pre_header.timestamp,
+            last.timestamp + 1,
+            "the JVM's literal +1, not wall clock"
+        );
+        assert_eq!(
+            *ctx.pre_header.miner_pk,
+            ec_point::generator(),
+            "no miner is known for a block nobody has mined"
+        );
+        assert_eq!(ctx.pre_header.votes, Votes([0, 0, 0]));
+    }
+
+    /// The live failure, in one test: at tip H a node rejected **every**
+    /// transaction the network offered it with `Creation height H+1 >
+    /// preheader height`, because the mempool validated against a preheader
+    /// sitting at H. Wallets target H+1; the upcoming context is the one that
+    /// admits them.
+    #[test]
+    fn tip_plus_one_creation_height_passes_upcoming_and_fails_at_the_tip() {
+        let last = header_at(SEED_HEIGHT);
+        let preceding = [header_at(SEED_HEIGHT - 1)];
+        let source = make_box(true, 0x11);
+        let tx = tx_creating_at(SEED_HEIGHT + 1, &source);
+
+        let upcoming = build_upcoming_state_context(&last, &preceding, &Parameters::default());
+        validate_single_transaction(&tx, vec![source.clone()], vec![], &upcoming)
+            .expect("a transaction targeting the next block must validate against it");
+
+        let at_tip = build_state_context(&last, &preceding, &Parameters::default());
+        let err = validate_single_transaction(&tx, vec![source], vec![], &at_tip)
+            .expect_err("the same transaction is one block early for a preheader at the tip");
+        let reason = format!("{err}");
+        assert!(
+            reason.contains(&format!(
+                "Creation height {} > preheader height",
+                SEED_HEIGHT + 1
+            )),
+            "expected the observed mempool rejection, got: {reason}"
+        );
+    }
+
+    /// The tip occupies a slot in the window, so ten ancestors become nine.
+    /// Total stays at the JVM's `LastHeadersInContext`.
+    #[test]
+    fn window_is_the_tip_plus_nine_ancestors() {
+        let last = header_at(20);
+        let preceding: Vec<Header> = (10..20).rev().map(header_at).collect();
+        let ctx = build_upcoming_state_context(&last, &preceding, &Parameters::default());
+
+        assert_eq!(ctx.headers.len(), 10);
+        assert_eq!(
+            ctx.headers.first().height,
+            20,
+            "the tip is the newest preceding header of the upcoming block"
+        );
+        assert_eq!(
+            ctx.headers.last().height,
+            11,
+            "the tenth ancestor (height 10) drops out to make room for the tip"
+        );
+    }
+
+    /// Near genesis the window is short rather than padded, same as the block
+    /// builder — and unlike it, an empty ancestor slice is legal, because the
+    /// tip alone already satisfies `Headers`' lower bound.
+    #[test]
+    fn short_window_is_not_padded_and_no_ancestors_is_legal() {
+        let ctx = build_upcoming_state_context(
+            &header_at(3),
+            &[header_at(2), header_at(1)],
+            &Parameters::default(),
+        );
+        assert_eq!(ctx.headers.len(), 3);
+        assert_eq!(ctx.headers.first().height, 3);
+        assert_eq!(ctx.headers.last().height, 1);
+
+        let genesis = build_upcoming_state_context(&header_at(1), &[], &Parameters::default());
+        assert_eq!(genesis.headers.len(), 1);
+        assert_eq!(genesis.headers.first().height, 1);
+        assert_eq!(genesis.pre_header.height, 2);
+    }
+
+    /// `lastBlockUtxoRoot` is derived from the newest header in the window
+    /// (ergo-lib `signing.rs` `make_context`), so `headers.first()` is the
+    /// observable proxy for it. A transaction in the mempool at tip H spends
+    /// the UTXO set as of H — the same set the block at H+1 will be validated
+    /// against — so the two windows must be the *same window*, not merely the
+    /// same length.
+    #[test]
+    fn utxo_root_matches_the_block_context_at_the_same_chain_position() {
+        let last = header_at(20);
+        let ancestors: Vec<Header> = (11..20).rev().map(header_at).collect();
+
+        let upcoming = build_upcoming_state_context(&last, &ancestors, &Parameters::default());
+
+        // The block at 21, once mined, validates against the tip and its nine
+        // ancestors — which is exactly what the mempool saw a moment earlier.
+        let mut preceding_for_next = vec![last.clone()];
+        preceding_for_next.extend(ancestors.iter().cloned());
+        let at_next =
+            build_state_context(&header_at(21), &preceding_for_next, &Parameters::default());
+
+        assert_eq!(
+            upcoming.headers.first().state_root,
+            last.state_root,
+            "the UTXO root is the state after the tip, not after its parent"
+        );
+        assert_eq!(
+            upcoming.headers.as_vec(),
+            at_next.headers.as_vec(),
+            "same chain position, same window"
+        );
     }
 }
 
