@@ -63,9 +63,16 @@ methods had one consumer each and did not share it:
 | `proofs_for_transactions`, `emission_box_id` | `main` — `Validator::update_mining_proofs` |
 
 So they become two traits, each implemented **only by `UtxoValidator`**. There
-is no per-method forwarding left in the wrapper to forget: it exposes one
-accessor per trait, and a method added to either trait needs no wrapper change
-at all.
+is no per-method forwarding left in the wrapper to forget: a method added to
+either trait needs no wrapper change at all.
+
+One accessor does survive on `BlockValidator` — `state_persistence()`, and it
+is **required, not defaulted**. `sync/` is generic over `V: BlockValidator` and
+cannot name main's `Validator`, so a trait method is the only route by which it
+can reach storage at all. That is a smaller surface than four defaulted methods
+and a different kind of thing: it reports a capability rather than performing
+work, so `None` is a truthful answer where `Ok(())` was a false claim. See
+"How callers reach the split traits" below.
 
 ⚠ **The absence of an impl is the mode signal.** `DigestValidator` does not
 implement either new trait. Do not reintroduce "digest mode returns a harmless
@@ -148,6 +155,27 @@ pub trait BlockValidator {
     ///     always Ok.
     fn reset_to(&mut self, height: u32, digest: ADDigest) -> Result<(), ValidationError>;
 
+    /// Does this validator own persistent state? `Some` hands out its storage
+    /// lifecycle; `None` means it owns none (digest mode).
+    ///
+    /// REQUIRED — no default body. `sync/` is generic over
+    /// `V: BlockValidator` (`HeaderSync<T, C, S, V>`) and never names main's
+    /// `Validator`, so this is the only route by which a generic caller can
+    /// reach `StatePersistence`. `MiningState` needs no such accessor because
+    /// its only consumer is `main`, which does name the type.
+    ///
+    /// This method answers a capability question; it does NOT perform work.
+    /// That is what separates it from the defaulted no-ops it replaces — a
+    /// `None` return is a truthful answer, whereas `Ok(())` from a defaulted
+    /// `flush` was a claim that work happened.
+    ///
+    /// ⚠ STAGING ARTEFACT: during the v0.8.0 split (steps A–D) this ships
+    /// with a temporary `None` default, because a required method cannot be
+    /// added to a trait additively — all nine implementors would break in one
+    /// commit. **Step E removes that default** along with the four old
+    /// methods. If the default is still present when the split is called
+    /// done, the split failed: four silent defaults will have become one.
+    fn state_persistence(&self) -> Option<&dyn StatePersistence>;
 }
 
 /// Storage lifecycle. Implemented by `UtxoValidator` only — a validator that
@@ -190,30 +218,53 @@ pub trait MiningState {
 
 ### Who implements what
 
-| Type | `BlockValidator` | `StatePersistence` | `MiningState` |
-|---|---|---|---|
-| `UtxoValidator` | ✅ | ✅ | ✅ |
-| `DigestValidator` | ✅ | — | — |
-| `Validator` (enum wrapper, `src/main.rs`) | ✅ | via accessor | via accessor |
-| `sync/` test stubs | ✅ | only those exercising flush | — |
+| Type | `BlockValidator` | `state_persistence()` returns | `StatePersistence` | `MiningState` |
+|---|---|---|---|---|
+| `UtxoValidator` | ✅ | `Some(self)` | ✅ | ✅ |
+| `DigestValidator` | ✅ | `None` | — | — |
+| `Validator` (enum wrapper, `src/main.rs`) | ✅ | match on variant | — | — |
+| `sync/` stubs exercising flush (4) | ✅ | `Some(self)` | ✅ | — |
+| `sync/` stubs that do not (2) | ✅ | `None` | — | — |
 
 ### How callers reach the split traits
 
-The wrapper exposes one accessor per trait, each a match over
-`ValidatorInner` — not a per-method forward:
+**Two different mechanisms, because the two consumers differ.**
+
+`sync/` is generic (`HeaderSync<T, C, S, V: BlockValidator>`) and cannot name
+main's `Validator`, so it reaches storage through the trait method:
+
+```rust
+// in sync/, where V: BlockValidator
+match validator.state_persistence() {
+    Some(p) => p.flush(),          // real work, real Result
+    None    => /* nothing to persist — see facts/sync.md */,
+}
+```
+
+`main` names `Validator` directly and is `MiningState`'s only consumer, so
+that one is an inherent accessor on the wrapper and needs no trait surface:
 
 ```rust
 impl Validator {
-    fn state_persistence(&self) -> Option<&dyn StatePersistence>;
     fn mining_state(&self) -> Option<&dyn MiningState>;
 }
 ```
 
-`None` means the active variant is digest mode. Both borrow from `&self`, so
-the returned reference cannot outlive the caller's guard — relevant because
-`UtxoValidator` holds `Rc`s through the AVL prover and the wrapper carries a
-hand-written `Send` assertion (`src/main.rs`, see its SAFETY comment). Check
-that reasoning rather than inheriting it.
+⚠ Do not "regularise" these into one shape. Putting `mining_state()` on
+`BlockValidator` would force six `sync/` test stubs to declare a capability
+they have no consumer for; making `state_persistence()` inherent would put it
+out of reach of the only caller that needs it.
+
+Both return references borrowed from `&self`, so they cannot outlive the
+caller's guard — relevant because `UtxoValidator` holds `Rc`s through the AVL
+prover and the wrapper carries a hand-written `Send` assertion (`src/main.rs`,
+see its SAFETY comment). Check that reasoning rather than inheriting it.
+
+⚠ **`E0034` hazard, found in step A.** With both `BlockValidator` and
+`MiningState` in scope on a *concrete* `UtxoValidator`,
+`proofs_for_transactions` resolves ambiguously and the call must be qualified
+(`BlockValidator::proofs_for_transactions(&v, ..)`). Generic `V: BlockValidator`
+call sites are unaffected. The ambiguity disappears in step E with the shims.
 
 ### No behavioural delta
 

@@ -62,7 +62,9 @@ How the sync machine queries persistent storage.
 - **Precondition**: caller MUST have flushed the validator before invoking
   this — see the flush ordering rule under "Cross-DB Durability Handshake"
   below. Since v0.8.0 that flush is reached through
-  `validator.state_persistence()`, which is `None` in digest mode; see
+  `validator.state_persistence()` — a required `BlockValidator` method, so it
+  is callable from sync's generic `V: BlockValidator` bound — which returns
+  `None` in digest mode; see
   "Flushing a validator that owns no state" below for what the precondition
   means there.
 
