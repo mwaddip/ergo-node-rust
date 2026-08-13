@@ -132,11 +132,18 @@ fn reemission_rules_for(
 /// Pre-computed state proofs for mining candidate generation.
 /// Written by the validator after each block, read by the mining task.
 #[derive(Clone)]
+/// What the post-apply hook can supply that the mining task cannot get for
+/// itself: the parent it was applied against, and the emission box — whose id
+/// comes from `MiningState`, i.e. from the validator, which the mining task
+/// cannot reach.
+///
+/// It no longer carries AD proofs or a pre-built emission transaction. Those
+/// were computed for an emission-ONLY block; with transaction selection the
+/// proofs must cover the assembled list, so `generate_candidate` computes them
+/// through `proofs_from_storage` against the reader.
 struct MiningProofData {
     parent: ergo_chain_types::Header,
-    ad_proof_bytes: Vec<u8>,
-    state_root: ADDigest,
-    emission_tx: ergo_validation::Transaction,
+    emission_box: ergo_validation::ErgoBox,
     tip_height: u32,
 }
 
@@ -247,7 +254,6 @@ impl Validator {
             None => return,
         };
 
-        let next_height = header.height + 1;
         let emission_id = match mining_state.emission_box_id() {
             Some(id) => id,
             None => return, // all ERG emitted — and now that is all it means
@@ -269,35 +275,14 @@ impl Validator {
             }
         };
 
-        let emission_tx = match ergo_mining::emission::build_emission_tx(
-            &emission_box,
-            next_height,
-            &mining.config.miner_pk,
-            mining.config.reward_delay,
-            &mining.config.reemission_rules,
-        ) {
-            Ok(tx) => tx,
-            Err(e) => {
-                tracing::warn!("mining: failed to build emission tx: {e}");
-                return;
-            }
-        };
-
-        let (ad_proof_bytes, state_root) =
-            match mining_state.proofs_for_transactions(std::slice::from_ref(&emission_tx)) {
-                Ok(result) => result,
-                Err(e) => {
-                    tracing::warn!("mining: proof computation failed: {e}");
-                    return;
-                }
-            };
-
+        // Deliberately stops here. Building the emission tx and its proofs
+        // belongs to `generate_candidate`, which knows the full transaction
+        // list; doing it here would compute proofs for a block that is not the
+        // one we are about to mine.
         let mut guard = mining.proof_cache.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(MiningProofData {
             parent: header.clone(),
-            ad_proof_bytes,
-            state_root,
-            emission_tx,
+            emission_box,
             tip_height: header.height,
         });
     }
@@ -3180,6 +3165,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mining_height = shared_validated_height.clone();
             let mining_chain = chain.clone();
             let mining_store = store.clone();
+            // Read-only state access for proofs and UTXO lookups. Re-read per
+            // iteration via `current()` rather than captured once, so the
+            // at-tip storage reopen swaps underneath us correctly.
+            let mining_swap_reader = swap_reader.clone();
+            let mining_mempool = mempool.clone();
             tokio::spawn(async move {
                 let mut last_height = 0u32;
                 loop {
@@ -3286,51 +3276,104 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
 
-                    // Build extension + header + WorkMessage
-                    let extension = match ergo_mining::extension::build_extension(
+                    // Everything below used to be assembled inline here —
+                    // extension, CandidateBlock, work message — which is why
+                    // `generate_candidate` had no production caller and mined
+                    // blocks carried the emission transaction alone. The crate
+                    // owns assembly; this task supplies what only it can reach.
+                    // See facts/mining.md § "Ownership".
+
+                    let reader = match mining_swap_reader.current() {
+                        Some(r) => r,
+                        // Mid-swap at the at-tip storage reopen. Skipping costs
+                        // one poll interval; the next iteration re-reads.
+                        None => continue,
+                    };
+
+                    // Prioritised mempool transactions, with the serialized size
+                    // selection bounds against.
+                    let candidate_txs: Vec<(ergo_validation::Transaction, usize)> = {
+                        let pool = mining_mempool.lock().await;
+                        pool.all_prioritized()
+                            .into_iter()
+                            .map(|u| (u.tx.clone(), u.tx_bytes.len()))
+                            .collect()
+                    };
+
+                    // Ancestors for the upcoming-block context, newest first,
+                    // WITHOUT the parent — generate_candidate prepends it. A
+                    // one-header window here would fail any script reading
+                    // headers[5] and get a valid transaction evicted.
+                    let (active_params, ancestor_headers) = {
+                        let chain_guard = mining_chain.lock().await;
+                        let params = chain_guard.active_parameters().clone();
+                        let mut hs = chain_guard
+                            .headers_from(proof_data.parent.height.saturating_sub(9), 10);
+                        hs.reverse();
+                        hs.retain(|h| h.height != proof_data.parent.height);
+                        (params, hs)
+                    };
+
+                    let lookup_reader = reader.clone();
+                    let utxo_lookup = move |id: &[u8; 32]| -> Option<ergo_validation::ErgoBox> {
+                        let bytes = lookup_reader.lookup_key(id)?;
+                        ergo_validation::deserialize_box(&bytes).ok()
+                    };
+
+                    // Proofs without the validator: sync/ owns it and it is
+                    // !Sync. This reads the committed tree through the reader
+                    // and builds its own prover, so it cannot disturb
+                    // validation. facts/validation.md § "Free Function".
+                    let proof_reader = reader.clone();
+                    // Always `Some`: the Option layer means "no UTXO access at
+                    // all" (digest mode), and we hold a reader by this point.
+                    let validator_proofs = move |txs: &[ergo_validation::Transaction]| {
+                        Some(ergo_validation::proofs_from_storage(
+                            proof_reader.resolver(),
+                            proof_reader.root_state(),
+                            txs,
+                        ))
+                    };
+
+                    match ergo_mining::generate_candidate(
+                        &gen.config,
                         &proof_data.parent,
+                        n_bits,
                         &parent_interlinks,
+                        &proof_data.emission_box,
                         boundary_params.as_ref(),
                         &proposed_update_bytes,
+                        &candidate_txs,
+                        &active_params,
+                        &ancestor_headers,
+                        &utxo_lookup,
+                        &validator_proofs,
                     ) {
-                        Ok(ext) => ext,
-                        Err(e) => {
-                            tracing::warn!("mining: extension build failed: {e}");
-                            continue;
-                        }
-                    };
-
-                    let candidate = ergo_mining::CandidateBlock {
-                        parent: proof_data.parent.clone(),
-                        version: proof_data.parent.version,
-                        n_bits,
-                        state_root: proof_data.state_root,
-                        ad_proof_bytes: proof_data.ad_proof_bytes.clone(),
-                        transactions: vec![proof_data.emission_tx.clone()],
-                        timestamp: {
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as u64;
-                            std::cmp::max(now, proof_data.parent.timestamp + 1)
-                        },
-                        extension,
-                        votes: gen.config.votes,
-                        header_bytes: vec![],
-                    };
-
-                    match ergo_mining::candidate::build_work_message(
-                        &candidate,
-                        &gen.config.miner_pk.h,
-                    ) {
-                        Ok((header_bytes, work)) => {
-                            let mut candidate = candidate;
-                            candidate.header_bytes = header_bytes;
-                            gen.cache_candidate(candidate, work, current);
-                            tracing::debug!(height = current + 1, "mining candidate cached");
+                        Ok(generated) => {
+                            // Step 3.6: the crate identifies unusable
+                            // transactions and cannot remove them itself.
+                            // Dropping these on the floor silently re-selects
+                            // and re-rejects them every 15s forever.
+                            if !generated.invalid_txs.is_empty() {
+                                let mut pool = mining_mempool.lock().await;
+                                for id in &generated.invalid_txs {
+                                    pool.invalidate(id);
+                                }
+                                tracing::debug!(
+                                    count = generated.invalid_txs.len(),
+                                    "mining: evicted transactions rejected during selection"
+                                );
+                            }
+                            let tx_count = generated.block.transactions.len();
+                            gen.cache_candidate(generated.block, generated.work, current);
+                            tracing::debug!(
+                                height = current + 1,
+                                transactions = tx_count,
+                                "mining candidate cached"
+                            );
                         }
                         Err(e) => {
-                            tracing::warn!("mining: work message build failed: {e}");
+                            tracing::warn!("mining: candidate generation failed: {e}");
                         }
                     }
                 }
