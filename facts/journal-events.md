@@ -1,6 +1,6 @@
 # Journal Events Contract
 
-Version: 1.6.0
+Version: 2.0.0
 
 Stable contract for parseable events in the node's structured log
 output. Consumers (e.g. the Ergo Node Doctor adapter) write parsers
@@ -26,6 +26,32 @@ The node advertises this contract's version in `/info`:
 Consumers refuse to parse on unrecognized major. Additive changes (new
 events, new optional fields) are minor bumps.
 
+### 2.0.0 — deferred script evaluation removed (v0.8.0)
+
+A major bump, because three **stable** events were removed outright and two
+field domains narrowed. Per the stability rules below, that is exactly what a
+major is for.
+
+| Change | Was |
+|---|---|
+| `deferred_eval_backlog` removed | 1.5, replaced by `catchup_progress` |
+| `deferred_eval_gate_engaged` removed | 1.6 |
+| `eval_frontier_hole` removed | 1.6 |
+| `validation_rollback_failed.path` loses `eval_failure` | now only `reorg` |
+| `validation_stuck.error_kind` loses `script_eval` | now classifies as `other` |
+
+All five describe deferred script evaluation, which no longer exists:
+`apply_state` evaluates before persisting, so there is no queue to report on,
+no dispatch gate to engage, and no verification frontier to fall behind.
+
+⚠ **The stability rules below also require a deprecation release, and this did
+not get one.** The events went in the same release that removed the machinery
+behind them, because emitting a deprecated `eval_frontier_hole` from a node
+with no frontier would mean fabricating the fields. Consumers pinned to major 1
+— the Doctor adapter among them — will refuse to parse a v0.8.0 node until they
+are updated. That is a real cost and it was accepted knowingly rather than
+overlooked.
+
 ## Format conventions
 
 Each contract event is a single line emitted via `tracing::info!()`,
@@ -37,7 +63,7 @@ human-readable subscriber. The line carries:
 - Zero or more **fields**: `key=value` pairs appended via tracing's
   named-field syntax. Keys are snake_case ASCII. String-recorded values
   are surrounded by double quotes in the default formatter (e.g.
-  `error_kind="script_eval"`); numeric and `Display`-formatted values
+  `error_kind="missing_key"`); numeric and `Display`-formatted values
   are not. Parsers MUST tolerate optional surrounding quotes on any
   value.
 - Optional **free-text suffix** after the marker, for human
@@ -64,11 +90,12 @@ One field-level convention, which applies to **every** event that carries it:
   `HeaderSync`'s struct field of the same name.** That field is a cache
   reconciled at sweep *end*; any event emitted mid-sweep reads it frozen at the
   pre-sweep tip. This is stated once here rather than per entry because it has
-  now caught two events — `deferred_eval_backlog`, where the stale read would
-  peg `eval_lag` at 0 by saturation and report a healthy node while the queue
-  grew, and `eval_frontier_hole`, which is reached from the dispatch gate's
-  mid-sweep drain. Assume the next event that carries the field has the same
-  trap.
+  caught two events before either was retired in 2.0 — `deferred_eval_backlog`,
+  where the stale read would peg `eval_lag` at 0 by saturation and report a
+  healthy node while the queue grew, and `eval_frontier_hole`, reached from the
+  dispatch gate's mid-sweep drain. Both are gone; the trap is not. `catchup_progress`
+  carries the field today and reads it from the validator for exactly this
+  reason. Assume the next event that carries it has the same trap.
 
 A parser consuming these cannot tell a stale value from a fresh one, which is
 why the rule lives in the contract rather than in a comment at each emit site.
@@ -270,12 +297,19 @@ phase's `_started`.
 - **Emitted:** when the validated frontier (`validated_height`) fails
   to advance past the same height for `attempts >= 5` consecutive
   sweeps — the next block is failing deterministically. Covers both
-  failure modes: an `apply_state` error (state-DB inconsistency such
-  as `missing_key`) and a deferred script-eval rejection (the
-  evaluator refusing a transaction). `error_kind` names the mode — an
-  `apply_state` error kind, or `script_eval` for an eval-failure
-  stall; `missing_key` is present only for the `apply_state`
-  `missing_key` case. Surfaces the silent retry loop that previously
+  failure modes, though since 2.0 they arrive by one route: an
+  `apply_state` error (state-DB inconsistency such as `missing_key`)
+  and a script rejection, which `apply_state` now returns directly
+  because evaluation happens inside it. `error_kind` names the mode
+  via `classify_apply_state_error`; `missing_key` is present only for
+  the `apply_state` `missing_key` case.
+
+  ⚠ **`error_kind` no longer takes the value `script_eval`.** It named
+  the deferred eval-failure path, which no longer exists; a wedged
+  script failure now classifies as `other`. Restoring the distinction
+  means teaching `classify_apply_state_error` to recognise a script
+  rejection, which is a separate change and has not been made — the
+  Doctor adapter loses that discrimination until it is. Surfaces the silent retry loop that previously
   buried a stuck frontier in INFO-level logs. The Doctor adapter
   treats this as a primary "node stuck" signal. Emitted at most once
   per height; re-emits when the height changes or after real progress
@@ -283,113 +317,39 @@ phase's `_started`.
   `apply_state` path — a deferred eval-failure stall (the loop that
   hammered on a wrongly-rejected script) did not emit it.
 
-#### `deferred_eval_backlog`
+#### `catchup_progress`
 - **Level:** INFO
-- **Marker:** `"deferred eval backlog"`
-- **Fields:** `evals_in_flight` (u64: script evaluations dispatched to Rayon
-  and not yet drained), `state_applied_height` (u64: the **applied tip**, read
-  from the validator — see the warning below), `script_verified_height` (u64),
-  `eval_lag` (u64: applied tip − script_verified_height),
-  `jemalloc_allocated` (u64, **omitted entirely** when no heap probe is wired,
-  same convention as `validation_stuck`'s optional `missing_key`),
-  `eval_bytes_in_flight` (u64: Σ `approx_heap_bytes` of dispatched-not-drained
-  evals — the accumulator the byte bound gates on; **added 1.6**)
-- **Since:** 1.5 (added 2026-08-12); `eval_bytes_in_flight` since 1.6
+- **Marker:** `"catch-up progress"`
+- **Fields:** `state_applied_height` (u64: the **applied tip**, read from the
+  validator rather than from sync's struct field), `jemalloc_allocated`
+  (u64, **omitted entirely** when no heap probe is wired — an absent field
+  rather than a rendered `None`, same convention as `validation_stuck`'s
+  optional `missing_key`)
+- **Since:** 2.0 (replaces `deferred_eval_backlog`, 1.5–1.6)
 - **Stability:** stable
-- **Emitted:** at most once per 5 s during catch-up, from the sweep loop after
-  the non-blocking drain and before the flush — so the count is post-drain and
-  the heap reading is pre-flush. **Not emitted at chain tip**, where a
-  single-block sweep drains synchronously every time and the record would be
-  noise.
-- **Why it exists:** the queue was unbounded until 2026-08-12. During catch-up
-  the sweep-end drain never blocked, so if script verification was slower than
-  state application the queue grew across sweeps without limit — which is how a
-  4-thread host reached 10.62 GiB of anonymous RSS and was OOM-killed on
-  2026-08-12. It is now bounded by `eval_backlog_max_mb` /
-  `eval_backlog_max_blocks`; the record remains the way an operator sees depth
-  approaching those bounds. (An earlier revision of this entry derived an eval
-  count from a ~410 KB per-item figure that was 6–8× too low. Quote the
-  anon-rss; see `facts/sync.md`.)
-- ⚠ **`eval_lag` was meaningless before 1.6** — it derives from
-  `script_verified_height`, which used to freeze on the first out-of-order eval
-  result. Measured live: `eval_lag=187711` while `evals_in_flight=1` and
-  jemalloc `allocated` flat at ~1.14 GB across 190,000 blocks. The watermark is
-  fixed and the field now tracks reality, **except** on a node configured with
-  `checkpoint_height` above its start height, where heights at or below the
-  checkpoint never dispatch an eval and `eval_lag` is permanently large by that
-  offset. Anything quoting `eval_lag` from a pre-1.6 run is quoting a frozen
-  number.
-- ⚠ **`state_applied_height` is the validator's `validated_height()`, not the
-  sync struct's field of the same name.** That field is a cache reconciled only
-  after the sweep loop; mid-sweep it is frozen at the pre-sweep tip, which
-  would peg `eval_lag` at 0 by saturation and report a healthy system while the
-  queue grew.
+- **Emitted:** at most once per 5 s during catch-up, from the sweep loop. Not
+  emitted at tip.
+- **Why it exists:** catch-up is otherwise silent between flushes, and an
+  operator watching a long sync needs to know it is moving. The applied tip is
+  read from the validator because sync's own field lags it within a sweep.
 
-#### `deferred_eval_gate_engaged`
-- **Level:** DEBUG
-- **Marker:** `"eval dispatch gate engaged"`
-- **Fields:** `evals_in_flight` (u64), `eval_bytes_in_flight` (u64),
-  `incoming_bytes` (u64: `approx_heap_bytes` of the eval that did not fit —
-  explains why *this* block tripped it), `bound` (string:
-  `bytes`|`blocks`|`both` — which bound tripped, named rather than left to be
-  inferred from the two numbers, since the operator re-tuning one needs to know
-  which regime the host is in)
-- **Since:** 1.6 (added 2026-08-12)
-- **Stability:** stable
-- **Emitted:** when the dispatch gate blocks because adding an eval would
-  exceed the byte bound or the count bound, immediately before it drains to
-  half of each enabled bound.
-- *The marker was `"deferred eval backlog at bound — draining to half"` in the
-  first draft of this entry. Changed before release for two reasons: it began
-  with `deferred_eval_backlog`'s entire marker, so a prefix parser matched both
-  events and then failed looking for `eval_lag`; and it carried a U+2014 em
-  dash inside the matched portion. The configured limits were also documented
-  as fields — dropped, because they are static and the operator already has
-  them; the emitted set above is the one that varies.*
-- **Why it exists:** the gate blocking is the node deliberately trading sync
-  throughput for bounded memory, and it is otherwise invisible — the operator
-  sees only that catch-up got slower. DEBUG rather than INFO because on a host
-  that genuinely cannot keep up this fires continuously; it is a diagnostic for
-  "why is catch-up slow", not a health signal. Sustained engagement means the
-  host is verification-bound, which is the condition the bound exists for and
-  not in itself a fault.
-
-#### `eval_frontier_hole`
-- **Level:** WARN
-- **Marker:** `"no eval outstanding below the script frontier"`
-- **Fields:** `script_verified_height` (u64: where the frontier is stuck),
-  `hole` (u64: the height it cannot pass, `script_verified_height + 1`),
-  `buffered` (u64: reorder-buffer entries discarded at this point — the number
-  that would otherwise have grown by one per block forever),
-  `state_applied_height` (u64: how far state has run ahead, i.e. the size of
-  the span this leaves unattested)
-- **Since:** 1.6 (added 2026-08-12)
-- **Stability:** stable
-- **Emitted:** when a drain finds nothing in flight below the frontier — i.e.
-  no result can ever arrive to advance it. **Latched: once per distinct hole,
-  not once per occurrence**, re-arming when the frontier moves; otherwise this
-  is a WARN on every block for the life of the process. The reorder buffer is
-  dropped at the same point so it stops accumulating one `u32` per block.
-- **Why it exists:** the expected cause is a `checkpoint_height` configured
-  above the node's start height. Heights at or below the checkpoint never
-  dispatch an eval, so the frontier can never reach it and `eval_lag` is
-  permanently large by that offset. **This is configuration, not backlog** —
-  read `evals_in_flight` and `eval_bytes_in_flight` for real depth. If it fires
-  on a node with **no** checkpoint configured, that is a genuine defect in
-  frontier accounting and should be reported. See `facts/sync.md`
-  § "Checkpoint frontier hole", which records the open question of whether the
-  frontier should advance over deliberately-skipped heights.
+*Replaced `deferred_eval_backlog` in 2.0. That event carried four more fields
+— `evals_in_flight`, `script_verified_height`, `eval_lag`, and
+`eval_bytes_in_flight` — all describing the deferred-eval queue, which no
+longer exists. Anything quoting `eval_lag` from a v0.7.x journal is quoting a
+number that was frozen by the reorder-buffer bug until 2026-08-12 anyway; see
+facts/sync.md § "Block Assembly".*
 
 #### `validation_rollback_failed`
 - **Level:** ERROR
 - **Marker:** `"validation rollback failed"`
 - **Fields:** `height` (u64: the rollback TARGET height), `path`
-  (string: `eval_failure`|`reorg`), `error` (string: the underlying
+  (string: `reorg` — the only value since 2.0; see below), `error` (string: the underlying
   storage/rollback error, Display-formatted)
 - **Since:** 1.4 (added 2026-06-12 with `reset_to → Result`)
 - **Stability:** stable
 - **Emitted:** when `BlockValidator::reset_to` returns Err on the
-  deferred-eval-failure path or the reorg-control path — the underlying
+  reorg-control path — the underlying
   state rollback failed and the validator did NOT move (its height and
   digest are unchanged; facts/validation.md `reset_to` Err
   postcondition). Sync holds every watermark in place rather than

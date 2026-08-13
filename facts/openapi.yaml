@@ -1643,8 +1643,9 @@ components:
           type: string
           description: |
             Version of the journal-events contract this build emits — see
-            `facts/journal-events.md`.
-          example: '1.0'
+            `facts/journal-events.md`. Major 2 as of v0.8.0; consumers pinned
+            to major 1 refuse to parse.
+          example: '2.0'
         statsVersion:
           type: string
           description: |
