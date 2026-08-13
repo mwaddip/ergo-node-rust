@@ -16,7 +16,9 @@ use crate::sections::{parse_ad_proofs, parse_block_transactions, parse_extension
 use crate::state_changes::{compute_state_changes, transactions_to_summaries};
 use crate::tx_validation;
 use crate::voting;
-use crate::{ApplyStateOutcome, BlockValidator, ScriptEvalMode, ValidationError};
+use crate::{
+    ApplyStateOutcome, BlockValidator, ScriptEvalMode, StatePersistence, ValidationError,
+};
 
 /// Key length for Ergo's UTXO AVL+ tree (BoxId = 32 bytes).
 pub(crate) const KEY_LENGTH: usize = 32;
@@ -314,6 +316,23 @@ impl BlockValidator for DigestValidator {
         self.current_digest = digest;
         tracing::info!(height, "validator reset to fork point");
         Ok(())
+    }
+
+    /// Digest mode owns no persistent state — there is nothing to flush and
+    /// no cache to resize, so there is no [`StatePersistence`] to hand out.
+    ///
+    /// Written out even though the trait's temporary default would supply the
+    /// same `None`: this is the answer the contract's table specifies, and
+    /// stating it here means step E deletes one default rather than also
+    /// having to work out which implementors were silently riding it.
+    ///
+    /// ⚠ The absence of a [`StatePersistence`] impl is the mode signal. Do
+    /// not "helpfully" give `DigestValidator` a no-op one — a defaulted
+    /// `resize_cache` on `BlockValidator` is exactly what let the enum
+    /// wrapper in `src/main.rs` drop the at-tip cache resize for the life of
+    /// the feature while logging success.
+    fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+        None
     }
 }
 

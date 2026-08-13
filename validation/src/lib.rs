@@ -311,6 +311,32 @@ pub trait BlockValidator {
     /// onto the un-rolled state — it decides recovery.
     fn reset_to(&mut self, height: u32, digest: ADDigest) -> Result<(), ValidationError>;
 
+    /// Does this validator own persistent state? `Some` hands out its storage
+    /// lifecycle; `None` means it owns none (digest mode).
+    ///
+    /// Required once step E lands — see the staging note below. `sync/` is
+    /// generic over `V: BlockValidator` (`HeaderSync<T, C, S, V>`) and never
+    /// names main's `Validator`, so this is the only route by which a generic
+    /// caller can reach [`StatePersistence`]. [`MiningState`] needs no such
+    /// accessor because its only consumer is `main`, which does name the type.
+    ///
+    /// This method answers a capability question; it does NOT perform work.
+    /// That is what separates it from the defaulted no-ops it replaces — a
+    /// `None` return is a truthful answer, whereas `Ok(())` from a defaulted
+    /// `flush` was a claim that work happened.
+    ///
+    /// ⚠ **STAGING ARTEFACT — the default body below is temporary and must
+    /// not be read as a design choice.** It is the exact shape this split
+    /// exists to delete. It ships only because a required method cannot be
+    /// added to a trait additively: all nine implementors across three crates
+    /// would break in one commit. **Step E of the v0.8.0 split removes this
+    /// default** along with the four deprecated methods beneath it. If the
+    /// default is still here when the split is called done, the split failed
+    /// — four silent defaults will have become one.
+    fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+        None
+    }
+
     /// Force a durable commit (fsync) of all outstanding storage writes.
     /// Call periodically during long sweeps (bounds crash data loss) and
     /// on graceful shutdown. Digest-mode validators may make this a no-op.

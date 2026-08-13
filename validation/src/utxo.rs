@@ -199,6 +199,13 @@ impl BlockValidator for UtxoValidator {
         Ok(())
     }
 
+    /// UTXO mode owns an AVL+ tree over redb, so it hands out its own
+    /// storage lifecycle. Overrides the trait's temporary `None` default,
+    /// which step E deletes.
+    fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+        Some(self)
+    }
+
     // ── Shims onto the split traits ─────────────────────────────────────
     //
     // These four still hang off `BlockValidator` only because `sync/` and
