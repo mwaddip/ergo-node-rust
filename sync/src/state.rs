@@ -43,26 +43,65 @@ fn sync_info_anchor_ids(info: &SyncInfo) -> Vec<BlockId> {
 
 /// Result of a paired state/store flush.
 ///
-/// Discriminates three cases:
+/// Discriminates four cases:
 /// - `Flushed(M)`: validator flushed successfully at height `M`; modifier
 ///   store's `validated_height` was advanced to `M`.
-/// - `NoValidator`: light-mode path; there is no state to flush, and
+/// - `NothingToPersist(M)`: the validator owns no persistent state
+///   (`state_persistence()` is `None` — digest mode). Nothing was fsynced,
+///   but the validator has a real `validated_height()` and the store side of
+///   the pair runs exactly as it does after a successful flush.
+/// - `NoValidator`: light-mode path; there is no validator at all, and
 ///   `validated_height` is not recorded.
 /// - `Failed`: validator's `flush()` returned an error; modifier store's
 ///   `validated_height` was NOT advanced.
+///
+/// ⚠ `NothingToPersist` and `NoValidator` are NOT interchangeable, and folding
+/// the first into the second is a behaviour change, not a simplification.
+/// Digest mode has a validator and a real height; before the v0.8.0 trait split
+/// it reached `Flushed(M)` through `BlockValidator`'s defaulted `flush` —
+/// returning `Ok(())` for work it never did — so the `set_validated_height(M)`
+/// write and the prune both happened. They must keep happening. Light mode
+/// deliberately skips both. See `../facts/sync.md` § "Flushing a validator that
+/// owns no state".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FlushOutcome {
     Flushed(u32),
+    NothingToPersist(u32),
     NoValidator,
     Failed,
 }
 
 impl FlushOutcome {
     /// Whether the caller should advance its `last_flush_height` bookkeeping.
-    /// Advances on either a successful flush or no-validator (light mode);
-    /// stays put on flush failure so the next `should_flush()` retries.
+    /// Advances on a successful flush, on nothing-to-persist (digest mode),
+    /// and on no-validator (light mode); stays put on flush failure so the
+    /// next `should_flush()` retries.
     pub(crate) fn advances_last_flush(self) -> bool {
-        matches!(self, FlushOutcome::Flushed(_) | FlushOutcome::NoValidator)
+        matches!(
+            self,
+            FlushOutcome::Flushed(_)
+                | FlushOutcome::NothingToPersist(_)
+                | FlushOutcome::NoValidator
+        )
+    }
+
+    /// The height the cross-DB pair may record and prune against, if any.
+    ///
+    /// `Some(M)` for both a real fsync and the nothing-to-persist case: the
+    /// store side of the handshake does not distinguish them, because step (1)
+    /// is either satisfied or vacuous. `None` for light mode (no height exists)
+    /// and for a failed flush (durability is UNKNOWN — advancing anything on
+    /// the strength of it is exactly the bug the split exists to prevent).
+    ///
+    /// Single decision point on purpose: the prune call sites match on the
+    /// outcome with `if let`, which the compiler does not check for
+    /// exhaustiveness, so a future variant must be considered here rather than
+    /// silently falling out of three separate patterns.
+    pub(crate) fn committed_height(self) -> Option<u32> {
+        match self {
+            FlushOutcome::Flushed(m) | FlushOutcome::NothingToPersist(m) => Some(m),
+            FlushOutcome::NoValidator | FlushOutcome::Failed => None,
+        }
     }
 }
 
@@ -87,12 +126,18 @@ pub(crate) fn try_flush_validator<V: BlockValidator>(
 ) -> FlushOutcome {
     match validator {
         None => FlushOutcome::NoValidator,
-        Some(v) => match v.flush() {
-            Ok(()) => FlushOutcome::Flushed(v.validated_height()),
-            Err(e) => {
-                tracing::warn!(height = height_context, error = %e, "validator flush failed");
-                FlushOutcome::Failed
-            }
+        // No `StatePersistence` = digest mode: nothing to fsync, which is not
+        // a failure and not the same as having no validator. See
+        // `FlushOutcome::NothingToPersist`.
+        Some(v) => match v.state_persistence() {
+            None => FlushOutcome::NothingToPersist(v.validated_height()),
+            Some(p) => match p.flush() {
+                Ok(()) => FlushOutcome::Flushed(v.validated_height()),
+                Err(e) => {
+                    tracing::warn!(height = height_context, error = %e, "validator flush failed");
+                    FlushOutcome::Failed
+                }
+            },
         },
     }
 }
@@ -101,16 +146,17 @@ pub(crate) fn try_flush_validator<V: BlockValidator>(
 ///
 /// Takes the outcome of [`try_flush_validator`] (validator already flushed)
 /// and finishes the durability handshake on the store side. Order is
-/// load-bearing: `set_validated_height(M)` (only on `Flushed`) then
-/// `store.flush()`. A failed validator flush MUST NOT advance the modifier
-/// store's recorded `validated_height`; light mode (no validator) skips the
-/// `set_validated_height` write entirely. The store flush always runs to
-/// fsync any accumulated section writes.
+/// load-bearing: `set_validated_height(M)` (only when the outcome carries a
+/// height) then `store.flush()`. A failed validator flush MUST NOT advance the
+/// modifier store's recorded `validated_height`; light mode (no validator)
+/// skips the `set_validated_height` write entirely. Digest mode
+/// (`NothingToPersist`) does write it — see that variant's doc. The store flush
+/// always runs to fsync any accumulated section writes.
 pub(crate) async fn complete_store_flush_pair<S: SyncStore>(
     outcome: FlushOutcome,
     store: &S,
 ) {
-    if let FlushOutcome::Flushed(m) = outcome {
+    if let Some(m) = outcome.committed_height() {
         store.set_validated_height(m).await;
     }
     store.flush().await;
@@ -904,7 +950,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         tracing::info!(height, "header sync exiting — flushing state");
         let outcome = try_flush_validator(self.validator.as_ref(), height);
         complete_store_flush_pair(outcome, &self.store).await;
-        if let FlushOutcome::Flushed(m) = outcome {
+        if let Some(m) = outcome.committed_height() {
             maybe_prune_at_horizon(&self.store, &self.chain, m, self.config.blocks_to_keep).await;
         }
         if outcome.advances_last_flush() {
@@ -1492,7 +1538,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     if self.should_flush(height) {
                         let outcome = try_flush_validator(self.validator.as_ref(), height);
                         complete_store_flush_pair(outcome, &self.store).await;
-                        if let FlushOutcome::Flushed(m) = outcome {
+                        if let Some(m) = outcome.committed_height() {
                             maybe_prune_at_horizon(
                                 &self.store,
                                 &self.chain,
@@ -1609,7 +1655,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         let outcome =
             try_flush_validator(self.validator.as_ref(), self.state_applied_height);
         complete_store_flush_pair(outcome, &self.store).await;
-        if let FlushOutcome::Flushed(m) = outcome {
+        if let Some(m) = outcome.committed_height() {
             maybe_prune_at_horizon(&self.store, &self.chain, m, self.config.blocks_to_keep).await;
         }
         if outcome.advances_last_flush() {
@@ -2350,19 +2396,31 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
 
         // ── In-place cache resize (no reopen, no second mmap) ──
         if let Some(cache_bytes) = self.synced_cache_bytes.take() {
-            if let Some(ref validator) = self.validator {
-                if let Err(e) = validator.resize_cache(cache_bytes) {
-                    tracing::error!(
-                        cache_bytes,
-                        error = ?e,
-                        "at-tip: resize_cache failed; continuing with cold-sync cache size"
-                    );
-                } else {
-                    tracing::info!(
-                        cache_bytes,
-                        "at-tip: cache resized in-place on existing storage handle"
-                    );
+            // Only a validator that owns storage has a cache to resize. Digest
+            // mode has none, and must NOT reach the success log below — before
+            // the v0.8.0 trait split the defaulted `resize_cache` returned
+            // `Ok(())` there and this logged "cache resized in-place" for a
+            // resize that never happened. That false success is the reason the
+            // split exists (facts/validation.md).
+            match self.validator.as_ref().and_then(|v| v.state_persistence()) {
+                Some(persistence) => {
+                    if let Err(e) = persistence.resize_cache(cache_bytes) {
+                        tracing::error!(
+                            cache_bytes,
+                            error = ?e,
+                            "at-tip: resize_cache failed; continuing with cold-sync cache size"
+                        );
+                    } else {
+                        tracing::info!(
+                            cache_bytes,
+                            "at-tip: cache resized in-place on existing storage handle"
+                        );
+                    }
                 }
+                None => tracing::debug!(
+                    cache_bytes,
+                    "at-tip: validator owns no persistent state; no cache to resize"
+                ),
             }
         }
 
@@ -2379,7 +2437,12 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 // (and the new validator's height field) believe state is at
                 // `height`, leaving an N-block gap where any later block that
                 // spends an output from the gap fails with "Key does not exist".
-                if let Err(e) = validator.flush() {
+                //
+                // A validator that owns no persistent state (digest mode) has
+                // no write tx to lose, so the absence of `StatePersistence`
+                // proceeds to the rebuild; only a real `Err` aborts it
+                // (../facts/sync.md § "At-tip Storage Reopen", step 1).
+                if let Some(Err(e)) = validator.state_persistence().map(|p| p.flush()) {
                     tracing::error!(
                         height,
                         error = ?e,
@@ -2701,7 +2764,7 @@ mod cross_db_flush_tests {
     use super::*;
     use ergo_chain_types::{ADDigest, Header};
     use ergo_validation::{
-        ApplyStateOutcome, BlockValidator, Parameters, ValidationError,
+        ApplyStateOutcome, BlockValidator, Parameters, StatePersistence, ValidationError,
     };
     use std::sync::Mutex;
 
@@ -2837,9 +2900,63 @@ mod cross_db_flush_tests {
             unimplemented!("not called in flush-ordering tests")
         }
 
+        fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+            Some(self)
+        }
+    }
+
+    impl StatePersistence for FakeValidator {
         fn flush(&self) -> Result<(), ValidationError> {
             self.flush_result
                 .map_err(|s| ValidationError::ProofVerificationFailed(s.to_string()))
+        }
+
+        fn resize_cache(&self, _cache_bytes: usize) -> Result<(), ValidationError> {
+            unimplemented!("not called in flush-ordering tests")
+        }
+    }
+
+    /// Digest-mode shape: a validator that owns no persistent state. Its
+    /// `state_persistence()` is `None`, which is NOT the light-mode
+    /// no-validator case — the store side of the pair still runs.
+    struct NoPersistenceValidator {
+        validated_height: u32,
+        digest: ADDigest,
+    }
+
+    impl BlockValidator for NoPersistenceValidator {
+        fn apply_state(
+            &mut self,
+            _header: &Header,
+            _block_txs: &[u8],
+            _ad_proofs: Option<&[u8]>,
+            _extension: &[u8],
+            _preceding_headers: &[Header],
+            _active_params: &Parameters,
+            _expected_boundary_params: Option<&Parameters>,
+            _expected_proposed_update: Option<&[u8]>,
+        ) -> Result<ApplyStateOutcome, ValidationError> {
+            unimplemented!("not called in flush-ordering tests")
+        }
+
+        fn validated_height(&self) -> u32 {
+            self.validated_height
+        }
+
+        fn current_digest(&self) -> &ADDigest {
+            &self.digest
+        }
+
+        fn reset_to(
+            &mut self,
+            _height: u32,
+            _digest: ADDigest,
+        ) -> Result<(), ValidationError> {
+            unimplemented!("not called in flush-ordering tests")
+        }
+
+        fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+            None
         }
     }
 
@@ -2895,11 +3012,54 @@ mod cross_db_flush_tests {
         );
     }
 
+    #[tokio::test]
+    async fn validator_without_persistence_still_records_validated_height() {
+        let store = MockStore::new();
+        let validator = NoPersistenceValidator {
+            validated_height: 1_785_000,
+            digest: ADDigest::zero(),
+        };
+
+        // Digest mode: `state_persistence()` is None, so nothing is fsynced —
+        // but the validator has a real height and the store side of the pair
+        // runs exactly as after a successful flush. Before the v0.8.0 trait
+        // split this height reached the store via a defaulted `flush` that
+        // returned Ok(()) without doing anything; the write must survive the
+        // split. See ../facts/sync.md § "Flushing a validator that owns no
+        // state".
+        let outcome = try_flush_validator(Some(&validator), 1_785_000);
+        complete_store_flush_pair(outcome, &store).await;
+
+        assert_eq!(outcome, FlushOutcome::NothingToPersist(1_785_000));
+        assert_eq!(
+            store.calls(),
+            vec![
+                StoreCall::SetValidatedHeight(1_785_000),
+                StoreCall::Flush,
+            ],
+            "nothing to persist is NOT the light-mode case — validated_height \
+             MUST still be recorded, before store.flush()"
+        );
+    }
+
     #[test]
-    fn flush_outcome_advances_last_flush_only_on_success_or_no_validator() {
+    fn flush_outcome_advances_last_flush_unless_the_flush_failed() {
         assert!(FlushOutcome::Flushed(42).advances_last_flush());
+        assert!(FlushOutcome::NothingToPersist(42).advances_last_flush());
         assert!(FlushOutcome::NoValidator.advances_last_flush());
         assert!(!FlushOutcome::Failed.advances_last_flush());
+    }
+
+    #[test]
+    fn committed_height_covers_flushed_and_nothing_to_persist_only() {
+        assert_eq!(FlushOutcome::Flushed(42).committed_height(), Some(42));
+        assert_eq!(
+            FlushOutcome::NothingToPersist(42).committed_height(),
+            Some(42),
+            "digest mode records and prunes at M exactly as a real flush does"
+        );
+        assert_eq!(FlushOutcome::NoValidator.committed_height(), None);
+        assert_eq!(FlushOutcome::Failed.committed_height(), None);
     }
 }
 
@@ -2917,7 +3077,7 @@ mod shutdown_flush_tests {
     use enr_chain::{ChainError, SyncInfo};
     use ergo_chain_types::{ADDigest, Header};
     use ergo_validation::{
-        ApplyStateOutcome, BlockValidator, Parameters, ValidationError,
+        ApplyStateOutcome, BlockValidator, Parameters, StatePersistence, ValidationError,
     };
     use std::sync::atomic::{AtomicBool, AtomicU32};
     use std::sync::Mutex;
@@ -3052,10 +3212,20 @@ mod shutdown_flush_tests {
             unreachable!("not called in shutdown-flush tests")
         }
 
+        fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+            Some(self)
+        }
+    }
+
+    impl StatePersistence for FakeValidator {
         fn flush(&self) -> Result<(), ValidationError> {
             *self.flush_count.lock().unwrap() += 1;
             self.flush_result
                 .map_err(|s| ValidationError::ProofVerificationFailed(s.to_string()))
+        }
+
+        fn resize_cache(&self, _cache_bytes: usize) -> Result<(), ValidationError> {
+            unreachable!("not called in shutdown-flush tests")
         }
     }
 
@@ -3302,7 +3472,7 @@ mod blocks_to_keep_tests {
     use enr_chain::{ChainError, SyncInfo};
     use ergo_chain_types::{ADDigest, Header};
     use ergo_validation::{
-        ApplyStateOutcome, BlockValidator, Parameters, ValidationError,
+        ApplyStateOutcome, BlockValidator, Parameters, StatePersistence, ValidationError,
     };
     use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicBool, AtomicU32};
@@ -3442,8 +3612,50 @@ mod blocks_to_keep_tests {
             unreachable!("not called in blocks_to_keep tests")
         }
 
+        fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+            Some(self)
+        }
+    }
+
+    impl StatePersistence for FakeValidator {
         fn flush(&self) -> Result<(), ValidationError> {
             Ok(())
+        }
+
+        fn resize_cache(&self, _cache_bytes: usize) -> Result<(), ValidationError> {
+            unreachable!("not called in blocks_to_keep tests")
+        }
+    }
+
+    /// Digest-mode shape: no persistent state, so nothing to fsync — but the
+    /// flush pair still records and prunes at the validator's height.
+    struct NoPersistenceValidator(FakeValidator);
+
+    impl BlockValidator for NoPersistenceValidator {
+        fn apply_state(
+            &mut self,
+            _h: &Header,
+            _bt: &[u8],
+            _ap: Option<&[u8]>,
+            _e: &[u8],
+            _ph: &[Header],
+            _p: &Parameters,
+            _bp: Option<&Parameters>,
+            _pu: Option<&[u8]>,
+        ) -> Result<ApplyStateOutcome, ValidationError> {
+            unreachable!("not called in blocks_to_keep tests")
+        }
+        fn validated_height(&self) -> u32 {
+            self.0.validated_height
+        }
+        fn current_digest(&self) -> &ADDigest {
+            &self.0.digest
+        }
+        fn reset_to(&mut self, _h: u32, _d: ADDigest) -> Result<(), ValidationError> {
+            unreachable!("not called in blocks_to_keep tests")
+        }
+        fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+            None
         }
     }
 
@@ -3715,8 +3927,17 @@ mod blocks_to_keep_tests {
             fn reset_to(&mut self, _h: u32, _d: ADDigest) -> Result<(), ValidationError> {
                 unreachable!()
             }
+            fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+                Some(self)
+            }
+        }
+
+        impl StatePersistence for FailingValidator {
             fn flush(&self) -> Result<(), ValidationError> {
                 Err(ValidationError::ProofVerificationFailed("nope".into()))
+            }
+            fn resize_cache(&self, _cache_bytes: usize) -> Result<(), ValidationError> {
+                unreachable!()
             }
         }
 
@@ -3753,6 +3974,51 @@ mod blocks_to_keep_tests {
             last_prune_call(&sync.store.calls()).is_none(),
             "failed validator.flush() MUST NOT trigger prune"
         );
+    }
+
+    #[tokio::test]
+    async fn prune_still_runs_when_validator_owns_no_persistent_state() {
+        // Digest mode: state_persistence() is None → FlushOutcome::
+        // NothingToPersist(M) → prune at the same horizon a real flush would
+        // use. Before the v0.8.0 trait split this path went through the
+        // defaulted `flush` returning Ok(()) and reached Flushed(M), so
+        // pruning happened; folding the case into NoValidator would silently
+        // stop a digest node from pruning. The prune call sites use `if let`,
+        // which the compiler does not exhaustiveness-check — this test is the
+        // guard the compiler cannot be.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (_progress_tx, progress_rx) = mpsc::channel(1);
+        let (_dc_tx, delivery_control_rx) = mpsc::unbounded_channel::<DeliveryControl>();
+        let (_dd_tx, delivery_data_rx) = mpsc::channel::<DeliveryData>(1);
+        let mut sync = HeaderSync::<
+            HangingTransport,
+            FixedVotingLengthChain,
+            MockStore,
+            NoPersistenceValidator,
+        >::new(
+            config_with_keep(50),
+            HangingTransport,
+            FixedVotingLengthChain { voting_length: 1024 },
+            MockStore::new(),
+            Some(NoPersistenceValidator(FakeValidator::at(1000))),
+            progress_rx,
+            delivery_control_rx,
+            delivery_data_rx,
+            None,
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(0)),
+            shutdown_rx,
+        );
+
+        shutdown_tx.send(()).unwrap();
+        sync.run().await;
+
+        let calls = sync.store.calls();
+        let (horizon, _type_ids) = last_prune_call(&calls)
+            .expect("nothing-to-persist MUST still prune — same horizon as a real flush");
+        assert_eq!(horizon, 951, "raw horizon = validated_height - keep + 1");
     }
 
     // ----- startup WARN capture -----
@@ -3871,7 +4137,9 @@ mod sweep_resume_tests {
     use crate::test_support::capture_async;
     use enr_chain::{ChainError, SyncInfo};
     use ergo_chain_types::{ADDigest, Header};
-    use ergo_validation::{ApplyStateOutcome, BlockValidator, Parameters, ValidationError};
+    use ergo_validation::{
+        ApplyStateOutcome, BlockValidator, Parameters, StatePersistence, ValidationError,
+    };
     use std::sync::atomic::{AtomicBool, AtomicU32};
     use std::sync::Arc;
     use tracing::level_filters::LevelFilter;
@@ -4004,6 +4272,12 @@ mod sweep_resume_tests {
             }
             self.validated_height = height;
             Ok(())
+        }
+
+        /// These tests assert sweep/resume behaviour, not durability; there is
+        /// no storage to flush and none of them look at the flush pair.
+        fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+            None
         }
     }
 
@@ -5583,7 +5857,7 @@ mod serve_continuation_tests {
     use enr_chain::{ChainError, SyncInfo};
     use ergo_chain_types::{ADDigest, Header};
     use ergo_validation::{
-        ApplyStateOutcome, BlockValidator, Parameters, ValidationError,
+        ApplyStateOutcome, BlockValidator, Parameters, StatePersistence, ValidationError,
     };
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
@@ -5855,6 +6129,9 @@ mod serve_continuation_tests {
             _digest: ADDigest,
         ) -> Result<(), ValidationError> {
             unreachable!("not called in serve tests")
+        }
+        fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+            None
         }
     }
 
