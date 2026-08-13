@@ -317,6 +317,36 @@ as well as the workspace root — a root-only declaration is not unified into a
 standalone `cargo test -p enr-state` build, and the accessor would silently
 return 0.
 
+### `SnapshotReader::resolver(&self) -> Resolver` and `root_state(&self) -> Option<(Digest32, usize)>`
+
+The same two accessors `RedbAVLStorage` already exposes, reachable from a
+reader. Together they are everything needed to build a **read-only prover** over
+the committed tree.
+
+**Why they are needed.** Mining assembles a candidate and must compute AD proofs
+and a state root for it. `UtxoValidator::compute_proofs` already does this
+without touching the live prover — it loads the stored root into a fresh tree
+with its own resolver, deliberately, so that mining cannot disturb validation.
+But it is a method on the validator, and the validator is owned by `sync/` and
+is `!Sync`; the mining task cannot reach it. A second `RedbAVLStorage` on the
+same file is not an option either, because redb holds an exclusive file lock —
+which is why `SnapshotReader` exists.
+
+So the requirement is not validator access. It is read-only storage access from
+a handle mining already holds.
+
+**Invariants:**
+
+- Both are read-only. Neither may mutate the tree, the version chain, or any
+  metadata.
+- `resolver()` returns a resolver over the same `Arc<Database>` the reader
+  holds, so nodes it resolves are fresh `Rc`s independent of any other prover.
+  ⚠ This is load-bearing: sharing node handles with the validator's prover is
+  the wrong-proof hazard recorded under `rollback()` above.
+- `root_state()` returns the committed root, i.e. what a reader sees — never
+  uncommitted in-memory state.
+- A reader that exists has a database, so neither call needs a liveness check.
+
 ### `SnapshotReader::cache_bytes_used(&self) -> u64`
 
 Same figure, reachable from a reader rather than the storage.
