@@ -1238,8 +1238,6 @@ fn conv_snapshot_map(
     out
 }
 
-/// At-tip storage reopen handler. Awaits a one-shot from sync's `synced()`
-
 fn locate_config(args: &[String]) -> Option<String> {
     if let Some(p) = args.iter().skip(1).find(|a| !a.starts_with("--")).cloned() {
         return Some(p);
