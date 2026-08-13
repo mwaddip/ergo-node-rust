@@ -304,11 +304,29 @@ phase's `_started`.
   via `classify_apply_state_error`; `missing_key` is present only for
   the `apply_state` `missing_key` case.
 
-  **`error_kind` domain as of 2.0:** `missing_key` (the AVL tree lacks a
-  key the block spends — a state-DB problem), `transaction_invalid` (the
-  block was rejected because a transaction in it did not validate — a
-  consensus problem), `other` (everything else). `missing_key` is
-  accompanied by the `missing_key` field; the others are not.
+  **`error_kind` domain as of 2.0:** `missing_key` (the AVL tree lacks a key
+  the block spends), `transaction_invalid` (the block was rejected because a
+  transaction in it did not validate — a consensus problem), `other`
+  (everything else). `missing_key` is accompanied by the `missing_key` field;
+  the others are not.
+
+  ⚠ **`missing_key` arrives through two variants, not one, and means
+  different things in each.** The prose is raised once in
+  `ergo_avltree_rust`'s shared `operation.rs`, which both the prover and the
+  verifier use — so it surfaces as `StateOperationFailed` in UTXO mode and as
+  `ProofVerificationFailed` in digest mode. The classifier matches both.
+  In UTXO mode it means the node's own state store lacks the key, which is a
+  local storage problem. In digest mode the node holds no UTXO set at all, so
+  it means the *proof* did not contain the key it needed — closer to a bad
+  block or a bad peer. An adapter that reads `missing_key` as "this node's
+  database is damaged" is right only for a UTXO-mode node, and should consult
+  `stateType` from `/info` before recommending a resync.
+
+  *An earlier draft of this section described a single `String`-carrying
+  variant and called the kind a state-DB problem outright. Both were wrong,
+  and matching only the UTXO arm would have dropped `missing_key` on every
+  digest-mode node — silently, which is the exact failure this rewrite exists
+  to prevent.*
 
   *`script_eval` is gone and `transaction_invalid` is not a rename of it.*
   The old value named the deferred eval-failure **path**, which no longer
