@@ -39,6 +39,28 @@ pub fn input_box_id_raw(box_id: &ergo_lib::ergotree_ir::chain::ergo_box::BoxId) 
     arr
 }
 
+/// The first output whose creation height sits above the context's preheader,
+/// or `None` if every output is at or below it.
+///
+/// This is the *transient* half of ergo-lib's `InvalidHeightError`: the sender
+/// built the transaction against a tip one block ahead of ours, and applying
+/// the next block makes it valid. Callers must decline such a transaction, not
+/// invalidate it — see the contract's step 6a.
+///
+/// The comparison is signed, mirroring `verify_output()` in ergo-lib's
+/// `wallet/tx_context.rs` byte for byte. A creation height with bit 31 set is
+/// "negative" under the V1 rules ergo-lib still honours, so it does *not* trip
+/// that check; it trips `NegativeHeight` instead, which is permanent. Widening
+/// this to an unsigned comparison would swallow those into the transient path
+/// and re-validate the same garbage on every rebroadcast, forever.
+pub fn output_above_preheader(tx: &Transaction, state_context: &ErgoStateContext) -> Option<u32> {
+    let preheader_height = state_context.pre_header.height as i32;
+    tx.outputs
+        .iter()
+        .map(|out| out.creation_height)
+        .find(|h| *h as i32 > preheader_height)
+}
+
 /// Extract output box IDs and boxes as Vec<([u8; 32], ErgoBox)>.
 pub fn output_boxes(tx: &Transaction) -> Vec<([u8; 32], ErgoBox)> {
     tx.outputs
@@ -133,6 +155,21 @@ impl super::Mempool {
                     .collect()
             })
             .unwrap_or_default();
+
+        // 6a. Transient creation-height guard. A transaction built one block
+        // ahead of us is not invalid, it is early — the next applied block
+        // makes it valid. Letting it reach step 6 would cache it as invalid
+        // for `invalidation_ttl`, so every rebroadcast in the next half hour
+        // is dropped at step 1 without ever being re-validated. Same reasoning
+        // as the missing-input decline above.
+        if let Some(height) = output_above_preheader(&tx, state_context) {
+            return ProcessingOutcome::Declined {
+                reason: format!(
+                    "creation height {height} above preheader height {}",
+                    state_context.pre_header.height
+                ),
+            };
+        }
 
         // 6. Validate (returns script evaluation cost in block cost units)
         let cost = match validate_single_transaction(
