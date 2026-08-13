@@ -23,6 +23,62 @@ pub struct CostedTx {
     pub size: usize,
 }
 
+/// Sentinel the BlockTransactions serializer adds to the block version, so a
+/// reader can tell a versioned section from a pre-v2 one where the first VLQ
+/// *was* the transaction count (JVM `BlockTransactionsSerializer`,
+/// `MaxTransactionsInBlock`).
+const BLOCK_VERSION_SENTINEL: u64 = 10_000_000;
+
+/// Framing bytes of the BlockTransactions section — everything the section
+/// carries that is not a transaction:
+///
+/// ```text
+/// [header_id: 32B][ver_or_count: VLQ][tx_count: VLQ if ver > 1][txs…]
+/// ```
+///
+/// These count against `max_block_size`, because the limit is enforced over
+/// the **section** and not over a sum of transactions: the JVM validates
+/// `fb.blockTransactions.size <= currentParameters.maxBlockSize`
+/// (`ErgoStateContext.scala:308-310`, rule `bsBlockTransactionsSize`), and
+/// `.size` there is the serialized section. A candidate landing within this of
+/// the limit is over it by the rule that decides validity, and gets rejected by
+/// every peer. Comes to 37 bytes for a current-version block carrying fewer
+/// than 128 transactions.
+///
+/// ⚠ **Not a safety margin, and must not become one.** The overhead is
+/// deterministic and computable, so counting it is accuracy — the no-`safeGap`
+/// decision (see the cost bound below) is untouched. The JVM's own generator
+/// sums transaction sizes and carries the undercount
+/// (`CandidateGenerator.correctLimits`); we do not copy that.
+pub fn block_transactions_overhead(block_version: u8, tx_count: usize) -> usize {
+    // JVM `BlockTransactionsSerializer.serialize`: 32 header-id bytes, then
+    // `putUInt(MaxTransactionsInBlock + blockVersion)` for a versioned section,
+    // then `putUInt(txs.size)`. A version-1 section omits the first field
+    // entirely — the reader recognises the difference by the sentinel.
+    let version_bytes = if block_version > 1 {
+        vlq_len(BLOCK_VERSION_SENTINEL + u64::from(block_version))
+    } else {
+        0
+    };
+    32 + version_bytes + vlq_len(tx_count as u64)
+}
+
+/// Encoded length of `v` under Scorex's unsigned VLQ: 7 payload bits per byte,
+/// high bit as the continuation flag.
+///
+/// Computed rather than encoded-and-measured, so the size accounting carries no
+/// error path to swallow. `vlq_len_matches_the_encoder` pins it to `sigma_ser`'s
+/// writer — the one that produces the bytes being counted.
+fn vlq_len(v: u64) -> usize {
+    let mut len = 1;
+    let mut rest = v >> 7;
+    while rest != 0 {
+        len += 1;
+        rest >>= 7;
+    }
+    len
+}
+
 /// Select transactions from mempool for block inclusion.
 ///
 /// Takes prioritized candidates (highest-fee-rate first) and validates
@@ -39,14 +95,18 @@ pub struct CostedTx {
 /// *skip* it, which for us — skipping where the JVM stops — would silently
 /// produce a block with no coinbase.
 ///
-/// Bounded by both protocol limits from `Parameters`: cumulative serialized
-/// size against `max_block_size`, and cumulative ErgoScript evaluation cost
-/// against `max_block_cost`. Cost is bounded at exactly
-/// `accumulated + tx_cost <= max_block_cost` with **no safety margin** — the
-/// JVM's `safeGap` guards its own AOT costing divergence, not ours (see
+/// Bounded by both protocol limits from `Parameters`: the serialized
+/// BlockTransactions **section** against `max_block_size`, and cumulative
+/// ErgoScript evaluation cost against `max_block_cost`. Cost is bounded at
+/// exactly `accumulated + tx_cost <= max_block_cost` with **no safety margin** —
+/// the JVM's `safeGap` guards its own AOT costing divergence, not ours (see
 /// `../facts/mining.md`, Step 3). Exceeding either limit skips that one
 /// transaction and the scan continues, so a later cheaper or smaller
 /// transaction can still use the remaining budget.
+///
+/// `block_version` is the candidate's version, and it is a size input, not
+/// decoration: the section's framing bytes depend on it
+/// (`block_transactions_overhead`), and those bytes are inside the limit.
 ///
 /// ⚠ The fee transaction is NOT accounted for here — it does not exist until
 /// the selection is known. Bounding the assembled set is the caller's job;
@@ -57,17 +117,22 @@ pub struct CostedTx {
 /// a limit, for conflicting with one already selected, or for inputs that
 /// don't resolve is *not* invalid — it stays in the mempool for a later
 /// block.
+#[allow(clippy::too_many_arguments)]
 pub fn select_transactions(
     candidates: &[(Transaction, usize)],
     committed: &[CostedTx],
     state_context: &ErgoStateContext,
+    block_version: u8,
     max_block_size: usize,
     max_block_cost: u64,
     utxo_lookup: &dyn Fn(&[u8; 32]) -> Option<ErgoBox>,
 ) -> (Vec<CostedTx>, Vec<[u8; 32]>) {
     let mut selected: Vec<CostedTx> = Vec::new();
     let mut invalid_ids = Vec::new();
-    let mut accumulated_size: usize = 0;
+    // Transaction bytes only. The section's framing bytes are added at each
+    // bound check rather than seeded here, because one of them — the VLQ
+    // transaction count — grows with the selection.
+    let mut accumulated_tx_bytes: usize = 0;
     let mut accumulated_cost: u64 = 0;
 
     // Outputs of the emission tx and of already-selected txs — spendable as
@@ -87,7 +152,7 @@ pub fn select_transactions(
 
     for committed_tx in committed {
         accumulated_cost = accumulated_cost.saturating_add(committed_tx.cost);
-        accumulated_size = accumulated_size.saturating_add(committed_tx.size);
+        accumulated_tx_bytes = accumulated_tx_bytes.saturating_add(committed_tx.size);
         record(&committed_tx.tx, &mut available_outputs, &mut spent_ids);
     }
 
@@ -96,8 +161,15 @@ pub fn select_transactions(
         // far the most expensive step here and candidate assembly now runs
         // every 15 s (TTL regeneration) rather than once a block.
 
-        // Size limit.
-        if accumulated_size.saturating_add(*tx_size) > max_block_size {
+        // Size limit, measured over the section this candidate would produce:
+        // its framing bytes, every transaction already accounted for, and this
+        // one. The framing is recomputed per candidate because its VLQ
+        // transaction count is a function of the selection so far.
+        let section_size =
+            block_transactions_overhead(block_version, committed.len() + selected.len() + 1)
+                .saturating_add(accumulated_tx_bytes)
+                .saturating_add(*tx_size);
+        if section_size > max_block_size {
             continue; // Skip, might fit smaller txs later
         }
 
@@ -161,7 +233,7 @@ pub fn select_transactions(
                 };
 
                 accumulated_cost = total_cost;
-                accumulated_size += tx_size;
+                accumulated_tx_bytes += tx_size;
 
                 record(tx, &mut available_outputs, &mut spent_ids);
 
@@ -200,4 +272,54 @@ pub(crate) fn id_bytes(bytes: &[u8]) -> [u8; 32] {
     let mut id = [0u8; 32];
     id.copy_from_slice(bytes);
     id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sigma_ser::vlq_encode::WriteSigmaVlqExt;
+
+    /// `vlq_len` counts what the encoder writes. Computing the length instead
+    /// of encoding keeps an error path out of the size accounting, which is
+    /// only safe while the two agree — so pin them together, at every byte
+    /// boundary and either side of it.
+    #[test]
+    fn vlq_len_matches_the_encoder() {
+        let mut cases: Vec<u64> = vec![0, 1, 127, 128, 16_383, 16_384, 10_000_002, u64::MAX];
+        // Every 7-bit boundary and its neighbours.
+        for shift in 1..=9 {
+            let boundary = 1u64 << (7 * shift);
+            cases.extend([boundary - 1, boundary, boundary + 1]);
+        }
+
+        for v in cases {
+            let mut encoded: Vec<u8> = Vec::new();
+            encoded.put_u64(v).expect("writing to a Vec cannot fail");
+            assert_eq!(
+                vlq_len(v),
+                encoded.len(),
+                "vlq_len({v}) disagrees with the encoder"
+            );
+        }
+    }
+
+    /// The 32 + 4 + 1 that the sum of transaction sizes misses on a
+    /// current-version block: header id, the sentinel-offset version, and the
+    /// transaction count.
+    #[test]
+    fn section_overhead_is_37_bytes_for_a_normal_block() {
+        assert_eq!(block_transactions_overhead(3, 1), 37);
+        assert_eq!(block_transactions_overhead(3, 127), 37);
+        // 128 transactions push the count VLQ to two bytes.
+        assert_eq!(block_transactions_overhead(3, 128), 38);
+        assert_eq!(block_transactions_overhead(3, 16_384), 39);
+        // Every plausible block version sits inside the same 24-bit VLQ band
+        // as the sentinel, so the version field is 4 bytes throughout.
+        for version in 2..=u8::MAX {
+            assert_eq!(block_transactions_overhead(version, 1), 37);
+        }
+        // A version-1 section has no version field at all: the first VLQ is
+        // the transaction count.
+        assert_eq!(block_transactions_overhead(1, 1), 33);
+    }
 }

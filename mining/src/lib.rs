@@ -144,6 +144,7 @@ pub fn generate_candidate(
         select_and_collect_fees(
             config,
             height,
+            version,
             emission_tx,
             emission_box,
             candidate_txs,
@@ -237,7 +238,9 @@ fn upcoming_header(
 /// The fee transaction is a transaction in the block: it has serialized size
 /// and it has script cost, and both are charged to `max_block_size` /
 /// `max_block_cost` by every validator (ours sums per-transaction costs over
-/// the whole block — `validation/src/tx_validation.rs`, `enforce_block_cost`).
+/// the whole block — `validation/src/tx_validation.rs`, `enforce_block_cost`;
+/// the size limit is enforced over the serialized BlockTransactions section,
+/// so `block_transactions_overhead` is part of the measurement here too).
 /// `select_transactions` accumulates over mempool transactions only and knows
 /// nothing about it, so selecting up to `max_block_cost` and *then* appending
 /// a fee transaction produces exactly the over-limit block the cost bound
@@ -276,6 +279,7 @@ fn upcoming_header(
 fn select_and_collect_fees(
     config: &MinerConfig,
     height: u32,
+    block_version: u8,
     emission_tx: Transaction,
     emission_box: &ErgoBox,
     candidate_txs: &[(Transaction, usize)],
@@ -322,6 +326,7 @@ fn select_and_collect_fees(
         candidate_txs,
         std::slice::from_ref(&emission),
         state_context,
+        block_version,
         max_block_size,
         max_block_cost,
         utxo_lookup,
@@ -355,10 +360,18 @@ fn select_and_collect_fees(
             .iter()
             .fold(emission.cost, |acc, c| acc.saturating_add(c.cost))
             .saturating_add(fee_cost);
+        // Size is measured over the serialized SECTION — the framing bytes
+        // sit inside `max_block_size` alongside the transactions, and the
+        // transaction count in them is this iteration's, fee tx included.
+        let tx_count = 1 + selected.len() + usize::from(fee_tx.is_some());
         let total_size = selected
             .iter()
             .fold(emission.size, |acc, c| acc.saturating_add(c.size))
-            .saturating_add(fee_size);
+            .saturating_add(fee_size)
+            .saturating_add(selection::block_transactions_overhead(
+                block_version,
+                tx_count,
+            ));
 
         if total_cost <= max_block_cost && total_size <= max_block_size {
             break fee_tx;

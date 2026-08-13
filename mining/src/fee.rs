@@ -7,7 +7,7 @@ use ergo_lib::chain::transaction::{Input, Transaction};
 use ergo_lib::ergotree_interpreter::sigma_protocol::prover::ProofBytes;
 use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
 use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
-use ergo_lib::ergotree_ir::chain::token::Token;
+use ergo_lib::ergotree_ir::chain::token::{Token, TokenId};
 use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use std::collections::{HashMap, HashSet};
@@ -26,6 +26,11 @@ use crate::MiningError;
 /// `height` is the CANDIDATE's height: the fee proposition requires
 /// `HEIGHT == creationHeight(OUTPUTS(0))`, so the miner box is created at the
 /// height the block will have (JVM `collectRewards`, `nextHeight`).
+///
+/// Tokens carried by the fee boxes are aggregated onto the miner box and
+/// capped at `ErgoBox::MAX_TOKENS_COUNT`; the excess is burned rather than
+/// allowed to make the box unbuildable and cost the miner every fee in the
+/// block. See the truncation site below.
 ///
 /// Returns None if total fee is zero or no fee boxes exist — a zero-fee block
 /// is a normal outcome, not an error.
@@ -83,15 +88,54 @@ pub fn build_fee_tx(
         return Ok(None);
     }
 
-    // Aggregate tokens from fee boxes (capped at what fits in a single box)
-    let mut token_map: HashMap<ergo_lib::ergotree_ir::chain::token::TokenId, u64> = HashMap::new();
+    // Aggregate the fee boxes' tokens, in first-seen order.
+    //
+    // Order rather than `HashMap` iteration because it decides two things that
+    // must not depend on a hash seed: which tokens survive the cap below, and
+    // the reward box's serialized bytes — hence its id, the fee transaction's
+    // id, and the transactions root the miner is handed to hash. The traversal
+    // matches the JVM's `feeBoxes.toArray.toColl.flatMap(_.additionalTokens)`:
+    // fee boxes in block order, tokens in box order.
+    let mut aggregated: Vec<(TokenId, u64)> = Vec::new();
+    let mut position: HashMap<TokenId, usize> = HashMap::new();
     for fee_box in &fee_boxes {
-        if let Some(ref tokens) = fee_box.tokens {
-            let token_slice: &[Token] = tokens.as_ref();
-            for token in token_slice {
-                *token_map.entry(token.token_id).or_insert(0) += u64::from(token.amount);
+        let Some(ref tokens) = fee_box.tokens else {
+            continue;
+        };
+        let token_slice: &[Token] = tokens.as_ref();
+        for token in token_slice {
+            let amount = u64::from(token.amount);
+            match position.get(&token.token_id) {
+                Some(&at) => aggregated[at].1 = aggregated[at].1.saturating_add(amount),
+                None => {
+                    position.insert(token.token_id, aggregated.len());
+                    aggregated.push((token.token_id, amount));
+                }
             }
         }
+    }
+
+    // Cap at what one box can hold. Past `MAX_TOKENS_COUNT` the reward box
+    // does not build at all (`BoxTokens` is a bounded vec), and an unbuildable
+    // fee box means the block ships collecting NO fees — the miner loses the
+    // whole block's revenue over the excess tokens, not just the excess.
+    //
+    // The JVM truncates for the same reason and in the same way:
+    // `feeBoxes.toArray.toColl.flatMap(_.additionalTokens).take(MaxAssetsPerBox)`
+    // (`CandidateGenerator.scala:811`) — a plain take, no ordering by value.
+    //
+    // The dropped tokens are burned: their fee boxes are still spent as inputs
+    // and Ergo permits an output carrying fewer tokens than its inputs. The
+    // JVM's `take` burns them too.
+    if aggregated.len() > ErgoBox::MAX_TOKENS_COUNT {
+        tracing::warn!(
+            height,
+            distinct_tokens = aggregated.len(),
+            burned = aggregated.len() - ErgoBox::MAX_TOKENS_COUNT,
+            "mining: fee boxes carry more distinct tokens than one box holds; \
+             burning the excess so the block still collects its fees"
+        );
+        aggregated.truncate(ErgoBox::MAX_TOKENS_COUNT);
     }
 
     // Build inputs from fee boxes (empty proofs — fee proposition allows same-block spending)
@@ -122,7 +166,7 @@ pub fn build_fee_tx(
     );
 
     // Add aggregated tokens to reward box
-    for (token_id, amount) in token_map {
+    for (token_id, amount) in aggregated {
         reward_builder.add_token(Token {
             token_id,
             amount: amount

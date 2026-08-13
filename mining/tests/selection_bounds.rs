@@ -20,7 +20,7 @@ use ergo_lib::ergotree_ir::chain::ergo_box::{ErgoBox, ErgoBoxCandidate, NonManda
 use ergo_lib::ergotree_ir::chain::tx_id::TxId;
 use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
-use ergo_mining::selection::{select_transactions, CostedTx};
+use ergo_mining::selection::{block_transactions_overhead, select_transactions, CostedTx};
 use ergo_validation::{
     build_state_context, validate_single_transaction, ErgoStateContext, Parameter, Parameters,
 };
@@ -29,6 +29,10 @@ const FEE_CONTRACT_HEX: &str = "1005040004000e36100204a00b08cd0279be667ef9dcbbac
 const OUTPUT_TREE_HEX: &str = "100204a00b08cd02a27f37ca339c25a8ee65cbdb73fe7a7134dd89cd3e7c43e313a92c128859e4f6ea02d192a39a8cc7a70173007301";
 const MINER_PK_HEX: &str = "02a27f37ca339c25a8ee65cbdb73fe7a7134dd89cd3e7c43e313a92c128859e4f6";
 const BLOCK_HEIGHT: u32 = 342_964;
+/// Mainnet block 342,964 is a v1 block, and the fixture header says so. It is
+/// also a size input: a v1 BlockTransactions section carries no version field,
+/// so its framing is 33 bytes rather than the 37 a current-version block pays.
+const BLOCK_VERSION: u8 = 1;
 
 /// Mainnet default — the state context's own per-tx budget, deliberately kept
 /// generous so every fixture validates. The bound under test is the argument
@@ -87,7 +91,7 @@ fn block_header() -> Header {
             .try_into()
             .unwrap();
     Header {
-        version: 1,
+        version: BLOCK_VERSION,
         id: BlockId(Digest32::from([0u8; 32])),
         parent_id: BlockId(parent_id_bytes.into()),
         ad_proofs_root: Digest32::from([0u8; 32]),
@@ -110,7 +114,7 @@ fn block_header() -> Header {
 
 fn parent_header() -> Header {
     Header {
-        version: 1,
+        version: BLOCK_VERSION,
         id: BlockId(Digest32::from([1u8; 32])),
         parent_id: BlockId(Digest32::from([0u8; 32])),
         ad_proofs_root: Digest32::from([0u8; 32]),
@@ -205,6 +209,7 @@ fn over_budget_tx_is_skipped_but_a_later_cheaper_one_fits() {
         ],
         &[],
         &ctx,
+        BLOCK_VERSION,
         524_288,
         small_cost,
         &lookup,
@@ -245,7 +250,7 @@ fn exactly_max_block_cost_is_accepted() {
     ];
 
     let (selected, invalid) =
-        select_transactions(&candidates, &[], &ctx, 524_288, cost_a + cost_b, &lookup);
+        select_transactions(&candidates, &[], &ctx, BLOCK_VERSION, 524_288, cost_a + cost_b, &lookup);
     assert_eq!(
         selected_ids(&selected),
         ids(&[tx_a.clone(), tx_b.clone()]),
@@ -258,6 +263,7 @@ fn exactly_max_block_cost_is_accepted() {
         &candidates,
         &[],
         &ctx,
+        BLOCK_VERSION,
         524_288,
         cost_a + cost_b - 1,
         &lookup,
@@ -291,6 +297,7 @@ fn size_bound_still_skips_and_keeps_scanning() {
         &[(tx_a, 400), (tx_b.clone(), 100)],
         &[],
         &ctx,
+        BLOCK_VERSION,
         300,
         u64::from(u32::MAX),
         &lookup,
@@ -302,4 +309,65 @@ fn size_bound_still_skips_and_keeps_scanning() {
         "the oversized tx is skipped and the smaller one still selected"
     );
     assert!(invalid.is_empty());
+}
+
+/// The bound is over the serialized BlockTransactions **section**, so its
+/// framing bytes are inside `max_block_size` — a transaction that fits only
+/// when they are ignored must be skipped.
+///
+/// Measured at the boundary in both directions, because the margin is a few
+/// dozen bytes and an accounting that sums transaction sizes gets the
+/// comfortable cases right for free.
+#[test]
+fn size_bound_counts_the_section_framing() {
+    let ctx = state_context();
+    let src = vec![fee_box(0xF1, 1_000_000)];
+    let tx = fee_spend_tx(&src);
+    let lookup = lookup_over(&src);
+
+    // A v1 section frames one transaction in 32 header-id bytes plus the
+    // one-byte VLQ count. No version field: v1 predates it.
+    let framing = block_transactions_overhead(BLOCK_VERSION, 1);
+    assert_eq!(framing, 33, "fixture invariant: v1 framing for one transaction");
+
+    // Declared size, not the real one — the caller supplies it and the point
+    // here is the arithmetic of the bound.
+    const DECLARED: usize = 500;
+    let candidate = [(tx, DECLARED)];
+
+    let select_under = |max_block_size: usize| {
+        let (selected, invalid) = select_transactions(
+            &candidate,
+            &[],
+            &ctx,
+            BLOCK_VERSION,
+            max_block_size,
+            u64::from(u32::MAX),
+            &lookup,
+        );
+        assert!(
+            invalid.is_empty(),
+            "a transaction skipped for size is valid — it stays in the mempool"
+        );
+        selected.len()
+    };
+
+    assert_eq!(
+        select_under(DECLARED),
+        0,
+        "a limit equal to the transaction's own size leaves no room for the \
+         section framing: counting transactions only would accept this and \
+         ship a block every peer rejects"
+    );
+    assert_eq!(
+        select_under(DECLARED + framing - 1),
+        0,
+        "one byte short of the section is still over the limit"
+    );
+    assert_eq!(
+        select_under(DECLARED + framing),
+        1,
+        "the section landing exactly on the limit is accepted — the bound is \
+         `<=`, and the framing is accounted for, not padded against"
+    );
 }

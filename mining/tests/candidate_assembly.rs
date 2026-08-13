@@ -22,7 +22,10 @@ use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::ergotree_interpreter::sigma_protocol::prover::ProofBytes;
 use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
 use ergo_lib::ergotree_ir::chain::ergo_box::box_value::BoxValue;
-use ergo_lib::ergotree_ir::chain::ergo_box::{ErgoBox, ErgoBoxCandidate, NonMandatoryRegisters};
+use ergo_lib::ergotree_ir::chain::ergo_box::{
+    BoxTokens, ErgoBox, ErgoBoxCandidate, NonMandatoryRegisters,
+};
+use ergo_lib::ergotree_ir::chain::token::{Token, TokenId};
 use ergo_lib::ergotree_ir::chain::tx_id::TxId;
 use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
 use ergo_lib::ergotree_ir::mir::expr::Expr;
@@ -34,6 +37,7 @@ use ergo_mining::{GeneratedCandidate, ValidatorProofsResult};
 use ergo_validation::{
     build_state_context, validate_single_transaction, ErgoStateContext, Parameter, Parameters,
 };
+use sigma_ser::vlq_encode::WriteSigmaVlqExt;
 
 /// Trivial difficulty — the candidate's nBits, irrelevant to selection.
 const INITIAL_N_BITS: u32 = 16842752;
@@ -126,10 +130,14 @@ fn fee_tree() -> ErgoTree {
 
 /// A box on the "already on chain" side, spendable by anyone.
 fn source_box(seed: u8, value: u64) -> ErgoBox {
+    source_box_with_tokens(seed, value, None)
+}
+
+fn source_box_with_tokens(seed: u8, value: u64, tokens: Option<BoxTokens>) -> ErgoBox {
     ErgoBox::new(
         BoxValue::try_from(value).unwrap(),
         always_true(),
-        None,
+        tokens,
         NonMandatoryRegisters::empty(),
         PARENT_HEIGHT,
         TxId::from(Digest32::from([seed; 32])),
@@ -138,11 +146,58 @@ fn source_box(seed: u8, value: u64) -> ErgoBox {
     .unwrap()
 }
 
+/// `count` distinct token ids, deterministic and namespaced by `seed` so two
+/// source boxes never overlap. Amount 1, so each token costs the minimal 33
+/// serialized bytes and the box-size arithmetic in these tests is legible.
+fn distinct_tokens(seed: u8, count: usize) -> Vec<Token> {
+    (0..count)
+        .map(|i| {
+            let mut id = [0u8; 32];
+            id[0] = seed;
+            id[1] = i as u8;
+            id[2] = (i >> 8) as u8;
+            Token {
+                token_id: TokenId::from(Digest32::from(id)),
+                amount: 1u64.try_into().unwrap(),
+            }
+        })
+        .collect()
+}
+
+fn token_source_box(seed: u8, value: u64, tokens: &[Token]) -> ErgoBox {
+    source_box_with_tokens(
+        seed,
+        value,
+        Some(BoxTokens::from_vec(tokens.to_vec()).unwrap()),
+    )
+}
+
+fn token_ids(b: &ErgoBox) -> Vec<TokenId> {
+    let tokens: &[Token] = match b.tokens.as_ref() {
+        Some(t) => t.as_ref(),
+        None => &[],
+    };
+    tokens.iter().map(|t| t.token_id).collect()
+}
+
+/// The token ids `build_fee_tx` should keep: every group in order, truncated
+/// at `cap`.
+fn expected_ids(groups: &[&Vec<Token>], cap: usize) -> Vec<TokenId> {
+    groups
+        .iter()
+        .flat_map(|g| g.iter())
+        .take(cap)
+        .map(|t| t.token_id)
+        .collect()
+}
+
 fn spend_into(src: &ErgoBox, out_tree: ErgoTree) -> Transaction {
+    // Tokens carry through unchanged: the whole box goes to the one output, so
+    // preservation holds without a change box.
     let output = ErgoBoxCandidate {
         value: src.value,
         ergo_tree: out_tree,
-        tokens: None,
+        tokens: src.tokens.clone(),
         additional_registers: NonMandatoryRegisters::empty(),
         creation_height: CANDIDATE_HEIGHT,
     };
@@ -239,8 +294,11 @@ fn block_context(parameters: &Parameters) -> ErgoStateContext {
 }
 
 /// Total block cost and size, counted exactly as a validator counts them:
-/// the sum over EVERY transaction in the block (`enforce_block_cost` in
-/// `validation/src/tx_validation.rs`), fee and emission transactions included.
+/// cost is the sum over EVERY transaction in the block (`enforce_block_cost`
+/// in `validation/src/tx_validation.rs`), fee and emission transactions
+/// included; size is the serialized BlockTransactions **section**, framing and
+/// all (`ErgoStateContext.scala:308-310`), which is 37 bytes more than that
+/// sum on a current-version block.
 fn measure_block(block: &CandidateBlock, utxos: &[ErgoBox], ctx: &ErgoStateContext) -> (u64, usize) {
     let mut boxes: HashMap<[u8; 32], ErgoBox> = utxos.iter().map(|b| (id_of(b), b.clone())).collect();
     boxes.insert(id_of(&emission_box()), emission_box());
@@ -251,7 +309,6 @@ fn measure_block(block: &CandidateBlock, utxos: &[ErgoBox], ctx: &ErgoStateConte
     }
 
     let mut total_cost = 0u64;
-    let mut total_size = 0usize;
     for (i, tx) in block.transactions.iter().enumerate() {
         let inputs: Vec<ErgoBox> = tx
             .inputs
@@ -267,15 +324,36 @@ fn measure_block(block: &CandidateBlock, utxos: &[ErgoBox], ctx: &ErgoStateConte
             .collect();
         total_cost += validate_single_transaction(tx, inputs, vec![], ctx)
             .unwrap_or_else(|e| panic!("assembled tx {i} must validate: {e}"));
-        total_size += size_of(tx);
     }
-    (total_cost, total_size)
+    (total_cost, serialized_section(block).len())
 }
 
 fn is_fee_tx(tx: &Transaction) -> bool {
     tx.outputs.len() == 1
         && tx.outputs.get(0).unwrap().ergo_tree
             == ergo_tree_predef::reward_output_script(REWARD_DELAY, miner_pk()).unwrap()
+}
+
+/// The BlockTransactions section as a validator measures it, built here from
+/// the JVM serializer's own layout rather than from the crate's accounting:
+///
+/// ```text
+/// [header_id: 32B][10_000_000 + version: VLQ][tx_count: VLQ][txs…]
+/// ```
+///
+/// (`BlockTransactionsSerializer.serialize`; the sentinel offset is how a
+/// reader tells a versioned section from a pre-v2 one.) Independent of
+/// `block_transactions_overhead`, so it is free to disagree with it — which is
+/// the only reason it is worth writing out.
+fn serialized_section(block: &CandidateBlock) -> Vec<u8> {
+    // The header id is not known until a solution lands; its 32 bytes are.
+    let mut out: Vec<u8> = vec![0u8; 32];
+    out.put_u64(10_000_000 + u64::from(block.version)).unwrap();
+    out.put_u64(block.transactions.len() as u64).unwrap();
+    for tx in &block.transactions {
+        out.extend_from_slice(&tx.sigma_serialize_bytes().unwrap());
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -504,5 +582,233 @@ fn conflicting_transactions_are_not_both_selected() {
         generated.invalid_txs.is_empty(),
         "losing a mempool conflict is not evidence of invalidity — the \
          mempool owns conflict resolution"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. The size limit is over the serialized SECTION, not the sum of transactions
+// ---------------------------------------------------------------------------
+
+/// Validators enforce `max_block_size` against the BlockTransactions section —
+/// `fb.blockTransactions.size <= currentParameters.maxBlockSize`
+/// (`ErgoStateContext.scala:308-310`, rule `bsBlockTransactionsSize`) — and
+/// that section carries framing no sum of transaction sizes contains: 32 bytes
+/// of header id, the sentinel-offset block version, the transaction count.
+///
+/// So a candidate whose transactions sum to exactly the limit is **over** it by
+/// the rule that decides validity, and every peer rejects the block. This test
+/// sets the limit to exactly that sum: the accounting under test must shed
+/// transactions, and an accounting that sums transaction sizes accepts the
+/// whole block and ships it 37 bytes over.
+#[test]
+fn the_size_bound_is_over_the_section_not_the_sum_of_transactions() {
+    let srcs = vec![source_box(0xF1, 4_000_000)];
+    let txs = candidates(&[fee_paying_tx(&srcs[0])]);
+
+    let generous = params_with(1_000_000, 524_288);
+    let full = generate(&txs, &generous, &srcs);
+    assert_eq!(full.block.transactions.len(), 3, "[emission, tx, fee]");
+
+    let tx_bytes: usize = full.block.transactions.iter().map(size_of).sum();
+    let section_bytes = serialized_section(&full.block).len();
+    assert_eq!(
+        section_bytes - tx_bytes,
+        37,
+        "a v{} section framing {} transactions costs 32 header-id bytes, a \
+         4-byte version and a 1-byte count",
+        full.block.version,
+        full.block.transactions.len()
+    );
+
+    // The whole section on the limit: `<=`, so nothing sheds.
+    let exact = params_with(1_000_000, section_bytes);
+    let at_limit = generate(&txs, &exact, &srcs);
+    assert_eq!(
+        at_limit.block.transactions.len(),
+        3,
+        "a section landing exactly on max_block_size is accepted whole — the \
+         framing is counted, not padded against"
+    );
+    assert_eq!(serialized_section(&at_limit.block).len(), section_bytes);
+
+    // The limit is the sum of the transaction bytes — 37 short of the section.
+    let undercount = params_with(1_000_000, tx_bytes);
+    let bounded = generate(&txs, &undercount, &srcs);
+    let shipped = serialized_section(&bounded.block).len();
+    assert!(
+        shipped <= tx_bytes,
+        "the shipped section is {shipped} bytes against a {tx_bytes} limit — \
+         the section framing was not counted, and this block is rejected by \
+         every peer that checks it"
+    );
+    assert_eq!(
+        bounded.block.transactions.len(),
+        1,
+        "37 bytes short of the whole set, the selected transaction and the fee \
+         transaction it fed must both drop, leaving emission only"
+    );
+    assert!(
+        bounded.invalid_txs.is_empty(),
+        "a transaction dropped for size is not invalid — it stays in the mempool"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Fee token aggregation, and the cap on it
+// ---------------------------------------------------------------------------
+
+/// A token-carrying fee box is collected like any other: the miner box takes
+/// the ERG and the tokens with it, and the assembled block validates.
+///
+/// The regression this guards is the aggregation rewrite that the cap needed.
+/// Tokens are summed in first-seen traversal order — fee boxes in block order,
+/// tokens in box order — rather than in `HashMap` order, because that order
+/// decides the miner box's serialized bytes, hence its id, the fee
+/// transaction's id, and the transactions root the miner is handed to hash.
+#[test]
+fn fee_box_tokens_are_collected_onto_the_miner_box() {
+    const PER_BOX: usize = 50;
+
+    let tokens_a = distinct_tokens(0x10, PER_BOX);
+    let tokens_b = distinct_tokens(0x20, PER_BOX);
+    let srcs = vec![
+        token_source_box(0xA7, 2_000_000, &tokens_a),
+        token_source_box(0xA8, 3_000_000, &tokens_b),
+    ];
+    let txs = vec![fee_paying_tx(&srcs[0]), fee_paying_tx(&srcs[1])];
+
+    // Token-heavy boxes are large and cost more to evaluate; neither limit is
+    // what this test is about.
+    let params = params_with(50_000_000, 524_288);
+    let generated = generate(&candidates(&txs), &params, &srcs);
+    let assembled = &generated.block.transactions;
+
+    assert_eq!(assembled.len(), 4, "[emission, tx, tx, fee]");
+    let fee_tx = assembled.last().unwrap();
+    assert!(is_fee_tx(fee_tx), "the last transaction must be the fee transaction");
+
+    let miner_box = fee_tx.outputs.get(0).unwrap();
+    assert_eq!(miner_box.value.as_i64(), 5_000_000, "every ERG of fee collected");
+    assert_eq!(
+        token_ids(miner_box),
+        expected_ids(&[&tokens_a, &tokens_b], 2 * PER_BOX),
+        "every token collected, in traversal order"
+    );
+
+    // Re-validates every assembled transaction — a token-carrying fee
+    // collection that does not validate fails here.
+    measure_block(&generated.block, &srcs, &block_context(&params));
+    assert!(generated.invalid_txs.is_empty());
+}
+
+/// Past `MAX_TOKENS_COUNT` distinct tokens the miner box cannot be built at
+/// all (`BoxTokens` is a bounded vec), and an unbuilt fee box means the block
+/// ships collecting **no fees** — the miner loses the whole block's revenue,
+/// not just the excess tokens. Truncating burns the excess and keeps the ERG,
+/// which is what the JVM does (`CandidateGenerator.scala:811`,
+/// `.take(MaxAssetsPerBox)`): a plain take, no reordering by value.
+///
+/// Asserted against `build_fee_tx` directly rather than through
+/// `generate_candidate`, because a 255-token box does not survive validation
+/// either — see `fee_tokens_past_the_box_window_still_lose_the_fees`.
+#[test]
+fn fee_tokens_are_capped_at_one_box_worth_in_traversal_order() {
+    const PER_BOX: usize = 100;
+    const CAP: usize = ErgoBox::MAX_TOKENS_COUNT;
+    const { assert!(3 * PER_BOX > CAP, "fixture must overflow the token cap") };
+
+    let groups = [
+        distinct_tokens(0x10, PER_BOX),
+        distinct_tokens(0x20, PER_BOX),
+        distinct_tokens(0x30, PER_BOX),
+    ];
+    let block_txs: Vec<Transaction> = groups
+        .iter()
+        .enumerate()
+        .map(|(i, tokens)| fee_paying_tx(&token_source_box(0xB0 + i as u8, 2_000_000, tokens)))
+        .collect();
+
+    let fee_tx = ergo_mining::fee::build_fee_tx(
+        &block_txs,
+        CANDIDATE_HEIGHT,
+        REWARD_DELAY,
+        &miner_pk(),
+    )
+    .expect("the cap is what keeps this buildable")
+    .expect("three fee boxes must produce a fee transaction");
+
+    let miner_box = fee_tx.outputs.get(0).unwrap();
+    assert_eq!(
+        miner_box.value.as_i64(),
+        3 * 2_000_000,
+        "capping tokens must not cost the miner any ERG"
+    );
+    assert_eq!(
+        token_ids(miner_box),
+        expected_ids(&groups.iter().collect::<Vec<_>>(), CAP),
+        "the survivors are the first {CAP} in traversal order — a plain take, \
+         no reordering by value, no hash-map iteration"
+    );
+    assert_eq!(
+        fee_tx.inputs.len(),
+        3,
+        "all three fee boxes are still spent — the dropped tokens are burned, \
+         which Ergo permits and the JVM's own take does too"
+    );
+}
+
+/// ⚠ **The cap above is necessary but not sufficient, and this pins why.**
+///
+/// `MAX_TOKENS_COUNT` is not the binding limit on a box's tokens; the
+/// consensus rule is `MAX_BOX_SIZE` — `out.bytes.length <= MaxBoxSize` (4096),
+/// JVM rule `txBoxSize`, `ErgoTransaction.scala:175`, and ergo-lib's
+/// `BoxSizeExceeded`. A minimal token costs 33 bytes, so a miner reward box
+/// holds **122** of them, and a 255-token box is 8476 bytes — over by more
+/// than double. The cap therefore moves the failure from "box will not build"
+/// to "box will not validate"; it does not restore the fees.
+///
+/// 140 distinct tokens is under the cap and over the window, so the cap is not
+/// even reached here: the fee transaction is dropped and the block ships
+/// collecting nothing. Matching the JVM, which caps by the same wrong constant
+/// and loses the same fees.
+///
+/// Fixing this means capping by serialized box size rather than token count —
+/// a divergence from the reference on what lands in a consensus-visible box,
+/// which is above this crate's pay grade. Flip this test when that decision
+/// is made.
+#[test]
+fn fee_tokens_past_the_box_window_still_lose_the_fees() {
+    const PER_BOX: usize = 70;
+    const {
+        assert!(
+            2 * PER_BOX < ErgoBox::MAX_TOKENS_COUNT,
+            "fixture must stay UNDER the token cap, so the box window is what bites"
+        )
+    };
+
+    let srcs = vec![
+        token_source_box(0xC1, 2_000_000, &distinct_tokens(0x10, PER_BOX)),
+        token_source_box(0xC2, 3_000_000, &distinct_tokens(0x20, PER_BOX)),
+    ];
+    let txs = vec![fee_paying_tx(&srcs[0]), fee_paying_tx(&srcs[1])];
+
+    let params = params_with(50_000_000, 524_288);
+    let generated = generate(&candidates(&txs), &params, &srcs);
+    let assembled = &generated.block.transactions;
+
+    assert_eq!(
+        assembled.len(),
+        3,
+        "[emission, tx, tx] — the fee transaction is missing, and 5,000,000 \
+         nanoERG of fees goes uncollected"
+    );
+    assert!(
+        !is_fee_tx(assembled.last().unwrap()),
+        "no fee transaction: a {} -token miner box is over MAX_BOX_SIZE",
+        2 * PER_BOX
+    );
+    assert!(
+        generated.invalid_txs.is_empty(),
+        "the fee boxes' creators are perfectly valid transactions"
     );
 }
