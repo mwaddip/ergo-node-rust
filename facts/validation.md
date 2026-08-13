@@ -521,14 +521,23 @@ Mirrors `simplifiedUpcoming()` composed with `PreHeader.apply` and
 | `version` | `last_header.version` | |
 | `n_bits` | `last_header.n_bits` | difficulty carries over |
 | `timestamp` | `last_header.timestamp + 1` | JVM's literal `+ 1`, not wall clock |
-| `miner_pk` | `EcPoint::generator()` | placeholder; no miner is known yet |
-| `votes` | `Votes([0, 0, 0])` | JVM passes an empty array |
+| `miner_pk` | `ec_point::generator()` | free fn in `ergo-chain-types`, not an assoc fn |
+| `votes` | `Votes([0, 0, 0])` | see below — not equivalent to the JVM |
 
 `miner_pk` is the secp256k1 group generator rather than a real key because the
 miner of the next block is unknown. A script reading `CONTEXT.preHeader.minerPk`
 therefore sees a placeholder in the mempool and the real key once mined — the
 same divergence the JVM has, and the reason a transaction can pass mempool
 validation and still fail in a block.
+
+⚠ **`votes` cannot match the JVM, and the difference is observable.** The JVM
+passes `Array.emptyByteArray`; `Votes` is three fixed bytes and has no empty
+representation, so the upcoming preheader carries `[0, 0, 0]`. A script reading
+`CONTEXT.preHeader.votes` sees a three-byte zero collection here and an empty
+one on a JVM node. No known script does, and a transaction that depended on it
+would fail once mined anyway — the real block carries real votes — but it is a
+genuine divergence rather than an equivalent encoding, so do not record it as
+parity.
 
 **Mining does not use this builder, deliberately.** `generate_candidate` builds
 a stub header at `height + 1` with a real wall-clock timestamp and feeds that to
