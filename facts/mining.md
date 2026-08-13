@@ -435,9 +435,28 @@ diverge.** Here the timestamp rule already existed twice.
 rather than reached for — the caller owns the mempool and the UTXO set, the
 crate owns the assembly:
 
-- the candidate transactions, prioritised (`mempool.all_prioritized()`)
-- the active `Parameters`, for `max_block_cost` and `max_block_size`
+- the candidate transactions, prioritised (`mempool.all_prioritized()`), each
+  with its serialized size
+- the **active** `Parameters` — `stateContext.currentParameters` in JVM terms,
+  not `boundary_params`, which is the epoch-boundary *proposal* and is a
+  different input
+- **ancestor headers**, newest first, for the upcoming-block `ErgoStateContext`
 - a UTXO lookup, for validating each candidate against accumulated state
+
+⚠ **The ancestor headers are not optional padding.** Selection validates each
+transaction against a context built by `build_state_context(stub,
+preceding_headers, parameters)`. Built from the parent alone that context
+exposes a **one-header** `CONTEXT.headers` window, where block validation
+exposes up to ten. A script reading `headers[5]` would then fail *during
+selection* and the transaction would be evicted from the mempool as invalid —
+a valid transaction destroyed by a selection-only artefact. Pass
+`chain.headers_from(parent.height - 9, 10)` reversed, minus the parent; the
+parent is prepended internally.
+
+`generate_candidate` returns `GeneratedCandidate { block, work, invalid_txs }`.
+⚠ **`invalid_txs` MUST be routed to the mempool for eviction** or Step 3.6 is
+silently lost — the crate identifies unusable transactions and has no way to
+remove them itself.
 
 ### Overview
 
@@ -561,6 +580,28 @@ See "Ownership" above for why it spent v0.8.0 development with no caller.
    `validate_single_transaction`; there is nothing to check against before
    that call returns.
 
+   ⚠ **The size bound is over the serialized SECTION, not the sum of
+   transaction sizes.** Validators enforce `max_block_size` against the
+   BlockTransactions section, which is
+   `[header_id: 32B][ver_or_count: VLQ][tx_count: VLQ if ver>1][txs…]` —
+   so `32 + vlq_len(version) + vlq_len(tx_count)` bytes, about 34–35, sit
+   outside a sum of transaction sizes. A candidate landing within that margin
+   of the limit is over it by the rule that actually decides validity.
+
+   The JVM generator sums transaction sizes and carries the same undercount;
+   we do not copy it. **This is not a safety margin** — the overhead is
+   deterministic and computable, so counting it is accuracy, not headroom, and
+   the no-`safeGap` decision above is untouched.
+
+   ⚠ **A double-spend loser is skipped, not evicted.** Two mempool
+   transactions spending the same box both validate in isolation — validation
+   sees one transaction at a time and the box is unspent on chain — so
+   selection must reject the second against the accumulated block, before
+   script evaluation (the JVM's ordering, to save time). The JVM *evicts* the
+   loser; we skip it and leave it in the pool, because conflict resolution is
+   the mempool's job and a candidate is a poor place to adjudicate it. The
+   transaction may well be the winner next block.
+
    ⚠ **Bound at `accumulated + tx_cost <= max_block_cost`, with NO safety
    margin.** The JVM subtracts a `safeGap` first — 0 below a 1M limit,
    150,000 below 5M, 500,000 above (`CandidateGenerator.scala:585`) —
@@ -582,6 +623,14 @@ See "Ownership" above for why it spent v0.8.0 development with no caller.
 transaction and fee transaction (zero-fee). This is valid.
 
 ### Step 4: Fee Transaction
+
+⚠ **Known limitation: aggregated fee tokens are not capped at
+`MaxAssetsPerBox`.** The JVM caps them. Without the cap, a block whose fee
+boxes carry more than 255 distinct tokens produces an unbuildable fee box, and
+the block ships **without collecting any fees**, with a warning. That is a
+revenue loss for the miner, not an invalid block, so it degrades rather than
+breaking — but on a token-heavy chain it is reachable. Fix by truncating to the
+highest-value tokens, as the JVM does.
 
 Collect fees from all selected transactions and create a single fee output
 for the miner.
