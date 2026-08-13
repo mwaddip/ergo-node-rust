@@ -456,6 +456,17 @@ guarantee is load-bearing here: a prover working over nodes still keyed in
 another prover's address-keyed map emits a **different proof for identical tree
 state**. Same digest, different bytes. Do not add a node cache between these.
 
+⚠ **A missing root reports one error, not two.** The signature takes a
+resolver rather than a storage handle, so the committed root is materialised by
+calling the resolver rather than `get_node` + `unpack`. The unpack is
+byte-identical — the resolver is that call plus a clone — but its miss path
+yields `Node::LabelOnly` instead of an `Err`. `unpack` itself never produces
+that variant, so it uniquely identifies the miss and is what the code gates on.
+The consequence is diagnostic: the former "failed to read root node: {e}" and
+"root node not found in storage" collapse into the latter. Same
+`ValidationError::StateOperationFailed`; the underlying redb cause is still
+logged at ERROR by `state/`, with the digest.
+
 ⚠ **This is a read path.** It computes what proofs *would* be; it applies
 nothing, persists nothing, and advances no watermark. A caller that treats its
 success as evidence a block is valid has misread it.
