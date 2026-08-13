@@ -343,10 +343,26 @@ impl BlockValidator for Validator {
             let _ = self.height_watch_tx.send(h);
 
             // Publish state context for mempool/API transaction validation.
-            // Only when we have preceding headers (height > 0).
+            //
+            // The UPCOMING context, not `build_state_context`: its consumers
+            // validate transactions that are not in a block yet, and those
+            // target the block after this one. `header` is the block just
+            // applied, so it is the *last* header here, not the preheader —
+            // and `preceding_headers` is unchanged, since the builder prepends
+            // `header` itself (facts/validation.md § Free Functions: state
+            // context). Publishing the current-tip context instead rejects
+            // every well-formed transaction on the network with
+            // "Creation height H+1 > preheader height".
+            //
+            // The guard no longer protects the builder — `header` alone
+            // satisfies `Headers` — but a context published at height 0 has no
+            // meaningful UTXO root for its consumers, so it stays.
             if !preceding_headers.is_empty() {
-                let ctx =
-                    ergo_validation::build_state_context(header, preceding_headers, active_params);
+                let ctx = ergo_validation::build_upcoming_state_context(
+                    header,
+                    preceding_headers,
+                    active_params,
+                );
                 let ctx_lock = self.shared_state_context.clone();
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
