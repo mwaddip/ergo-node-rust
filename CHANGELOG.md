@@ -43,8 +43,12 @@
   touched — measured at 1021 MB of freed-but-unreturned memory during a
   genesis sync.
 
-- **BREAKING — the journal-events contract is 2.0** (`journalEventsVersion` in
-  `/info`). Three **stable** events were removed — `deferred_eval_backlog`
+- **BREAKING — the journal-events contract goes 1.6 → 2.1** (`journalEventsVersion`
+  in `/info`). **2.0 is the breaking step**; 2.1 is additive on top of it and
+  adds `memory_budget_derived` (see the memory-sizing entry above), so a
+  consumer updated for major 2 needs nothing further.
+
+  Three **stable** events were removed — `deferred_eval_backlog`
   (replaced by `catchup_progress`), `deferred_eval_gate_engaged` and
   `eval_frontier_hole` — and two field domains narrowed:
   `validation_rollback_failed.path` loses `eval_failure`, and

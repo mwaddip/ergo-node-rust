@@ -20,7 +20,7 @@ are promised stable.
 The node advertises this contract's version in `/info`:
 
 ```json
-{ "journalEventsVersion": "1.0", ... }
+{ "journalEventsVersion": "2.1", ... }
 ```
 
 Consumers refuse to parse on unrecognized major. Additive changes (new
