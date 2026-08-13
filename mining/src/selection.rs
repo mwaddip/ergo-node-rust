@@ -12,18 +12,30 @@ use ergo_validation::{validate_single_transaction, ErgoStateContext};
 /// each against the upcoming block state. Transactions whose inputs can't
 /// be resolved or that fail validation are reported as invalid.
 ///
+/// Bounded by both protocol limits from `Parameters`: cumulative serialized
+/// size against `max_block_size`, and cumulative ErgoScript evaluation cost
+/// against `max_block_cost`. Cost is bounded at exactly
+/// `accumulated + tx_cost <= max_block_cost` with **no safety margin** — the
+/// JVM's `safeGap` guards its own AOT costing divergence, not ours (see
+/// `../facts/mining.md`, Step 3). Exceeding either limit skips that one
+/// transaction and the scan continues, so a later cheaper or smaller
+/// transaction can still use the remaining budget.
+///
 /// Returns `(selected_txs, invalid_tx_ids)`. Invalid IDs should be
-/// reported to the mempool for cleanup.
+/// reported to the mempool for cleanup. A transaction skipped for exceeding
+/// a limit is *not* invalid — it stays in the mempool for a later block.
 pub fn select_transactions(
     candidates: &[(Transaction, usize)],
     emission_outputs: &[ErgoBox],
     state_context: &ErgoStateContext,
     max_block_size: usize,
+    max_block_cost: u64,
     utxo_lookup: &dyn Fn(&[u8; 32]) -> Option<ErgoBox>,
 ) -> (Vec<Transaction>, Vec<[u8; 32]>) {
     let mut selected = Vec::new();
     let mut invalid_ids = Vec::new();
     let mut accumulated_size: usize = 0;
+    let mut accumulated_cost: u64 = 0;
 
     // Track outputs from emission tx and selected txs (available as inputs for later txs)
     let mut available_outputs: HashMap<[u8; 32], ErgoBox> = HashMap::new();
@@ -73,7 +85,20 @@ pub fn select_transactions(
 
         // Validate against upcoming state
         match validate_single_transaction(tx, input_boxes, data_boxes, state_context) {
-            Ok(_) => {
+            Ok(tx_cost) => {
+                // The cost check cannot precede validation — validation is what
+                // produces the number. `checked_add` reads an overflowing sum as
+                // "does not fit" instead of wrapping into a spurious accept.
+                let Some(total_cost) = accumulated_cost
+                    .checked_add(tx_cost)
+                    .filter(|total| *total <= max_block_cost)
+                else {
+                    // Over budget, but still a valid transaction: leave it in
+                    // the mempool and keep scanning — a cheaper one may fit.
+                    continue;
+                };
+
+                accumulated_cost = total_cost;
                 accumulated_size += tx_size;
 
                 // Track outputs for later txs (intra-block spending)
