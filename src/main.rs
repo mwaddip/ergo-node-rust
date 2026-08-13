@@ -25,7 +25,10 @@ use ergo_chain_types::EcPoint;
 use enr_store::{ModifierStore, RedbModifierStore};
 use ergo_node_rust::{P2pTransport, PeerStorageAdapter, SharedChain, SharedStore, ValidationPipeline};
 use ergo_sync::{HeaderSync, SyncConfig, SyncStore};
-use ergo_validation::{ApplyStateOutcome, BlockValidator, DigestValidator, UtxoValidator, ValidationError};
+use ergo_validation::{
+    ApplyStateOutcome, BlockValidator, DigestValidator, MiningState, StatePersistence,
+    UtxoValidator, ValidationError,
+};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
@@ -212,6 +215,23 @@ impl Validator {
         Self { inner, shared_height, shared_state_context, block_applied_tx, height_watch_tx, mining }
     }
 
+    /// The active variant's mining support. `None` in digest mode, where
+    /// candidate assembly has no UTXO set to work from.
+    ///
+    /// Inherent rather than a `BlockValidator` method because `main` is its
+    /// only consumer and does name this type. Putting it on the trait would
+    /// force six `sync/` test stubs to declare a capability nothing asks them
+    /// for. See facts/validation.md § "How callers reach the split traits" —
+    /// the asymmetry with `state_persistence` follows the consumers and is
+    /// deliberate.
+    #[allow(dead_code)] // wired into update_mining_proofs in step D of the split
+    fn mining_state(&self) -> Option<&dyn MiningState> {
+        match &self.inner {
+            ValidatorInner::Digest(_) => None,
+            ValidatorInner::Utxo(v) => Some(v),
+        }
+    }
+
     /// Pre-compute mining proofs after a successful block validation.
     fn update_mining_proofs(&self, header: &ergo_chain_types::Header) {
         let mining = match &self.mining {
@@ -367,7 +387,9 @@ impl BlockValidator for Validator {
     fn flush(&self) -> Result<(), ValidationError> {
         match &self.inner {
             ValidatorInner::Digest(v) => v.flush(),
-            ValidatorInner::Utxo(v) => v.flush(),
+            // Qualified: UtxoValidator implements flush on both traits during
+            // the split, and the BlockValidator one is a shim step E deletes.
+            ValidatorInner::Utxo(v) => StatePersistence::flush(v),
         }
     }
 
@@ -380,7 +402,7 @@ impl BlockValidator for Validator {
     fn resize_cache(&self, cache_bytes: usize) -> Result<(), ValidationError> {
         match &self.inner {
             ValidatorInner::Digest(v) => v.resize_cache(cache_bytes),
-            ValidatorInner::Utxo(v) => v.resize_cache(cache_bytes),
+            ValidatorInner::Utxo(v) => StatePersistence::resize_cache(v, cache_bytes),
         }
     }
 
@@ -389,15 +411,36 @@ impl BlockValidator for Validator {
         txs: &[ergo_validation::Transaction],
     ) -> Option<Result<(Vec<u8>, ADDigest), ValidationError>> {
         match &self.inner {
-            ValidatorInner::Utxo(v) => v.proofs_for_transactions(txs),
+            // The outer Some is this shim's whole job: MiningState returns a
+            // bare Result, and the "wrong mode" Option layer dies with the
+            // shim in step E.
+            ValidatorInner::Utxo(v) => Some(MiningState::proofs_for_transactions(v, txs)),
             ValidatorInner::Digest(_) => None,
         }
     }
 
     fn emission_box_id(&self) -> Option<[u8; 32]> {
         match &self.inner {
-            ValidatorInner::Utxo(v) => v.emission_box_id(),
+            ValidatorInner::Utxo(v) => MiningState::emission_box_id(v),
             ValidatorInner::Digest(_) => None,
+        }
+    }
+
+    /// The active variant's storage lifecycle. `None` in digest mode, which
+    /// owns no redb.
+    ///
+    /// `None` means "nothing to persist" — never "the flush failed". Callers
+    /// must keep those apart; collapsing them is the shape that produced the
+    /// `resize_cache` bug documented above. See facts/sync.md § "Flushing a
+    /// validator that owns no state".
+    ///
+    /// This one is a trait method rather than an inherent accessor because
+    /// `sync/` is generic over `V: BlockValidator` and never names this type,
+    /// so an inherent method here would be out of reach of its only caller.
+    fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+        match &self.inner {
+            ValidatorInner::Digest(_) => None,
+            ValidatorInner::Utxo(v) => Some(v),
         }
     }
 }
