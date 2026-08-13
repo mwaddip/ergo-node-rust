@@ -114,9 +114,9 @@ fn vlq_len(v: u64) -> usize {
 ///
 /// Returns `(selected_txs, invalid_tx_ids)`. Invalid IDs should be
 /// reported to the mempool for cleanup. A transaction skipped for exceeding
-/// a limit, for conflicting with one already selected, or for inputs that
-/// don't resolve is *not* invalid — it stays in the mempool for a later
-/// block.
+/// a limit, for conflicting with one already selected, or for an input or
+/// data input that doesn't resolve is *not* invalid — it stays in the mempool
+/// for a later block.
 #[allow(clippy::too_many_arguments)]
 pub fn select_transactions(
     candidates: &[(Transaction, usize)],
@@ -203,19 +203,31 @@ pub fn select_transactions(
             continue; // Inputs not available, skip (not necessarily invalid — might appear later)
         }
 
-        // Resolve data input boxes
-        let data_boxes: Vec<ErgoBox> = tx
-            .data_inputs
-            .as_ref()
-            .map(|dis| {
-                dis.iter()
-                    .filter_map(|di| {
-                        let id = id_bytes(di.box_id.as_ref());
-                        available_outputs.get(&id).cloned().or_else(|| utxo_lookup(&id))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Resolve data input boxes, under the same rule as the inputs above:
+        // a box that will not resolve is not evidence of anything about the
+        // transaction.
+        //
+        // Filtering the misses away instead yields a `data_boxes` shorter than
+        // `tx.data_inputs`, which `TransactionContext::new` rejects
+        // deterministically as `DataInputBoxNotFound` — so the transaction
+        // comes back *invalid* rather than skipped, lands in `invalid_ids`,
+        // and the caller evicts it for the mempool's invalidation TTL. A
+        // transiently unresolvable data input would have selected fine on the
+        // next rebuild 15 seconds later.
+        let mut data_boxes: Vec<ErgoBox> = Vec::new();
+        let mut data_inputs_found = true;
+        for di in tx.data_inputs.iter().flat_map(|dis| dis.iter()) {
+            let id = id_bytes(di.box_id.as_ref());
+            if let Some(b) = available_outputs.get(&id).cloned().or_else(|| utxo_lookup(&id)) {
+                data_boxes.push(b);
+            } else {
+                data_inputs_found = false;
+                break;
+            }
+        }
+        if !data_inputs_found {
+            continue; // Data inputs not available, skip (same as inputs — might appear later)
+        }
 
         // Validate against upcoming state
         match validate_single_transaction(tx, input_boxes, data_boxes, state_context) {

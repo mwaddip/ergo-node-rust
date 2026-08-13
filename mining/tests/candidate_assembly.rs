@@ -18,7 +18,7 @@ use ergo_lib::chain::ergo_tree_predef;
 use ergo_lib::chain::genesis;
 use ergo_lib::chain::transaction::input::prover_result::ProverResult;
 use ergo_lib::chain::transaction::input::Input;
-use ergo_lib::chain::transaction::Transaction;
+use ergo_lib::chain::transaction::{DataInput, Transaction};
 use ergo_lib::ergotree_interpreter::sigma_protocol::prover::ProofBytes;
 use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
 use ergo_lib::ergotree_ir::chain::ergo_box::box_value::BoxValue;
@@ -227,6 +227,17 @@ fn box_bytes_with(b: &ErgoBox, extra: &Token) -> usize {
 }
 
 fn spend_into(src: &ErgoBox, out_tree: ErgoTree) -> Transaction {
+    spend_into_with_data_inputs(src, &[], out_tree)
+}
+
+/// `spend_into` with read-only data inputs attached. The fixture script is
+/// `sigmaProp(true)` and never reads them, so all they change for selection is
+/// whether the boxes they name have to resolve.
+fn spend_into_with_data_inputs(
+    src: &ErgoBox,
+    data_boxes: &[&ErgoBox],
+    out_tree: ErgoTree,
+) -> Transaction {
     // Tokens carry through unchanged: the whole box goes to the one output, so
     // preservation holds without a change box.
     let output = ErgoBoxCandidate {
@@ -243,7 +254,8 @@ fn spend_into(src: &ErgoBox, out_tree: ErgoTree) -> Transaction {
             extension: ContextExtension::empty(),
         },
     );
-    Transaction::new_from_vec(vec![input], vec![], vec![output]).unwrap()
+    let data_inputs: Vec<DataInput> = data_boxes.iter().map(|b| b.box_id().into()).collect();
+    Transaction::new_from_vec(vec![input], data_inputs, vec![output]).unwrap()
 }
 
 /// Spends `src` entirely into a fee-proposition box — the whole value becomes
@@ -903,4 +915,65 @@ fn fee_tokens_past_the_box_window_are_capped_and_the_fees_collected() {
         generated.invalid_txs.is_empty(),
         "the fee boxes' creators are perfectly valid transactions"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 8. An unresolvable DATA input is skipped, not evicted
+// ---------------------------------------------------------------------------
+
+/// The same rule § 5 applies to conflicts, and the one selection already
+/// applied to regular inputs: a box that will not resolve is not evidence the
+/// transaction is invalid. It may be a reorg race, a fastsync gap, or the
+/// at-tip storage swap window, and it may resolve on the next 15-second
+/// rebuild.
+///
+/// Resolving data inputs with a filter that drops the misses yields a
+/// `data_boxes` shorter than `tx.data_inputs`, which `TransactionContext::new`
+/// rejects deterministically as `DataInputBoxNotFound`. So the transaction
+/// comes back *invalid* rather than skipped, lands in `invalid_txs`, and the
+/// caller routes it to `pool.invalidate` — evicting a valid transaction for
+/// the mempool's invalidation TTL.
+///
+/// ⚠ The exclusion assertion passes either way: the truncated context is
+/// caught up front, so a filtered transaction never reaches the block. Nothing
+/// is validated against a mismatched context. The whole bug is **which of the
+/// two return values** it lands in, so the `invalid_txs` assertion is the one
+/// under test — restore the filter and it is the one that fails.
+#[test]
+fn an_unresolvable_data_input_is_skipped_not_evicted() {
+    let src = source_box(0xDA, 4_000_000);
+    // Referenced as a data input, and deliberately withheld from the lookup in
+    // the first pass: a box the node cannot see right now.
+    let referenced = source_box(0xDB, 1_000_000);
+    let tx = spend_into_with_data_inputs(&src, &[&referenced], fee_tree());
+    let mempool = candidates(std::slice::from_ref(&tx));
+
+    let generated = generate(&mempool, &Parameters::default(), std::slice::from_ref(&src));
+    assert!(
+        !generated
+            .block
+            .transactions
+            .iter()
+            .any(|t| t.id() == tx.id()),
+        "a transaction whose data input will not resolve cannot be selected"
+    );
+    assert!(
+        generated.invalid_txs.is_empty(),
+        "an unresolvable data input is not evidence of invalidity — reporting \
+         it evicts a valid transaction from the mempool for the invalidation \
+         TTL, when it would have selected fine on the next rebuild"
+    );
+
+    // Control: hand the lookup the same box and the transaction selects. The
+    // skip above is about resolution, not about carrying a data input at all.
+    let resolved = generate(&mempool, &Parameters::default(), &[src, referenced]);
+    assert!(
+        resolved
+            .block
+            .transactions
+            .iter()
+            .any(|t| t.id() == tx.id()),
+        "fixture invariant: the transaction is otherwise selectable"
+    );
+    assert!(resolved.invalid_txs.is_empty());
 }
