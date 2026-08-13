@@ -634,11 +634,18 @@ transaction and fee transaction (zero-fee). This is valid.
 
 `MaxAssetsPerBox` (255) is **not** the binding limit and capping there does not
 collect the fees. The consensus rule is `txBoxSize` —
-`out.bytes.length <= MaxBoxSize` (4096), `ErgoTransaction.scala` — and a miner
-reward box with a 54-byte tree holds about **122** minimal 33-byte tokens
-before crossing it. A 255-token fee box is ~8476 bytes and can never validate,
-so a count cap only moves the failure from "box will not build" to "box will
-not validate": the block still ships collecting **zero** fees.
+`out.bytes.length <= MaxBoxSize` (4096), `ErgoTransaction.scala`. Measured at
+`reward_delay = 720`: a miner reward box holds **121** minimal tokens at
+**4087 bytes**; 122 is over. A 255-token box is **8509** bytes and can never
+validate, so a count cap only moves the failure from "box will not build" to
+"box will not validate": the block still ships collecting **zero** fees.
+
+⚠ **Measure `out.bytes`, not the candidate.** `txBoxSize` applies to the
+serialized `ErgoBox`, which carries 32 bytes of transaction id plus the output
+index on top of the `ErgoBoxCandidate` body — 33 bytes that an
+estimate-from-the-candidate misses. Earlier drafts of this section said 122 and
+8476 for exactly that reason. Any implementation must grow the real box and
+measure it rather than assuming a per-token width.
 
 The JVM caps by the same wrong constant — `flatMap(_.additionalTokens).take(MaxAssetsPerBox)`,
 unsorted — and loses the same fees. **We diverge deliberately.** Which fee
@@ -646,6 +653,18 @@ boxes a miner collects is miner policy, not consensus: the rule constrains the
 box it produces, not the choice of what to put in it, and uncollected fee boxes
 simply remain spendable later. So capping by size is legal, strictly better for
 the miner, and not a parity break in any sense that matters.
+
+⚠ **The dust rule cannot bind here, and a guard for it would only misfire.**
+`value >= bytes * minValuePerByte` is already satisfied by construction: every
+fee box collected has cleared that rule while carrying the same tokens under
+the *larger* fee-proposition tree (105 bytes against the reward script's 54),
+values add across the collected boxes while the box overhead is paid once, and
+duplicate token ids collapse to a single entry. The reward box is strictly
+cheaper per byte than the boxes that fed it. A guard would also have to
+hardcode `minValuePerByte` rather than read the block's voted value, which
+`build_fee_tx` is not given — so it could only ever fire wrongly and burn
+tokens that would have validated. Recorded because it looks like an obvious
+second check to add.
 
 ⚠ **The surviving tokens must be selected deterministically**, in a stable
 traversal order — first-seen across the fee boxes, never hash-map iteration
