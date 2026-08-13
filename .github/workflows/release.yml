@@ -5,21 +5,37 @@ name: release
 # and attaches both to a GitHub Release for the tag.
 
 on:
+  # Two ways in, and they must stay equivalent.
   push:
     tags:
       - 'v*'
+  # Merging a release/* PR into main releases what was merged. The tag is
+  # created by this workflow rather than by hand, so the tag and the merge
+  # cannot disagree about what shipped.
+  pull_request:
+    types: [closed]
 
 permissions:
-  contents: write   # required for creating the release + uploading assets
+  contents: write   # release + asset upload, and the tag push on the merge path
 
 jobs:
   build-and-release:
     runs-on: ubuntu-24.04
+    # A closed PR is not a merged one, and only release/* branches release.
+    # Without this the job would run on every closed PR, including abandoned
+    # ones.
+    if: >-
+      github.event_name == 'push' ||
+      (github.event.pull_request.merged == true &&
+       startsWith(github.event.pull_request.head.ref, 'release/'))
 
     steps:
       - name: Checkout (with submodules)
         uses: actions/checkout@v5
         with:
+          # On the merge path the PR ref is gone; take main, which now
+          # contains the merge commit.
+          ref: ${{ github.event_name == 'pull_request' && 'main' || github.ref }}
           # Top-level submodules only — fetches chain, p2p, state, store,
           # facts but NOT their nested facts/ pointers. The nested
           # facts/ submodules are docs read by per-submodule Claude
@@ -28,6 +44,34 @@ jobs:
           # `recursive` would fail the checkout.
           submodules: true
           fetch-depth: 0
+
+      # Resolves to the pushed tag on the tag path, or creates one from
+      # Cargo.toml on the merge path. Everything downstream reads
+      # steps.tag.outputs.name and does not care which path it came from.
+      - name: Resolve release tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          tag="v${version}"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "::error::tag ${tag} already exists — bump the workspace version before merging a release branch"
+            exit 1
+          fi
+          # Annotated, with the CHANGELOG section as the message: the release
+          # body is sourced from the annotation further down, and a lightweight
+          # tag would leave it empty.
+          notes=$(awk -v v="## ${tag}" '$0 ~ "^" v {f=1; next} /^## v/ {f=0} f' CHANGELOG.md)
+          [ -z "$notes" ] && notes="Release ${tag}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${tag}" -m "${notes}"
+          git push origin "${tag}"
+          echo "name=${tag}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -81,7 +125,7 @@ jobs:
           git fetch --tags --force
           {
             echo 'body<<EOF_TAG_BODY'
-            git tag -l --format='%(contents)' "${GITHUB_REF_NAME}"
+            git tag -l --format='%(contents)' "${{ steps.tag.outputs.name }}"
             echo 'EOF_TAG_BODY'
           } >> "$GITHUB_OUTPUT"
 
