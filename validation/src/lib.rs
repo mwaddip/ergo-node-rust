@@ -314,58 +314,17 @@ pub trait BlockValidator {
     /// Does this validator own persistent state? `Some` hands out its storage
     /// lifecycle; `None` means it owns none (digest mode).
     ///
-    /// Required once step E lands — see the staging note below. `sync/` is
-    /// generic over `V: BlockValidator` (`HeaderSync<T, C, S, V>`) and never
-    /// names main's `Validator`, so this is the only route by which a generic
-    /// caller can reach [`StatePersistence`]. [`MiningState`] needs no such
-    /// accessor because its only consumer is `main`, which does name the type.
+    /// REQUIRED — no default body. `sync/` is generic over
+    /// `V: BlockValidator` (`HeaderSync<T, C, S, V>`) and never names main's
+    /// `Validator`, so this is the only route by which a generic caller can
+    /// reach [`StatePersistence`]. [`MiningState`] needs no such accessor
+    /// because its only consumer is `main`, which does name the type.
     ///
     /// This method answers a capability question; it does NOT perform work.
     /// That is what separates it from the defaulted no-ops it replaces — a
     /// `None` return is a truthful answer, whereas `Ok(())` from a defaulted
     /// `flush` was a claim that work happened.
-    ///
-    /// ⚠ **STAGING ARTEFACT — the default body below is temporary and must
-    /// not be read as a design choice.** It is the exact shape this split
-    /// exists to delete. It ships only because a required method cannot be
-    /// added to a trait additively: all nine implementors across three crates
-    /// would break in one commit. **Step E of the v0.8.0 split removes this
-    /// default** along with the four deprecated methods beneath it. If the
-    /// default is still here when the split is called done, the split failed
-    /// — four silent defaults will have become one.
-    fn state_persistence(&self) -> Option<&dyn StatePersistence> {
-        None
-    }
-
-    /// Force a durable commit (fsync) of all outstanding storage writes.
-    /// Call periodically during long sweeps (bounds crash data loss) and
-    /// on graceful shutdown. Digest-mode validators may make this a no-op.
-    fn flush(&self) -> Result<(), ValidationError> {
-        Ok(())
-    }
-
-    /// Resize the storage read cache at runtime (e.g. after initial sync).
-    /// Digest-mode validators may make this a no-op.
-    fn resize_cache(&self, _cache_bytes: usize) -> Result<(), ValidationError> {
-        Ok(())
-    }
-
-    /// Compute AD proofs and new state root for a set of transactions
-    /// without modifying persistent state. Returns None for digest-mode
-    /// validators (mining requires UTXO mode).
-    fn proofs_for_transactions(
-        &self,
-        txs: &[Transaction],
-    ) -> Option<Result<(Vec<u8>, ADDigest), ValidationError>> {
-        let _ = txs;
-        None
-    }
-
-    /// Current emission box ID in the UTXO set. None if digest mode or
-    /// all ERG emitted. Updated after each block validation.
-    fn emission_box_id(&self) -> Option<[u8; 32]> {
-        None
-    }
+    fn state_persistence(&self) -> Option<&dyn StatePersistence>;
 }
 
 /// Storage lifecycle. Implemented by [`UtxoValidator`] only — a validator that

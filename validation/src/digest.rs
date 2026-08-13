@@ -321,11 +321,6 @@ impl BlockValidator for DigestValidator {
     /// Digest mode owns no persistent state — there is nothing to flush and
     /// no cache to resize, so there is no [`StatePersistence`] to hand out.
     ///
-    /// Written out even though the trait's temporary default would supply the
-    /// same `None`: this is the answer the contract's table specifies, and
-    /// stating it here means step E deletes one default rather than also
-    /// having to work out which implementors were silently riding it.
-    ///
     /// ⚠ The absence of a [`StatePersistence`] impl is the mode signal. Do
     /// not "helpfully" give `DigestValidator` a no-op one — a defaulted
     /// `resize_cache` on `BlockValidator` is exactly what let the enum

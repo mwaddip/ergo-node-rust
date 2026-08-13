@@ -200,39 +200,9 @@ impl BlockValidator for UtxoValidator {
     }
 
     /// UTXO mode owns an AVL+ tree over redb, so it hands out its own
-    /// storage lifecycle. Overrides the trait's temporary `None` default,
-    /// which step E deletes.
+    /// storage lifecycle.
     fn state_persistence(&self) -> Option<&dyn StatePersistence> {
         Some(self)
-    }
-
-    // ── Shims onto the split traits ─────────────────────────────────────
-    //
-    // These four still hang off `BlockValidator` only because `sync/` and
-    // `main` have not moved to `StatePersistence`/`MiningState` yet. They
-    // hold no logic: the bodies live in the impls below, so when the last
-    // caller moves off them this becomes a deletion rather than a
-    // reconciliation of four drifted copies.
-
-    fn flush(&self) -> Result<(), ValidationError> {
-        StatePersistence::flush(self)
-    }
-
-    fn resize_cache(&self, cache_bytes: usize) -> Result<(), ValidationError> {
-        StatePersistence::resize_cache(self, cache_bytes)
-    }
-
-    fn proofs_for_transactions(
-        &self,
-        txs: &[ergo_lib::chain::transaction::Transaction],
-    ) -> Option<Result<(Vec<u8>, ADDigest), ValidationError>> {
-        // The outer `Some` is the layer the split deletes: here it says only
-        // "UTXO mode", which the impl's existence already says.
-        Some(MiningState::proofs_for_transactions(self, txs))
-    }
-
-    fn emission_box_id(&self) -> Option<[u8; 32]> {
-        MiningState::emission_box_id(self)
     }
 }
 
@@ -914,13 +884,8 @@ mod tests {
         // rejected block never reached storage. `proofs_for_transactions`
         // reads the tree back out of storage, so this observes the durable
         // side specifically, not the in-memory one asserted above.
-        //
-        // Spelled out rather than called as a method because `UtxoValidator`
-        // now carries `proofs_for_transactions` on both `BlockValidator` (the
-        // shim) and `MiningState` (the body). Step E deletes the shim; this
-        // line then loses its qualifier and its outer `expect`.
-        let (_, storage_digest) = BlockValidator::proofs_for_transactions(&validator, &[])
-            .expect("UTXO mode computes proofs")
+        let (_, storage_digest) = validator
+            .proofs_for_transactions(&[])
             .expect("empty-operation proof");
         assert_eq!(
             storage_digest, before,

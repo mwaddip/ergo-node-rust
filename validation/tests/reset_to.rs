@@ -14,7 +14,7 @@ use ergo_avltree_rust::batch_node::AVLTree;
 use ergo_avltree_rust::operation::{KeyValue, Operation};
 use ergo_chain_types::ADDigest;
 use ergo_validation::{
-    BlockValidator, DigestValidator, ScriptEvalMode, UtxoValidator, ValidationError,
+    BlockValidator, DigestValidator, MiningState, ScriptEvalMode, UtxoValidator, ValidationError,
 };
 use tempfile::TempDir;
 
@@ -84,7 +84,6 @@ fn utxo_validator_with_history() -> (UtxoValidator, ADDigest, ADDigest, TempDir)
 fn observed_prover_digest(validator: &UtxoValidator) -> ADDigest {
     let (_, digest) = validator
         .proofs_for_transactions(&[])
-        .expect("UTXO mode computes proofs")
         .expect("empty-ops proof generation succeeds");
     digest
 }
