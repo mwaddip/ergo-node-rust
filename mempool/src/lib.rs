@@ -9,7 +9,9 @@ pub mod weight;
 
 use std::collections::HashMap;
 
+use ergo_lib::chain::ergo_tree_predef;
 use ergo_lib::chain::transaction::Transaction;
+use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
 use expiring_cache::ExpiringCache;
 use pool::OrderedPool;
 use stats::FeeStats;
@@ -21,6 +23,10 @@ pub struct Mempool {
     invalidated: ExpiringCache<[u8; 32]>,
     stats: FeeStats,
     config: MempoolConfig,
+    /// The tree a fee output is guarded by, derived once from
+    /// `config.reward_delay`. Step 7a compares every output against this, so
+    /// deriving it per output would recompile a tree per output per tx.
+    fee_proposition: ErgoTree,
     /// Validation cost since last block (rate limiting).
     interblock_cost: u64,
     /// Per-peer validation cost since last block.
@@ -28,13 +34,33 @@ pub struct Mempool {
 }
 
 impl Mempool {
+    /// # Panics
+    ///
+    /// If the fee proposition cannot be built from `config.reward_delay`.
+    ///
+    /// `fee_proposition()` is a pure function of that one integer and takes no
+    /// external input, so a failure means the predef builder itself is broken —
+    /// a build-integrity fault, not a runtime or configuration condition. There
+    /// is no recovery worth having: a mempool that cannot recognise a fee
+    /// output reads every fee as zero and silently declines every transaction
+    /// on the network, which is precisely the bug this step exists to fix.
+    /// Failing loudly at startup is the honest outcome, and `new` stays
+    /// infallible so its two call sites in `main.rs` and `api/` are unaffected.
     pub fn new(config: MempoolConfig) -> Self {
         let capacity = config.capacity;
+        let fee_proposition = ergo_tree_predef::fee_proposition(config.reward_delay)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "fee proposition for reward_delay {}: {e}",
+                    config.reward_delay
+                )
+            });
         Self {
             pool: OrderedPool::new(capacity),
             invalidated: ExpiringCache::new(config.invalidation_ttl, config.invalidation_capacity),
             stats: FeeStats::new(1000),
             config,
+            fee_proposition,
             interblock_cost: 0,
             per_peer_cost: HashMap::new(),
         }

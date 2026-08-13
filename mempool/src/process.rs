@@ -1,16 +1,36 @@
 use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
+use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
 use ergo_validation::{validate_single_transaction, ErgoStateContext};
 
 use crate::family::propagate_family_weight;
 use crate::types::*;
 use crate::weight::TxWeight;
 
-/// Extract the transaction fee: input_sum - output_sum.
-pub fn extract_fee(tx: &Transaction, input_boxes: &[ErgoBox]) -> u64 {
-    let input_sum: u64 = input_boxes.iter().map(|b| *b.value.as_u64()).sum();
-    let output_sum: u64 = tx.outputs.iter().map(|b| *b.value.as_u64()).sum();
-    input_sum.saturating_sub(output_sum)
+/// The transaction fee: the summed value of every output guarded by the fee
+/// proposition.
+///
+/// **Not `input_sum - output_sum`.** Ergo has no implicit remainder that
+/// becomes the fee — ergo-lib enforces exact ERG preservation
+/// (`ErgPreservationError` when `input_sum != output_sum`,
+/// `wallet/tx_context.rs:122`), so a difference-based fee is structurally zero
+/// for every transaction that survives validation, and the minimum-fee check
+/// then declines all of them. The fee is an explicit output instead.
+///
+/// Mirrors `ErgoMemPool.extractFee` (`ErgoMemPool.scala:304-309`), which
+/// filters outputs on `chainSettings.monetary.feeProposition`.
+///
+/// Compared by `ErgoTree` value rather than by serialized bytes: that is the
+/// JVM's own structural `==`, sigma-rust's `PartialEq` deliberately ignores
+/// `ParsedErgoTree`'s memoisation field, and it avoids serializing every
+/// output's script on a per-transaction path. An output whose script failed to
+/// parse is an `ErgoTree::Unparsed` and correctly matches nothing.
+pub fn extract_fee(tx: &Transaction, fee_proposition: &ErgoTree) -> u64 {
+    tx.outputs
+        .iter()
+        .filter(|out| &out.ergo_tree == fee_proposition)
+        .map(|out| *out.value.as_u64())
+        .sum()
 }
 
 /// Extract transaction ID as [u8; 32].
@@ -193,8 +213,10 @@ impl super::Mempool {
             *self.per_peer_cost.entry(peer).or_insert(0) += cost as u64;
         }
 
-        // 7. Check minimum fee
-        let fee = extract_fee(&tx, &input_boxes);
+        // 7a. Compute fee from the outputs paying the fee proposition.
+        let fee = extract_fee(&tx, &self.fee_proposition);
+
+        // 7b. Check minimum fee
         if fee < self.config.min_fee {
             return ProcessingOutcome::Declined {
                 reason: format!("fee {fee} below minimum {}", self.config.min_fee),

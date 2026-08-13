@@ -78,6 +78,13 @@ pub struct MempoolConfig {
     pub cost_per_block: u64,
     /// Maximum validation cost budget per peer per block interval.
     pub cost_per_peer_per_block: u64,
+    /// Miner reward delay, the only input to the fee proposition tree.
+    ///
+    /// A monetary constant, not a mining setting: the node must extract fees
+    /// whether or not it mines, so this mirrors the JVM's
+    /// `chainSettings.monetary.minerRewardDelay` rather than `[mining]`.
+    /// Mainnet is 720, which is the default.
+    pub reward_delay: i32,
 }
 
 impl Default for MempoolConfig {
@@ -92,6 +99,7 @@ impl Default for MempoolConfig {
             invalidation_capacity: 10_000,
             cost_per_block: 12_000_000,
             cost_per_peer_per_block: 10_000_000,
+            reward_delay: 720,
         }
     }
 }

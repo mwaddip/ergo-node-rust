@@ -231,6 +231,19 @@ derives it from `reward_delay` via
 compares each output's `ergo_tree` against the stored value. Deriving it per
 output would recompile a tree for every output of every transaction.
 
+`Mempool::new` stays **infallible** and panics if the tree cannot be built.
+`fee_proposition()` is a pure function of one integer with no external input, so
+a failure is a build-integrity fault rather than a runtime or configuration
+condition, and the only cheap fallback — treat the fee as zero — silently
+declines every transaction on the network, which is the defect step 7a exists to
+fix. A loud startup failure for an unreachable case beats a quiet one for a
+reachable one.
+
+⚠ **That reasoning depends on `reward_delay` not being user-settable.** It is a
+`MempoolConfig` field left at its default by both call sites today. If it is
+ever wired to an operator-facing key, the panic becomes reachable from a config
+file and `new` must become fallible.
+
 ⚠ **`reward_delay` is a monetary constant, not a mining setting.** The node
 must extract fees whether or not mining is enabled, so this does **not** read
 `[mining].reward_delay`. It mirrors the JVM's

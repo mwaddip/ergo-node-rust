@@ -1,189 +1,29 @@
 //! Step 6a: a creation height above the preheader is transient, not fatal.
 //!
-//! These are the crate's first `process()`-level tests, so they build real
-//! artefacts rather than poking `OrderedPool` directly: a real `ErgoStateContext`,
-//! real `ErgoTree`s, and transactions that genuinely reach ergo-lib's evaluator.
-//! The bug under test is invisible to a stubbed validator — it lives precisely in
-//! *which* outcome a real validation failure is mapped to.
-//!
-//! Scripts are the two trivial sigma propositions: `sigmaProp(true)` verifies
-//! against an empty proof, `sigmaProp(false)` cannot. No key material, and the
-//! failure mode of the false one does not depend on any particular reduction.
-//!
-//! ## Why `min_fee = 0` throughout
-//!
-//! ergo-lib enforces *exact* ERG preservation (`ErgPreservationError` when
-//! `input_sum != output_sum`), so any transaction that survives validation has
-//! `input_sum - output_sum == 0` — which is what `process::extract_fee` returns
-//! as the fee. Under the default `min_fee` no validating transaction can ever
-//! reach `Accepted`, so these tests set it to zero to isolate the creation-height
-//! behaviour. That interaction is a separate defect (the contract's step 3 wants
-//! outputs to the *fee proposition*, matching the JVM's `extractFee`); it is
-//! reported to the main session and deliberately not addressed here.
+//! Fixtures live in `common/` — real `ErgoStateContext`, real `ErgoTree`s,
+//! transactions that reach ergo-lib's evaluator. The bug under test is
+//! invisible to a stubbed validator: it lives precisely in *which* outcome a
+//! real validation failure is mapped to.
 
-use std::collections::HashMap;
+mod common;
+
 use std::time::Instant;
 
-use ergo_chain_types::{
-    ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint, Header, PreHeader, Votes,
-};
-use ergo_lib::chain::transaction::input::prover_result::ProverResult;
-use ergo_lib::chain::transaction::input::Input;
-use ergo_lib::chain::transaction::Transaction;
-use ergo_lib::ergotree_interpreter::sigma_protocol::prover::ProofBytes;
-use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
-use ergo_lib::ergotree_ir::chain::ergo_box::box_value::BoxValue;
-use ergo_lib::ergotree_ir::chain::ergo_box::{ErgoBox, ErgoBoxCandidate, NonMandatoryRegisters};
-use ergo_lib::ergotree_ir::chain::tx_id::TxId;
-use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
-use ergo_lib::ergotree_ir::mir::bool_to_sigma::BoolToSigmaProp;
-use ergo_lib::ergotree_ir::mir::expr::Expr;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 
-use ergo_mempool::types::{MempoolConfig, ProcessingOutcome, UnconfirmedTx, UtxoReader};
+use common::{make_box, spend_tx, state_context_at, tx_id_bytes, StaticUtxo, TIP_HEIGHT};
+use ergo_mempool::types::{MempoolConfig, ProcessingOutcome, UnconfirmedTx};
 use ergo_mempool::Mempool;
-use ergo_validation::{ErgoStateContext, Parameters};
 
-/// Well past genesis, so nothing here trips a near-genesis special case.
-const TIP_HEIGHT: u32 = 1_000;
-/// Comfortably above `min_value_per_byte × box size` for these small boxes.
-const BOX_VALUE: u64 = 1_000_000_000;
-
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
-
-/// `sigmaProp(<value>)` — reduces to a trivial true or false with no proof and
-/// no prover key.
-fn sigma_bool_tree(value: bool) -> ErgoTree {
-    let expr = Expr::BoolToSigmaProp(BoolToSigmaProp {
-        input: Box::new(Expr::Const(value.into())),
-    });
-    ErgoTree::try_from(expr).expect("sigmaProp(bool) is a valid ErgoTree")
-}
-
-/// A UTXO guarded by `sigmaProp(spendable)`, distinguished from its siblings by
-/// `seed` (which varies the source tx id, hence the box id).
-fn make_box(spendable: bool, seed: u8, creation_height: u32) -> ErgoBox {
-    ErgoBox::new(
-        BoxValue::try_from(BOX_VALUE).expect("value above the minimum"),
-        sigma_bool_tree(spendable),
-        None,
-        NonMandatoryRegisters::empty(),
-        creation_height,
-        TxId::from(Digest32::from([seed; 32])),
-        0,
-    )
-    .expect("box construction")
-}
-
-/// A transaction spending `inputs` into a single always-true output at
-/// `out_creation_height`. Value is preserved exactly — ergo-lib rejects any
-/// other ratio outright, and an unbalanced transaction would fail for a reason
-/// that has nothing to do with creation height.
-fn spend_tx(inputs: &[ErgoBox], out_creation_height: u32) -> Transaction {
-    let total: u64 = inputs.iter().map(|b| *b.value.as_u64()).sum();
-    let output = ErgoBoxCandidate {
-        value: BoxValue::try_from(total).expect("output value above the minimum"),
-        ergo_tree: sigma_bool_tree(true),
-        tokens: None,
-        additional_registers: NonMandatoryRegisters::empty(),
-        creation_height: out_creation_height,
-    };
-    let tx_inputs: Vec<Input> = inputs
-        .iter()
-        .map(|b| {
-            Input::new(
-                b.box_id(),
-                ProverResult {
-                    proof: ProofBytes::Empty,
-                    extension: ContextExtension::empty(),
-                },
-            )
-        })
-        .collect();
-    Transaction::new_from_vec(tx_inputs, vec![], vec![output]).expect("transaction construction")
-}
-
-fn make_header(height: u32) -> Header {
-    Header {
-        version: 3,
-        id: BlockId(Digest32::zero()),
-        parent_id: BlockId(Digest32::zero()),
-        ad_proofs_root: Digest32::zero(),
-        state_root: ADDigest::zero(),
-        transaction_root: Digest32::zero(),
-        timestamp: 1_600_000_000_000 + height as u64,
-        n_bits: 100_000,
-        height,
-        extension_root: Digest32::zero(),
-        autolykos_solution: AutolykosSolution {
-            miner_pk: Box::new(EcPoint::default()),
-            pow_onetime_pk: None,
-            nonce: vec![0u8; 8],
-            pow_distance: None,
-        },
-        votes: Votes([0, 0, 0]),
-        unparsed_bytes: Box::new([]),
-    }
-}
-
-/// A state context whose preheader sits at `preheader_height` — i.e. describing
-/// the block about to be mined. Version 3 so the monotonic-height rule is live,
-/// matching mainnet.
-fn state_context_at(preheader_height: u32) -> ErgoStateContext {
-    let pre_header = PreHeader {
-        version: 3,
-        parent_id: BlockId(Digest32::zero()),
-        timestamp: 1_600_000_000_000 + preheader_height as u64,
-        n_bits: 100_000,
-        height: preheader_height,
-        miner_pk: Box::new(EcPoint::default()),
-        votes: Votes([0, 0, 0]),
-    };
-    let headers = vec![make_header(preheader_height.saturating_sub(1))]
-        .try_into()
-        .expect("one header is within the 1..10 bound");
-    ErgoStateContext::new(pre_header, headers, Parameters::default())
-}
-
-/// A `UtxoReader` over a fixed set of boxes.
-struct StaticUtxo(HashMap<[u8; 32], ErgoBox>);
-
-impl StaticUtxo {
-    fn new(boxes: &[ErgoBox]) -> Self {
-        Self(
-            boxes
-                .iter()
-                .map(|b| {
-                    let mut id = [0u8; 32];
-                    id.copy_from_slice(b.box_id().as_ref());
-                    (id, b.clone())
-                })
-                .collect(),
-        )
-    }
-}
-
-impl UtxoReader for StaticUtxo {
-    fn box_by_id(&self, box_id: &[u8; 32]) -> Option<ErgoBox> {
-        self.0.get(box_id).cloned()
-    }
-}
-
-/// See the module header: the default `min_fee` is unreachable for any
-/// transaction that survives ergo-lib's exact ERG-preservation check.
+/// These fixtures spend into a single always-true output and pay no fee output,
+/// so their fee is legitimately 0 and step 7b would decline them before they
+/// could demonstrate anything about creation height. `min_fee = 0` isolates the
+/// guard. Fee extraction itself is covered in `fee_test.rs`.
 fn test_config() -> MempoolConfig {
     MempoolConfig {
         min_fee: 0,
         ..MempoolConfig::default()
     }
-}
-
-fn tx_id_bytes(tx: &Transaction) -> [u8; 32] {
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(tx.id().as_ref());
-    arr
 }
 
 // ---------------------------------------------------------------------------
