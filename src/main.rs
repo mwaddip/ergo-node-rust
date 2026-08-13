@@ -840,12 +840,6 @@ struct NodeConfig {
     data_dir: String,
     #[serde(default = "default_state_type")]
     state_type: String,
-    /// Where ErgoScript evaluation happens: `"deferred"` (background pool,
-    /// faster, leaves a crash-consistency window) or `"inline"` (inside
-    /// apply_state before persisting, so nothing unverified reaches disk).
-    /// See facts/validation.md § "Script evaluation modes".
-    #[serde(default = "default_script_eval")]
-    script_eval: String,
     #[serde(default = "default_verify_transactions")]
     verify_transactions: bool,
     #[serde(default = "default_blocks_to_keep")]
@@ -931,17 +925,6 @@ struct NodeConfig {
     // yet drained. Governs a pool of memory DISJOINT from the redb dirty
     // pages that flush_heap_threshold_mb controls — flushing redb does not
     // free a queued eval, so the two must not share a budget.
-    /// Ceiling (MB) on the summed heap of dispatched-not-drained script
-    /// evaluations. 0 disables the byte bound. Governs dense blocks, where
-    /// a single queued eval can be megabytes.
-    #[serde(default = "default_eval_backlog_max_mb")]
-    eval_backlog_max_mb: u64,
-    /// Ceiling on the *count* of dispatched-not-drained evaluations.
-    /// 0 disables the count bound. Not redundant with the byte bound: it
-    /// governs ordinary and coinbase-only blocks, where tens of thousands
-    /// could queue inside the byte budget while paying per-item overhead.
-    #[serde(default = "default_eval_backlog_max_blocks")]
-    eval_backlog_max_blocks: u32,
 
     // ── At-tip memory mirrors ────────────────────────────────────────────
     // These take effect once chain sync reaches tip. Until then the cold-
@@ -990,7 +973,6 @@ impl Default for NodeConfig {
         Self {
             data_dir: default_data_dir(),
             state_type: default_state_type(),
-            script_eval: default_script_eval(),
             verify_transactions: default_verify_transactions(),
             blocks_to_keep: default_blocks_to_keep(),
             revalidate: false,
@@ -1011,8 +993,6 @@ impl Default for NodeConfig {
             flush_heap_threshold_mb: default_flush_heap_threshold_mb(),
             flush_max_blocks: default_flush_max_blocks(),
             flush_min_blocks: default_flush_min_blocks(),
-            eval_backlog_max_mb: default_eval_backlog_max_mb(),
-            eval_backlog_max_blocks: default_eval_backlog_max_blocks(),
             synced_cache_mb: None,
             synced_flush_heap_threshold_mb: None,
             synced_flush_max_blocks: None,
@@ -1032,9 +1012,6 @@ fn default_state_type() -> String {
 /// Deferred until a slow box tells us what inline actually costs. Changing
 /// this default is a durability decision, not a tuning one — see
 /// facts/validation.md § "Script evaluation modes".
-fn default_script_eval() -> String {
-    "deferred".to_string()
-}
 fn default_verify_transactions() -> bool {
     true
 }
@@ -1120,20 +1097,6 @@ fn default_flush_min_blocks() -> u32 {
 fn default_reconciliation_trust_threshold() -> u32 {
     100
 }
-/// 256 MB never binds on a host that keeps pace — observed depth on a
-/// 32-core box is 1-3 evals — so the bound is inert exactly where it is not
-/// needed, while capping the 2026-08-12 field OOM at ~2.4% of the 10.62 GiB
-/// it reached. See facts/sync.md § "Eval backpressure".
-fn default_eval_backlog_max_mb() -> u64 {
-    256
-}
-/// Paired with the byte bound above; the two govern disjoint block shapes.
-/// Must match `SyncConfig`'s own default so a config that omits both and a
-/// config that states the defaults behave identically.
-fn default_eval_backlog_max_blocks() -> u32 {
-    256
-}
-
 /// Top-level config wrapper.
 #[derive(Debug, Deserialize)]
 struct RootConfig {
@@ -1477,22 +1440,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let capture_tap = capture_handle.as_ref().map(|h| h.tap());
     let capture_access: Option<Arc<dyn enr_p2p::capture::CaptureAccess>> =
         capture_handle.as_ref().map(|h| h.clone() as Arc<dyn enr_p2p::capture::CaptureAccess>);
-    // THE binding for the script-evaluation mode. Every validator constructor
-    // and `SyncConfig` must be fed from this one value — two independently
-    // derived copies that disagree either freeze the sync frontier waiting for
-    // results nothing dispatches, or advance it over blocks nothing verified.
-    // `checkpoint_height` had exactly this hazard and it went wrong in one of
-    // four branches; see `resolve_checkpoint` below.
-    let script_eval_mode = match node_config.script_eval.as_str() {
-        "deferred" => ergo_validation::ScriptEvalMode::Deferred,
-        "inline" => ergo_validation::ScriptEvalMode::Inline,
-        other => {
-            return Err(format!(
-                "unknown script_eval '{other}' (expected 'deferred' or 'inline')"
-            )
-            .into());
-        }
-    };
     let state_type = match node_config.state_type.as_str() {
         "utxo" => StateType::Utxo,
         "digest" => StateType::Digest,
@@ -1512,9 +1459,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         state_type = ?state_type, verify_transactions, blocks_to_keep, revalidate,
         checkpoint_height = ?configured_checkpoint,
-        // Visible at startup because it is a durability choice, not a tuning
-        // one: deferred persists blocks before their scripts are checked.
-        script_eval = ?script_eval_mode,
         storing_snapshots = node_config.storing_snapshots,
         snapshot_interval = node_config.snapshot_interval,
         cache_mb = node_config.cache_mb,
@@ -2014,11 +1958,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let swap_reader = Arc::new(ergo_node_rust::SwappableReader::empty());
 
     // The checkpoint the validator is ACTUALLY constructed with, captured from
-    // whichever branch below runs. `sync` floors `script_verified_height` at
-    // this value (facts/sync.md § "Checkpoint frontier hole") and the two must
-    // be the same number: at or below the validator's checkpoint no eval is
-    // ever dispatched, so a floor set any lower leaves exactly the permanent
-    // frontier hole the floor was added to close.
+    // whichever branch below runs. It decides which blocks skip script
+    // evaluation entirely: at or below it, `apply_state` builds no
+    // `ScriptEvalInputs` and runs nothing.
+    //
+    // It used to have a second consumer — `sync` floored `script_verified_height`
+    // at this value, and the two had to be the same number or a checkpointed
+    // node left a permanent frontier hole. That watermark is gone with deferred
+    // evaluation, so the coupling is gone with it; the value now has exactly
+    // one meaning and one reader.
     //
     // This is deliberately NOT `configured_checkpoint.unwrap_or(0)`. Digest
     // mode resuming from a stored tip defaults to `height - 100`, not 0 — so
@@ -2185,7 +2133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     generator: g.clone(),
                 });
                 Some(Validator::new(
-                    ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint, script_eval_mode)),
+                    ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint)),
                     shared_validated_height.clone(),
                     shared_state_context.clone(),
                     block_applied_tx.clone(),
@@ -2251,7 +2199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 Some(Validator::new(
                     ValidatorInner::Utxo({
-                        let mut uv = UtxoValidator::new(storage, prover, 0, checkpoint, script_eval_mode);
+                        let mut uv = UtxoValidator::new(storage, prover, 0, checkpoint);
                         // Diagnostic: regenerate historical ADProofs that UTXO mode does
                         // not store. Set ENR_DUMP_ADPROOFS_AT=h1,h2,... for a one-shot
                         // genesis replay; writes adproofs-<H>.104 (raw type-104 section)
@@ -2297,7 +2245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // publish the resume height so startup-time readers
                 // don't see 0.
                 shared_validated_height.store(height, std::sync::atomic::Ordering::Relaxed);
-                DigestValidator::from_state(digest, height, checkpoint, script_eval_mode)
+                DigestValidator::from_state(digest, height, checkpoint)
             } else if revalidate && chain_guard.height() > 0 {
                 let checkpoint = resolve_checkpoint(configured_checkpoint.unwrap_or(0));
                 let chain_height = chain_guard.height();
@@ -2321,7 +2269,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if start_from == 0 {
                     tracing::warn!("revalidate: no complete blocks found in store, starting from genesis");
-                    DigestValidator::new(genesis_digest, checkpoint, script_eval_mode)
+                    DigestValidator::new(genesis_digest, checkpoint)
                 } else {
                     let prev_height = start_from - 1;
                     let digest = if prev_height == 0 {
@@ -2339,12 +2287,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // height to prev_height — publish it so the
                     // atomic doesn't lie about the node's state.
                     shared_validated_height.store(prev_height, std::sync::atomic::Ordering::Relaxed);
-                    DigestValidator::from_state(digest, prev_height, checkpoint, script_eval_mode)
+                    DigestValidator::from_state(digest, prev_height, checkpoint)
                 }
             } else {
                 let checkpoint = resolve_checkpoint(configured_checkpoint.unwrap_or(0));
                 tracing::info!(checkpoint, "block validator starting from genesis (digest mode)");
-                DigestValidator::new(genesis_digest, checkpoint, script_eval_mode)
+                DigestValidator::new(genesis_digest, checkpoint)
             };
             Some(Validator::new(
                 ValidatorInner::Digest(validator),
@@ -2404,20 +2352,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         flush_heap_threshold_mb: node_config.flush_heap_threshold_mb,
         flush_max_blocks: node_config.flush_max_blocks,
         flush_min_blocks: node_config.flush_min_blocks,
-        eval_backlog_max_mb: node_config.eval_backlog_max_mb,
-        eval_backlog_max_blocks: node_config.eval_backlog_max_blocks,
-        // The value the validator was actually built with, not the raw config
-        // option — see `resolve_checkpoint` above for why those differ. Light
-        // mode constructs no validator and leaves this 0, which is correct:
-        // nothing is script-verified there, so the floor is a no-op.
-        checkpoint_height: effective_checkpoint.get(),
         // Derived from THE mode binding, never re-parsed from node_config —
         // sync doing deferred bookkeeping while the validator evaluates
         // inline freezes the frontier; the reverse advances it over blocks
         // nothing verified. Omitting this line used to compile, because the
         // literal ended in `..SyncConfig::default()` and this would have taken
         // `false` in silence. It no longer does; see the note at the bottom.
-        script_eval_inline: matches!(script_eval_mode, ergo_validation::ScriptEvalMode::Inline),
         synced_flush_heap_threshold_mb: node_config.synced_flush_heap_threshold_mb,
         synced_flush_max_blocks: node_config.synced_flush_max_blocks,
         synced_flush_min_blocks: node_config.synced_flush_min_blocks,
@@ -2671,7 +2611,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     prover.restore_root(root, tree_h);
 
                     let validator = Validator::new(
-                        ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint, script_eval_mode)),
+                        ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint)),
                         shared_validated_height.clone(),
                         shared_state_context.clone(),
                         block_applied_tx.clone(),

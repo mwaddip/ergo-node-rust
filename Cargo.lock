@@ -891,7 +891,6 @@ dependencies = [
  "ergo-validation",
  "ergo_avltree_rust",
  "hex",
- "rayon",
  "redb",
  "tempfile",
  "thiserror",
