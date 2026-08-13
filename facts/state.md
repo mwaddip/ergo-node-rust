@@ -989,6 +989,21 @@ Not fixed here: bounding the write half at runtime needs a redb patch, which is
 out of scope for the cache-budget work. Documented so the budget arithmetic and
 the endpoint are both read correctly.
 
+**The read half does bind, and it binds warm** (measured 2026-08-13 by an
+external operator, `synced_cache_mb = 128` at `cache_store_pct = 50`, so a 64 MB
+read limit). The node was left down two hours to accumulate a real backlog, so
+the cache was hot rather than freshly opened when the resize fired: peak 577.2 MB
+at 22:45:30, `cache resized in-place cache_bytes=67108864` at 22:45:40, 31.0 MB
+by 22:49:06 — 577 MB released in roughly ten seconds — and 63.9 MB twelve hours
+later, holding at the limit rather than climbing back through it. Worth recording
+because a limit that is merely *set* on a warm cache is not evidence it is
+*enforced*; this is the enforcement, over a long enough window to see drift.
+
+Steady-state at tip from the same run: 723 MB allocated, 786 MB `rssAnon`,
+254 MB store cache, 0 evictions. Read `retained` (1673 MB there) as virtual and
+ignore it. The number that sizes an operator profile is the **cold-sync** peak,
+which runs more than double this — at-tip footprint is not the constraint.
+
 The integrator side: main repo holds a `SwappableReader` (a
 `parking_lot::RwLock<Option<Arc<SnapshotReader>>>`) shared with
 mempool, REST API, and the snapshot dump trigger. To reopen:
