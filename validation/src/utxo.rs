@@ -17,7 +17,10 @@ use crate::sections::{parse_block_transactions, parse_extension};
 use crate::state_changes::{compute_state_changes, transactions_to_summaries};
 use crate::tx_validation;
 use crate::voting;
-use crate::{ApplyStateOutcome, BlockValidator, ScriptEvalMode, ValidationError};
+use crate::{
+    ApplyStateOutcome, BlockValidator, MiningState, ScriptEvalMode, StatePersistence,
+    ValidationError,
+};
 
 /// UTXO-mode block validator.
 ///
@@ -196,22 +199,55 @@ impl BlockValidator for UtxoValidator {
         Ok(())
     }
 
+    // ── Shims onto the split traits ─────────────────────────────────────
+    //
+    // These four still hang off `BlockValidator` only because `sync/` and
+    // `main` have not moved to `StatePersistence`/`MiningState` yet. They
+    // hold no logic: the bodies live in the impls below, so when the last
+    // caller moves off them this becomes a deletion rather than a
+    // reconciliation of four drifted copies.
+
     fn flush(&self) -> Result<(), ValidationError> {
-        self.storage.flush().map_err(|e| {
-            ValidationError::StateOperationFailed(format!("flush: {e}"))
-        })
+        StatePersistence::flush(self)
     }
 
     fn resize_cache(&self, cache_bytes: usize) -> Result<(), ValidationError> {
-        self.storage.resize_cache(cache_bytes);
-        Ok(())
+        StatePersistence::resize_cache(self, cache_bytes)
     }
 
     fn proofs_for_transactions(
         &self,
         txs: &[ergo_lib::chain::transaction::Transaction],
     ) -> Option<Result<(Vec<u8>, ADDigest), ValidationError>> {
-        Some(self.compute_proofs(txs))
+        // The outer `Some` is the layer the split deletes: here it says only
+        // "UTXO mode", which the impl's existence already says.
+        Some(MiningState::proofs_for_transactions(self, txs))
+    }
+
+    fn emission_box_id(&self) -> Option<[u8; 32]> {
+        MiningState::emission_box_id(self)
+    }
+}
+
+impl StatePersistence for UtxoValidator {
+    fn flush(&self) -> Result<(), ValidationError> {
+        self.storage
+            .flush()
+            .map_err(|e| ValidationError::StateOperationFailed(format!("flush: {e}")))
+    }
+
+    fn resize_cache(&self, cache_bytes: usize) -> Result<(), ValidationError> {
+        self.storage.resize_cache(cache_bytes);
+        Ok(())
+    }
+}
+
+impl MiningState for UtxoValidator {
+    fn proofs_for_transactions(
+        &self,
+        txs: &[ergo_lib::chain::transaction::Transaction],
+    ) -> Result<(Vec<u8>, ADDigest), ValidationError> {
+        self.compute_proofs(txs)
     }
 
     fn emission_box_id(&self) -> Option<[u8; 32]> {
@@ -871,8 +907,12 @@ mod tests {
         // rejected block never reached storage. `proofs_for_transactions`
         // reads the tree back out of storage, so this observes the durable
         // side specifically, not the in-memory one asserted above.
-        let (_, storage_digest) = validator
-            .proofs_for_transactions(&[])
+        //
+        // Spelled out rather than called as a method because `UtxoValidator`
+        // now carries `proofs_for_transactions` on both `BlockValidator` (the
+        // shim) and `MiningState` (the body). Step E deletes the shim; this
+        // line then loses its qualifier and its outer `expect`.
+        let (_, storage_digest) = BlockValidator::proofs_for_transactions(&validator, &[])
             .expect("UTXO mode computes proofs")
             .expect("empty-operation proof");
         assert_eq!(

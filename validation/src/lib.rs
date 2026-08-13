@@ -342,6 +342,55 @@ pub trait BlockValidator {
     }
 }
 
+/// Storage lifecycle. Implemented by [`UtxoValidator`] only — a validator that
+/// owns no persistent state does not implement it, and the caller handles that
+/// case explicitly rather than being handed a successful no-op.
+///
+/// ⚠ **The absence of an impl is the mode signal.** [`DigestValidator`] must
+/// never gain a no-op impl of this trait: a defaulted `resize_cache` on
+/// `BlockValidator` is exactly what let the enum wrapper in `src/main.rs`
+/// silently drop the at-tip cache resize for the life of the feature, while
+/// logging success (facts/validation.md).
+pub trait StatePersistence {
+    /// Force a durable commit (fsync) of all outstanding storage writes.
+    /// Called at sweep flush points (bounds crash data loss) and on graceful
+    /// shutdown.
+    ///
+    /// Postconditions on Ok: every write issued before this call is durable.
+    /// Postconditions on Err: durability is UNKNOWN. The caller must not
+    /// advance any watermark that assumes persistence — see facts/sync.md
+    /// § "Flush ordering".
+    fn flush(&self) -> Result<(), ValidationError>;
+
+    /// Resize the storage read cache at runtime (e.g. on reaching the tip).
+    ///
+    /// ⚠ Read cache only. `stateCacheBytes` covers read + write, so a 64 MB
+    /// resize gives roughly a 128 MB envelope, not 64.
+    fn resize_cache(&self, cache_bytes: usize) -> Result<(), ValidationError>;
+}
+
+/// Mining support. Implemented by [`UtxoValidator`] only — candidate assembly
+/// requires a live UTXO set, so digest mode does not implement it and the
+/// caller skips mining rather than receiving a `None` that means "wrong mode".
+pub trait MiningState {
+    /// Compute AD proofs and the resulting state root for a set of
+    /// transactions WITHOUT modifying persistent state.
+    ///
+    /// No outer `Option`: "wrong mode" is expressed by not implementing the
+    /// trait, so every layer of this return type now carries exactly one
+    /// meaning. An `Err` is a real failure to compute the proof.
+    fn proofs_for_transactions(
+        &self,
+        txs: &[Transaction],
+    ) -> Result<(Vec<u8>, ADDigest), ValidationError>;
+
+    /// Current emission box ID in the UTXO set, updated after each block.
+    ///
+    /// `None` means **all ERG has been emitted** — nothing else. It no longer
+    /// doubles as the digest-mode signal.
+    fn emission_box_id(&self) -> Option<[u8; 32]>;
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
     #[error("section parse failed (type {section_type}): {reason}")]
