@@ -168,13 +168,6 @@ pub trait BlockValidator {
     /// That is what separates it from the defaulted no-ops it replaces — a
     /// `None` return is a truthful answer, whereas `Ok(())` from a defaulted
     /// `flush` was a claim that work happened.
-    ///
-    /// ⚠ STAGING ARTEFACT: during the v0.8.0 split (steps A–D) this ships
-    /// with a temporary `None` default, because a required method cannot be
-    /// added to a trait additively — all nine implementors would break in one
-    /// commit. **Step E removes that default** along with the four old
-    /// methods. If the default is still present when the split is called
-    /// done, the split failed: four silent defaults will have become one.
     fn state_persistence(&self) -> Option<&dyn StatePersistence>;
 }
 
