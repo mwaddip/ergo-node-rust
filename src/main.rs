@@ -2390,6 +2390,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build sync config from P2P network settings
     let net = net_settings;
+    // Source for the pacing constants at the bottom of this literal. See the
+    // comment there for why they are named individually rather than swept in
+    // with `..SyncConfig::default()`.
+    let sync_defaults = SyncConfig::default();
     let sync_config = SyncConfig {
         delivery_timeout: std::time::Duration::from_secs(net.delivery_timeout_secs),
         max_delivery_checks: net.max_delivery_checks,
@@ -2410,9 +2414,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Derived from THE mode binding, never re-parsed from node_config —
         // sync doing deferred bookkeeping while the validator evaluates
         // inline freezes the frontier; the reverse advances it over blocks
-        // nothing verified. Note this literal ends in `..SyncConfig::default()`,
-        // so omitting this line would have compiled and silently left sync in
-        // deferred mode forever.
+        // nothing verified. Omitting this line used to compile, because the
+        // literal ended in `..SyncConfig::default()` and this would have taken
+        // `false` in silence. It no longer does; see the note at the bottom.
         script_eval_inline: matches!(script_eval_mode, ergo_validation::ScriptEvalMode::Inline),
         synced_flush_heap_threshold_mb: node_config.synced_flush_heap_threshold_mb,
         synced_flush_max_blocks: node_config.synced_flush_max_blocks,
@@ -2423,7 +2427,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // there are no bodies to prune anyway, so 0 keeps sync/pruning + the
         // wire advertisement consistent.
         blocks_to_keep: if state_type == StateType::Light { 0 } else { blocks_to_keep as i32 },
-        ..SyncConfig::default()
+
+        // Pacing constants: deliberately not operator-tunable, not derived from
+        // config, and not consensus-, memory-, or durability-relevant.
+        //
+        // Named individually instead of riding `..SyncConfig::default()` so that
+        // a 25th field on SyncConfig is a COMPILE ERROR here rather than a
+        // silent default. That trap already came close once: `script_eval_inline`
+        // would have taken `false` through the fallthrough and left sync doing
+        // deferred bookkeeping while the validator evaluated inline — green
+        // build, wrong node.
+        //
+        // Values still come from the Default impl, so there is one source of
+        // truth for them. Only the *enumeration* is restated here, which is
+        // precisely the part we want the compiler to police.
+        //
+        // Note this works because struct literals without `..` are exhaustively
+        // checked — unlike a `match` on an enum, where `if let` and `matches!`
+        // let a new variant through in silence.
+        sync_interval: sync_defaults.sync_interval,
+        stall_timeout: sync_defaults.stall_timeout,
+        synced_poll_interval: sync_defaults.synced_poll_interval,
+        delivery_check_interval: sync_defaults.delivery_check_interval,
+        min_sync_send_interval: sync_defaults.min_sync_send_interval,
     };
 
     // Snapshot bootstrap channels — only created when needed
