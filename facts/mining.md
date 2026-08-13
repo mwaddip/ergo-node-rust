@@ -418,8 +418,9 @@ supported path; constructing a `CandidateBlock` field-by-field outside this
 crate is a contract violation regardless of whether the result happens to be
 well-formed.
 
-⚠ **As of v0.8.0 this was violated, and the violation is what made steps 3 and
-4 dead code.** `src/main.rs` built `CandidateBlock { .. }` inline — parent,
+⚠ **This was violated until v0.8.0, and the violation is what made steps 3 and
+4 dead code. Fixed in `3aecc7f`; the history stays because the failure was
+invisible for months.** `src/main.rs` built `CandidateBlock { .. }` inline — parent,
 n_bits, state root, AD proofs, its own copy of the
 `max(now, parent.timestamp + 1)` rule, `transactions: vec![emission_tx]` — and
 never called `generate_candidate`. So the crate's entry point had no production

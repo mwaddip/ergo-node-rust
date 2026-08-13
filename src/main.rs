@@ -151,7 +151,9 @@ type MiningProofCache = Arc<std::sync::Mutex<Option<MiningProofData>>>;
 
 /// Context for mining proof pre-computation inside the validator callback.
 struct MiningCtx {
-    config: ergo_mining::MinerConfig,
+    // No `config` here: the hook stopped building the emission transaction when
+    // assembly moved into `generate_candidate`, and the mining task reads the
+    // config off the generator it already holds.
     proof_cache: MiningProofCache,
     snapshot_reader: Arc<SnapshotReader>,
     /// Candidate lifecycle handle — the post-apply hook calls
@@ -2358,7 +2360,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // processed.
                 shared_validated_height.store(height, std::sync::atomic::Ordering::Relaxed);
                 let mining_ctx = mining_generator.as_ref().map(|g| MiningCtx {
-                    config: g.config.clone(),
                     proof_cache: mining_proof_cache.clone(),
                     snapshot_reader: Arc::new(sr),
                     generator: g.clone(),
@@ -2423,7 +2424,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // will carry).
                 let _ = chain_guard.recompute_active_parameters_from_storage(0);
                 let mining_ctx = mining_generator.as_ref().map(|g| MiningCtx {
-                    config: g.config.clone(),
                     proof_cache: mining_proof_cache.clone(),
                     snapshot_reader: Arc::new(sr),
                     generator: g.clone(),
