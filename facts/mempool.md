@@ -75,13 +75,21 @@ intra-block output tracking.
 Also expose the state context builder for mempool use:
 
 ```rust
-/// Build an ErgoStateContext from a header and preceding headers.
-pub fn build_state_context(
-    header: &Header,
+/// Build an ErgoStateContext whose preheader describes the NEXT block.
+pub fn build_upcoming_state_context(
+    last_header: &Header,
     preceding_headers: &[Header],
     parameters: &Parameters,
 ) -> ErgoStateContext;
 ```
+
+⚠ **The mempool takes the *upcoming* context, never `build_state_context()`.**
+An unconfirmed transaction is a candidate for the block after the tip, and
+wallets set `creationHeight` accordingly. Validating against a preheader at the
+current tip rejects every well-formed transaction on the network with `Creation
+height H+1 > preheader height`. Full derivation and the JVM reference are in
+`facts/validation.md` § "Free Functions: state context". The mempool does not
+build this itself — the main crate publishes it after each applied block.
 
 Both functions are pure — no mutable state, no side effects.
 
@@ -407,6 +415,13 @@ impl Mempool {
 5. **Resolve input boxes**: For each input, look up via `utxo_reader.box_by_id()`.
    If any input is missing, return `Declined` (not invalidated — input may appear later).
 6. **Resolve data-input boxes**: Same lookup for data inputs.
+6a. **Check creation height** (transient guard): if any output's `creation_height`
+   exceeds `state_context.pre_header.height`, return `Declined` — **not**
+   `Invalidated`. The transaction was built against a tip newer than ours and
+   becomes valid as soon as we apply the next block. Caching it as invalid
+   suppresses every rebroadcast for `invalidation_ttl` (1800s ≈ 15 blocks)
+   without re-validating, so a momentary propagation race turns into a half-hour
+   blackout for that transaction. Same reasoning as step 5's missing input.
 7. **Validate**: Call `validate_single_transaction(tx, inputs, data_inputs, state_context)`.
    On failure: return `Invalidated` (add to expiring cache).
    On success: receive `cost`.

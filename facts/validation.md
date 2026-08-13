@@ -471,6 +471,88 @@ logged at ERROR by `state/`, with the digest.
 nothing, persists nothing, and advances no watermark. A caller that treats its
 success as evidence a block is valid has misread it.
 
+## Free Functions: state context
+
+Two builders, and **which one you call is a correctness decision, not a style
+one.**
+
+```rust
+/// Context for validating a block that HAS been mined.
+/// The preheader is `header` itself. Use for block validation only.
+pub fn build_state_context(
+    header: &Header,
+    preceding_headers: &[Header],
+    parameters: &Parameters,
+) -> ErgoStateContext;
+
+/// Context for validating a transaction that is NOT yet in a block.
+/// The preheader describes the *next* block, built on `last_header`.
+/// Use for the mempool and for API-submitted transactions.
+pub fn build_upcoming_state_context(
+    last_header: &Header,
+    preceding_headers: &[Header],
+    parameters: &Parameters,
+) -> ErgoStateContext;
+```
+
+### Why two
+
+An unconfirmed transaction is not a member of the chain tip — it is a candidate
+for the block *after* it. Wallets set `creationHeight` to the block they expect
+to land in, so a transaction built against tip `H` carries `creationHeight =
+H+1`. ergo-lib enforces `creationHeight <= preHeader.height`. Validate it
+against a preheader at `H` and **every well-formed transaction on the network is
+rejected**, with the reason `Creation height H+1 > preheader height`.
+
+This mirrors the JVM, which keeps the same split: block validation uses the
+block's own header, while `ErgoMemPool` validates against
+`ErgoStateContext.simplifiedUpcoming()`
+(`ergo-core/.../nodeView/state/ErgoStateContext.scala:140`).
+
+### Field derivation for the upcoming preheader
+
+Mirrors `simplifiedUpcoming()` composed with `PreHeader.apply` and
+`AutolykosPowScheme.derivedHeaderFields` (`PreHeader.scala:49-63`):
+
+| Field | Value | Note |
+|---|---|---|
+| `height` | `last_header.height + 1` | the whole point |
+| `parent_id` | `last_header.id` | **not** `last_header.parent_id` |
+| `version` | `last_header.version` | |
+| `n_bits` | `last_header.n_bits` | difficulty carries over |
+| `timestamp` | `last_header.timestamp + 1` | JVM's literal `+ 1`, not wall clock |
+| `miner_pk` | `EcPoint::generator()` | placeholder; no miner is known yet |
+| `votes` | `Votes([0, 0, 0])` | JVM passes an empty array |
+
+`miner_pk` is the secp256k1 group generator rather than a real key because the
+miner of the next block is unknown. A script reading `CONTEXT.preHeader.minerPk`
+therefore sees a placeholder in the mempool and the real key once mined — the
+same divergence the JVM has, and the reason a transaction can pass mempool
+validation and still fail in a block.
+
+**Mining does not use this builder, deliberately.** `generate_candidate` builds
+a stub header at `height + 1` with a real wall-clock timestamp and feeds that to
+`build_state_context` (`facts/mining.md` § Selection). Its preheader height is
+therefore already correct — which is why candidate assembly kept working while
+the mempool rejected everything. The timestamp is the honest difference: a miner
+knows the block's real timestamp, the mempool does not, so it uses the JVM's
+`last.timestamp + 1` placeholder. Do not collapse the two paths into one.
+
+⚠ **Parameters are the caller's, and lag by one block at an epoch boundary.**
+The JVM recomputes parameters for `height + 1` inside `simplifiedUpcoming()`.
+We pass the parameters active for `last_header` instead. These differ only on
+the single block where an epoch boundary is crossed, and only for
+parameter-sensitive validation. Accepted as a bounded divergence; revisit if a
+boundary-block mempool rejection is ever observed.
+
+### Invariant
+
+**Never validate an unconfirmed transaction against a preheader at the current
+tip.** The mempool and the API validate against the upcoming context; block
+validation validates against the block's own header. A caller that mixes these
+is wrong even when it appears to work — the failure is silent, total, and looks
+exactly like an idle network.
+
 ## Free Function
 
 ```rust
