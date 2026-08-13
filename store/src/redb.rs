@@ -1,10 +1,12 @@
 use crate::{ModifierBatchEntry, ModifierStore};
-use ::redb::{Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
+use ::redb::{
+    Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+};
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::time::Instant;
-use parking_lot::RwLock;
 
 const PRIMARY: TableDefinition<(u8, [u8; 32]), &[u8]> = TableDefinition::new("primary");
 const HEIGHT_INDEX: TableDefinition<(u8, u32), [u8; 32]> = TableDefinition::new("height_index");
@@ -213,7 +215,9 @@ impl RedbModifierStore {
         let t_total = Instant::now();
 
         let t = Instant::now();
-        let db = Database::builder().set_cache_size(cache_bytes).create(path)?;
+        let db = Database::builder()
+            .set_cache_size(cache_bytes)
+            .create(path)?;
         tracing::info!(
             elapsed_ms = t.elapsed().as_millis() as u64,
             cache_bytes,
@@ -406,13 +410,7 @@ impl RedbModifierStore {
 impl ModifierStore for RedbModifierStore {
     type Error = StoreError;
 
-    fn put(
-        &self,
-        type_id: u8,
-        id: &[u8; 32],
-        height: u32,
-        data: &[u8],
-    ) -> Result<(), Self::Error> {
+    fn put(&self, type_id: u8, id: &[u8; 32], height: u32, data: &[u8]) -> Result<(), Self::Error> {
         // Headers must go through put_batch so the cumulative score is
         // written in the same atomic transaction as the header data.
         if type_id == 101 {
@@ -438,10 +436,7 @@ impl ModifierStore for RedbModifierStore {
     /// BEST_CHAIN inserts for headers are unconditional: main-chain headers
     /// authoritatively own their height slot and will overwrite a stale
     /// entry left by an earlier fork-first arrival or a deep reorg.
-    fn put_batch(
-        &self,
-        entries: &[ModifierBatchEntry],
-    ) -> Result<(), Self::Error> {
+    fn put_batch(&self, entries: &[ModifierBatchEntry]) -> Result<(), Self::Error> {
         // Validate score precondition upfront so that an invalid batch
         // is rejected without partial writes. (redb would roll back an
         // un-committed txn anyway, but failing here is cheaper and the
@@ -509,9 +504,7 @@ impl ModifierStore for RedbModifierStore {
         // Update non-header tips cache (HEIGHT_INDEX-backed).
         let mut tips = self.tips.write();
         for (type_id, id, height, _, _) in entries {
-            if *type_id != 101
-                && *height > 0
-                && tips.get(type_id).is_none_or(|tip| *height > tip.0)
+            if *type_id != 101 && *height > 0 && tips.get(type_id).is_none_or(|tip| *height > tip.0)
             {
                 tips.insert(*type_id, (*height, *id));
             }
@@ -529,11 +522,7 @@ impl ModifierStore for RedbModifierStore {
         Ok(())
     }
 
-    fn get(
-        &self,
-        type_id: u8,
-        id: &[u8; 32],
-    ) -> Result<Option<Vec<u8>>, Self::Error> {
+    fn get(&self, type_id: u8, id: &[u8; 32]) -> Result<Option<Vec<u8>>, Self::Error> {
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(PRIMARY) {
             Ok(t) => t,
@@ -544,11 +533,7 @@ impl ModifierStore for RedbModifierStore {
         Ok(value.map(|guard| guard.value().to_vec()))
     }
 
-    fn get_id_at(
-        &self,
-        type_id: u8,
-        height: u32,
-    ) -> Result<Option<[u8; 32]>, Self::Error> {
+    fn get_id_at(&self, type_id: u8, height: u32) -> Result<Option<[u8; 32]>, Self::Error> {
         // Headers (type_id=101) are looked up via BEST_CHAIN, not HEIGHT_INDEX.
         // HEIGHT_INDEX is the legacy schema for headers and is cleared by
         // migration on first open.
@@ -565,11 +550,7 @@ impl ModifierStore for RedbModifierStore {
         Ok(value.map(|guard| guard.value()))
     }
 
-    fn contains(
-        &self,
-        type_id: u8,
-        id: &[u8; 32],
-    ) -> Result<bool, Self::Error> {
+    fn contains(&self, type_id: u8, id: &[u8; 32]) -> Result<bool, Self::Error> {
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(PRIMARY) {
             Ok(t) => t,
@@ -579,10 +560,7 @@ impl ModifierStore for RedbModifierStore {
         Ok(table.get((type_id, *id))?.is_some())
     }
 
-    fn tip(
-        &self,
-        type_id: u8,
-    ) -> Result<Option<(u32, [u8; 32])>, Self::Error> {
+    fn tip(&self, type_id: u8) -> Result<Option<(u32, [u8; 32])>, Self::Error> {
         // Headers (type_id=101) live in the fork-aware tables; their tip is
         // tracked separately. Route the lookup so the documented contract
         // ("highest stored modifier of this type") holds for headers too.
@@ -639,10 +617,7 @@ impl ModifierStore for RedbModifierStore {
         Ok(())
     }
 
-    fn header_ids_at_height(
-        &self,
-        height: u32,
-    ) -> Result<Vec<([u8; 32], u32)>, Self::Error> {
+    fn header_ids_at_height(&self, height: u32) -> Result<Vec<([u8; 32], u32)>, Self::Error> {
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(HEADER_FORKS) {
             Ok(t) => t,
@@ -660,10 +635,7 @@ impl ModifierStore for RedbModifierStore {
         Ok(results)
     }
 
-    fn header_score(
-        &self,
-        id: &[u8; 32],
-    ) -> Result<Option<Vec<u8>>, Self::Error> {
+    fn header_score(&self, id: &[u8; 32]) -> Result<Option<Vec<u8>>, Self::Error> {
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(HEADER_SCORES) {
             Ok(t) => t,
@@ -674,11 +646,7 @@ impl ModifierStore for RedbModifierStore {
         Ok(value.map(|guard| guard.value().to_vec()))
     }
 
-    fn put_header_score(
-        &self,
-        id: &[u8; 32],
-        score: &[u8],
-    ) -> Result<(), Self::Error> {
+    fn put_header_score(&self, id: &[u8; 32], score: &[u8]) -> Result<(), Self::Error> {
         // Verify the header exists in PRIMARY before writing. The
         // scores backfill migration walks BEST_CHAIN — which is
         // invariant-consistent with PRIMARY — so a missing PRIMARY
@@ -712,10 +680,7 @@ impl ModifierStore for RedbModifierStore {
         Ok(())
     }
 
-    fn put_header_score_batch(
-        &self,
-        entries: &[([u8; 32], Vec<u8>)],
-    ) -> Result<(), Self::Error> {
+    fn put_header_score_batch(&self, entries: &[([u8; 32], Vec<u8>)]) -> Result<(), Self::Error> {
         // Empty batch is a no-op — skip the txn entirely so we don't
         // pay for an empty commit or accidentally create the
         // PRIMARY/HEADER_SCORES tables on a fresh DB.
@@ -758,11 +723,7 @@ impl ModifierStore for RedbModifierStore {
         Ok(())
     }
 
-    fn prune_below_height(
-        &self,
-        horizon: u32,
-        type_ids: &[u8],
-    ) -> Result<usize, Self::Error> {
+    fn prune_below_height(&self, horizon: u32, type_ids: &[u8]) -> Result<usize, Self::Error> {
         // Headers (type_id=101) are never pruned. They live in the
         // fork-aware tables and their retention is governed elsewhere;
         // the blocks_to_keep horizon applies only to non-header section
@@ -827,10 +788,7 @@ impl ModifierStore for RedbModifierStore {
         Ok(count)
     }
 
-    fn min_height_present(
-        &self,
-        type_id: u8,
-    ) -> Result<Option<u32>, Self::Error> {
+    fn min_height_present(&self, type_id: u8) -> Result<Option<u32>, Self::Error> {
         // Headers (type_id=101) live in the fork-aware tables; the
         // lowest height is BEST_CHAIN's first entry. Mirrors how
         // tip(101) routes to best_header_tip.
@@ -862,10 +820,7 @@ impl ModifierStore for RedbModifierStore {
         }
     }
 
-    fn chain_meta_get(
-        &self,
-        key: &[u8],
-    ) -> Result<Option<Vec<u8>>, Self::Error> {
+    fn chain_meta_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(CHAIN_META) {
             Ok(t) => t,
@@ -876,11 +831,7 @@ impl ModifierStore for RedbModifierStore {
         Ok(value.map(|guard| guard.value().to_vec()))
     }
 
-    fn chain_meta_put(
-        &self,
-        key: &[u8],
-        value: &[u8],
-    ) -> Result<(), Self::Error> {
+    fn chain_meta_put(&self, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
         let mut write_txn = self.db.begin_write()?;
         write_txn
             .set_durability(Durability::None)
@@ -894,10 +845,7 @@ impl ModifierStore for RedbModifierStore {
         Ok(())
     }
 
-    fn chain_meta_delete(
-        &self,
-        key: &[u8],
-    ) -> Result<(), Self::Error> {
+    fn chain_meta_delete(&self, key: &[u8]) -> Result<(), Self::Error> {
         let mut write_txn = self.db.begin_write()?;
         write_txn
             .set_durability(Durability::None)
@@ -917,10 +865,7 @@ impl ModifierStore for RedbModifierStore {
         Ok(())
     }
 
-    fn best_header_at(
-        &self,
-        height: u32,
-    ) -> Result<Option<[u8; 32]>, Self::Error> {
+    fn best_header_at(&self, height: u32) -> Result<Option<[u8; 32]>, Self::Error> {
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(BEST_CHAIN) {
             Ok(t) => t,
@@ -951,10 +896,7 @@ impl ModifierStore for RedbModifierStore {
         Ok(result)
     }
 
-    fn read_header_at(
-        &self,
-        height: u32,
-    ) -> Result<Option<Vec<u8>>, Self::Error> {
+    fn read_header_at(&self, height: u32) -> Result<Option<Vec<u8>>, Self::Error> {
         let read_txn = self.db.begin_read()?;
 
         let best_chain = match read_txn.open_table(BEST_CHAIN) {
@@ -972,14 +914,12 @@ impl ModifierStore for RedbModifierStore {
             Err(::redb::TableError::TableDoesNotExist(_)) => return Ok(None),
             Err(e) => return Err(StoreError::Table(e)),
         };
-        Ok(primary.get((101u8, id))?.map(|guard| guard.value().to_vec()))
+        Ok(primary
+            .get((101u8, id))?
+            .map(|guard| guard.value().to_vec()))
     }
 
-    fn put_peer(
-        &self,
-        addr: SocketAddr,
-        record: &[u8],
-    ) -> Result<(), Self::Error> {
+    fn put_peer(&self, addr: SocketAddr, record: &[u8]) -> Result<(), Self::Error> {
         let key = encode_addr(addr);
         let mut write_txn = self.db.begin_write()?;
         write_txn
@@ -994,10 +934,7 @@ impl ModifierStore for RedbModifierStore {
         Ok(())
     }
 
-    fn delete_peer(
-        &self,
-        addr: SocketAddr,
-    ) -> Result<(), Self::Error> {
+    fn delete_peer(&self, addr: SocketAddr) -> Result<(), Self::Error> {
         let key = encode_addr(addr);
         let mut write_txn = self.db.begin_write()?;
         write_txn
@@ -1015,9 +952,7 @@ impl ModifierStore for RedbModifierStore {
         Ok(())
     }
 
-    fn list_peers(
-        &self,
-    ) -> Result<Vec<(SocketAddr, Vec<u8>)>, Self::Error> {
+    fn list_peers(&self) -> Result<Vec<(SocketAddr, Vec<u8>)>, Self::Error> {
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(PEER_DB) {
             Ok(t) => t,
@@ -1089,7 +1024,9 @@ mod tests {
         let id = test_id(1);
         let data = b"hello world";
 
-        store.put_batch(&[(101, id, 1, data.to_vec(), s())]).unwrap();
+        store
+            .put_batch(&[(101, id, 1, data.to_vec(), s())])
+            .unwrap();
         let result = store.get(101, &id).unwrap();
         assert_eq!(result, Some(data.to_vec()));
     }
@@ -1105,9 +1042,18 @@ mod tests {
 
         store.put_batch(&entries).unwrap();
 
-        assert_eq!(store.get(101, &test_id(1)).unwrap(), Some(b"data1".to_vec()));
-        assert_eq!(store.get(101, &test_id(2)).unwrap(), Some(b"data2".to_vec()));
-        assert_eq!(store.get(102, &test_id(3)).unwrap(), Some(b"data3".to_vec()));
+        assert_eq!(
+            store.get(101, &test_id(1)).unwrap(),
+            Some(b"data1".to_vec())
+        );
+        assert_eq!(
+            store.get(101, &test_id(2)).unwrap(),
+            Some(b"data2".to_vec())
+        );
+        assert_eq!(
+            store.get(102, &test_id(3)).unwrap(),
+            Some(b"data3".to_vec())
+        );
     }
 
     #[test]
@@ -1161,8 +1107,12 @@ mod tests {
         let id = test_id(1);
         let data = b"same data";
 
-        store.put_batch(&[(101, id, 1, data.to_vec(), s())]).unwrap();
-        store.put_batch(&[(101, id, 1, data.to_vec(), s())]).unwrap();
+        store
+            .put_batch(&[(101, id, 1, data.to_vec(), s())])
+            .unwrap();
+        store
+            .put_batch(&[(101, id, 1, data.to_vec(), s())])
+            .unwrap();
         assert_eq!(store.get(101, &id).unwrap(), Some(data.to_vec()));
     }
 
@@ -1434,7 +1384,9 @@ mod tests {
         // "BEST_CHAIN[100] is empty, so insert me." Now BEST_CHAIN[100] points
         // at the FORK header, not the main-chain header.
         let fork_100 = test_id(0xF0);
-        store.put_header(&fork_100, 100, 1, &[0x99], b"fork100").unwrap();
+        store
+            .put_header(&fork_100, 100, 1, &[0x99], b"fork100")
+            .unwrap();
 
         // The main-chain header is the rightful occupant of best_header_at(100).
         let best = store.best_header_at(100).unwrap();
@@ -1460,12 +1412,16 @@ mod tests {
 
                 for h in 1..=3u32 {
                     let id = test_id(h as u8);
-                    primary.insert((101u8, id), format!("data{h}").as_bytes()).unwrap();
+                    primary
+                        .insert((101u8, id), format!("data{h}").as_bytes())
+                        .unwrap();
                     height_idx.insert((101u8, h), id).unwrap();
                 }
                 // Also insert a non-header entry (type 102) that should NOT migrate.
                 let other_id = test_id(0xFF);
-                primary.insert((102u8, other_id), b"other".as_slice()).unwrap();
+                primary
+                    .insert((102u8, other_id), b"other".as_slice())
+                    .unwrap();
                 height_idx.insert((102u8, 1), other_id).unwrap();
             }
             write_txn.commit().unwrap();
@@ -1511,7 +1467,10 @@ mod tests {
         assert_eq!(store.get_id_at(102, 1).unwrap(), Some(test_id(0xFF)));
 
         // PRIMARY data still accessible
-        assert_eq!(store.get(101, &test_id(1)).unwrap(), Some(b"data1".to_vec()));
+        assert_eq!(
+            store.get(101, &test_id(1)).unwrap(),
+            Some(b"data1".to_vec())
+        );
     }
 
     // --- read_header_at: height-indexed best-chain header bytes ---
@@ -1713,7 +1672,10 @@ mod tests {
         store.put_header_score_batch(&updates).unwrap();
 
         assert_eq!(store.header_score(&id1).unwrap(), Some(vec![0xAA, 0xAA]));
-        assert_eq!(store.header_score(&id2).unwrap(), Some(vec![0xBB, 0xBB, 0xBB]));
+        assert_eq!(
+            store.header_score(&id2).unwrap(),
+            Some(vec![0xBB, 0xBB, 0xBB])
+        );
         assert_eq!(store.header_score(&id3).unwrap(), Some(vec![0xCC]));
     }
 
@@ -1777,13 +1739,13 @@ mod tests {
 
         // Second batch overwrites with new values.
         store
-            .put_header_score_batch(&[
-                (id1, vec![0xAA, 0xBB]),
-                (id2, vec![0xCC, 0xDD, 0xEE]),
-            ])
+            .put_header_score_batch(&[(id1, vec![0xAA, 0xBB]), (id2, vec![0xCC, 0xDD, 0xEE])])
             .unwrap();
         assert_eq!(store.header_score(&id1).unwrap(), Some(vec![0xAA, 0xBB]));
-        assert_eq!(store.header_score(&id2).unwrap(), Some(vec![0xCC, 0xDD, 0xEE]));
+        assert_eq!(
+            store.header_score(&id2).unwrap(),
+            Some(vec![0xCC, 0xDD, 0xEE])
+        );
     }
 
     #[test]
@@ -1812,8 +1774,7 @@ mod tests {
         store.put_batch(&entries).unwrap();
 
         let got = store.best_chain_entries().unwrap();
-        let expected: Vec<(u32, [u8; 32])> =
-            (1..=5u32).map(|h| (h, test_id(h as u8))).collect();
+        let expected: Vec<(u32, [u8; 32])> = (1..=5u32).map(|h| (h, test_id(h as u8))).collect();
         assert_eq!(got, expected);
     }
 
@@ -1845,9 +1806,7 @@ mod tests {
 
         // Sentinel-style write used by the v0.5.0 scores backfill migration.
         assert_eq!(store.chain_meta_get(b"scores_migrated_v1").unwrap(), None);
-        store
-            .chain_meta_put(b"scores_migrated_v1", &[1u8])
-            .unwrap();
+        store.chain_meta_put(b"scores_migrated_v1", &[1u8]).unwrap();
         assert_eq!(
             store.chain_meta_get(b"scores_migrated_v1").unwrap(),
             Some(vec![1u8])
@@ -1868,7 +1827,10 @@ mod tests {
         store.chain_meta_put(b"keep", b"value").unwrap();
         store.chain_meta_put(b"toss", b"value").unwrap();
         store.chain_meta_delete(b"toss").unwrap();
-        assert_eq!(store.chain_meta_get(b"keep").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(
+            store.chain_meta_get(b"keep").unwrap(),
+            Some(b"value".to_vec())
+        );
         assert_eq!(store.chain_meta_get(b"toss").unwrap(), None);
     }
 
@@ -1895,10 +1857,19 @@ mod tests {
     }
 
     fn v6_addr(segments: [u16; 8], port: u16) -> SocketAddr {
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::new(
-            segments[0], segments[1], segments[2], segments[3],
-            segments[4], segments[5], segments[6], segments[7],
-        )), port)
+        SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(
+                segments[0],
+                segments[1],
+                segments[2],
+                segments[3],
+                segments[4],
+                segments[5],
+                segments[6],
+                segments[7],
+            )),
+            port,
+        )
     }
 
     #[test]
@@ -2075,18 +2046,9 @@ mod tests {
         // trips. Catches the case where set_quick_repair flips some
         // bit redb doesn't expect at our use scale.
         let store = RedbModifierStore::new(&path, TEST_CACHE_BYTES).unwrap();
-        assert_eq!(
-            store.get(101, &test_id(1)).unwrap(),
-            Some(b"h1".to_vec())
-        );
-        assert_eq!(
-            store.get(102, &test_id(2)).unwrap(),
-            Some(b"bt".to_vec())
-        );
-        assert_eq!(
-            store.get(101, &test_id(3)).unwrap(),
-            Some(b"fork".to_vec())
-        );
+        assert_eq!(store.get(101, &test_id(1)).unwrap(), Some(b"h1".to_vec()));
+        assert_eq!(store.get(102, &test_id(2)).unwrap(), Some(b"bt".to_vec()));
+        assert_eq!(store.get(101, &test_id(3)).unwrap(), Some(b"fork".to_vec()));
         // Last score-batch write wins.
         assert_eq!(store.header_score(&test_id(1)).unwrap(), Some(vec![0xBB]));
         // chain_meta_delete after chain_meta_put leaves the key absent.
@@ -2156,7 +2118,9 @@ mod tests {
                 let mut height_idx = write_txn.open_table(HEIGHT_INDEX).unwrap();
                 for h in 1..=5u32 {
                     let id = test_id(h as u8);
-                    primary.insert((101u8, id), format!("h{h}").as_bytes()).unwrap();
+                    primary
+                        .insert((101u8, id), format!("h{h}").as_bytes())
+                        .unwrap();
                     height_idx.insert((101u8, h), id).unwrap();
                 }
                 // Also drop a non-header at height 20 so load_tips has
@@ -2362,7 +2326,13 @@ mod tests {
         id[0] = type_id;
         id[1..5].copy_from_slice(&height.to_be_bytes());
         store
-            .put_batch(&[(type_id, id, height, format!("d{type_id}_{height}").into_bytes(), None)])
+            .put_batch(&[(
+                type_id,
+                id,
+                height,
+                format!("d{type_id}_{height}").into_bytes(),
+                None,
+            )])
             .unwrap();
         id
     }
@@ -2541,9 +2511,7 @@ mod tests {
 
         // Sanity: an out-of-range fork header at height 5 via put_header
         // (fork=0, first-arrival) lowers the BEST_CHAIN minimum.
-        store
-            .put_header(&test_id(5), 5, 0, &[0x05], b"h5")
-            .unwrap();
+        store.put_header(&test_id(5), 5, 0, &[0x05], b"h5").unwrap();
         assert_eq!(store.min_height_present(101).unwrap(), Some(5));
     }
 

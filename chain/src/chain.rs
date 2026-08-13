@@ -12,8 +12,7 @@ use crate::cache::LazyHeaderStore;
 use crate::config::ChainConfig;
 use crate::error::{ChainError, RestoreError};
 use crate::voting::{
-    default_parameters, default_proposed_update_bytes, ValidationSettingsUpdate,
-    SOFT_FORK_VOTE,
+    default_parameters, default_proposed_update_bytes, ValidationSettingsUpdate, SOFT_FORK_VOTE,
 };
 
 /// Map a signed parameter ID (1-8) to its [`Parameter`] enum variant.
@@ -37,8 +36,7 @@ fn ordinary_param(signed_id: i8) -> Option<Parameter> {
 ///
 /// Wired by the integrator (main crate) to bridge `enr-store`. Returns
 /// `None` if no extension is available at that height.
-pub type ExtensionLoader =
-    Arc<dyn Fn(u32) -> Option<Vec<u8>> + Send + Sync + 'static>;
+pub type ExtensionLoader = Arc<dyn Fn(u32) -> Option<Vec<u8>> + Send + Sync + 'static>;
 
 /// Result of a successful `try_append` call.
 #[derive(Debug)]
@@ -365,7 +363,9 @@ impl HeaderChain {
                     got: header.height,
                 });
             }
-            Ok(AppendResult::Forked { fork_height: parent_height })
+            Ok(AppendResult::Forked {
+                fork_height: parent_height,
+            })
         } else {
             Err(ChainError::ParentNotFound {
                 parent_id: header.parent_id,
@@ -701,9 +701,7 @@ impl HeaderChain {
         }
 
         let loader = self.extension_loader.as_ref().ok_or_else(|| {
-            ChainError::Voting(
-                "extension loader not set; cannot recompute parameters".into(),
-            )
+            ChainError::Voting("extension loader not set; cannot recompute parameters".into())
         })?;
 
         let extension_bytes = loader(boundary_height).ok_or_else(|| {
@@ -714,9 +712,7 @@ impl HeaderChain {
 
         let (header_id, fields) = crate::voting::parse_extension_bytes(&extension_bytes)?;
         let expected = self.header_at(boundary_height).ok_or_else(|| {
-            ChainError::Voting(format!(
-                "no header at boundary height {boundary_height}"
-            ))
+            ChainError::Voting(format!("no header at boundary height {boundary_height}"))
         })?;
         if header_id != expected.id {
             return Err(ChainError::Voting(format!(
@@ -875,8 +871,7 @@ impl HeaderChain {
             return Ok(Vec::new());
         }
 
-        let mut window: Vec<(u32, [u8; 3])> =
-            Vec::with_capacity((end - start + 1) as usize);
+        let mut window: Vec<(u32, [u8; 3])> = Vec::with_capacity((end - start + 1) as usize);
         for h in start..=end {
             let header = self.header_at(h).ok_or_else(|| {
                 ChainError::Voting(format!(
@@ -1035,9 +1030,7 @@ impl HeaderChain {
     ) -> Result<Vec<(i8, u32)>, ChainError> {
         let voting_length = self.config.voting.voting_length;
         if voting_length == 0 {
-            return Err(ChainError::Voting(
-                "voting_length must be > 0".into(),
-            ));
+            return Err(ChainError::Voting("voting_length must be > 0".into()));
         }
         let boundary_height = epoch_end_height.checked_add(1).ok_or_else(|| {
             ChainError::Voting(format!(
@@ -1129,8 +1122,7 @@ impl HeaderChain {
             crate::verify_pow(&suffix_head)?;
         }
 
-        let mut installed: Vec<InstalledHeader> =
-            Vec::with_capacity(1 + suffix_tail.len());
+        let mut installed: Vec<InstalledHeader> = Vec::with_capacity(1 + suffix_tail.len());
 
         // Push suffix_head bypassing validate_genesis: it is rarely actually
         // genesis (height 1) and its parent_id is whatever the upstream chain
@@ -1273,10 +1265,7 @@ impl HeaderChain {
     ///   `height` field disagrees with its slot), or not in `by_id`.
     ///
     /// Empty and single-header chains verify trivially.
-    pub fn verify_best_chain_linkage(
-        &self,
-        max_depth: Option<u32>,
-    ) -> Result<(), ChainError> {
+    pub fn verify_best_chain_linkage(&self, max_depth: Option<u32>) -> Result<(), ChainError> {
         let Some(base) = self.base_height else {
             return Ok(());
         };
@@ -1319,13 +1308,13 @@ impl HeaderChain {
     /// silent-`None` divergence masking so the walk can DESCRIBE the
     /// divergence instead of reporting a bare gap.
     fn load_for_linkage_walk(&self, height: u32) -> Result<Header, ChainError> {
-        let header = self.lazy.get_header(height).ok_or_else(|| {
-            ChainError::IndexInconsistency {
-                height,
-                detail: "header unresolvable (cache miss and loader returned None)"
-                    .into(),
-            }
-        })?;
+        let header =
+            self.lazy
+                .get_header(height)
+                .ok_or_else(|| ChainError::IndexInconsistency {
+                    height,
+                    detail: "header unresolvable (cache miss and loader returned None)".into(),
+                })?;
         if header.height != height {
             return Err(ChainError::IndexInconsistency {
                 height,
@@ -1622,14 +1611,10 @@ impl HeaderChain {
             // header would save the wrong branch for rollback and
             // remove nothing from `by_id` below. Bail pre-mutation.
             let hdr = self.header_at(h).ok_or_else(|| {
-                ChainError::Reorg(format!(
-                    "header at height {h} unavailable for reorg drain"
-                ))
+                ChainError::Reorg(format!("header at height {h} unavailable for reorg drain"))
             })?;
             let score = self.score_at(h).ok_or_else(|| {
-                ChainError::Reorg(format!(
-                    "score at height {h} unavailable for reorg drain"
-                ))
+                ChainError::Reorg(format!("score at height {h} unavailable for reorg drain"))
             })?;
             saved_headers.push(hdr);
             saved_scores.push(score);
@@ -1745,10 +1730,7 @@ impl HeaderChain {
     /// Append a header skipping PoW verification.
     /// For tests that need to validate chain logic without real mining solutions.
     #[cfg(test)]
-    pub(crate) fn try_append_no_pow(
-        &mut self,
-        header: Header,
-    ) -> Result<AppendResult, ChainError> {
+    pub(crate) fn try_append_no_pow(&mut self, header: Header) -> Result<AppendResult, ChainError> {
         if self.is_empty() {
             self.validate_genesis_no_pow(&header)?;
             self.push_header(header);
@@ -1767,7 +1749,9 @@ impl HeaderChain {
                     got: header.height,
                 });
             }
-            Ok(AppendResult::Forked { fork_height: parent_height })
+            Ok(AppendResult::Forked {
+                fork_height: parent_height,
+            })
         } else {
             Err(ChainError::ParentNotFound {
                 parent_id: header.parent_id,
@@ -1798,7 +1782,9 @@ impl HeaderChain {
     #[cfg(test)]
     fn validate_genesis_no_pow(&self, header: &Header) -> Result<(), ChainError> {
         if header.parent_id != genesis_parent_id() {
-            return Err(ChainError::InvalidGenesisParent { got: header.parent_id });
+            return Err(ChainError::InvalidGenesisParent {
+                got: header.parent_id,
+            });
         }
         if header.height != 1 {
             return Err(ChainError::InvalidGenesisHeight { got: header.height });
@@ -1826,7 +1812,9 @@ impl HeaderChain {
         let tip = self.tip();
 
         if header.parent_id != tip.id {
-            return Err(ChainError::ParentNotFound { parent_id: header.parent_id });
+            return Err(ChainError::ParentNotFound {
+                parent_id: header.parent_id,
+            });
         }
 
         if header.height != tip.height + 1 {
@@ -1868,9 +1856,7 @@ impl HeaderChain {
         }
 
         if header.height != 1 {
-            return Err(ChainError::InvalidGenesisHeight {
-                got: header.height,
-            });
+            return Err(ChainError::InvalidGenesisHeight { got: header.height });
         }
 
         if header.n_bits != self.config.initial_n_bits {

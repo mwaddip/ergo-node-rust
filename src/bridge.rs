@@ -142,7 +142,11 @@ impl SyncChain for SharedChain {
     }
 
     async fn active_proposed_update_bytes(&self) -> Vec<u8> {
-        self.chain.lock().await.active_proposed_update_bytes().to_vec()
+        self.chain
+            .lock()
+            .await
+            .active_proposed_update_bytes()
+            .to_vec()
     }
 
     async fn verify_nipopow_envelope(
@@ -189,10 +193,11 @@ impl SyncChain for SharedChain {
         // install_from_nipopow_proof returns InstalledHeader entries in
         // the same order as `all_headers`.
         for (header, ih) in all_headers.iter().zip(installed.iter()) {
-            let raw = header.scorex_serialize_bytes()
+            let raw = header
+                .scorex_serialize_bytes()
                 .map_err(|e| ChainError::Nipopow(format!("re-serialize installed header: {e}")))?;
             self.store
-                .put_header(&ih.id.0.0, ih.height, 0, &ih.score_be, &raw)
+                .put_header(&ih.id.0 .0, ih.height, 0, &ih.score_be, &raw)
                 .map_err(|e| ChainError::Nipopow(format!("persist installed header: {e}")))?;
         }
         Ok(())
@@ -275,13 +280,11 @@ impl SyncStore for SharedStore {
 
     async fn validated_height(&self) -> Option<u32> {
         let store = self.store.clone();
-        match tokio::task::spawn_blocking(move || {
-            match store.chain_meta_get(b"validated_height") {
-                Ok(Some(bytes)) if bytes.len() == 4 => {
-                    Some(u32::from_be_bytes(bytes[..4].try_into().unwrap()))
-                }
-                _ => None,
+        match tokio::task::spawn_blocking(move || match store.chain_meta_get(b"validated_height") {
+            Ok(Some(bytes)) if bytes.len() == 4 => {
+                Some(u32::from_be_bytes(bytes[..4].try_into().unwrap()))
             }
+            _ => None,
         })
         .await
         {
@@ -296,9 +299,7 @@ impl SyncStore for SharedStore {
     async fn set_validated_height(&self, height: u32) {
         let store = self.store.clone();
         if let Err(e) = tokio::task::spawn_blocking(move || {
-            if let Err(e) =
-                store.chain_meta_put(b"validated_height", &height.to_be_bytes())
-            {
+            if let Err(e) = store.chain_meta_put(b"validated_height", &height.to_be_bytes()) {
                 tracing::warn!(height, "failed to persist validated_height: {e}");
                 return;
             }
@@ -315,11 +316,7 @@ impl SyncStore for SharedStore {
         }
     }
 
-    async fn prune_below_height(
-        &self,
-        horizon: u32,
-        type_ids: &[u8],
-    ) -> Result<usize, String> {
+    async fn prune_below_height(&self, horizon: u32, type_ids: &[u8]) -> Result<usize, String> {
         let store = self.store.clone();
         let type_ids = type_ids.to_vec();
         match tokio::task::spawn_blocking(move || {
@@ -340,9 +337,7 @@ impl SyncStore for SharedStore {
     async fn min_height_present(&self, type_id: u8) -> Result<Option<u32>, String> {
         let store = self.store.clone();
         match tokio::task::spawn_blocking(move || {
-            store
-                .min_height_present(type_id)
-                .map_err(|e| e.to_string())
+            store.min_height_present(type_id).map_err(|e| e.to_string())
         })
         .await
         {

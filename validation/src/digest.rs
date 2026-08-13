@@ -102,24 +102,24 @@ impl BlockValidator for DigestValidator {
         // Uses JVM v6 matchParameters60 semantics: local can have fewer
         // entries than received, every entry in local must match received.
         // At v4+ the proposedUpdate byte-for-byte comparison also runs.
-        let (epoch_boundary_params, epoch_boundary_proposed_update) =
-            match expected_boundary_params {
-                Some(expected) => {
-                    let parsed = voting::parse_parameters_from_extension(&parsed_ext)?;
-                    let parsed_pu = voting::extract_proposed_update(&parsed_ext);
-                    let expected_pu = expected_proposed_update.unwrap_or(&[]);
-                    voting::check_parameters_v6(
-                        expected,
-                        &parsed,
-                        header.height,
-                        header.version,
-                        expected_pu,
-                        &parsed_pu,
-                    )?;
-                    (Some(parsed), Some(parsed_pu))
-                }
-                None => (None, None),
-            };
+        let (epoch_boundary_params, epoch_boundary_proposed_update) = match expected_boundary_params
+        {
+            Some(expected) => {
+                let parsed = voting::parse_parameters_from_extension(&parsed_ext)?;
+                let parsed_pu = voting::extract_proposed_update(&parsed_ext);
+                let expected_pu = expected_proposed_update.unwrap_or(&[]);
+                voting::check_parameters_v6(
+                    expected,
+                    &parsed,
+                    header.height,
+                    header.version,
+                    expected_pu,
+                    &parsed_pu,
+                )?;
+                (Some(parsed), Some(parsed_pu))
+            }
+            None => (None, None),
+        };
 
         // 1b. Block-version gate (consensus check — JVM exBlockVersion).
         // Boundary-only: the JVM checks header.version against the newly
@@ -132,10 +132,9 @@ impl BlockValidator for DigestValidator {
         }
 
         // 2. Verify AD proofs digest matches header
-        let proof_digest: [u8; 32] = blake2::Blake2b::<blake2::digest::typenum::U32>::digest(
-            &parsed_proofs.proof_bytes,
-        )
-        .into();
+        let proof_digest: [u8; 32] =
+            blake2::Blake2b::<blake2::digest::typenum::U32>::digest(&parsed_proofs.proof_bytes)
+                .into();
         let expected_digest: [u8; 32] = header.ad_proofs_root.into();
         if proof_digest != expected_digest {
             return Err(ValidationError::ProofDigestMismatch {
@@ -185,11 +184,9 @@ impl BlockValidator for DigestValidator {
         let mut proof_box_bytes: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
 
         for (i, op) in operations.iter().enumerate() {
-            let result = verifier
-                .perform_one_operation(op)
-                .map_err(|e| ValidationError::ProofVerificationFailed(
-                    format!("operation {i} failed: {e}"),
-                ))?;
+            let result = verifier.perform_one_operation(op).map_err(|e| {
+                ValidationError::ProofVerificationFailed(format!("operation {i} failed: {e}"))
+            })?;
 
             if validate_txs {
                 if let Some(value) = result {
@@ -426,8 +423,7 @@ mod tests {
 
         // Checkpoint at the block's own height: `height > checkpoint` is
         // false, so the unsatisfiable script is never looked at.
-        let mut validator =
-            DigestValidator::from_state(f.pre_digest, SEED_HEIGHT, BLOCK_HEIGHT);
+        let mut validator = DigestValidator::from_state(f.pre_digest, SEED_HEIGHT, BLOCK_HEIGHT);
         f.apply(&mut validator)
             .expect("checkpointed block applies without script evaluation");
 

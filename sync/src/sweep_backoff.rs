@@ -96,7 +96,10 @@ impl StallDetail {
     /// epoch-boundary processing error). Reuses the `apply_state`
     /// catch-all kind.
     pub(crate) fn other() -> Self {
-        Self { error_kind: "other", missing_key: None }
+        Self {
+            error_kind: "other",
+            missing_key: None,
+        }
     }
 }
 
@@ -189,7 +192,11 @@ impl SweepBackoff {
             next_allowed: now + delay,
             stuck_emitted: stuck_emitted || stuck_fired,
         });
-        Some(Stall { attempt: consecutive, delay, stuck_fired })
+        Some(Stall {
+            attempt: consecutive,
+            delay,
+            stuck_fired,
+        })
     }
 
     /// Current consecutive stall count (0 when idle).
@@ -255,7 +262,11 @@ mod tests {
             let stall = b
                 .record(100, 100, now, StallDetail::other())
                 .expect("a non-advancing sweep arms a stall");
-            assert_eq!(stall.attempt, (i + 1) as u32, "attempt counts consecutive stalls");
+            assert_eq!(
+                stall.attempt,
+                (i + 1) as u32,
+                "attempt counts consecutive stalls"
+            );
             assert_eq!(
                 stall.delay,
                 Duration::from_secs(*exp),
@@ -348,7 +359,10 @@ mod tests {
         assert!(output.contains("height=100"), "{output}");
         assert!(output.contains("attempts=5"), "{output}");
         assert!(output.contains("error_kind=\"missing_key\""), "{output}");
-        assert!(output.contains(&format!("missing_key={key_hex}")), "{output}");
+        assert!(
+            output.contains(&format!("missing_key={key_hex}")),
+            "{output}"
+        );
     }
 
     #[test]
@@ -362,7 +376,9 @@ mod tests {
         let mut fired = Vec::new();
         let output = capture(|| {
             for _ in 0..5 {
-                let s = b.record(100, 100, now, StallDetail::other()).expect("stall");
+                let s = b
+                    .record(100, 100, now, StallDetail::other())
+                    .expect("stall");
                 fired.push(s.stuck_fired);
             }
         });
@@ -382,8 +398,7 @@ mod tests {
         let mut fires = 0;
         let output = capture(|| {
             for _ in 0..10 {
-                if b
-                    .record(100, 100, now, StallDetail::other())
+                if b.record(100, 100, now, StallDetail::other())
                     .unwrap()
                     .stuck_fired
                 {
@@ -391,7 +406,10 @@ mod tests {
                 }
             }
         });
-        assert_eq!(fires, 1, "exactly one fire across 10 stalls at one frontier");
+        assert_eq!(
+            fires, 1,
+            "exactly one fire across 10 stalls at one frontier"
+        );
         assert_eq!(output.matches("validation stuck").count(), 1, "{output}");
     }
 

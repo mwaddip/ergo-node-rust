@@ -9,7 +9,6 @@ use std::time::Duration;
 use ergo_chain_types::{
     ADDigest, AutolykosSolution, BlockId, Digest, Digest32, EcPoint, Header, Votes,
 };
-use tracing_test::traced_test;
 use ergo_lib::chain::emission::{EmissionRules, MonetarySettings};
 use ergo_lib::chain::genesis;
 use ergo_lib::chain::parameters::Parameters;
@@ -19,6 +18,7 @@ use ergo_mining::emission::{build_emission_tx, ReemissionRules};
 use ergo_mining::solution::validate_solution;
 use ergo_mining::types::*;
 use ergo_mining::{MiningError, ValidatorProofsResult};
+use tracing_test::traced_test;
 
 /// Initial difficulty for testnet/mainnet — decodes to 1.
 /// Target = order / 1 ≈ 2^256, so any nonce is valid.
@@ -114,8 +114,7 @@ fn cpu_mine(candidate: &CandidateBlock, max_attempts: u64) -> Result<Header, Str
 fn build_emission_tx_produces_valid_structure() {
     let settings = MonetarySettings::default();
     let pks = founder_pks();
-    let (emission_box, _, _) =
-        genesis::genesis_boxes(&settings, &pks, 2, PROOFS).unwrap();
+    let (emission_box, _, _) = genesis::genesis_boxes(&settings, &pks, 2, PROOFS).unwrap();
 
     let miner_pk = test_miner_pk();
     let reemission_rules = ReemissionRules::mainnet();
@@ -145,8 +144,7 @@ fn build_emission_tx_produces_valid_structure() {
 fn generate_candidate_and_mine_block() {
     let settings = MonetarySettings::default();
     let pks = founder_pks();
-    let (emission_box, _, _) =
-        genesis::genesis_boxes(&settings, &pks, 2, PROOFS).unwrap();
+    let (emission_box, _, _) = genesis::genesis_boxes(&settings, &pks, 2, PROOFS).unwrap();
 
     let miner_pk = test_miner_pk();
     let config = MinerConfig {
@@ -194,10 +192,17 @@ fn generate_candidate_and_mine_block() {
     assert!(!work.msg.is_empty(), "msg should be non-empty hex");
     assert!(!work.b.is_empty(), "b (target) should be non-empty");
     assert!(!work.pk.is_empty(), "pk should be non-empty hex");
-    assert!(work.proof.is_none(), "basic candidate omits the proof (no nested msgPreimage)");
+    assert!(
+        work.proof.is_none(),
+        "basic candidate omits the proof (no nested msgPreimage)"
+    );
 
     // Verify candidate structure
-    assert_eq!(candidate.transactions.len(), 1, "should have 1 tx (emission only)");
+    assert_eq!(
+        candidate.transactions.len(),
+        1,
+        "should have 1 tx (emission only)"
+    );
     assert_eq!(candidate.version, 2);
     assert_eq!(candidate.n_bits, INITIAL_N_BITS);
     assert_eq!(candidate.votes, [0, 0, 0]);
@@ -218,8 +223,7 @@ fn generate_candidate_and_mine_block() {
 fn mine_three_consecutive_blocks() {
     let settings = MonetarySettings::default();
     let pks = founder_pks();
-    let (emission_box, _, _) =
-        genesis::genesis_boxes(&settings, &pks, 2, PROOFS).unwrap();
+    let (emission_box, _, _) = genesis::genesis_boxes(&settings, &pks, 2, PROOFS).unwrap();
 
     let miner_pk = test_miner_pk();
     let config = MinerConfig {
@@ -274,11 +278,8 @@ fn mine_three_consecutive_blocks() {
         );
 
         // Update interlinks for the next block
-        interlinks = ergo_nipopow::NipopowAlgos::update_interlinks(
-            parent.clone(),
-            interlinks,
-        )
-        .unwrap_or_else(|e| panic!("interlinks update at height {height} failed: {e}"));
+        interlinks = ergo_nipopow::NipopowAlgos::update_interlinks(parent.clone(), interlinks)
+            .unwrap_or_else(|e| panic!("interlinks update at height {height} failed: {e}"));
 
         // The emission tx is the first transaction in the candidate.
         // Its first output is the new emission box for the next block.
@@ -324,8 +325,7 @@ fn mine_three_consecutive_blocks() {
 fn mining_block_found_emits_contract_marker() {
     let settings = MonetarySettings::default();
     let pks = founder_pks();
-    let (emission_box, _, _) =
-        genesis::genesis_boxes(&settings, &pks, 2, PROOFS).unwrap();
+    let (emission_box, _, _) = genesis::genesis_boxes(&settings, &pks, 2, PROOFS).unwrap();
 
     let miner_pk = test_miner_pk();
     let config = MinerConfig {
@@ -360,13 +360,9 @@ fn mining_block_found_emits_contract_marker() {
     .expect("candidate generation failed")
     .block;
 
-    let header =
-        cpu_mine(&candidate, 100).expect("mining should succeed with trivial difficulty");
+    let header = cpu_mine(&candidate, 100).expect("mining should succeed with trivial difficulty");
 
-    assert!(
-        logs_contain("mining: block found"),
-        "marker prefix missing"
-    );
+    assert!(logs_contain("mining: block found"), "marker prefix missing");
     assert!(
         logs_contain(&format!("height={}", header.height)),
         "height field missing"

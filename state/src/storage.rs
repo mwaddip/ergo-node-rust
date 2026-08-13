@@ -452,7 +452,11 @@ impl RedbAVLStorage {
     /// Create a lightweight AVLTree for pack/unpack only (no real resolver).
     fn make_tree(&self) -> AVLTree {
         let dummy: Resolver = Arc::new(|_| panic!("dummy resolver"));
-        AVLTree::with_resolver(dummy, self.tree_params.key_length, self.tree_params.value_length)
+        AVLTree::with_resolver(
+            dummy,
+            self.tree_params.key_length,
+            self.tree_params.value_length,
+        )
     }
 
     fn serialize_version_chain(chain: &VecDeque<(u64, ADDigest)>) -> Vec<u8> {
@@ -520,8 +524,10 @@ impl RedbAVLStorage {
             }
 
             meta_table.insert(META_TOP_NODE_HASH, root_hash.as_slice())?;
-            meta_table
-                .insert(META_TOP_NODE_HEIGHT, (height as u32).to_be_bytes().as_slice())?;
+            meta_table.insert(
+                META_TOP_NODE_HEIGHT,
+                (height as u32).to_be_bytes().as_slice(),
+            )?;
             meta_table.insert(META_CURRENT_VERSION, version.as_ref())?;
             meta_table.insert(META_LSN, 1u64.to_be_bytes().as_slice())?;
             meta_table.insert(META_BLOCK_HEIGHT, block_height.to_be_bytes().as_slice())?;
@@ -746,8 +752,22 @@ impl SnapshotReader {
             subtree_roots.push(right_label);
         } else {
             // level < manifest_depth: recurse.
-            self.walk_manifest(table, &left_label, level + 1, manifest_depth, manifest, subtree_roots)?;
-            self.walk_manifest(table, &right_label, level + 1, manifest_depth, manifest, subtree_roots)?;
+            self.walk_manifest(
+                table,
+                &left_label,
+                level + 1,
+                manifest_depth,
+                manifest,
+                subtree_roots,
+            )?;
+            self.walk_manifest(
+                table,
+                &right_label,
+                level + 1,
+                manifest_depth,
+                manifest,
+                subtree_roots,
+            )?;
         }
 
         Ok(())
@@ -820,9 +840,9 @@ impl SnapshotReader {
                         warn!("corrupt leaf node: truncated value length");
                         return None;
                     }
-                    let vlen = u32::from_be_bytes(
-                        packed[vlen_offset..vlen_offset + 4].try_into().ok()?,
-                    ) as usize;
+                    let vlen =
+                        u32::from_be_bytes(packed[vlen_offset..vlen_offset + 4].try_into().ok()?)
+                            as usize;
                     if packed.len() < vlen_offset + 4 + vlen {
                         warn!("corrupt leaf node: truncated value");
                         return None;
@@ -954,8 +974,7 @@ impl RedbAVLStorage {
                 let mut removed_with_bytes = Vec::with_capacity(removed_labels.len());
                 for label in &removed_labels {
                     if let Some(data) = nodes_table.get(label.as_slice())? {
-                        removed_with_bytes
-                            .push((*label, Bytes::copy_from_slice(data.value())));
+                        removed_with_bytes.push((*label, Bytes::copy_from_slice(data.value())));
                     }
                 }
 
@@ -1000,8 +1019,7 @@ impl RedbAVLStorage {
             // 6. Write new/modified nodes.  Track labels we just wrote so
             //    the delete loop can refuse to remove them — see the
             //    overlap guard at step 7 for the reasoning.
-            let mut written_labels: HashSet<Digest32> =
-                HashSet::with_capacity(changed_nodes.len());
+            let mut written_labels: HashSet<Digest32> = HashSet::with_capacity(changed_nodes.len());
             for (label, packed) in &changed_nodes {
                 nodes_table.insert(label.as_slice(), packed.as_ref())?;
                 written_labels.insert(*label);
@@ -1157,8 +1175,7 @@ impl VersionedAVLStorage for RedbAVLStorage {
 
             // Restore metadata from the last processed undo record.
             let undo = last_undo.as_ref().unwrap();
-            meta_table
-                .insert(META_TOP_NODE_HASH, undo.prev_top_node_hash.as_slice())?;
+            meta_table.insert(META_TOP_NODE_HASH, undo.prev_top_node_hash.as_slice())?;
             meta_table.insert(
                 META_TOP_NODE_HEIGHT,
                 undo.prev_top_node_height.to_be_bytes().as_slice(),
@@ -1418,8 +1435,10 @@ fn open_source_read_only(source: &Path) -> Result<ReadOnlyDatabase> {
              without writing to it — start the node once and stop it gracefully, then retry",
             source.display()
         ),
-        Err(e) => Err(anyhow::Error::new(e)
-            .context(format!("failed to open {} read-only", source.display()))),
+        Err(e) => {
+            Err(anyhow::Error::new(e)
+                .context(format!("failed to open {} read-only", source.display())))
+        }
     }
 }
 
@@ -1435,7 +1454,11 @@ fn open_source_read_only(source: &Path) -> Result<ReadOnlyDatabase> {
 /// nothing about the other twenty million rows.
 ///
 /// Returns the recomputed root label.
-fn verify_compacted(dest: &Path, expected_root: &Digest32, expected_nodes: u64) -> Result<Digest32> {
+fn verify_compacted(
+    dest: &Path,
+    expected_root: &Digest32,
+    expected_nodes: u64,
+) -> Result<Digest32> {
     let db = redb::Builder::new()
         .set_cache_size(COMPACTION_CACHE_BYTES)
         .open_read_only(dest)

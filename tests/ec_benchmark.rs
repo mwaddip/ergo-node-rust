@@ -36,7 +36,9 @@ fn ec_performance_comparison() {
     let start = Instant::now();
     for _ in 0..N {
         use k256::elliptic_curve::ops::MulByGenerator;
-        black_box(k256::ProjectivePoint::mul_by_generator(black_box(&k_scalar_b)));
+        black_box(k256::ProjectivePoint::mul_by_generator(black_box(
+            &k_scalar_b,
+        )));
     }
     let k_gen = start.elapsed();
 
@@ -106,9 +108,8 @@ fn ec_performance_comparison() {
     // =========================================================================
 
     let us = |d: std::time::Duration| d.as_micros() as f64 / N as f64;
-    let ratio = |a: std::time::Duration, b: std::time::Duration| {
-        a.as_nanos() as f64 / b.as_nanos() as f64
-    };
+    let ratio =
+        |a: std::time::Duration, b: std::time::Duration| a.as_nanos() as f64 / b.as_nanos() as f64;
 
     println!("\n{}", "=".repeat(60));
     println!("EC Performance: k256 vs libsecp256k1  ({N} iterations, --release)");

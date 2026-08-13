@@ -21,7 +21,9 @@ const META_BLOCK_HEIGHT: &str = "block_height";
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
-        bail!("usage: inspect-state <state.redb path> <target key hex | scan | check-digest <hex>>");
+        bail!(
+            "usage: inspect-state <state.redb path> <target key hex | scan | check-digest <hex>>"
+        );
     }
     let path = PathBuf::from(&args[0]);
     let cmd = &args[1];
@@ -30,7 +32,9 @@ fn main() -> Result<()> {
         return scan_tree(&path);
     }
     if cmd == "check-digest" {
-        if args.len() < 3 { bail!("check-digest needs a 32-byte hex digest arg"); }
+        if args.len() < 3 {
+            bail!("check-digest needs a 32-byte hex digest arg");
+        }
         return check_digest(&path, &args[2]);
     }
 
@@ -82,14 +86,20 @@ fn main() -> Result<()> {
         let packed_guard = match nodes.get(current_label.as_slice())? {
             Some(g) => g,
             None => {
-                println!("  depth={depth} label={} -- MISSING FROM NODES_TABLE", hex::encode(&current_label));
+                println!(
+                    "  depth={depth} label={} -- MISSING FROM NODES_TABLE",
+                    hex::encode(&current_label)
+                );
                 println!("  >>> this is the missing-node corruption signature <<<");
                 return Ok(());
             }
         };
         let packed = packed_guard.value();
         if packed.is_empty() {
-            println!("  depth={depth} label={} -- EMPTY PACKED BYTES", hex::encode(&current_label));
+            println!(
+                "  depth={depth} label={} -- EMPTY PACKED BYTES",
+                hex::encode(&current_label)
+            );
             return Ok(());
         }
         let node_type = packed[0];
@@ -98,12 +108,18 @@ fn main() -> Result<()> {
             // Leaf: type | key (32) | vlen u32 BE | value
             let key_end = 1 + 32;
             if packed.len() < key_end {
-                println!("  depth={depth} label={} -- TRUNCATED LEAF", hex::encode(&current_label));
+                println!(
+                    "  depth={depth} label={} -- TRUNCATED LEAF",
+                    hex::encode(&current_label)
+                );
                 return Ok(());
             }
             let leaf_key = &packed[1..key_end];
-            println!("  depth={depth} type=Leaf label={}.. key={}",
-                hex::encode(&current_label[..8]), hex::encode(leaf_key));
+            println!(
+                "  depth={depth} type=Leaf label={}.. key={}",
+                hex::encode(&current_label[..8]),
+                hex::encode(leaf_key)
+            );
             if leaf_key == target.as_slice() {
                 println!("  >>> target found at this leaf <<<");
             } else {
@@ -118,7 +134,10 @@ fn main() -> Result<()> {
         let right_off = left_off + 32;
         let end = right_off + 32;
         if packed.len() < end {
-            println!("  depth={depth} label={} -- TRUNCATED INTERNAL", hex::encode(&current_label));
+            println!(
+                "  depth={depth} label={} -- TRUNCATED INTERNAL",
+                hex::encode(&current_label)
+            );
             return Ok(());
         }
         let balance = packed[1] as i8;
@@ -126,16 +145,29 @@ fn main() -> Result<()> {
         let left = &packed[left_off..right_off];
         let right = &packed[right_off..end];
 
-        let direction = if target.as_slice() < node_key { "left" } else { "right" };
-        println!("  depth={depth} type=Internal label={}.. balance={} key={}.. -> {} ({}..)",
+        let direction = if target.as_slice() < node_key {
+            "left"
+        } else {
+            "right"
+        };
+        println!(
+            "  depth={depth} type=Internal label={}.. balance={} key={}.. -> {} ({}..)",
             hex::encode(&current_label[..8]),
             balance,
             hex::encode(&node_key[..8]),
             direction,
-            hex::encode(if direction == "left" { &left[..8] } else { &right[..8] }),
+            hex::encode(if direction == "left" {
+                &left[..8]
+            } else {
+                &right[..8]
+            }),
         );
 
-        current_label = if direction == "left" { left.to_vec() } else { right.to_vec() };
+        current_label = if direction == "left" {
+            left.to_vec()
+        } else {
+            right.to_vec()
+        };
         depth += 1;
     }
 }
@@ -199,16 +231,24 @@ fn scan_tree(path: &std::path::Path) -> Result<()> {
             None => {
                 missing_count += 1;
                 if missing_count <= max_missing_to_print {
-                    println!("MISSING ref={} from parent={} side={}",
+                    println!(
+                        "MISSING ref={} from parent={} side={}",
                         hex::encode(&label),
-                        if parent.is_empty() { "META_TOP_NODE_HASH".to_string() } else { hex::encode(&parent) },
-                        side);
+                        if parent.is_empty() {
+                            "META_TOP_NODE_HASH".to_string()
+                        } else {
+                            hex::encode(&parent)
+                        },
+                        side
+                    );
                 }
                 continue;
             }
         };
         let packed = packed_guard.value();
-        if packed.is_empty() { continue; }
+        if packed.is_empty() {
+            continue;
+        }
 
         visited_count += 1;
         let node_type = packed[0];
@@ -222,7 +262,9 @@ fn scan_tree(path: &std::path::Path) -> Result<()> {
         let left_off = key_off + 32;
         let right_off = left_off + 32;
         let end = right_off + 32;
-        if packed.len() < end { continue; }
+        if packed.len() < end {
+            continue;
+        }
         let left = packed[left_off..right_off].to_vec();
         let right = packed[right_off..end].to_vec();
         let parent_label = label.clone();
@@ -230,7 +272,9 @@ fn scan_tree(path: &std::path::Path) -> Result<()> {
         stack.push((left, parent_label, "left"));
 
         if visited_count.is_multiple_of(500_000) {
-            println!("  ... visited {visited_count} nodes (leaves={leaves}, missing={missing_count})");
+            println!(
+                "  ... visited {visited_count} nodes (leaves={leaves}, missing={missing_count})"
+            );
         }
     }
 
@@ -240,7 +284,10 @@ fn scan_tree(path: &std::path::Path) -> Result<()> {
     println!("  Leaves:             {leaves}");
     println!("  Internals:          {}", visited_count - leaves);
     println!("  Missing references: {missing_count}");
-    println!("  Orphan nodes (storage but unreachable): {}", total_in_table as i64 - visited_count as i64);
+    println!(
+        "  Orphan nodes (storage but unreachable): {}",
+        total_in_table as i64 - visited_count as i64
+    );
 
     Ok(())
 }

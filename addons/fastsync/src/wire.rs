@@ -3,7 +3,7 @@
 //! Each modifier is `(type_id, modifier_id, data)` where `data` is the raw
 //! Scorex-serialized body — the same bytes the node would receive over P2P.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
 use ergo_chain_types::Header;
@@ -80,10 +80,7 @@ pub fn header_to_modifier(header: &Header) -> Result<Modifier> {
 /// The header should be pushed separately (it was already sent during the
 /// chainSlice phase). This returns BlockTransactions, ADProofs (if present),
 /// and Extension modifiers.
-pub fn block_sections_to_modifiers(
-    block: &JvmFullBlock,
-    header: &Header,
-) -> Result<Vec<Modifier>> {
+pub fn block_sections_to_modifiers(block: &JvmFullBlock, header: &Header) -> Result<Vec<Modifier>> {
     let header_id: [u8; 32] = header.id.0 .0;
     let mut mods = Vec::with_capacity(3);
 
@@ -95,15 +92,11 @@ pub fn block_sections_to_modifiers(
 
     // ADProofs (optional — UTXO-mode peers may not serve them)
     if let Some(ref ad_proofs) = block.ad_proofs {
-        mods.push(
-            ad_proofs_to_modifier(ad_proofs, &header_id, header).context("ad proofs")?,
-        );
+        mods.push(ad_proofs_to_modifier(ad_proofs, &header_id, header).context("ad proofs")?);
     }
 
     // Extension
-    mods.push(
-        extension_to_modifier(&block.extension, &header_id, header).context("extension")?,
-    );
+    mods.push(extension_to_modifier(&block.extension, &header_id, header).context("extension")?);
 
     Ok(mods)
 }
@@ -176,8 +169,7 @@ fn ad_proofs_to_modifier(
     header_id: &[u8; 32],
     header: &Header,
 ) -> Result<Modifier> {
-    let proof_bytes =
-        hex::decode(&ap.proof_bytes).context("hex decode proofBytes")?;
+    let proof_bytes = hex::decode(&ap.proof_bytes).context("hex decode proofBytes")?;
 
     let mut out = Vec::with_capacity(32 + 5 + proof_bytes.len());
     out.extend_from_slice(header_id);
@@ -187,11 +179,7 @@ fn ad_proofs_to_modifier(
     out.extend_from_slice(&buf);
     out.extend_from_slice(&proof_bytes);
 
-    let modifier_id = prefixed_hash(
-        AD_PROOFS_TYPE_ID,
-        header_id,
-        &header.ad_proofs_root.0,
-    );
+    let modifier_id = prefixed_hash(AD_PROOFS_TYPE_ID, header_id, &header.ad_proofs_root.0);
 
     Ok(Modifier {
         type_id: AD_PROOFS_TYPE_ID,
@@ -222,13 +210,11 @@ fn extension_to_modifier(
     out.extend_from_slice(&buf);
 
     for (i, (key_hex, val_hex)) in ext.fields.iter().enumerate() {
-        let key = hex::decode(key_hex)
-            .with_context(|| format!("field {i}: hex decode key"))?;
+        let key = hex::decode(key_hex).with_context(|| format!("field {i}: hex decode key"))?;
         if key.len() != 2 {
             bail!("field {i}: key length {} != 2", key.len());
         }
-        let value = hex::decode(val_hex)
-            .with_context(|| format!("field {i}: hex decode value"))?;
+        let value = hex::decode(val_hex).with_context(|| format!("field {i}: hex decode value"))?;
         if value.len() > 255 {
             bail!("field {i}: value length {} > 255", value.len());
         }
@@ -237,11 +223,7 @@ fn extension_to_modifier(
         out.extend_from_slice(&value);
     }
 
-    let modifier_id = prefixed_hash(
-        EXTENSION_TYPE_ID,
-        header_id,
-        &header.extension_root.0,
-    );
+    let modifier_id = prefixed_hash(EXTENSION_TYPE_ID, header_id, &header.extension_root.0);
 
     Ok(Modifier {
         type_id: EXTENSION_TYPE_ID,

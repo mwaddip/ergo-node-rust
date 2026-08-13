@@ -133,9 +133,7 @@ pub fn generate_candidate(
         // transaction is not re-validated for a budget nothing competes for.
         (vec![emission_tx], Vec::new())
     } else {
-        let upcoming = upcoming_header(
-            parent, version, n_bits, height, timestamp, config,
-        );
+        let upcoming = upcoming_header(parent, version, n_bits, height, timestamp, config);
         let mut window = Vec::with_capacity(1 + ancestor_headers.len().min(9));
         window.push(parent.clone());
         window.extend(ancestor_headers.iter().take(9).cloned());
@@ -156,7 +154,9 @@ pub fn generate_candidate(
 
     // 5. Compute state root and AD proofs via validator
     let (ad_proof_bytes, state_root) = validator_proofs(&transactions)
-        .ok_or(MiningError::Unavailable("UTXO mode required for mining".into()))?
+        .ok_or(MiningError::Unavailable(
+            "UTXO mode required for mining".into(),
+        ))?
         .map_err(MiningError::Validation)?;
 
     // 6. Build extension
@@ -512,12 +512,7 @@ impl CandidateGenerator {
 
     /// Store a freshly generated candidate. The old candidate (if any)
     /// is preserved as `previous` so stale solutions can still be accepted.
-    pub fn cache_candidate(
-        &self,
-        block: CandidateBlock,
-        work: WorkMessage,
-        tip_height: u32,
-    ) {
+    pub fn cache_candidate(&self, block: CandidateBlock, work: WorkMessage, tip_height: u32) {
         let mut guard = self.cached.write().unwrap();
         // Move current → previous before overwriting
         if let Some(old) = guard.take() {

@@ -117,12 +117,30 @@ fn parse_byte_string_literal(s: &str) -> Option<Vec<u8>> {
             return None;
         }
         match bytes[i + 1] {
-            b'n' => { out.push(b'\n'); i += 2; }
-            b'r' => { out.push(b'\r'); i += 2; }
-            b't' => { out.push(b'\t'); i += 2; }
-            b'0' => { out.push(0); i += 2; }
-            b'\\' => { out.push(b'\\'); i += 2; }
-            b'"' => { out.push(b'"'); i += 2; }
+            b'n' => {
+                out.push(b'\n');
+                i += 2;
+            }
+            b'r' => {
+                out.push(b'\r');
+                i += 2;
+            }
+            b't' => {
+                out.push(b'\t');
+                i += 2;
+            }
+            b'0' => {
+                out.push(0);
+                i += 2;
+            }
+            b'\\' => {
+                out.push(b'\\');
+                i += 2;
+            }
+            b'"' => {
+                out.push(b'"');
+                i += 2;
+            }
             b'x' => {
                 if i + 3 >= bytes.len() {
                     return None;
@@ -147,7 +165,10 @@ mod tests {
         // The exact apply_state error the sweep wedge produced. Its own
         // variant carries no prose at all, so there is nothing to grep
         // even if someone were inclined to.
-        let err = ValidationError::HeightMismatch { expected: 2666, got: 2668 };
+        let err = ValidationError::HeightMismatch {
+            expected: 2666,
+            got: 2668,
+        };
         let (kind, key) = classify_apply_state_error(&err);
         assert_eq!(kind, "other");
         assert!(key.is_none());

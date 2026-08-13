@@ -140,7 +140,10 @@ impl SnapshotMessage {
                     let mut manifest_id = [0u8; 32];
                     manifest_id.copy_from_slice(&body[offset..offset + 32]);
                     offset += 32;
-                    entries.push(SnapshotEntry { height, manifest_id });
+                    entries.push(SnapshotEntry {
+                        height,
+                        manifest_id,
+                    });
                 }
                 Ok(SnapshotMessage::SnapshotsInfo(entries))
             }
@@ -164,7 +167,9 @@ impl SnapshotMessage {
                 if body.len() < offset + len {
                     return Err(ProtocolError::TooShort);
                 }
-                Ok(SnapshotMessage::Manifest(body[offset..offset + len].to_vec()))
+                Ok(SnapshotMessage::Manifest(
+                    body[offset..offset + len].to_vec(),
+                ))
             }
 
             GET_UTXO_SNAPSHOT_CHUNK => {
@@ -186,7 +191,9 @@ impl SnapshotMessage {
                 if body.len() < offset + len {
                     return Err(ProtocolError::TooShort);
                 }
-                Ok(SnapshotMessage::UtxoSnapshotChunk(body[offset..offset + len].to_vec()))
+                Ok(SnapshotMessage::UtxoSnapshotChunk(
+                    body[offset..offset + len].to_vec(),
+                ))
             }
 
             _ => Err(ProtocolError::UnknownCode(code)),
@@ -217,9 +224,7 @@ impl SnapshotMessage {
                 (MANIFEST, body)
             }
 
-            SnapshotMessage::GetUtxoSnapshotChunk(id) => {
-                (GET_UTXO_SNAPSHOT_CHUNK, id.to_vec())
-            }
+            SnapshotMessage::GetUtxoSnapshotChunk(id) => (GET_UTXO_SNAPSHOT_CHUNK, id.to_vec()),
 
             SnapshotMessage::UtxoSnapshotChunk(data) => {
                 let mut body = Vec::with_capacity(5 + data.len());

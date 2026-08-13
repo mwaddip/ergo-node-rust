@@ -192,7 +192,11 @@ pub fn select_transactions(
         let mut inputs_found = true;
         for input in tx.inputs.iter() {
             let id = id_bytes(input.box_id.as_ref());
-            if let Some(b) = available_outputs.get(&id).cloned().or_else(|| utxo_lookup(&id)) {
+            if let Some(b) = available_outputs
+                .get(&id)
+                .cloned()
+                .or_else(|| utxo_lookup(&id))
+            {
                 input_boxes.push(b);
             } else {
                 inputs_found = false;
@@ -218,7 +222,11 @@ pub fn select_transactions(
         let mut data_inputs_found = true;
         for di in tx.data_inputs.iter().flat_map(|dis| dis.iter()) {
             let id = id_bytes(di.box_id.as_ref());
-            if let Some(b) = available_outputs.get(&id).cloned().or_else(|| utxo_lookup(&id)) {
+            if let Some(b) = available_outputs
+                .get(&id)
+                .cloned()
+                .or_else(|| utxo_lookup(&id))
+            {
                 data_boxes.push(b);
             } else {
                 data_inputs_found = false;

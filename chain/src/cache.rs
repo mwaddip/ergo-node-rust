@@ -47,8 +47,7 @@ pub const DEFAULT_CACHE_CAPACITY: usize = 16_384;
 /// `LruEntry` is private to `lru`, so the node is reconstructed from
 /// its fields rather than measured; the reconstruction ignores the few
 /// bytes of padding the real layout adds.
-const LRU_NODE_OVERHEAD_BYTES: u64 =
-    (size_of::<u32>() + 2 * size_of::<usize>()) as u64;
+const LRU_NODE_OVERHEAD_BYTES: u64 = (size_of::<u32>() + 2 * size_of::<usize>()) as u64;
 
 /// Bytes one entry occupies in the LRU's internal index, a
 /// `HashMap<KeyRef<u32>, NonNull<LruEntry<..>>>`: the two pointers of
@@ -97,26 +96,21 @@ pub(crate) const fn header_entry_bytes() -> u64 {
 /// inline in the boxed `LruEntry` node, plus its heap digits, plus the
 /// node overhead and the entry's slot in the LRU's index.
 pub(crate) const fn score_entry_bytes() -> u64 {
-    size_of::<BigUint>() as u64
-        + SCORE_DIGIT_BYTES
-        + LRU_NODE_OVERHEAD_BYTES
-        + LRU_INDEX_SLOT_BYTES
+    size_of::<BigUint>() as u64 + SCORE_DIGIT_BYTES + LRU_NODE_OVERHEAD_BYTES + LRU_INDEX_SLOT_BYTES
 }
 
 /// Callback for loading a header by height from persistent storage.
 ///
 /// Returns `None` if no header is stored at that height. Wired by the
 /// integrator (main crate) to bridge `enr-store`.
-pub type HeaderLoader =
-    Arc<dyn Fn(u32) -> Option<Header> + Send + Sync + 'static>;
+pub type HeaderLoader = Arc<dyn Fn(u32) -> Option<Header> + Send + Sync + 'static>;
 
 /// Callback for loading a cumulative-difficulty score by height.
 ///
 /// Split from [`HeaderLoader`] so consumers that only need the header
 /// (NiPoPoW build, difficulty walk) don't pay `BigUint`
 /// deserialization on every lookup.
-pub type ScoreLoader =
-    Arc<dyn Fn(u32) -> Option<BigUint> + Send + Sync + 'static>;
+pub type ScoreLoader = Arc<dyn Fn(u32) -> Option<BigUint> + Send + Sync + 'static>;
 
 /// Paired LRU caches + loaders for headers and cumulative scores.
 ///
@@ -137,8 +131,7 @@ impl LazyHeaderStore {
     /// ([`DEFAULT_CACHE_CAPACITY`]).
     pub fn with_default_capacity() -> Self {
         Self::with_capacity(
-            NonZeroUsize::new(DEFAULT_CACHE_CAPACITY)
-                .expect("DEFAULT_CACHE_CAPACITY is nonzero"),
+            NonZeroUsize::new(DEFAULT_CACHE_CAPACITY).expect("DEFAULT_CACHE_CAPACITY is nonzero"),
         )
     }
 

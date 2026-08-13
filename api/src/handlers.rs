@@ -933,7 +933,9 @@ pub async fn get_mining_candidate(
     // there fails `cached.tip_height == current_tip_height` and returns 503
     // even though a valid candidate for the validated tip is cached.
     // (facts/mining.md — "GET /mining/candidate", height-source paragraph.)
-    let tip_height = state.validated_height.load(std::sync::atomic::Ordering::Relaxed);
+    let tip_height = state
+        .validated_height
+        .load(std::sync::atomic::Ordering::Relaxed);
     match mining.cached_work(tip_height) {
         Some(work) => Ok(Json(work)),
         None => err(
@@ -3499,7 +3501,10 @@ mod tests {
                 assert_eq!(status, StatusCode::NOT_FOUND);
                 assert_eq!(body.error, 404);
                 assert_eq!(body.reason, "block-not-found");
-                assert_eq!(body.detail.as_deref(), Some(format!("headerId={}", "aa".repeat(32)).as_str()));
+                assert_eq!(
+                    body.detail.as_deref(),
+                    Some(format!("headerId={}", "aa".repeat(32)).as_str())
+                );
             }
             Ok(_) => panic!("expected 404 for unknown headerId"),
         }
@@ -3570,8 +3575,8 @@ mod tests {
             // full canonical bytes are non-empty hex and re-parse to the same tx
             assert!(!frag.bytes.is_empty(), "tx[{i}] bytes must be non-empty");
             let raw = hex::decode(&frag.bytes).expect("bytes is hex");
-            let reparsed = Transaction::sigma_parse_bytes(&raw)
-                .expect("bytes must re-parse to a Transaction");
+            let reparsed =
+                Transaction::sigma_parse_bytes(&raw).expect("bytes must re-parse to a Transaction");
             assert_eq!(
                 reparsed.id().0 .0,
                 parsed.transactions[i].id().0 .0,

@@ -113,8 +113,7 @@ fn build_work_message_wiring_matches_independent_serialization() {
     let parent = parent_for_wiring_test();
     let settings = MonetarySettings::default();
     let pks = founder_pks();
-    let (emission_box, _, _) =
-        genesis::genesis_boxes(&settings, &pks, 2, TEST_PROOFS).unwrap();
+    let (emission_box, _, _) = genesis::genesis_boxes(&settings, &pks, 2, TEST_PROOFS).unwrap();
 
     let miner_pk = test_miner_pk();
     let reemission_rules = ReemissionRules::mainnet();
@@ -274,8 +273,7 @@ fn sigma_rust_serialize_without_pow_matches_jvm_canonical_height_614400() {
     let msg_hex = hex::encode(blake2b256_bytes(&bytes));
 
     assert_eq!(
-        msg_hex,
-        "548c3e602a8f36f8f2738f5f643b02425038044d98543a51cabaa9785e7e864f",
+        msg_hex, "548c3e602a8f36f8f2738f5f643b02425038044d98543a51cabaa9785e7e864f",
         "sigma-rust serialize_without_pow drifted from JVM-canonical msg \
          for height 614400. Either sigma-rust changed its serialization \
          (which would be a hard fork on the wire) or our blake2b256 \

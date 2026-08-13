@@ -11,19 +11,21 @@ use std::sync::Arc;
 use bytes::Bytes;
 use enr_chain::{ChainConfig, HeaderChain, StateType, HEADER_TYPE_ID};
 use enr_state::{AVLTreeParams, CacheSize, RedbAVLStorage, SnapshotReader};
+use enr_store::{ModifierStore, RedbModifierStore};
 use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
 use ergo_avltree_rust::batch_node::AVLTree;
 use ergo_avltree_rust::operation::{KeyValue, Operation};
 use ergo_avltree_rust::versioned_avl_storage::VersionedAVLStorage;
 use ergo_chain_types::ADDigest;
+use ergo_chain_types::EcPoint;
 use ergo_lib::chain::emission::MonetarySettings;
 use ergo_lib::chain::genesis;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
-use ergo_chain_types::EcPoint;
-use enr_store::{ModifierStore, RedbModifierStore};
-use ergo_node_rust::{P2pTransport, PeerStorageAdapter, SharedChain, SharedStore, ValidationPipeline};
+use ergo_node_rust::{
+    P2pTransport, PeerStorageAdapter, SharedChain, SharedStore, ValidationPipeline,
+};
 use ergo_sync::{HeaderSync, SyncConfig, SyncStore};
 use ergo_validation::{
     ApplyStateOutcome, BlockValidator, DigestValidator, MiningState, StatePersistence,
@@ -103,14 +105,17 @@ fn build_genesis_boxes(network: enr_p2p::types::Network) -> Vec<([u8; 32], Vec<u
         &founder_pks,
         2, // 2-of-3 threshold
         proof_strings,
-    ).expect("genesis box construction failed");
+    )
+    .expect("genesis box construction failed");
 
     [emission, no_premine, founders]
         .into_iter()
         .map(|b| {
             let mut id = [0u8; 32];
             id.copy_from_slice(b.box_id().as_ref());
-            let bytes = b.sigma_serialize_bytes().expect("genesis box serialization failed");
+            let bytes = b
+                .sigma_serialize_bytes()
+                .expect("genesis box serialization failed");
             (id, bytes)
         })
         .collect()
@@ -221,7 +226,14 @@ impl Validator {
         };
         shared_height.store(h, std::sync::atomic::Ordering::Relaxed);
         let _ = height_watch_tx.send(h);
-        Self { inner, shared_height, shared_state_context, block_applied_tx, height_watch_tx, mining }
+        Self {
+            inner,
+            shared_height,
+            shared_state_context,
+            block_applied_tx,
+            height_watch_tx,
+            mining,
+        }
     }
 
     /// The active variant's mining support. `None` in digest mode, where
@@ -304,27 +316,37 @@ impl BlockValidator for Validator {
     ) -> Result<ApplyStateOutcome, ValidationError> {
         let result = match &mut self.inner {
             ValidatorInner::Digest(v) => v.apply_state(
-                header, block_txs, ad_proofs, extension, preceding_headers,
-                active_params, expected_boundary_params, expected_proposed_update,
+                header,
+                block_txs,
+                ad_proofs,
+                extension,
+                preceding_headers,
+                active_params,
+                expected_boundary_params,
+                expected_proposed_update,
             ),
             ValidatorInner::Utxo(v) => v.apply_state(
-                header, block_txs, ad_proofs, extension, preceding_headers,
-                active_params, expected_boundary_params, expected_proposed_update,
+                header,
+                block_txs,
+                ad_proofs,
+                extension,
+                preceding_headers,
+                active_params,
+                expected_boundary_params,
+                expected_proposed_update,
             ),
         };
         if result.is_ok() {
             let h = self.validated_height();
-            self.shared_height.store(h, std::sync::atomic::Ordering::Relaxed);
+            self.shared_height
+                .store(h, std::sync::atomic::Ordering::Relaxed);
             let _ = self.height_watch_tx.send(h);
 
             // Publish state context for mempool/API transaction validation.
             // Only when we have preceding headers (height > 0).
             if !preceding_headers.is_empty() {
-                let ctx = ergo_validation::build_state_context(
-                    header,
-                    preceding_headers,
-                    active_params,
-                );
+                let ctx =
+                    ergo_validation::build_state_context(header, preceding_headers, active_params);
                 let ctx_lock = self.shared_state_context.clone();
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
@@ -374,7 +396,8 @@ impl BlockValidator for Validator {
         // Republish the validator's ACTUAL height: the new one on Ok, the
         // unchanged one on Err (reset_to Err = validator unmoved).
         let h = self.validated_height();
-        self.shared_height.store(h, std::sync::atomic::Ordering::Relaxed);
+        self.shared_height
+            .store(h, std::sync::atomic::Ordering::Relaxed);
         let _ = self.height_watch_tx.send(h);
         result
     }
@@ -428,9 +451,7 @@ async fn penalize(
         Some(addr) => addr.ip().to_string(),
         None => "unknown".to_string(),
     };
-    tracing::warn!(
-        "PENALTY peer_ip={ip} type={penalty_type} reason=\"{reason}\""
-    );
+    tracing::warn!("PENALTY peer_ip={ip} type={penalty_type} reason=\"{reason}\"");
     if disconnect {
         p2p.disconnect_peer(peer_id).await;
     }
@@ -459,7 +480,14 @@ async fn handle_nipopow_event(
             let req = match nipopow_serve::parse_get_nipopow_proof(body) {
                 Ok(r) => r,
                 Err(e) => {
-                    penalize(p2p, peer_id, "misbehavior", &format!("GetNipopowProof parse failed: {e}"), false).await;
+                    penalize(
+                        p2p,
+                        peer_id,
+                        "misbehavior",
+                        &format!("GetNipopowProof parse failed: {e}"),
+                        false,
+                    )
+                    .await;
                     return;
                 }
             };
@@ -480,8 +508,8 @@ async fn handle_nipopow_event(
                 let anchor = match req.header_id {
                     Some(id) => Some(id),
                     None => {
-                        let validated_h = shared_validated_height
-                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let validated_h =
+                            shared_validated_height.load(std::sync::atomic::Ordering::Relaxed);
                         if validated_h == 0 {
                             tracing::warn!(
                                 peer = %peer_id,
@@ -539,7 +567,14 @@ async fn handle_nipopow_event(
             let proof_bytes = match nipopow_serve::parse_nipopow_proof(body) {
                 Ok(b) => b,
                 Err(e) => {
-                    penalize(p2p, peer_id, "misbehavior", &format!("NipopowProof parse failed: {e}"), false).await;
+                    penalize(
+                        p2p,
+                        peer_id,
+                        "misbehavior",
+                        &format!("NipopowProof parse failed: {e}"),
+                        false,
+                    )
+                    .await;
                     return;
                 }
             };
@@ -556,14 +591,24 @@ async fn handle_nipopow_event(
                     );
                 }
                 Err(e) => {
-                    penalize(p2p, peer_id, "permanent", &format!("NiPoPoW proof verification failed: {e}"), true).await;
+                    penalize(
+                        p2p,
+                        peer_id,
+                        "permanent",
+                        &format!("NiPoPoW proof verification failed: {e}"),
+                        true,
+                    )
+                    .await;
                 }
             }
         }
 
         _ => {
             // is_nipopow_message guarantees code is 90 or 91; this branch is unreachable.
-            debug_assert!(false, "handle_nipopow_event called with non-nipopow code {code}");
+            debug_assert!(
+                false,
+                "handle_nipopow_event called with non-nipopow code {code}"
+            );
         }
     }
 }
@@ -578,7 +623,10 @@ struct MempoolUtxoReader {
 }
 
 impl ergo_mempool::types::UtxoReader for MempoolUtxoReader {
-    fn box_by_id(&self, box_id: &[u8; 32]) -> Option<ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox> {
+    fn box_by_id(
+        &self,
+        box_id: &[u8; 32],
+    ) -> Option<ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox> {
         let reader = self.reader.as_ref()?;
         let value_bytes = reader.lookup_key(box_id)?;
         ergo_validation::deserialize_box(&value_bytes).ok()
@@ -623,7 +671,11 @@ impl ergo_api::ChainAccess for HeaderChainAdapter {
     fn tip(&self) -> Option<ergo_chain_types::Header> {
         self.with_chain(|c| {
             let h = c.height();
-            if h == 0 { None } else { c.header_at(h) }
+            if h == 0 {
+                None
+            } else {
+                c.header_at(h)
+            }
         })
     }
     /// Maps `chain/`'s estimate onto the api-local mirror type. `api/`
@@ -645,12 +697,10 @@ impl ergo_api::ChainAccess for HeaderChainAdapter {
         k: u32,
         header_id: Option<[u8; 32]>,
     ) -> Result<Vec<u8>, String> {
-        let block_id = header_id.map(|id| {
-            ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(id))
-        });
+        let block_id =
+            header_id.map(|id| ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(id)));
         self.with_chain(|c| {
-            enr_chain::build_nipopow_proof(c, m, k, block_id)
-                .map_err(|e| e.to_string())
+            enr_chain::build_nipopow_proof(c, m, k, block_id).map_err(|e| e.to_string())
         })
     }
     fn header_ids(&self, offset: u32, limit: u32) -> Vec<[u8; 32]> {
@@ -668,7 +718,9 @@ impl ergo_api::ChainAccess for HeaderChainAdapter {
                     id.copy_from_slice(header.id.0.as_ref());
                     out.push(id);
                 }
-                if h == 0 { break; }
+                if h == 0 {
+                    break;
+                }
                 h -= 1;
             }
             out
@@ -676,9 +728,7 @@ impl ergo_api::ChainAccess for HeaderChainAdapter {
     }
     fn popow_header_by_id(&self, id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
         let block_id = ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(*id));
-        self.with_chain(|c| {
-            enr_chain::popow_header_by_id(c, &block_id).map_err(|e| e.to_string())
-        })
+        self.with_chain(|c| enr_chain::popow_header_by_id(c, &block_id).map_err(|e| e.to_string()))
     }
 }
 
@@ -772,9 +822,27 @@ impl ergo_api::BlockSubmitter for MinedBlockSubmitter {
         // Pre-store all sections in the modifier store so the sync task can
         // find them when the chain advances.
         let entries = vec![
-            (enr_chain::BLOCK_TRANSACTIONS_TYPE_ID, block_txs_id, header.height, block_txs_bytes, None),
-            (enr_chain::AD_PROOFS_TYPE_ID, ad_proofs_id, header.height, ad_proofs_bytes, None),
-            (enr_chain::EXTENSION_TYPE_ID, extension_id, header.height, extension_bytes, None),
+            (
+                enr_chain::BLOCK_TRANSACTIONS_TYPE_ID,
+                block_txs_id,
+                header.height,
+                block_txs_bytes,
+                None,
+            ),
+            (
+                enr_chain::AD_PROOFS_TYPE_ID,
+                ad_proofs_id,
+                header.height,
+                ad_proofs_bytes,
+                None,
+            ),
+            (
+                enr_chain::EXTENSION_TYPE_ID,
+                extension_id,
+                header.height,
+                extension_bytes,
+                None,
+            ),
         ];
         self.store
             .put_batch(&entries)
@@ -817,9 +885,15 @@ struct MiningConfig {
     candidate_ttl_secs: u64,
 }
 
-fn default_votes() -> String { "000000".to_string() }
-fn default_reward_delay() -> i32 { 720 }
-fn default_candidate_ttl() -> u64 { 15 }
+fn default_votes() -> String {
+    "000000".to_string()
+}
+fn default_reward_delay() -> i32 {
+    720
+}
+fn default_candidate_ttl() -> u64 {
+    15
+}
 
 /// Node-level config parsed from the `[node]` section of ergo.toml.
 #[derive(Debug, Deserialize)]
@@ -920,7 +994,6 @@ struct NodeConfig {
     // and reopens the AVL state DB once with the synced_cache_mb value.
     // Default: each mirror equals its cold-sync parent (= no-op until
     // configured), so existing configs keep their current behavior.
-
     /// redb cache size (MB) used at tip. Smaller = lower steady-state RSS;
     /// the tradeoff is more disk reads when cold-restarting at tip (cache
     /// has to re-warm from the working set).
@@ -1268,8 +1341,12 @@ fn derive_memory_plan(
         flush_heap_threshold_mb: cfg.flush_heap_threshold_mb.unwrap_or(derived_flush_mb),
         // Not derived: block counts bound crash-recovery work, and nothing
         // measured relates a block count to a memory budget.
-        flush_max_blocks: cfg.flush_max_blocks.unwrap_or_else(default_flush_max_blocks),
-        flush_min_blocks: cfg.flush_min_blocks.unwrap_or_else(default_flush_min_blocks),
+        flush_max_blocks: cfg
+            .flush_max_blocks
+            .unwrap_or_else(default_flush_max_blocks),
+        flush_min_blocks: cfg
+            .flush_min_blocks
+            .unwrap_or_else(default_flush_min_blocks),
         synced_cache_mb: Some(
             cfg.synced_cache_mb
                 .unwrap_or(((cache_mb as f64 * SYNCED_RATIO) as u64).max(32)),
@@ -1486,7 +1563,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.iter().any(|a| a == "--reset-scores-migration") {
         let config_path = locate_config(&args).ok_or_else(|| -> Box<dyn std::error::Error> {
             "no config found (pass an explicit path, or place one at ./ergo.toml, \
-             ~/.config/ergo-node/ergo.toml, or /etc/ergo-node/ergo.toml)".into()
+             ~/.config/ergo-node/ergo.toml, or /etc/ergo-node/ergo.toml)"
+                .into()
         })?;
         let config_content = std::fs::read_to_string(&config_path)?;
         let root_config: RootConfig = toml::from_str(&config_content)?;
@@ -1497,7 +1575,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             RedbModifierStore::new(&data_dir.join("modifiers.redb"), MAINTENANCE_CACHE_BYTES)?;
         store.chain_meta_delete(b"scores_migrated_v1")?;
         store.flush()?;
-        tracing::info!("scores-migration sentinel cleared; next normal start will re-run the migration");
+        tracing::info!(
+            "scores-migration sentinel cleared; next normal start will re-run the migration"
+        );
         return Ok(());
     }
 
@@ -1511,7 +1591,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.iter().any(|a| a == "--compact-state") {
         let config_path = locate_config(&args).ok_or_else(|| -> Box<dyn std::error::Error> {
             "no config found (pass an explicit path, or place one at ./ergo.toml, \
-             ~/.config/ergo-node/ergo.toml, or /etc/ergo-node/ergo.toml)".into()
+             ~/.config/ergo-node/ergo.toml, or /etc/ergo-node/ergo.toml)"
+                .into()
         })?;
         let config_content = std::fs::read_to_string(&config_path)?;
         let root_config: RootConfig = toml::from_str(&config_content)?;
@@ -1638,14 +1719,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let capture_tap = capture_handle.as_ref().map(|h| h.tap());
-    let capture_access: Option<Arc<dyn enr_p2p::capture::CaptureAccess>> =
-        capture_handle.as_ref().map(|h| h.clone() as Arc<dyn enr_p2p::capture::CaptureAccess>);
+    let capture_access: Option<Arc<dyn enr_p2p::capture::CaptureAccess>> = capture_handle
+        .as_ref()
+        .map(|h| h.clone() as Arc<dyn enr_p2p::capture::CaptureAccess>);
     let state_type = match node_config.state_type.as_str() {
         "utxo" => StateType::Utxo,
         "digest" => StateType::Digest,
         "light" => StateType::Light,
         other => {
-            return Err(format!("unknown state_type '{}' (expected 'utxo', 'digest', or 'light')", other).into());
+            return Err(format!(
+                "unknown state_type '{}' (expected 'utxo', 'digest', or 'light')",
+                other
+            )
+            .into());
         }
     };
     let verify_transactions = node_config.verify_transactions;
@@ -1680,10 +1766,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if node_config.mining.votes.is_empty() || node_config.mining.votes == "000000" {
             [0, 0, 0]
         } else {
-            let v = hex::decode(&node_config.mining.votes)
-                .map_err(|e| format!("invalid mining votes hex '{}': {e}", node_config.mining.votes))?;
+            let v = hex::decode(&node_config.mining.votes).map_err(|e| {
+                format!(
+                    "invalid mining votes hex '{}': {e}",
+                    node_config.mining.votes
+                )
+            })?;
             if v.len() != 3 {
-                return Err(format!("mining votes must be exactly 3 bytes, got {}", v.len()).into());
+                return Err(
+                    format!("mining votes must be exactly 3 bytes, got {}", v.len()).into(),
+                );
             }
             [v[0], v[1], v[2]]
         }
@@ -1731,21 +1823,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let entries = store.best_chain_entries()?;
         let total = entries.len();
         if total > 0 {
-            tracing::info!(
-                total,
-                "scores migration: starting (one-time backfill)"
-            );
+            tracing::info!(total, "scores migration: starting (one-time backfill)");
             const CHUNK_SIZE: usize = 50_000;
             let mut prev_score = enr_chain::BigUint::default();
             let mut batch: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(CHUNK_SIZE);
             for (i, (height, header_id)) in entries.iter().enumerate() {
-                let data = store
-                    .get(HEADER_TYPE_ID, header_id)?
-                    .ok_or_else(|| format!(
+                let data = store.get(HEADER_TYPE_ID, header_id)?.ok_or_else(|| {
+                    format!(
                         "scores migration: header at h={} missing from PRIMARY (id={})",
                         height,
                         hex::encode(header_id),
-                    ))?;
+                    )
+                })?;
                 let header = enr_chain::parse_header(&data)
                     .map_err(|e| format!("scores migration: parse_header at h={}: {e}", height))?;
                 let difficulty = enr_chain::decode_compact_bits(header.n_bits)
@@ -1770,7 +1859,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::info!(done, total, "scores migration: progress");
                 }
             }
-            tracing::info!(headers = total, "scores migration: complete, persisting sentinel");
+            tracing::info!(
+                headers = total,
+                "scores migration: complete, persisting sentinel"
+            );
             store.flush()?;
         }
         store.chain_meta_put(b"scores_migrated_v1", &[1u8])?;
@@ -1794,7 +1886,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(*id_bytes))
     });
     let restore_entries = best_chain_entries.into_iter().map(|(h, id_bytes)| {
-        (h, ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(id_bytes)))
+        (
+            h,
+            ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(id_bytes)),
+        )
     });
     let mut chain = HeaderChain::restore(chain_config, restore_entries)
         .map_err(|e| format!("header chain restore failed: {e:?}"))?;
@@ -1804,10 +1899,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tip = %tip,
             "header chain restored",
         ),
-        None => tracing::info!(
-            headers = 0u64,
-            "header chain restored",
-        ),
+        None => tracing::info!(headers = 0u64, "header chain restored",),
     }
 
     // Phase 2: the header index is real now, so re-derive everything that has
@@ -1921,9 +2013,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             match store_for_score_loader.header_score(&header_id) {
-                Ok(Some(bytes)) if !bytes.is_empty() => Some(enr_chain::BigUint::from_bytes_be(&bytes)),
+                Ok(Some(bytes)) if !bytes.is_empty() => {
+                    Some(enr_chain::BigUint::from_bytes_be(&bytes))
+                }
                 Ok(_) => {
-                    tracing::warn!(height, "score_loader: empty or missing score (post-migration store bug?)");
+                    tracing::warn!(
+                        height,
+                        "score_loader: empty or missing score (post-migration store bug?)"
+                    );
                     None
                 }
                 Err(e) => {
@@ -1954,10 +2051,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         const LINKAGE_CHECK_DEPTH: u32 = 4096;
         match chain.verify_best_chain_linkage(Some(LINKAGE_CHECK_DEPTH)) {
             Ok(()) => {
-                tracing::info!(
-                    depth = LINKAGE_CHECK_DEPTH,
-                    "best-chain linkage verified"
-                );
+                tracing::info!(depth = LINKAGE_CHECK_DEPTH, "best-chain linkage verified");
             }
             Err(e) => {
                 tracing::error!(
@@ -2004,14 +2098,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             StateType::Digest | StateType::Light => 1,
         },
         verifying: verify_transactions && state_type != StateType::Light,
-        blocks_to_keep: if state_type == StateType::Light { 0 } else { blocks_to_keep as i32 },
+        blocks_to_keep: if state_type == StateType::Light {
+            0
+        } else {
+            blocks_to_keep as i32
+        },
     };
 
     // Start P2P with modifier sink (no validator)
     let peer_storage = Box::new(PeerStorageAdapter::new(store.clone()));
     // capture_tap from [debug.p2p_capture] in ergo.toml — None when the
     // section is absent or `enabled = false`. See facts/p2p-capture.md.
-    let p2p = Arc::new(enr_p2p::node::P2pNode::start(config, Some(modifier_tx), mode_config, peer_storage, capture_tap).await?);
+    let p2p = Arc::new(
+        enr_p2p::node::P2pNode::start(
+            config,
+            Some(modifier_tx),
+            mode_config,
+            peer_storage,
+            capture_tap,
+        )
+        .await?,
+    );
 
     // Register message codes consumed by the main crate's event stream so
     // the router doesn't blindly forward them to all peers.
@@ -2024,9 +2131,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Store-blind router, store-aware closure. redb reads are sync + cheap.
     {
         let serve_store = store.clone();
-        p2p.set_local_serve(std::sync::Arc::new(move |modifier_type: u8, id: &[u8; 32]| {
-            serve_store.get(modifier_type, id).ok().flatten()
-        }))
+        p2p.set_local_serve(std::sync::Arc::new(
+            move |modifier_type: u8, id: &[u8; 32]| {
+                serve_store.get(modifier_type, id).ok().flatten()
+            },
+        ))
         .await;
     }
 
@@ -2049,8 +2158,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pipeline_store = store.clone();
     tokio::spawn(async move {
-        let mut pipeline =
-            ValidationPipeline::new(modifier_rx, pipeline_chain, pipeline_store, progress_tx, delivery_control_tx, delivery_data_tx);
+        let mut pipeline = ValidationPipeline::new(
+            modifier_rx,
+            pipeline_chain,
+            pipeline_store,
+            progress_tx,
+            delivery_control_tx,
+            delivery_data_tx,
+        );
         pipeline.set_tx_sender(tx_tx);
         pipeline.run().await;
     });
@@ -2073,9 +2188,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Snapshot store: open if serving is enabled
     let snapshot_store = if node_config.storing_snapshots > 0 {
-        let store = ergo_node_rust::snapshot_store::SnapshotStore::open(
-            &data_dir.join("snapshots.redb"),
-        )?;
+        let store =
+            ergo_node_rust::snapshot_store::SnapshotStore::open(&data_dir.join("snapshots.redb"))?;
         Some(std::sync::Arc::new(store))
     } else {
         None
@@ -2094,7 +2208,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Some(event) = events.recv().await {
                 let handled = if let enr_p2p::protocol::peer::ProtocolEvent::Message {
                     peer_id,
-                    message: enr_p2p::protocol::messages::ProtocolMessage::Unknown { code, ref body },
+                    message:
+                        enr_p2p::protocol::messages::ProtocolMessage::Unknown { code, ref body },
                 } = event
                 {
                     // Snapshot serving (codes 76, 78, 80)
@@ -2150,10 +2265,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     false
                 };
 
-                if !handled
-                    && sync_events_tx.send(event).await.is_err() {
-                        break;
-                    }
+                if !handled && sync_events_tx.send(event).await.is_err() {
+                    break;
+                }
             }
         });
     }
@@ -2168,8 +2282,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         enr_p2p::types::Network::Mainnet => MAINNET_GENESIS_DIGEST,
     };
     let genesis_bytes = hex::decode(genesis_digest_hex).expect("invalid genesis digest hex");
-    let genesis_digest = ADDigest::try_from(genesis_bytes.as_slice())
-        .expect("invalid genesis digest length");
+    let genesis_digest =
+        ADDigest::try_from(genesis_bytes.as_slice()).expect("invalid genesis digest length");
 
     // Candidate generator — constructed before the validator so the
     // post-apply lifecycle hook (CandidateGenerator::on_block_applied) can
@@ -2226,7 +2340,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut validator: Option<Validator> = match state_type {
         StateType::Utxo => {
             let state_path = data_dir.join("state.redb");
-            let params = AVLTreeParams { key_length: 32, value_length: None };
+            let params = AVLTreeParams {
+                key_length: 32,
+                value_length: None,
+            };
             let keep_versions = 256u32;
             tracing::info!(
                 path = %state_path.display(),
@@ -2235,8 +2352,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cache_bytes = state_cache_bytes,
                 "opening UTXO state storage"
             );
-            let mut storage = RedbAVLStorage::open(&state_path, params, keep_versions, CacheSize::Bytes(state_cache_bytes))
-                .expect("failed to open UTXO state storage");
+            let mut storage = RedbAVLStorage::open(
+                &state_path,
+                params,
+                keep_versions,
+                CacheSize::Bytes(state_cache_bytes),
+            )
+            .expect("failed to open UTXO state storage");
 
             // `revalidate` in UTXO mode: the state tree cannot be rolled back
             // to genesis in place (the undo log holds keep_versions, not the
@@ -2254,7 +2376,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .expect("revalidate: failed to remove UTXO state file");
                 storage = RedbAVLStorage::open(
                     &state_path,
-                    AVLTreeParams { key_length: 32, value_length: None },
+                    AVLTreeParams {
+                        key_length: 32,
+                        value_length: None,
+                    },
                     keep_versions,
                     CacheSize::Bytes(state_cache_bytes),
                 )
@@ -2288,7 +2413,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 prover.restore_root(root, tree_height);
 
                 let prover_digest = prover.digest().expect("prover has no root");
-                let prover_digest_arr: [u8; 33] = prover_digest.as_ref().try_into()
+                let prover_digest_arr: [u8; 33] = prover_digest
+                    .as_ref()
+                    .try_into()
                     .expect("prover digest should be 33 bytes");
                 let chain_height = chain_guard.height();
                 let stored_height = storage.block_height();
@@ -2394,10 +2521,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut prover = BatchAVLProver::new(tree, true);
 
                 for (box_id, box_bytes) in build_genesis_boxes(network) {
-                    prover.perform_one_operation(&Operation::Insert(KeyValue {
-                        key: Bytes::copy_from_slice(&box_id),
-                        value: Bytes::copy_from_slice(&box_bytes),
-                    })).expect("genesis box insert failed");
+                    prover
+                        .perform_one_operation(&Operation::Insert(KeyValue {
+                            key: Bytes::copy_from_slice(&box_id),
+                            value: Bytes::copy_from_slice(&box_bytes),
+                        }))
+                        .expect("genesis box insert failed");
                 }
 
                 // First update commits genesis state with block_height=0
@@ -2421,11 +2550,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let actual = prover.digest().expect("prover has no root after genesis");
                 let expected: [u8; 33] = genesis_digest.into();
                 assert_eq!(
-                    actual.as_ref(), &expected[..],
+                    actual.as_ref(),
+                    &expected[..],
                     "genesis UTXO state digest mismatch"
                 );
 
-                tracing::info!(checkpoint, "block validator starting from genesis (UTXO mode)");
+                tracing::info!(
+                    checkpoint,
+                    "block validator starting from genesis (UTXO mode)"
+                );
 
                 // Genesis resync — recompute(0) is a no-op per the chain
                 // contract; active_parameters stays at construction defaults
@@ -2445,8 +2578,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // genesis replay; writes adproofs-<H>.104 (raw type-104 section)
                         // into data_dir at each listed height. Empty/unset = no-op.
                         if let Ok(spec) = std::env::var("ENR_DUMP_ADPROOFS_AT") {
-                            let heights: std::collections::HashSet<u32> =
-                                spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                            let heights: std::collections::HashSet<u32> = spec
+                                .split(',')
+                                .filter_map(|s| s.trim().parse().ok())
+                                .collect();
                             if !heights.is_empty() {
                                 tracing::warn!(
                                     ?heights, dir = %data_dir.display(),
@@ -2471,10 +2606,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let tip = chain_guard.tip();
                 let height = chain_guard.height();
                 let digest = tip.state_root;
-                let checkpoint =
-                    resolve_checkpoint(configured_checkpoint.unwrap_or_else(|| {
-                        height.saturating_sub(100)
-                    }));
+                let checkpoint = resolve_checkpoint(
+                    configured_checkpoint.unwrap_or_else(|| height.saturating_sub(100)),
+                );
                 tracing::info!(
                     height,
                     checkpoint,
@@ -2508,7 +2642,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if start_from == 0 {
-                    tracing::warn!("revalidate: no complete blocks found in store, starting from genesis");
+                    tracing::warn!(
+                        "revalidate: no complete blocks found in store, starting from genesis"
+                    );
                     DigestValidator::new(genesis_digest, checkpoint)
                 } else {
                     let prev_height = start_from - 1;
@@ -2526,12 +2662,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Revalidation resets the effective validated
                     // height to prev_height — publish it so the
                     // atomic doesn't lie about the node's state.
-                    shared_validated_height.store(prev_height, std::sync::atomic::Ordering::Relaxed);
+                    shared_validated_height
+                        .store(prev_height, std::sync::atomic::Ordering::Relaxed);
                     DigestValidator::from_state(digest, prev_height, checkpoint)
                 }
             } else {
                 let checkpoint = resolve_checkpoint(configured_checkpoint.unwrap_or(0));
-                tracing::info!(checkpoint, "block validator starting from genesis (digest mode)");
+                tracing::info!(
+                    checkpoint,
+                    "block validator starting from genesis (digest mode)"
+                );
                 DigestValidator::new(genesis_digest, checkpoint)
             };
             Some(Validator::new(
@@ -2606,7 +2746,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Mirror the handshake's Light-mode override (line above) — in Light
         // there are no bodies to prune anyway, so 0 keeps sync/pruning + the
         // wire advertisement consistent.
-        blocks_to_keep: if state_type == StateType::Light { 0 } else { blocks_to_keep as i32 },
+        blocks_to_keep: if state_type == StateType::Light {
+            0
+        } else {
+            blocks_to_keep as i32
+        },
 
         // Pacing constants: deliberately not operator-tunable, not derived from
         // config, and not consensus-, memory-, or durability-relevant.
@@ -2633,13 +2777,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Snapshot bootstrap channels — only created when needed
-    let (snapshot_tx, snapshot_rx, validator_tx_send, validator_rx) = if validator.is_none() && utxo_bootstrap {
-        let (stx, srx) = tokio::sync::oneshot::channel::<ergo_sync::snapshot::SnapshotData>();
-        let (vtx, vrx) = tokio::sync::oneshot::channel::<Validator>();
-        (Some(stx), Some(srx), Some(vtx), Some(vrx))
-    } else {
-        (None, None, None, None)
-    };
+    let (snapshot_tx, snapshot_rx, validator_tx_send, validator_rx) =
+        if validator.is_none() && utxo_bootstrap {
+            let (stx, srx) = tokio::sync::oneshot::channel::<ergo_sync::snapshot::SnapshotData>();
+            let (vtx, vrx) = tokio::sync::oneshot::channel::<Validator>();
+            (Some(stx), Some(srx), Some(vtx), Some(vrx))
+        } else {
+            (None, None, None, None)
+        };
 
     // Cross-DB durability handshake — startup reconciliation.
     // Detect drift between state.redb's META_BLOCK_HEIGHT (canonical) and
@@ -2731,10 +2876,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // clones of the P2P node. See facts/sync.md "Graceful shutdown".
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let mut sync = HeaderSync::new(
-        sync_config, transport, sync_chain, sync_store, validator,
-        progress_rx, delivery_control_rx, delivery_data_rx,
-        snapshot_tx, validator_rx, sync_shared_downloaded_height,
-        sync_block_request_gate, sync_peer_chain_tip,
+        sync_config,
+        transport,
+        sync_chain,
+        sync_store,
+        validator,
+        progress_rx,
+        delivery_control_rx,
+        delivery_data_rx,
+        snapshot_tx,
+        validator_rx,
+        sync_shared_downloaded_height,
+        sync_block_request_gate,
+        sync_peer_chain_tip,
         shutdown_rx,
     );
 
@@ -2791,9 +2945,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "loading snapshot into state"
                     );
 
-                    let params = AVLTreeParams { key_length: 32, value_length: None };
-                    let mut storage = RedbAVLStorage::open(&state_path, params, 256, CacheSize::Bytes(state_cache_bytes))
-                        .expect("failed to open state storage for snapshot");
+                    let params = AVLTreeParams {
+                        key_length: 32,
+                        value_length: None,
+                    };
+                    let mut storage = RedbAVLStorage::open(
+                        &state_path,
+                        params,
+                        256,
+                        CacheSize::Bytes(state_cache_bytes),
+                    )
+                    .expect("failed to open state storage for snapshot");
 
                     let root_hash = snapshot_data.root_hash;
                     let tree_height = snapshot_data.tree_height as usize;
@@ -2805,11 +2967,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     version_bytes.push(snapshot_data.tree_height);
                     let version = Bytes::from(version_bytes);
 
-                    let nodes_iter = snapshot_data.nodes.into_iter().map(|(label, packed)| {
-                        (label, Bytes::from(packed))
-                    });
+                    let nodes_iter = snapshot_data
+                        .nodes
+                        .into_iter()
+                        .map(|(label, packed)| (label, Bytes::from(packed)));
 
-                    storage.load_snapshot(nodes_iter, root_hash, tree_height, version.clone(), height)
+                    storage
+                        .load_snapshot(nodes_iter, root_hash, tree_height, version.clone(), height)
                         .expect("failed to load snapshot into state");
 
                     tracing::info!("snapshot loaded, creating validator");
@@ -2822,7 +2986,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Mirrors the resume branch in the UTXO validator block.
                     {
                         let mut chain_guard = snapshot_chain.lock().await;
-                        if let Err(e) = chain_guard.recompute_active_parameters_from_storage(height) {
+                        if let Err(e) = chain_guard.recompute_active_parameters_from_storage(height)
+                        {
                             tracing::warn!(
                                 error = %e,
                                 resume_height = height,
@@ -2851,7 +3016,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     prover.restore_root(root, tree_h);
 
                     let validator = Validator::new(
-                        ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint)),
+                        ValidatorInner::Utxo(UtxoValidator::new(
+                            storage, prover, height, checkpoint,
+                        )),
                         shared_validated_height.clone(),
                         shared_state_context.clone(),
                         block_applied_tx.clone(),
@@ -2964,7 +3131,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             });
-            tracing::info!(snapshot_interval, storing_snapshots, "snapshot creation trigger active");
+            tracing::info!(
+                snapshot_interval,
+                storing_snapshots,
+                "snapshot creation trigger active"
+            );
         }
     }
 
@@ -3144,7 +3315,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // REST API server
     {
-        let api_bind_addr: std::net::SocketAddr = node_config.api_address
+        let api_bind_addr: std::net::SocketAddr = node_config
+            .api_address
             .as_deref()
             .unwrap_or(match network {
                 enr_p2p::types::Network::Testnet => "0.0.0.0:9052",
@@ -3264,11 +3436,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // The parent extension lookup mirrors the chain extension loader:
                     // header → section_ids[2] → extension bytes → mining helper.
                     let parent_interlinks = {
-                        let parent_extension_id =
-                            enr_chain::section_ids(&proof_data.parent)[2].1;
-                        match mining_store
-                            .get(enr_chain::EXTENSION_TYPE_ID, &parent_extension_id)
-                        {
+                        let parent_extension_id = enr_chain::section_ids(&proof_data.parent)[2].1;
+                        match mining_store.get(enr_chain::EXTENSION_TYPE_ID, &parent_extension_id) {
                             Ok(Some(ext_bytes)) => {
                                 ergo_mining::extension::unpack_parent_interlinks(&ext_bytes)
                             }
@@ -3400,8 +3569,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             state_context: api_state_ctx,
             peer_count: Arc::new(move || {
                 let count = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(p2p_for_api.peer_count())
+                    tokio::runtime::Handle::current().block_on(p2p_for_api.peer_count())
                 });
                 ergo_api::PeerCounts { connected: count }
             }),
@@ -3419,8 +3587,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_peer_height: peer_chain_tip.clone(),
             peer_api_urls: Arc::new(move || {
                 tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(p2p_for_api_urls.peer_rest_urls())
+                    tokio::runtime::Handle::current().block_on(p2p_for_api_urls.peer_rest_urls())
                 })
                 .into_iter()
                 .map(|(peer_id, addr, rest_url)| ergo_api::PeerRestInfo {
@@ -3432,8 +3599,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
             peer_all: Arc::new(move || {
                 tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(p2p_for_all.all_peers())
+                    tokio::runtime::Handle::current().block_on(p2p_for_all.all_peers())
                 })
                 .into_iter()
                 .map(|entry| ergo_api::PeerInfo {
@@ -3449,8 +3615,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
             peer_status: Arc::new(move || {
                 let status = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(p2p_for_status.network_status())
+                    tokio::runtime::Handle::current().block_on(p2p_for_status.network_status())
                 });
                 ergo_api::PeerStatusSummary {
                     last_incoming_message: status.last_incoming_message_ms,
@@ -3469,16 +3634,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .block_on(p2p_for_connect.queue_outbound_connection(addr))
                 })
             }),
-            snapshots_info: Arc::new(move || {
-                match &snapshot_store_for_api {
-                    Some(store) => store
-                        .snapshots_info()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|(height, digest)| ergo_api::SnapshotInfoEntry { height, digest })
-                        .collect(),
-                    None => Vec::new(),
-                }
+            snapshots_info: Arc::new(move || match &snapshot_store_for_api {
+                Some(store) => store
+                    .snapshots_info()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(height, digest)| ergo_api::SnapshotInfoEntry { height, digest })
+                    .collect(),
+                None => Vec::new(),
             }),
             api_key_hash: None,
             modifier_tx: Some(modifier_tx_for_mining.clone()),
@@ -3489,11 +3652,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(Arc::new(|| {
                         let _ = tikv_jemalloc_ctl::epoch::advance();
                         ergo_api::JemallocSnapshot {
-                            allocated: tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0) as u64,
+                            allocated: tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0)
+                                as u64,
                             active: tikv_jemalloc_ctl::stats::active::read().unwrap_or(0) as u64,
-                            resident: tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0) as u64,
-                            retained: tikv_jemalloc_ctl::stats::retained::read().unwrap_or(0) as u64,
-                            metadata: tikv_jemalloc_ctl::stats::metadata::read().unwrap_or(0) as u64,
+                            resident: tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0)
+                                as u64,
+                            retained: tikv_jemalloc_ctl::stats::retained::read().unwrap_or(0)
+                                as u64,
+                            metadata: tikv_jemalloc_ctl::stats::metadata::read().unwrap_or(0)
+                                as u64,
                         }
                     }))
                 }
@@ -3532,13 +3699,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
 
         tokio::spawn(async move {
-            if let Err(e) = ergo_api::serve(
-                api_state,
-                api_bind_addr,
-                api_stats_config,
-                api_p2p_counters,
-            )
-            .await
+            if let Err(e) =
+                ergo_api::serve(api_state, api_bind_addr, api_stats_config, api_p2p_counters).await
             {
                 tracing::error!("REST API server failed: {e}");
             }
@@ -3551,9 +3713,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let fastsync_enabled = node_config.fastsync;
         let fastsync_peer = node_config.fastsync_peer.clone();
         let fastsync_threshold = node_config.fastsync_threshold_blocks;
-        let fastsync_peer_wait = std::time::Duration::from_secs(
-            node_config.fastsync_peer_wait_timeout_sec,
-        );
+        let fastsync_peer_wait =
+            std::time::Duration::from_secs(node_config.fastsync_peer_wait_timeout_sec);
         let api_port = api_bind_addr.port();
         let bootstrap_gate = block_request_gate.clone();
         let bootstrap_peer_tip = peer_chain_tip.clone();
@@ -3603,7 +3764,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if gap <= fastsync_threshold {
                 tracing::info!(
-                    peer_tip, downloaded, gap, threshold = fastsync_threshold,
+                    peer_tip,
+                    downloaded,
+                    gap,
+                    threshold = fastsync_threshold,
                     "gap at/below fastsync threshold — going straight to P2P"
                 );
                 bootstrap_gate.store(true, Ordering::Relaxed);
@@ -3611,13 +3775,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             tracing::info!(
-                peer_tip, downloaded, gap, threshold = fastsync_threshold,
+                peer_tip,
+                downloaded,
+                gap,
+                threshold = fastsync_threshold,
                 "gap exceeds fastsync threshold — spawning fastsync"
             );
             let node_url = format!("http://127.0.0.1:{api_port}");
             let mut cmd = tokio::process::Command::new("ergo-fastsync");
             cmd.arg("--node-url").arg(&node_url);
-            cmd.arg("--handoff-distance").arg(fastsync_threshold.to_string());
+            cmd.arg("--handoff-distance")
+                .arg(fastsync_threshold.to_string());
             if let Some(ref peer) = fastsync_peer {
                 cmd.arg("--peer-url").arg(peer);
             }
@@ -3727,7 +3895,10 @@ mod tests {
                 cache_store_pct: Some(pct),
                 ..NodeConfig::default()
             };
-            assert!(validate_cache_split(&cfg).is_ok(), "pct {pct} should be accepted");
+            assert!(
+                validate_cache_split(&cfg).is_ok(),
+                "pct {pct} should be accepted"
+            );
         }
     }
 
@@ -3771,7 +3942,10 @@ mod tests {
         );
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let params = AVLTreeParams { key_length: 32, value_length: None };
+        let params = AVLTreeParams {
+            key_length: 32,
+            value_length: None,
+        };
         let mut storage = RedbAVLStorage::open(
             &dir.path().join("state.redb"),
             params,
@@ -3782,15 +3956,15 @@ mod tests {
 
         // Establish a version so UtxoValidator::new's precondition holds —
         // the empty first commit documented on that constructor.
-        let mut prover = BatchAVLProver::new(
-            AVLTree::with_resolver(storage.resolver(), 32, None),
-            true,
-        );
+        let mut prover =
+            BatchAVLProver::new(AVLTree::with_resolver(storage.resolver(), 32, None), true);
         storage
             .update_with_height(&mut prover, vec![], 0)
             .expect("empty first commit");
 
-        let utxo = wrap(ValidatorInner::Utxo(UtxoValidator::new(storage, prover, 0, 0)));
+        let utxo = wrap(ValidatorInner::Utxo(UtxoValidator::new(
+            storage, prover, 0, 0,
+        )));
         assert!(
             utxo.state_persistence().is_some(),
             "UTXO mode owns state.redb — handing out None here silently stops \
@@ -3815,7 +3989,10 @@ mod tests {
         let b = budget(4096);
 
         let derived = derive_memory_plan(&NodeConfig::default(), &b, 0);
-        assert!(derived.cache_mb > 0, "absent cache_mb must derive a real size");
+        assert!(
+            derived.cache_mb > 0,
+            "absent cache_mb must derive a real size"
+        );
         assert!(derived.derived_any);
 
         let stated = NodeConfig {
@@ -3939,12 +4116,7 @@ mod tests {
             "5527430474b673e4aafb08e0079c639de23e6a17e87edd00f78662b43c88aeda",
         ];
         for (i, (id, _)) in boxes.iter().enumerate() {
-            assert_eq!(
-                hex::encode(id),
-                expected_ids[i],
-                "box {} ID mismatch",
-                i
-            );
+            assert_eq!(hex::encode(id), expected_ids[i], "box {} ID mismatch", i);
         }
 
         // Insert into AVL+ tree and verify genesis state digest
@@ -3985,12 +4157,7 @@ mod tests {
             "5527430474b673e4aafb08e0079c639de23e6a17e87edd00f78662b43c88aeda",
         ];
         for (i, (id, _)) in boxes.iter().enumerate() {
-            assert_eq!(
-                hex::encode(id),
-                expected_ids[i],
-                "box {} ID mismatch",
-                i
-            );
+            assert_eq!(hex::encode(id), expected_ids[i], "box {} ID mismatch", i);
         }
 
         // Insert into AVL+ tree and verify genesis state digest

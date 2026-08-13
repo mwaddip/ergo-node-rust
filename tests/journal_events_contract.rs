@@ -49,7 +49,10 @@ fn marker_lines() -> Vec<&'static str> {
 }
 
 fn markers() -> Vec<&'static str> {
-    marker_lines().iter().flat_map(|l| quoted_literals(l)).collect()
+    marker_lines()
+        .iter()
+        .flat_map(|l| quoted_literals(l))
+        .collect()
 }
 
 /// Guards every other test in this file against passing vacuously.
@@ -114,7 +117,11 @@ fn markers_are_unique() {
     let markers = markers();
     let mut sorted = markers.clone();
     sorted.sort_unstable();
-    let mut dupes: Vec<_> = sorted.windows(2).filter(|w| w[0] == w[1]).map(|w| w[0]).collect();
+    let mut dupes: Vec<_> = sorted
+        .windows(2)
+        .filter(|w| w[0] == w[1])
+        .map(|w| w[0])
+        .collect();
     dupes.dedup();
 
     assert!(

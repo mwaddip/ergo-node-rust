@@ -35,7 +35,8 @@ fn make_value(seed: u8, len: usize) -> Bytes {
 fn setup(keep_versions: u32) -> (RedbAVLStorage, BatchAVLProver, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("state.redb");
-    let mut storage = RedbAVLStorage::open(&path, params(), keep_versions, CacheSize::default()).unwrap();
+    let mut storage =
+        RedbAVLStorage::open(&path, params(), keep_versions, CacheSize::default()).unwrap();
 
     let resolver = storage.resolver();
     let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
@@ -408,8 +409,7 @@ fn flush_persists_state_across_reopen() {
 
     let expected_version;
     {
-        let mut storage =
-            RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+        let mut storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
         let resolver = storage.resolver();
         let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
         let mut prover = BatchAVLProver::new(tree, true);
@@ -474,8 +474,7 @@ fn flush_on_empty_storage_succeeds() {
     // Flush on a freshly opened storage with no updates must not error.
     let dir = tempdir().unwrap();
     let path = dir.path().join("state.redb");
-    let storage =
-        RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+    let storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
     assert!(storage.version().is_none());
     storage.flush().unwrap();
 }
@@ -529,8 +528,7 @@ fn parse_dfs_nodes(data: &[u8], key_length: usize) -> Vec<(Digest32, Vec<u8>)> {
             // Leaf: type(1) + key(key_length) + value_len(4) + value + next_key(key_length)
             let vlen_offset = pos + 1 + key_length;
             let value_len =
-                u32::from_be_bytes(data[vlen_offset..vlen_offset + 4].try_into().unwrap())
-                    as usize;
+                u32::from_be_bytes(data[vlen_offset..vlen_offset + 4].try_into().unwrap()) as usize;
             1 + key_length + 4 + value_len + key_length
         };
 
@@ -584,7 +582,10 @@ fn dump_snapshot_round_trip() {
 
     // 5. Verify metadata.
     assert_eq!(snap.root_hash, expected_root, "root hash mismatch");
-    assert_eq!(snap.tree_height, expected_height as u8, "tree height mismatch");
+    assert_eq!(
+        snap.tree_height, expected_height as u8,
+        "tree height mismatch"
+    );
 
     // 6. Verify manifest header.
     assert_eq!(snap.manifest[0], expected_height as u8);
@@ -595,7 +596,10 @@ fn dump_snapshot_round_trip() {
     assert!(!manifest_nodes.is_empty(), "manifest has no nodes");
 
     // First node's label should be the root hash.
-    assert_eq!(manifest_nodes[0].0, expected_root, "first manifest node is not root");
+    assert_eq!(
+        manifest_nodes[0].0, expected_root,
+        "first manifest node is not root"
+    );
 
     // 8. Verify chunks are non-empty.
     assert!(!snap.chunks.is_empty(), "no chunks produced");
@@ -685,9 +689,15 @@ fn cache_size_percent_returns_fraction_of_ram() {
     let half = CacheSize::Percent(0.5);
     let resolved = half.resolve();
     // On any machine running these tests, half of RAM should be >128MB.
-    assert!(resolved > 128 * 1024 * 1024, "half of RAM unexpectedly small: {resolved}");
+    assert!(
+        resolved > 128 * 1024 * 1024,
+        "half of RAM unexpectedly small: {resolved}"
+    );
     // And less than 1TB, just to catch parse failures returning garbage.
-    assert!(resolved < 1024 * 1024 * 1024 * 1024, "half of RAM unexpectedly large: {resolved}");
+    assert!(
+        resolved < 1024 * 1024 * 1024 * 1024,
+        "half of RAM unexpectedly large: {resolved}"
+    );
 }
 
 #[test]
@@ -739,8 +749,7 @@ fn update_persists_block_height() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("state.redb");
     {
-        let mut storage =
-            RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+        let mut storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
         let resolver = storage.resolver();
         let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
         let mut prover = BatchAVLProver::new(tree, true);
@@ -774,8 +783,7 @@ fn update_persists_block_height() {
 fn rollback_restores_block_height() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("state.redb");
-    let mut storage =
-        RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+    let mut storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
     let resolver = storage.resolver();
     let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
     let mut prover = BatchAVLProver::new(tree, true);
@@ -787,7 +795,9 @@ fn rollback_restores_block_height() {
             value: make_value(1, 64),
         }))
         .unwrap();
-    storage.update_with_height(&mut prover, vec![], 100).unwrap();
+    storage
+        .update_with_height(&mut prover, vec![], 100)
+        .unwrap();
     let digest_at_100 = storage.version().unwrap();
 
     // Update at height 101.
@@ -800,7 +810,9 @@ fn rollback_restores_block_height() {
             value: make_value(2, 64),
         }))
         .unwrap();
-    storage.update_with_height(&mut prover, vec![], 101).unwrap();
+    storage
+        .update_with_height(&mut prover, vec![], 101)
+        .unwrap();
 
     // Update at height 102.
     prover.base.tree.reset();
@@ -812,7 +824,9 @@ fn rollback_restores_block_height() {
             value: make_value(3, 64),
         }))
         .unwrap();
-    storage.update_with_height(&mut prover, vec![], 102).unwrap();
+    storage
+        .update_with_height(&mut prover, vec![], 102)
+        .unwrap();
 
     assert_eq!(storage.block_height(), Some(102));
 
@@ -829,8 +843,7 @@ fn load_snapshot_sets_block_height() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("state.redb");
     {
-        let mut storage =
-            RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+        let mut storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
 
         let resolver = storage.resolver();
         let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
@@ -880,8 +893,7 @@ fn crash_simulation_preserves_pre_update_block_height() {
     // 1. Commit block_height = 42 via the normal update path.
     let committed_version;
     {
-        let mut storage =
-            RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+        let mut storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
         let resolver = storage.resolver();
         let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
         let mut prover = BatchAVLProver::new(tree, true);
@@ -923,8 +935,7 @@ fn block_height_is_none_on_empty_storage() {
     // Invariant: block_height() returns None iff version() is None.
     let dir = tempdir().unwrap();
     let path = dir.path().join("state.redb");
-    let storage =
-        RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+    let storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
     assert!(storage.version().is_none());
     assert!(storage.block_height().is_none());
 }
@@ -968,7 +979,9 @@ fn churn_round(path: &Path, keys: u8, round: u8, value_len: usize, height: u32) 
             }))
             .unwrap();
     }
-    storage.update_with_height(&mut prover, vec![], height).unwrap();
+    storage
+        .update_with_height(&mut prover, vec![], height)
+        .unwrap();
     storage.flush().unwrap();
 }
 
@@ -1006,12 +1019,7 @@ fn reachable_node_count(path: &Path) -> u64 {
     let nodes = txn.open_table(NODES_DEF).unwrap();
     let meta = txn.open_table(META_DEF).unwrap();
 
-    let root = meta
-        .get("top_node_hash")
-        .unwrap()
-        .unwrap()
-        .value()
-        .to_vec();
+    let root = meta.get("top_node_hash").unwrap().unwrap().value().to_vec();
 
     let mut stack = vec![root];
     let mut count = 0u64;
@@ -1114,7 +1122,10 @@ fn compact_to_reclaims_unreachable_rows() {
     );
 
     assert_eq!(stats.digest, version, "compaction must preserve the digest");
-    assert_eq!(stats.block_height, block_height, "block_height must carry over");
+    assert_eq!(
+        stats.block_height, block_height,
+        "block_height must carry over"
+    );
     assert_eq!(stats.nodes_written, reachable);
     assert_eq!(stats.source_bytes, source_before.len() as u64);
     assert_eq!(
@@ -1122,7 +1133,11 @@ fn compact_to_reclaims_unreachable_rows() {
         reachable,
         "dest must hold exactly the reachable nodes"
     );
-    assert_eq!(undo_row_count(&dest), 0, "dest must have an empty undo table");
+    assert_eq!(
+        undo_row_count(&dest),
+        0,
+        "dest must have an empty undo table"
+    );
     assert!(
         stats.dest_bytes < stats.source_bytes,
         "dest ({}) is not smaller than source ({})",
@@ -1227,7 +1242,8 @@ fn compact_to_fails_when_a_reachable_node_is_missing() {
         write_txn.set_quick_repair(true);
         {
             let mut meta = write_txn.open_table(META_DEF).unwrap();
-            meta.insert("top_node_hash", [0xABu8; 32].as_slice()).unwrap();
+            meta.insert("top_node_hash", [0xABu8; 32].as_slice())
+                .unwrap();
         }
         write_txn.commit().unwrap();
     }
@@ -1290,7 +1306,10 @@ fn compact_to_refuses_an_existing_destination() {
     std::fs::write(&dest, b"not mine").unwrap();
 
     let err = RedbAVLStorage::compact_to(&src, &dest, None).unwrap_err();
-    assert!(err.to_string().contains("already exists"), "unexpected error: {err}");
+    assert!(
+        err.to_string().contains("already exists"),
+        "unexpected error: {err}"
+    );
     // Refusing to overwrite means refusing to delete, too.
     assert_eq!(std::fs::read(&dest).unwrap(), b"not mine");
 }
@@ -1304,7 +1323,10 @@ fn compact_to_rejects_an_empty_source() {
     let dest = dir.path().join("state.redb.compacted");
     let err = RedbAVLStorage::compact_to(&src, &dest, None).unwrap_err();
 
-    assert!(err.to_string().contains("nothing to compact"), "unexpected error: {err}");
+    assert!(
+        err.to_string().contains("nothing to compact"),
+        "unexpected error: {err}"
+    );
     assert!(!dest.exists());
 }
 

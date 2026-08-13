@@ -249,8 +249,15 @@ fn exactly_max_block_cost_is_accepted() {
         (tx_b.clone(), serialized_size(&tx_b)),
     ];
 
-    let (selected, invalid) =
-        select_transactions(&candidates, &[], &ctx, BLOCK_VERSION, 524_288, cost_a + cost_b, &lookup);
+    let (selected, invalid) = select_transactions(
+        &candidates,
+        &[],
+        &ctx,
+        BLOCK_VERSION,
+        524_288,
+        cost_a + cost_b,
+        &lookup,
+    );
     assert_eq!(
         selected_ids(&selected),
         ids(&[tx_a.clone(), tx_b.clone()]),
@@ -328,7 +335,10 @@ fn size_bound_counts_the_section_framing() {
     // A v1 section frames one transaction in 32 header-id bytes plus the
     // one-byte VLQ count. No version field: v1 predates it.
     let framing = block_transactions_overhead(BLOCK_VERSION, 1);
-    assert_eq!(framing, 33, "fixture invariant: v1 framing for one transaction");
+    assert_eq!(
+        framing, 33,
+        "fixture invariant: v1 framing for one transaction"
+    );
 
     // Declared size, not the real one — the caller supplies it and the point
     // here is the arithmetic of the bound.

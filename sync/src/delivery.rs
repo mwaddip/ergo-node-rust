@@ -115,12 +115,15 @@ impl DeliveryTracker {
     pub fn mark_requested(&mut self, ids: &[[u8; 32]], peer: PeerId, type_id: u8) {
         let now = Instant::now();
         for id in ids {
-            self.pending.insert(*id, PendingRequest {
-                peer,
-                type_id,
-                requested_at: now,
-                checks: 0,
-            });
+            self.pending.insert(
+                *id,
+                PendingRequest {
+                    peer,
+                    type_id,
+                    requested_at: now,
+                    checks: 0,
+                },
+            );
         }
     }
 
@@ -171,12 +174,18 @@ impl DeliveryTracker {
 
         let fresh = std::mem::take(&mut self.evicted);
 
-        CheckResult { retries, fresh, abandoned }
+        CheckResult {
+            retries,
+            fresh,
+            abandoned,
+        }
     }
 
     /// Remove all pending requests for a peer. Returns their IDs for re-request.
     pub fn purge_peer(&mut self, peer: PeerId) -> Vec<[u8; 32]> {
-        let orphaned: Vec<[u8; 32]> = self.pending.iter()
+        let orphaned: Vec<[u8; 32]> = self
+            .pending
+            .iter()
             .filter(|(_, req)| req.peer == peer)
             .map(|(id, _)| *id)
             .collect();

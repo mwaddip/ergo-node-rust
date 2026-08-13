@@ -78,7 +78,9 @@ fn verify(
         v.perform_one_operation(op)
             .map_err(|e| format!("verifier replay failed at op {i}: {e}"))?;
     }
-    let got = v.digest().ok_or_else(|| "verifier produced no digest".to_string())?;
+    let got = v
+        .digest()
+        .ok_or_else(|| "verifier produced no digest".to_string())?;
     Ok(got == *expected_post)
 }
 
@@ -125,11 +127,7 @@ fn repro_reset_before_generate_proof() {
     let proof = prover.generate_proof();
 
     let result = verify(&start, &proof, &ops, &post);
-    println!(
-        "REPRO: proof_len={} result={:?}",
-        proof.len(),
-        result
-    );
+    println!("REPRO: proof_len={} result={:?}", proof.len(), result);
     match &result {
         Ok(true) => println!(
             "REPRO VERDICT: proof VERIFIED — apply-time proof is valid; dump task premise HOLDS"

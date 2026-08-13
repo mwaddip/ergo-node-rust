@@ -13,10 +13,10 @@ use ergo_chain_types::{ADDigest, Header};
 
 pub use digest::DigestValidator;
 pub use sections::{
-    ExtensionField, ParsedAdProofs, ParsedBlockTransactions, ParsedExtension, parse_block_transactions,
-    parse_extension, serialize_ad_proofs, serialize_block_transactions, serialize_extension,
+    parse_block_transactions, parse_extension, serialize_ad_proofs, serialize_block_transactions,
+    serialize_extension, ExtensionField, ParsedAdProofs, ParsedBlockTransactions, ParsedExtension,
 };
-pub use state_changes::{StateChanges, compute_state_changes, transactions_to_summaries};
+pub use state_changes::{compute_state_changes, transactions_to_summaries, StateChanges};
 pub use tx_validation::{
     build_state_context, deserialize_box, evaluate_scripts, validate_single_transaction,
 };

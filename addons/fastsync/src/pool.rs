@@ -338,10 +338,7 @@ impl PeerPool {
                     chunks.push_back((from, to));
 
                     if total_empties > max_empties || self.healthy_count() == 0 {
-                        warn!(
-                            height = next_flush,
-                            "all peers behind target — truncating"
-                        );
+                        warn!(height = next_flush, "all peers behind target — truncating");
                         break;
                     }
 
@@ -371,9 +368,10 @@ impl PeerPool {
                         for header in &hdrs {
                             // Autolykos v1 headers (version < 2) — skip PoW
                             if header.version >= 2 {
-                                if !header.check_pow().with_context(|| {
-                                    format!("PoW at height {}", header.height)
-                                })? {
+                                if !header
+                                    .check_pow()
+                                    .with_context(|| format!("PoW at height {}", header.height))?
+                                {
                                     bail!("PoW failed at height {}", header.height);
                                 }
                             }
@@ -382,8 +380,7 @@ impl PeerPool {
 
                         if collect_ids {
                             for header in &hdrs {
-                                header_ids
-                                    .push((header.height, hex::encode(header.id.0 .0)));
+                                header_ids.push((header.height, hex::encode(header.id.0 .0)));
                             }
                         }
 
@@ -393,10 +390,8 @@ impl PeerPool {
                             Err(e) => {
                                 warn!(error = %e, "ingest failed, backing off");
                                 tokio::time::sleep(Duration::from_secs(1)).await;
-                                headers_pushed += ingest
-                                    .push(&batch)
-                                    .await
-                                    .context("ingest retry failed")?;
+                                headers_pushed +=
+                                    ingest.push(&batch).await.context("ingest retry failed")?;
                             }
                         }
 
@@ -480,10 +475,7 @@ impl PeerPool {
                     chunks.push_back((from, to));
 
                     if self.healthy_count() == 0 {
-                        bail!(
-                            "all peers unhealthy — stuck at height {}",
-                            next_flush
-                        );
+                        bail!("all peers unhealthy — stuck at height {}", next_flush);
                     }
 
                     // Reassign to a healthy peer
@@ -572,7 +564,14 @@ impl PeerPool {
         let mut completed = 0u32;
 
         // Return ids from task so we can re-queue on failure
-        type Task = (usize, u32, u32, Vec<String>, Duration, Result<Vec<JvmFullBlock>>);
+        type Task = (
+            usize,
+            u32,
+            u32,
+            Vec<String>,
+            Duration,
+            Result<Vec<JvmFullBlock>>,
+        );
         let mut tasks: JoinSet<Task> = JoinSet::new();
 
         // Track in-flight peer indices so new peers discovered mid-fetch
@@ -601,8 +600,7 @@ impl PeerPool {
 
             match result {
                 Ok(blocks) => {
-                    self.peers[peer_idx]
-                        .record_success(latency, blocks.len() as u32, false);
+                    self.peers[peer_idx].record_success(latency, blocks.len() as u32, false);
 
                     for block in &blocks {
                         let header: Header = parse_header_json(&block.header)
@@ -691,9 +689,7 @@ impl PeerPool {
                     queue.push_back((min_h, max_h, ids));
 
                     if self.healthy_count() == 0 {
-                        bail!(
-                            "all peers unhealthy — block fetch at {completed}/{total_batches}"
-                        );
+                        bail!("all peers unhealthy — block fetch at {completed}/{total_batches}");
                     }
 
                     if let Some(alt) = self.next_healthy_excluding(peer_idx) {
@@ -734,11 +730,7 @@ impl PeerPool {
 
     /// Fetch header IDs for a height range without pushing headers.
     /// Used when headers are already synced but block sections are missing.
-    pub async fn header_ids_for_range(
-        &mut self,
-        from: u32,
-        to: u32,
-    ) -> Result<Vec<(u32, String)>> {
+    pub async fn header_ids_for_range(&mut self, from: u32, to: u32) -> Result<Vec<(u32, String)>> {
         let mut ids = Vec::with_capacity((to - from + 1) as usize);
         let chunk_size = self.chunk_size;
         let mut height = from;
@@ -749,9 +741,10 @@ impl PeerPool {
 
         while height <= to {
             let chunk_to = (height + chunk_size - 1).min(to);
-            let peer_idx = *self.healthy_indices().first().ok_or_else(|| {
-                anyhow::anyhow!("no healthy peers for header ID fetch")
-            })?;
+            let peer_idx = *self
+                .healthy_indices()
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("no healthy peers for header ID fetch"))?;
             let fetcher = self.peers[peer_idx].fetcher.clone();
             let start = Instant::now();
 

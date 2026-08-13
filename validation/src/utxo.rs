@@ -79,8 +79,8 @@ impl UtxoValidator {
         // Compute emission contract ErgoTree bytes for box matching.
         // Uses mainnet MonetarySettings — the emission contract is the same
         // across mainnet/testnet (same script, different genesis boxes).
-        use ergo_lib::chain::ergo_tree_predef;
         use ergo_lib::chain::emission::MonetarySettings;
+        use ergo_lib::chain::ergo_tree_predef;
         use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 
         let emission_tree_bytes =
@@ -262,7 +262,8 @@ impl UtxoValidator {
         // Uses JVM v6 matchParameters60 semantics: local can have fewer
         // entries than received, every entry in local must match received.
         // At v4+ the proposedUpdate byte-for-byte comparison also runs.
-        let (epoch_boundary_params, epoch_boundary_proposed_update) = match expected_boundary_params {
+        let (epoch_boundary_params, epoch_boundary_proposed_update) = match expected_boundary_params
+        {
             Some(expected) => {
                 let parsed = voting::parse_parameters_from_extension(&parsed_ext)?;
                 let parsed_pu = voting::extract_proposed_update(&parsed_ext);
@@ -314,12 +315,9 @@ impl UtxoValidator {
         let mut proof_box_bytes: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
 
         for (i, op) in operations.iter().enumerate() {
-            let result = self
-                .prover
-                .perform_one_operation(op)
-                .map_err(|e| ValidationError::StateOperationFailed(
-                    format!("operation {i} failed: {e}"),
-                ))?;
+            let result = self.prover.perform_one_operation(op).map_err(|e| {
+                ValidationError::StateOperationFailed(format!("operation {i} failed: {e}"))
+            })?;
 
             if validate_txs {
                 if let Some(value) = result {
@@ -337,12 +335,9 @@ impl UtxoValidator {
 
         // 5. Verify resulting digest matches header.state_root
         let expected_state_root: [u8; 33] = header.state_root.into();
-        let prover_digest = self
-            .prover
-            .digest()
-            .ok_or_else(|| ValidationError::StateOperationFailed(
-                "prover has no root after operations".to_string(),
-            ))?;
+        let prover_digest = self.prover.digest().ok_or_else(|| {
+            ValidationError::StateOperationFailed("prover has no root after operations".to_string())
+        })?;
         if prover_digest.as_ref() != expected_state_root.as_slice() {
             return Err(ValidationError::StateRootMismatch {
                 expected: expected_state_root.to_vec(),
@@ -397,9 +392,7 @@ impl UtxoValidator {
         //    ~658 KB/block, zero deletions).
         self.storage
             .update_with_height(&mut self.prover, vec![], header.height)
-            .map_err(|e| ValidationError::StateOperationFailed(
-                format!("persist failed: {e}"),
-            ))?;
+            .map_err(|e| ValidationError::StateOperationFailed(format!("persist failed: {e}")))?;
 
         // 8. Generate the AD proof AFTER persisting — the canonical order,
         //    matching the JVM's
@@ -465,8 +458,7 @@ impl UtxoValidator {
         if let Some(dir) = &self.adproof_dump_dir {
             if self.adproof_dump_heights.contains(&header.height) {
                 // Raw type-104 section: [header_id:32][proof_size:VLQ][proof].
-                let section =
-                    crate::sections::serialize_ad_proofs(&header.id.0 .0, proof.as_ref());
+                let section = crate::sections::serialize_ad_proofs(&header.id.0 .0, proof.as_ref());
                 let path = dir.join(format!("adproofs-{}.104", header.height));
                 match std::fs::write(&path, &section) {
                     Ok(()) => tracing::info!(
@@ -776,7 +768,10 @@ mod tests {
             }
         }
 
-        fn apply(&self, validator: &mut UtxoValidator) -> Result<ApplyStateOutcome, ValidationError> {
+        fn apply(
+            &self,
+            validator: &mut UtxoValidator,
+        ) -> Result<ApplyStateOutcome, ValidationError> {
             validator.apply_state(
                 &self.header,
                 &self.txs,

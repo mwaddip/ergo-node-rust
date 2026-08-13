@@ -1,14 +1,11 @@
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 
 use ergo_mempool::expiring_cache::ExpiringCache;
 
 #[test]
 fn insert_and_contains() {
-    let mut cache: ExpiringCache<[u8; 32]> = ExpiringCache::new(
-        Duration::from_secs(60),
-        100,
-    );
+    let mut cache: ExpiringCache<[u8; 32]> = ExpiringCache::new(Duration::from_secs(60), 100);
 
     let key_a = [1u8; 32];
     let key_b = [2u8; 32];
@@ -25,10 +22,7 @@ fn insert_and_contains() {
 
 #[test]
 fn insert_is_idempotent() {
-    let mut cache: ExpiringCache<[u8; 32]> = ExpiringCache::new(
-        Duration::from_secs(60),
-        100,
-    );
+    let mut cache: ExpiringCache<[u8; 32]> = ExpiringCache::new(Duration::from_secs(60), 100);
 
     let key = [1u8; 32];
     cache.insert(key);
@@ -57,7 +51,10 @@ fn capacity_evicts_oldest() {
     // Inserting a 4th should evict the oldest (key_a)
     cache.insert(key_d);
     assert_eq!(cache.len(), 3);
-    assert!(!cache.contains(&key_a), "oldest entry should have been evicted");
+    assert!(
+        !cache.contains(&key_a),
+        "oldest entry should have been evicted"
+    );
     assert!(cache.contains(&key_b));
     assert!(cache.contains(&key_c));
     assert!(cache.contains(&key_d));
@@ -77,7 +74,10 @@ fn expired_entries_not_found() {
     // Sleep long enough for the entry to expire
     thread::sleep(Duration::from_millis(5));
 
-    assert!(!cache.contains(&key), "expired entry should not be found via contains()");
+    assert!(
+        !cache.contains(&key),
+        "expired entry should not be found via contains()"
+    );
     // Note: len() still counts expired entries until prune() is called
     assert_eq!(cache.len(), 1, "expired entry is still stored until pruned");
 }
@@ -108,15 +108,16 @@ fn prune_removes_expired() {
     assert!(!cache.contains(&key_a));
     assert!(!cache.contains(&key_b));
     assert!(cache.contains(&key_c));
-    assert_eq!(cache.len(), 1, "only the fresh entry should remain after prune");
+    assert_eq!(
+        cache.len(),
+        1,
+        "only the fresh entry should remain after prune"
+    );
 }
 
 #[test]
 fn clear_empties_cache() {
-    let mut cache: ExpiringCache<[u8; 32]> = ExpiringCache::new(
-        Duration::from_secs(60),
-        100,
-    );
+    let mut cache: ExpiringCache<[u8; 32]> = ExpiringCache::new(Duration::from_secs(60), 100);
 
     cache.insert([1u8; 32]);
     cache.insert([2u8; 32]);

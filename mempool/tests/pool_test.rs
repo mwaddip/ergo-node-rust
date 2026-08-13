@@ -1,20 +1,19 @@
 use std::time::Instant;
 
-use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::chain::transaction::input::UnsignedInput;
-use ergo_lib::ergotree_ir::chain::ergo_box::{
-    BoxId, ErgoBox, ErgoBoxCandidate, NonMandatoryRegisters,
-    box_value::BoxValue,
-};
+use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
+use ergo_lib::ergotree_ir::chain::ergo_box::{
+    box_value::BoxValue, BoxId, ErgoBox, ErgoBoxCandidate, NonMandatoryRegisters,
+};
 use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 
 use ergo_chain_types::Digest32;
 
 use ergo_mempool::pool::OrderedPool;
-use ergo_mempool::weight::TxWeight;
 use ergo_mempool::types::{FeeStrategy, UnconfirmedTx};
+use ergo_mempool::weight::TxWeight;
 
 /// Minimal ErgoTree that represents `true` proposition.
 /// This is the simplest valid tree: header byte 0x00 + constant `true` as SigmaProp.
@@ -91,11 +90,7 @@ fn make_tx(input_seed: u8, output_value: u64) -> Transaction {
         creation_height: 1,
     };
 
-    Transaction::new_from_vec(
-        vec![input],
-        vec![],
-        vec![output],
-    ).unwrap()
+    Transaction::new_from_vec(vec![input], vec![], vec![output]).unwrap()
 }
 
 /// Extract tx_id as [u8; 32].
@@ -123,20 +118,26 @@ fn make_utx(tx: Transaction, fee: u64) -> UnconfirmedTx {
 
 /// Extract input box IDs from a Transaction.
 fn input_box_ids(tx: &Transaction) -> Vec<[u8; 32]> {
-    tx.inputs.iter().map(|i| {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(i.box_id.as_ref());
-        arr
-    }).collect()
+    tx.inputs
+        .iter()
+        .map(|i| {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(i.box_id.as_ref());
+            arr
+        })
+        .collect()
 }
 
 /// Build output (box_id, ErgoBox) pairs from a Transaction.
 fn output_box_pairs(tx: &Transaction) -> Vec<([u8; 32], ErgoBox)> {
-    tx.outputs.iter().map(|b| {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(b.box_id().as_ref());
-        (arr, b.clone())
-    }).collect()
+    tx.outputs
+        .iter()
+        .map(|b| {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(b.box_id().as_ref());
+            (arr, b.clone())
+        })
+        .collect()
 }
 
 // -----------------------------------------------------------------------
@@ -153,7 +154,13 @@ fn insert_and_lookup() {
     let outputs = output_box_pairs(&tx);
     let utx = make_utx(tx, 2_000_000);
 
-    let weight = TxWeight::new(tx_id, 2_000_000, utx.tx_bytes.len(), utx.cost, FeeStrategy::FeePerByte);
+    let weight = TxWeight::new(
+        tx_id,
+        2_000_000,
+        utx.tx_bytes.len(),
+        utx.cost,
+        FeeStrategy::FeePerByte,
+    );
     pool.insert(weight, utx, &input_ids, outputs);
 
     assert_eq!(pool.len(), 1);
@@ -215,7 +222,13 @@ fn remove_cleans_indexes() {
     let output_box_id = outputs[0].0;
     let utx = make_utx(tx, 2_000_000);
 
-    let weight = TxWeight::new(tx_id, 2_000_000, utx.tx_bytes.len(), utx.cost, FeeStrategy::FeePerByte);
+    let weight = TxWeight::new(
+        tx_id,
+        2_000_000,
+        utx.tx_bytes.len(),
+        utx.cost,
+        FeeStrategy::FeePerByte,
+    );
     pool.insert(weight, utx, &input_ids, outputs);
 
     assert!(pool.contains(&tx_id));
@@ -227,8 +240,14 @@ fn remove_cleans_indexes() {
     assert!(removed.is_some());
     assert_eq!(pool.len(), 0);
     assert!(!pool.contains(&tx_id));
-    assert!(pool.spending_tx(&input_ids[0]).is_none(), "input index should be cleaned");
-    assert!(pool.unconfirmed_box(&output_box_id).is_none(), "output index should be cleaned");
+    assert!(
+        pool.spending_tx(&input_ids[0]).is_none(),
+        "input index should be cleaned"
+    );
+    assert!(
+        pool.unconfirmed_box(&output_box_id).is_none(),
+        "output index should be cleaned"
+    );
 }
 
 #[test]
@@ -255,7 +274,13 @@ fn double_spend_detection() {
     let inputs_a = input_box_ids(&tx_a);
     let outputs_a = output_box_pairs(&tx_a);
     let utx_a = make_utx(tx_a, 3_000_000);
-    let w_a = TxWeight::new(id_a, 3_000_000, utx_a.tx_bytes.len(), utx_a.cost, FeeStrategy::FeePerByte);
+    let w_a = TxWeight::new(
+        id_a,
+        3_000_000,
+        utx_a.tx_bytes.len(),
+        utx_a.cost,
+        FeeStrategy::FeePerByte,
+    );
     pool.insert(w_a, utx_a, &inputs_a, outputs_a);
 
     // The input should be tracked as spent by tx_a
@@ -268,7 +293,13 @@ fn double_spend_detection() {
     let inputs_b = input_box_ids(&tx_b);
     let outputs_b = output_box_pairs(&tx_b);
     let utx_b = make_utx(tx_b, 5_000_000);
-    let w_b = TxWeight::new(id_b, 5_000_000, utx_b.tx_bytes.len(), utx_b.cost, FeeStrategy::FeePerByte);
+    let w_b = TxWeight::new(
+        id_b,
+        5_000_000,
+        utx_b.tx_bytes.len(),
+        utx_b.cost,
+        FeeStrategy::FeePerByte,
+    );
     pool.insert(w_b, utx_b, &inputs_b, outputs_b);
 
     // spending_tx should now return tx_b (last writer wins in HashMap)
@@ -298,14 +329,26 @@ fn evict_lowest() {
     let inputs = input_box_ids(&tx_low);
     let outputs = output_box_pairs(&tx_low);
     let utx = make_utx(tx_low, fee_low);
-    let w = TxWeight::new(id_low, fee_low, utx.tx_bytes.len(), utx.cost, FeeStrategy::FeePerByte);
+    let w = TxWeight::new(
+        id_low,
+        fee_low,
+        utx.tx_bytes.len(),
+        utx.cost,
+        FeeStrategy::FeePerByte,
+    );
     pool.insert(w, utx, &inputs, outputs);
 
     // Insert high-fee tx
     let inputs = input_box_ids(&tx_high);
     let outputs = output_box_pairs(&tx_high);
     let utx = make_utx(tx_high, fee_high);
-    let w = TxWeight::new(id_high, fee_high, utx.tx_bytes.len(), utx.cost, FeeStrategy::FeePerByte);
+    let w = TxWeight::new(
+        id_high,
+        fee_high,
+        utx.tx_bytes.len(),
+        utx.cost,
+        FeeStrategy::FeePerByte,
+    );
     pool.insert(w, utx, &inputs, outputs);
 
     assert_eq!(pool.len(), 2);
@@ -322,14 +365,23 @@ fn evict_lowest() {
 fn lowest_weight_tracks_minimum() {
     let mut pool = OrderedPool::new(100);
 
-    assert!(pool.lowest_weight().is_none(), "empty pool has no lowest weight");
+    assert!(
+        pool.lowest_weight().is_none(),
+        "empty pool has no lowest weight"
+    );
 
     let tx1 = make_tx(1, 1_000_000);
     let id1 = tx_id_bytes(&tx1);
     let inputs = input_box_ids(&tx1);
     let outputs = output_box_pairs(&tx1);
     let utx = make_utx(tx1, 5_000_000);
-    let w1 = TxWeight::new(id1, 5_000_000, utx.tx_bytes.len(), utx.cost, FeeStrategy::FeePerByte);
+    let w1 = TxWeight::new(
+        id1,
+        5_000_000,
+        utx.tx_bytes.len(),
+        utx.cost,
+        FeeStrategy::FeePerByte,
+    );
     let expected_weight = w1.fee_per_factor;
     pool.insert(w1, utx, &inputs, outputs);
 
@@ -341,7 +393,13 @@ fn lowest_weight_tracks_minimum() {
     let inputs = input_box_ids(&tx2);
     let outputs = output_box_pairs(&tx2);
     let utx = make_utx(tx2, 1_000_000);
-    let w2 = TxWeight::new(id2, 1_000_000, utx.tx_bytes.len(), utx.cost, FeeStrategy::FeePerByte);
+    let w2 = TxWeight::new(
+        id2,
+        1_000_000,
+        utx.tx_bytes.len(),
+        utx.cost,
+        FeeStrategy::FeePerByte,
+    );
     let lower_weight = w2.fee_per_factor;
     pool.insert(w2, utx, &inputs, outputs);
 
@@ -359,7 +417,13 @@ fn is_full_respects_capacity() {
     let inputs = input_box_ids(&tx1);
     let outputs = output_box_pairs(&tx1);
     let utx = make_utx(tx1, 2_000_000);
-    let w = TxWeight::new(id1, 2_000_000, utx.tx_bytes.len(), utx.cost, FeeStrategy::FeePerByte);
+    let w = TxWeight::new(
+        id1,
+        2_000_000,
+        utx.tx_bytes.len(),
+        utx.cost,
+        FeeStrategy::FeePerByte,
+    );
     pool.insert(w, utx, &inputs, outputs);
     assert!(!pool.is_full());
 
@@ -368,7 +432,13 @@ fn is_full_respects_capacity() {
     let inputs = input_box_ids(&tx2);
     let outputs = output_box_pairs(&tx2);
     let utx = make_utx(tx2, 3_000_000);
-    let w = TxWeight::new(id2, 3_000_000, utx.tx_bytes.len(), utx.cost, FeeStrategy::FeePerByte);
+    let w = TxWeight::new(
+        id2,
+        3_000_000,
+        utx.tx_bytes.len(),
+        utx.cost,
+        FeeStrategy::FeePerByte,
+    );
     pool.insert(w, utx, &inputs, outputs);
     assert!(pool.is_full());
 }
@@ -387,7 +457,13 @@ fn tx_ids_returns_all() {
         let inputs = input_box_ids(&tx);
         let outputs = output_box_pairs(&tx);
         let utx = make_utx(tx, fee);
-        let w = TxWeight::new(tx_id, fee, utx.tx_bytes.len(), utx.cost, FeeStrategy::FeePerByte);
+        let w = TxWeight::new(
+            tx_id,
+            fee,
+            utx.tx_bytes.len(),
+            utx.cost,
+            FeeStrategy::FeePerByte,
+        );
         pool.insert(w, utx, &inputs, outputs);
     }
 
@@ -411,13 +487,25 @@ fn update_weight_reorders() {
     let inputs_a = input_box_ids(&tx_a);
     let outputs_a = output_box_pairs(&tx_a);
     let utx_a = make_utx(tx_a, 1_000_000);
-    let w_a = TxWeight::new(id_a, 1_000_000, utx_a.tx_bytes.len(), utx_a.cost, FeeStrategy::FeePerByte);
+    let w_a = TxWeight::new(
+        id_a,
+        1_000_000,
+        utx_a.tx_bytes.len(),
+        utx_a.cost,
+        FeeStrategy::FeePerByte,
+    );
     pool.insert(w_a, utx_a, &inputs_a, outputs_a);
 
     let inputs_b = input_box_ids(&tx_b);
     let outputs_b = output_box_pairs(&tx_b);
     let utx_b = make_utx(tx_b, 5_000_000);
-    let w_b = TxWeight::new(id_b, 5_000_000, utx_b.tx_bytes.len(), utx_b.cost, FeeStrategy::FeePerByte);
+    let w_b = TxWeight::new(
+        id_b,
+        5_000_000,
+        utx_b.tx_bytes.len(),
+        utx_b.cost,
+        FeeStrategy::FeePerByte,
+    );
     pool.insert(w_b, utx_b, &inputs_b, outputs_b);
 
     // Before update: tx_b is top
@@ -428,5 +516,9 @@ fn update_weight_reorders() {
     pool.update_weight(&id_a, very_high);
 
     // Now tx_a should be top
-    assert_eq!(pool.top(1)[0].fee, 1_000_000, "boosted tx_a should now be at the top");
+    assert_eq!(
+        pool.top(1)[0].fee,
+        1_000_000,
+        "boosted tx_a should now be at the top"
+    );
 }

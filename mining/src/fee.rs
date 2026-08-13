@@ -13,8 +13,8 @@ use ergo_lib::ergotree_ir::chain::ergo_box::{
 use ergo_lib::ergotree_ir::chain::token::{Token, TokenId};
 use ergo_lib::ergotree_ir::chain::tx_id::TxId;
 use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
-use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
 use std::collections::{HashMap, HashSet};
 
 use crate::MiningError;
@@ -70,10 +70,7 @@ pub fn build_fee_tx(
     let mut fee_boxes: Vec<&ErgoBox> = Vec::new();
     for tx in block_txs {
         for output in tx.outputs.iter() {
-            let output_tree_bytes = output
-                .ergo_tree
-                .sigma_serialize_bytes()
-                .unwrap_or_default();
+            let output_tree_bytes = output.ergo_tree.sigma_serialize_bytes().unwrap_or_default();
             if output_tree_bytes == fee_tree_bytes {
                 let mut id = [0u8; 32];
                 id.copy_from_slice(output.box_id().as_ref());
@@ -122,9 +119,8 @@ pub fn build_fee_tx(
     }
 
     // Build the miner reward output.
-    let reward_script =
-        ergo_tree_predef::reward_output_script(reward_delay, miner_pk.clone())
-            .map_err(|e| MiningError::Emission(format!("reward script: {e}")))?;
+    let reward_script = ergo_tree_predef::reward_output_script(reward_delay, miner_pk.clone())
+        .map_err(|e| MiningError::Emission(format!("reward script: {e}")))?;
     let reward_value: BoxValue = (total_fee as u64)
         .try_into()
         .map_err(|e| MiningError::Emission(format!("fee value: {e}")))?;
@@ -160,8 +156,7 @@ pub fn build_fee_tx(
         })
         .collect();
 
-    let mut reward_builder =
-        ErgoBoxCandidateBuilder::new(reward_value, reward_script, height);
+    let mut reward_builder = ErgoBoxCandidateBuilder::new(reward_value, reward_script, height);
     for token in kept {
         reward_builder.add_token(token);
     }

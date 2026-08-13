@@ -57,8 +57,7 @@ fn dump_serve_receive_round_trip() {
             .unwrap();
     }
 
-    let _persistent =
-        PersistentBatchAVLProver::new(prover, Box::new(storage), vec![]).unwrap();
+    let _persistent = PersistentBatchAVLProver::new(prover, Box::new(storage), vec![]).unwrap();
     let digest = _persistent.digest();
     let original_root: [u8; 32] = digest[..32].try_into().unwrap();
     let original_height = digest[32];
@@ -113,7 +112,8 @@ fn dump_serve_receive_round_trip() {
         key_length: 32,
         value_length: None,
     };
-    let mut storage2 = RedbAVLStorage::open(&state2_path, params2, 0, CacheSize::default()).unwrap();
+    let mut storage2 =
+        RedbAVLStorage::open(&state2_path, params2, 0, CacheSize::default()).unwrap();
 
     let mut version_bytes = Vec::with_capacity(33);
     version_bytes.extend_from_slice(&dump.root_hash);

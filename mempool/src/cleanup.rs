@@ -1,6 +1,6 @@
-use ergo_validation::{validate_single_transaction, ErgoStateContext};
-use crate::types::UtxoReader;
 use crate::process;
+use crate::types::UtxoReader;
+use ergo_validation::{validate_single_transaction, ErgoStateContext};
 
 impl super::Mempool {
     /// Revalidate pool transactions against current state.
@@ -42,9 +42,13 @@ impl super::Mempool {
 
             // Resolve inputs
             let input_ids = process::input_box_ids(&utx.tx);
-            let input_boxes: Option<Vec<_>> = input_ids.iter()
-                .map(|id| utxo_reader.box_by_id(id)
-                    .or_else(|| self.pool.unconfirmed_box(id).cloned()))
+            let input_boxes: Option<Vec<_>> = input_ids
+                .iter()
+                .map(|id| {
+                    utxo_reader
+                        .box_by_id(id)
+                        .or_else(|| self.pool.unconfirmed_box(id).cloned())
+                })
                 .collect();
 
             let input_boxes = match input_boxes {
@@ -56,12 +60,20 @@ impl super::Mempool {
                 }
             };
 
-            let data_boxes: Vec<_> = utx.tx.data_inputs.as_ref()
-                .map(|dis| dis.iter().filter_map(|di| {
-                    let id = process::input_box_id_raw(&di.box_id);
-                    utxo_reader.box_by_id(&id)
-                        .or_else(|| self.pool.unconfirmed_box(&id).cloned())
-                }).collect())
+            let data_boxes: Vec<_> = utx
+                .tx
+                .data_inputs
+                .as_ref()
+                .map(|dis| {
+                    dis.iter()
+                        .filter_map(|di| {
+                            let id = process::input_box_id_raw(&di.box_id);
+                            utxo_reader
+                                .box_by_id(&id)
+                                .or_else(|| self.pool.unconfirmed_box(&id).cloned())
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
 
             // Clone what we need before the mutable borrow
@@ -101,9 +113,9 @@ impl super::Mempool {
             if valid.len() >= self.config.rebroadcast_count {
                 break;
             }
-            let all_inputs_exist = process::input_box_ids(&utx.tx).iter().all(|id|
-                utxo_reader.box_by_id(id).is_some()
-            );
+            let all_inputs_exist = process::input_box_ids(&utx.tx)
+                .iter()
+                .all(|id| utxo_reader.box_by_id(id).is_some());
             if all_inputs_exist {
                 valid.push(utx);
             }

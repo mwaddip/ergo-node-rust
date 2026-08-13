@@ -144,10 +144,19 @@ fn error_kind_domain_is_closed() {
     let cases = [
         ValidationError::StateOperationFailed(avl_missing_key_message()),
         ValidationError::ProofVerificationFailed(avl_missing_key_message()),
-        ValidationError::TransactionInvalid { index: 0, reason: "nope".to_string() },
+        ValidationError::TransactionInvalid {
+            index: 0,
+            reason: "nope".to_string(),
+        },
         ValidationError::MissingProof,
-        ValidationError::HeightMismatch { expected: 2666, got: 2668 },
-        ValidationError::BlockCostExceeded { cost: 2, max_cost: 1 },
+        ValidationError::HeightMismatch {
+            expected: 2666,
+            got: 2668,
+        },
+        ValidationError::BlockCostExceeded {
+            cost: 2,
+            max_cost: 1,
+        },
         ValidationError::IntraBlockDoubleSpend("box".to_string()),
     ];
     for err in &cases {

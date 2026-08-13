@@ -11,8 +11,8 @@ use crate::apply_state_error::classify_apply_state_error;
 use crate::delivery::{DeliveryControl, DeliveryData, DeliveryTracker};
 use crate::sweep_backoff::StallDetail;
 use enr_chain::{
-    BlockId, StateType, SyncInfo, HEADER_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID,
-    EXTENSION_TYPE_ID, TRANSACTION_TYPE_ID,
+    BlockId, StateType, SyncInfo, AD_PROOFS_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, EXTENSION_TYPE_ID,
+    HEADER_TYPE_ID, TRANSACTION_TYPE_ID,
 };
 
 use crate::traits::{SyncChain, SyncStore, SyncTransport};
@@ -23,7 +23,10 @@ use ergo_validation::BlockValidator;
 /// backpressure, so this is capped below the JVM's `desiredInvObjects` (400).
 /// 64 per type × 2 types = 128 sections per cycle = 64 blocks/cycle.
 fn is_block_section_type(type_id: u8) -> bool {
-    matches!(type_id, BLOCK_TRANSACTIONS_TYPE_ID | AD_PROOFS_TYPE_ID | EXTENSION_TYPE_ID)
+    matches!(
+        type_id,
+        BLOCK_TRANSACTIONS_TYPE_ID | AD_PROOFS_TYPE_ID | EXTENSION_TYPE_ID
+    )
 }
 
 /// Max continuation header ids served to a behind/forked peer per incoming
@@ -152,10 +155,7 @@ pub(crate) fn try_flush_validator<V: BlockValidator>(
 /// skips the `set_validated_height` write entirely. Digest mode
 /// (`NothingToPersist`) does write it — see that variant's doc. The store flush
 /// always runs to fsync any accumulated section writes.
-pub(crate) async fn complete_store_flush_pair<S: SyncStore>(
-    outcome: FlushOutcome,
-    store: &S,
-) {
+pub(crate) async fn complete_store_flush_pair<S: SyncStore>(outcome: FlushOutcome, store: &S) {
     if let Some(m) = outcome.committed_height() {
         store.set_validated_height(m).await;
     }
@@ -198,11 +198,7 @@ pub(crate) async fn maybe_prune_at_horizon<S: SyncStore, C: SyncChain>(
         )
         .await
     {
-        Ok(n) => tracing::debug!(
-            pruned = n,
-            horizon,
-            "pruned modifier rows"
-        ),
+        Ok(n) => tracing::debug!(pruned = n, horizon, "pruned modifier rows"),
         Err(e) => tracing::warn!(
             error = %e,
             horizon,
@@ -443,7 +439,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         peer_chain_tip: std::sync::Arc<std::sync::atomic::AtomicU32>,
         shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> Self {
-        let tracker = DeliveryTracker::with_config(config.delivery_timeout, config.max_delivery_checks);
+        let tracker =
+            DeliveryTracker::with_config(config.delivery_timeout, config.max_delivery_checks);
         let initial_validated = validator.as_ref().map_or(0, |v| v.validated_height());
         let last_flush_height = initial_validated;
         Self {
@@ -482,10 +479,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     /// Configure the at-tip transition. When `synced()` is first entered,
     /// `resize_cache()` is called on the validator with `synced_cache_bytes`
     /// to shrink the read cache without reopening the database.
-    pub fn set_at_tip_cache(
-        &mut self,
-        synced_cache_bytes: usize,
-    ) {
+    pub fn set_at_tip_cache(&mut self, synced_cache_bytes: usize) {
         self.synced_cache_bytes = Some(synced_cache_bytes);
     }
 
@@ -635,11 +629,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         // Idempotent: skipped on restart when the chain is non-empty.
         if self.config.state_type == StateType::Light && self.chain.chain_height().await == 0 {
             tracing::info!("light-client mode: running NiPoPoW bootstrap");
-            match crate::light_bootstrap::run_light_bootstrap(
-                &mut self.transport,
-                &self.chain,
-            )
-            .await
+            match crate::light_bootstrap::run_light_bootstrap(&mut self.transport, &self.chain)
+                .await
             {
                 Ok(()) => {
                     let height = self.chain.chain_height().await;
@@ -648,7 +639,10 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     // no validator running and no block sections to download.
                     self.downloaded_height = height;
                     self.state_applied_height = height;
-                    tracing::info!(height, "light bootstrap installed, entering tip-following sync");
+                    tracing::info!(
+                        height,
+                        "light bootstrap installed, entering tip-following sync"
+                    );
                 }
                 Err(e) => {
                     tracing::error!("light bootstrap failed: {e}");
@@ -848,9 +842,13 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         let mut sweep_ticker = tokio::time::interval(Duration::from_secs(10));
 
         loop {
-            let until_next = self.config.sync_interval
+            let until_next = self
+                .config
+                .sync_interval
                 .saturating_sub(self.last_scheduled_sync.elapsed());
-            let until_delivery = self.config.delivery_check_interval
+            let until_delivery = self
+                .config
+                .delivery_check_interval
                 .saturating_sub(last_delivery_check.elapsed());
 
             tokio::select! {
@@ -952,7 +950,10 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     /// tracker before sending. Chunks into messages of at most 400 IDs
     /// to stay within the JVM's `desiredInvObjects` limit.
     async fn request_announced(&mut self, peer: PeerId, modifier_type: u8, ids: Vec<[u8; 32]>) {
-        if !self.block_request_gate.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self
+            .block_request_gate
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return;
         }
         // Filter out already-known and already-in-flight IDs
@@ -1037,7 +1038,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         if new_height > self.downloaded_height {
             let advanced = new_height - self.downloaded_height;
             self.downloaded_height = new_height;
-            self.shared_downloaded_height.store(new_height, std::sync::atomic::Ordering::Relaxed);
+            self.shared_downloaded_height
+                .store(new_height, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!(
                 downloaded_height = new_height,
                 advanced,
@@ -1161,34 +1163,34 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             // is sync and stateless w.r.t. chain state, so all chain queries
             // happen out-of-band before/after the call.
             let active_params = self.chain.active_parameters().await;
-            let (expected_boundary_params, expected_proposed_update) =
-                if self.chain.is_epoch_boundary(height).await {
-                    let block_proposed_update =
-                        match enr_chain::parse_extension_bytes(&extension) {
-                            Ok((_header_id, fields)) => {
-                                enr_chain::extract_disabling_rules_from_kv(&fields)
-                            }
-                            Err(e) => {
-                                tracing::error!(height, error = %e, "extension parse for proposed update failed");
-                                break;
-                            }
-                        };
-                    let params = match self
-                        .chain
-                        .compute_expected_parameters(height, &block_proposed_update)
-                        .await
-                    {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::error!(height, error = %e, "compute_expected_parameters failed");
-                            break;
-                        }
-                    };
-                    let expected_pu = self.chain.active_proposed_update_bytes().await;
-                    (Some(params), Some(expected_pu))
-                } else {
-                    (None, None)
+            let (expected_boundary_params, expected_proposed_update) = if self
+                .chain
+                .is_epoch_boundary(height)
+                .await
+            {
+                let block_proposed_update = match enr_chain::parse_extension_bytes(&extension) {
+                    Ok((_header_id, fields)) => enr_chain::extract_disabling_rules_from_kv(&fields),
+                    Err(e) => {
+                        tracing::error!(height, error = %e, "extension parse for proposed update failed");
+                        break;
+                    }
                 };
+                let params = match self
+                    .chain
+                    .compute_expected_parameters(height, &block_proposed_update)
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!(height, error = %e, "compute_expected_parameters failed");
+                        break;
+                    }
+                };
+                let expected_pu = self.chain.active_proposed_update_bytes().await;
+                (Some(params), Some(expected_pu))
+            } else {
+                (None, None)
+            };
 
             let result = self.validator.as_mut().unwrap().apply_state(
                 &header,
@@ -1237,12 +1239,10 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         .validator
                         .as_ref()
                         .map_or(validated_to, |v| v.validated_height());
-                    self.catchup_progress.maybe_emit(
-                        Instant::now(),
-                        sweep_size,
-                        applied,
-                        || self.config.flush_probe.as_ref().map(|probe| probe()),
-                    );
+                    self.catchup_progress
+                        .maybe_emit(Instant::now(), sweep_size, applied, || {
+                            self.config.flush_probe.as_ref().map(|probe| probe())
+                        });
 
                     // Progress report every 1000 blocks during large sweeps
                     let done = height - applied_tip;
@@ -1250,7 +1250,11 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         let elapsed = sweep_start.elapsed().as_secs().max(1);
                         let rate = done as f64 / elapsed as f64;
                         let remaining = sweep_to - height;
-                        let eta_secs = if rate > 0.0 { remaining as f64 / rate } else { 0.0 };
+                        let eta_secs = if rate > 0.0 {
+                            remaining as f64 / rate
+                        } else {
+                            0.0
+                        };
                         tracing::debug!(
                             height,
                             done,
@@ -1295,7 +1299,10 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     // script-failure kind went missing without a compile error
                     // when deferred evaluation was removed.
                     let (error_kind, missing_key) = classify_apply_state_error(&e);
-                    stall_detail = StallDetail { error_kind, missing_key };
+                    stall_detail = StallDetail {
+                        error_kind,
+                        missing_key,
+                    };
                     tracing::error!(height, error = %e, "apply_state failed");
                     break;
                 }
@@ -1311,7 +1318,10 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         // what the prover actually holds; the cache must mirror it in both
         // directions. Persistence is handled atomically inside state.redb by
         // `UtxoValidator::apply_state` — no separate hint write needed.
-        let true_tip = self.validator.as_ref().map_or(validated_to, |v| v.validated_height());
+        let true_tip = self
+            .validator
+            .as_ref()
+            .map_or(validated_to, |v| v.validated_height());
 
         // Drive the sweep backoff off the authoritative applied tip. If the
         // sweep moved the tip past where it started, that is real progress —
@@ -1376,8 +1386,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         // Durable flush at sweep end — catches the tail of blocks that
         // didn't hit a heap-threshold or max-blocks trigger mid-sweep. The
         // tip-following path (single block per sweep) always reaches this.
-        let outcome =
-            try_flush_validator(self.validator.as_ref(), self.state_applied_height);
+        let outcome = try_flush_validator(self.validator.as_ref(), self.state_applied_height);
         complete_store_flush_pair(outcome, &self.store).await;
         if let Some(m) = outcome.committed_height() {
             maybe_prune_at_horizon(&self.store, &self.chain, m, self.config.blocks_to_keep).await;
@@ -1394,8 +1403,17 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 tracing::info!(type_id, "pipeline needs modifier for reorg");
                 self.request_announced(peer, type_id, vec![id]).await;
             }
-            DeliveryControl::Reorg { fork_point, old_tip, new_tip } => {
-                tracing::info!(fork_point, old_tip, new_tip, "reorg: adjusting section queue and watermark");
+            DeliveryControl::Reorg {
+                fork_point,
+                old_tip,
+                new_tip,
+            } => {
+                tracing::info!(
+                    fork_point,
+                    old_tip,
+                    new_tip,
+                    "reorg: adjusting section queue and watermark"
+                );
 
                 // Nothing to drain. Since v0.8.0 a reorg cannot arrive between
                 // a block's application and its verification, because there is
@@ -1475,9 +1493,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 }
 
                 // Empty Inv: peer has no more headers
-                ProtocolMessage::Inv { modifier_type, .. }
-                    if modifier_type == HEADER_TYPE_ID =>
-                {
+                ProtocolMessage::Inv { modifier_type, .. } if modifier_type == HEADER_TYPE_ID => {
                     let height = self.chain.chain_height().await;
                     tracing::debug!(height, "peer reports no more headers");
                     EventResult::Synced
@@ -1487,7 +1503,11 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 ProtocolMessage::Inv { modifier_type, ids }
                     if is_block_section_type(modifier_type) && !ids.is_empty() =>
                 {
-                    tracing::debug!(type_id = modifier_type, count = ids.len(), "block section Inv → requesting");
+                    tracing::debug!(
+                        type_id = modifier_type,
+                        count = ids.len(),
+                        "block section Inv → requesting"
+                    );
                     self.request_announced(peer_id, modifier_type, ids).await;
                     EventResult::Continue
                 }
@@ -1511,7 +1531,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         if let Some(peer_tip) = peer_tip {
                             // Publish the max peer tip we've seen — main crate
                             // reads this for the bootstrap gap decision.
-                            let prev = self.peer_chain_tip
+                            let prev = self
+                                .peer_chain_tip
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             if peer_tip > prev {
                                 self.peer_chain_tip
@@ -1537,8 +1558,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         // peer = served from height 1. An empty own chain has
                         // nothing to serve. Runs even when `result` flips to
                         // Synced — a behind sync-peer still gets its Inv.
-                        let peer_strictly_ahead =
-                            peer_tip.is_some_and(|t| t > our_height);
+                        let peer_strictly_ahead = peer_tip.is_some_and(|t| t > our_height);
                         if our_height > 0 && !peer_strictly_ahead {
                             let anchors = sync_info_anchor_ids(&info);
                             let ids = self
@@ -1590,7 +1610,10 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     EventResult::Continue
                 }
 
-                ProtocolMessage::Inv { modifier_type, ref ids } => {
+                ProtocolMessage::Inv {
+                    modifier_type,
+                    ref ids,
+                } => {
                     tracing::debug!(
                         peer = %peer_id,
                         modifier_type,
@@ -1627,25 +1650,35 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     ) {
         // Re-request timed-out modifiers from a different peer
         if !result.retries.is_empty()
-            && self.block_request_gate.load(std::sync::atomic::Ordering::Relaxed)
+            && self
+                .block_request_gate
+                .load(std::sync::atomic::Ordering::Relaxed)
         {
             let peers = self.transport.outbound_peers().await;
             for retry in &result.retries {
-                let target = peers.iter()
+                let target = peers
+                    .iter()
                     .find(|&&p| p != retry.failed_peer)
                     .copied()
                     .unwrap_or(retry.failed_peer);
 
-                self.tracker.mark_requested(&[retry.id], target, retry.type_id);
-                let _ = self.transport.send_to(
-                    target,
-                    ProtocolMessage::ModifierRequest {
-                        modifier_type: retry.type_id,
-                        ids: vec![retry.id],
-                    },
-                ).await;
+                self.tracker
+                    .mark_requested(&[retry.id], target, retry.type_id);
+                let _ = self
+                    .transport
+                    .send_to(
+                        target,
+                        ProtocolMessage::ModifierRequest {
+                            modifier_type: retry.type_id,
+                            ids: vec![retry.id],
+                        },
+                    )
+                    .await;
             }
-            tracing::debug!(count = result.retries.len(), "re-requested timed-out modifiers");
+            tracing::debug!(
+                count = result.retries.len(),
+                "re-requested timed-out modifiers"
+            );
         }
 
         // Re-request evicted modifiers (LRU buffer evictions — headers only)
@@ -1670,7 +1703,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     async fn rerequest_from_any(&mut self, modifier_type: u8, ids: &[[u8; 32]]) {
         let peers = self.transport.outbound_peers().await;
         if let Some(&target) = peers.first() {
-            self.request_announced(target, modifier_type, ids.to_vec()).await;
+            self.request_announced(target, modifier_type, ids.to_vec())
+                .await;
             tracing::debug!(count = ids.len(), peer = %target, "re-requested modifiers");
         }
     }
@@ -1775,9 +1809,10 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         }
 
         // ── Storage reopen handshake (legacy, kept for digest-mode) ──
-        if let (Some(req_tx), Some(val_rx)) =
-            (self.at_tip_request_tx.take(), self.at_tip_validator_rx.take())
-        {
+        if let (Some(req_tx), Some(val_rx)) = (
+            self.at_tip_request_tx.take(),
+            self.at_tip_validator_rx.take(),
+        ) {
             if let Some(validator) = self.validator.take() {
                 let height = validator.validated_height();
                 // Persist any pending in-memory state BEFORE dropping. Without
@@ -1802,7 +1837,10 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     return;
                 }
                 drop(validator); // releases AVL storage so main can reopen it
-                tracing::info!(height, "at-tip: requesting validator rebuild with synced cache");
+                tracing::info!(
+                    height,
+                    "at-tip: requesting validator rebuild with synced cache"
+                );
                 if req_tx.send(height).is_err() {
                     tracing::error!("at-tip: failed to signal main; continuing without rebuild");
                     return;
@@ -1818,7 +1856,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         self.validator = Some(new_validator);
                     }
                     Err(_) => {
-                        tracing::error!("at-tip: validator rebuild channel closed; sync cannot proceed");
+                        tracing::error!(
+                            "at-tip: validator rebuild channel closed; sync cannot proceed"
+                        );
                     }
                 }
             }
@@ -1963,10 +2003,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             return;
         }
 
-        let window_end = std::cmp::min(
-            self.downloaded_height + Self::DOWNLOAD_WINDOW,
-            chain_height,
-        );
+        let window_end =
+            std::cmp::min(self.downloaded_height + Self::DOWNLOAD_WINDOW, chain_height);
 
         let mut by_type: HashMap<u8, Vec<[u8; 32]>> = HashMap::new();
         let mut total = 0usize;
@@ -2034,7 +2072,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         // Diagnostic: log SyncInfo content + first 40 hex bytes for wire analysis
         if let Ok(info) = self.chain.parse_sync_info(&body) {
             let heights = C::sync_info_heights(&info);
-            let hex_prefix: String = body.iter().take(40)
+            let hex_prefix: String = body
+                .iter()
+                .take(40)
                 .map(|b| format!("{:02x}", b))
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -2234,11 +2274,7 @@ mod cross_db_flush_tests {
             &self.digest
         }
 
-        fn reset_to(
-            &mut self,
-            _height: u32,
-            _digest: ADDigest,
-        ) -> Result<(), ValidationError> {
+        fn reset_to(&mut self, _height: u32, _digest: ADDigest) -> Result<(), ValidationError> {
             unimplemented!("not called in flush-ordering tests")
         }
 
@@ -2289,11 +2325,7 @@ mod cross_db_flush_tests {
             &self.digest
         }
 
-        fn reset_to(
-            &mut self,
-            _height: u32,
-            _digest: ADDigest,
-        ) -> Result<(), ValidationError> {
+        fn reset_to(&mut self, _height: u32, _digest: ADDigest) -> Result<(), ValidationError> {
             unimplemented!("not called in flush-ordering tests")
         }
 
@@ -2313,10 +2345,7 @@ mod cross_db_flush_tests {
         assert_eq!(outcome, FlushOutcome::Flushed(1_785_000));
         assert_eq!(
             store.calls(),
-            vec![
-                StoreCall::SetValidatedHeight(1_785_000),
-                StoreCall::Flush,
-            ],
+            vec![StoreCall::SetValidatedHeight(1_785_000), StoreCall::Flush,],
             "set_validated_height MUST precede store.flush() (cross-DB handshake ordering)"
         );
     }
@@ -2375,10 +2404,7 @@ mod cross_db_flush_tests {
         assert_eq!(outcome, FlushOutcome::NothingToPersist(1_785_000));
         assert_eq!(
             store.calls(),
-            vec![
-                StoreCall::SetValidatedHeight(1_785_000),
-                StoreCall::Flush,
-            ],
+            vec![StoreCall::SetValidatedHeight(1_785_000), StoreCall::Flush,],
             "nothing to persist is NOT the light-mode case — validated_height \
              MUST still be recorded, before store.flush()"
         );
@@ -2436,7 +2462,9 @@ mod shutdown_flush_tests {
 
     impl MockStore {
         fn new() -> Self {
-            Self { calls: Mutex::new(Vec::new()) }
+            Self {
+                calls: Mutex::new(Vec::new()),
+            }
         }
 
         fn calls(&self) -> Vec<StoreCall> {
@@ -2538,11 +2566,7 @@ mod shutdown_flush_tests {
             &self.digest
         }
 
-        fn reset_to(
-            &mut self,
-            _height: u32,
-            _digest: ADDigest,
-        ) -> Result<(), ValidationError> {
+        fn reset_to(&mut self, _height: u32, _digest: ADDigest) -> Result<(), ValidationError> {
             unreachable!("not called in shutdown-flush tests")
         }
 
@@ -2659,11 +2683,7 @@ mod shutdown_flush_tests {
             unreachable!("not called when state_type=Utxo")
         }
 
-        async fn is_better_nipopow(
-            &self,
-            _this: &[u8],
-            _than: &[u8],
-        ) -> Result<bool, ChainError> {
+        async fn is_better_nipopow(&self, _this: &[u8], _than: &[u8]) -> Result<bool, ChainError> {
             unreachable!("not called in shutdown-flush tests")
         }
 
@@ -2718,7 +2738,9 @@ mod shutdown_flush_tests {
             shutdown_rx,
         );
 
-        shutdown_tx.send(()).expect("sync must be polling shutdown_rx");
+        shutdown_tx
+            .send(())
+            .expect("sync must be polling shutdown_rx");
         sync.run().await;
 
         assert_eq!(
@@ -2728,10 +2750,7 @@ mod shutdown_flush_tests {
         );
         assert_eq!(
             sync.store.calls(),
-            vec![
-                StoreCall::SetValidatedHeight(1_785_000),
-                StoreCall::Flush,
-            ],
+            vec![StoreCall::SetValidatedHeight(1_785_000), StoreCall::Flush,],
             "shutdown_flush must mirror the end-of-sweep ordering: \
              set_validated_height(M) precedes store.flush(), where \
              M = validator.validated_height()"
@@ -2808,8 +2827,8 @@ mod blocks_to_keep_tests {
     use ergo_validation::{
         ApplyStateOutcome, BlockValidator, Parameters, StatePersistence, ValidationError,
     };
-    use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::sync::{Arc, Mutex};
 
     /// Mock store recording prune + min_height calls in addition to the
     /// flush-pair calls. Tests assert on the recorded sequence.
@@ -2869,22 +2888,18 @@ mod blocks_to_keep_tests {
             self.calls.lock().unwrap().push(StoreCall::Flush);
         }
 
-        async fn prune_below_height(
-            &self,
-            horizon: u32,
-            type_ids: &[u8],
-        ) -> Result<usize, String> {
-            self.calls.lock().unwrap().push(StoreCall::PruneBelowHeight {
-                horizon,
-                type_ids: type_ids.to_vec(),
-            });
+        async fn prune_below_height(&self, horizon: u32, type_ids: &[u8]) -> Result<usize, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(StoreCall::PruneBelowHeight {
+                    horizon,
+                    type_ids: type_ids.to_vec(),
+                });
             Ok(0)
         }
 
-        async fn min_height_present(
-            &self,
-            type_id: u8,
-        ) -> Result<Option<u32>, String> {
+        async fn min_height_present(&self, type_id: u8) -> Result<Option<u32>, String> {
             if type_id == BLOCK_TRANSACTIONS_TYPE_ID {
                 Ok(*self.min_block_txs_height.lock().unwrap())
             } else {
@@ -2930,11 +2945,7 @@ mod blocks_to_keep_tests {
             &self.digest
         }
 
-        fn reset_to(
-            &mut self,
-            _height: u32,
-            _digest: ADDigest,
-        ) -> Result<(), ValidationError> {
+        fn reset_to(&mut self, _height: u32, _digest: ADDigest) -> Result<(), ValidationError> {
             unreachable!("not called in blocks_to_keep tests")
         }
 
@@ -3077,11 +3088,7 @@ mod blocks_to_keep_tests {
             unreachable!()
         }
 
-        async fn is_better_nipopow(
-            &self,
-            _this: &[u8],
-            _than: &[u8],
-        ) -> Result<bool, ChainError> {
+        async fn is_better_nipopow(&self, _this: &[u8], _than: &[u8]) -> Result<bool, ChainError> {
             unreachable!()
         }
 
@@ -3135,9 +3142,7 @@ mod blocks_to_keep_tests {
 
     fn last_prune_call(calls: &[StoreCall]) -> Option<(u32, Vec<u8>)> {
         calls.iter().rev().find_map(|c| match c {
-            StoreCall::PruneBelowHeight { horizon, type_ids } => {
-                Some((*horizon, type_ids.clone()))
-            }
+            StoreCall::PruneBelowHeight { horizon, type_ids } => Some((*horizon, type_ids.clone())),
             _ => None,
         })
     }
@@ -3153,7 +3158,9 @@ mod blocks_to_keep_tests {
             config_with_keep(50),
             Some(FakeValidator::at(1000)),
             MockStore::new(),
-            FixedVotingLengthChain { voting_length: 1024 },
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
             shutdown_rx,
         );
 
@@ -3185,7 +3192,9 @@ mod blocks_to_keep_tests {
             config_with_keep(50),
             Some(FakeValidator::at(2500)),
             MockStore::new(),
-            FixedVotingLengthChain { voting_length: 1024 },
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
             shutdown_rx,
         );
 
@@ -3209,7 +3218,9 @@ mod blocks_to_keep_tests {
             config_with_keep(-1),
             Some(FakeValidator::at(1000)),
             MockStore::new(),
-            FixedVotingLengthChain { voting_length: 1024 },
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
             shutdown_rx,
         );
 
@@ -3279,7 +3290,9 @@ mod blocks_to_keep_tests {
         >::new(
             config_with_keep(50),
             HangingTransport,
-            FixedVotingLengthChain { voting_length: 1024 },
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
             MockStore::new(),
             Some(FailingValidator(FakeValidator::at(1000))),
             progress_rx,
@@ -3324,7 +3337,9 @@ mod blocks_to_keep_tests {
         >::new(
             config_with_keep(50),
             HangingTransport,
-            FixedVotingLengthChain { voting_length: 1024 },
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
             MockStore::new(),
             Some(NoPersistenceValidator(FakeValidator::at(1000))),
             progress_rx,
@@ -3361,7 +3376,9 @@ mod blocks_to_keep_tests {
             config_with_keep(100),
             Some(FakeValidator::at(1000)),
             MockStore::with_min_block_txs(1),
-            FixedVotingLengthChain { voting_length: 1024 },
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
             shutdown_rx,
         );
 
@@ -3386,7 +3403,9 @@ mod blocks_to_keep_tests {
             config_with_keep(100),
             Some(FakeValidator::at(1000)),
             MockStore::with_min_block_txs(901),
-            FixedVotingLengthChain { voting_length: 1024 },
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
             shutdown_rx,
         );
 
@@ -3407,7 +3426,9 @@ mod blocks_to_keep_tests {
             config_with_keep(-1),
             Some(FakeValidator::at(1000)),
             MockStore::with_min_block_txs(1),
-            FixedVotingLengthChain { voting_length: 1024 },
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
             shutdown_rx,
         );
 
@@ -3429,7 +3450,9 @@ mod blocks_to_keep_tests {
             config_with_keep(100),
             None,
             MockStore::with_min_block_txs(1),
-            FixedVotingLengthChain { voting_length: 1024 },
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
             shutdown_rx,
         );
 
@@ -3575,7 +3598,10 @@ mod sweep_resume_tests {
             }
             let expected = self.validated_height + 1;
             if header.height != expected {
-                return Err(ValidationError::HeightMismatch { expected, got: header.height });
+                return Err(ValidationError::HeightMismatch {
+                    expected,
+                    got: header.height,
+                });
             }
             self.validated_height = header.height;
             self.applied.push(header.height);
@@ -3800,7 +3826,11 @@ mod sweep_resume_tests {
             "sweep MUST resume at applied_tip+1 (2666) and apply consecutively, \
              not skip to the stale cache height"
         );
-        assert_eq!(v.validated_height(), 2670, "validator advanced to the downloaded tip");
+        assert_eq!(
+            v.validated_height(),
+            2670,
+            "validator advanced to the downloaded tip"
+        );
         assert_eq!(
             sync.state_applied_height, 2670,
             "cache reconciled to the validator's true tip — no lingering desync"
@@ -3819,7 +3849,10 @@ mod sweep_resume_tests {
         sync.advance_state_applied_height().await;
 
         let v = sync.validator.as_ref().unwrap();
-        assert!(v.applied.is_empty(), "no blocks past the applied tip — nothing to apply");
+        assert!(
+            v.applied.is_empty(),
+            "no blocks past the applied tip — nothing to apply"
+        );
         assert_eq!(
             sync.state_applied_height, 2665,
             "stale-ahead cache reconciled down to the validator tip"
@@ -3851,7 +3884,10 @@ mod sweep_resume_tests {
             vec![2668, 2669, 2670],
             "sweep re-applies from the rolled-back tip + 1, not from the stale cache"
         );
-        assert_eq!(sync.state_applied_height, 2670, "cache back in sync with the prover");
+        assert_eq!(
+            sync.state_applied_height, 2670,
+            "cache back in sync with the prover"
+        );
     }
 
     #[tokio::test]
@@ -3859,25 +3895,35 @@ mod sweep_resume_tests {
         // Successful reorg rollback: validator rolls to the fork point, the
         // state watermark follows, and the handler's immediate rescan
         // re-applies the new branch's on-disk blocks from fork_point + 1.
-        let mut sync =
-            build_sync_with_chain(SweepValidator::at(2670), SweepChain::at_tip(2670));
+        let mut sync = build_sync_with_chain(SweepValidator::at(2670), SweepChain::at_tip(2670));
         sync.state_applied_height = 2670;
         sync.downloaded_height = 2670;
 
         sync.handle_control_event(
-            DeliveryControl::Reorg { fork_point: 2667, old_tip: 2670, new_tip: 2670 },
+            DeliveryControl::Reorg {
+                fork_point: 2667,
+                old_tip: 2670,
+                new_tip: 2670,
+            },
             PeerId(0),
         )
         .await;
 
         let v = sync.validator.as_ref().unwrap();
-        assert_eq!(v.resets, vec![2667], "validator rolled back to the fork point");
+        assert_eq!(
+            v.resets,
+            vec![2667],
+            "validator rolled back to the fork point"
+        );
         assert_eq!(
             v.applied,
             vec![2668, 2669, 2670],
             "rescan re-applied the new branch from fork_point + 1"
         );
-        assert_eq!(sync.state_applied_height, 2670, "sweep re-advanced after the rollback");
+        assert_eq!(
+            sync.state_applied_height, 2670,
+            "sweep re-advanced after the rollback"
+        );
     }
 
     #[tokio::test]
@@ -3896,7 +3942,11 @@ mod sweep_resume_tests {
         sync.downloaded_height = 2670;
 
         sync.handle_control_event(
-            DeliveryControl::Reorg { fork_point: 2667, old_tip: 2670, new_tip: 2670 },
+            DeliveryControl::Reorg {
+                fork_point: 2667,
+                old_tip: 2670,
+                new_tip: 2670,
+            },
             PeerId(0),
         )
         .await;
@@ -3904,8 +3954,14 @@ mod sweep_resume_tests {
         let v = sync.validator.as_ref().unwrap();
         assert_eq!(v.resets, vec![2667], "rollback was attempted");
         assert_eq!(v.validated_height(), 2670, "validator unmoved on Err");
-        assert!(v.applied.is_empty(), "nothing re-applied onto un-rolled state");
-        assert_eq!(sync.state_applied_height, 2670, "state watermark NOT retreated");
+        assert!(
+            v.applied.is_empty(),
+            "nothing re-applied onto un-rolled state"
+        );
+        assert_eq!(
+            sync.state_applied_height, 2670,
+            "state watermark NOT retreated"
+        );
     }
 
     #[tokio::test]
@@ -3921,13 +3977,21 @@ mod sweep_resume_tests {
         // First sweep: one attempt at 2666, it stalls, the tip stays pinned,
         // and the backoff arms at attempt 1.
         sync.advance_state_applied_height().await;
-        assert_eq!(sync.validator.as_ref().unwrap().attempts, 1, "sweep made one attempt");
+        assert_eq!(
+            sync.validator.as_ref().unwrap().attempts,
+            1,
+            "sweep made one attempt"
+        );
         assert_eq!(
             sync.validator.as_ref().unwrap().validated_height(),
             2665,
             "deterministic failure left the tip pinned"
         );
-        assert_eq!(sync.sweep_backoff.consecutive(), 1, "non-advancing sweep armed the backoff");
+        assert_eq!(
+            sync.sweep_backoff.consecutive(),
+            1,
+            "non-advancing sweep armed the backoff"
+        );
 
         // Immediate re-entry, well inside the backoff window: the gate must
         // short-circuit the sweep — no second apply_state attempt, no
@@ -3939,7 +4003,11 @@ mod sweep_resume_tests {
             1,
             "gate suppressed the retry inside the backoff window"
         );
-        assert_eq!(sync.sweep_backoff.consecutive(), 1, "still attempt 1 — no fresh stall recorded");
+        assert_eq!(
+            sync.sweep_backoff.consecutive(),
+            1,
+            "still attempt 1 — no fresh stall recorded"
+        );
     }
 
     #[tokio::test]
@@ -3957,7 +4025,11 @@ mod sweep_resume_tests {
             2670,
             "healthy sweep caught up to the downloaded tip"
         );
-        assert_eq!(sync.sweep_backoff.consecutive(), 0, "progress arms no backoff");
+        assert_eq!(
+            sync.sweep_backoff.consecutive(),
+            0,
+            "progress arms no backoff"
+        );
     }
 
     // ---- journal-event conformance (`../facts/journal-events.md`) ----
@@ -3998,13 +4070,25 @@ mod sweep_resume_tests {
     fn has_field_rejects_a_renamed_or_truncated_field() {
         // The self-check for the assertion helper: without it these three all
         // look like a present `height=1785500`.
-        assert!(has_field(" INFO chain tip reached height=1785500", "height", "1785500"));
+        assert!(has_field(
+            " INFO chain tip reached height=1785500",
+            "height",
+            "1785500"
+        ));
         assert!(
-            !has_field(" INFO chain tip reached tip_height=1785500", "height", "1785500"),
+            !has_field(
+                " INFO chain tip reached tip_height=1785500",
+                "height",
+                "1785500"
+            ),
             "a renamed field must not satisfy the assertion"
         );
         assert!(
-            !has_field(" INFO chain tip reached height=17855001", "height", "1785500"),
+            !has_field(
+                " INFO chain tip reached height=17855001",
+                "height",
+                "1785500"
+            ),
             "a different value must not satisfy the assertion"
         );
     }
@@ -4028,7 +4112,11 @@ mod sweep_resume_tests {
         let output = capture_async(
             LevelFilter::ERROR,
             sync.handle_control_event(
-                DeliveryControl::Reorg { fork_point: 2668, old_tip: 2670, new_tip: 2671 },
+                DeliveryControl::Reorg {
+                    fork_point: 2668,
+                    old_tip: 2670,
+                    new_tip: 2671,
+                },
                 PeerId(0),
             ),
         )
@@ -4046,9 +4134,7 @@ mod sweep_resume_tests {
         // passed, because it was matching its own `info!()` rather than the
         // emit. The contract says "Display-formatted"; this is what that is.
         assert!(
-            output.contains(
-                "error=UTXO state operation failed: rollback to height 2668 failed"
-            ),
+            output.contains("error=UTXO state operation failed: rollback to height 2668 failed"),
             "missing the Display-formatted underlying error: {output}"
         );
     }
@@ -4063,11 +4149,7 @@ mod sweep_resume_tests {
         let mut sync = build_sync(SweepValidator::at(1000));
         sync.downloaded_height = 1150;
 
-        let output = capture_async(
-            LevelFilter::INFO,
-            sync.advance_state_applied_height(),
-        )
-        .await;
+        let output = capture_async(LevelFilter::INFO, sync.advance_state_applied_height()).await;
 
         assert!(
             output.contains("VALIDATION SWEEP STARTED"),
@@ -4111,10 +4193,8 @@ mod sweep_resume_tests {
     /// and returns. The emit is above the loop, so it has already fired.
     #[tokio::test]
     async fn journal_chain_tip_reached_conforms() {
-        let mut sync = build_sync_with_chain(
-            SweepValidator::at(1_785_500),
-            SweepChain::at_tip(1_785_500),
-        );
+        let mut sync =
+            build_sync_with_chain(SweepValidator::at(1_785_500), SweepChain::at_tip(1_785_500));
         sync.downloaded_height = 1_785_500;
 
         let output = capture_async(LevelFilter::INFO, sync.synced()).await;
@@ -4214,7 +4294,9 @@ mod serve_continuation_tests {
 
     impl ServeChain {
         fn new() -> Self {
-            Self { continuation_calls: AtomicU32::new(0) }
+            Self {
+                continuation_calls: AtomicU32::new(0),
+            }
         }
     }
 
@@ -4231,7 +4313,9 @@ mod serve_continuation_tests {
         }
 
         async fn header_at(&self, height: u32) -> Option<Header> {
-            (1..=TIP).contains(&height).then(|| test_header(height, block_id_at(height)))
+            (1..=TIP)
+                .contains(&height)
+                .then(|| test_header(height, block_id_at(height)))
         }
 
         async fn header_state_root(&self, _height: u32) -> Option<[u8; 33]> {
@@ -4258,11 +4342,7 @@ mod serve_continuation_tests {
             Ok(SyncInfo::V2 { headers })
         }
 
-        async fn continuation_ids(
-            &self,
-            peer_last_ids: &[BlockId],
-            limit: usize,
-        ) -> Vec<[u8; 32]> {
+        async fn continuation_ids(&self, peer_last_ids: &[BlockId], limit: usize) -> Vec<[u8; 32]> {
             self.continuation_calls.fetch_add(1, Ordering::Relaxed);
             let common = if peer_last_ids.is_empty() {
                 0 // fresh peer — serve from height 1
@@ -4311,11 +4391,7 @@ mod serve_continuation_tests {
             unreachable!("not called in serve tests")
         }
 
-        async fn is_better_nipopow(
-            &self,
-            _this: &[u8],
-            _than: &[u8],
-        ) -> Result<bool, ChainError> {
+        async fn is_better_nipopow(&self, _this: &[u8], _than: &[u8]) -> Result<bool, ChainError> {
             unreachable!("not called in serve tests")
         }
 
@@ -4406,11 +4482,7 @@ mod serve_continuation_tests {
         fn current_digest(&self) -> &ADDigest {
             unreachable!("not called in serve tests")
         }
-        fn reset_to(
-            &mut self,
-            _height: u32,
-            _digest: ADDigest,
-        ) -> Result<(), ValidationError> {
+        fn reset_to(&mut self, _height: u32, _digest: ADDigest) -> Result<(), ValidationError> {
             unreachable!("not called in serve tests")
         }
         fn state_persistence(&self) -> Option<&dyn StatePersistence> {
@@ -4432,7 +4504,9 @@ mod serve_continuation_tests {
         let (_dd_tx, delivery_data_rx) = mpsc::channel::<DeliveryData>(1);
         let sync = HeaderSync::new(
             SyncConfig::default(),
-            RecordingTransport { sent: Arc::clone(&sent) },
+            RecordingTransport {
+                sent: Arc::clone(&sent),
+            },
             ServeChain::new(),
             NoopStore,
             None,
@@ -4468,9 +4542,7 @@ mod serve_continuation_tests {
             .unwrap()
             .iter()
             .filter_map(|(p, m)| match m {
-                ProtocolMessage::Inv { modifier_type, ids }
-                    if *modifier_type == HEADER_TYPE_ID =>
-                {
+                ProtocolMessage::Inv { modifier_type, ids } if *modifier_type == HEADER_TYPE_ID => {
                     Some((*p, ids.clone()))
                 }
                 _ => None,
@@ -4479,15 +4551,11 @@ mod serve_continuation_tests {
     }
 
     /// Recipients of every SyncInfo recorded by the transport, in send order.
-    fn sent_sync_info_peers(
-        sent: &Mutex<Vec<(PeerId, ProtocolMessage)>>,
-    ) -> Vec<PeerId> {
+    fn sent_sync_info_peers(sent: &Mutex<Vec<(PeerId, ProtocolMessage)>>) -> Vec<PeerId> {
         sent.lock()
             .unwrap()
             .iter()
-            .filter_map(|(p, m)| {
-                matches!(m, ProtocolMessage::SyncInfo { .. }).then_some(*p)
-            })
+            .filter_map(|(p, m)| matches!(m, ProtocolMessage::SyncInfo { .. }).then_some(*p))
             .collect()
     }
 
@@ -4505,7 +4573,11 @@ mod serve_continuation_tests {
 
         assert!(matches!(result, EventResult::Continue));
         let invs = sent_header_invs(&sent);
-        assert_eq!(invs.len(), 1, "fresh peer must receive exactly one header Inv");
+        assert_eq!(
+            invs.len(),
+            1,
+            "fresh peer must receive exactly one header Inv"
+        );
         let (to, ids) = &invs[0];
         assert_eq!(*to, fresh_peer, "Inv goes to the SyncInfo sender");
         assert_eq!(ids.len(), 400, "continuation capped at 400 (JVM size)");
@@ -4534,7 +4606,10 @@ mod serve_continuation_tests {
         let (to, ids) = &invs[0];
         assert_eq!(*to, SYNC_PEER);
         let expected: Vec<[u8; 32]> = (451..=TIP).map(id_at).collect();
-        assert_eq!(*ids, expected, "ids ascend from the newest anchor + 1 to our tip");
+        assert_eq!(
+            *ids, expected,
+            "ids ascend from the newest anchor + 1 to our tip"
+        );
     }
 
     #[tokio::test]

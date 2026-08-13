@@ -1,6 +1,6 @@
-use std::time::{Duration, Instant};
 use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
+use std::time::{Duration, Instant};
 
 /// Read-only access to the UTXO set for transaction validation.
 ///
@@ -35,7 +35,10 @@ pub enum ProcessingOutcome {
     /// Transaction accepted and added to the pool.
     Accepted { tx_id: [u8; 32] },
     /// Transaction replaced one or more double-spending transactions.
-    Replaced { tx_id: [u8; 32], removed: Vec<[u8; 32]> },
+    Replaced {
+        tx_id: [u8; 32],
+        removed: Vec<[u8; 32]>,
+    },
     /// Transaction rejected — higher-fee txs already spend the same inputs.
     DoubleSpendLoser { winner_ids: Vec<[u8; 32]> },
     /// Transaction temporarily declined — may succeed later.

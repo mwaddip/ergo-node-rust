@@ -182,9 +182,18 @@ mod tests {
         // msg/pk stay quoted hex strings, h stays a bare number. (proof
         // omission is asserted separately in basic_candidate_omits_proof.)
         let json = serde_json::to_string(&work_with_b("12237864960")).unwrap();
-        assert!(json.contains(r#""msg":"0000"#), "msg must stay a hex string: {json}");
-        assert!(json.contains(r#""pk":"0211"#), "pk must stay a hex string: {json}");
-        assert!(json.contains(r#""h":271235"#), "h must stay a bare number: {json}");
+        assert!(
+            json.contains(r#""msg":"0000"#),
+            "msg must stay a hex string: {json}"
+        );
+        assert!(
+            json.contains(r#""pk":"0211"#),
+            "pk must stay a hex string: {json}"
+        );
+        assert!(
+            json.contains(r#""h":271235"#),
+            "h must stay a bare number: {json}"
+        );
     }
 
     #[test]
@@ -211,7 +220,10 @@ mod tests {
 
         // The four expected keys are present, b still bare.
         assert!(json.contains(r#""msg":"#), "msg present: {json}");
-        assert!(json.contains(r#""b":12237864960"#), "b present and bare: {json}");
+        assert!(
+            json.contains(r#""b":12237864960"#),
+            "b present and bare: {json}"
+        );
         assert!(json.contains(r#""h":271235"#), "h present: {json}");
         assert!(json.contains(r#""pk":"#), "pk present: {json}");
 
@@ -220,8 +232,14 @@ mod tests {
         // object + one per key + one per scalar value = 1 + 4 + 4 = 9 <= 11.
         // Assert exactly four scalar fields and no nesting.
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let obj = value.as_object().expect("WorkMessage serializes to a JSON object");
-        assert_eq!(obj.len(), 4, "basic candidate must have exactly 4 keys: {json}");
+        let obj = value
+            .as_object()
+            .expect("WorkMessage serializes to a JSON object");
+        assert_eq!(
+            obj.len(),
+            4,
+            "basic candidate must have exactly 4 keys: {json}"
+        );
         assert!(
             obj.values().all(|v| !v.is_object() && !v.is_array()),
             "no nested objects/arrays in the basic candidate: {json}"

@@ -135,7 +135,10 @@ mod tests {
                 "a fresh reporter has nothing to wait for"
             );
         });
-        assert!(output.contains("catch-up progress"), "missing marker: {output}");
+        assert!(
+            output.contains("catch-up progress"),
+            "missing marker: {output}"
+        );
     }
 
     #[test]
@@ -207,7 +210,10 @@ mod tests {
                 "a zero-block sweep is not catch-up either"
             );
         });
-        assert!(!output.contains("catch-up progress"), "tip sweeps emitted: {output}");
+        assert!(
+            !output.contains("catch-up progress"),
+            "tip sweeps emitted: {output}"
+        );
     }
 
     #[test]
@@ -297,7 +303,11 @@ mod tests {
             }
             assert_eq!(calls.get(), 1, "gated calls must not touch the probe");
             r.maybe_emit(t0, 1, 1_000, probe);
-            assert_eq!(calls.get(), 1, "a tip sweep must not touch the probe either");
+            assert_eq!(
+                calls.get(),
+                1,
+                "a tip sweep must not touch the probe either"
+            );
         });
     }
 }

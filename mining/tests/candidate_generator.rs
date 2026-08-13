@@ -27,16 +27,22 @@ const FOUNDER_PKS: &[&str] = &[
     "0352ac2a471339b0d23b3d2c5ce0db0e81c969f77891b9edf0bda7fd39a78184e7",
 ];
 const PROOFS: &[&str] = &[
-    "test-proof-1", "test-proof-2", "test-proof-3",
-    "test-proof-4", "test-proof-5",
+    "test-proof-1",
+    "test-proof-2",
+    "test-proof-3",
+    "test-proof-4",
+    "test-proof-5",
 ];
 
 fn founder_pks() -> Vec<ProveDlog> {
-    FOUNDER_PKS.iter().map(|hex_str| {
-        let bytes = hex::decode(hex_str).unwrap();
-        let point = EcPoint::sigma_parse_bytes(&bytes).unwrap();
-        ProveDlog::new(point)
-    }).collect()
+    FOUNDER_PKS
+        .iter()
+        .map(|hex_str| {
+            let bytes = hex::decode(hex_str).unwrap();
+            let point = EcPoint::sigma_parse_bytes(&bytes).unwrap();
+            ProveDlog::new(point)
+        })
+        .collect()
 }
 
 fn test_miner_pk() -> ProveDlog {
@@ -78,9 +84,7 @@ fn test_config() -> MinerConfig {
     }
 }
 
-fn mock_proofs(
-    _txs: &[ergo_lib::chain::transaction::Transaction],
-) -> ValidatorProofsResult {
+fn mock_proofs(_txs: &[ergo_lib::chain::transaction::Transaction]) -> ValidatorProofsResult {
     Some(Ok((vec![0u8; 64], ADDigest::from([0u8; 33]))))
 }
 
@@ -150,7 +154,8 @@ fn cached_work_returns_same_result_within_ttl() {
 
     // Multiple polls at the same tip height should return the cached work
     for _ in 0..20 {
-        let w = gen.cached_work(parent.height)
+        let w = gen
+            .cached_work(parent.height)
             .expect("should return cached work");
         assert_eq!(w.h, work.h);
         assert_eq!(w.msg, work.msg);
@@ -184,7 +189,10 @@ fn cached_work_returns_none_after_ttl_expires() {
     gen.cache_candidate(block, work, parent.height);
 
     std::thread::sleep(Duration::from_millis(5));
-    assert!(gen.cached_work(parent.height).is_none(), "should expire after TTL");
+    assert!(
+        gen.cached_work(parent.height).is_none(),
+        "should expire after TTL"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +228,9 @@ fn stale_solution_accepted_after_regeneration() {
     gen.cache_candidate(block2, work2, parent.height);
 
     // The previous candidate should still be accessible
-    let prev = gen.previous_block().expect("previous candidate should exist");
+    let prev = gen
+        .previous_block()
+        .expect("previous candidate should exist");
     assert_eq!(prev.timestamp, block1.timestamp);
 
     // Solution for the OLD candidate should still validate
@@ -356,10 +366,7 @@ fn mined_block_advances_emission_box() {
     let reward_2 = emission_rules.miners_reward_at_height(2);
     let reward_3 = emission_rules.miners_reward_at_height(3);
     let original_value = emission_box.value.as_i64();
-    assert_eq!(
-        new_emission_box.value.as_i64(),
-        original_value - reward_2,
-    );
+    assert_eq!(new_emission_box.value.as_i64(), original_value - reward_2,);
     let final_emission_box = candidate_3.transactions[0].outputs.get(0).unwrap();
     assert_eq!(
         final_emission_box.value.as_i64(),
@@ -396,7 +403,10 @@ fn on_block_applied_own_block_drops_slots_and_clears_latch() {
     gen.on_block_applied(&solved.id, solved.height);
     assert!(gen.cached_block().is_none(), "current must be dropped");
     assert!(gen.previous_block().is_none(), "previous must be dropped");
-    assert!(!gen.solved_pending(), "latch must clear on own block applied");
+    assert!(
+        !gen.solved_pending(),
+        "latch must clear on own block applied"
+    );
 }
 
 #[test]
@@ -492,7 +502,10 @@ fn solved_latch_survives_application_below_latch_height() {
     // Reorg re-application below the latched height must not clear the
     // latch — our solved block's height has not been reached yet.
     gen.on_block_applied(&block_id(0x01), 9);
-    assert!(gen.solved_pending(), "latch must survive lower-height application");
+    assert!(
+        gen.solved_pending(),
+        "latch must survive lower-height application"
+    );
 }
 
 #[test]

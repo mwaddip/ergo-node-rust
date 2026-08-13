@@ -27,12 +27,10 @@ pub fn verify_pow(header: &Header) -> Result<(), ChainError> {
     let decoded_n_bits = decode_compact_bits(header.n_bits);
     let target = order_bigint() / decoded_n_bits;
 
-    let hit_bigint = hit
-        .to_bigint()
-        .ok_or(ChainError::PowInvalid {
-            hit: format!("{hit}"),
-            target: format!("{target}"),
-        })?;
+    let hit_bigint = hit.to_bigint().ok_or(ChainError::PowInvalid {
+        hit: format!("{hit}"),
+        target: format!("{target}"),
+    })?;
 
     if hit_bigint < target {
         Ok(())

@@ -48,9 +48,9 @@ pub fn compute_state_changes(
     for summary in &tx_summaries {
         for &input_id in &summary.input_ids {
             if !spent.insert(input_id) {
-                return Err(ValidationError::IntraBlockDoubleSpend(
-                    hex::encode(input_id),
-                ));
+                return Err(ValidationError::IntraBlockDoubleSpend(hex::encode(
+                    input_id,
+                )));
             }
             if created.contains(&input_id) {
                 // Intra-block: output created by earlier tx, now spent — net-zero
@@ -114,20 +114,20 @@ pub fn transactions_to_summaries(
             .map(|dis| dis.iter().map(|di| box_id_to_bytes(&di.box_id)).collect())
             .unwrap_or_default();
 
-        let output_entries: Vec<([u8; 32], Vec<u8>)> = tx
-            .outputs
-            .iter()
-            .map(|output| {
-                let id = box_id_to_bytes(&output.box_id());
-                let box_bytes = output.sigma_serialize_bytes().map_err(|e| {
-                    ValidationError::SectionParse {
-                        section_type: 102,
-                        reason: format!("output serialization: {e}"),
-                    }
-                })?;
-                Ok((id, box_bytes))
-            })
-            .collect::<Result<Vec<_>, ValidationError>>()?;
+        let output_entries: Vec<([u8; 32], Vec<u8>)> =
+            tx.outputs
+                .iter()
+                .map(|output| {
+                    let id = box_id_to_bytes(&output.box_id());
+                    let box_bytes = output.sigma_serialize_bytes().map_err(|e| {
+                        ValidationError::SectionParse {
+                            section_type: 102,
+                            reason: format!("output serialization: {e}"),
+                        }
+                    })?;
+                    Ok((id, box_bytes))
+                })
+                .collect::<Result<Vec<_>, ValidationError>>()?;
 
         summaries.push(TxSummary {
             input_ids,

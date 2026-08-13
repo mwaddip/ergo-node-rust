@@ -192,7 +192,13 @@ impl Router {
             HashSet::new(),
         )
         .expect("MemoryPeerStorage::load_all is infallible");
-        Self::with_peer_db(Arc::new(StdMutex::new(peer_db)), blacklist, 64, network, true)
+        Self::with_peer_db(
+            Arc::new(StdMutex::new(peer_db)),
+            blacklist,
+            64,
+            network,
+            true,
+        )
     }
 
     /// Construct a router with an externally-owned PeerDb + Blacklist.
@@ -586,9 +592,7 @@ impl Router {
                             // PeerSynchronizer.addNewPeers → AddPeerIfEmpty
                             // never penalizes here. Non-bogus entries from the
                             // same body are recorded regardless.
-                            if self.filter_bogus_addresses
-                                && is_bogus_address(addr, self.network)
-                            {
+                            if self.filter_bogus_addresses && is_bogus_address(addr, self.network) {
                                 continue;
                             }
                             if self.blacklist.contains(addr) {
@@ -1390,7 +1394,10 @@ mod tests {
             } => {
                 assert_eq!(*target, source, "response goes straight to the requester");
                 assert_eq!(*modifier_type, 101);
-                assert_eq!(modifiers.as_slice(), &[(mid(0xAA), b"header-bytes".to_vec())]);
+                assert_eq!(
+                    modifiers.as_slice(),
+                    &[(mid(0xAA), b"header-bytes".to_vec())]
+                );
             }
             other => panic!("expected direct ModifierResponse, got {other:?}"),
         }
@@ -1648,7 +1655,9 @@ mod tests {
         );
         let actions = router.handle_event(ProtocolEvent::Message {
             peer_id: source,
-            message: ProtocolMessage::SyncInfo { body: vec![1, 2, 3] },
+            message: ProtocolMessage::SyncInfo {
+                body: vec![1, 2, 3],
+            },
         });
         assert!(actions.is_empty(), "SyncInfo from Light source dropped");
     }
@@ -1680,9 +1689,7 @@ mod tests {
                 Action::Send {
                     target,
                     message: ProtocolMessage::ModifierResponse { modifiers, .. },
-                } if *target == source => {
-                    Some(modifiers.iter().map(|(id, _)| *id).collect())
-                }
+                } if *target == source => Some(modifiers.iter().map(|(id, _)| *id).collect()),
                 _ => None,
             })
             .collect();

@@ -50,8 +50,14 @@ mod parse_tests {
         // fills pow_onetime_pk with the group generator — matching the JVM
         // (`wForV2 = CryptoConstants.dlogGroup.generator`) — while pow_distance
         // stays None.
-        assert_eq!(parsed.autolykos_solution.miner_pk, from_json.autolykos_solution.miner_pk);
-        assert_eq!(parsed.autolykos_solution.nonce, from_json.autolykos_solution.nonce);
+        assert_eq!(
+            parsed.autolykos_solution.miner_pk,
+            from_json.autolykos_solution.miner_pk
+        );
+        assert_eq!(
+            parsed.autolykos_solution.nonce,
+            from_json.autolykos_solution.nonce
+        );
         assert_eq!(
             parsed.autolykos_solution.pow_onetime_pk,
             Some(Box::new(ergo_chain_types::ec_point::generator()))
@@ -94,7 +100,10 @@ mod parse_tests {
         assert_eq!(parsed.version, 1);
         assert_eq!(parsed.height, 3132);
         assert_eq!(parsed.id, from_json.id);
-        assert_eq!(parsed.autolykos_solution.pow_distance, from_json.autolykos_solution.pow_distance);
+        assert_eq!(
+            parsed.autolykos_solution.pow_distance,
+            from_json.autolykos_solution.pow_distance
+        );
         assert!(parsed.autolykos_solution.pow_onetime_pk.is_some());
     }
 
@@ -334,12 +343,7 @@ mod chain_tests {
     use sigma_ser::ScorexSerializable;
 
     /// Build a header with a computed ID. For chain tests — no real PoW.
-    fn make_chain_header(
-        height: u32,
-        parent_id: BlockId,
-        timestamp: u64,
-        n_bits: u32,
-    ) -> Header {
+    fn make_chain_header(height: u32, parent_id: BlockId, timestamp: u64, n_bits: u32) -> Header {
         let zero32 = Digest32::zero();
         let mut header = Header {
             version: 2,
@@ -418,7 +422,12 @@ mod chain_tests {
         let config = testnet_config();
         let mut chain = HeaderChain::new(config.clone());
         // Genesis with non-zero parent
-        let bad = make_chain_header(1, BlockId(Digest32::from([1u8; 32])), 1_000_000, config.initial_n_bits);
+        let bad = make_chain_header(
+            1,
+            BlockId(Digest32::from([1u8; 32])),
+            1_000_000,
+            config.initial_n_bits,
+        );
 
         let err = chain.try_append_no_pow(bad).unwrap_err();
         assert!(matches!(err, ChainError::InvalidGenesisParent { .. }));
@@ -448,9 +457,10 @@ mod chain_tests {
     fn reject_genesis_wrong_id() {
         // Build a config with a specific genesis ID requirement
         let mut config = testnet_config();
-        let expected_id: BlockId = "b0244dfc267baca974a4caee06120321562784303a8a688976ae56170e4d175b"
-            .parse()
-            .unwrap();
+        let expected_id: BlockId =
+            "b0244dfc267baca974a4caee06120321562784303a8a688976ae56170e4d175b"
+                .parse()
+                .unwrap();
         config.genesis_id = Some(expected_id);
 
         let mut chain = HeaderChain::new(config.clone());
@@ -487,7 +497,12 @@ mod chain_tests {
         chain.try_append_no_pow(genesis).unwrap();
 
         // Child pointing to a non-existent parent
-        let bad = make_chain_header(2, BlockId(Digest32::from([0xAB; 32])), 2_000_000, config.initial_n_bits);
+        let bad = make_chain_header(
+            2,
+            BlockId(Digest32::from([0xAB; 32])),
+            2_000_000,
+            config.initial_n_bits,
+        );
         let err = chain.try_append_no_pow(bad).unwrap_err();
         assert!(matches!(err, ChainError::ParentNotFound { .. }));
     }
@@ -546,13 +561,17 @@ mod chain_tests {
         for h in 2..=10 {
             let tip = chain.tip();
             let expected_n_bits = crate::difficulty::expected_difficulty(&tip, &chain).unwrap();
-            let header = make_chain_header(h, tip.id, 1_000_000 + h as u64 * 45_000, expected_n_bits);
+            let header =
+                make_chain_header(h, tip.id, 1_000_000 + h as u64 * 45_000, expected_n_bits);
             chain.try_append_no_pow(header).unwrap();
         }
 
         let existing = chain.header_at(5).unwrap().clone();
         let result = chain.try_append_no_pow(existing).unwrap();
-        assert!(matches!(result, crate::AppendResult::Forked { fork_height: 4 }));
+        assert!(matches!(
+            result,
+            crate::AppendResult::Forked { fork_height: 4 }
+        ));
         assert_eq!(chain.height(), 10, "chain should be unchanged");
     }
 
@@ -568,14 +587,23 @@ mod chain_tests {
         for h in 2..=10 {
             let tip = chain.tip();
             let expected_n_bits = crate::difficulty::expected_difficulty(&tip, &chain).unwrap();
-            let header = make_chain_header(h, tip.id, 1_000_000 + h as u64 * 45_000, expected_n_bits);
+            let header =
+                make_chain_header(h, tip.id, 1_000_000 + h as u64 * 45_000, expected_n_bits);
             chain.try_append_no_pow(header).unwrap();
         }
 
         let mid_header = chain.header_at(5).unwrap();
-        let fork_child = make_chain_header(6, mid_header.id, mid_header.timestamp + 1000, config.initial_n_bits);
+        let fork_child = make_chain_header(
+            6,
+            mid_header.id,
+            mid_header.timestamp + 1000,
+            config.initial_n_bits,
+        );
         let result = chain.try_append_no_pow(fork_child).unwrap();
-        assert!(matches!(result, crate::AppendResult::Forked { fork_height: 5 }));
+        assert!(matches!(
+            result,
+            crate::AppendResult::Forked { fork_height: 5 }
+        ));
         assert_eq!(chain.height(), 10, "chain should be unchanged");
     }
 
@@ -663,15 +691,9 @@ mod chain_tests {
         // approximately the same (the actual result depends on the linear regression
         // with only one epoch of data, which returns the same difficulty).
         let parent = chain.tip();
-        let expected_n_bits =
-            crate::difficulty::expected_difficulty(&parent, &chain).unwrap();
+        let expected_n_bits = crate::difficulty::expected_difficulty(&parent, &chain).unwrap();
 
-        let header129 = make_chain_header(
-            129,
-            prev_id,
-            1_000_000 + 128 * 45_000,
-            expected_n_bits,
-        );
+        let header129 = make_chain_header(129, prev_id, 1_000_000 + 128 * 45_000, expected_n_bits);
         assert!(chain.try_append_no_pow(header129).is_ok());
         assert_eq!(chain.height(), 129);
     }
@@ -683,13 +705,14 @@ mod reorg_tests {
     use ergo_chain_types::*;
     use sigma_ser::ScorexSerializable;
 
-    fn make_chain_header(
-        height: u32,
-        parent_id: BlockId,
-        timestamp: u64,
-        n_bits: u32,
-    ) -> Header {
-        make_chain_header_with_nonce(height, parent_id, timestamp, n_bits, height.to_be_bytes().repeat(2))
+    fn make_chain_header(height: u32, parent_id: BlockId, timestamp: u64, n_bits: u32) -> Header {
+        make_chain_header_with_nonce(
+            height,
+            parent_id,
+            timestamp,
+            n_bits,
+            height.to_be_bytes().repeat(2),
+        )
     }
 
     /// Build a header with a specific nonce — different nonces at the same
@@ -733,7 +756,12 @@ mod reorg_tests {
     }
 
     fn make_genesis(config: &ChainConfig) -> Header {
-        make_chain_header(1, BlockId(Digest32::zero()), 1_000_000, config.initial_n_bits)
+        make_chain_header(
+            1,
+            BlockId(Digest32::zero()),
+            1_000_000,
+            config.initial_n_bits,
+        )
     }
 
     /// Build a chain of `count` headers, returning the chain.
@@ -750,7 +778,12 @@ mod reorg_tests {
         for h in 2..=count {
             let tip = chain.tip();
             let expected_n_bits = crate::difficulty::expected_difficulty(&tip, &chain).unwrap();
-            let header = make_chain_header(h, tip.id, 1_000_000 + (h as u64 - 1) * 45_000, expected_n_bits);
+            let header = make_chain_header(
+                h,
+                tip.id,
+                1_000_000 + (h as u64 - 1) * 45_000,
+                expected_n_bits,
+            );
             chain.try_append_no_pow(header).unwrap();
         }
 
@@ -770,7 +803,10 @@ mod reorg_tests {
 
         // Alternative block at height 3 — same parent as current tip, different nonce
         let alt_tip = make_chain_header_with_nonce(
-            3, parent_id, parent_ts + 50_000, n_bits,
+            3,
+            parent_id,
+            parent_ts + 50_000,
+            n_bits,
             vec![0xFF; 8], // different nonce → different ID
         );
         assert_ne!(alt_tip.id, old_tip_id, "alternative must have different ID");
@@ -778,7 +814,9 @@ mod reorg_tests {
         // Continuation at height 4 building on the alternative
         let continuation = make_chain_header(4, alt_tip.id, parent_ts + 100_000, n_bits);
 
-        let replaced = chain.try_reorg_no_pow(alt_tip.clone(), continuation.clone()).unwrap();
+        let replaced = chain
+            .try_reorg_no_pow(alt_tip.clone(), continuation.clone())
+            .unwrap();
 
         assert_eq!(replaced, old_tip_id);
         assert_eq!(chain.height(), 4);
@@ -798,7 +836,10 @@ mod reorg_tests {
 
         // Alternative pointing to some random parent
         let alt_tip = make_chain_header_with_nonce(
-            3, BlockId(Digest32::from([0xAB; 32])), 2_100_000, n_bits,
+            3,
+            BlockId(Digest32::from([0xAB; 32])),
+            2_100_000,
+            n_bits,
             vec![0xFF; 8],
         );
         let continuation = make_chain_header(4, alt_tip.id, 2_200_000, n_bits);
@@ -817,12 +858,15 @@ mod reorg_tests {
         let parent_ts = parent.timestamp;
         let n_bits = parent.n_bits;
 
-        let alt_tip = make_chain_header_with_nonce(
-            3, parent_id, parent_ts + 50_000, n_bits,
-            vec![0xFF; 8],
-        );
+        let alt_tip =
+            make_chain_header_with_nonce(3, parent_id, parent_ts + 50_000, n_bits, vec![0xFF; 8]);
         // Continuation points to wrong parent (not the alternative)
-        let continuation = make_chain_header(4, BlockId(Digest32::from([0xCD; 32])), parent_ts + 100_000, n_bits);
+        let continuation = make_chain_header(
+            4,
+            BlockId(Digest32::from([0xCD; 32])),
+            parent_ts + 100_000,
+            n_bits,
+        );
 
         let result = chain.try_reorg_no_pow(alt_tip, continuation);
         assert!(result.is_err());
@@ -839,10 +883,8 @@ mod reorg_tests {
         let n_bits = parent.n_bits;
 
         // Height 5 instead of 3
-        let alt_tip = make_chain_header_with_nonce(
-            5, parent_id, parent_ts + 50_000, n_bits,
-            vec![0xFF; 8],
-        );
+        let alt_tip =
+            make_chain_header_with_nonce(5, parent_id, parent_ts + 50_000, n_bits, vec![0xFF; 8]);
         let continuation = make_chain_header(6, alt_tip.id, parent_ts + 100_000, n_bits);
 
         let result = chain.try_reorg_no_pow(alt_tip, continuation);
@@ -855,7 +897,12 @@ mod reorg_tests {
         let config = testnet_config();
         let mut chain = HeaderChain::new(config.clone());
 
-        let alt = make_chain_header(1, BlockId(Digest32::zero()), 1_000_000, config.initial_n_bits);
+        let alt = make_chain_header(
+            1,
+            BlockId(Digest32::zero()),
+            1_000_000,
+            config.initial_n_bits,
+        );
         let cont = make_chain_header(2, alt.id, 2_000_000, config.initial_n_bits);
 
         let result = chain.try_reorg_no_pow(alt, cont);
@@ -869,7 +916,10 @@ mod reorg_tests {
         let n_bits = chain.tip().n_bits;
 
         let alt = make_chain_header_with_nonce(
-            1, BlockId(Digest32::zero()), 1_000_000, n_bits,
+            1,
+            BlockId(Digest32::zero()),
+            1_000_000,
+            n_bits,
             vec![0xFF; 8],
         );
         let cont = make_chain_header(2, alt.id, 2_000_000, n_bits);
@@ -885,12 +935,7 @@ mod sync_info_tests {
     use ergo_chain_types::*;
     use sigma_ser::ScorexSerializable;
 
-    fn make_chain_header(
-        height: u32,
-        parent_id: BlockId,
-        timestamp: u64,
-        n_bits: u32,
-    ) -> Header {
+    fn make_chain_header(height: u32, parent_id: BlockId, timestamp: u64, n_bits: u32) -> Header {
         let zero32 = Digest32::zero();
         let mut header = Header {
             version: 2,
@@ -923,7 +968,12 @@ mod sync_info_tests {
     }
 
     fn make_genesis(config: &ChainConfig) -> Header {
-        make_chain_header(1, BlockId(Digest32::zero()), 1_000_000, config.initial_n_bits)
+        make_chain_header(
+            1,
+            BlockId(Digest32::zero()),
+            1_000_000,
+            config.initial_n_bits,
+        )
     }
 
     fn build_test_chain(count: u32) -> HeaderChain {
@@ -939,8 +989,7 @@ mod sync_info_tests {
 
         for h in 2..=count {
             let parent = chain.tip();
-            let expected_n_bits =
-                crate::difficulty::expected_difficulty(&parent, &chain).unwrap();
+            let expected_n_bits = crate::difficulty::expected_difficulty(&parent, &chain).unwrap();
             let timestamp = 1_000_000 + (h as u64 - 1) * 45_000;
             let header = make_chain_header(h, prev_id, timestamp, expected_n_bits);
             prev_id = header.id;
@@ -1215,13 +1264,14 @@ mod score_and_deep_reorg_tests {
     use num_bigint::BigUint;
     use sigma_ser::ScorexSerializable;
 
-    fn make_chain_header(
-        height: u32,
-        parent_id: BlockId,
-        timestamp: u64,
-        n_bits: u32,
-    ) -> Header {
-        make_chain_header_with_nonce(height, parent_id, timestamp, n_bits, height.to_be_bytes().repeat(2))
+    fn make_chain_header(height: u32, parent_id: BlockId, timestamp: u64, n_bits: u32) -> Header {
+        make_chain_header_with_nonce(
+            height,
+            parent_id,
+            timestamp,
+            n_bits,
+            height.to_be_bytes().repeat(2),
+        )
     }
 
     fn make_chain_header_with_nonce(
@@ -1263,7 +1313,12 @@ mod score_and_deep_reorg_tests {
     }
 
     fn make_genesis(config: &ChainConfig) -> Header {
-        make_chain_header(1, BlockId(Digest32::zero()), 1_000_000, config.initial_n_bits)
+        make_chain_header(
+            1,
+            BlockId(Digest32::zero()),
+            1_000_000,
+            config.initial_n_bits,
+        )
     }
 
     fn build_test_chain(count: u32) -> HeaderChain {
@@ -1277,7 +1332,12 @@ mod score_and_deep_reorg_tests {
         for h in 2..=count {
             let tip = chain.tip();
             let expected_n_bits = crate::difficulty::expected_difficulty(&tip, &chain).unwrap();
-            let header = make_chain_header(h, tip.id, 1_000_000 + (h as u64 - 1) * 45_000, expected_n_bits);
+            let header = make_chain_header(
+                h,
+                tip.id,
+                1_000_000 + (h as u64 - 1) * 45_000,
+                expected_n_bits,
+            );
             chain.try_append_no_pow(header).unwrap();
         }
         chain
@@ -1295,7 +1355,10 @@ mod score_and_deep_reorg_tests {
     fn cumulative_score_increases_on_append() {
         let chain = build_test_chain(5);
         let score = chain.cumulative_score();
-        assert!(score > BigUint::ZERO, "score should be positive after appending headers");
+        assert!(
+            score > BigUint::ZERO,
+            "score should be positive after appending headers"
+        );
         // Each header contributes decode_compact_bits(n_bits). With constant n_bits,
         // the score should be n * difficulty.
         let score_at_1 = chain.score_at(1).unwrap().clone();
@@ -1367,7 +1430,10 @@ mod score_and_deep_reorg_tests {
         let mut prev_id = genesis_id;
         for h in 2..=5 {
             let header = make_chain_header_with_nonce(
-                h, prev_id, genesis_ts + (h as u64) * 50_000, n_bits,
+                h,
+                prev_id,
+                genesis_ts + (h as u64) * 50_000,
+                n_bits,
                 vec![0xAA; 8],
             );
             prev_id = header.id;
@@ -1396,8 +1462,10 @@ mod score_and_deep_reorg_tests {
         let genesis_ts = chain.header_at(1).unwrap().timestamp;
 
         // First header is valid, second has timestamp <= first (invalid)
-        let h2 = make_chain_header_with_nonce(2, genesis_id, genesis_ts + 50_000, n_bits, vec![0xBB; 8]);
-        let h3_bad = make_chain_header_with_nonce(3, h2.id, genesis_ts + 10_000, n_bits, vec![0xBB; 8]); // ts goes backwards
+        let h2 =
+            make_chain_header_with_nonce(2, genesis_id, genesis_ts + 50_000, n_bits, vec![0xBB; 8]);
+        let h3_bad =
+            make_chain_header_with_nonce(3, h2.id, genesis_ts + 10_000, n_bits, vec![0xBB; 8]); // ts goes backwards
 
         let result = chain.try_reorg_deep_no_pow(1, vec![h2, h3_bad]);
         assert!(result.is_err());
@@ -1438,7 +1506,10 @@ mod score_and_deep_reorg_tests {
         let mut prev_id = genesis_id;
         for h in 2..=6 {
             let header = make_chain_header_with_nonce(
-                h, prev_id, genesis_ts + (h as u64) * 50_000, n_bits,
+                h,
+                prev_id,
+                genesis_ts + (h as u64) * 50_000,
+                n_bits,
                 vec![0xCC; 8],
             );
             prev_id = header.id;
@@ -1503,21 +1574,13 @@ mod voting_chain_tests {
     /// Build a testnet chain of `count` headers whose votes come from
     /// `votes_at(height)`. The seeded tally makes vote PLACEMENT matter:
     /// only ids voted by the epoch's opening boundary header accumulate.
-    fn build_chain_with_votes_fn(
-        count: u32,
-        votes_at: impl Fn(u32) -> [u8; 3],
-    ) -> HeaderChain {
+    fn build_chain_with_votes_fn(count: u32, votes_at: impl Fn(u32) -> [u8; 3]) -> HeaderChain {
         let config = testnet_config();
         let mut chain = HeaderChain::new(config.clone());
         let n_bits = config.initial_n_bits;
 
-        let genesis = make_header_with_votes(
-            1,
-            BlockId(Digest32::zero()),
-            1_000_000,
-            n_bits,
-            votes_at(1),
-        );
+        let genesis =
+            make_header_with_votes(1, BlockId(Digest32::zero()), 1_000_000, n_bits, votes_at(1));
         let mut prev_id = genesis.id;
         chain.try_append_no_pow(genesis).unwrap();
 
@@ -1573,7 +1636,10 @@ mod voting_chain_tests {
         let chain = HeaderChain::new(ChainConfig::mainnet());
         assert!(chain.is_epoch_boundary(1024));
         assert!(!chain.is_epoch_boundary(1023));
-        assert!(!chain.is_epoch_boundary(128), "128 is testnet boundary, not mainnet");
+        assert!(
+            !chain.is_epoch_boundary(128),
+            "128 is testnet boundary, not mainnet"
+        );
     }
 
     #[test]
@@ -1711,7 +1777,10 @@ mod voting_chain_tests {
             .compute_expected_parameters_for_candidate(256, &hostile, [0, 0, 0])
             .unwrap();
         assert_eq!(params, with_empty);
-        assert_eq!(activated, crate::voting::ValidationSettingsUpdate::default());
+        assert_eq!(
+            activated,
+            crate::voting::ValidationSettingsUpdate::default()
+        );
     }
 
     #[test]
@@ -1815,12 +1884,20 @@ mod voting_chain_tests {
             matches!(err, crate::ChainError::Voting(_)),
             "rule 214 must reject the contradictory vote field, got: {err}"
         );
-        assert_eq!(chain.height(), 5, "the rejected header must not be appended");
+        assert_eq!(
+            chain.height(),
+            5,
+            "the rejected header must not be appended"
+        );
 
         // A valid-votes sibling at the same position extends normally.
         let good = make_header_with_votes(6, tip.id, ts, nb, [1, 2, 0]);
         chain.try_append_no_pow(good).unwrap();
-        assert_eq!(chain.height(), 6, "the valid-votes sibling extends normally");
+        assert_eq!(
+            chain.height(),
+            6,
+            "the valid-votes sibling extends normally"
+        );
     }
 
     #[test]
@@ -1969,13 +2046,8 @@ mod voting_chain_tests {
     fn compute_expected_parameters_boundary_fork_vote_starts_round() {
         // Only the boundary header (256) votes for the fork → a round
         // starts: id 122 = 256, id 121 = 0.
-        let chain = build_chain_with_votes_fn(256, |h| {
-            if h == 256 {
-                [120, 0, 0]
-            } else {
-                [0, 0, 0]
-            }
-        });
+        let chain =
+            build_chain_with_votes_fn(256, |h| if h == 256 { [120, 0, 0] } else { [0, 0, 0] });
         let expected = chain.compute_expected_parameters(256, &[]).unwrap();
         assert_eq!(expected.soft_fork_starting_height(), Some(256));
         assert_eq!(expected.soft_fork_votes_collected(), Some(0));
@@ -2024,12 +2096,14 @@ mod voting_chain_tests {
             }
         });
         let mut params = chain.active_parameters().clone();
-        params
-            .parameters_table
-            .insert(ergo_lib::chain::parameters::Parameter::SoftForkStartingHeight, 128);
-        params
-            .parameters_table
-            .insert(ergo_lib::chain::parameters::Parameter::SoftForkVotesCollected, 0);
+        params.parameters_table.insert(
+            ergo_lib::chain::parameters::Parameter::SoftForkStartingHeight,
+            128,
+        );
+        params.parameters_table.insert(
+            ergo_lib::chain::parameters::Parameter::SoftForkVotesCollected,
+            0,
+        );
         let keep = chain.active_proposed_update_bytes().to_vec();
         chain.apply_epoch_boundary_parameters(params, keep);
 
@@ -2064,8 +2138,15 @@ mod voting_chain_tests {
             .unwrap();
 
         assert_eq!(via_candidate, via_header);
-        assert_eq!(via_candidate.storage_fee_factor(), 1_275_000, "step applied");
-        assert_eq!(activated, crate::voting::ValidationSettingsUpdate::default());
+        assert_eq!(
+            via_candidate.storage_fee_factor(),
+            1_275_000,
+            "step applied"
+        );
+        assert_eq!(
+            activated,
+            crate::voting::ValidationSettingsUpdate::default()
+        );
     }
 
     #[test]
@@ -2124,7 +2205,11 @@ mod voting_chain_tests {
         chain.try_append_no_pow(g).unwrap();
         for h in 2..=50 {
             let header = make_header_with_votes(
-                h, prev, 1_000_000 + (h as u64 - 1) * 45_000, n_bits, [0, 0, 0],
+                h,
+                prev,
+                1_000_000 + (h as u64 - 1) * 45_000,
+                n_bits,
+                [0, 0, 0],
             );
             prev = header.id;
             chain.try_append_no_pow(header).unwrap();
@@ -2151,7 +2236,11 @@ mod voting_chain_tests {
         chain.try_append_no_pow(g).unwrap();
         for h in 2..=130 {
             let header = make_header_with_votes(
-                h, prev, 1_000_000 + (h as u64 - 1) * 45_000, n_bits, [0, 0, 0],
+                h,
+                prev,
+                1_000_000 + (h as u64 - 1) * 45_000,
+                n_bits,
+                [0, 0, 0],
             );
             prev = header.id;
             chain.try_append_no_pow(header).unwrap();
@@ -2199,7 +2288,11 @@ mod voting_chain_tests {
         chain.try_append_no_pow(g).unwrap();
         for h in 2..=130 {
             let header = make_header_with_votes(
-                h, prev, 1_000_000 + (h as u64 - 1) * 45_000, n_bits, [0, 0, 0],
+                h,
+                prev,
+                1_000_000 + (h as u64 - 1) * 45_000,
+                n_bits,
+                [0, 0, 0],
             );
             prev = header.id;
             chain.try_append_no_pow(header).unwrap();
@@ -2222,7 +2315,11 @@ mod voting_chain_tests {
         chain.try_append_no_pow(g).unwrap();
         for h in 2..=130 {
             let header = make_header_with_votes(
-                h, prev, 1_000_000 + (h as u64 - 1) * 45_000, n_bits, [0, 0, 0],
+                h,
+                prev,
+                1_000_000 + (h as u64 - 1) * 45_000,
+                n_bits,
+                [0, 0, 0],
             );
             prev = header.id;
             chain.try_append_no_pow(header).unwrap();
@@ -2248,7 +2345,11 @@ mod voting_chain_tests {
         chain.try_append_no_pow(g).unwrap();
         for h in 2..=130 {
             let header = make_header_with_votes(
-                h, prev, 1_000_000 + (h as u64 - 1) * 45_000, n_bits, [0, 0, 0],
+                h,
+                prev,
+                1_000_000 + (h as u64 - 1) * 45_000,
+                n_bits,
+                [0, 0, 0],
             );
             prev = header.id;
             chain.try_append_no_pow(header).unwrap();
@@ -2273,7 +2374,10 @@ mod voting_chain_tests {
         let r = chain.recompute_active_parameters_from_storage(tip);
         assert!(r.is_err());
         let msg = format!("{}", r.unwrap_err());
-        assert!(msg.contains("mismatch"), "expected mismatch error, got: {msg}");
+        assert!(
+            msg.contains("mismatch"),
+            "expected mismatch error, got: {msg}"
+        );
     }
 
     #[test]
@@ -2315,7 +2419,9 @@ mod voting_chain_tests {
         // At each, simulate validator: compute, then apply.
         let mut current_height = voting_length;
         while current_height <= voting_end {
-            let params = chain.compute_expected_parameters(current_height, &[]).unwrap();
+            let params = chain
+                .compute_expected_parameters(current_height, &[])
+                .unwrap();
             // Save current tip; we need to advance to the boundary height before applying.
             // (We've already built the chain — now we just simulate apply at each boundary.)
             // The chain's tip is at voting_end, so we need a per-height apply path.
@@ -2352,9 +2458,9 @@ mod voting_chain_tests {
         let default = crate::voting::default_proposed_update_bytes(crate::Network::Testnet);
         assert_eq!(chain.active_proposed_update_bytes(), &default[..]);
         assert!(
-            chain.active_proposed_update_bytes().starts_with(&[
-                0x02, 0xD7, 0x01, 0x99, 0x03
-            ]),
+            chain
+                .active_proposed_update_bytes()
+                .starts_with(&[0x02, 0xD7, 0x01, 0x99, 0x03]),
             "seed must encode rulesToDisable=[215,409]"
         );
     }
@@ -2387,7 +2493,11 @@ mod voting_chain_tests {
         chain.try_append_no_pow(g).unwrap();
         for h in 2..=130 {
             let header = make_header_with_votes(
-                h, prev, 1_000_000 + (h as u64 - 1) * 45_000, n_bits, [0, 0, 0],
+                h,
+                prev,
+                1_000_000 + (h as u64 - 1) * 45_000,
+                n_bits,
+                [0, 0, 0],
             );
             prev = header.id;
             chain.try_append_no_pow(header).unwrap();
@@ -2453,7 +2563,11 @@ mod voting_chain_tests {
         chain.try_append_no_pow(g).unwrap();
         for h in 2..=130 {
             let header = make_header_with_votes(
-                h, prev, 1_000_000 + (h as u64 - 1) * 45_000, n_bits, [0, 0, 0],
+                h,
+                prev,
+                1_000_000 + (h as u64 - 1) * 45_000,
+                n_bits,
+                [0, 0, 0],
             );
             prev = header.id;
             chain.try_append_no_pow(header).unwrap();
@@ -2539,7 +2653,9 @@ mod voting_chain_tests {
         // Force-remove SubblocksPerBlock from the active parameters to
         // simulate a chain that hasn't had it auto-inserted yet.
         let mut stripped = chain.active_parameters().clone();
-        stripped.parameters_table.remove(&Parameter::SubblocksPerBlock);
+        stripped
+            .parameters_table
+            .remove(&Parameter::SubblocksPerBlock);
         assert!(
             !stripped
                 .parameters_table
@@ -2623,9 +2739,8 @@ mod voting_chain_tests {
         // target = voting_length - 1 (=127). Still no boundary at or before
         // that height. Defaults stand, loader not called.
         let mut chain = build_chain_with_votes(260, [0, 0, 0]);
-        chain.set_extension_loader(|_| {
-            panic!("loader must not be called below the first boundary")
-        });
+        chain
+            .set_extension_loader(|_| panic!("loader must not be called below the first boundary"));
 
         chain
             .recompute_active_parameters_from_storage(127)
@@ -2767,13 +2882,7 @@ mod voting_chain_tests {
 
         let base_height = boundary_height - voting_length;
         let mut prev_id = BlockId(Digest32::zero());
-        let head = make_header_with_votes(
-            base_height,
-            prev_id,
-            1_000_000,
-            n_bits,
-            [0, 0, 0],
-        );
+        let head = make_header_with_votes(base_height, prev_id, 1_000_000, n_bits, [0, 0, 0]);
         prev_id = head.id;
 
         let mut tail: Vec<Header> = Vec::with_capacity((voting_length - 1) as usize);
@@ -2801,8 +2910,8 @@ mod voting_chain_tests {
     /// block 1,628,160 extension (key `[0x00, 0x7C]`). Decodes to
     /// `rulesToDisable = [215, 409]` + 3 status updates.
     const MAINNET_V6_PROPOSED_UPDATE: [u8; 18] = [
-        0x02, 0xD7, 0x01, 0x99, 0x03, 0x03, 0x0B, 0x01, 0x03,
-        0x10, 0x07, 0x01, 0x03, 0x11, 0x08, 0x01, 0x03, 0x12,
+        0x02, 0xD7, 0x01, 0x99, 0x03, 0x03, 0x0B, 0x01, 0x03, 0x10, 0x07, 0x01, 0x03, 0x11, 0x08,
+        0x01, 0x03, 0x12,
     ];
 
     #[test]
@@ -2825,8 +2934,7 @@ mod voting_chain_tests {
         let mut chain = build_mainnet_chain_for_boundary(activation);
 
         let mut pre = crate::voting::default_parameters(crate::Network::Mainnet);
-        pre.parameters_table
-            .insert(Parameter::BlockVersion, 3);
+        pre.parameters_table.insert(Parameter::BlockVersion, 3);
         pre.parameters_table
             .insert(Parameter::SoftForkStartingHeight, starting_height as i32);
         pre.parameters_table
@@ -2894,8 +3002,7 @@ mod voting_chain_tests {
         // BlockVersion = 4, soft-fork state still present (it clears at
         // THIS boundary), NO SubblocksPerBlock yet.
         let mut pre = crate::voting::default_parameters(crate::Network::Mainnet);
-        pre.parameters_table
-            .insert(Parameter::BlockVersion, 4);
+        pre.parameters_table.insert(Parameter::BlockVersion, 4);
         pre.parameters_table
             .insert(Parameter::SoftForkStartingHeight, starting_height as i32);
         pre.parameters_table
@@ -2989,13 +3096,14 @@ mod light_client_install_tests {
     use ergo_chain_types::*;
     use sigma_ser::ScorexSerializable;
 
-    fn make_chain_header(
-        height: u32,
-        parent_id: BlockId,
-        timestamp: u64,
-        n_bits: u32,
-    ) -> Header {
-        make_chain_header_with_nonce(height, parent_id, timestamp, n_bits, height.to_be_bytes().repeat(2))
+    fn make_chain_header(height: u32, parent_id: BlockId, timestamp: u64, n_bits: u32) -> Header {
+        make_chain_header_with_nonce(
+            height,
+            parent_id,
+            timestamp,
+            n_bits,
+            height.to_be_bytes().repeat(2),
+        )
     }
 
     fn make_chain_header_with_nonce(
@@ -3142,7 +3250,10 @@ mod light_client_install_tests {
         assert_eq!(installed.len(), 1);
         assert_eq!(installed[0].height, 500);
         assert_eq!(installed[0].id, head_id);
-        assert_eq!(installed[0].score_be, num_bigint::BigUint::ZERO.to_bytes_be());
+        assert_eq!(
+            installed[0].score_be,
+            num_bigint::BigUint::ZERO.to_bytes_be()
+        );
     }
 
     #[test]
@@ -3150,7 +3261,12 @@ mod light_client_install_tests {
         // A chain that already contains headers cannot be re-installed.
         let config = testnet_config();
         let mut chain = HeaderChain::new(config.clone());
-        let genesis = make_chain_header(1, BlockId(Digest32::zero()), 1_000_000, config.initial_n_bits);
+        let genesis = make_chain_header(
+            1,
+            BlockId(Digest32::zero()),
+            1_000_000,
+            config.initial_n_bits,
+        );
         chain.try_append_no_pow(genesis).unwrap();
 
         let parent = BlockId(Digest32::from([0x77; 32]));
@@ -3223,7 +3339,10 @@ mod light_client_install_tests {
             .install_from_nipopow_proof(suffix_head, suffix_tail)
             .unwrap_err();
         assert!(
-            matches!(err, ChainError::PowInvalid { .. } | ChainError::PowCompute(_)),
+            matches!(
+                err,
+                ChainError::PowInvalid { .. } | ChainError::PowCompute(_)
+            ),
             "expected PoW failure, got {err:?}"
         );
 
@@ -3277,7 +3396,12 @@ mod light_client_install_tests {
         // 1) Normal-mode rejection: build a chain at genesis, try a child
         //    with wrong n_bits, expect WrongDifficulty.
         let mut full_chain = HeaderChain::new(config.clone());
-        let genesis = make_chain_header(1, BlockId(Digest32::zero()), 1_000_000, config.initial_n_bits);
+        let genesis = make_chain_header(
+            1,
+            BlockId(Digest32::zero()),
+            1_000_000,
+            config.initial_n_bits,
+        );
         let genesis_id = genesis.id;
         full_chain.try_append_no_pow(genesis).unwrap();
         let bad_child = make_chain_header(2, genesis_id, 2_000_000, config.initial_n_bits + 1);
@@ -3329,7 +3453,12 @@ mod light_client_install_tests {
         // is the structural expression of "can't reorg past genesis".
         let config = testnet_config();
         let mut chain = HeaderChain::new(config.clone());
-        let genesis = make_chain_header(1, BlockId(Digest32::zero()), 1_000_000, config.initial_n_bits);
+        let genesis = make_chain_header(
+            1,
+            BlockId(Digest32::zero()),
+            1_000_000,
+            config.initial_n_bits,
+        );
         chain.try_append_no_pow(genesis).unwrap();
         assert_eq!(chain.reorg_floor(), 1);
     }
@@ -3375,9 +3504,7 @@ mod light_client_install_tests {
             config.initial_n_bits,
             vec![0xDD; 8],
         );
-        let err = chain
-            .try_reorg_deep_no_pow(2499, vec![bogus])
-            .unwrap_err();
+        let err = chain.try_reorg_deep_no_pow(2499, vec![bogus]).unwrap_err();
         match &err {
             ChainError::Reorg(msg) => {
                 assert!(
@@ -3419,12 +3546,7 @@ mod lazy_cache_tests {
     /// Synthetic header builder — no real PoW, id computed via
     /// serialization roundtrip so each (height, parent_id, timestamp,
     /// n_bits) tuple yields a distinct, deterministic id.
-    fn make_header(
-        height: u32,
-        parent_id: BlockId,
-        timestamp: u64,
-        n_bits: u32,
-    ) -> Header {
+    fn make_header(height: u32, parent_id: BlockId, timestamp: u64, n_bits: u32) -> Header {
         let zero32 = Digest32::zero();
         let mut header = Header {
             version: 2,
@@ -3486,7 +3608,10 @@ mod lazy_cache_tests {
         // Scores are cumulative — we don't compare exact values here;
         // just assert they exist at every height that was pushed.
         for h in 1..=5 {
-            assert!(chain.lazy().peek_score(h).is_some(), "score cache missing height {h}");
+            assert!(
+                chain.lazy().peek_score(h).is_some(),
+                "score cache missing height {h}"
+            );
         }
         assert_eq!(chain.lazy().header_cache_len(), 5);
         assert_eq!(chain.lazy().score_cache_len(), 5);
@@ -3541,7 +3666,11 @@ mod lazy_cache_tests {
         let calls_hot = calls.clone();
         chain.set_score_loader(move |h| {
             calls_hot.fetch_add(1, Ordering::SeqCst);
-            if h == 10 { Some(BigUint::from(7u32)) } else { None }
+            if h == 10 {
+                Some(BigUint::from(7u32))
+            } else {
+                None
+            }
         });
         assert!(chain.has_score_loader());
 
@@ -3594,9 +3723,7 @@ mod lazy_cache_tests {
             fork_parent.timestamp + 1000,
             fork_parent.n_bits,
         );
-        let err = chain
-            .try_reorg_deep_no_pow(3, vec![bad_first])
-            .unwrap_err();
+        let err = chain.try_reorg_deep_no_pow(3, vec![bad_first]).unwrap_err();
         // We don't care which error variant — just that it failed and
         // rolled back.
         drop(err);
@@ -3624,12 +3751,7 @@ mod lazy_cache_tests {
             fork_parent.timestamp + 9_999,
             fork_parent.n_bits,
         );
-        let new5 = make_header(
-            5,
-            new4.id,
-            new4.timestamp + 45_000,
-            new4.n_bits,
-        );
+        let new5 = make_header(5, new4.id, new4.timestamp + 45_000, new4.n_bits);
         let new4_id = new4.id;
         let new5_id = new5.id;
 
@@ -3651,7 +3773,12 @@ mod lazy_cache_tests {
         let mut chain = HeaderChain::new(testnet_config());
         // Install a valid head followed by a bogus tail header whose
         // parent_id doesn't link to the head → triggers rollback.
-        let head = make_header(1000, BlockId(Digest32::from([7u8; 32])), 50_000_000, 16842752);
+        let head = make_header(
+            1000,
+            BlockId(Digest32::from([7u8; 32])),
+            50_000_000,
+            16842752,
+        );
         let bogus_tail = make_header(
             1001,
             BlockId(Digest32::from([0xff; 32])), // wrong parent
@@ -3735,7 +3862,12 @@ mod lazy_cache_tests {
     #[test]
     fn successful_install_caches_suffix_head_with_zero_score() {
         let mut chain = HeaderChain::new(testnet_config());
-        let head = make_header(1000, BlockId(Digest32::from([7u8; 32])), 50_000_000, 16842752);
+        let head = make_header(
+            1000,
+            BlockId(Digest32::from([7u8; 32])),
+            50_000_000,
+            16842752,
+        );
         let head_id = head.id;
         chain
             .install_from_nipopow_proof_no_pow(head, vec![])
@@ -3906,8 +4038,7 @@ mod restore_tests {
 
     #[test]
     fn restore_multi_entry_contiguous_populates_by_id() {
-        let entries: Vec<(u32, BlockId)> =
-            (10u32..=14).map(|h| (h, id_at(h))).collect();
+        let entries: Vec<(u32, BlockId)> = (10u32..=14).map(|h| (h, id_at(h))).collect();
         let chain = HeaderChain::restore(testnet_config(), entries)
             .expect("contiguous restore must succeed");
         assert_eq!(chain.len(), 5);
@@ -3924,10 +4055,7 @@ mod restore_tests {
     /// Unwrap the error variant — `HeaderChain` does not derive `Debug`
     /// (loaders are `Arc<dyn Fn>`), so the standard `unwrap_err` won't
     /// compile here.
-    fn restore_err(
-        config: ChainConfig,
-        entries: Vec<(u32, BlockId)>,
-    ) -> RestoreError {
+    fn restore_err(config: ChainConfig, entries: Vec<(u32, BlockId)>) -> RestoreError {
         match HeaderChain::restore(config, entries) {
             Ok(_) => panic!("expected RestoreError, got Ok(HeaderChain)"),
             Err(e) => e,
@@ -3940,7 +4068,10 @@ mod restore_tests {
         let entries = vec![(1u32, id_at(1)), (2, id_at(2)), (4, id_at(4))];
         assert_eq!(
             restore_err(testnet_config(), entries),
-            RestoreError::NonContiguousHeights { expected: 3, got: 4 }
+            RestoreError::NonContiguousHeights {
+                expected: 3,
+                got: 4
+            }
         );
     }
 
@@ -3956,7 +4087,10 @@ mod restore_tests {
         let entries = vec![(1u32, id_at(1)), (2, id_at(2)), (2, other_id_at_2)];
         assert_eq!(
             restore_err(testnet_config(), entries),
-            RestoreError::NonContiguousHeights { expected: 3, got: 2 }
+            RestoreError::NonContiguousHeights {
+                expected: 3,
+                got: 2
+            }
         );
     }
 
@@ -4007,12 +4141,7 @@ mod linkage_tests {
     use ergo_chain_types::*;
     use sigma_ser::ScorexSerializable;
 
-    fn make_chain_header(
-        height: u32,
-        parent_id: BlockId,
-        timestamp: u64,
-        n_bits: u32,
-    ) -> Header {
+    fn make_chain_header(height: u32, parent_id: BlockId, timestamp: u64, n_bits: u32) -> Header {
         make_chain_header_with_nonce(
             height,
             parent_id,
@@ -4063,7 +4192,12 @@ mod linkage_tests {
     }
 
     fn make_genesis(config: &ChainConfig) -> Header {
-        make_chain_header(1, BlockId(Digest32::zero()), 1_000_000, config.initial_n_bits)
+        make_chain_header(
+            1,
+            BlockId(Digest32::zero()),
+            1_000_000,
+            config.initial_n_bits,
+        )
     }
 
     fn build_test_chain(count: u32) -> HeaderChain {
@@ -4073,8 +4207,7 @@ mod linkage_tests {
         chain.try_append_no_pow(genesis).unwrap();
         for h in 2..=count {
             let tip = chain.tip();
-            let expected_n_bits =
-                crate::difficulty::expected_difficulty(&tip, &chain).unwrap();
+            let expected_n_bits = crate::difficulty::expected_difficulty(&tip, &chain).unwrap();
             let header = make_chain_header(
                 h,
                 tip.id,
@@ -4103,8 +4236,7 @@ mod linkage_tests {
             if h > base {
                 let parent = chain.header_at(h - 1).unwrap();
                 assert_eq!(
-                    header.parent_id,
-                    parent.id,
+                    header.parent_id, parent.id,
                     "broken parent link at height {h}"
                 );
             }
@@ -4123,7 +4255,11 @@ mod linkage_tests {
 
         // Losing candidate at 6 arrives first — extends the best chain.
         let loser = make_chain_header_with_nonce(
-            6, tip5.id, tip5.timestamp + 45_000, n_bits, vec![0xAA; 8],
+            6,
+            tip5.id,
+            tip5.timestamp + 45_000,
+            n_bits,
+            vec![0xAA; 8],
         );
         assert!(matches!(
             chain.try_append_no_pow(loser.clone()).unwrap(),
@@ -4133,7 +4269,11 @@ mod linkage_tests {
         // Winner at 6 (same parent, different id) — reported as a fork,
         // NOT stored in the chain.
         let winner = make_chain_header_with_nonce(
-            6, tip5.id, tip5.timestamp + 50_000, n_bits, vec![0xBB; 8],
+            6,
+            tip5.id,
+            tip5.timestamp + 50_000,
+            n_bits,
+            vec![0xBB; 8],
         );
         assert_ne!(winner.id, loser.id);
         assert!(matches!(
@@ -4181,12 +4321,10 @@ mod linkage_tests {
         let genesis = make_genesis(&config);
         let h2 = make_chain_header(2, genesis.id, 1_050_000, config.initial_n_bits);
         let h3 = make_chain_header(3, h2.id, 1_100_000, config.initial_n_bits);
-        let loser = make_chain_header_with_nonce(
-            4, h3.id, 1_150_000, config.initial_n_bits, vec![0x5f; 8],
-        );
-        let winner = make_chain_header_with_nonce(
-            4, h3.id, 1_151_000, config.initial_n_bits, vec![0x89; 8],
-        );
+        let loser =
+            make_chain_header_with_nonce(4, h3.id, 1_150_000, config.initial_n_bits, vec![0x5f; 8]);
+        let winner =
+            make_chain_header_with_nonce(4, h3.id, 1_151_000, config.initial_n_bits, vec![0x89; 8]);
         let child = make_chain_header(5, winner.id, 1_200_000, config.initial_n_bits);
         assert_eq!(child.parent_id, winner.id);
         assert_ne!(winner.id, loser.id);
@@ -4204,10 +4342,14 @@ mod linkage_tests {
 
         // Loader serving the same corrupted view (the store bridge).
         // Heights are unique in `view`: 1..=3 common, 4→loser, 5→child.
-        let view = [genesis.clone(), h2.clone(), h3.clone(), loser.clone(), child.clone()];
-        chain.set_header_loader(move |h| {
-            view.iter().find(|hdr| hdr.height == h).cloned()
-        });
+        let view = [
+            genesis.clone(),
+            h2.clone(),
+            h3.clone(),
+            loser.clone(),
+            child.clone(),
+        ];
+        chain.set_header_loader(move |h| view.iter().find(|hdr| hdr.height == h).cloned());
 
         // The chain serves the broken link — this is the production
         // observable (`header_at(N).id != header_at(N+1).parent_id`).
@@ -4253,9 +4395,8 @@ mod linkage_tests {
         let h2 = make_chain_header(2, genesis.id, 1_050_000, config.initial_n_bits);
         let h3 = make_chain_header(3, h2.id, 1_100_000, config.initial_n_bits);
         // Impostor at height 3: also a child of h2, but not h4's parent.
-        let impostor = make_chain_header_with_nonce(
-            3, h2.id, 1_101_000, config.initial_n_bits, vec![0xEE; 8],
-        );
+        let impostor =
+            make_chain_header_with_nonce(3, h2.id, 1_101_000, config.initial_n_bits, vec![0xEE; 8]);
         let h4 = make_chain_header(4, h3.id, 1_150_000, config.initial_n_bits);
         let h5 = make_chain_header(5, h4.id, 1_200_000, config.initial_n_bits);
         let h6 = make_chain_header(6, h5.id, 1_250_000, config.initial_n_bits);
@@ -4273,13 +4414,15 @@ mod linkage_tests {
         ];
         let mut chain = HeaderChain::restore(config, entries).unwrap();
         let view = [genesis, h2, impostor, h4, h5, h6];
-        chain.set_header_loader(move |h| {
-            view.iter().find(|hdr| hdr.height == h).cloned()
-        });
+        chain.set_header_loader(move |h| view.iter().find(|hdr| hdr.height == h).cloned());
 
         // Links checked tip-down: depth 1 → 6-5; depth 2 → +5-4; both clean.
-        chain.verify_best_chain_linkage(Some(1)).expect("6→5 link is clean");
-        chain.verify_best_chain_linkage(Some(2)).expect("5→4 link is clean");
+        chain
+            .verify_best_chain_linkage(Some(1))
+            .expect("6→5 link is clean");
+        chain
+            .verify_best_chain_linkage(Some(2))
+            .expect("5→4 link is clean");
         // Depth 3 reaches the 4→3 link.
         assert!(matches!(
             chain.verify_best_chain_linkage(Some(3)),
@@ -4307,7 +4450,11 @@ mod linkage_tests {
         // An impostor at height 3 the chain never accepted.
         let h2 = &real[1];
         let impostor = make_chain_header_with_nonce(
-            3, h2.id, h2.timestamp + 46_000, accepted_h3.n_bits, vec![0xEE; 8],
+            3,
+            h2.id,
+            h2.timestamp + 46_000,
+            accepted_h3.n_bits,
+            vec![0xEE; 8],
         );
         assert_ne!(impostor.id, accepted_h3.id);
         // A store bridge that serves every height, but the wrong header
@@ -4347,18 +4494,25 @@ mod linkage_tests {
     #[test]
     fn verify_linkage_trivial_and_clean_cases() {
         let empty = HeaderChain::new(testnet_config());
-        empty.verify_best_chain_linkage(None).expect("empty chain is clean");
+        empty
+            .verify_best_chain_linkage(None)
+            .expect("empty chain is clean");
 
         let single = build_test_chain(1);
-        single.verify_best_chain_linkage(None).expect("single header is clean");
+        single
+            .verify_best_chain_linkage(None)
+            .expect("single header is clean");
 
         let chain = build_test_chain(8);
-        chain.verify_best_chain_linkage(None).expect("full walk clean");
-        chain.verify_best_chain_linkage(Some(3)).expect("bounded walk clean");
+        chain
+            .verify_best_chain_linkage(None)
+            .expect("full walk clean");
+        chain
+            .verify_best_chain_linkage(Some(3))
+            .expect("bounded walk clean");
         chain
             .verify_best_chain_linkage(Some(100))
             .expect("depth beyond chain length clamps to the chain");
         assert_linkage(&chain);
     }
 }
-

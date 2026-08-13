@@ -1,9 +1,9 @@
+use bytes::Bytes;
 use ergo_avltree_rust::batch_node::LeafNode;
 use ergo_sync::snapshot::parser::{
     compute_internal_label, compute_leaf_label, parse_dfs_stream, parse_node, ParsedNode,
     PACKED_INTERNAL_PREFIX, PACKED_LEAF_PREFIX,
 };
-use bytes::Bytes;
 
 /// Verify our leaf label computation matches ergo_avltree_rust.
 #[test]
@@ -23,7 +23,10 @@ fn leaf_label_matches_library() {
     // Compute via our function
     let our_label = compute_leaf_label(&key, value, &next_key);
 
-    assert_eq!(our_label, lib_label, "leaf label mismatch with ergo_avltree_rust");
+    assert_eq!(
+        our_label, lib_label,
+        "leaf label mismatch with ergo_avltree_rust"
+    );
 }
 
 /// Verify our internal label computation matches ergo_avltree_rust.
@@ -56,7 +59,10 @@ fn internal_label_matches_library() {
 
     let our_label = compute_internal_label(0i8, &left_label, &right_label);
 
-    assert_eq!(our_label, lib_label, "internal label mismatch with ergo_avltree_rust");
+    assert_eq!(
+        our_label, lib_label,
+        "internal label mismatch with ergo_avltree_rust"
+    );
 }
 
 /// Verify internal label with non-zero balance.

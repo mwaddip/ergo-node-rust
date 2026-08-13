@@ -346,8 +346,13 @@ fn block_context(parameters: &Parameters) -> ErgoStateContext {
 /// included; size is the serialized BlockTransactions **section**, framing and
 /// all (`ErgoStateContext.scala:308-310`), which is 37 bytes more than that
 /// sum on a current-version block.
-fn measure_block(block: &CandidateBlock, utxos: &[ErgoBox], ctx: &ErgoStateContext) -> (u64, usize) {
-    let mut boxes: HashMap<[u8; 32], ErgoBox> = utxos.iter().map(|b| (id_of(b), b.clone())).collect();
+fn measure_block(
+    block: &CandidateBlock,
+    utxos: &[ErgoBox],
+    ctx: &ErgoStateContext,
+) -> (u64, usize) {
+    let mut boxes: HashMap<[u8; 32], ErgoBox> =
+        utxos.iter().map(|b| (id_of(b), b.clone())).collect();
     boxes.insert(id_of(&emission_box()), emission_box());
     for tx in &block.transactions {
         for out in tx.outputs.iter() {
@@ -357,18 +362,17 @@ fn measure_block(block: &CandidateBlock, utxos: &[ErgoBox], ctx: &ErgoStateConte
 
     let mut total_cost = 0u64;
     for (i, tx) in block.transactions.iter().enumerate() {
-        let inputs: Vec<ErgoBox> = tx
-            .inputs
-            .iter()
-            .map(|input| {
-                let mut id = [0u8; 32];
-                id.copy_from_slice(input.box_id.as_ref());
-                boxes
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_else(|| panic!("tx {i}: input box {} unresolved", hex::encode(id)))
-            })
-            .collect();
+        let inputs: Vec<ErgoBox> =
+            tx.inputs
+                .iter()
+                .map(|input| {
+                    let mut id = [0u8; 32];
+                    id.copy_from_slice(input.box_id.as_ref());
+                    boxes.get(&id).cloned().unwrap_or_else(|| {
+                        panic!("tx {i}: input box {} unresolved", hex::encode(id))
+                    })
+                })
+                .collect();
         total_cost += validate_single_transaction(tx, inputs, vec![], ctx)
             .unwrap_or_else(|e| panic!("assembled tx {i} must validate: {e}"));
     }
@@ -606,7 +610,11 @@ fn conflicting_transactions_are_not_both_selected() {
     let first = fee_paying_tx(&src);
     // Same input, different output script → a different transaction id.
     let second = feeless_tx(&src);
-    assert_ne!(first.id(), second.id(), "fixture: two distinct transactions");
+    assert_ne!(
+        first.id(),
+        second.id(),
+        "fixture: two distinct transactions"
+    );
 
     let generated = generate(
         &candidates(&[first.clone(), second.clone()]),
@@ -732,10 +740,17 @@ fn fee_box_tokens_are_collected_onto_the_miner_box() {
 
     assert_eq!(assembled.len(), 4, "[emission, tx, tx, fee]");
     let fee_tx = assembled.last().unwrap();
-    assert!(is_fee_tx(fee_tx), "the last transaction must be the fee transaction");
+    assert!(
+        is_fee_tx(fee_tx),
+        "the last transaction must be the fee transaction"
+    );
 
     let miner_box = fee_tx.outputs.get(0).unwrap();
-    assert_eq!(miner_box.value.as_i64(), 5_000_000, "every ERG of fee collected");
+    assert_eq!(
+        miner_box.value.as_i64(),
+        5_000_000,
+        "every ERG of fee collected"
+    );
     assert_eq!(
         token_ids(miner_box),
         expected_ids(&[&tokens_a, &tokens_b], 2 * PER_BOX),
@@ -774,14 +789,10 @@ fn fee_tokens_are_capped_at_one_box_worth_in_traversal_order() {
         .map(|(i, tokens)| fee_paying_tx(&token_source_box(0xB0 + i as u8, 2_000_000, tokens)))
         .collect();
 
-    let fee_tx = ergo_mining::fee::build_fee_tx(
-        &block_txs,
-        CANDIDATE_HEIGHT,
-        REWARD_DELAY,
-        &miner_pk(),
-    )
-    .expect("the cap is what keeps this buildable")
-    .expect("three fee boxes must produce a fee transaction");
+    let fee_tx =
+        ergo_mining::fee::build_fee_tx(&block_txs, CANDIDATE_HEIGHT, REWARD_DELAY, &miner_pk())
+            .expect("the cap is what keeps this buildable")
+            .expect("three fee boxes must produce a fee transaction");
 
     let miner_box = fee_tx.outputs.get(0).unwrap();
     let ordered = ordered_tokens(&groups);

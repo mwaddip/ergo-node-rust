@@ -2,9 +2,9 @@ use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
 use ergo_validation::{validate_single_transaction, ErgoStateContext};
 
-use crate::weight::TxWeight;
-use crate::types::*;
 use crate::family::propagate_family_weight;
+use crate::types::*;
+use crate::weight::TxWeight;
 
 /// Extract the transaction fee: input_sum - output_sum.
 pub fn extract_fee(tx: &Transaction, input_boxes: &[ErgoBox]) -> u64 {
@@ -22,11 +22,14 @@ pub fn tx_id_bytes(tx: &Transaction) -> [u8; 32] {
 
 /// Extract input box IDs as Vec<[u8; 32]>.
 pub fn input_box_ids(tx: &Transaction) -> Vec<[u8; 32]> {
-    tx.inputs.iter().map(|i| {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(i.box_id.as_ref());
-        arr
-    }).collect()
+    tx.inputs
+        .iter()
+        .map(|i| {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(i.box_id.as_ref());
+            arr
+        })
+        .collect()
 }
 
 /// Extract a raw box_id reference as [u8; 32].
@@ -38,11 +41,14 @@ pub fn input_box_id_raw(box_id: &ergo_lib::ergotree_ir::chain::ergo_box::BoxId) 
 
 /// Extract output box IDs and boxes as Vec<([u8; 32], ErgoBox)>.
 pub fn output_boxes(tx: &Transaction) -> Vec<([u8; 32], ErgoBox)> {
-    tx.outputs.iter().map(|b| {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(b.box_id().as_ref());
-        (arr, b.clone())
-    }).collect()
+    tx.outputs
+        .iter()
+        .map(|b| {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(b.box_id().as_ref());
+            (arr, b.clone())
+        })
+        .collect()
 }
 
 impl super::Mempool {
@@ -99,29 +105,42 @@ impl super::Mempool {
         let input_ids = input_box_ids(&tx);
         let mut input_boxes = Vec::with_capacity(input_ids.len());
         for id in &input_ids {
-            match utxo_reader.box_by_id(id)
+            match utxo_reader
+                .box_by_id(id)
                 .or_else(|| self.pool.unconfirmed_box(id).cloned())
             {
                 Some(b) => input_boxes.push(b),
-                None => return ProcessingOutcome::Declined {
-                    reason: format!("input box {} not found", hex::encode(id)),
-                },
+                None => {
+                    return ProcessingOutcome::Declined {
+                        reason: format!("input box {} not found", hex::encode(id)),
+                    }
+                }
             }
         }
 
         // 5. Resolve data-input boxes
-        let data_boxes: Vec<ErgoBox> = tx.data_inputs.as_ref()
+        let data_boxes: Vec<ErgoBox> = tx
+            .data_inputs
+            .as_ref()
             .map(|dis| {
-                dis.iter().filter_map(|di| {
-                    let id = input_box_id_raw(&di.box_id);
-                    utxo_reader.box_by_id(&id)
-                        .or_else(|| self.pool.unconfirmed_box(&id).cloned())
-                }).collect()
+                dis.iter()
+                    .filter_map(|di| {
+                        let id = input_box_id_raw(&di.box_id);
+                        utxo_reader
+                            .box_by_id(&id)
+                            .or_else(|| self.pool.unconfirmed_box(&id).cloned())
+                    })
+                    .collect()
             })
             .unwrap_or_default();
 
         // 6. Validate (returns script evaluation cost in block cost units)
-        let cost = match validate_single_transaction(&tx, input_boxes.clone(), data_boxes, state_context) {
+        let cost = match validate_single_transaction(
+            &tx,
+            input_boxes.clone(),
+            data_boxes,
+            state_context,
+        ) {
             Ok(script_cost) => script_cost.max(tx_bytes.len() as u64) as u32,
             Err(e) => {
                 self.invalidated.insert(tx_id);
@@ -146,9 +165,7 @@ impl super::Mempool {
         }
 
         // 8. Compute weight
-        let weight = TxWeight::new(
-            tx_id, fee, tx_bytes.len(), cost, self.config.fee_strategy,
-        );
+        let weight = TxWeight::new(tx_id, fee, tx_bytes.len(), cost, self.config.fee_strategy);
 
         // 9. Double-spend resolution
         let mut conflicts: Vec<[u8; 32]> = Vec::new();
@@ -161,7 +178,8 @@ impl super::Mempool {
         }
 
         if !conflicts.is_empty() {
-            let total_conflict_weight: u64 = conflicts.iter()
+            let total_conflict_weight: u64 = conflicts
+                .iter()
                 .filter_map(|id| self.pool.by_id.get(id))
                 .map(|w| w.weight)
                 .sum();

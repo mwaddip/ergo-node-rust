@@ -67,11 +67,7 @@ impl BlockTxCache {
     /// left uninitialized so the next caller retries — a transient node failure
     /// never poisons the cache, and a persistent one degrades to *serialized*
     /// retries rather than the concurrent burst this layer exists to prevent.
-    pub async fn get_or_fetch<F, Fut>(
-        &self,
-        header_id: &str,
-        fetch: F,
-    ) -> anyhow::Result<Block>
+    pub async fn get_or_fetch<F, Fut>(&self, header_id: &str, fetch: F) -> anyhow::Result<Block>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = anyhow::Result<BlockTransactionsJson>>,
@@ -229,7 +225,11 @@ mod tests {
                     })
                     .await
                     .unwrap();
-                assert_eq!(block.transactions[0]["id"].as_str(), Some(k), "pass {pass} key {k}");
+                assert_eq!(
+                    block.transactions[0]["id"].as_str(),
+                    Some(k),
+                    "pass {pass} key {k}"
+                );
             }
         }
 

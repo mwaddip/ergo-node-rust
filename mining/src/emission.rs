@@ -163,9 +163,8 @@ pub fn build_emission_tx(
         .map_err(|e| MiningError::Emission(format!("emission box build: {e}")))?;
 
     // --- Output 1: miner reward box (time-locked) ---
-    let reward_script =
-        ergo_tree_predef::reward_output_script(reward_delay, miner_pk.clone())
-            .map_err(|e| MiningError::Emission(format!("reward script: {e}")))?;
+    let reward_script = ergo_tree_predef::reward_output_script(reward_delay, miner_pk.clone())
+        .map_err(|e| MiningError::Emission(format!("reward script: {e}")))?;
 
     let mut reward_builder = ErgoBoxCandidateBuilder::new(
         (miner_reward as u64)
@@ -276,15 +275,9 @@ mod tests {
     fn reemission_at_floor() {
         let rules = ReemissionRules::mainnet();
         // Total emission exactly 3 ERG → 0 (not > floor)
-        assert_eq!(
-            rules.reemission_for_height(2_500_000, 3_000_000_000),
-            0
-        );
+        assert_eq!(rules.reemission_for_height(2_500_000, 3_000_000_000), 0);
         // Total emission below floor → 0
-        assert_eq!(
-            rules.reemission_for_height(2_500_000, 2_000_000_000),
-            0
-        );
+        assert_eq!(rules.reemission_for_height(2_500_000, 2_000_000_000), 0);
     }
 
     #[test]
@@ -307,9 +300,6 @@ mod tests {
             14_999_999_999 - 3_000_000_000
         );
         // Just above floor
-        assert_eq!(
-            rules.reemission_for_height(h, 3_000_000_001),
-            1
-        );
+        assert_eq!(rules.reemission_for_height(h, 3_000_000_001), 1);
     }
 }

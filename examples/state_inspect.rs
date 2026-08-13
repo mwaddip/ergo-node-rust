@@ -43,12 +43,7 @@ fn main() {
                     match meta.get(*key).unwrap() {
                         Some(v) => {
                             let bytes = v.value();
-                            println!(
-                                "  {} = {} ({} bytes)",
-                                key,
-                                hex(bytes),
-                                bytes.len()
-                            );
+                            println!("  {} = {} ({} bytes)", key, hex(bytes), bytes.len());
                         }
                         None => println!("  {} = <missing>", key),
                     }
@@ -79,11 +74,7 @@ fn main() {
                                 break;
                             }
                             if let Ok((k, v)) = item {
-                                println!(
-                                    "    lsn={}, undo_bytes={}",
-                                    k.value(),
-                                    v.value().len()
-                                );
+                                println!("    lsn={}, undo_bytes={}", k.value(), v.value().len());
                             }
                         }
                     }
@@ -99,34 +90,30 @@ fn main() {
         key_length: 32,
         value_length: None,
     };
-    let storage = RedbAVLStorage::open(
-        &path,
-        params,
-        200,
-        CacheSize::Bytes(256 * 1024 * 1024),
-    )
-    .expect("open storage");
+    let storage = RedbAVLStorage::open(&path, params, 200, CacheSize::Bytes(256 * 1024 * 1024))
+        .expect("open storage");
 
     match storage.version() {
-        Some(v) => println!(
-            "  storage.version() = {} ({} bytes)",
-            hex(&v),
-            v.len()
-        ),
+        Some(v) => println!("  storage.version() = {} ({} bytes)", hex(&v), v.len()),
         None => println!("  storage.version() = None"),
     }
 
     match storage.root_state() {
         Some((hash, height)) => {
-            println!("  storage.root_state() = (hash={}, height={})", hex(&hash), height)
+            println!(
+                "  storage.root_state() = (hash={}, height={})",
+                hex(&hash),
+                height
+            )
         }
         None => println!("  storage.root_state() = None"),
     }
 
-    let rollback_versions: Vec<_> = storage
-        .rollback_versions()
-        .collect();
-    println!("  rollback_versions (chain w/o current): {}", rollback_versions.len());
+    let rollback_versions: Vec<_> = storage.rollback_versions().collect();
+    println!(
+        "  rollback_versions (chain w/o current): {}",
+        rollback_versions.len()
+    );
     for (i, d) in rollback_versions.iter().take(5).enumerate() {
         println!("    [{}] {}", i, hex(d));
     }
@@ -139,12 +126,19 @@ fn main() {
         .expect("construct persistent prover");
 
     let d = persistent_prover.digest();
-    println!("  prover.digest() = {} ({} bytes)", hex(d.as_ref()), d.len());
+    println!(
+        "  prover.digest() = {} ({} bytes)",
+        hex(d.as_ref()),
+        d.len()
+    );
     let prover_digest = d.to_vec();
 
     if args.len() >= 3 {
         let modifiers_path = PathBuf::from(&args[2]);
-        println!("\n=== cross-check vs modifiers.redb ({}) ===", modifiers_path.display());
+        println!(
+            "\n=== cross-check vs modifiers.redb ({}) ===",
+            modifiers_path.display()
+        );
         // Read-only inspection of a handful of keys; 16 MiB is ample and
         // avoids handing an offline tool the node's full cache budget.
         let store =
@@ -188,7 +182,10 @@ fn main() {
         // any header whose state_root matches prover.digest().
         let scan_top = target_height.saturating_add(50);
         let scan_bottom = target_height.saturating_sub(100);
-        println!("\n  Scanning headers [{}..{}] for state_root matching prover.digest():", scan_bottom, scan_top);
+        println!(
+            "\n  Scanning headers [{}..{}] for state_root matching prover.digest():",
+            scan_bottom, scan_top
+        );
         let mut found_any = false;
         for h in (scan_bottom..=scan_top).rev() {
             if let Ok(Some(id)) = store.best_header_at(h) {
@@ -196,7 +193,11 @@ fn main() {
                     if let Ok(header) = parse_header(&bytes) {
                         let root_bytes: [u8; 33] = header.state_root.into();
                         if root_bytes.as_slice() == prover_digest.as_slice() {
-                            println!("    MATCH at height {}: state_root = {}", h, hex(&root_bytes));
+                            println!(
+                                "    MATCH at height {}: state_root = {}",
+                                h,
+                                hex(&root_bytes)
+                            );
                             found_any = true;
                         }
                     }

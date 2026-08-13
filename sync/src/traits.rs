@@ -38,10 +38,7 @@ pub trait SyncStore {
     /// PRECONDITION: caller MUST have called `validator.flush()` before
     /// invoking this — the ordering is load-bearing for the cross-DB
     /// invariant. See ../facts/sync.md.
-    fn set_validated_height(
-        &self,
-        height: u32,
-    ) -> impl std::future::Future<Output = ()> + Send;
+    fn set_validated_height(&self, height: u32) -> impl std::future::Future<Output = ()> + Send;
 
     /// Fsync outstanding modifier writes. Paired with validator flushes so
     /// state and modifier stores advance durably together.
@@ -91,9 +88,7 @@ pub trait SyncTransport {
     fn outbound_peers(&self) -> impl std::future::Future<Output = Vec<PeerId>> + Send;
 
     /// Receive the next protocol event. Returns None if the event stream ends.
-    fn next_event(
-        &mut self,
-    ) -> impl std::future::Future<Output = Option<ProtocolEvent>> + Send;
+    fn next_event(&mut self) -> impl std::future::Future<Output = Option<ProtocolEvent>> + Send;
 }
 
 /// How the sync machine queries and updates chain state.
@@ -142,10 +137,7 @@ pub trait SyncChain {
     ) -> impl std::future::Future<Output = ergo_validation::Parameters> + Send;
 
     /// `true` iff `height` is the start of a new voting epoch.
-    fn is_epoch_boundary(
-        &self,
-        height: u32,
-    ) -> impl std::future::Future<Output = bool> + Send;
+    fn is_epoch_boundary(&self, height: u32) -> impl std::future::Future<Output = bool> + Send;
 
     /// Voting epoch length for this network (mainnet: 1024, testnet: 128).
     /// Used by sync to align the `blocks_to_keep` prune horizon to voting-
@@ -168,7 +160,7 @@ pub trait SyncChain {
         epoch_boundary_height: u32,
         block_proposed_update: &[u8],
     ) -> impl std::future::Future<Output = Result<ergo_validation::Parameters, enr_chain::ChainError>>
-    + Send;
+           + Send;
 
     /// Apply parameters from a successfully validated epoch-boundary block.
     /// Called by the validator's caller AFTER `validate_block` returns Ok with
@@ -184,9 +176,7 @@ pub trait SyncChain {
     /// on the chain (JVM `Parameters.proposedUpdate`). Used by the
     /// validator at v4+ epoch boundaries to compare against the block's
     /// `[0x00, 124]` extension field — JVM `matchParameters60`.
-    fn active_proposed_update_bytes(
-        &self,
-    ) -> impl std::future::Future<Output = Vec<u8>> + Send;
+    fn active_proposed_update_bytes(&self) -> impl std::future::Future<Output = Vec<u8>> + Send;
 
     /// Strip a `NipopowProof` (P2P code 91) message envelope and verify the
     /// inner proof bytes via [`enr_chain::verify_nipopow_proof_bytes`].

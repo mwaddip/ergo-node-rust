@@ -177,7 +177,11 @@ async fn run(cli: Cli) -> Result<()> {
         // but downloaded_height may be much higher if sections persist.
         let sections_from = node_info.downloaded_height.max(node_info.full_height) + 1;
         if sections_from <= target {
-            info!(from = sections_from, to = target, "building block ID list for sections gap");
+            info!(
+                from = sections_from,
+                to = target,
+                "building block ID list for sections gap"
+            );
             header_ids = pool.header_ids_for_range(sections_from, target).await?;
         }
     }

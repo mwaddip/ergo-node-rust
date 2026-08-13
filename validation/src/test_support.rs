@@ -13,9 +13,7 @@
 
 use bytes::Bytes;
 use ergo_avltree_rust::operation::{KeyValue, Operation};
-use ergo_chain_types::{
-    ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint, Header, Votes,
-};
+use ergo_chain_types::{ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint, Header, Votes};
 use ergo_lib::chain::transaction::input::prover_result::ProverResult;
 use ergo_lib::chain::transaction::input::Input;
 use ergo_lib::chain::transaction::Transaction;
@@ -74,9 +72,7 @@ pub fn box_key(ergo_box: &ErgoBox) -> [u8; 32] {
 }
 
 pub fn serialized_box(ergo_box: &ErgoBox) -> Vec<u8> {
-    ergo_box
-        .sigma_serialize_bytes()
-        .expect("box serialization")
+    ergo_box.sigma_serialize_bytes().expect("box serialization")
 }
 
 /// A transaction spending `inputs` into a single always-true output. Value is

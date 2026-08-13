@@ -98,7 +98,6 @@ impl ChainConfig {
 
     /// Whether EIP-37 difficulty adjustment is active at the given height.
     pub fn eip37_active(&self, height: u32) -> bool {
-        self.eip37_activation_height
-            .is_some_and(|h| height >= h)
+        self.eip37_activation_height.is_some_and(|h| height >= h)
     }
 }

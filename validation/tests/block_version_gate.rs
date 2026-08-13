@@ -85,7 +85,16 @@ fn mid_epoch_version_divergence_not_checked() {
     let active = make_params(Some(3));
 
     let err = validator
-        .apply_state(&header, &fx.txs, Some(&fx.proofs), &ext, &[], &active, None, None)
+        .apply_state(
+            &header,
+            &fx.txs,
+            Some(&fx.proofs),
+            &ext,
+            &[],
+            &active,
+            None,
+            None,
+        )
         .unwrap_err();
     assert!(
         matches!(err, ValidationError::ProofDigestMismatch { .. }),
@@ -102,11 +111,8 @@ fn boundary_mismatch_rejected_against_recomputed_set() {
     let mut validator = DigestValidator::new(ADDigest::zero(), 0);
     let header = make_header(1, 4);
     let fx = make_sections();
-    let ext = serialize_extension(
-        &[0u8; 32],
-        &[([0x00, 123], 3i32.to_be_bytes().to_vec())],
-    )
-    .expect("extension with params");
+    let ext = serialize_extension(&[0u8; 32], &[([0x00, 123], 3i32.to_be_bytes().to_vec())])
+        .expect("extension with params");
     let active = make_params(Some(4));
     let boundary = make_params(Some(3));
 
@@ -138,11 +144,8 @@ fn matching_version_passes_gate_at_boundary() {
     let mut validator = DigestValidator::new(ADDigest::zero(), 0);
     let header = make_header(1, 4);
     let fx = make_sections();
-    let ext = serialize_extension(
-        &[0u8; 32],
-        &[([0x00, 123], 4i32.to_be_bytes().to_vec())],
-    )
-    .expect("extension with params");
+    let ext = serialize_extension(&[0u8; 32], &[([0x00, 123], 4i32.to_be_bytes().to_vec())])
+        .expect("extension with params");
     let active = make_params(Some(4));
     let boundary = make_params(Some(4));
 
@@ -175,11 +178,8 @@ fn absent_block_version_at_boundary_rejects_without_panicking() {
     let mut validator = DigestValidator::new(ADDigest::zero(), 0);
     let header = make_header(1, 4);
     let fx = make_sections();
-    let ext = serialize_extension(
-        &[0u8; 32],
-        &[([0x00, 123], 4i32.to_be_bytes().to_vec())],
-    )
-    .expect("extension with params");
+    let ext = serialize_extension(&[0u8; 32], &[([0x00, 123], 4i32.to_be_bytes().to_vec())])
+        .expect("extension with params");
     let active = make_params(Some(4));
     let boundary = make_params(None);
 

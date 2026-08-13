@@ -1,17 +1,17 @@
+pub mod cleanup;
+pub mod expiring_cache;
+pub mod family;
+pub mod pool;
+pub mod process;
+pub mod stats;
 pub mod types;
 pub mod weight;
-pub mod expiring_cache;
-pub mod pool;
-pub mod family;
-pub mod process;
-pub mod cleanup;
-pub mod stats;
 
 use std::collections::HashMap;
 
 use ergo_lib::chain::transaction::Transaction;
-use pool::OrderedPool;
 use expiring_cache::ExpiringCache;
+use pool::OrderedPool;
 use stats::FeeStats;
 use types::{MempoolConfig, UnconfirmedTx};
 use weight::TxWeight;
@@ -42,22 +42,45 @@ impl Mempool {
 
     // --- Query methods ---
 
-    pub fn get(&self, tx_id: &[u8; 32]) -> Option<&UnconfirmedTx> { self.pool.get(tx_id) }
-    pub fn contains(&self, tx_id: &[u8; 32]) -> bool { self.pool.contains(tx_id) || self.invalidated.contains(tx_id) }
-    pub fn is_invalidated(&self, tx_id: &[u8; 32]) -> bool { self.invalidated.contains(tx_id) }
-    pub fn len(&self) -> usize { self.pool.len() }
-    pub fn is_empty(&self) -> bool { self.pool.is_empty() }
-    pub fn top(&self, limit: usize) -> Vec<&UnconfirmedTx> { self.pool.top(limit) }
-    pub fn all_prioritized(&self) -> Vec<&UnconfirmedTx> { self.pool.all_prioritized() }
-    pub fn tx_ids(&self) -> Vec<[u8; 32]> { self.pool.tx_ids() }
+    pub fn get(&self, tx_id: &[u8; 32]) -> Option<&UnconfirmedTx> {
+        self.pool.get(tx_id)
+    }
+    pub fn contains(&self, tx_id: &[u8; 32]) -> bool {
+        self.pool.contains(tx_id) || self.invalidated.contains(tx_id)
+    }
+    pub fn is_invalidated(&self, tx_id: &[u8; 32]) -> bool {
+        self.invalidated.contains(tx_id)
+    }
+    pub fn len(&self) -> usize {
+        self.pool.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.pool.is_empty()
+    }
+    pub fn top(&self, limit: usize) -> Vec<&UnconfirmedTx> {
+        self.pool.top(limit)
+    }
+    pub fn all_prioritized(&self) -> Vec<&UnconfirmedTx> {
+        self.pool.all_prioritized()
+    }
+    pub fn tx_ids(&self) -> Vec<[u8; 32]> {
+        self.pool.tx_ids()
+    }
 
-    pub fn unconfirmed_box(&self, box_id: &[u8; 32]) -> Option<&ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox> {
+    pub fn unconfirmed_box(
+        &self,
+        box_id: &[u8; 32],
+    ) -> Option<&ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox> {
         self.pool.unconfirmed_box(box_id)
     }
 
-    pub fn spent_inputs(&self) -> impl Iterator<Item = &[u8; 32]> { self.pool.spent_inputs() }
+    pub fn spent_inputs(&self) -> impl Iterator<Item = &[u8; 32]> {
+        self.pool.spent_inputs()
+    }
 
-    pub fn fee_histogram(&self, buckets: usize) -> Vec<stats::FeeBucket> { self.stats.histogram(buckets) }
+    pub fn fee_histogram(&self, buckets: usize) -> Vec<stats::FeeBucket> {
+        self.stats.histogram(buckets)
+    }
 
     pub fn expected_wait_time(&self, fee: u64, tx_size: usize) -> Option<u64> {
         let fee_per_factor = fee * 1024 / tx_size.max(1) as u64;
@@ -65,7 +88,8 @@ impl Mempool {
     }
 
     pub fn recommended_fee(&self, target_wait_ms: u64, tx_size: usize) -> Option<u64> {
-        self.stats.recommended_fee(target_wait_ms)
+        self.stats
+            .recommended_fee(target_wait_ms)
             .map(|fpf| fpf * tx_size.max(1) as u64 / 1024)
     }
 
@@ -86,7 +110,10 @@ impl Mempool {
             // Record stats if tx was in our pool
             if let Some(utx) = self.pool.get(&tx_id) {
                 let wait_ms = utx.created.elapsed().as_millis() as u64;
-                let fee_per_factor = self.pool.by_id.get(&tx_id)
+                let fee_per_factor = self
+                    .pool
+                    .by_id
+                    .get(&tx_id)
                     .map(|w| w.fee_per_factor)
                     .unwrap_or(0);
                 self.stats.record_confirmation(fee_per_factor, wait_ms);
@@ -102,9 +129,10 @@ impl Mempool {
                 let input_id = process::input_box_id_raw(&input.box_id);
                 if let Some(conflict_weight) = self.pool.spending_tx(&input_id).cloned() {
                     if conflict_weight.tx_id != tx_id
-                        && self.pool.remove(&conflict_weight.tx_id).is_some() {
-                            removed.push(conflict_weight.tx_id);
-                        }
+                        && self.pool.remove(&conflict_weight.tx_id).is_some()
+                    {
+                        removed.push(conflict_weight.tx_id);
+                    }
                 }
             }
         }
@@ -129,7 +157,11 @@ impl Mempool {
             let input_ids = process::input_box_ids(&utx.tx);
             let outputs = process::output_boxes(&utx.tx);
             let weight = TxWeight::new(
-                tx_id, utx.fee, utx.tx_bytes.len(), utx.cost, self.config.fee_strategy,
+                tx_id,
+                utx.fee,
+                utx.tx_bytes.len(),
+                utx.cost,
+                self.config.fee_strategy,
             );
             self.pool.insert(weight, utx, &input_ids, outputs);
         }

@@ -2,8 +2,8 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use enr_chain::{
-    AppendResult, BlockId, ChainError, Header, HeaderChain, HeaderTracker,
-    decode_compact_bits, HEADER_TYPE_ID, TRANSACTION_TYPE_ID,
+    decode_compact_bits, AppendResult, BlockId, ChainError, Header, HeaderChain, HeaderTracker,
+    HEADER_TYPE_ID, TRANSACTION_TYPE_ID,
 };
 use enr_store::{ModifierStore, RedbModifierStore};
 use ergo_sync::delivery::{DeliveryControl, DeliveryData};
@@ -113,7 +113,7 @@ impl ValidationPipeline {
             }
 
             // Parent is another fork header — read it from the store
-            let parent_data = match self.store.get(HEADER_TYPE_ID, &current_parent.0.0) {
+            let parent_data = match self.store.get(HEADER_TYPE_ID, &current_parent.0 .0) {
                 Ok(Some(data)) => data,
                 _ => {
                     tracing::debug!(parent = %current_parent, "fork chain broken — parent not in store");
@@ -165,37 +165,42 @@ impl ValidationPipeline {
         let mut section_entries: Vec<StoreEntry> = Vec::new();
 
         {
-        let chain_guard = self.chain.lock().await;
-        for (type_id, id, data, peer_id) in &batch {
-            received_ids.push(*id);
-            if *type_id == HEADER_TYPE_ID {
-                raw_headers.push((data.as_slice(), *peer_id));
-            } else if *type_id == TRANSACTION_TYPE_ID && !data.is_empty() {
-                // Unconfirmed transaction — forward to mempool
-                if let Some(ref tx_sender) = self.tx_sender {
-                    let _ = tx_sender.try_send((*id, data.clone()));
+            let chain_guard = self.chain.lock().await;
+            for (type_id, id, data, peer_id) in &batch {
+                received_ids.push(*id);
+                if *type_id == HEADER_TYPE_ID {
+                    raw_headers.push((data.as_slice(), *peer_id));
+                } else if *type_id == TRANSACTION_TYPE_ID && !data.is_empty() {
+                    // Unconfirmed transaction — forward to mempool
+                    if let Some(ref tx_sender) = self.tx_sender {
+                        let _ = tx_sender.try_send((*id, data.clone()));
+                    }
+                } else if !data.is_empty() {
+                    // Block sections (102=BlockTransactions, 104=ADProofs, 108=Extension)
+                    // have the header ID in the first 32 bytes. Look up the header to
+                    // derive the height so the store can index by (type_id, height).
+                    let height = if data.len() >= 32 {
+                        let header_id: [u8; 32] = data[..32].try_into().unwrap();
+                        let block_id =
+                            ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(header_id));
+                        chain_guard.height_of(&block_id).unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    section_entries.push((*type_id, *id, height, data.clone(), None));
                 }
-            } else if !data.is_empty() {
-                // Block sections (102=BlockTransactions, 104=ADProofs, 108=Extension)
-                // have the header ID in the first 32 bytes. Look up the header to
-                // derive the height so the store can index by (type_id, height).
-                let height = if data.len() >= 32 {
-                    let header_id: [u8; 32] = data[..32].try_into().unwrap();
-                    let block_id = ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(header_id));
-                    chain_guard.height_of(&block_id).unwrap_or(0)
-                } else {
-                    0
-                };
-                section_entries.push((*type_id, *id, height, data.clone(), None));
             }
-        }
         } // drop chain_guard
 
         // Notify delivery tracker (data plane — ok to drop)
         if !received_ids.is_empty()
-            && self.delivery_data_tx.try_send(DeliveryData::Received(received_ids)).is_err() {
-                tracing::debug!("delivery data channel full, dropped Received notification");
-            }
+            && self
+                .delivery_data_tx
+                .try_send(DeliveryData::Received(received_ids))
+                .is_err()
+        {
+            tracing::debug!("delivery data channel full, dropped Received notification");
+        }
 
         // Store non-header block sections directly (no validation)
         if !section_entries.is_empty() {
@@ -230,7 +235,9 @@ impl ValidationPipeline {
             // different bytes. These would break SyncInfo (commonPoint fails).
             if let Ok(reserialized) = header.scorex_serialize_bytes() {
                 if data != reserialized.as_slice() {
-                    let first_diff = data.iter().zip(reserialized.iter())
+                    let first_diff = data
+                        .iter()
+                        .zip(reserialized.iter())
                         .position(|(a, b)| a != b);
                     tracing::error!(
                         height = header.height,
@@ -246,7 +253,11 @@ impl ValidationPipeline {
 
             if let Err(e) = enr_chain::verify_pow(&header) {
                 if let Some(pid) = peer_id {
-                    tracing::warn!(peer_id = pid, height = header.height, "PENALTY invalid PoW: {e}");
+                    tracing::warn!(
+                        peer_id = pid,
+                        height = header.height,
+                        "PENALTY invalid PoW: {e}"
+                    );
                 } else {
                     tracing::debug!(
                         "pipeline: rejecting header at height {}: {e}",
@@ -290,10 +301,17 @@ impl ValidationPipeline {
             match chain.try_append(header.clone()) {
                 Ok(AppendResult::Extended) => {
                     chained += 1;
-                    let score_bytes = chain.score_at(header_height)
+                    let score_bytes = chain
+                        .score_at(header_height)
                         .expect("score for just-appended header")
                         .to_bytes_be();
-                    store_entries.push((HEADER_TYPE_ID, header_id.0.0, header_height, raw, Some(score_bytes)));
+                    store_entries.push((
+                        HEADER_TYPE_ID,
+                        header_id.0 .0,
+                        header_height,
+                        raw,
+                        Some(score_bytes),
+                    ));
                     if header_height % 400 < 2 {
                         tracing::debug!(height = header_height, id = %header_id, "chained header ID");
                     }
@@ -305,10 +323,17 @@ impl ValidationPipeline {
                         match chain.try_append(buf.clone()) {
                             Ok(AppendResult::Extended) => {
                                 chained += 1;
-                                let buf_score_bytes = chain.score_at(buf_height)
+                                let buf_score_bytes = chain
+                                    .score_at(buf_height)
                                     .expect("score for just-appended buffered header")
                                     .to_bytes_be();
-                                store_entries.push((HEADER_TYPE_ID, bid.0.0, buf_height, buf_raw, Some(buf_score_bytes)));
+                                store_entries.push((
+                                    HEADER_TYPE_ID,
+                                    bid.0 .0,
+                                    buf_height,
+                                    buf_raw,
+                                    Some(buf_score_bytes),
+                                ));
                                 self.tracker.observe(&buf);
                                 next_parent = bid;
                             }
@@ -320,22 +345,26 @@ impl ValidationPipeline {
                     // Header is valid but forks from the best chain.
                     // Compute its cumulative score and store immediately
                     // (later headers in this batch may extend this fork).
-                    let parent_score = chain.score_at(fork_height)
-                        .unwrap_or_default();
+                    let parent_score = chain.score_at(fork_height).unwrap_or_default();
                     let difficulty = decode_compact_bits(header.n_bits)
                         .to_biguint()
                         .unwrap_or_default();
                     let fork_score = &parent_score + &difficulty;
 
                     // Determine fork number at this height
-                    let fork_num = self.store.header_ids_at_height(header_height)
+                    let fork_num = self
+                        .store
+                        .header_ids_at_height(header_height)
                         .map(|forks| forks.last().map(|(_, f)| f + 1).unwrap_or(1))
                         .unwrap_or(1);
 
                     let score_bytes = fork_score.to_bytes_be();
                     if let Err(e) = self.store.put_header(
-                        &header_id.0.0, header_height, fork_num,
-                        &score_bytes, &raw,
+                        &header_id.0 .0,
+                        header_height,
+                        fork_num,
+                        &score_bytes,
+                        &raw,
                     ) {
                         tracing::error!(height = header_height, "store fork header failed: {e}");
                     }
@@ -355,7 +384,9 @@ impl ValidationPipeline {
                 Err(ChainError::ParentNotFound { .. }) => {
                     // Parent not in best chain. Check if it's a known fork header
                     // in the store — if so, this extends that fork chain.
-                    let parent_score_opt = self.store.header_score(&parent_id.0.0)
+                    let parent_score_opt = self
+                        .store
+                        .header_score(&parent_id.0 .0)
                         .ok()
                         .flatten()
                         .filter(|s| !s.is_empty());
@@ -369,16 +400,24 @@ impl ValidationPipeline {
                             .unwrap_or_default();
                         let fork_score = &parent_score + &difficulty;
 
-                        let fork_num = self.store.header_ids_at_height(header_height)
+                        let fork_num = self
+                            .store
+                            .header_ids_at_height(header_height)
                             .map(|forks| forks.last().map(|(_, f)| f + 1).unwrap_or(1))
                             .unwrap_or(1);
 
                         let score_bytes = fork_score.to_bytes_be();
                         if let Err(e) = self.store.put_header(
-                            &header_id.0.0, header_height, fork_num,
-                            &score_bytes, &raw,
+                            &header_id.0 .0,
+                            header_height,
+                            fork_num,
+                            &score_bytes,
+                            &raw,
                         ) {
-                            tracing::error!(height = header_height, "store fork chain header failed: {e}");
+                            tracing::error!(
+                                height = header_height,
+                                "store fork chain header failed: {e}"
+                            );
                         }
 
                         let best_score = chain.cumulative_score();
@@ -423,18 +462,20 @@ impl ValidationPipeline {
                         // so fetching the lowest missing parent is sufficient: once
                         // it arrives and chains, the rest drain from the buffer.
                         if (self.reorg_requested.is_empty() || self.reorg_requested.len() < 3)
-                            && self.reorg_requested.insert(parent_id.0.0) {
-                                let _ = self.delivery_control_tx.send(
-                                    DeliveryControl::NeedModifier {
-                                        type_id: HEADER_TYPE_ID,
-                                        id: parent_id.0.0,
-                                    },
-                                );
-                            }
+                            && self.reorg_requested.insert(parent_id.0 .0)
+                        {
+                            let _ = self
+                                .delivery_control_tx
+                                .send(DeliveryControl::NeedModifier {
+                                    type_id: HEADER_TYPE_ID,
+                                    id: parent_id.0 .0,
+                                });
+                        }
 
                         buffered += 1;
-                        if let Some((_, (evicted, _))) = self.buffer.push(parent_id, (header, raw)) {
-                            evicted_ids.push(evicted.id.0.0);
+                        if let Some((_, (evicted, _))) = self.buffer.push(parent_id, (header, raw))
+                        {
+                            evicted_ids.push(evicted.id.0 .0);
                         }
                     }
                 }
@@ -442,7 +483,7 @@ impl ValidationPipeline {
                 | Err(ChainError::InvalidGenesisHeight { .. }) => {
                     buffered += 1;
                     if let Some((_, (evicted, _))) = self.buffer.push(parent_id, (header, raw)) {
-                        evicted_ids.push(evicted.id.0.0);
+                        evicted_ids.push(evicted.id.0 .0);
                     }
                 }
                 Err(_) => {
@@ -460,10 +501,8 @@ impl ValidationPipeline {
         if let Some((fork_point, new_branch_with_raw)) = pending_reorg {
             let old_tip = chain.height();
             let old_tip_id = chain.tip().id;
-            let headers_only: Vec<Header> = new_branch_with_raw
-                .iter()
-                .map(|(h, _)| h.clone())
-                .collect();
+            let headers_only: Vec<Header> =
+                new_branch_with_raw.iter().map(|(h, _)| h.clone()).collect();
             match chain.try_reorg_deep(fork_point, headers_only) {
                 Ok(demoted_ids) => {
                     let new_tip = chain.height();
@@ -492,10 +531,11 @@ impl ValidationPipeline {
                     let reorg_entries: Vec<StoreEntry> = new_branch_with_raw
                         .into_iter()
                         .map(|(h, raw)| {
-                            let score_bytes = chain.score_at(h.height)
+                            let score_bytes = chain
+                                .score_at(h.height)
                                 .expect("score for reorged header")
                                 .to_bytes_be();
-                            (HEADER_TYPE_ID, h.id.0.0, h.height, raw, Some(score_bytes))
+                            (HEADER_TYPE_ID, h.id.0 .0, h.height, raw, Some(score_bytes))
                         })
                         .collect();
                     let reorg_entry_count = reorg_entries.len();
@@ -528,7 +568,9 @@ impl ValidationPipeline {
 
         // Purge buffer entries at or below the chain tip (stale duplicates)
         let before_purge = self.buffer.len();
-        let stale_keys: Vec<BlockId> = self.buffer.iter()
+        let stale_keys: Vec<BlockId> = self
+            .buffer
+            .iter()
             .filter(|(_, (h, _))| h.height <= height_after)
             .map(|(k, _)| *k)
             .collect();
@@ -573,8 +615,9 @@ impl ValidationPipeline {
                     .map(|forks| forks.last().map(|(_, f)| f + 1).unwrap_or(1))
                     .unwrap_or(1);
                 let score_bytes = score.unwrap_or_default();
-                if let Err(e) =
-                    self.store.put_header(&id, height, fork_num, &score_bytes, &raw)
+                if let Err(e) = self
+                    .store
+                    .put_header(&id, height, fork_num, &score_bytes, &raw)
                 {
                     tracing::error!(height, "store demoted header failed: {e}");
                 }
@@ -590,7 +633,11 @@ impl ValidationPipeline {
         // Notify delivery tracker of evicted modifier IDs for re-request (data plane — ok to drop)
         if !evicted_ids.is_empty() {
             tracing::debug!(count = evicted_ids.len(), "buffer evictions → re-request");
-            if self.delivery_data_tx.try_send(DeliveryData::Evicted(evicted_ids)).is_err() {
+            if self
+                .delivery_data_tx
+                .try_send(DeliveryData::Evicted(evicted_ids))
+                .is_err()
+            {
                 tracing::debug!("delivery data channel full, dropped Evicted notification");
             }
         }
@@ -610,14 +657,18 @@ impl ValidationPipeline {
         if chained > 0 || buffered > 0 {
             tracing::debug!(
                 batch_size,
-                chained, buffered, rejected, purged,
+                chained,
+                buffered,
+                rejected,
+                purged,
                 chain_tip = height_after,
                 "pipeline: batch breakdown"
             );
         } else if rejected > 0 || purged > 0 {
             tracing::debug!(
                 batch_size,
-                rejected, purged,
+                rejected,
+                purged,
                 chain_tip = height_after,
                 "pipeline: batch breakdown (all known)"
             );
@@ -651,8 +702,22 @@ mod tests {
         let store = Arc::new(
             RedbModifierStore::new(&dir.path().join("test.redb"), 8 * 1024 * 1024).unwrap(),
         );
-        let pipeline = ValidationPipeline::new(rx, chain, store, progress_tx, delivery_control_tx, delivery_data_tx);
-        (pipeline, tx, progress_rx, delivery_control_rx, delivery_data_rx, dir)
+        let pipeline = ValidationPipeline::new(
+            rx,
+            chain,
+            store,
+            progress_tx,
+            delivery_control_tx,
+            delivery_data_tx,
+        );
+        (
+            pipeline,
+            tx,
+            progress_rx,
+            delivery_control_rx,
+            delivery_data_rx,
+            dir,
+        )
     }
 
     #[test]
@@ -683,7 +748,10 @@ mod tests {
         let bytes1 = header.scorex_serialize_bytes().unwrap();
         let header2 = Header::scorex_parse_bytes(&bytes1).unwrap();
         let bytes2 = header2.scorex_serialize_bytes().unwrap();
-        assert_eq!(bytes1, bytes2, "scorex serialize round-trip must be byte-identical");
+        assert_eq!(
+            bytes1, bytes2,
+            "scorex serialize round-trip must be byte-identical"
+        );
     }
 
     #[test]
@@ -739,9 +807,17 @@ mod tests {
         rt.block_on(pipeline.process_batch(batch));
 
         // Header has valid PoW but parent is missing, so it goes to the LRU buffer
-        assert_eq!(pipeline.buffer.len(), 1, "valid PoW header should be buffered");
+        assert_eq!(
+            pipeline.buffer.len(),
+            1,
+            "valid PoW header should be buffered"
+        );
         let chain = rt.block_on(pipeline.chain.lock());
-        assert_eq!(chain.height(), 0, "unchainable header should not increase height");
+        assert_eq!(
+            chain.height(),
+            0,
+            "unchainable header should not increase height"
+        );
     }
 
     /// Test vector from JVM ergo-core HeaderSerializationSpecification.
@@ -778,8 +854,7 @@ mod tests {
         // Verify header ID matches JVM (Blake2b256 of serialized bytes)
         let id_hex = format!("{}", header.id);
         assert_eq!(
-            id_hex,
-            "f46c89e44f13a92d8409341490f97f05c85785fa8d2d2164332cc066eda95c39",
+            id_hex, "f46c89e44f13a92d8409341490f97f05c85785fa8d2d2164332cc066eda95c39",
             "header ID must match JVM test vector"
         );
 

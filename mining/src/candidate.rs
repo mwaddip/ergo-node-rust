@@ -2,9 +2,7 @@
 
 use blake2::Digest as Blake2Digest;
 use ergo_chain_types::autolykos_pow_scheme::decode_compact_bits;
-use ergo_chain_types::{
-    AutolykosSolution, BlockId, Digest, Digest32, EcPoint, Header, Votes,
-};
+use ergo_chain_types::{AutolykosSolution, BlockId, Digest, Digest32, EcPoint, Header, Votes};
 use ergo_lib::chain::transaction::Transaction;
 use ergo_merkle_tree::{MerkleNode, MerkleTree};
 
@@ -21,10 +19,7 @@ type Blake2b256 = blake2::Blake2b<blake2::digest::typenum::U32>;
 /// witness IDs (`txIds ++ witnessIds` — two concatenated lists, not
 /// interleaved). Mainnet and testnet are both version >= 2 today, so a
 /// tx-IDs-only root is rejected by every JVM peer.
-pub fn transactions_root(
-    txs: &[Transaction],
-    block_version: u8,
-) -> Result<Digest32, MiningError> {
+pub fn transactions_root(txs: &[Transaction], block_version: u8) -> Result<Digest32, MiningError> {
     if txs.is_empty() {
         return Err(MiningError::AssemblyFailed("no transactions".into()));
     }
