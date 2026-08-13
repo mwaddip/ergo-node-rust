@@ -72,7 +72,7 @@ dependency decision — which still dispatches.
 
 ## Goal
 
-Replace the JVM reference node with a Rust implementation that is memory-safe, efficient, and IPv6-native. The P2P layer (`ergo-proxy-node`) is complete and running on testnet. This project builds everything above it: header validation, block validation, UTXO state management, mempool, chain sync, and storage.
+Replace the JVM reference node with a Rust implementation that is memory-safe, efficient, and IPv6-native. The P2P layer lives in this repo as the `p2p/` crate — handshake, framing, routing, IPv4/IPv6 — and everything above it is built here too: header validation, block validation, UTXO state management, mempool, chain sync, and storage.
 
 ## Architecture
 
@@ -102,7 +102,7 @@ Single-repo, multi-session development:
 - **Design by Contract**: every component boundary has explicit preconditions, postconditions, and invariants. Contracts are documented in `facts/` and enforced via `debug_assert!`.
 - **The wire is the spec**: the Ergo P2P protocol has no formal specification. Protocol behavior was reverse-engineered from the JVM reference node and verified against pcap captures. See `docs/protocol/` for the wire format spec.
 - **Reuse before building**: the Rust Ergo ecosystem has substantial existing components. Use them. See the ecosystem inventory below.
-- **Incremental validation**: each phase adds one capability without breaking what came before. The node starts as a proxy and gains validation layers progressively.
+- **Incremental validation**: each phase adds one capability without breaking what came before. Early builds forwarded traffic without understanding it and gained validation layers progressively; the `[proxy]` config section is a leftover of that era, not a statement about what the node does now.
 
 ## Existing Rust Ecosystem (Inventory)
 
@@ -129,7 +129,6 @@ the build actually resolves.*
 | Merkle proofs | `ergo-merkle-tree` | 0.15.0 | 2026-08-04 | Tree, proof, batch multiproof |
 | ErgoScript compiler | `ergoscript-compiler` | 0.24.0 | 2026-08-04 | Source to ErgoTree. **Available, not a dependency** — the node never compiles source |
 | Scorex serialization | `sigma-ser` | 0.19.0 | 2026-08-04 | VLQ, ZigZag, binary encoding |
-| P2P networking | `ergo-proxy-node` | 0.1.0 | — | Handshake, framing, message routing, IPv6. Now vendored as this repo's `p2p/` crate |
 
 ### Built (this project)
 
@@ -164,7 +163,8 @@ operators today. Listed for awareness:
 | Crate | Status |
 |---|---|
 | `ergo-utilities-rust` | Abandoned, pinned to ergo-lib 0.13 (current: 0.28) |
-| sigma-rust `ergo-p2p` | Architecture only, codec is `todo!()`. Our proxy supersedes this. |
+| sigma-rust `ergo-p2p` | Architecture only, codec is `todo!()`. This repo's `p2p/` crate supersedes it. |
+| P2P **relay proxy** (the original `ergo-proxy-node` concept) | Abandoned as impractical. Several nodes sharing one proxy share one peer identity, so a single misbehaving node behind it gets **the proxy banned for everybody** — the well-behaved nodes lose their peers for someone else's conduct, with no way to attribute or isolate the offender. The networking code was worth keeping and is now `p2p/`; the relay in front of it was not. |
 | `ogre` (TypeScript) | Abandoned light node attempt (April 2023) |
 
 ## Phased Build Order
@@ -206,5 +206,5 @@ A local checkout for reference is at `~/projects/ergo-node-build` (v6.0.3 branch
 
 ## Related Projects
 
-- `~/projects/ergo-proxy-node` — P2P relay proxy (this project's networking layer). GitHub: `mwaddip/ergo-proxy`
+- `~/projects/ergo-proxy-node` — where the P2P layer was originally written, now vendored here as `p2p/`. GitHub: `mwaddip/ergo-proxy`. The **relay** idea it was named for is abandoned; see "Dead / Superseded".
 - `~/projects/blockhost-ergo/ergo-relay` — BlockHost signing service and peer discovery
