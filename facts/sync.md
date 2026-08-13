@@ -40,14 +40,10 @@ How the sync machine queries persistent storage.
 - Returns None if not found. Used during validation sweeps to load
   block sections (transactions, AD proofs, extensions) by type and ID.
 
-#### `script_verified_height() -> Option<u32>`
-- Read the persisted script_verified_height. Returns None if not set.
-- Used on startup to detect the gap between script-verified and
-  state-applied heights after an unclean shutdown.
-
-#### `set_script_verified_height(height)`
-- Persist the script_verified_height. Called every 100 blocks during
-  the sweep's drain of deferred eval results.
+*(`script_verified_height()` / `set_script_verified_height()` were removed from
+this trait in v0.8.0 with deferred evaluation. The metadata key they wrote
+remains in `chain_meta` on existing nodes and is simply never read again — a
+few stale bytes, no migration.)*
 
 #### `validated_height() -> Option<u32>`
 - Read the durably-recorded validated_height from
@@ -272,11 +268,12 @@ arrives that creates a better chain (higher cumulative difficulty), the pipeline
 3. Executes `HeaderChain::try_reorg_deep()` to atomically swap the best chain.
 4. Sends `DeliveryControl::Reorg { fork_point, old_tip, new_tip }` to the sync machine.
 
-The sync machine responds by draining in-flight eval results, clearing its section
-queue, resetting all three watermarks (`downloaded_height`, `state_applied_height`,
-and `script_verified_height`) to the fork point, resetting the block validator's
-state root, re-queuing sections for the new branch, and re-scanning the download
-watermark.
+The sync machine responds by clearing its section queue, resetting both
+watermarks (`downloaded_height` and `state_applied_height`) to the fork point,
+resetting the block validator's state root, re-queuing sections for the new
+branch, and re-scanning the download watermark. There are no in-flight eval
+results to drain — a reorg cannot arrive between a block's application and its
+verification, because there is no longer any gap between them.
 
 For incomplete fork chains (parent not in store), the pipeline sends
 `DeliveryControl::NeedModifier` to request the missing parent header. Once it
@@ -973,7 +970,7 @@ existing ingestion endpoints (see `facts/api.md`). The main node:
 - Receives headers and block sections, stores them via the normal store
   write path, and advances `downloaded_height` via the watermark scanner.
 - Runs the validation pipeline on delivered data concurrently, advancing
-  `state_applied_height` and `script_verified_height` normally.
+  `state_applied_height` normally.
 
 The main node does NOT supervise fastsync's peer selection, fetch strategy,
 or internal state. It waits for the subprocess to exit and then transitions
@@ -1008,462 +1005,72 @@ the mean block interval. The "far behind while running" case is rare enough
 that the added complexity of continuous monitoring and mode transitions
 isn't justified. Restart is an acceptable recovery mechanism.
 
-## Block Assembly (state_applied_height / script_verified_height)
+## Block Assembly (state_applied_height)
 
-The sync machine tracks three watermarks:
+The sync machine tracks two watermarks:
 
 - **`downloaded_height`** — highest height where all required block sections
   are present in the store.
 - **`state_applied_height`** — highest height where `apply_state()` returned Ok.
   External consumers (API, mempool, mining) see this height.
-- **`script_verified_height`** — highest height where `evaluate_scripts()` has
-  completed successfully. Internal bookkeeping for rollback decisions.
 
-  Advances in-order as eval results arrive, and **survives out-of-order
-  arrival across separate drains**. The reorder buffer is a `HeaderSync` field
-  (`eval_verified`), not a drain-local one.
+**`script_verified_height` was deleted in v0.8.0**, along with deferred
+evaluation itself. It tracked how far script verification trailed state
+application; `apply_state` now evaluates before persisting, so `Ok` already
+means the scripts passed, and a second watermark could only ever disagree with
+the first. Everything hanging off it went too: the reorder buffer and its
+`eval_generation` stamp, the dispatch gate and its byte/count bounds, the
+failure-rollback path, the startup gap repair, and the checkpoint frontier
+floor.
 
-  *History — was broken from an unknown date until 2026-08-12.* The buffer used
-  to be a function-local `BTreeSet` dropped when `drain_eval_results` returned,
-  so a result whose predecessor was still running was drained, found
-  non-contiguous, and discarded; the channel never resends, so the frontier
-  could never pass that hole for the life of the process. Observed live: block
-  3522 is 3 txs / 17 inputs, the first non-coinbase-only block in its region.
-  With two Rayon threads the trivial eval for 3523 overtook it, was drained
-  alone, and was dropped — the watermark froze at 3522 for 190,000+ blocks.
-  Scripts were still evaluated and failures still rolled back throughout (the
-  `Err` branch never depended on contiguity), so it was bookkeeping rather than
-  a verification skip — but any consumer reading the watermark as "fully
-  validated up to here" was being lied to from the first overtake onwards,
-  which on a low-thread host is almost immediate.
+*The history is kept because it is the argument against reintroducing any of
+it.* The reorder buffer was drain-local until 2026-08-12, so any eval result
+that overtook its predecessor was found non-contiguous and discarded — and the
+channel never resends, so the frontier could never pass that hole for the life
+of the process. Block 3522 (3 txs, 17 inputs, the first non-coinbase-only block
+in its region) was overtaken by the trivial 3523 on a two-thread pool, and the
+watermark froze there for **190,000+ blocks** while `eval_lag` read **187,711**
+against `evals_in_flight` of **1** and flat memory. Scripts were still
+evaluated and failures still rolled back, so it was bookkeeping rather than a
+verification skip — but every consumer reading that watermark as "validated up
+to here" was lied to from the first overtake onwards, which on a low-thread
+host is almost immediate.
 
-  The buffer is paired with an `eval_generation` counter stamped on every
-  dispatched eval. A rollback bumps the generation **only where the validator
-  actually moved**, so a result from before the rollback is retired for
-  accounting — its count and bytes are returned to the gate — but cannot reach
-  the frontier. This is why `handle_eval_failure` no longer zeroes
-  `evals_in_flight`: the rayon tasks are still running and still holding their
-  heap, and pretending otherwise is what let the gate open early.
+That bug, the `handle_eval_failure` zeroing of `evals_in_flight` while its
+rayon tasks still ran and still held their heap, and the unbounded backlog that
+killed a 4-thread 1.8 GHz host at anon-rss 10.62 GiB, were three faces of one
+root: **verification lagging application**. Removing the lag removed the class,
+and it is the reason a "just make it async again for throughput" proposal
+should be treated as a request to reopen all three.
 
-`downloaded_height` and `state_applied_height` are initialized from
-`validator.validated_height()` on startup. `script_verified_height` is
-persisted separately and loaded on startup.
+Both watermarks initialize from `validator.validated_height()` on startup.
+Nothing script-related is persisted separately any more.
 
 ### Invariants
 
-- `script_verified_height <= state_applied_height <= downloaded_height <= chain_height`
-- `state_applied_height` is monotonically increasing (except on reorg or eval failure)
-- Heights at or below `script_verified_height` have had their state applied,
-  and their scripts either **verified** or **explicitly skipped by
-  `checkpoint_height` configuration**. See "Checkpoint frontier hole" — the
-  watermark means "no further script work is owed below here", which is what
-  all three of its consumers actually need. It did read "fully validated (state
-  + scripts)" until 2026-08-12; that was stronger than any consumer required
-  and stronger than a checkpointed node could honour.
+- `state_applied_height <= downloaded_height <= chain_height`
+- `state_applied_height` is monotonically increasing (except on reorg)
+- Heights at or below `state_applied_height` have had their state applied, and
+  their scripts either **verified** or **explicitly skipped by
+  `checkpoint_height` configuration**. One watermark carrying both facts, which
+  is what all of its consumers actually needed.
 
-### Script evaluation mode (added 2026-08-12)
+### Catch-up progress instrumentation
 
-`SyncConfig` carries `script_eval_inline: bool`, default `false`. It selects
-between the two modes in `facts/validation.md` § "Script evaluation modes".
-
-⚠ **It must be fed from the same expression that constructs the validator's
-mode, in `src/main.rs`.** Two independently-derived copies that disagree put
-sync into deferred bookkeeping while the validator evaluates inline, or the
-reverse — the frontier would then either freeze forever waiting for results
-that are never dispatched, or advance over blocks nothing verified. This is the
-identical hazard as `checkpoint_height`, whose plumbing note is below, and it
-went wrong there first.
-
-**In inline mode everything in the rest of this section is inert.**
-`apply_state` returns `deferred_eval = None`, so nothing is dispatched, the
-gate never engages, `evals_in_flight` and `eval_bytes_in_flight` stay at zero,
-and neither backlog event fires.
-
-Two consequences the implementation must handle rather than inherit:
-
-- **`script_verified_height` advances with `state_applied_height`.** In inline
-  mode an `Ok` from `apply_state` *means* the scripts passed, so the watermark
-  is no longer derived from drained results — it is set directly on each
-  successful apply. Left alone it would freeze at its startup value and
-  `eval_frontier_hole` would fire on every drain.
-- **A startup gap can still appear, but it is no longer dangerous.** An earlier
-  draft of this section claimed the gap "cannot occur"; that was too strong.
-  `apply_state` persists and *then* runs the proof-digest check, so a crash in
-  that window leaves a persisted block for which `apply_state` never returned
-  `Ok` and the watermark was never advanced — a gap, on restart, in inline
-  mode.
-
-  What changes is what the gap *means*. Scripts ran before the persist, so
-  every block below the gap has been script-verified; the missing watermark is
-  bookkeeping, and advancing over it asserts something true. In deferred mode
-  the same gap means the scripts were never run at all, and advancing over it
-  asserts something nobody checked.
-
-  So "Startup gap handling" stays open **for deferred mode only**. Under inline
-  the existing accept-and-advance behaviour is correct, and for the first time
-  the justification in that section — that the state transition was already
-  proven — is actually the whole story.
-
-The checkpoint floor still applies in both modes: heights at or below
-`checkpoint_height` skip evaluation regardless of where evaluation happens.
-
-### Eval dispatch
-
-Script evaluation is dispatched to the rayon thread pool via `rayon::spawn`.
-Results are sent through `crossbeam_channel::Sender<(u32, Result<(), ValidationError>)>`.
-The sync layer drains the receiver non-blocking between blocks during the
-sweep, and blocking after the sweep completes.
-
-Memory per DeferredEval, from the `approx_heap_bytes` accounting in
-`facts/validation.md` (revised 2026-08-12): **~10 KB coinbase-only, ~195 KB for
-a 20-tx block, ~3.6 MB dense.**
-
-⚠ **These supersede the "~25 KB typical / ~410 KB worst case" this document
-carried until 2026-08-12, which were 6–8× too low.** The old figures counted
-payload and missed the inline struct cost: ergo-lib's `Transaction`
-materialises every output *twice* — once as `ErgoBoxCandidate`, once as
-`ErgoBox` — so 20 parsed transactions are ~49 KB of struct before any payload
-at all. Anything sized against the old numbers is wrong; see the backlog
-derivation below and `eval_backlog.rs`'s module doc.
-
-The figures are theory-grounded from sigma-rust struct shapes and have **not**
-been validated against live jemalloc. `eval_bytes_in_flight` in the catch-up
-record exists to settle that — see below.
-
-Dispatch is bounded by the backpressure policy specified below; the paragraphs
-immediately following describe the unbounded behaviour that policy replaces,
-retained because it is what a node built before it still does.
-
-**The per-item cost is bounded; the aggregate is not.** `evals_in_flight` has
-no cap — it is written only by `+= 1` at dispatch, `-= 1` at drain, and
-reset-to-zero on rollback. During catch-up `blocking = sweep_size <= 1` is
-false, so a 192-block sweep dispatches up to 192 evals and never waits for
-them. If script verification is slower than state application the queue grows
-across sweeps without limit.
-
-Consistent with a field OOM on 2026-08-12 (4-thread 1.8 GHz host, v0.7.11):
-**anon-rss 10.62 GiB, file-rss 2.4 MB**, killed mid-sweep during catch-up.
-At ~3.6 MB per dense eval that is **≈3,000 queued evals, roughly 15 sweeps of
-backlog** — the host was at height 1,779,387, where blocks are dense, so the
-dense figure is the right divisor.
-
-The measured quantity is the 10.62 GiB. Everything after the division is
-model-dependent: it moved from ≈27,000 to ≈3,000 purely by correcting the
-per-item estimate, and it will move again when `eval_bytes_in_flight` is
-measured against jemalloc. **Quote the anon-rss, not the eval count.** Neither
-figure changes the diagnosis — 3,000 queued evals is still fifteen sweeps of
-unbounded backlog and still fatal on that host.
-
-This is invisible on high-core-count hosts, where Rayon keeps pace and the
-queue stays shallow. It is not a hypothetical on small ones.
-
-### Catch-up progress instrumentation (added 2026-08-12)
-
-Because the queue depth is the quantity that matters and nothing exposes it,
-the sync layer emits a periodic INFO record during catch-up:
+A periodic INFO record during catch-up:
 
 | Field | Source |
 |---|---|
-| `evals_in_flight` | the counter itself |
 | `state_applied_height` | **the applied tip — `validator.validated_height()`**, NOT the struct field |
-| `script_verified_height` | existing watermark |
-| `eval_lag` | applied tip − `script_verified_height` — trustworthy since 2026-08-12, with one caveat below |
 | `jemalloc_allocated` | the existing probe; the field is **omitted** when no probe is wired |
-| `eval_bytes_in_flight` | Σ `approx_heap_bytes` of dispatched-not-drained evals — the accumulator the byte bound gates on |
 
-`eval_bytes_in_flight` is not only a second depth signal. `approx_heap_bytes`
-is derived from sigma-rust struct shapes and has never been checked against a
-running allocator; logging it beside `jemalloc_allocated`, which this record
-already carries, makes the estimator falsifiable on the next catch-up run. If
-the two do not move together, the accounting in `facts/validation.md` is wrong
-and the byte bound is calibrated against fiction. Cheap to emit — the gate has
-to maintain the sum regardless.
+Reduced in v0.8.0 from six fields to two. `evals_in_flight`,
+`script_verified_height`, `eval_lag` and `eval_bytes_in_flight` all described a
+queue that no longer exists.
 
-`eval_lag` was unreadable until 2026-08-12 and the historical journals show it:
-the frozen watermark made it read **187,711** while `evals_in_flight` was **1**
-and jemalloc `allocated` was flat at ~1.14 GB across 190,000 blocks — an
-enormous apparent backlog with no backlog and no memory growth whatsoever.
-Since the reorder buffer was hoisted the number tracks reality. **Anything
-quoting `eval_lag` from a pre-2026-08-12 run is quoting a frozen number.**
-
-⚠ **One caveat survives: `checkpoint_height`.** Heights at or below it never
-dispatch an eval, so on a node configured with a checkpoint above its start
-height the frontier can never reach the checkpoint and `eval_lag` is
-permanently large by exactly that offset. This is configuration, not backlog.
-`evals_in_flight` and `eval_bytes_in_flight` remain the unambiguous depth
-signals in that case. See "Checkpoint frontier hole" below.
-
-⚠ **`self.state_applied_height` is the wrong source and would silently measure
-nothing.** It is a cache reconciled only *after* the sweep loop, so mid-sweep it
-stays frozen at the pre-sweep tip while `script_verified_height` climbs past it.
-A record built from the literal field pegs `eval_lag` at 0 by saturation for
-the entire sweep — the instrumentation would run, log, and report a healthy
-system while the queue grew. Read the validator's `validated_height()` instead.
-
-Requirements:
-
-- **Time-based, not per-block.** At 192 blocks/second through the early chain a
-  per-block record is unusable; the interval must be seconds, not blocks.
-- Emitted only while catching up. At tip the queue is drained synchronously
-  every sweep and the record would be noise.
-- `eval_lag` is derived rather than left to the reader: it is the number the
-  backlog hypothesis predicts will climb, and a reader computing it by hand
-  from two other fields will not do it consistently.
-- Must not perturb what it measures — no allocation in the hot path beyond the
-  log record itself.
-
-This is diagnostic, not a fix. The bound is specified below.
-
-### Eval backpressure (specified 2026-08-12)
-
-The queue is bounded by **bytes in flight, with a count guardrail** — the same
-shape as `should_flush`'s heap-threshold-plus-min/max, and for the same reason:
-a pure count bounds a quantity that varies by three orders of magnitude between
-a coinbase-only block and a dense late-chain one. `sync/` cannot weigh a
-`DeferredEval` itself, so `validation/` supplies `approx_heap_bytes` — see
-`facts/validation.md`.
-
-| Config | Default | Meaning |
-|---|---|---|
-| `eval_backlog_max_mb` | 256 | Primary bound: Σ `approx_heap_bytes` of dispatched-not-drained evals. `0` disables. |
-| `eval_backlog_max_blocks` | 256 | Backstop for many-tiny-blocks (early chain), where bytes stay low but per-item overhead does not. `0` disables. |
-
-Policy, applied at dispatch — **before** `rayon::spawn`, not after:
-
-- If adding this eval would exceed either bound, drain blocking until **both**
-  are back under **half** their limit, then dispatch.
-- The low-water mark is hysteresis and is load-bearing: draining only to the
-  limit puts the gate at the boundary on every subsequent block, converting the
-  pipeline into a lockstep one-in-one-out and losing the pipelining on hosts
-  that were never the problem.
-
-Four constraints on the implementation:
-
-1. **The budget is separate from `flush_heap_threshold_mb` and governs a
-   disjoint pool.** They must not share a signal. Flushing redb frees dirty
-   pages; it does not free a queued `DeferredEval`. A single heap threshold
-   driving both would fire the flush controller repeatedly against pressure it
-   has no way to relieve, while the eval queue — the thing actually growing —
-   goes unbounded.
-
-2. **The gate's counters are trustworthy, and were not before 2026-08-12.**
-   `handle_eval_failure` used to zero `evals_in_flight` while its rayon tasks
-   were still running; an undercount opens the gate early, which is precisely
-   the failure the bound exists to prevent, and the byte accumulator would have
-   inherited the same hazard. It now retires superseded results via the
-   `eval_generation` stamp instead of zeroing, so the counters keep describing
-   heap that is genuinely still held. **Nothing may reset these counters on the
-   grounds that a result is no longer wanted** — the task is still running and
-   the memory is still allocated, which is the only thing the gate measures.
-
-3. **The channel is `tokio::sync::mpsc::unbounded` and the drain awaits it.**
-   It was crossbeam, whose `recv()` is a blocking call inside an `async fn` —
-   invisible while it only fired at tip with an empty queue, and the steady
-   state throughout catch-up once backpressure exists. `block_in_place` was
-   considered and rejected: it panics on a `current_thread` runtime, which every
-   current test uses. Awaiting an async channel parks nothing and imposes no
-   `multi_thread` requirement on callers.
-
-4. **The bound does not scale with the Rayon pool size, and must not be made
-   to.** `evaluate_scripts` `par_iter`s over the block's transactions on the
-   same global pool, so a single queued eval can already occupy every thread.
-   Queue depth is not what keeps the pool fed; intra-block width is. A bound
-   tied to thread count would grow exactly on the hosts that have the least
-   memory per core.
-
-`drain_eval_results` takes a `DrainTarget`, not a `bool`: `Available` (drain
-what has arrived) or `AtMost { evals, bytes }`. A `bool` could not express
-"drain until under a watermark" — `true` meant drain-to-zero, which throws away
-the whole pipeline at every gate.
-
-**A disabled bound gets a low-water mark of _never_, not of zero.** Setting
-`eval_backlog_max_mb = 0` means "do not bound bytes"; if that were translated
-into a target of zero bytes, disabling a bound would produce the most
-aggressive possible draining instead of none. The gate releases at half of each
-*enabled* bound.
-
-The gate returns a `GateOutcome`. A rollback triggered by a failure drained
-inside the gate aborts the sweep rather than letting it dispatch onto state
-that has just moved underneath it.
-
-On defaults: 256 MB never binds on a host that keeps pace — the observed depth
-on a 32-core box is 1–3 evals — so the bound is inert exactly where it is not
-needed, and caps the field OOM at ~2.4% of the 10.62 GiB it reached.
-
-**The two bounds are not redundant; they govern different regimes**, which is
-why both defaults are 256 and neither should be tuned in isolation:
-
-| Block shape | Binding bound | Resulting ceiling |
-|---|---|---|
-| ordinary (~195 KB) | count, at 256 evals | ~50 MB — bytes never come close |
-| dense (~3.6 MB) | bytes, at 256 MB | ~70 evals — count never comes close |
-
-Remove either and one regime goes unbounded: without the count guardrail a
-chain of coinbase-only blocks queues tens of thousands of evals inside the byte
-budget, paying per-item structural overhead the whole way; without the byte
-bound a run of dense blocks reaches ~920 MB before the count notices. Both
-ceilings sit three orders of magnitude below the 10.62 GiB failure.
-
-These defaults were originally sized against the superseded ~410 KB worst-case
-figure. They survive the correction — by the arithmetic above rather than by
-luck — but anyone re-tuning them should re-derive from the current numbers in
-`facts/validation.md` and treat those as provisional until
-`eval_bytes_in_flight` has been compared against jemalloc on a real catch-up.
-
-### At chain tip
-
-When `sweep_size == 1`, drain the eval channel synchronously after applying
-state. No pipeline benefit for a single block during live sync.
-
-### Eval failure handling
-
-Eval failures are detected in `drain_eval_results` during the sweep loop.
-Two detection points:
-
-**In-loop detection:** After each non-blocking drain, the sweep compares
-`state_applied_height` against its pre-drain value. If `handle_eval_failure`
-reduced it during the drain, the sweep corrects `validated_to` and breaks
-immediately — preventing the post-loop code from overwriting the rolled-back
-watermark with the stale `validated_to`. Without this check, the sweep would
-continue feeding blocks to a rolled-back validator (height mismatch) and then
-clobber `state_applied_height` back to the pre-rollback value.
-
-**Post-sweep detection:** The blocking drain after sweep completion can also
-find failures. `handle_eval_failure` sets the correct watermarks directly;
-no post-drain code overwrites them.
-
-`handle_eval_failure` sequence:
-1. **Bump `eval_generation` — do NOT drain-and-discard, and do NOT zero the
-   counters.** Superseded results are retired for accounting (their count and
-   bytes are returned to the gate) but cannot reach the frontier. *This
-   replaces "drain and discard remaining channel results", which was the
-   specification until 2026-08-12 and was itself the bug:* the rayon tasks are
-   still running and still holding their `DeferredEval` heap, so discarding
-   their results and zeroing the counter told the gate that memory had been
-   freed which had not been. The counters exist to describe live heap; nothing
-   may reset them because a result stopped being interesting.
-
-   The generation is bumped **only where the validator actually moved** — step
-   5 below is the case where it did not, and an unconditional bump there would
-   retire results that are still valid. The reorg path is likewise conditional
-   on `rolled_back`, where it used to be unconditional.
-2. Look up digest via `chain.header_at(failed_height - 1).state_root`
-3. Call `validator.reset_to(failed_height - 1, digest)`
-4. **On Ok**: reset `state_applied_height` and `script_verified_height`
-   to `failed_height - 1`, reset `downloaded_height` to match
-5. **On Err (2026-06-12)**: the validator did NOT move — watermarks stay
-   exactly where they are (NO resets; retreating them onto un-rolled
-   state is the gap-wedge hole). Log loud (`validation_rollback_failed`)
-   and resume — the sweep/backoff machinery (v0.6.11) retries the stall.
-   Same rule for the Reorg-control path (the other `reset_to` site).
-6. Log the error, resume sync
-
-### Startup gap handling
-
-On startup, if persisted `script_verified_height < state_applied_height`,
-the gap is accepted — the AVL digest already proved state correctness during
-`apply_state`, and proof boxes aren't available without re-running apply_state.
-`script_verified_height` is advanced to match `state_applied_height`.
-
-⚠ **The stated justification does not support the conclusion.** The AVL digest
-proves the *state transition* matches the block's claimed root. It does not
-prove the spends were authorised — that is exactly what script evaluation does,
-and it is what was skipped. A node restarting with a genuine gap therefore
-marks blocks fully verified without having verified them.
-
-This was masked until 2026-08-12 by the frozen-watermark bug: the persisted
-value was wrong-low while scripts really had been evaluated, so the startup
-"repair" was usually correcting bookkeeping rather than laundering a real gap.
-With the watermark fixed, a gap now means what it says, and the dangerous case
-is the honest one — an unclean shutdown with evals genuinely in flight.
-
-**Still open, deliberately.** The checkpoint hole below looked like the same
-question and was resolved on 2026-08-12; this one was not. A checkpoint is a
-feature the operator configured and thereby consented to; a startup gap is an
-accident of shutdown timing with nothing to gate on. See "Why startup gap
-handling does NOT get the same treatment".
-
-### Checkpoint frontier hole
-
-Heights at or below `checkpoint_height` never dispatch an eval
-(`facts/validation.md`: blocks at or below it skip ErgoScript validation). A
-node configured with a checkpoint above its start height therefore has a
-**permanent** frontier hole: `script_verified_height` can never reach the
-checkpoint, because the results that would fill the gap are never produced.
-
-`checkpoint_height` is `Option<u32>` and defaults to `None`, so this affects
-only operators who opt in.
-
-**Resolution (decided 2026-08-12): `script_verified_height` is floored at
-`checkpoint_height`.**
-
-The floor applies **everywhere the watermark is set** — startup init, rollback,
-reorg — not only at startup. A reorg that resets the frontier to a fork point
-below the checkpoint would otherwise re-open the hole that startup had closed.
-
-The decision rests on what actually consumes this watermark, which is less than
-the old invariant implied. Outside `sync/` there is exactly one consumer:
-`src/bridge.rs`, which persists and reloads it. **It is on no REST endpoint,
-not in `/info`, and is read by neither mempool, mining, nor api** —
-`facts/validation.md` calls it "internal bookkeeping" and means it. Its three
-real jobs are: where the frontier retreats to on eval failure, where to resume
-verification after restart, and `eval_lag`. All three want *the highest height
-below which no further script work is owed*, which is exactly what the floor
-gives. Nothing wanted the stronger claim, and a checkpointed node could not
-honour it anyway.
-
-Under a checkpoint the operator has declared they do not require verification
-below that height. The frontier starting there is not a silent skip; it is the
-configured feature doing what it says. `checkpoint_height` is `Option<u32>`
-defaulting to `None`, so an unconfigured node is unaffected and the floor is a
-no-op.
-
-`eval_frontier_hole` stays. With the floor in place it should no longer fire
-for a checkpoint, so if it fires at all it now indicates a genuine defect in
-frontier accounting — which is a better signal than the one it replaced.
-
-**Plumbing.** `sync/` does not see the checkpoint at all — it travels from
-`src/main.rs` into the validator and nowhere else. It reaches `sync/` as a
-`SyncConfig` field, `checkpoint_height: u32`, defaulting to `0` (no checkpoint,
-floor is a no-op). Adding a trait method to `BlockValidator` was the
-alternative and is worse — it makes a `validation/` contract change out of a
-value `main` already holds.
-
-⚠ **Wire the checkpoint the validator was actually built with, not
-`configured_checkpoint.unwrap_or(0)`.** There is no single expression: the
-validator is constructed in four branches, and **digest mode resuming from a
-stored tip defaults to `height - 100`, not 0**. Wiring the `unwrap_or(0)` form
-would set the floor up to an entire chain below the eval-skip boundary on an
-unconfigured digest node — reopening this hole at full width, in the one mode
-where nobody would think to look for it.
-
-`src/main.rs` captures the value through a `resolve_checkpoint` recorder that
-every branch calls, so a future branch computing a checkpoint directly is
-visibly different from its neighbours. The snapshot-bootstrap path builds a
-validator *after* `sync_config` exists and is deliberately not routed; it is
-safe only because it repeats the `unwrap_or(0)` its match branch already
-recorded, and carries a comment saying so.
-
-The general rule: **the floor and the eval-skip boundary are the same number by
-construction, or they are a bug.** Anything that changes how one is derived
-must change the other in the same edit.
-
-### Why startup gap handling does NOT get the same treatment
-
-The two look like one question — *may the watermark advance over heights whose
-scripts were never evaluated?* — and they get opposite answers, because only
-one of them has a feature behind it.
-
-A checkpoint is an operator declaration: someone configured a height and
-accepted what that means. There is a feature to gate on, and gating on it is
-honest.
-
-A startup gap is an artefact of when the process happened to die. Nobody
-declared anything, nothing requires the relaxation, and there is no flag to
-gate on. Advancing there converts shutdown timing into a claim of
-verification — and it is the one case where the claim is load-bearing, because
-an unclean shutdown with evals genuinely in flight is precisely when blocks
-went unverified. **Still open; see "Startup gap handling" above.**
+⚠ **Anything quoting `eval_lag` from a pre-2026-08-12 run is quoting a frozen
+number** — see the watermark history above. Field reports and journals from
+that era should not be used to argue about backlog depth.
 
 ### Watermark scanner
 

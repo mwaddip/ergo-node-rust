@@ -97,7 +97,7 @@ pub trait BlockValidator {
     ///     for digest mode, None for UTXO mode
     ///   - `extension` is the raw Extension section (type 108)
     ///   - `preceding_headers` contains up to 10 headers before this block,
-    ///     newest first (for ErgoStateContext in DeferredEval)
+    ///     newest first (for ErgoStateContext in ScriptEvalInputs)
     ///   - `active_params` is the current chain parameters
     ///   - `expected_boundary_params` is Some iff header.height is an
     ///     epoch boundary
@@ -106,8 +106,8 @@ pub trait BlockValidator {
     ///   - `self.validated_height()` == header.height
     ///   - `self.current_digest()` == header.state_root
     ///   - State transition persisted (UTXO mode) or digest updated (digest mode)
-    ///   - `ApplyStateOutcome.deferred_eval` is Some if scripts need
-    ///     evaluation (height > checkpoint), None otherwise
+    ///   - The block's scripts have been evaluated and passed. `Ok` from
+    ///     `apply_state` means exactly that; there is nothing left owed.
     ///   - `ApplyStateOutcome.epoch_boundary_params` is Some if this was
     ///     an epoch-boundary block with verified parameters
     ///
@@ -136,7 +136,7 @@ pub trait BlockValidator {
     /// Current state root digest (33 bytes: 32-byte hash + 1-byte tree height).
     fn current_digest(&self) -> &ADDigest;
 
-    /// Reset to a previous state. Used on reorg and deferred eval failure.
+    /// Reset to a previous state. Used on reorg.
     ///
     /// Preconditions:
     ///   - `height < self.validated_height()`
@@ -269,16 +269,31 @@ The split changes no runtime behaviour. Digest mode previously returned
 be reported as a flush that failed; nothing may be pruned or advanced on the
 strength of it either way.
 
-## Script evaluation modes (added 2026-08-12)
+## Script evaluation (deferred mode removed in v0.8.0)
 
-`UtxoValidator` is constructed with a mode, alongside `checkpoint_height`:
+`apply_state` **always** evaluates the block's scripts itself, before
+persisting. `Ok` therefore means the scripts passed. There is no mode, no
+`ApplyStateOutcome::deferred_eval`, and no evaluation the caller still owes.
 
-| Mode | Behaviour |
-|---|---|
-| `Deferred` (default) | `apply_state` returns `ApplyStateOutcome.deferred_eval = Some(..)`. The caller evaluates on a background pool. Current behaviour. |
-| `Inline` | `apply_state` evaluates scripts itself and returns `deferred_eval = None`. `Ok` therefore means *scripts passed*. |
+⚠ **Deferred evaluation is gone and is not returning as an option.** It let
+`apply_state` return before the scripts ran — buying sync throughput at the
+price of a crash-consistency window and, worse, a second source of truth for
+*how far this chain is actually verified*. Every bug in that machinery came
+from the same root, that verification lagged application:
 
-**Inline evaluation happens before persistence, not before application.** The
+- the frozen reorder-buffer watermark, which wedged a node for 190,000 blocks
+- `handle_eval_failure` zeroing `evals_in_flight` while its rayon tasks were
+  still running and still holding their heap — the undercount that opened the
+  dispatch gate early
+- the unbounded backlog that killed a 4-thread 1.8 GHz host at **anon-rss
+  10.62 GiB** mid-catch-up
+- the checkpoint frontier floor, needed only because heights at or below the
+  checkpoint never dispatched an eval and so could never advance a frontier
+
+Removing the lag removes the class. Anything that reintroduces "apply now,
+verify later" reintroduces all of it.
+
+**Evaluation happens before persistence, not before application.** The
 JVM validates scripts before touching its AVL tree, but it can afford to: it
 reads each input box via `boxById` and removes it afterwards, paying two
 traversals. Ours captures the box from the removal's own return value, so a
@@ -288,14 +303,14 @@ The boundary that actually matters is **persistence**, because persistence is
 what survives a crash. Everything from the first prover operation to just
 before `storage.update_with_height` is in-memory only. Evaluating in that
 window means no block whose **scripts** are unverified reaches `state.redb`,
-which closes the startup-gap hole in `facts/sync.md` at the source rather than
-repairing it afterwards.
+which closed the startup-gap hole at the source rather than repairing it
+afterwards — and then let `sync/` delete the repair machinery entirely.
 
 Ordering: apply operations and capture boxes → verify digest → **evaluate
 scripts** → persist. The digest check stays first because it is cheap and
 rejects malformed blocks before the expensive step.
 
-⚠ **Inline closes the script gap only. It does not make `apply_state`
+⚠ **This closes the script gap only. It does not make `apply_state`
 crash-atomic.** The proof-digest consensus check still runs *after*
 `update_with_height`, so a post-persist `Err` remains reachable and a crash in
 that window can still leave a persisted block that failed a later check. Moving
@@ -365,13 +380,22 @@ here. **A node-level cache in `state/` returning live `Rc` handles from
 `rollback` would make a wrong proof reachable.** Caching the *bytes* is fine;
 caching the *handles* is a consensus bug.
 
-### Open: inline discards the block cost
+### Open: the block cost is discarded, and always was
 
-`evaluate_scripts` returns the block-accumulated transaction cost, and inline
-mode drops it. Nothing is unenforced — the `maxBlockCost` gate runs inside
-`evaluate_scripts` either way — but the figure is observable in deferred mode
-and invisible in inline. If `ApplyStateOutcome` should carry it, that is a
-contract addition and has not been decided.
+`evaluate_scripts` returns the block-accumulated transaction cost and
+`apply_state` drops it. Nothing is unenforced — the `maxBlockCost` gate runs
+inside `evaluate_scripts` regardless.
+
+*A previous draft of this section said the figure was "observable in deferred
+mode and invisible in inline". That was wrong: the deferred path discarded it
+too, at `sync/src/state.rs` — `evaluate_scripts(&eval).map(|_cost| ())`, with
+the binding name documenting the discard. No caller has ever consumed it in
+either mode, and the only cost-shaped value in the API is `max_block_cost`,
+which is the parameter limit rather than what a block actually spent.*
+
+So this is not a regression to repair but an observable to add, and it wants a
+consumer first — a `cost=` field on the sweep line, or a block-level API
+field. Adding it is a field on `ApplyStateOutcome` and one assignment.
 
 ## New Types
 
@@ -379,76 +403,28 @@ contract addition and has not been decided.
 pub struct ApplyStateOutcome {
     /// Some if this was an epoch-boundary block with verified parameters.
     pub epoch_boundary_params: Option<Parameters>,
-    /// Some if scripts need evaluation (height > checkpoint).
-    pub deferred_eval: Option<DeferredEval>,
 }
 
-/// Everything needed to verify transaction spending proofs.
-/// Owned, Send — can move to any thread.
-pub struct DeferredEval {
+/// Everything needed to verify transaction spending proofs. Built inside
+/// `apply_state` and consumed by `evaluate_scripts` a few lines later.
+pub struct ScriptEvalInputs {
     pub height: u32,
     pub transactions: Vec<Transaction>,
     pub proof_boxes: HashMap<[u8; 32], ErgoBox>,
     pub header: Header,
     pub preceding_headers: Vec<Header>,
     pub parameters: Parameters,
-    /// PRIVATE — read via `approx_heap_bytes()`. See below for why.
-    approx_heap_bytes: usize,
-}
-
-impl DeferredEval {
-    /// The only way to build one. Derives `approx_heap_bytes` from the
-    /// serialized sizes the caller already holds.
-    pub fn new(/* ..., block_txs: &[u8], proof_box_bytes: usize */) -> Self;
-
-    /// Estimated retained heap of this value, in bytes.
-    pub fn approx_heap_bytes(&self) -> usize;
 }
 ```
 
-### `approx_heap_bytes` (added 2026-08-12)
-
-The sync layer bounds its deferred-eval queue by **bytes in flight**, not by
-item count, because per-item weight varies by three orders of magnitude:
-`proof_boxes` holds every input and data-input box of the block, so a
-coinbase-only block is a few KB and a dense late-chain block is megabytes. A
-count cap bounds the number that isn't the problem. `sync/` cannot compute this
-itself — it never sees the boxes — so `validation/` must supply it.
-
-Semantics and required properties:
-
-- **It is an estimate, and the name says so.** Callers use it as a budget
-  input, never as a measurement. Nothing may assert on its exact value.
-- **Computed at construction**, in the pass that already builds `proof_boxes`.
-  It must not cost a second walk over the data, and specifically must not
-  serialize anything solely in order to measure it. Serialized lengths already
-  on hand at construction are the intended source; the in-memory form is a
-  bounded multiple of them, and a documented inflation factor is acceptable.
-- **Monotone in the block's real weight** — more/larger boxes and transactions
-  must not produce a smaller figure.
-- **Never zero when the block carries any transaction.** A zero would silently
-  disable the caller's bound, which is the one failure mode that turns this
-  field into a liability rather than a safeguard.
-
-Under-estimation costs memory headroom; over-estimation costs throughput. Prefer
-over-estimation — the bound exists for hosts that OOM, and on those the
-throughput is already gone.
-
-**The field is private and the constructor is public — deliberately, and this
-supersedes the first draft of this section, which had a `pub` field.** With the
-field public, any out-of-crate struct literal can set it to zero, and the
-"never zero" invariant above is then enforced by nothing but the hope that
-nobody writes one. An invariant described as the difference between a safeguard
-and a liability should not rest on that. A private field makes out-of-crate
-literal construction impossible, so `new` is the only path in and the estimator
-is unbypassable. Callers read through `approx_heap_bytes()`.
-
-`new` is public rather than `pub(crate)` because the startup re-evaluation path
-— rebuilding a `DeferredEval` for gap blocks from stored sections — is a
-documented future caller that may not live in this crate. `pub(crate)` would
-force whoever writes it to either move into `validation/` or reconstruct the
-estimator, and a second estimator is exactly the drift this design exists to
-prevent.
+**Renamed from `DeferredEval` in v0.8.0**, along with the removal of its
+`approx_heap_bytes` field and the `new()` that derived it. That weight existed
+so `sync/` could bound a queue by bytes in flight rather than item count —
+per-item weight varies by three orders of magnitude, since `proof_boxes` holds
+every input and data-input box of the block. There is no queue now. The struct
+is a plain input bundle that never leaves the stack frame that built it, so it
+no longer needs to be `Send`, no longer needs to weigh itself, and no longer
+carries a name describing a deferral that does not happen.
 
 ## Free Function
 
@@ -456,7 +432,7 @@ prevent.
 /// Verify spending proofs for all transactions in a block.
 /// Pure computation — no validator state needed. Uses rayon par_iter internally.
 /// On success returns the block-accumulated transaction cost.
-pub fn evaluate_scripts(eval: &DeferredEval) -> Result<u64, ValidationError>;
+pub fn evaluate_scripts(eval: &ScriptEvalInputs) -> Result<u64, ValidationError>;
 ```
 
 ### Block cost semantics (added 2026-06-10)
@@ -484,7 +460,7 @@ pub fn evaluate_scripts(eval: &DeferredEval) -> Result<u64, ValidationError>;
   wrap, never panic.
 - Degenerate cases return `Ok(0)`: empty transaction list; the height-1
   no-preceding-headers guard. Blocks at or below a validator's
-  `checkpoint_height` never reach evaluation (no `DeferredEval` is built),
+  `checkpoint_height` never reach evaluation (no `ScriptEvalInputs` is built),
   matching the JVM's `Valid(0L)` checkpoint shortcut.
 - The per-tx sigma-rust JIT budget (`max_block_cost × 10` per tx,
   ergo-lib `tx_context.rs:202`) is unchanged — it bounds each evaluation's
@@ -576,18 +552,18 @@ DigestValidator::new(
    - Verify `verifier.digest() == header.state_root`
    - On success, `current_digest` = `header.state_root`
 
-5. **Advance state** (immediate, before script eval)
-   - `validated_height` = header.height
-   - `current_digest` = header.state_root
-
-6. **Build DeferredEval** (skipped below checkpoint_height)
+5. **Evaluate scripts** (skipped below checkpoint_height) — BEFORE persisting
    - Deserialize old values from step 4 into `ErgoBox` instances
    - Bundle transactions, proof boxes, header, preceding headers, and
-     parameters into a `DeferredEval` struct
-   - Returned as `ApplyStateOutcome.deferred_eval` for the sync layer
-     to evaluate asynchronously via `evaluate_scripts()`
-   - `evaluate_scripts` uses rayon `par_iter` for intra-block parallelism
-     and returns the block-accumulated cost (see "Block cost semantics")
+     parameters into `ScriptEvalInputs`
+   - Call `evaluate_scripts()`, which uses rayon `par_iter` for intra-block
+     parallelism and returns the block-accumulated cost (see "Block cost
+     semantics"). On `Err` the block is rejected and the prover is rolled
+     back by the `apply_state` wrapper — nothing is persisted.
+
+6. **Persist, then advance state**
+   - `validated_height` = header.height
+   - `current_digest` = header.state_root
 
 ### Error causes
 
@@ -635,17 +611,20 @@ DigestValidator::new(
 ### Watermarks
 
 - `state_applied_height` — AVL state advanced to here. External consumers see this.
-- `script_verified_height` — scripts confirmed up to here. Internal bookkeeping.
 - `downloaded_height` — all required section bytes are present in the store.
+
+`script_verified_height` was deleted in v0.8.0 along with deferred evaluation.
+It existed to track how far behind application verification had fallen; since
+`apply_state` now evaluates before persisting, application *is* verification
+and a second watermark can only disagree with the first.
 
 ### Invariants
 
-- `script_verified_height <= state_applied_height <= downloaded_height <= chain_height`
-- `state_applied_height` is monotonically increasing (except on reorg/eval-failure reset)
-- Heights at or below `script_verified_height` have had their state applied,
-  and their scripts either verified or explicitly skipped by
-  `checkpoint_height`. Authoritative wording and rationale live in
-  `facts/sync.md` § "Checkpoint frontier hole"; `sync/` owns the watermark.
+- `state_applied_height <= downloaded_height <= chain_height`
+- `state_applied_height` is monotonically increasing (except on reorg reset)
+- Heights at or below `state_applied_height` have had their state applied and
+  their scripts either verified or explicitly skipped by `checkpoint_height` —
+  one watermark, both facts.
 
 ### `advance_state_applied_height()`
 
@@ -654,13 +633,10 @@ from `state_applied_height + 1` to `downloaded_height`:
 
 1. Get header, sections, preceding headers, active params
 2. Call `validator.apply_state(...)`
-3. On Ok: advance `state_applied_height`, apply epoch boundary params,
-   spawn `evaluate_scripts(deferred_eval)` on rayon pool if Some
+3. On Ok: advance `state_applied_height`, apply epoch boundary params. The
+   block's scripts have already passed — `Ok` is the only assertion sync
+   needs, and there is no second watermark to advance.
 4. On Err: stop, log error, do NOT advance watermark
-
-Between blocks: non-blocking drain of eval result channel to advance
-`script_verified_height`. On eval failure: rollback (see Failure Handling
-in spec).
 
 ### SyncStore extension
 
@@ -673,22 +649,15 @@ fn get_modifier(&self, type_id: u8, id: &[u8; 32]) -> Option<Vec<u8>>;
 Reads section bytes from the store. The existing `has_modifier` checks existence;
 this returns the actual data for validation.
 
-### Startup re-evaluation
-
-On startup, if `script_verified_height < state_applied_height`, rebuild
-`DeferredEval` for gap blocks from stored sections and evaluate before
-resuming normal sync.
-
 ### Reorg handling
 
 On `DeliveryControl::Reorg { fork_point, .. }` (received via unbounded control channel):
-1. Drain and discard in-flight eval results
-2. Reset `downloaded_height` to fork_point
-3. Get header at fork_point from chain
+1. Reset `downloaded_height` to fork_point
+2. Get header at fork_point from chain
 4. Call `validator.reset_to(fork_point, header.state_root)` — on Err the
    validator did NOT move; sync must not perform step 5 (watermarks stay
    where they were; see facts/sync.md)
-5. On Ok: `state_applied_height` and `script_verified_height` reset to fork_point
+5. On Ok: `state_applied_height` resets to fork_point
 6. Re-queue sections for the new branch, re-scan watermark
 7. Re-validate from fork_point + 1 as sections become available
 
