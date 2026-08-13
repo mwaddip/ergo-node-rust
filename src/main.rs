@@ -899,26 +899,25 @@ struct NodeConfig {
     /// Breaking change: this previously sized `state.redb` alone while
     /// `modifiers.redb` silently took redb's built-in 1 GiB default, so a
     /// config saying 1024 actually used 2048 MB.
-    #[serde(default = "default_cache_mb")]
-    cache_mb: u64,
+    /// Absent = derived from the memory budget (facts/memory.md).
+    cache_mb: Option<u64>,
+    /// Total memory the node may use, MB. Absent = read the cgroup limit,
+    /// else a conservative share of MemTotal.
+    memory_budget_mb: Option<u64>,
     /// Percentage of `cache_mb` given to `modifiers.redb`; the remainder goes
     /// to `state.redb`. Valid 1-99, validated at startup.
-    #[serde(default = "default_cache_store_pct")]
-    cache_store_pct: u32,
+    cache_store_pct: Option<u32>,
     /// Live-heap threshold (MB) above which the validation sweep commits
     /// the redb write transaction mid-sweep. 0 disables the memory trigger
     /// and flushes degenerate to every `flush_max_blocks`. Default tuned to
     /// 4 GB, empirically the point where the redb write-tx dirty-page
     /// cache starts dominating live heap during initial sync.
-    #[serde(default = "default_flush_heap_threshold_mb")]
-    flush_heap_threshold_mb: u64,
+    flush_heap_threshold_mb: Option<u64>,
     /// Upper bound on blocks between flushes. Bounds crash-recovery work.
-    #[serde(default = "default_flush_max_blocks")]
-    flush_max_blocks: u32,
+    flush_max_blocks: Option<u32>,
     /// Lower bound on blocks between flushes. Prevents storm-flushing when
     /// heap growth is driven by something other than the redb write tx.
-    #[serde(default = "default_flush_min_blocks")]
-    flush_min_blocks: u32,
+    flush_min_blocks: Option<u32>,
 
     // ── Deferred-eval backpressure ───────────────────────────────────────
     // Bounds the queue of script evaluations dispatched to rayon but not
@@ -988,11 +987,12 @@ impl Default for NodeConfig {
             fastsync_peer: None,
             fastsync_threshold_blocks: default_fastsync_threshold_blocks(),
             fastsync_peer_wait_timeout_sec: default_fastsync_peer_wait_timeout_sec(),
-            cache_mb: default_cache_mb(),
-            cache_store_pct: default_cache_store_pct(),
-            flush_heap_threshold_mb: default_flush_heap_threshold_mb(),
-            flush_max_blocks: default_flush_max_blocks(),
-            flush_min_blocks: default_flush_min_blocks(),
+            cache_mb: None,
+            memory_budget_mb: None,
+            cache_store_pct: None,
+            flush_heap_threshold_mb: None,
+            flush_max_blocks: None,
+            flush_min_blocks: None,
             synced_cache_mb: None,
             synced_flush_heap_threshold_mb: None,
             synced_flush_max_blocks: None,
@@ -1039,9 +1039,6 @@ fn default_fastsync_threshold_blocks() -> u32 {
 fn default_fastsync_peer_wait_timeout_sec() -> u64 {
     30
 }
-fn default_cache_mb() -> u64 {
-    512
-}
 
 fn default_cache_store_pct() -> u32 {
     50
@@ -1058,11 +1055,12 @@ const MAINTENANCE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 /// tuning choice, and should fail at startup rather than produce a node that
 /// technically runs.
 fn validate_cache_split(cfg: &NodeConfig) -> Result<(), String> {
-    if !(1..=99).contains(&cfg.cache_store_pct) {
-        return Err(format!(
-            "cache_store_pct must be 1-99, got {}",
-            cfg.cache_store_pct
-        ));
+    // Only an operator-supplied value can be out of range; derivation never
+    // produces one. Absent is valid and means "derive".
+    if let Some(pct) = cfg.cache_store_pct {
+        if !(1..=99).contains(&pct) {
+            return Err(format!("cache_store_pct must be 1-99, got {pct}"));
+        }
     }
     Ok(())
 }
@@ -1073,8 +1071,8 @@ fn validate_cache_split(cfg: &NodeConfig) -> Result<(), String> {
 /// Note that redb splits whatever it receives a further 90% read / 10% write
 /// (`patches/redb/src/db.rs:1177`), and an at-tip in-place resize moves only
 /// the read half — see `facts/state.md`.
-fn cache_split_bytes(cfg: &NodeConfig) -> (usize, usize) {
-    split_cache_mb(cfg.cache_mb, cfg.cache_store_pct)
+fn cache_split_bytes(plan: &MemoryPlan) -> (usize, usize) {
+    split_cache_mb(plan.cache_mb, plan.cache_store_pct)
 }
 
 /// Split an arbitrary MB budget by the store percentage. Used for both the
@@ -1085,9 +1083,215 @@ fn split_cache_mb(total_mb: u64, store_pct: u32) -> (usize, usize) {
     let store = total * store_pct as usize / 100;
     (store, total - store)
 }
-fn default_flush_heap_threshold_mb() -> u64 {
-    4096
+// ── Memory budget derivation ─────────────────────────────────────────────
+//
+// See facts/memory.md. The node reads its own ceiling rather than being told
+// it: a systemd unit with MemoryMax, or a container with --memory, already
+// states how much this node may use, and until v0.8.0 the node never looked.
+
+/// Where the ceiling came from. Decides how much of it we are willing to
+/// spend — an explicit budget or a cgroup limit is somebody stating this node
+/// may have that much; `MemTotal` states only that the machine has it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetSource {
+    Explicit,
+    Cgroup,
+    MemTotal,
 }
+
+impl BudgetSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            BudgetSource::Explicit => "config",
+            BudgetSource::Cgroup => "cgroup",
+            BudgetSource::MemTotal => "meminfo",
+        }
+    }
+
+    fn usable_fraction(self) -> f64 {
+        match self {
+            BudgetSource::Explicit => 1.00,
+            BudgetSource::Cgroup => 0.90,
+            BudgetSource::MemTotal => 0.50,
+        }
+    }
+}
+
+/// This process's cgroup memory limit, or None when unconfined.
+///
+/// Walks the v2 hierarchy upward and takes the MINIMUM: our own cgroup may say
+/// `max` while a parent slice carries the real limit, and the effective
+/// ceiling is the tightest one on the path.
+fn cgroup_memory_limit() -> Option<u64> {
+    let self_cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+
+    // cgroup v2 — one line, "0::/path".
+    if let Some(path) = self_cgroup.lines().find_map(|l| l.strip_prefix("0::")) {
+        let mut best: Option<u64> = None;
+        let root = std::path::Path::new("/sys/fs/cgroup");
+        let mut cur = root.join(path.trim_start_matches('/'));
+        loop {
+            if let Ok(txt) = std::fs::read_to_string(cur.join("memory.max")) {
+                let t = txt.trim();
+                // The literal "max" means no limit at this level, not zero.
+                if t != "max" {
+                    if let Ok(v) = t.parse::<u64>() {
+                        best = Some(best.map_or(v, |b: u64| b.min(v)));
+                    }
+                }
+            }
+            if cur == root || !cur.pop() {
+                break;
+            }
+        }
+        return best;
+    }
+
+    // cgroup v1 — "hierarchy:controllers:path", memory controller.
+    for line in self_cgroup.lines() {
+        let mut parts = line.splitn(3, ':');
+        let (_, ctrl, path) = (parts.next()?, parts.next()?, parts.next()?);
+        if ctrl.split(',').any(|c| c == "memory") {
+            let f = format!("/sys/fs/cgroup/memory{path}/memory.limit_in_bytes");
+            if let Ok(txt) = std::fs::read_to_string(f) {
+                if let Ok(v) = txt.trim().parse::<u64>() {
+                    // v1 signals unlimited with a page-count sentinel near u64::MAX
+                    // rather than a word, so treat implausibly large as absent.
+                    if v < (1u64 << 62) {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn meminfo_total_bytes() -> Option<u64> {
+    let txt = std::fs::read_to_string("/proc/meminfo").ok()?;
+    txt.lines().find_map(|line| {
+        let rest = line.strip_prefix("MemTotal:")?;
+        let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+        Some(kb * 1024)
+    })
+}
+
+/// Anonymous heap the node holds that no cache knob governs. Measured at tip
+/// on mainnet 1.85M: jemalloc `allocated` 703 MB against 402 MB of tracked
+/// components. Excludes jemalloc's own overhead (a further ~260 MB between
+/// `allocated` and `resident`), which is not ours to allocate against.
+const BASELINE_ANON_BYTES: u64 = 300 * 1024 * 1024;
+
+/// Shares of the available budget. ⚠ Calibrated on a 32-core box; the
+/// constrained-box run that settles them is still in flight (facts/memory.md).
+const CACHE_SHARE: f64 = 0.40;
+const WRITE_SHARE: f64 = 0.40;
+const SYNCED_RATIO: f64 = 0.25;
+
+#[derive(Debug, Clone, Copy)]
+struct MemoryBudget {
+    source: BudgetSource,
+    ceiling_bytes: u64,
+    usable_bytes: u64,
+}
+
+/// Resolve the ceiling, in the priority order facts/memory.md specifies.
+fn detect_memory_budget(explicit_mb: Option<u64>) -> MemoryBudget {
+    let mem_total = meminfo_total_bytes();
+
+    let (ceiling, source) = if let Some(mb) = explicit_mb {
+        (mb.saturating_mul(1024 * 1024), BudgetSource::Explicit)
+    } else if let Some(cg) = cgroup_memory_limit() {
+        // A cgroup limit above physical RAM is not a licence to use more than
+        // exists, so the ceiling is the tighter of the two.
+        (cg.min(mem_total.unwrap_or(u64::MAX)), BudgetSource::Cgroup)
+    } else if let Some(mt) = mem_total {
+        (mt, BudgetSource::MemTotal)
+    } else {
+        // No cgroup, no /proc — assume a small box rather than a large one.
+        (1024 * 1024 * 1024, BudgetSource::MemTotal)
+    };
+
+    let usable = (ceiling as f64 * source.usable_fraction()) as u64;
+    MemoryBudget {
+        source,
+        ceiling_bytes: ceiling,
+        usable_bytes: usable,
+    }
+}
+
+/// Budget left for caches and write buffers after the parts nothing governs.
+/// `chain_index_bytes` is 0 in phase 1, when the store has not been opened and
+/// the index is not yet knowable.
+fn available_bytes(budget: &MemoryBudget, chain_index_bytes: u64) -> u64 {
+    let floor = BASELINE_ANON_BYTES.saturating_add(chain_index_bytes);
+    budget.usable_bytes.saturating_sub(floor)
+}
+
+/// Every memory setting, resolved: derived from the budget unless the operator
+/// stated it. An absent config key derives; a present one is obeyed exactly.
+#[derive(Debug, Clone, Copy)]
+struct MemoryPlan {
+    cache_mb: u64,
+    cache_store_pct: u32,
+    flush_heap_threshold_mb: u64,
+    flush_max_blocks: u32,
+    flush_min_blocks: u32,
+    synced_cache_mb: Option<u64>,
+    synced_flush_heap_threshold_mb: Option<u64>,
+    synced_flush_max_blocks: Option<u32>,
+    synced_flush_min_blocks: Option<u32>,
+    /// True when any field came from derivation rather than the config —
+    /// decides whether the startup record is worth emitting.
+    derived_any: bool,
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// Resolve every memory setting. `chain_index_bytes` is 0 in phase 1, before
+/// the store is open and the index is knowable — see facts/memory.md.
+fn derive_memory_plan(
+    cfg: &NodeConfig,
+    budget: &MemoryBudget,
+    chain_index_bytes: u64,
+) -> MemoryPlan {
+    let avail = available_bytes(budget, chain_index_bytes);
+
+    let derived_cache_mb = ((avail as f64 * CACHE_SHARE) as u64 / MIB).max(64);
+
+    // An ABSOLUTE heap level, not a share: the trigger compares against total
+    // jemalloc `allocated`, which already contains the caches. A threshold
+    // below the cache size would fire on every check forever.
+    let derived_flush_mb = (BASELINE_ANON_BYTES
+        + chain_index_bytes
+        + (avail as f64 * CACHE_SHARE) as u64
+        + (avail as f64 * WRITE_SHARE) as u64)
+        / MIB;
+
+    let cache_mb = cfg.cache_mb.unwrap_or(derived_cache_mb);
+    let derived_any = cfg.cache_mb.is_none()
+        || cfg.flush_heap_threshold_mb.is_none()
+        || cfg.synced_cache_mb.is_none();
+
+    MemoryPlan {
+        cache_mb,
+        cache_store_pct: cfg.cache_store_pct.unwrap_or_else(default_cache_store_pct),
+        flush_heap_threshold_mb: cfg.flush_heap_threshold_mb.unwrap_or(derived_flush_mb),
+        // Not derived: block counts bound crash-recovery work, and nothing
+        // measured relates a block count to a memory budget.
+        flush_max_blocks: cfg.flush_max_blocks.unwrap_or_else(default_flush_max_blocks),
+        flush_min_blocks: cfg.flush_min_blocks.unwrap_or_else(default_flush_min_blocks),
+        synced_cache_mb: Some(
+            cfg.synced_cache_mb
+                .unwrap_or(((cache_mb as f64 * SYNCED_RATIO) as u64).max(32)),
+        ),
+        synced_flush_heap_threshold_mb: cfg.synced_flush_heap_threshold_mb,
+        synced_flush_max_blocks: cfg.synced_flush_max_blocks,
+        synced_flush_min_blocks: cfg.synced_flush_min_blocks,
+        derived_any,
+    }
+}
+
 fn default_flush_max_blocks() -> u32 {
     100
 }
@@ -1291,7 +1495,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config_content = std::fs::read_to_string(&config_path)?;
         let root_config: RootConfig = toml::from_str(&config_content)?;
         let node_config = root_config.node.unwrap_or_default();
-        let data_dir = std::path::PathBuf::from(node_config.data_dir);
+        let data_dir = std::path::PathBuf::from(node_config.data_dir.clone());
         // Deliberately small: this path deletes one chain-meta key and exits.
         let store =
             RedbModifierStore::new(&data_dir.join("modifiers.redb"), MAINTENANCE_CACHE_BYTES)?;
@@ -1461,7 +1665,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         checkpoint_height = ?configured_checkpoint,
         storing_snapshots = node_config.storing_snapshots,
         snapshot_interval = node_config.snapshot_interval,
-        cache_mb = node_config.cache_mb,
+        cache_mb = ?node_config.cache_mb,
         "node config"
     );
 
@@ -1498,9 +1702,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     validate_cache_split(&node_config).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-    let (store_cache_bytes, state_cache_bytes) = cache_split_bytes(&node_config);
 
-    let data_dir = std::path::PathBuf::from(node_config.data_dir);
+    // Phase 1 of memory derivation (facts/memory.md). The modifier store must
+    // open before the header chain can be restored — the chain is restored FROM
+    // it — and redb fixes its cache at open with no resize path. So the index
+    // half of the floor is not knowable yet and enters as 0; phase 2 re-derives
+    // with the real figure for everything opened later.
+    let memory_budget = detect_memory_budget(node_config.memory_budget_mb);
+    let plan_phase1 = derive_memory_plan(&node_config, &memory_budget, 0);
+    let (store_cache_bytes, _) = cache_split_bytes(&plan_phase1);
+
+    let data_dir = std::path::PathBuf::from(node_config.data_dir.clone());
     std::fs::create_dir_all(&data_dir)?;
     tracing::info!(
         path = %data_dir.join("modifiers.redb").display(),
@@ -1600,6 +1812,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             headers = 0u64,
             "header chain restored",
         ),
+    }
+
+    // Phase 2: the header index is real now, so re-derive everything that has
+    // not been allocated yet — the state cache and the flush thresholds.
+    let chain_index_bytes = chain.memory_estimate().index_bytes;
+    let memory_plan = derive_memory_plan(&node_config, &memory_budget, chain_index_bytes);
+    let (_, state_cache_bytes) = cache_split_bytes(&memory_plan);
+
+    if memory_plan.derived_any {
+        // Every input and every output, because auto-sizing's failure mode is
+        // not being wrong — it is being wrong invisibly, leaving the operator
+        // no line to point at. facts/journal-events.md § memory_budget_derived.
+        tracing::info!(
+            source = memory_budget.source.as_str(),
+            ceiling_mb = memory_budget.ceiling_bytes / MIB,
+            usable_mb = memory_budget.usable_bytes / MIB,
+            baseline_mb = BASELINE_ANON_BYTES / MIB,
+            chain_index_mb = chain_index_bytes / MIB,
+            available_mb = available_bytes(&memory_budget, chain_index_bytes) / MIB,
+            cache_mb = memory_plan.cache_mb,
+            cache_store_pct = memory_plan.cache_store_pct,
+            store_cache_mb = store_cache_bytes as u64 / MIB,
+            state_cache_mb = state_cache_bytes as u64 / MIB,
+            flush_heap_threshold_mb = memory_plan.flush_heap_threshold_mb,
+            synced_cache_mb = memory_plan.synced_cache_mb.unwrap_or(0),
+            "memory budget derived"
+        );
+        if memory_budget.source == BudgetSource::MemTotal {
+            tracing::info!(
+                "memory budget came from MemTotal and takes a conservative share; \
+                 set MemoryMax on the unit or memory_budget_mb in ergo.toml to let \
+                 the node use more"
+            );
+        }
     }
 
     // Wire the extension loader so chain can read epoch-boundary extensions
@@ -2349,18 +2595,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         utxo_bootstrap,
         min_snapshot_peers,
         data_dir: data_dir.clone(),
-        flush_heap_threshold_mb: node_config.flush_heap_threshold_mb,
-        flush_max_blocks: node_config.flush_max_blocks,
-        flush_min_blocks: node_config.flush_min_blocks,
+        flush_heap_threshold_mb: memory_plan.flush_heap_threshold_mb,
+        flush_max_blocks: memory_plan.flush_max_blocks,
+        flush_min_blocks: memory_plan.flush_min_blocks,
         // Derived from THE mode binding, never re-parsed from node_config —
         // sync doing deferred bookkeeping while the validator evaluates
         // inline freezes the frontier; the reverse advances it over blocks
         // nothing verified. Omitting this line used to compile, because the
         // literal ended in `..SyncConfig::default()` and this would have taken
         // `false` in silence. It no longer does; see the note at the bottom.
-        synced_flush_heap_threshold_mb: node_config.synced_flush_heap_threshold_mb,
-        synced_flush_max_blocks: node_config.synced_flush_max_blocks,
-        synced_flush_min_blocks: node_config.synced_flush_min_blocks,
+        synced_flush_heap_threshold_mb: memory_plan.synced_flush_heap_threshold_mb,
+        synced_flush_max_blocks: memory_plan.synced_flush_max_blocks,
+        synced_flush_min_blocks: memory_plan.synced_flush_min_blocks,
         flush_probe,
         reconciliation_trust_threshold: node_config.reconciliation_trust_threshold,
         // Mirror the handshake's Light-mode override (line above) — in Light
@@ -2502,7 +2748,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // layer calls resize_cache() on the existing storage handle at first
     // synced() entry — no second Database handle, no mmap coherency bug.
     if state_type == StateType::Utxo {
-        if let Some(synced_cache_mb) = node_config.synced_cache_mb {
+        if let Some(synced_cache_mb) = memory_plan.synced_cache_mb {
             // `synced_cache_mb` is the at-tip TOTAL, mirroring `cache_mb`, so
             // the same store/state split applies. Only the state side is
             // resizable in place — the modifier store has no resize path.
@@ -2512,7 +2758,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // read half. See facts/state.md § "An in-place resize moves only
             // 90% of the budget".
             let (_, synced_state_bytes) =
-                split_cache_mb(synced_cache_mb, node_config.cache_store_pct);
+                split_cache_mb(synced_cache_mb, memory_plan.cache_store_pct);
             sync.set_at_tip_cache(synced_state_bytes);
             tracing::info!(
                 synced_cache_mb,
@@ -3398,7 +3644,7 @@ mod tests {
     fn cache_store_pct_out_of_range_is_rejected() {
         for pct in [0u32, 100, 250] {
             let cfg = NodeConfig {
-                cache_store_pct: pct,
+                cache_store_pct: Some(pct),
                 ..NodeConfig::default()
             };
             assert!(
@@ -3409,21 +3655,119 @@ mod tests {
         }
         for pct in [1u32, 50, 99] {
             let cfg = NodeConfig {
-                cache_store_pct: pct,
+                cache_store_pct: Some(pct),
                 ..NodeConfig::default()
             };
             assert!(validate_cache_split(&cfg).is_ok(), "pct {pct} should be accepted");
         }
     }
 
+    fn budget(usable_mb: u64) -> MemoryBudget {
+        MemoryBudget {
+            source: BudgetSource::Explicit,
+            ceiling_bytes: usable_mb * MIB,
+            usable_bytes: usable_mb * MIB,
+        }
+    }
+
     #[test]
-    fn cache_split_divides_the_total_exactly() {
-        let cfg = NodeConfig {
-            cache_mb: 512,
-            cache_store_pct: 25,
+    fn an_absent_key_is_derived_and_a_present_one_is_obeyed_exactly() {
+        let b = budget(4096);
+
+        let derived = derive_memory_plan(&NodeConfig::default(), &b, 0);
+        assert!(derived.cache_mb > 0, "absent cache_mb must derive a real size");
+        assert!(derived.derived_any);
+
+        let stated = NodeConfig {
+            cache_mb: Some(777),
             ..NodeConfig::default()
         };
-        let (store, state) = cache_split_bytes(&cfg);
+        let plan = derive_memory_plan(&stated, &b, 0);
+        assert_eq!(
+            plan.cache_mb, 777,
+            "a stated value must be obeyed exactly, not adjusted — silently \
+             overriding it is the failure this design exists to prevent"
+        );
+        assert_ne!(
+            plan.flush_heap_threshold_mb, 0,
+            "stating one key must not disable derivation of the others"
+        );
+    }
+
+    #[test]
+    fn the_flush_trigger_always_sits_above_the_cache_it_must_outlive() {
+        // The trigger compares against total jemalloc `allocated`, which
+        // already contains the caches. A threshold at or below cache size
+        // fires on every check forever — a pathology that produces a node
+        // that runs and flushes constantly rather than one that fails.
+        for usable_mb in [512u64, 1024, 2048, 4096, 16384] {
+            let plan = derive_memory_plan(&NodeConfig::default(), &budget(usable_mb), 0);
+            assert!(
+                plan.flush_heap_threshold_mb > plan.cache_mb,
+                "usable {usable_mb} MB: flush trigger {} must exceed cache {}",
+                plan.flush_heap_threshold_mb,
+                plan.cache_mb
+            );
+        }
+    }
+
+    #[test]
+    fn a_budget_smaller_than_the_floor_still_yields_a_usable_cache() {
+        // 128 MB is below BASELINE_ANON_BYTES, so `available` saturates to
+        // zero. Deriving a zero-byte cache would be worse than a small one:
+        // redb with no page cache makes the startup chain walk ~70x slower.
+        let plan = derive_memory_plan(&NodeConfig::default(), &budget(128), 0);
+        assert!(
+            plan.cache_mb >= 64,
+            "a starved budget must still floor at a usable cache, got {}",
+            plan.cache_mb
+        );
+    }
+
+    #[test]
+    fn the_growing_chain_index_shrinks_the_derived_cache() {
+        let b = budget(4096);
+        let early = derive_memory_plan(&NodeConfig::default(), &b, 10 * MIB);
+        let late = derive_memory_plan(&NodeConfig::default(), &b, 400 * MIB);
+        assert!(
+            late.cache_mb < early.cache_mb,
+            "the index is part of the floor and grows with the chain, so the \
+             cache derived against it must shrink: early {} late {}",
+            early.cache_mb,
+            late.cache_mb
+        );
+    }
+
+    #[test]
+    fn budget_source_decides_how_much_of_the_ceiling_is_spent() {
+        // A cgroup limit is somebody stating this node may have that much.
+        // MemTotal states only that the machine has it.
+        assert_eq!(BudgetSource::Explicit.usable_fraction(), 1.00);
+        assert!(BudgetSource::Cgroup.usable_fraction() > BudgetSource::MemTotal.usable_fraction());
+    }
+
+    /// A plan with only the two fields the split reads. Built directly rather
+    /// than through derivation so these tests keep asserting the split's
+    /// arithmetic and not the budget calibration, which moves.
+    fn plan_for_test(cache_mb: u64, cache_store_pct: u32) -> MemoryPlan {
+        MemoryPlan {
+            cache_mb,
+            cache_store_pct,
+            flush_heap_threshold_mb: 0,
+            flush_max_blocks: 0,
+            flush_min_blocks: 0,
+            synced_cache_mb: None,
+            synced_flush_heap_threshold_mb: None,
+            synced_flush_max_blocks: None,
+            synced_flush_min_blocks: None,
+            derived_any: false,
+        }
+    }
+
+    #[test]
+    fn cache_split_divides_the_total_exactly() {
+        let plan = plan_for_test(512, 25);
+        let (store, state) = cache_split_bytes(&plan);
         assert_eq!(store, 128 * 1024 * 1024);
         assert_eq!(state, 384 * 1024 * 1024);
         assert_eq!(
@@ -3438,12 +3782,8 @@ mod tests {
         // 333 is deliberately awkward: 777 MB * 33% does not divide evenly.
         // The remainder must land in state rather than vanishing, or the
         // configured total silently under-delivers.
-        let cfg = NodeConfig {
-            cache_mb: 777,
-            cache_store_pct: 33,
-            ..NodeConfig::default()
-        };
-        let (store, state) = cache_split_bytes(&cfg);
+        let plan = plan_for_test(777, 33);
+        let (store, state) = cache_split_bytes(&plan);
         assert_eq!(store + state, 777 * 1024 * 1024);
     }
 

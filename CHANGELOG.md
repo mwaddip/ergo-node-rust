@@ -73,6 +73,32 @@
   `resize_cache` forward return `Ok(())` and log success for a resize that never
   happened. Affects anyone building against `ergo-validation`.
 
+- **The node sizes its own memory.** Every key in the memory section is now
+  optional and **derived when absent**: the node reads its ceiling from its
+  cgroup limit (systemd `MemoryMax`, container `--memory`) or, failing that,
+  takes a conservative share of `MemTotal`, and sizes caches and the flush
+  threshold from what is left after the parts no knob governs. A key that IS
+  set is obeyed exactly, and disables derivation for that key alone — partial
+  configuration is normal.
+
+  New optional `memory_budget_mb` states the budget directly. Prefer
+  `MemoryMax` on the unit: a cgroup limit bounds the node for real, whereas
+  the config key only tells it what to aim for.
+
+  This closes a gap that was invisible until it was measured: a node run under
+  `MemoryMax=1500M` had no idea, sizing itself from a TOML file while the
+  kernel knew the answer exactly. It also fixes `flush_heap_threshold_mb`
+  defaulting to 4096 — above total RAM on any box small enough to care, so the
+  trigger it governs was inert exactly where it was needed.
+
+  Derivation is logged at startup as `memory budget derived` with every input
+  and output (journal-events **2.1**), because auto-sizing's failure mode is
+  not being wrong, it is being wrong invisibly.
+
+  `flush_max_blocks` and `flush_min_blocks` are **not** derived — they bound
+  crash-recovery work in blocks, and nothing measured relates a block count to
+  a memory budget.
+
 ### Fixed
 
 - `ergo_avltree_rust` moves to fork rev `b955790`. `BatchAVLProver::restore_root`

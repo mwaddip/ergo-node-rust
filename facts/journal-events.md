@@ -1,6 +1,6 @@
 # Journal Events Contract
 
-Version: 2.0.0
+Version: 2.1.0
 
 Stable contract for parseable events in the node's structured log
 output. Consumers (e.g. the Ergo Node Doctor adapter) write parsers
@@ -25,6 +25,11 @@ The node advertises this contract's version in `/info`:
 
 Consumers refuse to parse on unrecognized major. Additive changes (new
 events, new optional fields) are minor bumps.
+
+### 2.1.0 — memory budget derivation (v0.8.0)
+
+Additive: one new event, `memory_budget_derived`. Minor bump; consumers pinned
+to major 2 are unaffected.
 
 ### 2.0.0 — deferred script evaluation removed (v0.8.0)
 
@@ -350,6 +355,32 @@ phase's `_started`.
   resets the counter. **Before 1.3** this fired only on the
   `apply_state` path — a deferred eval-failure stall (the loop that
   hammered on a wrongly-rejected script) did not emit it.
+
+#### `memory_budget_derived`
+- **Level:** INFO
+- **Marker:** `"memory budget derived"`
+- **Fields:** `source` (string: `config`|`cgroup`|`meminfo` — where the ceiling
+  came from), `ceiling_mb` (u64), `usable_mb` (u64: ceiling × the fraction that
+  source justifies), `baseline_mb` (u64), `chain_index_mb` (u64),
+  `available_mb` (u64: usable − floor), `cache_mb` (u64),
+  `cache_store_pct` (u64), `store_cache_mb` (u64), `state_cache_mb` (u64),
+  `flush_heap_threshold_mb` (u64), `synced_cache_mb` (u64)
+- **Since:** 2.1
+- **Stability:** stable
+- **Emitted:** once at startup, after the header chain is restored, **only when
+  at least one memory setting was derived**. A node with every memory key set
+  explicitly derives nothing and emits nothing — absence of this event means
+  the operator configured everything, not that derivation failed.
+- **Why it exists:** the node sizes its own caches from its cgroup limit rather
+  than from config. Auto-sizing's failure mode is not being wrong, it is being
+  wrong **invisibly** — without this line an operator asking "why is my cache
+  this size" has nothing to point at. Every input and every output is present
+  so the arithmetic can be checked from the log alone.
+
+  A second INFO line follows when `source` is `meminfo`, noting that setting
+  `MemoryMax` on the unit or `memory_budget_mb` in `ergo.toml` would let the
+  node use more. That path takes a deliberately conservative share, because
+  nothing said the node owns the machine.
 
 #### `catchup_progress`
 - **Level:** INFO

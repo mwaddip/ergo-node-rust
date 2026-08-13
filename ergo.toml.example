@@ -144,7 +144,30 @@ protocol_version = "6.0.3"
 # whether to fastsync.
 # fastsync_peer_wait_timeout_sec = 30
 
-# ── Cold-sync memory (in use until chain reaches tip) ───────────────────
+# ── Memory ──────────────────────────────────────────────────────────────
+#
+# EVERY key in this section is optional and DERIVED when absent. The node
+# reads its own ceiling — the cgroup limit if it has one (systemd MemoryMax,
+# container --memory), otherwise a conservative share of total RAM — and sizes
+# its caches and flush thresholds from that, minus the parts no knob governs
+# (the header index, which grows with the chain).
+#
+# Setting a key disables derivation FOR THAT KEY ONLY and is then obeyed
+# exactly. Partial configuration is normal.
+#
+# The derivation is logged at startup as "memory budget derived", with every
+# input and output, so you can see why a cache is the size it is. If that line
+# is absent, you configured everything and nothing was derived.
+#
+# Prefer setting MemoryMax on the systemd unit over memory_budget_mb here:
+# the cgroup limit bounds the node for real, whereas this only tells it what
+# to aim for.
+
+# Total memory the node may use, MB. Absent = read the cgroup limit, else a
+# conservative share of MemTotal.
+# memory_budget_mb = 2048
+
+# ── Cold-sync values (in use until the chain reaches tip) ───────────────
 
 # TOTAL redb page cache across BOTH databases, in megabytes.
 #
