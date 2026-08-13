@@ -12,6 +12,7 @@ use ergo_chain_types::{
 use tracing_test::traced_test;
 use ergo_lib::chain::emission::{EmissionRules, MonetarySettings};
 use ergo_lib::chain::genesis;
+use ergo_lib::chain::parameters::Parameters;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
 use ergo_mining::emission::{build_emission_tx, ReemissionRules};
@@ -167,7 +168,7 @@ fn generate_candidate_and_mine_block() {
         };
 
     // Generate candidate for block 1
-    let (candidate, work) = ergo_mining::generate_candidate(
+    let generated = ergo_mining::generate_candidate(
         &config,
         &parent,
         INITIAL_N_BITS,
@@ -175,9 +176,18 @@ fn generate_candidate_and_mine_block() {
         &emission_box,
         None, // no boundary params (height 2 is not an epoch boundary)
         &[],  // no proposed-update payload
+        &[],  // empty mempool
+        &Parameters::default(),
+        &[], // no ancestors beyond the parent
+        &|_| None,
         &mock_proofs,
     )
     .expect("candidate generation failed");
+    let (candidate, work) = (generated.block, generated.work);
+    assert!(
+        generated.invalid_txs.is_empty(),
+        "no mempool transactions were offered, so none can be invalid"
+    );
 
     // Verify WorkMessage fields
     assert_eq!(work.h, 2, "block height should be 2 (genesis is 1)");
@@ -237,7 +247,7 @@ fn mine_three_consecutive_blocks() {
     for _ in 0..3u32 {
         let height = parent.height + 1;
 
-        let (candidate, _work) = ergo_mining::generate_candidate(
+        let candidate = ergo_mining::generate_candidate(
             &config,
             &parent,
             INITIAL_N_BITS,
@@ -245,9 +255,14 @@ fn mine_three_consecutive_blocks() {
             &current_emission_box,
             None, // no boundary params (heights 2-4 are not epoch boundaries)
             &[],  // no proposed-update payload
+            &[],  // empty mempool
+            &Parameters::default(),
+            &[], // no ancestors beyond the parent
+            &|_| None,
             &mock_proofs,
         )
-        .unwrap_or_else(|e| panic!("candidate at height {height} failed: {e}"));
+        .unwrap_or_else(|e| panic!("candidate at height {height} failed: {e}"))
+        .block;
 
         let header = cpu_mine(&candidate, 100)
             .unwrap_or_else(|e| panic!("mining block at height {height} failed: {e}"));
@@ -328,7 +343,7 @@ fn mining_block_found_emits_contract_marker() {
             Some(Ok((vec![0u8; 64], ADDigest::from([0u8; 33]))))
         };
 
-    let (candidate, _work) = ergo_mining::generate_candidate(
+    let candidate = ergo_mining::generate_candidate(
         &config,
         &parent,
         INITIAL_N_BITS,
@@ -336,9 +351,14 @@ fn mining_block_found_emits_contract_marker() {
         &emission_box,
         None,
         &[],
+        &[],
+        &Parameters::default(),
+        &[],
+        &|_| None,
         &mock_proofs,
     )
-    .expect("candidate generation failed");
+    .expect("candidate generation failed")
+    .block;
 
     let header =
         cpu_mine(&candidate, 100).expect("mining should succeed with trivial difficulty");

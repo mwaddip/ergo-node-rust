@@ -16,16 +16,23 @@ use crate::MiningError;
 
 /// Build the fee collection transaction.
 ///
-/// Scans outputs of `selected_txs` for boxes matching the fee proposition.
-/// Aggregates all fee values into a single miner reward box. Fee boxes
-/// that are spent by other selected transactions within the same block are
-/// excluded (they belong to chained transactions, not the miner).
+/// Scans outputs of `block_txs` — every transaction the block carries so far,
+/// emission transaction included, matching the JVM's `newTxs` — for boxes
+/// matching the fee proposition. Aggregates all fee values into a single
+/// miner reward box. Fee boxes that are spent by another transaction within
+/// the same block are excluded (they belong to chained transactions, not the
+/// miner).
 ///
-/// Returns None if total fee is zero or no fee boxes exist.
+/// `height` is the CANDIDATE's height: the fee proposition requires
+/// `HEIGHT == creationHeight(OUTPUTS(0))`, so the miner box is created at the
+/// height the block will have (JVM `collectRewards`, `nextHeight`).
+///
+/// Returns None if total fee is zero or no fee boxes exist — a zero-fee block
+/// is a normal outcome, not an error.
 ///
 /// Reference: JVM `CandidateGenerator.collectFees()`.
 pub fn build_fee_tx(
-    selected_txs: &[Transaction],
+    block_txs: &[Transaction],
     height: u32,
     reward_delay: i32,
     miner_pk: &ProveDlog,
@@ -37,8 +44,8 @@ pub fn build_fee_tx(
         .sigma_serialize_bytes()
         .map_err(|e| MiningError::Emission(format!("fee tree serialize: {e}")))?;
 
-    // Collect all input box IDs across selected txs (these outputs are spent, not fees)
-    let spent_ids: HashSet<[u8; 32]> = selected_txs
+    // Every box spent by the block so far — such an output is a chained spend, not a fee
+    let spent_ids: HashSet<[u8; 32]> = block_txs
         .iter()
         .flat_map(|tx| tx.inputs.iter())
         .map(|input| {
@@ -48,9 +55,9 @@ pub fn build_fee_tx(
         })
         .collect();
 
-    // Collect fee outputs from selected transactions
+    // Collect fee outputs from the block's transactions
     let mut fee_boxes: Vec<&ErgoBox> = Vec::new();
-    for tx in selected_txs {
+    for tx in block_txs {
         for output in tx.outputs.iter() {
             let output_tree_bytes = output
                 .ergo_tree
@@ -59,7 +66,7 @@ pub fn build_fee_tx(
             if output_tree_bytes == fee_tree_bytes {
                 let mut id = [0u8; 32];
                 id.copy_from_slice(output.box_id().as_ref());
-                // Only include if not spent by another selected tx
+                // Only include if not spent by another transaction in the block
                 if !spent_ids.contains(&id) {
                     fee_boxes.push(output);
                 }

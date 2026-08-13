@@ -20,7 +20,7 @@ use ergo_lib::ergotree_ir::chain::ergo_box::{ErgoBox, ErgoBoxCandidate, NonManda
 use ergo_lib::ergotree_ir::chain::tx_id::TxId;
 use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
-use ergo_mining::selection::select_transactions;
+use ergo_mining::selection::{select_transactions, CostedTx};
 use ergo_validation::{
     build_state_context, validate_single_transaction, ErgoStateContext, Parameter, Parameters,
 };
@@ -165,6 +165,10 @@ fn ids(txs: &[Transaction]) -> Vec<String> {
     txs.iter().map(|tx| format!("{}", tx.id())).collect()
 }
 
+fn selected_ids(selected: &[CostedTx]) -> Vec<String> {
+    selected.iter().map(|c| format!("{}", c.tx.id())).collect()
+}
+
 /// The half a `break` would silently fail: an over-budget transaction is
 /// skipped, and the scan keeps going so a later cheaper one still gets in.
 #[test]
@@ -207,7 +211,7 @@ fn over_budget_tx_is_skipped_but_a_later_cheaper_one_fits() {
     );
 
     assert_eq!(
-        ids(&selected),
+        selected_ids(&selected),
         ids(&[small]),
         "the expensive tx must be skipped and the cheap one still selected"
     );
@@ -243,7 +247,7 @@ fn exactly_max_block_cost_is_accepted() {
     let (selected, invalid) =
         select_transactions(&candidates, &[], &ctx, 524_288, cost_a + cost_b, &lookup);
     assert_eq!(
-        ids(&selected),
+        selected_ids(&selected),
         ids(&[tx_a.clone(), tx_b.clone()]),
         "a candidate set summing to exactly max_block_cost must be accepted"
     );
@@ -259,7 +263,7 @@ fn exactly_max_block_cost_is_accepted() {
         &lookup,
     );
     assert_eq!(
-        ids(&selected),
+        selected_ids(&selected),
         ids(&[tx_a]),
         "one block unit under the sum must drop the second transaction"
     );
@@ -293,7 +297,7 @@ fn size_bound_still_skips_and_keeps_scanning() {
     );
 
     assert_eq!(
-        ids(&selected),
+        selected_ids(&selected),
         ids(&[tx_b]),
         "the oversized tx is skipped and the smaller one still selected"
     );
