@@ -91,7 +91,7 @@ Single-repo, multi-session development:
 | Chain sync | `sync/` | **Done** | State machine + snapshot bootstrap |
 | Block/modifier storage | `store/` | **Done** | redb backend, height-indexed |
 | Mempool | `mempool/` | **Done** | Validate-on-entry, replace-by-fee |
-| REST API | `api/` | **Done** | 23 endpoints + `/debug/memory` |
+| REST API | `api/` | **Done** | 43 endpoints — 38 JVM-compatible + `/debug/memory`, 3 × `/debug/p2p-capture/*`, `/stats/p2p` |
 | Mining | `mining/` | **Done** | Autolykos v2 candidate assembly |
 | Soft-fork voting | (in `chain/`, `validation/`) | **Done** | Epoch-boundary parameter tracking, v6.0.3-compatible |
 | At-tip memory tuning | (in `sync/`) | **Done** | Runtime AVL DB cache resize on synced() (v0.4.0+) |
@@ -108,20 +108,28 @@ Single-repo, multi-session development:
 
 ### Ready to Use
 
-| Component | Crate | Version | Last Active | What it does |
+*Dates are the upstream repo's last push, checked 2026-08-13 via the GitHub API
+— not the crates.io release date, which is much older: `ergo-lib-v0.28.0` was
+published 2024-08-09. Every sigma-rust crate shares one repo and therefore one
+date. We consume them from `mwaddip/sigma-rust` pinned by rev, not from
+crates.io, so the version column is the last published release rather than what
+the build actually resolves.*
+
+
+| Component | Crate | Version | Upstream last push | What it does |
 |---|---|---|---|---|
-| ErgoTree interpreter | `ergotree-interpreter` | 0.28.0 | Feb 2026 | Full script evaluator, 70+ opcodes, sigma protocols |
-| Transaction validation | `ergo-lib` | 0.28.0 | Feb 2026 | Stateful: ERG/token preservation, script verification, storage rent |
-| Transaction signing | `ergo-lib` | 0.28.0 | Feb 2026 | Wallet, multi-sig, BIP-39/44, coin selection, tx builder |
-| Box/UTXO primitives | `ergo-lib` | 0.28.0 | Feb 2026 | ErgoBox, registers, tokens, ErgoStateContext |
-| Block header types | `ergo-chain-types` | 0.15.0 | Feb 2026 | Full Header struct with Autolykos solution |
-| Autolykos v2 PoW | `ergo-chain-types` | 0.15.0 | Feb 2026 | `pow_hit()`, compact bits, table size growth |
-| NiPoPoW verification | `ergo-nipopow` | 0.15.0 | Dec 2021 | Full KMZ17 algorithm, proof comparison, best chain |
-| AVL+ authenticated tree | `ergo_avltree_rust` | fork | Apr 2026 | Prover + verifier, batch operations — forked to fix `Resolver` type for persistence ([PR #10](https://github.com/ergoplatform/ergo_avltree_rust/pull/10)) |
-| Merkle proofs | `ergo-merkle-tree` | 0.15.0 | Feb 2026 | Tree, proof, batch multiproof |
-| ErgoScript compiler | `ergoscript-compiler` | 0.24.0 | Feb 2026 | Source to ErgoTree |
-| Scorex serialization | `sigma-ser` | — | Feb 2026 | VLQ, ZigZag, binary encoding |
-| P2P networking | `ergo-proxy-node` | 0.1.0 | Mar 2026 | Handshake, framing, message routing, IPv6 |
+| ErgoTree interpreter | `ergotree-interpreter` | 0.28.0 | 2026-08-04 | Full script evaluator, 70+ opcodes, sigma protocols |
+| Transaction validation | `ergo-lib` | 0.28.0 | 2026-08-04 | Stateful: ERG/token preservation, script verification, storage rent |
+| Transaction signing | `ergo-lib` | 0.28.0 | 2026-08-04 | Wallet, multi-sig, BIP-39/44, coin selection, tx builder |
+| Box/UTXO primitives | `ergo-lib` | 0.28.0 | 2026-08-04 | ErgoBox, registers, tokens, ErgoStateContext |
+| Block header types | `ergo-chain-types` | 0.15.0 | 2026-08-04 | Full Header struct with Autolykos solution |
+| Autolykos v2 PoW | `ergo-chain-types` | 0.15.0 | 2026-08-04 | `pow_hit()`, compact bits, table size growth |
+| NiPoPoW verification | `ergo-nipopow` | 0.15.0 | 2026-08-04 | Full KMZ17 algorithm, proof comparison, best chain |
+| AVL+ authenticated tree | `ergo_avltree_rust` | fork, pinned by rev | 2026-08-03 | Prover + verifier, batch operations. Fork carries persistent-prover support ([PR #27](https://github.com/ergoplatform/ergo_avltree_rust/pull/27)); `Resolver` is [#16](https://github.com/ergoplatform/ergo_avltree_rust/pull/16), superseding the closed #10 |
+| Merkle proofs | `ergo-merkle-tree` | 0.15.0 | 2026-08-04 | Tree, proof, batch multiproof |
+| ErgoScript compiler | `ergoscript-compiler` | 0.24.0 | 2026-08-04 | Source to ErgoTree. **Available, not a dependency** — the node never compiles source |
+| Scorex serialization | `sigma-ser` | 0.19.0 | 2026-08-04 | VLQ, ZigZag, binary encoding |
+| P2P networking | `ergo-proxy-node` | 0.1.0 | — | Handshake, framing, message routing, IPv6. Now vendored as this repo's `p2p/` crate |
 
 ### Built (this project)
 
@@ -177,9 +185,11 @@ Validate blocks in digest mode (AD proofs, `BatchAVLVerifier`) and UTXO mode (`P
 Persistent AVL+ tree over redb (`enr-state` crate). Implements `VersionedAVLStorage` from forked `ergo_avltree_rust`. Undo-log rollback, configurable version retention, crash-safe atomic writes. Genesis bootstrap from chain parameters via ported `ErgoTreePredef`. Sliding 192-block download window for sequential sync. **Done.**
 
 ### Phase 6: Full Node — **Done**
-Mempool, REST API (23 endpoints + `/debug/memory`), mining API,
+Mempool, REST API (43 endpoints, 38 of them JVM-compatible), mining API,
 soft-fork voting, NiPoPoW serve/verify, UTXO snapshot bootstrap, light
-client mode, at-tip memory tuning. Released as v0.4.x.
+client mode, at-tip memory tuning. First released as v0.4.x; current release
+is **v0.8.0**, which removed deferred script evaluation and split
+`BlockValidator` into three traits (see `CHANGELOG.md`).
 
 ## Protocol Reference
 
