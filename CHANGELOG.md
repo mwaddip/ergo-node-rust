@@ -105,6 +105,47 @@
 
 ### Fixed
 
+- **The mempool accepted nothing.** A synced node rejected every transaction the
+  network offered it with `Creation height H+1 > preheader height`, so it held a
+  permanently empty pool: no relay, no fees, and mining candidates carrying only
+  the emission transaction.
+
+  The state context published to the mempool and the REST API was built with the
+  block just applied as its preheader, leaving it at the current tip. Wallets set
+  `creationHeight` to the block they expect to land in, and ergo-lib enforces
+  `creationHeight <= preHeader.height`, so the check failed by exactly one block
+  for every well-formed transaction. The node now publishes an **upcoming**
+  context — `build_upcoming_state_context`, preheader at tip+1 — matching the
+  JVM, which validates mempool transactions against
+  `ErgoStateContext.simplifiedUpcoming()`.
+
+  Block validation was never affected: there the block's own header is the
+  correct preheader, so consensus was not at risk. Mining was never affected
+  either; it builds its own stub at height+1, which is why candidate assembly
+  kept working while the mempool starved.
+
+- **The fee was read as zero for every transaction.** `extract_fee` computed
+  `input_sum - output_sum`, but ergo-lib enforces exact ERG preservation, so that
+  expression is structurally zero for anything that validates — Ergo has no
+  implicit change-to-fee remainder. Every transaction was then declined against
+  `min_fee`. Fees are now summed from outputs guarded by the fee proposition,
+  matching `ErgoMemPool.extractFee`, with the tree built once at construction.
+
+  This was masked by the preheader defect: validation failed first, so nothing
+  ever reached the fee check. Fixing either alone would have left the mempool
+  empty.
+
+- **A transaction one block ahead of us was cached as invalid** for
+  `invalidation_ttl` (1800 s ≈ 15 blocks), suppressing every rebroadcast without
+  re-validating it. The condition is transient — the sender is simply ahead, and
+  the transaction is valid once the next block applies — so it is now `Declined`
+  rather than `Invalidated`, the same treatment a not-yet-visible input box
+  already received. `cleanup.rs` carried the same flaw on the reorg path, where a
+  reorg moves the preheader backwards over transactions re-pooled unvalidated.
+
+  Verified on live mainnet traffic at tip: the pool fills and drains with each
+  block, and candidates reached 47 transactions.
+
 - `ergo_avltree_rust` moves to fork rev `b955790`. `BatchAVLProver::restore_root`
   now clears `base.modified_nodes` itself, and `PersistentBatchAVLProver::rollback`
   delegates to it rather than hand-rolling a second rewind. Previously every
