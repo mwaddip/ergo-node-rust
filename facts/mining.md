@@ -584,8 +584,14 @@ See "Ownership" above for why it spent v0.8.0 development with no caller.
    transaction sizes.** Validators enforce `max_block_size` against the
    BlockTransactions section, which is
    `[header_id: 32B][ver_or_count: VLQ][tx_count: VLQ if ver>1][txs…]` —
-   so `32 + vlq_len(version) + vlq_len(tx_count)` bytes, about 34–35, sit
-   outside a sum of transaction sizes. A candidate landing within that margin
+   **37 bytes** for a current-version block under 128 transactions, 33 for v1.
+
+   The middle field is not a version byte. The JVM writes
+   `putUInt(MaxTransactionsInBlock + blockVersion)`, i.e. a VLQ of ~10,000,00X,
+   which is **4 bytes**, and the sentinel is what tells a parser this is a
+   versioned section rather than a v1 one whose first field is the transaction
+   count. So the overhead is `32 + 4 + vlq_len(tx_count)`, and a "1-byte
+   version" reading of the layout undercounts by three. A candidate landing within that margin
    of the limit is over it by the rule that actually decides validity.
 
    The JVM generator sums transaction sizes and carries the same undercount;
@@ -624,13 +630,29 @@ transaction and fee transaction (zero-fee). This is valid.
 
 ### Step 4: Fee Transaction
 
-⚠ **Known limitation: aggregated fee tokens are not capped at
-`MaxAssetsPerBox`.** The JVM caps them. Without the cap, a block whose fee
-boxes carry more than 255 distinct tokens produces an unbuildable fee box, and
-the block ships **without collecting any fees**, with a warning. That is a
-revenue loss for the miner, not an invalid block, so it degrades rather than
-breaking — but on a token-heavy chain it is reachable. Fix by truncating to the
-highest-value tokens, as the JVM does.
+⚠ **Cap aggregated fee tokens by serialized BOX SIZE, not by token count.**
+
+`MaxAssetsPerBox` (255) is **not** the binding limit and capping there does not
+collect the fees. The consensus rule is `txBoxSize` —
+`out.bytes.length <= MaxBoxSize` (4096), `ErgoTransaction.scala` — and a miner
+reward box with a 54-byte tree holds about **122** minimal 33-byte tokens
+before crossing it. A 255-token fee box is ~8476 bytes and can never validate,
+so a count cap only moves the failure from "box will not build" to "box will
+not validate": the block still ships collecting **zero** fees.
+
+The JVM caps by the same wrong constant — `flatMap(_.additionalTokens).take(MaxAssetsPerBox)`,
+unsorted — and loses the same fees. **We diverge deliberately.** Which fee
+boxes a miner collects is miner policy, not consensus: the rule constrains the
+box it produces, not the choice of what to put in it, and uncollected fee boxes
+simply remain spendable later. So capping by size is legal, strictly better for
+the miner, and not a parity break in any sense that matters.
+
+⚠ **The surviving tokens must be selected deterministically**, in a stable
+traversal order — first-seen across the fee boxes, never hash-map iteration
+order. The fee box's bytes determine its box id, which determines the
+transaction id, which feeds the transactions root the miner hashes. A
+seed-dependent order makes two runs over identical input produce different
+work. This bit once, via `HashMap` aggregation.
 
 Collect fees from all selected transactions and create a single fee output
 for the miner.
