@@ -401,8 +401,24 @@ be a defaulted `Ok(())`:
 | Case | Meaning | Effect on step (2)/(3) and pruning |
 |---|---|---|
 | `Some(p)`, `p.flush()` → `Ok` | state durable at M | proceed |
-| `None` | nothing to persist | proceed — step (1) is vacuously satisfied |
+| `None` | nothing to persist | proceed — step (1) is vacuously satisfied, **and (2) still runs** |
 | `Some(p)`, `p.flush()` → `Err` | durability UNKNOWN | **stop**: no `set_validated_height`, no prune |
+
+⚠ **`None` is NOT `FlushOutcome::NoValidator`.** That variant is light mode —
+no validator at all — and it deliberately skips `set_validated_height`. Digest
+mode has a validator and a real `validated_height()`, and today it reaches
+`FlushOutcome::Flushed(M)` by way of the defaulted `flush` returning `Ok(())`,
+so the store write happens. **It must keep happening**; reusing `NoValidator`
+would silently drop it and turn a refactor into a behaviour change.
+
+A distinct outcome is therefore required — one that advances `last_flush` and
+completes the store pair, while not claiming an fsync occurred. Digest mode
+does not *resume* from this value (it rescans for the first complete block and
+recovers state roots from headers — `src/main.rs`, the `StateType::Digest`
+branch), so the write is bookkeeping rather than load-bearing. It is preserved
+anyway, because the split is a refactor: dropping it is a separate decision
+that would need its own justification, not a side effect of moving a method
+between traits.
 
 ⚠ The `None` and `Err` arms must not be collapsed. "Nothing to flush" and
 "the flush failed" differ by exactly the bug this split was made to prevent —
