@@ -388,6 +388,28 @@ sharing the storage backend.
 
 ## Candidate Assembly
 
+### Regeneration triggers
+
+A cached candidate is rebuilt when **either**:
+
+- the validated tip advances, or
+- **the cached candidate has aged past `candidate_ttl`** (default 15 s).
+
+⚠ **The second trigger was missing until v0.8.0, and its absence made mining
+unusable.** Regeneration was gated on tip change alone, while `cached_work`
+invalidates on TTL — so `/mining/candidate` served work for 15 s after each
+block and returned **503 for the remaining ~105 s** of a mainnet interval. A
+miner could fetch work for roughly 12% of each block. The config key is
+documented as "maximum candidate lifetime before forced regeneration"; only the
+invalidation half existed.
+
+Regenerating on expiry also keeps the candidate's `timestamp` current and, with
+transaction selection wired, picks up transactions that arrived *after* the
+last block — rather than repeatedly mining the near-empty mempool that block
+left behind. **That failure mode — full mempool, empty blocks — is a caching
+and trigger problem, not a selection problem**, and wiring selection without
+this fix would not have produced fuller blocks.
+
 ### Ownership — `generate_candidate` is the only entry point
 
 **Callers ask `mining` for a candidate. They do not assemble one.**

@@ -3185,7 +3185,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 loop {
                     tokio::time::sleep(MINING_POLL_INTERVAL).await;
                     let current = mining_height.load(std::sync::atomic::Ordering::Relaxed);
-                    if current == last_height || current == 0 {
+                    if current == 0 {
+                        continue;
+                    }
+                    // Rebuild on a new tip OR when the cached candidate has aged
+                    // out. `candidate_ttl` (default 15s) invalidates the cache,
+                    // but nothing used to regenerate on expiry — and the tip only
+                    // moves every ~2 min on mainnet, so /mining/candidate served
+                    // work for 15s after each block and returned 503 for the
+                    // remaining ~105. The knob is documented as "maximum candidate
+                    // lifetime before forced regeneration"; this is the forced
+                    // regeneration half.
+                    //
+                    // Refreshing also keeps the candidate's timestamp current and,
+                    // once mempool selection is wired in, picks up transactions
+                    // that arrived after the last block rather than mining the
+                    // near-empty pool left behind by it.
+                    let stale = gen.cached_work(current).is_none();
+                    if current == last_height && !stale {
                         continue;
                     }
                     last_height = current;
