@@ -3662,6 +3662,77 @@ mod tests {
         }
     }
 
+    /// Build a `Validator` around either variant, with throwaway channels.
+    fn wrap(inner: ValidatorInner) -> Validator {
+        let (block_tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (height_tx, _hrx) = tokio::sync::watch::channel(0u32);
+        Validator::new(
+            inner,
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            Arc::new(tokio::sync::RwLock::new(None)),
+            block_tx,
+            height_tx,
+            None,
+        )
+    }
+
+    #[test]
+    fn the_wrapper_hands_out_utxo_persistence_and_withholds_digest_persistence() {
+        // A missing forward here does NOT break visibly. `state_persistence`
+        // returning None for both arms compiles, and `sync/` reads None as
+        // "nothing to persist" — so the node simply stops flushing and loses
+        // state on the next unclean shutdown. The compiler forces the method
+        // to exist, never to be right.
+        //
+        // BOTH arms are asserted deliberately: a test that only checked the
+        // digest side would pass with both arms wrongly returning None, which
+        // is precisely the bug it is meant to catch.
+
+        let digest = wrap(ValidatorInner::Digest(DigestValidator::new(
+            ergo_chain_types::ADDigest::zero(),
+            0,
+        )));
+        assert!(
+            digest.state_persistence().is_none(),
+            "digest mode owns no redb and must hand out no persistence"
+        );
+        assert!(
+            digest.mining_state().is_none(),
+            "digest mode has no UTXO set to assemble candidates from"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let params = AVLTreeParams { key_length: 32, value_length: None };
+        let mut storage = RedbAVLStorage::open(
+            &dir.path().join("state.redb"),
+            params,
+            16,
+            CacheSize::Bytes(1024 * 1024),
+        )
+        .expect("open state storage");
+
+        // Establish a version so UtxoValidator::new's precondition holds —
+        // the empty first commit documented on that constructor.
+        let mut prover = BatchAVLProver::new(
+            AVLTree::with_resolver(storage.resolver(), 32, None),
+            true,
+        );
+        storage
+            .update_with_height(&mut prover, vec![], 0)
+            .expect("empty first commit");
+
+        let utxo = wrap(ValidatorInner::Utxo(UtxoValidator::new(storage, prover, 0, 0)));
+        assert!(
+            utxo.state_persistence().is_some(),
+            "UTXO mode owns state.redb — handing out None here silently stops \
+             every flush in the node"
+        );
+        assert!(
+            utxo.mining_state().is_some(),
+            "UTXO mode can assemble candidates and must expose MiningState"
+        );
+    }
+
     fn budget(usable_mb: u64) -> MemoryBudget {
         MemoryBudget {
             source: BudgetSource::Explicit,
