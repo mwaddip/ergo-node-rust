@@ -2,7 +2,7 @@ mod handlers;
 pub mod stats;
 pub mod types;
 
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::Router;
@@ -90,6 +90,15 @@ pub struct ApiState {
     /// jemalloc; None with mimalloc or system allocator. The `/debug/memory`
     /// handler calls this to read live allocator counters.
     pub jemalloc_probe: Option<Arc<dyn Fn() -> JemallocSnapshot + Send + Sync>>,
+    /// AVL prover modified-node working set, published after each applied
+    /// block by the crate that owns the prover. Absent from `/debug/memory`
+    /// until something publishes — see [`PublishedGauge`].
+    pub prover_modified_nodes_bytes: Arc<PublishedGauge>,
+    /// AVL prover resident-node working set, published by the same writer as
+    /// [`ApiState::prover_modified_nodes_bytes`].
+    pub prover_resident_nodes_bytes: Arc<PublishedGauge>,
+    /// `sync/`'s in-flight download window, published by `sync/`.
+    pub sync_window_bytes: Arc<PublishedGauge>,
     /// Whether the operator stats endpoint is enabled. Overwritten by
     /// `serve()` based on its `stats_config` + `p2p_counters` arguments;
     /// callers should leave this `false`. When `true`, `/info` emits
@@ -100,6 +109,76 @@ pub struct ApiState {
     /// `/debug/p2p-capture/*` handlers return a disabled-shaped response
     /// (200 `{"enabled": false}` for `/info`, 404 for `/dump` and `/reset`).
     pub capture: Option<Arc<dyn enr_p2p::capture::CaptureAccess>>,
+}
+
+/// A byte figure **published** into shared state by the crate that owns the
+/// structure it measures, rather than read through an accessor.
+///
+/// Every other `/debug/memory` component figure is pulled synchronously via a
+/// trait method. These cannot be: the AVL prover lives inside the UTXO
+/// validator, which `sync/` owns and deliberately does not wrap in an
+/// `Arc<Mutex>` (`facts/validation.md`), so there is nothing for an HTTP
+/// handler to call. The owning crate computes its estimate and stores it here
+/// after each applied block — the mechanism already used for `shared_height` —
+/// and this crate reads it. Do not "simplify" this into a direct accessor: a
+/// synchronous read needs either a lock on an HTTP path or the `Arc<Mutex>`
+/// that was rejected on its own merits.
+///
+/// The `Option` discipline of the pulled figures survives intact. A gauge
+/// nothing has published to reports `None`, and `/debug/memory` omits the key;
+/// a published `0` reports `Some(0)` and renders as `0`. A node that has
+/// applied no blocks must not claim an empty prover — that is the same class of
+/// falsehood as the removed `chainHeaderEstimateBytes`. The two states are kept
+/// apart by a sentinel, and [`PublishedGauge::unset`] is the only constructor,
+/// so a handle cannot exist in a state that reports zero before anything has
+/// measured it.
+///
+/// See `facts/api.md` § "Component memory attribution".
+pub struct PublishedGauge(AtomicU64);
+
+impl PublishedGauge {
+    /// Sentinel for "nothing has published yet". 16 EiB is not a byte count any
+    /// structure in this process can reach; see [`PublishedGauge::publish`].
+    const UNSET: u64 = u64::MAX;
+
+    /// A gauge nothing has published to. Reports `None` until
+    /// [`publish`](PublishedGauge::publish) is called.
+    pub const fn unset() -> Self {
+        Self(AtomicU64::new(Self::UNSET))
+    }
+
+    /// Publish a freshly measured figure. Called by the owning crate after each
+    /// applied block; never called from this crate.
+    ///
+    /// Publishing `u64::MAX` is indistinguishable from never publishing and is
+    /// a caller bug. Debug builds assert; release builds report the field as
+    /// absent, which is a refusal to answer rather than a wrong answer.
+    pub fn publish(&self, bytes: u64) {
+        debug_assert!(
+            bytes != Self::UNSET,
+            "u64::MAX is the never-published sentinel; publishing it reports as absent"
+        );
+        self.0.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The last published figure, or `None` if nothing has published yet.
+    ///
+    /// `Relaxed` throughout: each gauge is an independent diagnostic reading
+    /// with no ordering relationship to any other value, and a reader that
+    /// catches the previous block's figure has caught a figure that was true
+    /// two seconds ago.
+    pub fn get(&self) -> Option<u64> {
+        match self.0.load(Ordering::Relaxed) {
+            Self::UNSET => None,
+            bytes => Some(bytes),
+        }
+    }
+}
+
+impl Default for PublishedGauge {
+    fn default() -> Self {
+        Self::unset()
+    }
 }
 
 /// Snapshot of jemalloc stats at a moment in time. The probe calls

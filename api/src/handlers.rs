@@ -1277,6 +1277,12 @@ pub async fn get_debug_memory(State(state): State<ApiState>) -> Json<DebugMemory
     // Transported verbatim from the owning crates — no arithmetic here. A
     // `None` becomes an absent key, never a zero: a zero would assert the
     // cache is empty, which is how a wrong figure hides in plain sight.
+    //
+    // The last three are read from gauges the owning crates publish into after
+    // each applied block, rather than pulled through a trait method — the AVL
+    // prover sits inside the validator that `sync/` owns and does not share.
+    // An unpublished gauge is `None` and drops out of the JSON, on the same
+    // terms as an unavailable redb stat.
     let components = ComponentMemory {
         chain_index_bytes: chain_memory.index_bytes,
         chain_header_cache_bytes: chain_memory.header_cache_bytes,
@@ -1285,6 +1291,9 @@ pub async fn get_debug_memory(State(state): State<ApiState>) -> Json<DebugMemory
         store_cache_bytes: state.store.cache_bytes_used(),
         state_cache_bytes: state.utxo_reader.cache_bytes_used(),
         store_cache_evictions: state.store.cache_evictions(),
+        prover_modified_nodes_bytes: state.prover_modified_nodes_bytes.get(),
+        prover_resident_nodes_bytes: state.prover_resident_nodes_bytes.get(),
+        sync_window_bytes: state.sync_window_bytes.get(),
         mempool_tx_count,
     };
 
@@ -2316,6 +2325,88 @@ mod tests {
         assert_eq!(c["storeCacheEvictions"], serde_json::json!(333));
     }
 
+    /// The published gauges carry values into the JSON unchanged, and the
+    /// pulled figures beside them are undisturbed. Three distinct values: a
+    /// field wired to a sibling's gauge passes with identical ones.
+    #[test]
+    fn debug_memory_transports_published_figures_unmodified() {
+        let c = debug_memory_components_of(test_state_with_published(
+            Some(444_000_444),
+            Some(555_000_555),
+            Some(666_000_666),
+        ));
+        assert_eq!(
+            c["proverModifiedNodesBytes"],
+            serde_json::json!(444_000_444u64)
+        );
+        assert_eq!(
+            c["proverResidentNodesBytes"],
+            serde_json::json!(555_000_555u64)
+        );
+        assert_eq!(c["syncWindowBytes"], serde_json::json!(666_000_666u64));
+        assert_eq!(
+            c["chainIndexBytes"],
+            serde_json::json!(MemoryChain::INDEX_BYTES),
+            "publishing must not disturb the pulled figures"
+        );
+        assert_eq!(c["mempoolTxCount"], serde_json::json!(0));
+    }
+
+    /// Nothing has published: all three keys absent. This is every node's
+    /// state at startup, and the moment a zero here would read as "the prover
+    /// is empty, look elsewhere" — the answer that cost a day on 2026-08-11.
+    #[test]
+    fn debug_memory_omits_published_fields_until_written() {
+        let c = debug_memory_components_of(test_state_with_published(None, None, None));
+        assert!(c.get("proverModifiedNodesBytes").is_none());
+        assert!(c.get("proverResidentNodesBytes").is_none());
+        assert!(c.get("syncWindowBytes").is_none());
+    }
+
+    /// Absence is per-gauge. One publisher that never runs must not drag the
+    /// others out of the response, and a field reading a sibling's gauge would
+    /// surface here as a key that refuses to disappear.
+    #[test]
+    fn debug_memory_published_fields_are_individually_absent() {
+        let c = debug_memory_components_of(test_state_with_published(None, Some(2), Some(3)));
+        assert!(c.get("proverModifiedNodesBytes").is_none());
+        assert_eq!(c["proverResidentNodesBytes"], serde_json::json!(2));
+        assert_eq!(c["syncWindowBytes"], serde_json::json!(3));
+
+        let c = debug_memory_components_of(test_state_with_published(Some(1), None, Some(3)));
+        assert_eq!(c["proverModifiedNodesBytes"], serde_json::json!(1));
+        assert!(c.get("proverResidentNodesBytes").is_none());
+        assert_eq!(c["syncWindowBytes"], serde_json::json!(3));
+
+        let c = debug_memory_components_of(test_state_with_published(Some(1), Some(2), None));
+        assert_eq!(c["proverModifiedNodesBytes"], serde_json::json!(1));
+        assert_eq!(c["proverResidentNodesBytes"], serde_json::json!(2));
+        assert!(c.get("syncWindowBytes").is_none());
+    }
+
+    /// The whole reason these are gauges and not plain atomics: a measured
+    /// zero is a fact and renders as `0`; an unmeasured gauge renders as
+    /// nothing. Collapsing the two is the bug this field set exists to avoid.
+    #[test]
+    fn debug_memory_published_zero_renders_as_zero_not_absent() {
+        let c = debug_memory_components_of(test_state_with_published(Some(0), Some(0), Some(0)));
+        assert_eq!(c["proverModifiedNodesBytes"], serde_json::json!(0));
+        assert_eq!(c["proverResidentNodesBytes"], serde_json::json!(0));
+        assert_eq!(c["syncWindowBytes"], serde_json::json!(0));
+    }
+
+    /// The sentinel directly, independent of the handler: `unset()` is not a
+    /// zero, and a published zero is not unset.
+    #[test]
+    fn published_gauge_separates_unwritten_from_zero() {
+        let gauge = PublishedGauge::unset();
+        assert_eq!(gauge.get(), None);
+        gauge.publish(0);
+        assert_eq!(gauge.get(), Some(0));
+        gauge.publish(9_876_543_210);
+        assert_eq!(gauge.get(), Some(9_876_543_210));
+    }
+
     /// Pins the serialized key set empirically rather than trusting what
     /// `rename_all = "camelCase"` is assumed to produce, and keeps
     /// `chainHeaderEstimateBytes` from returning — including as an alias. It
@@ -2334,6 +2425,28 @@ mod tests {
             keys
         }
 
+        let everything = test_state_with_cache(Some(1), Some(2), Some(3));
+        everything.prover_modified_nodes_bytes.publish(4);
+        everything.prover_resident_nodes_bytes.publish(5);
+        everything.sync_window_bytes.publish(6);
+        assert_eq!(
+            sorted_keys(&debug_memory_components_of(everything)),
+            [
+                "chainHeaderCacheBytes",
+                "chainHeaderCount",
+                "chainIndexBytes",
+                "chainScoreCacheBytes",
+                "mempoolTxCount",
+                "proverModifiedNodesBytes",
+                "proverResidentNodesBytes",
+                "stateCacheBytes",
+                "storeCacheBytes",
+                "storeCacheEvictions",
+                "syncWindowBytes",
+            ],
+            "component key set must match facts/openapi.yaml § ComponentMemory"
+        );
+
         assert_eq!(
             sorted_keys(&debug_memory_components_of(test_state_with_cache(
                 Some(1),
@@ -2350,7 +2463,7 @@ mod tests {
                 "storeCacheBytes",
                 "storeCacheEvictions",
             ],
-            "component key set must match facts/openapi.yaml § ComponentMemory"
+            "redb stats available but nothing published: the three published keys stay out"
         );
 
         assert_eq!(
@@ -2362,7 +2475,8 @@ mod tests {
                 "chainScoreCacheBytes",
                 "mempoolTxCount",
             ],
-            "the three cache keys are the only optional ones; the rest are required"
+            "the three cache and three published keys are the only optional ones; \
+             the rest are required"
         );
     }
 
@@ -2664,7 +2778,7 @@ mod tests {
 
     use crate::{
         BlockSubmitter, NodeMeta, PeerCounts, PeerInfo, PeerRestInfo, PeerStatusSummary,
-        SnapshotInfoEntry, StoreAccess, UtxoAccess,
+        PublishedGauge, SnapshotInfoEntry, StoreAccess, UtxoAccess,
     };
     use std::sync::atomic::AtomicU32;
 
@@ -2755,6 +2869,9 @@ mod tests {
             modifier_tx: None,
             height_watch: rx,
             jemalloc_probe: None,
+            prover_modified_nodes_bytes: Arc::new(PublishedGauge::unset()),
+            prover_resident_nodes_bytes: Arc::new(PublishedGauge::unset()),
+            sync_window_bytes: Arc::new(PublishedGauge::unset()),
             stats_enabled: false,
             capture: None,
         }
@@ -2776,6 +2893,28 @@ mod tests {
         state.utxo_reader = Arc::new(EmptyUtxoReader {
             cache_bytes: state_bytes,
         });
+        state
+    }
+
+    /// `test_state` over `MemoryChain` with the published gauges written to
+    /// the given values. A `None` leaves the gauge untouched — the state a
+    /// node is in before the owning crate has measured anything, which must
+    /// omit the key rather than report a zero.
+    fn test_state_with_published(
+        prover_modified: Option<u64>,
+        prover_resident: Option<u64>,
+        sync_window: Option<u64>,
+    ) -> ApiState {
+        let state = test_state(Arc::new(MemoryChain));
+        for (gauge, value) in [
+            (&state.prover_modified_nodes_bytes, prover_modified),
+            (&state.prover_resident_nodes_bytes, prover_resident),
+            (&state.sync_window_bytes, sync_window),
+        ] {
+            if let Some(bytes) = value {
+                gauge.publish(bytes);
+            }
+        }
         state
     }
 
