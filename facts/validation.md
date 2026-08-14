@@ -259,7 +259,12 @@ structure; per-block resolution buys nothing. (`sync/`'s tracker estimate is
 cheap and stays per block — the two cadences differ deliberately.)
 
 The interval is the main crate's `PROVER_GAUGE_INTERVAL_BLOCKS`, applied in the
-post-`apply_state` hook. An earlier revision said "flush cadence", which is not
+post-`apply_state` hook, with `PROVER_GAUGE_MAX_INTERVAL` as a wall-clock
+ceiling — whichever fires first. A block count alone is a sync-shaped rule: 512
+blocks is seconds during catch-up and roughly seventeen hours at tip, where a
+gauge that updates twice a day cannot show a growth curve on exactly the node an
+operator watches. The cost that motivates the block interval does not exist at
+tip, so the two triggers never compete. An earlier revision said "flush cadence", which is not
 implementable where the publish actually happens: `sync/` calls `flush()`
 through `state_persistence()`, so the main crate's `Validator` never observes a
 flush and has no hook to hang it on. Intercepting would mean `Validator` itself

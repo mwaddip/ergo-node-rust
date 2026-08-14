@@ -206,6 +206,8 @@ struct Validator {
     prover_resident_nodes_bytes: Arc<std::sync::atomic::AtomicU64>,
     /// Applied blocks since the gauges were last written.
     blocks_since_prover_gauge: u32,
+    /// When the gauges were last written, for the at-tip fallback.
+    last_prover_gauge: std::time::Instant,
 }
 
 /// How often the prover memory gauges are recomputed, in applied blocks.
@@ -215,6 +217,19 @@ struct Validator {
 /// block (`facts/validation.md`). The structure it measures grows monotonically
 /// over hundreds of thousands of blocks, so a coarse gauge loses nothing.
 const PROVER_GAUGE_INTERVAL_BLOCKS: u32 = 512;
+
+/// Wall-clock ceiling between publishes, whichever trigger fires first.
+///
+/// The block interval alone is a sync-shaped rule: 512 blocks is seconds during
+/// catch-up and roughly seventeen HOURS at tip, where blocks arrive every two
+/// minutes. A gauge that updates twice a day cannot show a growth curve on a
+/// synced node, which is the case an operator actually watches.
+///
+/// The cost that motivated the block interval does not exist at tip — one walk
+/// per two-minute block is free — so the two triggers do not conflict: during
+/// sync the block count is reached long before this elapses, and at tip this
+/// one carries it.
+const PROVER_GAUGE_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
 // Size difference between variants is fundamental: UTXO mode carries a
 // persistent AVL+ prover (~384 bytes); digest mode doesn't (~44 bytes).
@@ -256,6 +271,7 @@ impl Validator {
             // Publish on the first applied block rather than after 512, so a
             // node that is restarted often still reports something.
             blocks_since_prover_gauge: PROVER_GAUGE_INTERVAL_BLOCKS,
+            last_prover_gauge: std::time::Instant::now(),
         }
     }
 
@@ -333,7 +349,9 @@ impl Validator {
     /// `/debug/memory` omits the fields there instead of reporting zero.
     fn publish_prover_gauges(&mut self) {
         self.blocks_since_prover_gauge = self.blocks_since_prover_gauge.saturating_add(1);
-        if self.blocks_since_prover_gauge < PROVER_GAUGE_INTERVAL_BLOCKS {
+        let due_by_blocks = self.blocks_since_prover_gauge >= PROVER_GAUGE_INTERVAL_BLOCKS;
+        let due_by_time = self.last_prover_gauge.elapsed() >= PROVER_GAUGE_MAX_INTERVAL;
+        if !due_by_blocks && !due_by_time {
             return;
         }
         let Some(estimate) = self
@@ -343,6 +361,7 @@ impl Validator {
             return;
         };
         self.blocks_since_prover_gauge = 0;
+        self.last_prover_gauge = std::time::Instant::now();
         self.prover_modified_nodes_bytes.store(
             estimate.modified_nodes_bytes,
             std::sync::atomic::Ordering::Relaxed,
