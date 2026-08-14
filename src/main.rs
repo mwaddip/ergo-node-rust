@@ -198,7 +198,23 @@ struct Validator {
     height_watch_tx: tokio::sync::watch::Sender<u32>,
     /// Mining proof pre-computation (None if mining not configured or digest mode).
     mining: Option<MiningCtx>,
+    /// AVL prover memory gauges, published every
+    /// [`PROVER_GAUGE_INTERVAL_BLOCKS`] applied blocks and read by
+    /// `/debug/memory`. Digest mode never writes them, so they stay unset and
+    /// the endpoint omits the fields — correct, digest mode has no prover.
+    prover_modified_nodes_bytes: Arc<std::sync::atomic::AtomicU64>,
+    prover_resident_nodes_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// Applied blocks since the gauges were last written.
+    blocks_since_prover_gauge: u32,
 }
+
+/// How often the prover memory gauges are recomputed, in applied blocks.
+///
+/// `prover_memory_estimate` walks the resident tree — O(resident nodes), the
+/// same order as applying a block at mainnet scale — so this must never run per
+/// block (`facts/validation.md`). The structure it measures grows monotonically
+/// over hundreds of thousands of blocks, so a coarse gauge loses nothing.
+const PROVER_GAUGE_INTERVAL_BLOCKS: u32 = 512;
 
 // Size difference between variants is fundamental: UTXO mode carries a
 // persistent AVL+ prover (~384 bytes); digest mode doesn't (~44 bytes).
@@ -219,6 +235,8 @@ impl Validator {
         block_applied_tx: tokio::sync::mpsc::Sender<Vec<ergo_validation::Transaction>>,
         height_watch_tx: tokio::sync::watch::Sender<u32>,
         mining: Option<MiningCtx>,
+        prover_modified_nodes_bytes: Arc<std::sync::atomic::AtomicU64>,
+        prover_resident_nodes_bytes: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         let h = match &inner {
             ValidatorInner::Digest(v) => v.validated_height(),
@@ -233,6 +251,11 @@ impl Validator {
             block_applied_tx,
             height_watch_tx,
             mining,
+            prover_modified_nodes_bytes,
+            prover_resident_nodes_bytes,
+            // Publish on the first applied block rather than after 512, so a
+            // node that is restarted often still reports something.
+            blocks_since_prover_gauge: PROVER_GAUGE_INTERVAL_BLOCKS,
         }
     }
 
@@ -299,6 +322,41 @@ impl Validator {
             emission_box,
             tip_height: header.height,
         });
+    }
+
+    /// Recompute and publish the prover memory gauges, at most once every
+    /// [`PROVER_GAUGE_INTERVAL_BLOCKS`] applied blocks.
+    ///
+    /// The walk is O(resident nodes), so the interval is the point — see
+    /// `facts/validation.md`. Digest mode returns `None` from
+    /// `state_persistence()` and nothing is ever written, which is why
+    /// `/debug/memory` omits the fields there instead of reporting zero.
+    fn publish_prover_gauges(&mut self) {
+        self.blocks_since_prover_gauge = self.blocks_since_prover_gauge.saturating_add(1);
+        if self.blocks_since_prover_gauge < PROVER_GAUGE_INTERVAL_BLOCKS {
+            return;
+        }
+        let Some(estimate) = self
+            .state_persistence()
+            .and_then(|p| p.prover_memory_estimate())
+        else {
+            return;
+        };
+        self.blocks_since_prover_gauge = 0;
+        self.prover_modified_nodes_bytes.store(
+            estimate.modified_nodes_bytes,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.prover_resident_nodes_bytes.store(
+            estimate.resident_nodes_bytes,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        tracing::debug!(
+            modified_nodes_bytes = estimate.modified_nodes_bytes,
+            resident_nodes_bytes = estimate.resident_nodes_bytes,
+            node_count = estimate.node_count,
+            "prover memory gauges published"
+        );
     }
 }
 
@@ -386,6 +444,8 @@ impl BlockValidator for Validator {
 
             // Pre-compute mining proofs for the next block.
             self.update_mining_proofs(header);
+
+            self.publish_prover_gauges();
         }
         result
     }
@@ -2325,6 +2385,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (block_applied_tx, block_applied_rx) =
         tokio::sync::mpsc::channel::<Vec<ergo_validation::Transaction>>(64);
     let (height_watch_tx, height_watch_rx) = tokio::sync::watch::channel(0u32);
+
+    // Memory gauges for /debug/memory. Storage is a plain Arc<AtomicU64> so one
+    // allocation serves a producer in `validation/`-via-`Validator` or `sync/`
+    // and a reader in `api/` — those crates cannot name each other's types
+    // (facts/api.md). `u64::MAX` is the never-published sentinel on both ends,
+    // which is what makes an unmeasured field an absent JSON key rather than a
+    // zero asserting an empty prover.
+    // Minted through the reader's own constructor so the sentinel has one
+    // definition at the mint site rather than two that happen to agree.
+    let unset_gauge = || ergo_api::PublishedGauge::unset().storage();
+    let prover_modified_nodes_bytes = unset_gauge();
+    let prover_resident_nodes_bytes = unset_gauge();
+    let shared_window_bytes = unset_gauge();
+
+    // `sync/` re-stamps its own `WINDOW_BYTES_UNSET` into the window gauge in
+    // `HeaderSync::new`, and that constant is defined independently of the
+    // reader's. They agree today and nothing enforces it: if they diverged, an
+    // unmeasured window would render as a ~16 EiB reading instead of an absent
+    // key — a wrong answer wearing the shape of a right one, which is the exact
+    // failure `/debug/memory` exists to avoid.
+    debug_assert!(
+        {
+            let probe = Arc::new(std::sync::atomic::AtomicU64::new(
+                ergo_sync::WINDOW_BYTES_UNSET,
+            ));
+            ergo_api::PublishedGauge::from_storage(probe)
+                .get()
+                .is_none()
+        },
+        "ergo_sync::WINDOW_BYTES_UNSET is not the sentinel PublishedGauge reads as unset"
+    );
     let mut chain_guard = chain.lock().await;
 
     let swap_reader = Arc::new(ergo_node_rust::SwappableReader::empty());
@@ -2523,6 +2614,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     block_applied_tx.clone(),
                     height_watch_tx.clone(),
                     mining_ctx,
+                    prover_modified_nodes_bytes.clone(),
+                    prover_resident_nodes_bytes.clone(),
                 ))
             } else if utxo_bootstrap {
                 // Snapshot bootstrap — validator will be created after snapshot download
@@ -2613,6 +2706,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     block_applied_tx.clone(),
                     height_watch_tx.clone(),
                     mining_ctx,
+                    prover_modified_nodes_bytes.clone(),
+                    prover_resident_nodes_bytes.clone(),
                 ))
             }
         }
@@ -2697,6 +2792,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 block_applied_tx.clone(),
                 height_watch_tx.clone(),
                 None, // mining requires UTXO mode
+                prover_modified_nodes_bytes.clone(),
+                prover_resident_nodes_bytes.clone(),
             ))
         }
 
@@ -2905,6 +3002,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sync_shared_downloaded_height,
         sync_block_request_gate,
         sync_peer_chain_tip,
+        shared_window_bytes.clone(),
         shutdown_rx,
     );
 
@@ -2952,6 +3050,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let block_applied_tx = block_applied_tx.clone();
         let snapshot_swap_reader = swap_reader.clone();
         let snapshot_chain = chain.clone();
+        let prover_modified_nodes_bytes = prover_modified_nodes_bytes.clone();
+        let prover_resident_nodes_bytes = prover_resident_nodes_bytes.clone();
         tokio::spawn(async move {
             match snapshot_rx.await {
                 Ok(snapshot_data) => {
@@ -3040,6 +3140,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         block_applied_tx.clone(),
                         height_watch_tx.clone(),
                         None, // TODO: mining ctx for snapshot bootstrap
+                        prover_modified_nodes_bytes.clone(),
+                        prover_resident_nodes_bytes.clone(),
                     );
 
                     // Publish the bootstrap snapshot height to the
@@ -3598,6 +3700,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
             validated_height: shared_validated_height.clone(),
             downloaded_height: api_downloaded_height.clone(),
+            // Memory gauges. Views over the same storage the producers write:
+            // `Validator` for the two prover figures every
+            // PROVER_GAUGE_INTERVAL_BLOCKS, `HeaderSync` for the window after
+            // each applied block. Never written = absent JSON key, so digest
+            // mode omits the prover fields rather than claiming an empty one.
+            prover_modified_nodes_bytes: Arc::new(ergo_api::PublishedGauge::from_storage(
+                prover_modified_nodes_bytes.clone(),
+            )),
+            prover_resident_nodes_bytes: Arc::new(ergo_api::PublishedGauge::from_storage(
+                prover_resident_nodes_bytes.clone(),
+            )),
+            sync_window_bytes: Arc::new(ergo_api::PublishedGauge::from_storage(
+                shared_window_bytes.clone(),
+            )),
             // Same atomic the fastsync gap decision reads — sync maintains it
             // as a monotonic max over every peer's SyncInfo. Advisory only.
             max_peer_height: peer_chain_tip.clone(),
@@ -3929,6 +4045,8 @@ mod tests {
             block_tx,
             height_tx,
             None,
+            ergo_api::PublishedGauge::unset().storage(),
+            ergo_api::PublishedGauge::unset().storage(),
         )
     }
 
