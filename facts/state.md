@@ -437,38 +437,53 @@ impl RedbAVLStorage {
 
 ## Resolver Strategy
 
-### ⚠ Resolution is one-way: reads grow the resident tree permanently (found 2026-08-14)
+### ⚠ The prover holds the ENTIRE UTXO tree in RAM (corrected 2026-08-15)
 
-`AVLTree::resolve` (`batch_node.rs:372` at fork rev `b955790`) replaces a
-`LabelOnly` child with the fully unpacked node **in place**:
+**An earlier revision of this section said reads grow the resident tree
+permanently, and named that as the cause of a node's unattributed heap. That was
+wrong and is retracted.** The mechanism it described is real in the fork; it
+simply does not fire on the path that matters, and it was never the explanation
+for the memory.
 
-```rust
-if let Some(node) = resolved_node {
-    *child = node          // LabelOnly -> full node, never reversed
-}
-```
+What is actually true: **the prover's tree is 100% resident, by construction.**
+A UTXO node starting from genesis (`src/main.rs`) builds an in-memory `AVLTree`
+and inserts the genesis boxes; every node since is created by insertion and
+stays reachable from `tree.root`. No `Node::LabelOnly` can enter that tree — the
+only constructors are `AVLTree::unpack`'s two children and the resolver's miss
+path, both reachable only from `AVLTree::resolve`, which is a no-op unless the
+child is *already* `LabelOnly`. The set starts empty and is closed under every
+operation, so it stays empty. Measured over a 689k-block genesis sync: zero
+resolver misses, zero rollbacks.
 
-**Nothing anywhere converts a resolved node back to `LabelOnly`.** Every
-construction site is either a fresh node or a resolver closure producing one
-from a digest; there is no inverse, no pruning, no eviction. The only reset is
-`BatchAVLProver::restore_root` — i.e. a rollback.
+So `resolve` having no inverse is true and irrelevant here. There is nothing to
+evict because nothing was ever resolved — the tree is in RAM because it was
+*put* there.
 
-The consequence is that **reads are what grow the prover**, not writes. A pure
-`unauthenticated_lookup` sweep with zero mutation materialises every path it
-touches and holds it for the life of the process. `update_internal` does not
-reinstall the root either, so nothing shrinks between blocks.
+**Both starting states converge on the same ceiling, the whole tree:**
 
-Scale, measured: ~192 B per internal node, ~724 B for a leaf carrying a 500 B
-box. Millions of nodes puts this in the gigabyte range — the right order for
-the 1356 MB of unattributed live heap seen on a node that had applied ~27k
-blocks, against 214 MB on a node at the same tip that had not synced. It also
-explains why the at-tip cache resize does not help: this is the prover's own
-node graph, not a redb cache, and shrinking `cache_mb` cannot touch it.
+- *Genesis sync* — starts at the ceiling, 100% resident from block 1.
+- *Resumed or rolled-back node* — `restore_root` drops to three nodes, then
+  resolution ratchets back up toward the same ceiling and never comes down.
 
-This is upstream behaviour, not something our fork introduced. Recorded here
-because it is invisible from every memory knob the node exposes: an operator
-tuning `cache_mb` down will watch RSS stay put and reasonably conclude the
-setting does nothing.
+**`proverResidentNodesBytes` therefore measures the UTXO set, not a leak.**
+`node_count` is exactly `2 × boxes − 1`: always odd, and every delta even. It
+falls when the UTXO set contracts — confirmed against consensus data the node
+cannot influence, since the last byte of `stateRoot` is the AVL height, and that
+height fell 20 → 16 between h=205,440 and h=247,000, exactly where the gauge
+dropped 54.5 MB → 5.3 MB. An AVL height only falls on deletion, and height 16
+caps the tree at 65,536 leaves.
+
+Cost: roughly **500 B of RAM per UTXO box** carrying ~86 B of box data — 160 B
+per node (`RcBox` + `Node`), two nodes per box, plus keys. At h=688k that is
+2.26 M nodes / 568 MB, about 28% of live heap. It grows with the UTXO set, which
+grows with chain history. Bounded, and not reassuring.
+
+⚠ **Do not "fix" this by releasing subtrees after `update_internal` commits.**
+That is not a leak fix; it is adding eviction that has never existed. The fork
+has no inverse of `resolve`, so it would have to be written, and every
+subsequent touch would pay a redb read plus `unpack` and re-materialise the same
+nodes. It is a throughput-for-memory design decision with a real cost, not a
+defect repair — and it must be measured, not assumed.
 
 ### The problem
 
