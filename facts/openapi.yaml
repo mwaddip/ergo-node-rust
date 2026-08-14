@@ -2344,6 +2344,39 @@ components:
             Cumulative `modifiers.redb` cache evictions. A rising count is the
             signal that the cache is undersized — otherwise indistinguishable
             from one that is comfortably large. OMITTED when unavailable.
+        proverModifiedNodesBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            AVL prover pending modified-node buffer, cleared on flush. OMITTED
+            — never zero — until the owning crate has published a figure; a
+            zero here asserts an empty buffer, which is a different claim from
+            an unmeasured one.
+
+            PUBLISHED, not read on demand: the prover lives inside the UTXO
+            validator, which `sync/` owns and does not share, so no request
+            path can reach it. UTXO mode only — digest mode has no prover and
+            omits all three.
+        proverResidentNodesBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            AVL prover tree nodes held resident between blocks. Same publish
+            and omission rules as `proverModifiedNodesBytes`.
+        syncWindowBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Downloaded-but-not-yet-applied block sections plus queue and
+            delivery bookkeeping in `sync/`. Same publish and omission rules.
+
+            Added with the two prover fields on 2026-08-14: a node that had
+            caught up ~27k blocks held 1356 MB of live heap — 87% — that no
+            crate could name, while a node at the same tip that had not synced
+            held 214 MB unattributed. These three exist to close that gap.
         mempoolTxCount:
           type: integer
           format: int64
