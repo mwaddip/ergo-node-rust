@@ -129,22 +129,55 @@ pub struct ApiState {
 /// a published `0` reports `Some(0)` and renders as `0`. A node that has
 /// applied no blocks must not claim an empty prover — that is the same class of
 /// falsehood as the removed `chainHeaderEstimateBytes`. The two states are kept
-/// apart by a sentinel, and [`PublishedGauge::unset`] is the only constructor,
-/// so a handle cannot exist in a state that reports zero before anything has
-/// measured it.
+/// apart by a sentinel, so a gauge cannot report zero before anything has
+/// measured it — provided its storage was minted by
+/// [`unset`](PublishedGauge::unset), which is what sets the sentinel.
+///
+/// **The gauge is a view over an `Arc<AtomicU64>`, not the owner of an
+/// atomic.** The producer lives in a crate that cannot name this type — `api/`
+/// and `sync/` do not depend on each other, and none of the crates they share
+/// is a sensible home for an observability primitive. So the storage is a plain
+/// `Arc<AtomicU64>` that the main crate allocates once and hands to both ends:
+/// the producer publishes into it, and a gauge
+/// [adopts](PublishedGauge::from_storage) the same `Arc` to read it. Two views,
+/// one allocation.
 ///
 /// See `facts/api.md` § "Component memory attribution".
-pub struct PublishedGauge(AtomicU64);
+pub struct PublishedGauge(Arc<AtomicU64>);
 
 impl PublishedGauge {
     /// Sentinel for "nothing has published yet". 16 EiB is not a byte count any
     /// structure in this process can reach; see [`PublishedGauge::publish`].
     const UNSET: u64 = u64::MAX;
 
-    /// A gauge nothing has published to. Reports `None` until
-    /// [`publish`](PublishedGauge::publish) is called.
-    pub const fn unset() -> Self {
-        Self(AtomicU64::new(Self::UNSET))
+    /// A gauge over freshly allocated storage nothing has published to. Reports
+    /// `None` until [`publish`](PublishedGauge::publish) is called.
+    ///
+    /// This is also how the shared storage gets minted. The sentinel is
+    /// private, so an `Arc<AtomicU64>` allocated anywhere else starts at `0`
+    /// and reads as a published zero. Allocate here, then hand
+    /// [`storage`](PublishedGauge::storage) to the producer.
+    pub fn unset() -> Self {
+        Self(Arc::new(AtomicU64::new(Self::UNSET)))
+    }
+
+    /// A gauge over storage that already exists — the reading end of an `Arc`
+    /// whose writing end is a producer in another crate.
+    ///
+    /// The storage must have come from [`unset`](PublishedGauge::unset), or at
+    /// minimum have been initialised to the never-published sentinel. An
+    /// `AtomicU64::new(0)` adopted here reports `Some(0)`: a claim that
+    /// something measured an empty structure, which is precisely the falsehood
+    /// the sentinel exists to prevent.
+    pub fn from_storage(storage: Arc<AtomicU64>) -> Self {
+        Self(storage)
+    }
+
+    /// The storage this gauge reads, for handing to the producer in the crate
+    /// that owns the measured structure. Every view of one allocation sees
+    /// every [`publish`](PublishedGauge::publish) through any other.
+    pub fn storage(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.0)
     }
 
     /// Publish a freshly measured figure. Called by the owning crate after each

@@ -2407,6 +2407,36 @@ mod tests {
         assert_eq!(gauge.get(), Some(9_876_543_210));
     }
 
+    /// The property the whole design rests on: gauges over one
+    /// `Arc<AtomicU64>` are two views of one value, not two values. The
+    /// producer lives in a crate that cannot name `PublishedGauge` and writes
+    /// the raw atomic; if adopting the `Arc` ever produced a separate
+    /// allocation, `/debug/memory` would read a gauge nothing writes and omit
+    /// the field forever — indistinguishable from a producer that never ran.
+    #[test]
+    fn published_gauges_over_one_storage_share_it() {
+        // How the main crate mints it: allocate through the gauge, because the
+        // sentinel is private and a hand-rolled atomic starts at a false zero.
+        let storage = PublishedGauge::unset().storage();
+        let reader = PublishedGauge::from_storage(Arc::clone(&storage));
+        let second = PublishedGauge::from_storage(Arc::clone(&storage));
+
+        assert_eq!(reader.get(), None, "minted storage is unpublished");
+        assert_eq!(second.get(), None, "and so is every view of it");
+
+        second.publish(1_234);
+        assert_eq!(
+            reader.get(),
+            Some(1_234),
+            "a publish through one view is visible through the other"
+        );
+
+        // What `sync/` actually does — it only ever sees the atomic.
+        storage.store(4_096, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(reader.get(), Some(4_096));
+        assert_eq!(second.get(), Some(4_096));
+    }
+
     /// Pins the serialized key set empirically rather than trusting what
     /// `rename_all = "camelCase"` is assumed to produce, and keeps
     /// `chainHeaderEstimateBytes` from returning — including as an alias. It
