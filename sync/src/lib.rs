@@ -15,5 +15,5 @@ mod sweep_backoff;
 mod test_support;
 mod traits;
 
-pub use state::{HeaderSync, SyncConfig};
+pub use state::{HeaderSync, SyncConfig, SyncWindowEstimate, WINDOW_BYTES_UNSET};
 pub use traits::{SyncChain, SyncStore, SyncTransport};

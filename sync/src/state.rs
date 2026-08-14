@@ -325,6 +325,44 @@ impl Default for SyncConfig {
     }
 }
 
+/// What the sync machine's in-flight window holds right now.
+///
+/// [`crate::delivery::DeliveryTracker`] bookkeeping and nothing else — this
+/// crate holds no section payloads. See
+/// [`HeaderSync::window_memory_estimate`] for what is and is not counted, and
+/// `../facts/sync.md` § "Memory attribution".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncWindowEstimate {
+    /// Heap bytes held by [`crate::delivery::DeliveryTracker`]: its
+    /// pending-request map and its evicted-id vec. Id-keyed bookkeeping only —
+    /// downloaded sections go straight from the p2p pipeline into the modifier
+    /// store, and the validation sweep reads each block back out, applies it,
+    /// and drops it inside one loop iteration. Nothing between "downloaded"
+    /// and "applied" lives on sync's heap.
+    ///
+    /// A lower bound, by a bounded and one-directional margin: it counts the
+    /// live entries exactly and not the hash table's unused slots. See
+    /// [`crate::delivery::DeliveryTracker::memory_bytes`] for why the slack
+    /// cannot be counted honestly and how large it can get (≈2.3×).
+    pub tracker_bytes: u64,
+    /// Live entries behind that figure: in-flight requests in the pending map
+    /// plus ids in the evicted vec awaiting re-request.
+    ///
+    /// There is no separate download queue to count. `request_next_sections`
+    /// recomputes the window's missing sections into a local map on every
+    /// cycle and drops it before returning.
+    pub tracker_entries: u64,
+}
+
+/// Sentinel in the published window atomic meaning "sync has never written it".
+///
+/// Zero is a legitimate reading — an idle tracker really has allocated
+/// nothing — so absence needs a value no byte count can take. `u64::MAX` is
+/// 16 EiB. Readers MUST map this to absent rather than reporting 0, per
+/// `../facts/api.md` § "Component memory attribution": a node that has applied
+/// no blocks must not claim an empty window.
+pub const WINDOW_BYTES_UNSET: u64 = u64::MAX;
+
 /// Header chain sync state machine.
 ///
 /// Event-driven loop matching the JVM's sync exchange pattern:
@@ -382,6 +420,14 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     /// Peer's chain tip, updated on every incoming SyncInfo to the max observed.
     /// Read by the main crate to compute the bootstrap gap.
     peer_chain_tip: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Published window memory estimate, written after each applied block.
+    ///
+    /// Publish, don't expose: `sync/` owns the validator and does not share it
+    /// (`../facts/validation.md`), so no HTTP path can call
+    /// [`Self::window_memory_estimate`] synchronously. The main crate hands in
+    /// this atomic and passes a clone to the API. Holds [`WINDOW_BYTES_UNSET`]
+    /// until the first block is applied.
+    shared_window_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Height of the most recent `validator.flush()` call. Used by the
     /// memory-aware flush policy to enforce `flush_min_blocks` spacing and
     /// `flush_max_blocks` upper bound.
@@ -418,10 +464,10 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
 }
 
 impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync<T, C, S, V> {
-    // 13-arg constructor reflects the dependency-inversion surface (4 trait
-    // objects + 6 channels/atomics + 3 config-ish args). Bundling these would
-    // hide the wiring without simplifying it. A builder is reasonable future
-    // work but not justified for one caller (`src/main.rs`).
+    // 15-arg constructor reflects the dependency-inversion surface (4 trait
+    // objects + 7 channels/atomics + 3 config-ish args + shutdown). Bundling
+    // these would hide the wiring without simplifying it. A builder is
+    // reasonable future work but not justified for one caller (`src/main.rs`).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: SyncConfig,
@@ -437,12 +483,17 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         shared_downloaded_height: std::sync::Arc<std::sync::atomic::AtomicU32>,
         block_request_gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
         peer_chain_tip: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        shared_window_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
         shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> Self {
         let tracker =
             DeliveryTracker::with_config(config.delivery_timeout, config.max_delivery_checks);
         let initial_validated = validator.as_ref().map_or(0, |v| v.validated_height());
         let last_flush_height = initial_validated;
+        // Stamp "never written" here rather than trusting the caller's initial
+        // value. Whatever the host constructed the atomic with, a reader that
+        // polls before the first applied block must see absent, not zero.
+        shared_window_bytes.store(WINDOW_BYTES_UNSET, std::sync::atomic::Ordering::Relaxed);
         Self {
             config,
             transport,
@@ -467,6 +518,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             shared_downloaded_height,
             block_request_gate,
             peer_chain_tip,
+            shared_window_bytes,
             last_flush_height,
             at_tip_request_tx: None,
             at_tip_validator_rx: None,
@@ -474,6 +526,53 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             sweep_backoff: crate::sweep_backoff::SweepBackoff::default(),
             shutdown_rx,
         }
+    }
+
+    /// Bytes held by the in-flight delivery bookkeeping. `None` if not
+    /// computable.
+    ///
+    /// [`crate::delivery::DeliveryTracker`] is the whole of it: `sync/` holds
+    /// no section payloads and no persistent download queue.
+    ///
+    /// - Sections never pass through sync's heap. `ModifierResponse` is not a
+    ///   message this state machine handles at all — the p2p pipeline writes
+    ///   the bytes to the modifier store and notifies sync with ids only
+    ///   ([`crate::delivery::DeliveryData::Received`]). The validation sweep
+    ///   reads each block back out of the store, applies it, and drops it
+    ///   within one iteration of the loop in `advance_state_applied_height`.
+    ///   Downloaded-but-unapplied section bytes live in redb, and redb's cache
+    ///   is already attributed as `storeCacheBytes`.
+    /// - There is no download queue to size. `request_next_sections`
+    ///   recomputes the missing sections in the 192-block window into a local
+    ///   map every cycle and drops it before returning.
+    /// - What is left is the [`crate::delivery::DeliveryTracker`]: the
+    ///   pending-request map and the evicted-id queue, both id-keyed. Their
+    ///   footprint is counted from the live entries, so it rises when requests
+    ///   go in flight and falls as they are delivered — never derived from a
+    ///   per-block constant.
+    ///
+    /// Currently always `Some`: both structures are always present and always
+    /// measurable. The `Option` is in the contract so that a future in-flight
+    /// structure sync cannot size reports absence rather than quietly
+    /// publishing a total that omits it.
+    pub fn window_memory_estimate(&self) -> Option<SyncWindowEstimate> {
+        Some(SyncWindowEstimate {
+            tracker_bytes: self.tracker.memory_bytes(),
+            tracker_entries: (self.tracker.pending_count() + self.tracker.evicted_count()) as u64,
+        })
+    }
+
+    /// Publish the current window estimate to the shared atomic.
+    ///
+    /// Called after each applied block. Not `async` and takes `&self`: the
+    /// borrow never spans an `.await`, so the enclosing future stays `Send`
+    /// even though `V` is `!Sync`.
+    fn publish_window_estimate(&self) {
+        let bytes = self
+            .window_memory_estimate()
+            .map_or(WINDOW_BYTES_UNSET, |e| e.tracker_bytes);
+        self.shared_window_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Configure the at-tip transition. When `synced()` is first entered,
@@ -1223,6 +1322,12 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         id = %header.id,
                         "block applied"
                     );
+
+                    // Publish the window estimate after each applied block —
+                    // the cadence the contract specifies, and the one that
+                    // matters: the window is at its widest during exactly the
+                    // catch-up sync this figure exists to characterise.
+                    self.publish_window_estimate();
 
                     // Periodic catch-up record. Placed before the flush below so
                     // the heap reading is the pre-flush peak. Time-gated and
@@ -2292,6 +2397,11 @@ mod cross_db_flush_tests {
         fn resize_cache(&self, _cache_bytes: usize) -> Result<(), ValidationError> {
             unimplemented!("not called in flush-ordering tests")
         }
+
+        /// No prover behind this double, so nothing to size.
+        fn prover_memory_estimate(&self) -> Option<ergo_validation::ProverMemoryEstimate> {
+            None
+        }
     }
 
     /// Digest-mode shape: a validator that owns no persistent state. Its
@@ -2447,7 +2557,7 @@ mod shutdown_flush_tests {
     use ergo_validation::{
         ApplyStateOutcome, BlockValidator, Parameters, StatePersistence, ValidationError,
     };
-    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
     use std::sync::Mutex;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2584,6 +2694,11 @@ mod shutdown_flush_tests {
 
         fn resize_cache(&self, _cache_bytes: usize) -> Result<(), ValidationError> {
             unreachable!("not called in shutdown-flush tests")
+        }
+
+        /// No prover behind this double, so nothing to size.
+        fn prover_memory_estimate(&self) -> Option<ergo_validation::ProverMemoryEstimate> {
+            None
         }
     }
 
@@ -2725,6 +2840,7 @@ mod shutdown_flush_tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU64::new(0)),
             shutdown_rx,
         )
     }
@@ -2827,7 +2943,7 @@ mod blocks_to_keep_tests {
     use ergo_validation::{
         ApplyStateOutcome, BlockValidator, Parameters, StatePersistence, ValidationError,
     };
-    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
     use std::sync::{Arc, Mutex};
 
     /// Mock store recording prune + min_height calls in addition to the
@@ -2961,6 +3077,11 @@ mod blocks_to_keep_tests {
 
         fn resize_cache(&self, _cache_bytes: usize) -> Result<(), ValidationError> {
             unreachable!("not called in blocks_to_keep tests")
+        }
+
+        /// No prover behind this double, so nothing to size.
+        fn prover_memory_estimate(&self) -> Option<ergo_validation::ProverMemoryEstimate> {
+            None
         }
     }
 
@@ -3129,6 +3250,7 @@ mod blocks_to_keep_tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU64::new(0)),
             shutdown_rx,
         )
     }
@@ -3276,6 +3398,11 @@ mod blocks_to_keep_tests {
             fn resize_cache(&self, _cache_bytes: usize) -> Result<(), ValidationError> {
                 unreachable!()
             }
+
+            /// No prover behind this double, so nothing to size.
+            fn prover_memory_estimate(&self) -> Option<ergo_validation::ProverMemoryEstimate> {
+                None
+            }
         }
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -3303,6 +3430,7 @@ mod blocks_to_keep_tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU64::new(0)),
             shutdown_rx,
         );
 
@@ -3350,6 +3478,7 @@ mod blocks_to_keep_tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU64::new(0)),
             shutdown_rx,
         );
 
@@ -3494,7 +3623,7 @@ mod sweep_resume_tests {
     use ergo_validation::{
         ApplyStateOutcome, BlockValidator, Parameters, StatePersistence, ValidationError,
     };
-    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
     use std::sync::Arc;
     use tracing::level_filters::LevelFilter;
 
@@ -3775,13 +3904,32 @@ mod sweep_resume_tests {
     }
 
     fn build_sync_with_chain(validator: SweepValidator, chain: SweepChain) -> SweepSync {
-        build_sync_full(validator, chain, SyncConfig::default())
+        build_sync_full(
+            validator,
+            chain,
+            SyncConfig::default(),
+            Arc::new(AtomicU64::new(0)),
+        )
+    }
+
+    /// Same harness, but hands back the published window atomic so a test can
+    /// observe what the sweep wrote into it.
+    fn build_sync_with_window_sink(validator: SweepValidator) -> (SweepSync, Arc<AtomicU64>) {
+        let sink = Arc::new(AtomicU64::new(0));
+        let sync = build_sync_full(
+            validator,
+            SweepChain::unbounded(),
+            SyncConfig::default(),
+            Arc::clone(&sink),
+        );
+        (sync, sink)
     }
 
     fn build_sync_full(
         validator: SweepValidator,
         chain: SweepChain,
         config: SyncConfig,
+        window_sink: Arc<AtomicU64>,
     ) -> SweepSync {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let (_progress_tx, progress_rx) = mpsc::channel(1);
@@ -3801,6 +3949,7 @@ mod sweep_resume_tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU32::new(0)),
+            window_sink,
             shutdown_rx,
         )
     }
@@ -4205,6 +4354,107 @@ mod sweep_resume_tests {
         );
         assert_field(&output, "height", "1785500");
     }
+
+    // ---- Window memory attribution (`facts/sync.md` § "Memory attribution")
+    //
+    // These live here rather than in a module of their own because the thing
+    // under test fires after an applied block, and this is the harness that
+    // applies blocks.
+
+    #[tokio::test]
+    async fn window_estimate_tracks_the_delivery_tracker_and_falls_back_down() {
+        // The symptom under investigation is heap that only ever rises, so the
+        // figure has to be shown to come back down. It counts the tracker's
+        // live entries, so it rises as requests go in flight and falls as they
+        // are delivered.
+        let (mut sync, _sink) = build_sync_with_window_sink(SweepValidator::at(100));
+
+        let idle = sync.window_memory_estimate().expect("always computable");
+        assert_eq!(idle.tracker_bytes, 0);
+        assert_eq!(idle.tracker_entries, 0);
+
+        let ids: Vec<[u8; 32]> = (0u8..150).map(|n| [n; 32]).collect();
+        sync.tracker.mark_requested(&ids, PeerId(1), 102);
+
+        let loaded = sync.window_memory_estimate().unwrap();
+        assert_eq!(loaded.tracker_entries, 150, "150 sections in flight");
+        assert!(
+            loaded.tracker_bytes > 0,
+            "in-flight requests must report bytes"
+        );
+
+        // Fewer in flight ⇒ proportionally fewer bytes. Proves the figure is
+        // derived from the structure and not from a constant.
+        let (mut small, _) = build_sync_with_window_sink(SweepValidator::at(100));
+        small.tracker.mark_requested(&ids[..15], PeerId(1), 102);
+        let small_est = small.window_memory_estimate().unwrap();
+        assert_eq!(
+            small_est.tracker_bytes * 10,
+            loaded.tracker_bytes,
+            "15 in flight ({}) must be exactly a tenth of 150 in flight ({})",
+            small_est.tracker_bytes,
+            loaded.tracker_bytes
+        );
+
+        // Delivery drains the tracker and both fields come back down. A figure
+        // that only ever rises is measuring the wrong thing — that is the
+        // symptom under investigation.
+        for id in &ids {
+            sync.tracker.mark_received(id);
+        }
+        let drained = sync.window_memory_estimate().unwrap();
+        assert_eq!(drained.tracker_entries, 0, "the window emptied");
+        assert_eq!(
+            drained.tracker_bytes, 0,
+            "and the bytes it was holding came back"
+        );
+    }
+
+    #[tokio::test]
+    async fn window_atomic_reads_never_written_until_a_block_is_applied() {
+        let (mut sync, sink) = build_sync_with_window_sink(SweepValidator::at(2665));
+        assert_eq!(
+            sink.load(std::sync::atomic::Ordering::Relaxed),
+            WINDOW_BYTES_UNSET,
+            "constructed but nothing applied — the reader must see absent, \
+             not an assertion that the window is empty"
+        );
+
+        // A sweep that applies nothing must not stamp the atomic either.
+        sync.downloaded_height = 2665;
+        sync.advance_state_applied_height().await;
+        assert_eq!(
+            sink.load(std::sync::atomic::Ordering::Relaxed),
+            WINDOW_BYTES_UNSET,
+            "no block applied ⇒ still never-written"
+        );
+    }
+
+    #[tokio::test]
+    async fn window_atomic_is_written_after_an_applied_block() {
+        let (mut sync, sink) = build_sync_with_window_sink(SweepValidator::at(2665));
+        sync.downloaded_height = 2670;
+
+        // Put sections in flight so the published figure is non-zero and a
+        // written zero cannot be mistaken for the sentinel or the reverse.
+        let ids: Vec<[u8; 32]> = (0u8..64).map(|n| [n; 32]).collect();
+        sync.tracker.mark_requested(&ids, PeerId(1), 102);
+        let expected = sync.window_memory_estimate().unwrap().tracker_bytes;
+        assert!(expected > 0);
+
+        sync.advance_state_applied_height().await;
+
+        assert_eq!(
+            sync.validator.as_ref().unwrap().applied,
+            vec![2666, 2667, 2668, 2669, 2670],
+            "harness sanity: blocks really were applied"
+        );
+        assert_eq!(
+            sink.load(std::sync::atomic::Ordering::Relaxed),
+            expected,
+            "the estimate must be published after an applied block"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4226,7 +4476,7 @@ mod serve_continuation_tests {
     use ergo_validation::{
         ApplyStateOutcome, BlockValidator, Parameters, StatePersistence, ValidationError,
     };
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// Test chain tip. Above the 400-id continuation cap so the fresh-peer
@@ -4518,6 +4768,7 @@ mod serve_continuation_tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU64::new(0)),
             shutdown_rx,
         );
         (sync, sent)
