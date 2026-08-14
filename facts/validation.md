@@ -251,13 +251,20 @@ construction** — it cannot show a leak, and a rising value there would mean
 something is wrong with the cycle rather than with memory. Test it at the proof
 cycle, not around a flush.
 
-⚠ **Publish at flush cadence, not per block.** The estimate walks the resident
-tree, so it is O(resident nodes) — the same order as applying a block at mainnet
-scale, and publishing it per block is a measurable sync regression. `flush` is
-already the expensive checkpoint and is bounded by `flush_min_blocks` /
-`flush_max_blocks`. The figure is a slow-moving gauge of a monotonically growing
-structure; per-block resolution buys nothing. (`sync/`'s window estimate is
+⚠ **Publish on a bounded block interval, never per block.** The estimate walks
+the resident tree, so it is O(resident nodes) — the same order as applying a
+block at mainnet scale, and publishing it per block is a measurable sync
+regression. The figure is a slow-moving gauge of a monotonically growing
+structure; per-block resolution buys nothing. (`sync/`'s tracker estimate is
 cheap and stays per block — the two cadences differ deliberately.)
+
+The interval is the main crate's `PROVER_GAUGE_INTERVAL_BLOCKS`, applied in the
+post-`apply_state` hook. An earlier revision said "flush cadence", which is not
+implementable where the publish actually happens: `sync/` calls `flush()`
+through `state_persistence()`, so the main crate's `Validator` never observes a
+flush and has no hook to hang it on. Intercepting would mean `Validator` itself
+implementing `StatePersistence` to wrap the delegate — a structural change to
+the split traits for a diagnostic gauge, which is not a trade worth making.
 
 `old_top_node` is `pub(crate)` in the fork, so the previous cycle's baseline is
 not reachable and is excluded. Documented rather than estimated.
