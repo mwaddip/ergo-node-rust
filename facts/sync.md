@@ -835,17 +835,46 @@ download phase via `nipopowBootstrap`); our chain crate folds the gating into
 hold:
 
 ```rust
-/// Bytes held by downloaded-but-not-yet-applied sections, the pending
-/// queue, and delivery bookkeeping. `None` if not computable.
+/// Bytes held by in-flight delivery bookkeeping. `None` if not computable.
 pub fn window_memory_estimate(&self) -> Option<SyncWindowEstimate>;
 
 pub struct SyncWindowEstimate {
-    /// Section payloads received and awaiting application.
-    pub buffered_section_bytes: u64,
-    /// Entries in the download queue and delivery-tracking maps.
-    pub queue_entries: u64,
+    /// `DeliveryTracker`'s pending map and evicted vec. Id-keyed
+    /// bookkeeping only — see below, this crate holds no payloads.
+    pub tracker_bytes: u64,
+    /// Live entries behind that figure.
+    pub tracker_entries: u64,
 }
 ```
+
+⚠ **An earlier revision of this contract named the first field
+`buffered_section_bytes` and described it as "section payloads received and
+awaiting application". No such thing exists in this crate** — that was my
+assumption, not the architecture, and it is corrected here.
+
+**The window is cleared as a suspect for the unattributed heap.** `sync/` holds
+**zero** section payload bytes and keeps no persistent download queue.
+`ModifierResponse` is not a message this state machine handles: the P2P pipeline
+writes bytes into the modifier store and notifies sync with **ids only**. The
+sweep reads each block back out of the store, applies it, and drops it within a
+single loop iteration. Downloaded-but-unapplied section bytes therefore live in
+redb and are already attributed as `storeCacheBytes` — counting them here would
+double-count.
+
+What remains is `DeliveryTracker` alone: an id-keyed pending map plus an evicted
+vec, bounded by the 192-block window at roughly 64 B per entry — tens of
+kilobytes. It cannot be the 1356 MB. That leaves the AVL prover as the sole
+remaining suspect, which `facts/state.md` § "Resolution is one-way" then
+identified.
+
+⚠ **Size the tracker from live entry counts, never `HashMap::capacity()`.**
+`capacity()` returns items plus growth-left, and erasing only returns a slot to
+growth-left when the probe sequence permits `EMPTY` over `DELETED` — which
+depends on `RandomState`'s per-process seed. The identical workload reported
+16640 B on one run and 8320 B on the next. Count live entries and document the
+figure as a lower bound: real allocation is at most ~2.3× (power-of-two buckets,
+7/8 load factor, one control byte per slot). `Vec::capacity()` is not affected
+and is the honest figure there, since the allocation survives `clear()`.
 
 **Publish it, do not expose it.** `sync/` owns the validator and is not shared,
 so no HTTP path can call this. `HeaderSync` writes the figure into a caller-

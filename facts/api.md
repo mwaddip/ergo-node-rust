@@ -151,6 +151,24 @@ stores it in a `PublishedGauge` — the mechanism already used for
 unchanged: a gauge that has never been written reports absent, not zero, so a
 node that has applied no blocks does not claim an empty prover.
 
+⚠ **`Arc<AtomicU64>` is the interchange type; `PublishedGauge` is a view over
+one.** `api/` and `sync/` cannot name each other's types — neither depends on
+the other, and their only shared crates are `enr-p2p`, `ergo-chain-types` and
+`ergo-validation`, none of which is a sensible home for an observability
+primitive. So the *storage* is a plain `Arc<AtomicU64>` that the main crate
+allocates once and hands to both ends: the producer publishes into it, and
+`PublishedGauge` adopts the same `Arc` to read it. Two views, one allocation.
+
+`PublishedGauge` must therefore be constructible from an existing
+`Arc<AtomicU64>` and able to hand its own back. A gauge that owns its
+`AtomicU64` outright cannot be shared with a producer in another crate, which
+is the whole requirement.
+
+Both ends already agree on `u64::MAX` as the never-published sentinel and on
+`Relaxed` ordering. Relaxed is right: this is a monotonic diagnostic gauge with
+a single writer, never a synchronisation edge, and nothing downstream orders
+other reads against it.
+
 ⚠ **The two cadences differ, deliberately.** `syncWindowBytes` is cheap and
 publishes after each applied block. The prover figures walk the resident tree —
 O(resident nodes), the same order as applying a block at mainnet scale — so they

@@ -2370,13 +2370,21 @@ components:
           format: int64
           minimum: 0
           description: |
-            Downloaded-but-not-yet-applied block sections plus queue and
-            delivery bookkeeping in `sync/`. Same publish and omission rules.
+            `DeliveryTracker` bookkeeping in `sync/` — an id-keyed pending map
+            and evicted vec, bounded by the 192-block window. Same publish and
+            omission rules.
+
+            Expect tens of kilobytes, not megabytes. `sync/` holds no section
+            payloads: the P2P pipeline writes bytes to the modifier store and
+            notifies sync with ids only, so downloaded-but-unapplied bytes are
+            already counted in `storeCacheBytes`. A large figure here means the
+            tracker is leaking entries, not that the node is buffering blocks.
 
             Added with the two prover fields on 2026-08-14: a node that had
             caught up ~27k blocks held 1356 MB of live heap — 87% — that no
             crate could name, while a node at the same tip that had not synced
-            held 214 MB unattributed. These three exist to close that gap.
+            held 214 MB unattributed. These three exist to close that gap; this
+            one closed it by exoneration.
         mempoolTxCount:
           type: integer
           format: int64
