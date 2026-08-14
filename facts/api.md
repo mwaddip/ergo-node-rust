@@ -126,6 +126,35 @@ methods **without default bodies**: a default would let an implementor silently
 return a wrong value, which is structurally how `AVG_HEADER_BYTES` survived
 four months.
 
+**Extended 2026-08-14** with `proverModifiedNodesBytes`, `proverResidentNodesBytes`
+and `syncWindowBytes`.
+
+The 2026-08-12 extension attributed redb and left the rest. Measured on two
+v0.8.0 nodes at the same tip on the same machine: a node that had applied ~27k
+blocks to catch up held **2175 MB rssAnon with 1356 MB (87% of live heap)
+unattributed**, while a node already at tip held 430 MB with 214 MB
+unattributed. Same version, same height, and the catch-up node had the *shorter*
+uptime — so the growth follows block application and is not released when sync
+ends. The at-tip cache resize fires correctly and does not help, because the
+bulk was never cache: that node's caches were down to 34 MB state / 18 MB store.
+
+The suspects are the AVL prover's working set and `sync/`'s in-flight window,
+neither of which any crate reports today.
+
+⚠ **These three cannot be read synchronously, unlike every field above.** The
+prover lives inside the UTXO validator, which `sync/` owns and does not share
+(`facts/validation.md` — the validator is moved into `HeaderSync`, not wrapped
+in an `Arc<Mutex>`). The API therefore cannot call an accessor on it. They are
+**published** instead: the owning crate computes its estimate, the main crate
+stores it in a shared atomic after each applied block — the mechanism already
+used for `shared_height` — and this crate reads that atomic. The `Option`
+discipline is unchanged: an atomic that has never been written reports absent,
+not zero, so a node that has applied no blocks does not claim an empty prover.
+
+Do not "simplify" this into a direct accessor. A synchronous read would need
+either a lock on the validator on an HTTP path or an `Arc<Mutex>` around it,
+and the second was rejected on its own merits.
+
 ### State Context Lifecycle
 
 `state_context` is rebuilt whenever the validated tip advances:

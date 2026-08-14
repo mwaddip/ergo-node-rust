@@ -829,6 +829,37 @@ JVM has no light-mode analog at the section-id level (it gates the entire
 download phase via `nipopowBootstrap`); our chain crate folds the gating into
 `required_section_ids` returning empty, which keeps the sync loop unchanged.
 
+### Memory attribution (added 2026-08-14)
+
+`HeaderSync` exposes a best-effort estimate of what its in-flight structures
+hold:
+
+```rust
+/// Bytes held by downloaded-but-not-yet-applied sections, the pending
+/// queue, and delivery bookkeeping. `None` if not computable.
+pub fn window_memory_estimate(&self) -> Option<SyncWindowEstimate>;
+
+pub struct SyncWindowEstimate {
+    /// Section payloads received and awaiting application.
+    pub buffered_section_bytes: u64,
+    /// Entries in the download queue and delivery-tracking maps.
+    pub queue_entries: u64,
+}
+```
+
+**Publish it, do not expose it.** `sync/` owns the validator and is not shared,
+so no HTTP path can call this. `HeaderSync` writes the figure into a caller-
+supplied `Arc<AtomicU64>` after each applied block — the same mechanism as
+`shared_height` — and the main crate hands that atomic to the API. An atomic
+never written must read as absent rather than zero (`facts/api.md`).
+
+Motivation: 1356 MB of live heap on a caught-up node is unattributed, and the
+sliding window is one of the two structures that could hold it. Sizing this
+either implicates the window or clears it, and both outcomes are progress.
+
+Compute from the actual buffers. A per-block constant times a block count is
+the failure mode that produced a 1.48 GB phantom in `facts/api.md`.
+
 ### Download queue
 
 The sync machine maintains an internal queue of `(type_id, modifier_id)` pairs

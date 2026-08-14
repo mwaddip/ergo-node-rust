@@ -219,6 +219,40 @@ pub trait MiningState {
 | `sync/` stubs exercising flush (4) | ✅ | `Some(self)` | ✅ | — |
 | `sync/` stubs that do not (2) | ✅ | `None` | — | — |
 
+### Prover memory attribution (added 2026-08-14)
+
+`StatePersistence` gains one method — it belongs there because the prover is
+exactly the state the trait already governs:
+
+```rust
+/// Resident bytes held by the AVL prover, best-effort.
+/// `None` when a figure cannot be computed — never a fabricated zero.
+fn prover_memory_estimate(&self) -> Option<ProverMemoryEstimate>;
+
+pub struct ProverMemoryEstimate {
+    /// The pending modified-node buffer, cleared on flush.
+    pub modified_nodes_bytes: u64,
+    /// Tree nodes held resident between blocks.
+    pub resident_nodes_bytes: u64,
+    /// Node count behind the two figures above, for cross-checking a
+    /// bytes-per-node that drifts.
+    pub node_count: u64,
+}
+```
+
+Measured motivation: a v0.8.0 node that caught up ~27k blocks holds 1356 MB of
+live heap that no crate can name — 87% of the total — while a node at the same
+tip that did not sync holds 214 MB unattributed. The prover is the prime
+suspect and reports nothing today.
+
+**Compute from the real structures, do not derive from a constant.** A
+bytes-per-node multiplier is precisely how `AVG_HEADER_BYTES` reported 1.48 GB
+for a `Vec` that no longer existed (`facts/api.md`). If only a node count is
+obtainable, return the count and omit the byte fields rather than multiplying.
+
+`DigestValidator` does not implement `StatePersistence` at all, so digest mode
+reports absent — which is correct, it has no prover.
+
 ### How callers reach the split traits
 
 **Two different mechanisms, because the two consumers differ.**
