@@ -20,8 +20,8 @@ use crate::state_changes::{compute_state_changes, transactions_to_summaries};
 use crate::tx_validation;
 use crate::voting;
 use crate::{
-    ApplyStateOutcome, BlockValidator, MiningState, ScriptEvalInputs, StatePersistence,
-    ValidationError,
+    ApplyStateOutcome, BlockValidator, MiningState, ProverMemoryEstimate, ScriptEvalInputs,
+    StatePersistence, ValidationError,
 };
 
 /// UTXO-mode block validator.
@@ -213,6 +213,12 @@ impl StatePersistence for UtxoValidator {
     fn resize_cache(&self, cache_bytes: usize) -> Result<(), ValidationError> {
         self.storage.resize_cache(cache_bytes);
         Ok(())
+    }
+
+    /// Measured from the live prover — see [`ProverMemoryEstimate`] for what
+    /// each figure covers and which way each one is wrong.
+    fn prover_memory_estimate(&self) -> Option<ProverMemoryEstimate> {
+        crate::prover_memory::estimate(&self.prover)
     }
 }
 
@@ -971,6 +977,206 @@ mod tests {
             prover_digest(&validator),
             before,
             "computing mining proofs moved the validator's own prover"
+        );
+    }
+
+    // ── Prover memory attribution ────────────────────────────────────────
+    //
+    // These read `validator.prover` through `prover_memory_estimate`, so they
+    // belong in here for the same reason the rewind tests do: from outside the
+    // crate the in-memory tree is invisible, and a test that cannot see it
+    // cannot fail.
+
+    fn estimate(validator: &UtxoValidator) -> ProverMemoryEstimate {
+        validator
+            .prover_memory_estimate()
+            .expect("a prover with a root always has something to measure")
+    }
+
+    /// The literal ask: a validator that has applied a block names a tree.
+    /// The bytes floor is what separates a measurement from a placeholder —
+    /// every counted node is at least one `Rc<RefCell<Node>>` allocation, so a
+    /// figure that satisfies this cannot have been a `node_count` with the
+    /// bytes stubbed out.
+    #[test]
+    fn a_validator_that_applied_a_block_reports_a_resident_tree() {
+        let input = make_box(true, 6);
+        let tx = spend_tx(std::slice::from_ref(&input));
+        let ops = block_operations(std::slice::from_ref(&tx));
+        let (state_root, ad_root) = oracle(std::slice::from_ref(&input), &ops);
+        let block = Block::new(std::slice::from_ref(&tx), state_root, ad_root);
+
+        let (mut validator, _dir) = seeded_validator(std::slice::from_ref(&input));
+        block.apply(&mut validator).expect("valid block applies");
+
+        let measured = estimate(&validator);
+        assert!(
+            measured.node_count > 0,
+            "an applied block left no resident nodes"
+        );
+        assert!(
+            measured.resident_nodes_bytes
+                >= measured.node_count * crate::prover_memory::node_allocation_bytes(),
+            "{} bytes across {} nodes is below one allocation per node",
+            measured.resident_nodes_bytes,
+            measured.node_count
+        );
+    }
+
+    /// The estimate must be a measurement, not a multiplier. Two validators
+    /// differing only in how much state they hold must report two different
+    /// answers, and both figures must move together. `AVG_HEADER_BYTES`
+    /// (`facts/api.md`) passed every test anyone wrote for four months because
+    /// nobody made it answer a question whose answer it could get wrong.
+    #[test]
+    fn the_estimate_follows_the_tree_it_is_measuring() {
+        let few: Vec<ErgoBox> = (100u8..102).map(|s| make_box(true, s)).collect();
+        let many: Vec<ErgoBox> = (110u8..134).map(|s| make_box(true, s)).collect();
+
+        let (small, _small_dir) = seeded_validator(&few);
+        let (large, _large_dir) = seeded_validator(&many);
+
+        let small = estimate(&small);
+        let large = estimate(&large);
+
+        assert!(
+            large.node_count > small.node_count,
+            "twelve times the boxes, {} nodes against {} — the walk is not \
+             seeing the tree",
+            large.node_count,
+            small.node_count
+        );
+        assert!(
+            large.resident_nodes_bytes > small.resident_nodes_bytes,
+            "node_count moved and bytes did not: {} against {}",
+            large.resident_nodes_bytes,
+            small.resident_nodes_bytes
+        );
+    }
+
+    /// Two claims at once, and the second is the dangerous one.
+    ///
+    /// `reset_to` reinstalls the root unpacked from storage — one internal
+    /// node and two `LabelOnly` children — so a walk that resolved would
+    /// report the whole tree here instead of three nodes, having just pulled
+    /// the entire UTXO set into RAM in order to measure it. That is the
+    /// failure this asserts against.
+    ///
+    /// What it demonstrates: nothing here mutates state. Reads alone resolve
+    /// nodes in place and the resident tree grows permanently, which is the
+    /// mechanism behind the unattributed heap being hunted.
+    #[test]
+    fn resolving_from_storage_grows_the_resident_tree() {
+        let boxes: Vec<ErgoBox> = (140u8..164).map(|s| make_box(true, s)).collect();
+        let (mut validator, _dir) = seeded_validator(&boxes);
+
+        let seeded = estimate(&validator);
+        let digest = prover_digest(&validator);
+
+        validator
+            .reset_to(SEED_HEIGHT, digest)
+            .expect("rollback to the version storage is already at");
+        let frontier = estimate(&validator);
+        assert!(
+            frontier.node_count < seeded.node_count,
+            "the frontier reports {} of {} nodes — the walk is resolving \
+             LabelOnly children from storage",
+            frontier.node_count,
+            seeded.node_count
+        );
+
+        // The frontier is a structure small enough to state exactly, which is
+        // what pins the payload accounting: `unpack` builds one internal node
+        // carrying a 32-byte key and two `LabelOnly` children carrying none.
+        // A `node_count × constant` — the `AVG_HEADER_BYTES` shape — cannot
+        // land on this by construction.
+        assert_eq!(
+            frontier.node_count, 3,
+            "an unpacked root is one internal node and two labels"
+        );
+        assert_eq!(
+            frontier.resident_nodes_bytes,
+            3 * crate::prover_memory::node_allocation_bytes() + KEY_LEN as u64,
+            "three allocations plus one key is the whole frontier; this figure \
+             is not counting what the nodes actually own"
+        );
+
+        for ergo_box in &boxes {
+            let key = Bytes::copy_from_slice(&box_key(ergo_box));
+            assert!(
+                validator.prover.unauthenticated_lookup(&key).is_some(),
+                "a seeded box is missing from the tree"
+            );
+        }
+
+        let resolved = estimate(&validator);
+        assert!(
+            resolved.node_count > frontier.node_count,
+            "resolving every leaf left the node count at {}",
+            resolved.node_count
+        );
+        assert!(
+            resolved.resident_nodes_bytes > frontier.resident_nodes_bytes,
+            "node_count grew and bytes did not: {} against {}",
+            resolved.resident_nodes_bytes,
+            frontier.resident_nodes_bytes
+        );
+    }
+
+    /// `modified_nodes_bytes` must read the live buffers rather than report a
+    /// fixed shape.
+    ///
+    /// ⚠ The contract calls that buffer "cleared on flush"
+    /// (`facts/validation.md`). It is not: `StatePersistence::flush` is redb's
+    /// fsync and never touches the prover. The clear is the *proof-cycle*
+    /// boundary — `generate_proof()` for all three buffers, plus
+    /// `update_internal` for the two `Vec`s — and both of those sit inside
+    /// `apply_state`. So this drives that seam directly; going through a
+    /// completed `apply_state` would sample only after the clear and leave
+    /// nothing to observe.
+    #[test]
+    fn the_cycle_buffers_are_measured_and_released() {
+        let boxes: Vec<ErgoBox> = (170u8..178).map(|s| make_box(true, s)).collect();
+        let (mut validator, _dir) = seeded_validator(&boxes);
+
+        let idle = estimate(&validator);
+
+        // Mid-cycle: operations performed, no proof generated yet — where an
+        // `apply_state` sits between applying its operations and step 8.
+        for ergo_box in &boxes {
+            validator
+                .prover
+                .perform_one_operation(&Operation::Lookup(Bytes::copy_from_slice(&box_key(
+                    ergo_box,
+                ))))
+                .expect("lookup of a seeded box");
+        }
+        let mid_cycle = estimate(&validator);
+        assert!(
+            mid_cycle.modified_nodes_bytes > idle.modified_nodes_bytes,
+            "the touched nodes did not register: {} against an idle {}",
+            mid_cycle.modified_nodes_bytes,
+            idle.modified_nodes_bytes
+        );
+
+        let _ = validator.prover.generate_proof();
+        let released = estimate(&validator);
+        assert!(
+            released.modified_nodes_bytes < mid_cycle.modified_nodes_bytes,
+            "the figure did not move across the clear — it is measuring \
+             something other than the buffers"
+        );
+        assert_eq!(
+            released.modified_nodes_bytes, idle.modified_nodes_bytes,
+            "the cycle ended but the figure did not return to idle"
+        );
+
+        // The tree itself is untouched by a lookup, so the *other* figure must
+        // not have moved. If it did, the two are not separated and summing
+        // them at the endpoint would double-count.
+        assert_eq!(
+            released.resident_nodes_bytes, idle.resident_nodes_bytes,
+            "lookups changed the resident figure"
         );
     }
 }

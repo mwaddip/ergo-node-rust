@@ -1,4 +1,5 @@
 mod digest;
+mod prover_memory;
 mod sections;
 mod state_changes;
 #[cfg(test)]
@@ -12,6 +13,7 @@ use std::collections::HashMap;
 use ergo_chain_types::{ADDigest, Header};
 
 pub use digest::DigestValidator;
+pub use prover_memory::ProverMemoryEstimate;
 pub use sections::{
     parse_block_transactions, parse_extension, serialize_ad_proofs, serialize_block_transactions,
     serialize_extension, ExtensionField, ParsedAdProofs, ParsedBlockTransactions, ParsedExtension,
@@ -175,6 +177,26 @@ pub trait StatePersistence {
     /// ⚠ Read cache only. `stateCacheBytes` covers read + write, so a 64 MB
     /// resize gives roughly a 128 MB envelope, not 64.
     fn resize_cache(&self, cache_bytes: usize) -> Result<(), ValidationError>;
+
+    /// Resident bytes held by the AVL prover, best-effort.
+    /// `None` when a figure cannot be computed — never a fabricated zero.
+    ///
+    /// It belongs on this trait because the prover *is* the state this trait
+    /// already governs, and because [`DigestValidator`] does not implement the
+    /// trait at all: digest mode therefore reports absent, which is correct —
+    /// it has no prover.
+    ///
+    /// REQUIRED — no default body, matching the cache accessors. A default
+    /// would let an implementor silently return a wrong value, which is
+    /// structurally how `AVG_HEADER_BYTES` survived four months of reporting
+    /// 1.48 GB for a `Vec` that no longer existed (`facts/api.md`).
+    ///
+    /// ⚠ **O(resident nodes).** The figure is walked, not multiplied, so the
+    /// call costs a full traversal of the materialised tree — on a synced
+    /// mainnet node, the same order as applying a block. Sample it on a flush
+    /// cadence or every N blocks; not per block, and never from an HTTP
+    /// handler.
+    fn prover_memory_estimate(&self) -> Option<ProverMemoryEstimate>;
 }
 
 /// Mining support. Implemented by [`UtxoValidator`] only — candidate assembly

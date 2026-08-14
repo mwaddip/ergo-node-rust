@@ -230,15 +230,37 @@ exactly the state the trait already governs:
 fn prover_memory_estimate(&self) -> Option<ProverMemoryEstimate>;
 
 pub struct ProverMemoryEstimate {
-    /// The pending modified-node buffer, cleared on flush.
+    /// All THREE per-proof-cycle buffers: `modified_nodes` and both
+    /// `changed_nodes` Vecs. Same lifecycle, same purpose — reporting one of
+    /// three would be the omission this endpoint exists to prevent.
     pub modified_nodes_bytes: u64,
-    /// Tree nodes held resident between blocks.
+    /// Tree nodes held resident between blocks. The figure that matters.
     pub resident_nodes_bytes: u64,
     /// Node count behind the two figures above, for cross-checking a
     /// bytes-per-node that drifts.
     pub node_count: u64,
 }
 ```
+
+⚠ **The buffers are NOT cleared on flush** — an earlier revision of this
+contract said so and was wrong. `StatePersistence::flush` is a redb fsync and
+never touches the prover. The clear happens at the proof-cycle boundary inside
+`apply_state`: `generate_proof` clears all three, `update_internal` the two
+Vecs. So `modified_nodes_bytes` sampled between blocks reads its idle floor **by
+construction** — it cannot show a leak, and a rising value there would mean
+something is wrong with the cycle rather than with memory. Test it at the proof
+cycle, not around a flush.
+
+⚠ **Publish at flush cadence, not per block.** The estimate walks the resident
+tree, so it is O(resident nodes) — the same order as applying a block at mainnet
+scale, and publishing it per block is a measurable sync regression. `flush` is
+already the expensive checkpoint and is bounded by `flush_min_blocks` /
+`flush_max_blocks`. The figure is a slow-moving gauge of a monotonically growing
+structure; per-block resolution buys nothing. (`sync/`'s window estimate is
+cheap and stays per block — the two cadences differ deliberately.)
+
+`old_top_node` is `pub(crate)` in the fork, so the previous cycle's baseline is
+not reachable and is excluded. Documented rather than estimated.
 
 Measured motivation: a v0.8.0 node that caught up ~27k blocks holds 1356 MB of
 live heap that no crate can name — 87% of the total — while a node at the same

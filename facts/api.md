@@ -146,10 +146,18 @@ prover lives inside the UTXO validator, which `sync/` owns and does not share
 (`facts/validation.md` — the validator is moved into `HeaderSync`, not wrapped
 in an `Arc<Mutex>`). The API therefore cannot call an accessor on it. They are
 **published** instead: the owning crate computes its estimate, the main crate
-stores it in a shared atomic after each applied block — the mechanism already
-used for `shared_height` — and this crate reads that atomic. The `Option`
-discipline is unchanged: an atomic that has never been written reports absent,
-not zero, so a node that has applied no blocks does not claim an empty prover.
+stores it in a `PublishedGauge` — the mechanism already used for
+`shared_height` — and this crate reads that. The `Option` discipline is
+unchanged: a gauge that has never been written reports absent, not zero, so a
+node that has applied no blocks does not claim an empty prover.
+
+⚠ **The two cadences differ, deliberately.** `syncWindowBytes` is cheap and
+publishes after each applied block. The prover figures walk the resident tree —
+O(resident nodes), the same order as applying a block at mainnet scale — so they
+publish at **flush cadence**. Per-block publication there is a measurable sync
+regression for no benefit: the structure grows monotonically, so a slow gauge
+loses nothing. Do not "make it consistent" by moving the prover onto the
+per-block path.
 
 Do not "simplify" this into a direct accessor. A synchronous read would need
 either a lock on the validator on an HTTP path or an `Arc<Mutex>` around it,

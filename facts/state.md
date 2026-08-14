@@ -437,6 +437,39 @@ impl RedbAVLStorage {
 
 ## Resolver Strategy
 
+### ⚠ Resolution is one-way: reads grow the resident tree permanently (found 2026-08-14)
+
+`AVLTree::resolve` (`batch_node.rs:372` at fork rev `b955790`) replaces a
+`LabelOnly` child with the fully unpacked node **in place**:
+
+```rust
+if let Some(node) = resolved_node {
+    *child = node          // LabelOnly -> full node, never reversed
+}
+```
+
+**Nothing anywhere converts a resolved node back to `LabelOnly`.** Every
+construction site is either a fresh node or a resolver closure producing one
+from a digest; there is no inverse, no pruning, no eviction. The only reset is
+`BatchAVLProver::restore_root` — i.e. a rollback.
+
+The consequence is that **reads are what grow the prover**, not writes. A pure
+`unauthenticated_lookup` sweep with zero mutation materialises every path it
+touches and holds it for the life of the process. `update_internal` does not
+reinstall the root either, so nothing shrinks between blocks.
+
+Scale, measured: ~192 B per internal node, ~724 B for a leaf carrying a 500 B
+box. Millions of nodes puts this in the gigabyte range — the right order for
+the 1356 MB of unattributed live heap seen on a node that had applied ~27k
+blocks, against 214 MB on a node at the same tip that had not synced. It also
+explains why the at-tip cache resize does not help: this is the prover's own
+node graph, not a redb cache, and shrinking `cache_mb` cannot touch it.
+
+This is upstream behaviour, not something our fork introduced. Recorded here
+because it is invisible from every memory knob the node exposes: an operator
+tuning `cache_mb` down will watch RSS stay put and reasonably conclude the
+setting does nothing.
+
 ### The problem
 
 `ergo_avltree_rust` defines `Resolver = fn(&Digest32) -> Node` — a bare
