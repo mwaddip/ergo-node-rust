@@ -151,6 +151,54 @@ which is a known and measured cost.
 minutes, and a restart picks up the drift. A periodic re-derive trades a real
 churn risk for an imperceptible gain.
 
+## Startup floor
+
+A ceiling below which a UTXO node will not run at all, checked once at startup
+after the budget is resolved and before anything is opened.
+
+```
+ceiling < 3 GiB   and state_type == "utxo"   → refuse to start
+ceiling < 4 GiB                              → warn: below the recommended minimum
+usable  < 3.02 GB                            → warn: derived budget is under the measured cold-sync peak
+```
+
+**Refusal keys on `ceiling_bytes`, not `MemAvailable`.** `MemAvailable`
+fluctuates with page cache, so keying on it makes startup nondeterministic — a
+node that came up at boot would refuse after a busy hour, for a reason the
+operator cannot see and did not cause. The ceiling is what the node is *allowed*,
+is already computed, and is the same number derivation spends.
+
+⚠ **The refusal is UTXO-mode only.** 4 GiB is a UTXO-mode figure — that is where
+the AVL prover tree lives. `digest` uses the verifier rather than the persistent
+prover and `light` holds no tree at all, so refusing them on a small box would
+block the one mode that box should be running. They warn and continue.
+
+⚠ **Ceiling and usable diverge by source, and the gap is the point of the second
+warning.** A 4 GiB box with no cgroup resolves to `MemTotal` → 50% → **2 GiB
+usable**, which is below the 3.02 GB cold-sync peak. It passes the ceiling check
+and is still the configuration most likely to struggle. The warning must say the
+actionable thing: setting `MemoryMax` or `memory_budget_mb` moves the source to
+cgroup or explicit and the fraction from 50% to 90% or 100% — the *same RAM*,
+honestly declared, buys ~40% more budget.
+
+The evidence for 3 GiB being survivable at all is a cgroup one:
+`cg_anon` peaked at **2.47 GB against a 3 GiB ceiling** across **831k blocks
+with zero OOM kills**. That is 90% of 3 GiB — 2.7 GB usable. Bare `MemTotal` of
+3 GiB gives 1.5 GB and is not the same machine. **Do not cite the 831k-block run
+as evidence that 3 GB of RAM is enough; it is evidence that a 3 GiB _stated
+budget_ is enough.**
+
+**Escape hatch: `[node] ignore_memory_floor = true`.** Downgrades the refusal to
+a warning. A rule-of-thumb floor is exactly the kind of thing a competent
+operator has a real reason to cross — a pruned node, a mode we have not measured,
+a box we are wrong about — and a check with no override turns our estimate into
+their outage. It is deliberately a config key rather than a flag: it survives a
+restart, it is greppable, and the startup log states when it is set.
+
+This is a **precondition, not a limiter** — see the non-goal below. It refuses to
+begin work it cannot finish; it does not cap, shrink, or police anything once
+running.
+
 ## Observability
 
 Derivation MUST be logged at startup at INFO, as a parseable journal event, with
@@ -165,7 +213,10 @@ alone, without reading this document.
 
 - **Not a memory limiter.** Derivation sizes caches and flush thresholds; it
   does not enforce a ceiling, and cannot prevent an OOM caused by something it
-  does not size.
+  does not size. The startup floor above is not an exception: it is a
+  precondition checked once, before any work begins. Nothing observes memory
+  after startup, and a node that passes the floor and then grows past its
+  budget is still killed by the kernel exactly as before.
 - **Not adaptive under pressure.** The node does not shrink caches in response
   to memory pressure. That is a larger design and is not this.
 - **Does not size `blocks_to_keep`.** Retention is the biggest lever on at-tip
