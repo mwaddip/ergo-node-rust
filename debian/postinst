@@ -1,8 +1,159 @@
 #!/bin/sh
 set -e
 
+. /usr/share/debconf/confmodule
+
+CONFD=/etc/ergo-node/conf.d
+DEFAULTS=/usr/share/ergo-node-rust/defaults
+
+# Escape a value for a TOML basic string. Operator input reaches these fields,
+# and an unescaped quote would produce a config the node cannot parse — which
+# on a fresh install looks like the package being broken.
+toml_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# ⚠ debconf returns a multiselect as "A, B, C" — comma AND space. Matching on
+# the comma alone silently honours only the FIRST selected topic and drops
+# every other one, with no error and a plausible-looking config file. Strip
+# spaces from both sides before comparing.
+topic_selected() {
+    _have=$(printf '%s' "$TOPICS" | tr -d ' ')
+    _want=$(printf '%s' "$1" | tr -d ' ')
+    case ",$_have," in
+        *",$_want,"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+write_generated_config() {
+    db_get ergo-node-rust/network || true
+    NETWORK="${RET:-mainnet}"
+    db_get ergo-node-rust/topics || true
+    TOPICS="$RET"
+
+    mkdir -p "$CONFD"
+
+    # ── 00-defaults.toml ────────────────────────────────────────────────
+    #
+    # Copied fresh on every configure, deliberately: that is what lets a
+    # corrected seed-peer list reach existing installs. Not a conffile, so
+    # dpkg has no opinion and there is no confold/confnew prompt.
+    if [ -f "$DEFAULTS/$NETWORK.toml" ]; then
+        cp "$DEFAULTS/$NETWORK.toml" "$CONFD/00-defaults.toml"
+    else
+        echo "ergo-node-rust: WARNING — $DEFAULTS/$NETWORK.toml is missing;" >&2
+        echo "  no package defaults were installed. The node will fall back to" >&2
+        echo "  its built-in defaults, which may not match your network." >&2
+    fi
+
+    # ── 50-debconf.toml ─────────────────────────────────────────────────
+    #
+    # ⚠ Only keys with a real answer are written. An unchecked topic must
+    # leave NOTHING behind, because for most of these settings the node's
+    # absent-means-derive behaviour is better than any number we could write:
+    # writing memory_budget_mb "helpfully" would switch derivation off.
+    {
+        echo "# Ergo Node Rust — generated from debconf answers."
+        echo "#"
+        echo "# ⚠ DO NOT EDIT. Rewritten on every package upgrade and on every"
+        echo "# 'dpkg-reconfigure ergo-node-rust'. Your edits will be lost."
+        echo "#"
+        echo "# To change these, either re-run:"
+        echo "#     sudo dpkg-reconfigure ergo-node-rust"
+        echo "# or put your value in 99-local.toml, which is yours and which"
+        echo "# wins over this file (conf.d is merged in lexical order)."
+        echo ""
+        echo "[node]"
+
+        # data_dir is always written: the package's location differs from the
+        # binary's in-pwd default, so leaving it out would put chain data in
+        # whatever directory systemd happened to start the node from.
+        db_get ergo-node-rust/data_dir || true
+        DATA_DIR="${RET:-/var/lib/ergo-node/data}"
+        echo "data_dir = \"$(toml_escape "$DATA_DIR")\""
+
+        if topic_selected "Node type"; then
+            db_get ergo-node-rust/state_type || true
+            [ -n "$RET" ] && echo "state_type = \"$(toml_escape "$RET")\""
+            db_get ergo-node-rust/blocks_to_keep || true
+            if [ -n "$RET" ] && [ "$RET" -eq "$RET" ] 2>/dev/null; then
+                echo "blocks_to_keep = $RET"
+            fi
+        fi
+
+        if topic_selected "Interfaces"; then
+            db_get ergo-node-rust/api_address || true
+            [ -n "$RET" ] && echo "api_address = \"$(toml_escape "$RET")\""
+        fi
+
+        if topic_selected "Bootstrap"; then
+            db_get ergo-node-rust/fastsync || true
+            [ -n "$RET" ] && echo "fastsync = $RET"
+        fi
+
+        # Blank is the recommended answer and means "derive at runtime", so a
+        # blank must write nothing at all rather than a zero or a guess.
+        if topic_selected "Memory"; then
+            db_get ergo-node-rust/memory_budget_mb || true
+            if [ -n "$RET" ] && [ "$RET" -eq "$RET" ] 2>/dev/null; then
+                echo "memory_budget_mb = $RET"
+            fi
+        fi
+
+        if topic_selected "Mining"; then
+            db_get ergo-node-rust/miner_pk || true
+            if [ -n "$RET" ]; then
+                echo ""
+                echo "[node.mining]"
+                echo "miner_pk = \"$(toml_escape "$RET")\""
+            fi
+        fi
+
+        if topic_selected "Interfaces"; then
+            db_get ergo-node-rust/listen_port || true
+            LISTEN_PORT="$RET"
+            db_get ergo-node-rust/max_inbound || true
+            MAX_INBOUND="$RET"
+            if [ -n "$LISTEN_PORT" ] || [ -n "$MAX_INBOUND" ]; then
+                echo ""
+                echo "[listen.ipv6]"
+                [ -n "$LISTEN_PORT" ] && echo "address = \"[::]:$LISTEN_PORT\""
+                if [ -n "$MAX_INBOUND" ] && [ "$MAX_INBOUND" -eq "$MAX_INBOUND" ] 2>/dev/null; then
+                    echo "max_inbound = $MAX_INBOUND"
+                fi
+            fi
+        fi
+
+        # seed_peers_add APPENDS to the shipped list rather than replacing it.
+        # A bare `seed_peers` here would discard every package default, which
+        # is not what "additional seed peers" asked for.
+        if topic_selected "Peers"; then
+            db_get ergo-node-rust/seed_peers_add || true
+            if [ -n "$RET" ]; then
+                echo ""
+                echo "[outbound]"
+                printf 'seed_peers_add = ['
+                # ⚠ printf '%s\n', not '%s'. Without the trailing newline the
+                # last field has no line terminator, `read` returns non-zero
+                # on it, and the loop exits BEFORE emitting it — silently
+                # dropping the final peer from every list.
+                printf '%s\n' "$RET" | tr ',' '\n' | while read -r peer; do
+                    peer=$(printf '%s' "$peer" | tr -d '[:space:]')
+                    [ -n "$peer" ] && printf '"%s", ' "$(toml_escape "$peer")"
+                done
+                echo ']'
+            fi
+        fi
+    } > "$CONFD/50-debconf.toml"
+
+    chmod 0644 "$CONFD/00-defaults.toml" "$CONFD/50-debconf.toml" 2>/dev/null || true
+}
+
 case "$1" in
     configure|reconfigure)
+        write_generated_config
+
         # Stop and disable old proxy if it was running
         if systemctl is-active --quiet ergo-proxy-node 2>/dev/null; then
             systemctl stop ergo-proxy-node 2>/dev/null || true
@@ -48,3 +199,7 @@ case "$1" in
         fi
         ;;
 esac
+
+#DEBHELPER#
+
+exit 0

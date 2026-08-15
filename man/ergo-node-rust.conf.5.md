@@ -6,14 +6,55 @@
 
 # SYNOPSIS
 
+**/etc/ergo-node/conf.d/**\*.toml
+
 **/etc/ergo-node/ergo.toml**
 
 # DESCRIPTION
 
 The ergo-node-rust daemon reads its configuration from a TOML file passed
-as its sole positional argument. The Debian package installs a default at
-**/etc/ergo-node/ergo.toml** and the systemd unit invokes the daemon with
-that path.
+as its sole positional argument, or — with no argument — from the first of
+**./ergo.toml**, **~/.config/ergo-node/ergo.toml**, or
+**/etc/ergo-node/ergo.toml** that exists.
+
+A **conf.d** directory beside the file that won is then layered on top of
+it, and either half may stand alone: a single file with no **conf.d**, or a
+**conf.d** with no base file. The Debian package produces the latter, and
+its systemd unit invokes the daemon with no path at all.
+
+## Layering
+
+Files in **conf.d** are read in lexical filename order, each merged onto the
+result so far. A file that needs to win names itself later.
+
+**00-defaults.toml**
+:   Package-owned per-network defaults, copied from
+    **/usr/share/ergo-node-rust/defaults/**. Replaced on every upgrade, so
+    corrections to the shipped seed-peer list actually reach you. Do not edit.
+
+**50-debconf.toml**
+:   Generated from your answers to **dpkg-reconfigure ergo-node-rust**.
+    Rewritten on every upgrade and reconfigure. Do not edit.
+
+**99-local.toml**
+:   Yours. The package never writes it, with one exception: an upgrade from a
+    version that used **/etc/ergo-node/ergo.toml** moves that file here, once,
+    and only when nothing is there already.
+
+Put your changes in **99-local.toml**. Edits to the other two are lost on the
+next upgrade.
+
+The merge is per key, not per file: setting **max_peers** in a later file does
+not drop **seed_peers** from the same section. An array in a later file
+replaces the earlier one outright. Three fields — **seed_peers**, and
+**include_ips** / **exclude_ips** under **[debug.p2p_capture]** — additionally
+accept a **_add** suffix, which appends instead:
+
+    [outbound]
+    seed_peers_add = ["1.2.3.4:9030"]
+
+adds that peer to the shipped list, whereas a bare **seed_peers** would replace
+the list entirely.
 
 The file is divided into sections. The **[proxy]**, **[listen.\*]**,
 **[outbound]**, and **[identity]** sections are required for any node
@@ -230,6 +271,42 @@ The binary must be on **PATH**.
     whether to start fastsync. If no peer reports a tip in this window,
     fastsync is skipped. Default: **30**.
 
+## Memory
+
+A full (**utxo**) node wants **4 GB of RAM or more**, and **refuses to start
+below 3 GB** — it holds the AVL prover tree in memory, and initial sync is the
+demanding phase. **light** and **digest** hold no such tree and are never
+refused; on a small machine, those are the modes to run.
+
+Every cache and flush threshold below is **derived at runtime** unless you set
+it. The node reads its ceiling from **memory_budget_mb**, else the cgroup limit
+(**MemoryMax** on the systemd unit), else total system RAM, and sizes itself
+from that minus the parts no setting governs. Setting a key disables derivation
+**for that key only**; partial configuration is normal.
+
+The derivation is logged at startup as *memory budget derived*, with every
+input and output. If that line is absent, you configured everything.
+
+**memory_budget_mb** = *integer*
+:   Total memory the node may use, in megabytes. Absent — recommended — reads
+    the cgroup limit, else takes a conservative share of **MemTotal**.
+
+:   The source matters more than the number. Nothing stating a budget means
+    the node takes roughly **half** of total RAM, because nothing has said it
+    owns the machine; a cgroup limit or an explicit value here raises that to
+    **90–100%**. On a 4 GB box that is the difference between a 2 GB and a
+    3.6 GB budget from the same hardware.
+
+:   Prefer **MemoryMax** on the systemd unit. This key tells the node what to
+    aim for; only the cgroup actually bounds it.
+
+**ignore_memory_floor** = *true* | *false*
+:   Downgrade the startup refusal to a warning. Default: **false**.
+
+:   For when you have a reason to cross the floor — a heavily pruned node, or
+    a machine the estimate is simply wrong about. The node will start and may
+    be killed by the OOM killer during sync.
+
 ## Storage tuning (cold sync)
 
 These govern the redb cache and write-transaction flush cadence during
@@ -237,13 +314,26 @@ initial sync. On a memory-constrained box, lowering **cache_mb** and
 **flush_heap_threshold_mb** reduces RSS at the cost of more disk I/O.
 
 **cache_mb** = *integer*
-:   redb cache size in megabytes. Default: **256**.
+:   TOTAL redb page cache across **both** databases, in megabytes, split by
+    **cache_store_pct**. Absent: derived. Previously sized **state.redb**
+    alone while **modifiers.redb** silently took redb's own 1 GiB default, so
+    a config saying 1024 used 2048.
+
+**cache_store_pct** = *integer*
+:   Percentage of **cache_mb** given to **modifiers.redb**; the remainder goes
+    to **state.redb**. Valid 1–99. Default: **50**.
 
 **flush_heap_threshold_mb** = *integer*
 :   Live-heap threshold (jemalloc.allocated, MB) above which the
     validation sweep commits the redb write transaction mid-sweep.
     **0** disables the memory trigger; flushes then degenerate to every
-    **flush_max_blocks**. Default: **4096**.
+    **flush_max_blocks**. Absent: derived from the memory budget.
+
+:   An absolute heap level, not a share — it is compared against total
+    jemalloc *allocated*, which already includes the caches, so a value below
+    the cache size would fire on every check forever. The old fixed default of
+    4096 sat above total RAM on any box small enough to care, leaving the
+    trigger inert exactly where it was needed.
 
 **flush_max_blocks** = *integer*
 :   Upper bound on blocks between flushes. Caps crash-recovery work.
@@ -332,8 +422,18 @@ data_dir = "/var/lib/ergo-node/data"
 
 # FILES
 
+**/etc/ergo-node/conf.d/**
+:   Layered configuration used by the Debian package. See **Layering** above.
+
+**/usr/share/ergo-node-rust/defaults/**{mainnet,testnet}**.toml**
+:   Package-owned per-network defaults. Copied to
+    **conf.d/00-defaults.toml** on install and on every upgrade. Not a
+    conffile: editing either copy is pointless, as both are replaced.
+
 **/etc/ergo-node/ergo.toml**
-:   Default config file path used by the systemd unit.
+:   Legacy single-file config. Still honoured if present — a **conf.d**
+    beside it is layered on top. Upgrades move it to
+    **conf.d/99-local.toml**.
 
 **/var/lib/ergo-node/data/state.redb**
 :   UTXO state and AVL+ tree (when **state_type = "utxo"**).

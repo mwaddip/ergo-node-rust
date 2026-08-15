@@ -7,7 +7,23 @@ Wants=network-online.target
 Type=simple
 User=ergo-node
 Group=ergo-node
-ExecStart=/usr/bin/ergo-node-rust /etc/ergo-node/ergo.toml
+# No config path argument, deliberately.
+#
+# Configuration is now layered across /etc/ergo-node/conf.d/ — package
+# defaults, debconf answers, and the operator's own file — with no single file
+# holding the result. Naming a path here would pin the node to one layer.
+#
+# ⚠ It specifically must not name /etc/ergo-node/ergo.toml any more. preinst
+# MOVES that file to conf.d/99-local.toml on upgrade, so an explicit argument
+# pointing at it would name a file that no longer exists and the service would
+# fail to start on the first upgrade after this change.
+#
+# With no argument the node searches ./ergo.toml, ~/.config/ergo-node/, then
+# /etc/ergo-node/ — and layers a sibling conf.d/ onto whichever it finds, or
+# uses conf.d alone. WorkingDirectory is pinned below so "./" is a known
+# location rather than whatever systemd happened to pick.
+WorkingDirectory=/var/lib/ergo-node
+ExecStart=/usr/bin/ergo-node-rust
 Restart=on-failure
 RestartSec=10
 # stdout/stderr default to journald — the shipped fail2ban jail uses

@@ -8,3 +8,35 @@ if ! getent passwd ergo-node >/dev/null 2>&1; then
 fi
 
 chown ergo-node:ergo-node /var/lib/ergo-node /var/log/ergo-node
+
+# ── Migrate the legacy single-file config into the conf.d layout ─────────
+#
+# /etc/ergo-node/ergo.toml used to be a dpkg conffile and is no longer shipped.
+# Move whatever the operator has to conf.d/99-local.toml, which is the layer
+# that wins over the package defaults.
+#
+# ⚠ Without this, 00-defaults.toml layers a network default on top of every
+# existing operator's hand-tuned file — flipping working mainnet nodes to
+# testnet on upgrade. This is the step that stops an upgrade from silently
+# changing which chain a node follows.
+#
+# ⚠ In preinst, not postinst, deliberately. Dropping a conffile from a package
+# makes dpkg decide the file's fate during UNPACK — before postinst runs, and
+# for an unmodified file that decision is deletion. Migrating here means we see
+# the operator's file in the state they left it, whatever dpkg would have gone
+# on to do with it.
+#
+# The guard on 99-local.toml is what makes this the single exception to "the
+# package never writes 99-local.toml": it fires once, when there is nothing
+# there to lose, and every later upgrade and dpkg-reconfigure leaves it alone.
+LEGACY=/etc/ergo-node/ergo.toml
+LOCAL=/etc/ergo-node/conf.d/99-local.toml
+
+if [ -f "$LEGACY" ] && [ ! -e "$LOCAL" ]; then
+    mkdir -p /etc/ergo-node/conf.d
+    mv "$LEGACY" "$LOCAL"
+    echo "ergo-node-rust: moved $LEGACY to $LOCAL"
+    echo "  Your settings are preserved and still win over the package defaults."
+    echo "  Package defaults now live in /etc/ergo-node/conf.d/00-defaults.toml"
+    echo "  and are refreshed on every upgrade."
+fi
