@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, HashMap};
 use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
+use std::collections::{BTreeMap, HashMap};
 
-use crate::weight::TxWeight;
 use crate::types::UnconfirmedTx;
+use crate::weight::TxWeight;
 
 /// Core ordered transaction pool with secondary indexes.
 pub struct OrderedPool {
@@ -29,11 +29,17 @@ impl OrderedPool {
         }
     }
 
-    pub fn len(&self) -> usize { self.ordered.len() }
+    pub fn len(&self) -> usize {
+        self.ordered.len()
+    }
 
-    pub fn is_empty(&self) -> bool { self.ordered.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.ordered.is_empty()
+    }
 
-    pub fn is_full(&self) -> bool { self.len() >= self.capacity }
+    pub fn is_full(&self) -> bool {
+        self.len() >= self.capacity
+    }
 
     /// Insert a transaction with its pre-computed weight.
     pub fn insert(
@@ -74,7 +80,9 @@ impl OrderedPool {
     }
 
     /// Check if tx ID is in pool.
-    pub fn contains(&self, tx_id: &[u8; 32]) -> bool { self.by_id.contains_key(tx_id) }
+    pub fn contains(&self, tx_id: &[u8; 32]) -> bool {
+        self.by_id.contains_key(tx_id)
+    }
 
     /// Find which pool tx spends a given input box (for double-spend check).
     pub fn spending_tx(&self, input_box_id: &[u8; 32]) -> Option<&TxWeight> {

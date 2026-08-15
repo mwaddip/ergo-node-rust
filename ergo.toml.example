@@ -144,10 +144,72 @@ protocol_version = "6.0.3"
 # whether to fastsync.
 # fastsync_peer_wait_timeout_sec = 30
 
-# ── Cold-sync memory (in use until chain reaches tip) ───────────────────
+# ── Memory ──────────────────────────────────────────────────────────────
+#
+# EVERY key in this section is optional and DERIVED when absent. The node
+# reads its own ceiling — the cgroup limit if it has one (systemd MemoryMax,
+# container --memory), otherwise a conservative share of total RAM — and sizes
+# its caches and flush thresholds from that, minus the parts no knob governs
+# (the header index, which grows with the chain).
+#
+# Setting a key disables derivation FOR THAT KEY ONLY and is then obeyed
+# exactly. Partial configuration is normal.
+#
+# The derivation is logged at startup as "memory budget derived", with every
+# input and output, so you can see why a cache is the size it is. If that line
+# is absent, you configured everything and nothing was derived.
+#
+# Prefer setting MemoryMax on the systemd unit over memory_budget_mb here:
+# the cgroup limit bounds the node for real, whereas this only tells it what
+# to aim for.
 
-# redb cache size in megabytes.
-# cache_mb = 256
+# Total memory the node may use, MB. Absent = read the cgroup limit, else a
+# conservative share of MemTotal.
+# memory_budget_mb = 2048
+
+# ── Startup memory floor ───────────────────────────────────────────────
+#
+# A UTXO node REFUSES TO START when its resolved ceiling is under 3 GiB, and
+# warns under 4 GiB. 4 GB is the practical minimum and more is better: cold
+# sync is the tightest phase, and it peaked at 3.02 GB on a well-provisioned
+# box. `digest` and `light` do not hold the AVL prover tree and are never
+# refused — on a small box, those are the modes to run.
+#
+# The check is on the CEILING, not on free memory at the moment you start, so
+# it is the same answer every time rather than one that depends on what the
+# page cache happens to be holding.
+#
+# ⚠ The source of the ceiling changes what it buys. Nothing stating a budget
+# means MemTotal, and the node takes a conservative 50% of it — so 4 GB of RAM
+# becomes a 2 GB budget, under the cold-sync peak. A MemoryMax on the unit, or
+# memory_budget_mb above, raises that to 90% or 100%. Declaring the same RAM
+# honestly is worth roughly 40% more budget, and the node says so at startup
+# when it notices.
+#
+# Downgrade the refusal to a warning. For when you have a real reason to cross
+# the floor — a heavily pruned node, or a box we are simply wrong about. It is
+# a config key rather than a flag so it survives a restart and is greppable,
+# and startup says when it is set.
+# ignore_memory_floor = false
+
+# ── Cold-sync values (in use until the chain reaches tip) ───────────────
+
+# TOTAL redb page cache across BOTH databases, in megabytes.
+#
+# BREAKING CHANGE: this previously sized state.redb's cache alone, while
+# modifiers.redb silently took redb's built-in 1 GiB default. A config saying
+# 1024 actually used 2048 MB. It now means what it says.
+# cache_mb = 512
+
+# Percentage of `cache_mb` given to modifiers.redb; the remainder goes to
+# state.redb. Valid range 1-99 — a zero share means a database with no page
+# cache at all, which is a configuration mistake rather than a tuning choice,
+# so the node refuses to start rather than running badly.
+#
+# 50 is provisional. The two databases have very different access patterns
+# (modifiers is write-heavy sequential during sync; state carries the AVL
+# tree) and the right split is a measurement, not a guess.
+# cache_store_pct = 50
 
 # Live-heap threshold (MB) above which the validation sweep commits the
 # redb write transaction mid-sweep. 0 disables the memory trigger and

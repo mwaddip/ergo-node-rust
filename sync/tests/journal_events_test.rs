@@ -1,195 +1,65 @@
-//! Verifies that the sync crate's journal-events emissions render with
-//! the marker prefixes and named fields promised in
-//! `facts/journal-events.md`. The Doctor adapter and other downstream
-//! consumers parse on these strings — drift here is silent breakage
+//! Journal-event conformance for the sync crate — `facts/journal-events.md`.
+//!
+//! The Doctor adapter and other downstream consumers parse on the marker
+//! prefixes and field names this crate emits; drift here is silent breakage
 //! over there.
 //!
-//! These tests assert the SHAPE of the emit, mirroring the per-event
-//! tracing calls in `src/state.rs`. They don't drive the state machine
-//! end-to-end — that's covered by the integration tests under `tests/`
-//! and the live mainnet run. The contract anchor is the rendered line.
-
-use std::io;
-use std::sync::{Arc, Mutex};
-use tracing::{error, info, warn};
-use tracing_subscriber::fmt::MakeWriter;
-
-#[derive(Clone, Default)]
-struct CaptureWriter {
-    buf: Arc<Mutex<Vec<u8>>>,
-}
-
-impl CaptureWriter {
-    fn captured(&self) -> String {
-        String::from_utf8(self.buf.lock().unwrap().clone()).unwrap()
-    }
-}
-
-impl io::Write for CaptureWriter {
-    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-        self.buf.lock().unwrap().extend_from_slice(b);
-        Ok(b.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for CaptureWriter {
-    type Writer = CaptureWriter;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-fn capture<F: FnOnce()>(f: F) -> String {
-    let writer = CaptureWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(writer.clone())
-        .without_time()
-        .with_ansi(false)
-        .with_target(false)
-        .finish();
-    tracing::subscriber::with_default(subscriber, f);
-    writer.captured()
-}
-
-#[test]
-fn validation_sweep_started_has_marker_and_named_fields() {
-    let sweep_from: u64 = 1_000_000;
-    let sweep_to: u64 = 1_000_500;
-    let sweep_size: u64 = 500;
-    let output = capture(|| {
-        info!(
-            from = sweep_from,
-            to = sweep_to,
-            blocks = sweep_size,
-            "VALIDATION SWEEP STARTED"
-        );
-    });
-    assert!(
-        output.contains("VALIDATION SWEEP STARTED"),
-        "missing marker: {output}"
-    );
-    // The contract pins the marker as the literal prefix — no decorative
-    // ===, no embedded values. The old emit shape was
-    // "=== VALIDATION SWEEP STARTED ===" which prefix-matches the
-    // contract regex but is noisier than necessary.
-    assert!(
-        !output.contains("==="),
-        "marker should be plain text, not decorated: {output}"
-    );
-    assert!(
-        output.contains("from=1000000"),
-        "missing from field: {output}"
-    );
-    assert!(
-        output.contains("to=1000500"),
-        "missing to field: {output}"
-    );
-    assert!(
-        output.contains("blocks=500"),
-        "missing blocks field: {output}"
-    );
-}
-
-#[test]
-fn validation_sweep_complete_has_marker_and_named_fields() {
-    let sweep_from: u64 = 1_000_000;
-    let validated_to: u64 = 1_000_500;
-    let advanced: u64 = 500;
-    let output = capture(|| {
-        info!(
-            from = sweep_from,
-            to = validated_to,
-            blocks = advanced,
-            elapsed = "0m42s",
-            rate = "12/s",
-            "VALIDATION SWEEP COMPLETE"
-        );
-    });
-    assert!(
-        output.contains("VALIDATION SWEEP COMPLETE"),
-        "missing marker: {output}"
-    );
-    assert!(
-        !output.contains("==="),
-        "marker should be plain text, not decorated: {output}"
-    );
-    assert!(
-        output.contains("from=1000000"),
-        "missing from field: {output}"
-    );
-    assert!(output.contains("to=1000500"), "missing to field: {output}");
-    assert!(
-        output.contains("blocks=500"),
-        "missing blocks field: {output}"
-    );
-}
-
-#[test]
-fn block_applied_has_marker_and_named_fields() {
-    // Mirrors the emit at apply_state success in `src/state.rs`. The
-    // contract says `height` is u64 and `id` is a 32-byte hex string.
-    let height: u64 = 1_785_000;
-    // BlockId Display impl renders as lowercase hex. Synthesize a
-    // sentinel string so the test isn't dependent on the actual type.
-    let block_id = "0000abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345";
-    let output = capture(|| {
-        info!(
-            height = height,
-            id = %block_id,
-            "block applied"
-        );
-    });
-    assert!(
-        output.contains("block applied"),
-        "missing marker: {output}"
-    );
-    assert!(
-        output.contains("height=1785000"),
-        "missing height field: {output}"
-    );
-    assert!(
-        output.contains(&format!("id={block_id}")),
-        "missing id field rendered via Display: {output}"
-    );
-}
-
-#[test]
-fn chain_tip_reached_has_marker_and_named_fields() {
-    let tip_height: u64 = 1_785_500;
-    let output = capture(|| {
-        info!(height = tip_height, "chain tip reached");
-    });
-    assert!(
-        output.contains("chain tip reached"),
-        "missing marker: {output}"
-    );
-    assert!(
-        output.contains("height=1785500"),
-        "missing height field: {output}"
-    );
-}
-
-// -------------------------------------------------------------------
-// `validation_stuck` (contract since 1.1, broadened to v1.3 —
-// `facts/journal-events.md`)
-//
-// The emission now lives in the sweep backoff — the single emitter for
-// BOTH the apply_state and deferred-eval stall modes. Its firing behavior
-// (fires on the 5th consecutive frontier stall, once per frontier, re-arms
-// on progress / frontier change) and the rendered shape are covered by
-// `ergo_sync::sweep_backoff`'s own unit tests, which capture the REAL emit.
-//
-// Kept here, the contract-shape anchor file: the apply_state error
-// classifier that feeds `error_kind`/`missing_key`, plus an inline mirror of
-// the emitted line so the Doctor-adapter contract shape is pinned alongside
-// the other journal events.
-// -------------------------------------------------------------------
+//! ## Why this file is an index and not a test suite
+//!
+//! Every one of this crate's contract events is emitted from a private method
+//! (`HeaderSync::handle_control_event`, the sweep loop) or a private module
+//! (`sweep_backoff`, `catchup_progress`), and setting one up means writing the
+//! struct's private watermark fields. None of that is reachable from an
+//! integration test, which sees only `ergo_sync`'s public API.
+//!
+//! This file used to paper over that with **inline mirrors**: each test called
+//! `info!(…)` with its own copy of the marker and fields, then asserted the
+//! captured output contained that same copy. That tests `tracing`'s formatter
+//! against itself. It cannot fail when an emit site drifts, because it never
+//! invokes one — which is precisely how `deferred_eval_gate_engaged` and
+//! `eval_frontier_hole` both shipped not matching the contract under a green
+//! suite on 2026-08-12, and how the `validation_rollback_failed` mirror came to
+//! assert an `error=` value the real emit never produced.
+//!
+//! The tests below are the same hazard one level down. They used to hand the
+//! classifier **string literals** — a hand-written copy of what a
+//! `ValidationError` renders to. That cannot fail when the error type changes,
+//! which is exactly how `error_kind` lost its script-failure value in v0.8.0
+//! under a green suite. They now build the real `ValidationError` values, so
+//! the classifier and its tests move together or neither compiles.
+//!
+//! The conformance tests therefore live beside the harness that can drive the
+//! real emit, and this file records where. Each entry below names the test that
+//! renders that event from its actual emit site:
+//!
+//! | Contract event | Driven by |
+//! |---|---|
+//! | `validation_sweep_started` | `state::sweep_resume_tests::journal_sweep_and_block_applied_conform` |
+//! | `validation_sweep_complete` | ditto |
+//! | `block_applied` | ditto |
+//! | `chain_tip_reached` | `state::sweep_resume_tests::journal_chain_tip_reached_conforms` |
+//! | `validation_stuck` | `sweep_backoff::tests::validation_stuck_fires_on_fifth_*_stall` |
+//! | `validation_rollback_failed` | `state::sweep_resume_tests::journal_validation_rollback_failed_conforms` |
+//! | catch-up progress | `catchup_progress::tests::*` (marker, both fields, both probe branches) |
+//!
+//! ## v0.8.0 — events that went with deferred evaluation
+//!
+//! `deferred_eval_backlog`, `deferred_eval_gate_engaged` and
+//! `eval_frontier_hole` no longer exist; nothing emits them. The first was
+//! reduced to a two-field `catch-up progress` record (the four dropped fields
+//! all described the queue); the other two described the dispatch gate and the
+//! script frontier, neither of which survives. `validation_rollback_failed`
+//! keeps its `reorg` path and loses its `eval_failure` one.
+//! `facts/journal-events.md` was updated to match in contract 2.0 (`5706fbf`,
+//! `0477774`, `c3277d8`).
+//!
+//! What remains here is what an integration test *can* exercise for real: the
+//! public classifier that produces `validation_stuck`'s `error_kind` and
+//! `missing_key` field values.
 
 use bytes::Bytes;
 use ergo_sync::apply_state_error::classify_apply_state_error;
+use ergo_validation::ValidationError;
 
 /// A realistic 32-byte AVL key with the three byte categories the
 /// `bytes::Bytes` Debug impl renders differently: printable ASCII
@@ -201,85 +71,99 @@ const AVL_KEY: [u8; 32] = [
     0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0, 0xf0, 0xff,
 ];
 
-#[test]
-fn classify_extracts_hex_from_avl_missing_key_error() {
+/// The AVL layer's own message, as `ergo_avltree_rust`'s `operation.rs`
+/// raises it. `validation/` wraps this verbatim into whichever variant the
+/// mode uses, so this is the real payload the classifier parses.
+fn avl_missing_key_message() -> String {
     let key = Bytes::copy_from_slice(&AVL_KEY);
-    let err = format!("Key {key:?} does not exists");
+    format!("operation 3 failed: Key {key:?} does not exists")
+}
+
+fn avl_key_hex() -> String {
+    AVL_KEY.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// UTXO mode: the persistent prover's failure arrives as
+/// `StateOperationFailed`.
+#[test]
+fn classify_extracts_hex_from_utxo_mode_missing_key_error() {
+    let err = ValidationError::StateOperationFailed(avl_missing_key_message());
     let (kind, hex) = classify_apply_state_error(&err);
     assert_eq!(kind, "missing_key");
-    let expected: String = AVL_KEY.iter().map(|b| format!("{b:02x}")).collect();
+    let expected = avl_key_hex();
     assert_eq!(
         hex.as_deref(),
         Some(expected.as_str()),
-        "expected hex {expected} from error {err:?}, got {hex:?}"
+        "expected hex {expected} from error {err}, got {hex:?}"
     );
+}
+
+/// Digest mode: the same `operation.rs` error, reached through the batch
+/// verifier instead, arrives as `ProofVerificationFailed`. Both channels
+/// must classify — a node running in digest mode is no less stuck.
+#[test]
+fn classify_extracts_hex_from_digest_mode_missing_key_error() {
+    let err = ValidationError::ProofVerificationFailed(avl_missing_key_message());
+    let (kind, hex) = classify_apply_state_error(&err);
+    assert_eq!(kind, "missing_key");
+    assert_eq!(hex.as_deref(), Some(avl_key_hex().as_str()));
+}
+
+/// The kind that went missing when deferred evaluation was removed. It is a
+/// consensus signal, not a state-DB one, and it is keyed on the variant —
+/// a preservation failure reads the same as a script failure here, which is
+/// the point.
+#[test]
+fn classify_transaction_invalid_for_a_rejected_transaction() {
+    let err = ValidationError::TransactionInvalid {
+        index: 7,
+        reason: "script evaluation returned false".to_string(),
+    };
+    let (kind, hex) = classify_apply_state_error(&err);
+    assert_eq!(kind, "transaction_invalid");
+    assert!(hex.is_none(), "only the missing-key case carries a key");
 }
 
 #[test]
 fn classify_other_for_non_missing_key_error() {
-    let (kind, hex) = classify_apply_state_error("validator state root mismatch");
+    let err = ValidationError::StateRootMismatch {
+        expected: vec![0u8; 33],
+        got: vec![1u8; 33],
+    };
+    let (kind, hex) = classify_apply_state_error(&err);
     assert_eq!(kind, "other");
     assert!(hex.is_none());
 }
 
+/// The contract's 2.0 domain is exactly three values, `script_eval` no longer
+/// among them. A sampling guard, not a proof: it covers the variants an
+/// `apply_state` failure realistically produces, so a fourth kind reachable
+/// only from some variant not listed here would still slip past.
 #[test]
-fn validation_stuck_renders_marker_and_named_fields() {
-    // Inline mirror of `sweep_backoff::emit_validation_stuck` (the missing_key
-    // branch). The contract pins marker "validation stuck" and fields height
-    // (u64), attempts (u64), error_kind (string), missing_key (hex, optional).
-    // The real emit is exercised end-to-end in the sweep_backoff unit tests;
-    // this is the contract-shape anchor beside the other journal events.
-    let key_hex: String = AVL_KEY.iter().map(|b| format!("{b:02x}")).collect();
-    let output = capture(|| {
-        warn!(
-            height = 1_783_677u64,
-            attempts = 5u64,
-            error_kind = "missing_key",
-            missing_key = %key_hex,
-            "validation stuck"
+fn error_kind_domain_is_closed() {
+    let cases = [
+        ValidationError::StateOperationFailed(avl_missing_key_message()),
+        ValidationError::ProofVerificationFailed(avl_missing_key_message()),
+        ValidationError::TransactionInvalid {
+            index: 0,
+            reason: "nope".to_string(),
+        },
+        ValidationError::MissingProof,
+        ValidationError::HeightMismatch {
+            expected: 2666,
+            got: 2668,
+        },
+        ValidationError::BlockCostExceeded {
+            cost: 2,
+            max_cost: 1,
+        },
+        ValidationError::IntraBlockDoubleSpend("box".to_string()),
+    ];
+    for err in &cases {
+        let (kind, _) = classify_apply_state_error(err);
+        assert!(
+            matches!(kind, "missing_key" | "transaction_invalid" | "other"),
+            "{err} produced out-of-domain error_kind {kind:?}"
         );
-    });
-    assert!(output.contains("validation stuck"), "missing marker: {output}");
-    assert!(output.contains("height=1783677"), "missing height: {output}");
-    assert!(output.contains("attempts=5"), "missing attempts: {output}");
-    assert!(
-        output.contains("error_kind=\"missing_key\""),
-        "missing error_kind: {output}"
-    );
-    assert!(
-        output.contains(&format!("missing_key={key_hex}")),
-        "missing key hex: {output}"
-    );
-}
-
-#[test]
-fn validation_rollback_failed_renders_marker_and_named_fields() {
-    // Inline mirror of the `validation rollback failed` ERROR emitted by
-    // `handle_eval_failure` and the reorg arm in `src/state.rs` when
-    // `BlockValidator::reset_to` returns Err (validator unmoved, watermarks
-    // held in place). Fields: height (u64, the rollback TARGET), path
-    // (string: "eval_failure" | "reorg"), error (Display). Not yet listed
-    // in `facts/journal-events.md` — contract addition owed by the main
-    // session; this pins the shape the entry must describe.
-    let output = capture(|| {
-        error!(
-            height = 2668u64,
-            path = "eval_failure",
-            error = %"rollback to height 2668 failed: simulated storage failure",
-            "validation rollback failed"
-        );
-    });
-    assert!(
-        output.contains("validation rollback failed"),
-        "missing marker: {output}"
-    );
-    assert!(output.contains("height=2668"), "missing height: {output}");
-    assert!(
-        output.contains("path=\"eval_failure\""),
-        "missing path: {output}"
-    );
-    assert!(
-        output.contains("error=rollback to height 2668 failed"),
-        "missing error field: {output}"
-    );
+    }
 }

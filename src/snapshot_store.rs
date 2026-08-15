@@ -68,7 +68,8 @@ impl SnapshotStore {
             let mut meta = txn.open_table(METADATA)?;
 
             // Read existing info, append new entry
-            let mut info = meta.get(SNAPSHOTS_INFO_KEY)?
+            let mut info = meta
+                .get(SNAPSHOTS_INFO_KEY)?
                 .map(|g| parse_info(g.value()))
                 .unwrap_or_default();
             info.push((height, manifest_id));
@@ -138,7 +139,9 @@ impl SnapshotStore {
         let chunk_ids: Vec<[u8; 32]> = {
             let meta = txn.open_table(METADATA)?;
             let result = meta.get(chunk_key.as_str())?;
-            result.map(|g| parse_chunk_id_list(g.value())).unwrap_or_default()
+            result
+                .map(|g| parse_chunk_id_list(g.value()))
+                .unwrap_or_default()
         };
 
         // Delete chunks
@@ -164,7 +167,8 @@ impl SnapshotStore {
             meta.remove(chunk_key.as_str())?;
 
             // Remove from snapshots_info
-            let mut info = meta.get(SNAPSHOTS_INFO_KEY)?
+            let mut info = meta
+                .get(SNAPSHOTS_INFO_KEY)?
                 .map(|g| parse_info(g.value()))
                 .unwrap_or_default();
             info.retain(|(_, id)| *id != manifest_id);

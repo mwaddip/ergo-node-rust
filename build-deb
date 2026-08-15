@@ -1,7 +1,28 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+# Read the literal out of [workspace.package], which is the one place it
+# exists — every member inherits it via `version.workspace = true`.
+#
+# Scoped to the section rather than "first ^version line": the old grep|head -1
+# happened to be right only because [workspace.package] sits above [package],
+# and would have silently produced "true" from `version.workspace = true` if
+# anyone reordered the file.
+VERSION=$(awk '
+    /^\[workspace\.package\]/ { in_section = 1; next }
+    /^\[/                     { in_section = 0 }
+    in_section && /^version[[:space:]]*=/ {
+        match($0, /"[^"]*"/)
+        print substr($0, RSTART + 1, RLENGTH - 2)
+        exit
+    }
+' Cargo.toml)
+
+if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    echo "error: could not read a version from [workspace.package] in Cargo.toml" >&2
+    echo "  got: '${VERSION}'" >&2
+    exit 1
+fi
 ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
 PKG="ergo-node-rust_${VERSION}_${ARCH}"
 
@@ -16,7 +37,10 @@ cargo build --locked --release --bin ergo-node-rust --bin sharpen
 rm -rf "target/${PKG}"
 mkdir -p "target/${PKG}/DEBIAN"
 mkdir -p "target/${PKG}/usr/bin"
-mkdir -p "target/${PKG}/etc/ergo-node"
+# Shipped empty. postinst fills conf.d/ with 00-defaults.toml and
+# 50-debconf.toml; the operator's 99-local.toml is never the package's to write
+# (the one exception being preinst's legacy migration).
+mkdir -p "target/${PKG}/etc/ergo-node/conf.d"
 mkdir -p "target/${PKG}/usr/lib/systemd/system"
 
 cp target/release/ergo-node-rust "target/${PKG}/usr/bin/"
@@ -24,7 +48,17 @@ cp target/release/sharpen "target/${PKG}/usr/bin/"
 strip "target/${PKG}/usr/bin/ergo-node-rust"
 strip "target/${PKG}/usr/bin/sharpen"
 
-cp deploy/ergo.toml "target/${PKG}/etc/ergo-node/ergo.toml"
+# Per-network defaults, package-owned. postinst copies the one matching the
+# debconf answer to /etc/ergo-node/conf.d/00-defaults.toml on every configure.
+#
+# NOT installed to /etc and NOT a conffile — that is the point. The old
+# /etc/ergo-node/ergo.toml was a conffile, which froze its seed-peer list on
+# every existing install forever; refreshing from /usr/share is what lets a
+# correction actually reach operators. preinst migrates the legacy file to
+# conf.d/99-local.toml so nobody's edits are lost on the way.
+mkdir -p "target/${PKG}/usr/share/ergo-node-rust/defaults"
+cp deploy/defaults/mainnet.toml deploy/defaults/testnet.toml \
+    "target/${PKG}/usr/share/ergo-node-rust/defaults/"
 
 cp deploy/ergo-node-rust.service "target/${PKG}/usr/lib/systemd/system/"
 
@@ -47,6 +81,14 @@ cp ergo.toml.example "target/${PKG}/usr/share/doc/ergo-node-rust/examples/"
 cp tools/rrd-create.sh tools/rrd-update.sh tools/rrd-graph.sh tools/rrd-demo-fill.sh \
     "target/${PKG}/usr/share/doc/ergo-node-rust/examples/"
 
+# Architecture and Version are substituted from the build, so the values in
+# debian/control are only what a reader sees — keep them current anyway.
+# Version sat at 0.1.0 there through eight releases, which made every naive
+# read of that file wrong.
+#
+# ⚠ debian/control is a binary package control file: NO `#` comments. dpkg-deb
+# rejects them with "field name '#' must be followed by colon". Explanations
+# about that file belong here instead.
 sed "s/^Architecture:.*/Architecture: ${ARCH}/" debian/control > "target/${PKG}/DEBIAN/control"
 sed -i "s/^Version:.*/Version: ${VERSION}/" "target/${PKG}/DEBIAN/control"
 SIZE=$(du -sk "target/${PKG}" | cut -f1)
@@ -54,7 +96,13 @@ echo "Installed-Size: ${SIZE}" >> "target/${PKG}/DEBIAN/control"
 
 cp debian/conffiles "target/${PKG}/DEBIAN/"
 
-for script in preinst postinst prerm postrm; do
+# `templates` is data, not a script: 644 and never executed. `config` IS a
+# script and runs before unpack — it must be 755 or debconf silently skips the
+# interview and every answer falls through to its default.
+cp debian/templates "target/${PKG}/DEBIAN/"
+chmod 644 "target/${PKG}/DEBIAN/templates"
+
+for script in config preinst postinst prerm postrm; do
     cp "debian/${script}" "target/${PKG}/DEBIAN/"
     chmod 755 "target/${PKG}/DEBIAN/${script}"
 done

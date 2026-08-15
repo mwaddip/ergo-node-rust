@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use ergo_chain_types::Header;
+use reqwest::Client;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
@@ -83,6 +84,14 @@ pub struct PeerPool {
     /// None when peers came from `--peer-url` (single-peer mode).
     node_url: Option<String>,
     last_refresh: Instant,
+    /// Client for the peer-discovery query, built once.
+    ///
+    /// Previously `maybe_refresh()` constructed a fresh `Client` on every
+    /// call. Each one owns a connection pool, and reqwest's documentation is
+    /// explicit that a single client should be reused — at one refresh per
+    /// 30 s that was ~480 pools created and dropped over a 4-hour header
+    /// phase.
+    refresh_client: Client,
 }
 
 /// Minimum time between /peers/api-urls refresh queries.
@@ -112,6 +121,10 @@ impl PeerPool {
             last_refresh: Instant::now()
                 .checked_sub(Duration::from_secs(3600))
                 .unwrap_or_else(Instant::now),
+            refresh_client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .context("build peer-refresh client")?,
         })
     }
 
@@ -136,14 +149,8 @@ impl PeerPool {
         }
         self.last_refresh = Instant::now();
 
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-        {
-            Ok(c) => c,
-            Err(_) => return 0,
-        };
-        let resp = match client
+        let resp = match self
+            .refresh_client
             .get(format!("{node_url}/peers/api-urls"))
             .send()
             .await
@@ -331,10 +338,7 @@ impl PeerPool {
                     chunks.push_back((from, to));
 
                     if total_empties > max_empties || self.healthy_count() == 0 {
-                        warn!(
-                            height = next_flush,
-                            "all peers behind target — truncating"
-                        );
+                        warn!(height = next_flush, "all peers behind target — truncating");
                         break;
                     }
 
@@ -364,9 +368,10 @@ impl PeerPool {
                         for header in &hdrs {
                             // Autolykos v1 headers (version < 2) — skip PoW
                             if header.version >= 2 {
-                                if !header.check_pow().with_context(|| {
-                                    format!("PoW at height {}", header.height)
-                                })? {
+                                if !header
+                                    .check_pow()
+                                    .with_context(|| format!("PoW at height {}", header.height))?
+                                {
                                     bail!("PoW failed at height {}", header.height);
                                 }
                             }
@@ -375,8 +380,7 @@ impl PeerPool {
 
                         if collect_ids {
                             for header in &hdrs {
-                                header_ids
-                                    .push((header.height, hex::encode(header.id.0 .0)));
+                                header_ids.push((header.height, hex::encode(header.id.0 .0)));
                             }
                         }
 
@@ -386,10 +390,8 @@ impl PeerPool {
                             Err(e) => {
                                 warn!(error = %e, "ingest failed, backing off");
                                 tokio::time::sleep(Duration::from_secs(1)).await;
-                                headers_pushed += ingest
-                                    .push(&batch)
-                                    .await
-                                    .context("ingest retry failed")?;
+                                headers_pushed +=
+                                    ingest.push(&batch).await.context("ingest retry failed")?;
                             }
                         }
 
@@ -473,10 +475,7 @@ impl PeerPool {
                     chunks.push_back((from, to));
 
                     if self.healthy_count() == 0 {
-                        bail!(
-                            "all peers unhealthy — stuck at height {}",
-                            next_flush
-                        );
+                        bail!("all peers unhealthy — stuck at height {}", next_flush);
                     }
 
                     // Reassign to a healthy peer
@@ -528,9 +527,20 @@ impl PeerPool {
     ///
     /// Batches are distributed round-robin across healthy peers. Order
     /// doesn't matter for block sections — the node accepts them in any order.
+    /// Takes `header_ids` BY VALUE and moves the strings into the batch queue.
+    ///
+    /// It previously took a slice and cloned every id, so the caller's
+    /// `Vec<(u32, String)>` and the queue's copies were alive simultaneously
+    /// for the whole of phase 2 — at 1.82M headers that is ~167 MiB plus a
+    /// ~153 MiB duplicate. Consuming the vec moves each `String` instead
+    /// (pointer move, no heap copy) and frees the tuple array as the
+    /// iterator drains.
+    ///
+    /// Nothing needs the ids after this call; the caller's only other use is
+    /// a `len()` for a log line, which it now captures beforehand.
     pub async fn fetch_blocks(
         &mut self,
-        header_ids: &[(u32, String)],
+        header_ids: Vec<(u32, String)>,
         ingest: &IngestClient,
     ) -> Result<u32> {
         let batch_size = block_batch_size();
@@ -538,19 +548,30 @@ impl PeerPool {
         let phase_start = Instant::now();
         let mut last_log = phase_start;
 
-        // Pre-build owned batches: (min_height, max_height, header_ids)
+        // Build owned batches: (min_height, max_height, header_ids).
+        // The queue is still materialised up front because a failed batch is
+        // re-queued for another peer, so the ids must outlive their task.
         let mut queue: VecDeque<(u32, u32, Vec<String>)> = VecDeque::new();
-        for chunk in header_ids.chunks(batch_size) {
+        let mut it = header_ids.into_iter().peekable();
+        while it.peek().is_some() {
+            let chunk: Vec<(u32, String)> = it.by_ref().take(batch_size).collect();
             let min_h = chunk.first().map(|(h, _)| *h).unwrap_or(0);
             let max_h = chunk.last().map(|(h, _)| *h).unwrap_or(0);
-            let ids: Vec<String> = chunk.iter().map(|(_, id)| id.clone()).collect();
+            let ids: Vec<String> = chunk.into_iter().map(|(_, id)| id).collect();
             queue.push_back((min_h, max_h, ids));
         }
         let total_batches = queue.len() as u32;
         let mut completed = 0u32;
 
         // Return ids from task so we can re-queue on failure
-        type Task = (usize, u32, u32, Vec<String>, Duration, Result<Vec<JvmFullBlock>>);
+        type Task = (
+            usize,
+            u32,
+            u32,
+            Vec<String>,
+            Duration,
+            Result<Vec<JvmFullBlock>>,
+        );
         let mut tasks: JoinSet<Task> = JoinSet::new();
 
         // Track in-flight peer indices so new peers discovered mid-fetch
@@ -579,8 +600,7 @@ impl PeerPool {
 
             match result {
                 Ok(blocks) => {
-                    self.peers[peer_idx]
-                        .record_success(latency, blocks.len() as u32, false);
+                    self.peers[peer_idx].record_success(latency, blocks.len() as u32, false);
 
                     for block in &blocks {
                         let header: Header = parse_header_json(&block.header)
@@ -669,9 +689,7 @@ impl PeerPool {
                     queue.push_back((min_h, max_h, ids));
 
                     if self.healthy_count() == 0 {
-                        bail!(
-                            "all peers unhealthy — block fetch at {completed}/{total_batches}"
-                        );
+                        bail!("all peers unhealthy — block fetch at {completed}/{total_batches}");
                     }
 
                     if let Some(alt) = self.next_healthy_excluding(peer_idx) {
@@ -712,11 +730,7 @@ impl PeerPool {
 
     /// Fetch header IDs for a height range without pushing headers.
     /// Used when headers are already synced but block sections are missing.
-    pub async fn header_ids_for_range(
-        &mut self,
-        from: u32,
-        to: u32,
-    ) -> Result<Vec<(u32, String)>> {
+    pub async fn header_ids_for_range(&mut self, from: u32, to: u32) -> Result<Vec<(u32, String)>> {
         let mut ids = Vec::with_capacity((to - from + 1) as usize);
         let chunk_size = self.chunk_size;
         let mut height = from;
@@ -727,9 +741,10 @@ impl PeerPool {
 
         while height <= to {
             let chunk_to = (height + chunk_size - 1).min(to);
-            let peer_idx = *self.healthy_indices().first().ok_or_else(|| {
-                anyhow::anyhow!("no healthy peers for header ID fetch")
-            })?;
+            let peer_idx = *self
+                .healthy_indices()
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("no healthy peers for header ID fetch"))?;
             let fetcher = self.peers[peer_idx].fetcher.clone();
             let start = Instant::now();
 

@@ -115,12 +115,15 @@ impl DeliveryTracker {
     pub fn mark_requested(&mut self, ids: &[[u8; 32]], peer: PeerId, type_id: u8) {
         let now = Instant::now();
         for id in ids {
-            self.pending.insert(*id, PendingRequest {
-                peer,
-                type_id,
-                requested_at: now,
-                checks: 0,
-            });
+            self.pending.insert(
+                *id,
+                PendingRequest {
+                    peer,
+                    type_id,
+                    requested_at: now,
+                    checks: 0,
+                },
+            );
         }
     }
 
@@ -171,12 +174,18 @@ impl DeliveryTracker {
 
         let fresh = std::mem::take(&mut self.evicted);
 
-        CheckResult { retries, fresh, abandoned }
+        CheckResult {
+            retries,
+            fresh,
+            abandoned,
+        }
     }
 
     /// Remove all pending requests for a peer. Returns their IDs for re-request.
     pub fn purge_peer(&mut self, peer: PeerId) -> Vec<[u8; 32]> {
-        let orphaned: Vec<[u8; 32]> = self.pending.iter()
+        let orphaned: Vec<[u8; 32]> = self
+            .pending
+            .iter()
             .filter(|(_, req)| req.peer == peer)
             .map(|(id, _)| *id)
             .collect();
@@ -206,6 +215,37 @@ impl DeliveryTracker {
     /// Number of evicted IDs queued for re-request.
     pub fn evicted_count(&self) -> usize {
         self.evicted.len()
+    }
+
+    /// Heap bytes occupied by the entries live in the tracker's two
+    /// collections.
+    ///
+    /// Counted from the entries themselves: `len()` times the exact size of
+    /// what one entry stores, never a guessed per-modifier constant and never
+    /// a block count. `PendingRequest` and `[u8; 32]` own no further heap, so
+    /// every byte an entry occupies is counted here.
+    ///
+    /// ⚠ Deliberately excludes the tables' unused slots, and `capacity()` is
+    /// the reason. It looks like the way to include them and is not: it
+    /// returns `items + growth_left`, and erasing an entry only returns its
+    /// slot to `growth_left` when the probe sequence lets the slot be marked
+    /// EMPTY rather than DELETED. That depends on `RandomState`'s per-process
+    /// hash seed, so after a burst of deliveries the same table reports
+    /// anything from a fraction of its real size up to the true value — the
+    /// first draft of this method was caught by its own test halving between
+    /// runs. A figure built on it would be wrong by a factor that changes run
+    /// to run, and nothing downstream could tell.
+    ///
+    /// The uncounted slack is bounded and one-directional: hashbrown rounds to
+    /// a power-of-two bucket count at a 7/8 load factor and adds one control
+    /// byte per bucket, so the real allocation is at most ~2.3× this figure
+    /// and never below it.
+    pub fn memory_bytes(&self) -> u64 {
+        let pending = (self.pending.len() as u64)
+            .saturating_mul(std::mem::size_of::<([u8; 32], PendingRequest)>() as u64);
+        let evicted =
+            (self.evicted.len() as u64).saturating_mul(std::mem::size_of::<[u8; 32]>() as u64);
+        pending.saturating_add(evicted)
     }
 }
 
@@ -311,6 +351,91 @@ mod tests {
         assert_eq!(result.fresh.len(), 1);
         assert_eq!(result.fresh[0], id(1));
         assert_eq!(tracker.evicted_count(), 0); // drained
+    }
+
+    #[test]
+    fn memory_bytes_rises_with_pending_and_falls_on_delivery() {
+        let mut tracker = DeliveryTracker::new();
+        assert_eq!(tracker.memory_bytes(), 0, "an empty tracker holds nothing");
+
+        let ids: Vec<[u8; 32]> = (0u8..200).map(|n| [n; 32]).collect();
+        tracker.mark_requested(&ids, peer(1), 101);
+        let loaded = tracker.memory_bytes();
+        assert!(loaded > 0, "200 in-flight requests must report bytes");
+
+        // Scales with the number in flight, not with a fixed constant.
+        let mut small = DeliveryTracker::new();
+        small.mark_requested(&ids[..10], peer(1), 101);
+        assert_eq!(
+            small.memory_bytes() * 20,
+            loaded,
+            "10 in flight ({}) must be exactly a twentieth of 200 in flight ({loaded})",
+            small.memory_bytes()
+        );
+
+        // Delivery brings it back down. A figure that only ever rises is
+        // measuring the wrong thing — that is the symptom under investigation.
+        for id in &ids[..100] {
+            tracker.mark_received(id);
+        }
+        assert_eq!(
+            tracker.memory_bytes(),
+            loaded / 2,
+            "half delivered ⇒ half the bytes"
+        );
+
+        for id in &ids[100..] {
+            tracker.mark_received(id);
+        }
+        assert_eq!(tracker.pending_count(), 0);
+        assert_eq!(tracker.memory_bytes(), 0, "an emptied window holds nothing");
+    }
+
+    /// The figure must depend on how much is in flight and on nothing else.
+    ///
+    /// This is the guard against reintroducing `HashMap::capacity()`. That
+    /// version reported a table emptied by `remove` as anywhere between a
+    /// fraction of its allocation and all of it, depending on `RandomState`'s
+    /// per-process seed — so a churned tracker and a fresh one at identical
+    /// occupancy disagreed, and the same node reported different window
+    /// memory on each restart for the same workload.
+    #[test]
+    fn memory_bytes_is_deterministic_for_a_given_occupancy() {
+        let ids: Vec<[u8; 32]> = (0u8..120).map(|n| [n; 32]).collect();
+
+        // Built by insertion only.
+        let mut fresh = DeliveryTracker::new();
+        fresh.mark_requested(&ids[..60], peer(1), 101);
+
+        // Same occupancy reached via a load-then-drain cycle.
+        let mut churned = DeliveryTracker::new();
+        churned.mark_requested(&ids, peer(1), 101);
+        for id in &ids[60..] {
+            churned.mark_received(id);
+        }
+
+        assert_eq!(fresh.pending_count(), churned.pending_count());
+        assert_eq!(
+            fresh.memory_bytes(),
+            churned.memory_bytes(),
+            "history must not change the figure — only occupancy may"
+        );
+    }
+
+    #[test]
+    fn memory_bytes_counts_the_evicted_queue() {
+        let mut tracker = DeliveryTracker::new();
+        let ids: Vec<[u8; 32]> = (0u8..50).map(|n| [n; 32]).collect();
+        tracker.schedule_rerequest(&ids);
+        assert_eq!(
+            tracker.memory_bytes(),
+            50 * 32,
+            "50 evicted 32-byte ids and nothing pending"
+        );
+
+        // Draining the queue via check_timeouts returns the bytes.
+        let _ = tracker.check_timeouts();
+        assert_eq!(tracker.memory_bytes(), 0);
     }
 
     #[test]

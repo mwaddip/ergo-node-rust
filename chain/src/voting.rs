@@ -104,8 +104,7 @@ impl VotingConfig {
     /// widens losslessly. Threshold math stays in u64 — JVM Int-overflow
     /// on hostile SETTINGS is out of scope (vectors hand sane settings).
     pub fn soft_fork_approved(&self, votes: i64) -> bool {
-        let threshold =
-            (self.voting_length as u64) * (self.soft_fork_epochs as u64) * 9 / 10;
+        let threshold = (self.voting_length as u64) * (self.soft_fork_epochs as u64) * 9 / 10;
         votes > threshold as i64
     }
 
@@ -151,9 +150,9 @@ pub fn parameter_min(id: i8) -> Option<i32> {
 /// Upper bound for an ordinary parameter (mirrors JVM `maxValues`).
 pub fn parameter_max(id: i8) -> Option<i32> {
     match id.unsigned_abs() as i8 {
-        1 => Some(2_500_000),     // StorageFeeFactor
-        2 => Some(10_000),        // MinValuePerByte
-        9 => Some(2_048),         // SubblocksPerBlock
+        1 => Some(2_500_000), // StorageFeeFactor
+        2 => Some(10_000),    // MinValuePerByte
+        9 => Some(2_048),     // SubblocksPerBlock
         3..=8 => Some(i32::MAX / 2),
         _ => None,
     }
@@ -448,9 +447,7 @@ pub fn parse_validation_settings_update(
             })?
             .wrapping_add(FIRST_RULE_ID as u16) as i16;
         let status = RuleStatus::sigma_parse(&mut r).map_err(|e| {
-            ChainError::ExtensionParse(format!(
-                "settings update: status update at index {i}: {e}"
-            ))
+            ChainError::ExtensionParse(format!("settings update: status update at index {i}: {e}"))
         })?;
         statuses.push((rule_id, status));
     }
@@ -502,14 +499,13 @@ pub fn encode_validation_settings_update(
     for (i, (rule_id, status)) in update.statuses.iter().enumerate() {
         // JVM `w.putUShort(ruleId - FirstRuleId)` (Int arithmetic) — the
         // scorex `putUShort` require rejects a negative offset.
-        let offset =
-            u16::try_from(*rule_id as i32 - FIRST_RULE_ID as i32).map_err(|_| {
-                ChainError::Voting(format!(
-                    "settings update encode: status update rule id {rule_id} at index {i} \
+        let offset = u16::try_from(*rule_id as i32 - FIRST_RULE_ID as i32).map_err(|_| {
+            ChainError::Voting(format!(
+                "settings update encode: status update rule id {rule_id} at index {i} \
                      is below FIRST_RULE_ID {FIRST_RULE_ID} (negative wire offset, JVM \
                      putUShort require)"
-                ))
-            })?;
+            ))
+        })?;
         w.put_u16(offset).expect("Vec write");
         status.sigma_serialize(&mut w).map_err(|e| {
             ChainError::Voting(format!(
@@ -686,9 +682,8 @@ pub fn pack_extension_bytes(
 ) -> Vec<u8> {
     use sigma_ser::vlq_encode::WriteSigmaVlqExt;
 
-    let mut out = Vec::with_capacity(
-        32 + 5 + fields.iter().map(|(_, v)| v.len() + 3).sum::<usize>(),
-    );
+    let mut out =
+        Vec::with_capacity(32 + 5 + fields.iter().map(|(_, v)| v.len() + 3).sum::<usize>());
     out.extend_from_slice(&header_id.0 .0);
     // VLQ-encoded field count
     out.put_u32(fields.len() as u32).expect("Vec write");
@@ -931,8 +926,7 @@ pub fn compute_boundary_parameters(
                 .copied()
                 .ok_or_else(|| {
                     ChainError::Voting(
-                        "BlockVersion missing from parameters table at soft-fork activation"
-                            .into(),
+                        "BlockVersion missing from parameters table at soft-fork activation".into(),
                     )
                 })?;
             table.insert(Parameter::BlockVersion, bv.wrapping_add(1));
@@ -948,11 +942,14 @@ pub fn compute_boundary_parameters(
     // Reads the RUNNING table like JVM (a voting-driven bump at the same
     // height suppresses the force).
     if boundary_height == voting.version2_activation_height {
-        let bv = table.get(&Parameter::BlockVersion).copied().ok_or_else(|| {
-            ChainError::Voting(
-                "BlockVersion missing from parameters table at forced-v2 height".into(),
-            )
-        })?;
+        let bv = table
+            .get(&Parameter::BlockVersion)
+            .copied()
+            .ok_or_else(|| {
+                ChainError::Voting(
+                    "BlockVersion missing from parameters table at forced-v2 height".into(),
+                )
+            })?;
         if bv == 1 {
             table.insert(Parameter::BlockVersion, 2);
         }
@@ -1454,28 +1451,55 @@ mod tests {
     fn boundary_params_majority_step_applies() {
         let cfg = VotingConfig::testnet();
         let (next, activated) = compute_boundary_parameters(
-            &cfg, 256, &base_params(), &tally_of(&[(1, 65)]), false, &[],
+            &cfg,
+            256,
+            &base_params(),
+            &tally_of(&[(1, 65)]),
+            false,
+            &[],
         )
         .unwrap();
-        assert_eq!(next.storage_fee_factor(), 1_275_000, "step +25_000 for id 1");
-        assert_eq!(activated, empty_update(), "non-activation boundary → 0x0000");
+        assert_eq!(
+            next.storage_fee_factor(),
+            1_275_000,
+            "step +25_000 for id 1"
+        );
+        assert_eq!(
+            activated,
+            empty_update(),
+            "non-activation boundary → 0x0000"
+        );
     }
 
     #[test]
     fn boundary_params_exact_half_no_step() {
         let cfg = VotingConfig::testnet();
         let (next, _) = compute_boundary_parameters(
-            &cfg, 256, &base_params(), &tally_of(&[(1, 64)]), false, &[],
+            &cfg,
+            256,
+            &base_params(),
+            &tally_of(&[(1, 64)]),
+            false,
+            &[],
         )
         .unwrap();
-        assert_eq!(next.storage_fee_factor(), 1_250_000, "64 of 128 is not > L/2");
+        assert_eq!(
+            next.storage_fee_factor(),
+            1_250_000,
+            "64 of 128 is not > L/2"
+        );
     }
 
     #[test]
     fn boundary_params_negative_vote_decreases() {
         let cfg = VotingConfig::testnet();
         let (next, _) = compute_boundary_parameters(
-            &cfg, 256, &base_params(), &tally_of(&[(-1, 65)]), false, &[],
+            &cfg,
+            256,
+            &base_params(),
+            &tally_of(&[(-1, 65)]),
+            false,
+            &[],
         )
         .unwrap();
         assert_eq!(next.storage_fee_factor(), 1_225_000);
@@ -1488,10 +1512,9 @@ mod tests {
         params
             .parameters_table
             .insert(Parameter::MaxBlockSize, 16 * 1024); // at min
-        let (next, _) = compute_boundary_parameters(
-            &cfg, 256, &params, &tally_of(&[(-3, 65)]), false, &[],
-        )
-        .unwrap();
+        let (next, _) =
+            compute_boundary_parameters(&cfg, 256, &params, &tally_of(&[(-3, 65)]), false, &[])
+                .unwrap();
         assert_eq!(
             next.max_block_size(),
             16 * 1024,
@@ -1506,7 +1529,12 @@ mod tests {
     fn boundary_params_max_block_cost_dynamic_step() {
         let cfg = VotingConfig::testnet();
         let (next, _) = compute_boundary_parameters(
-            &cfg, 256, &base_params(), &tally_of(&[(4, 65)]), false, &[],
+            &cfg,
+            256,
+            &base_params(),
+            &tally_of(&[(4, 65)]),
+            false,
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1522,9 +1550,17 @@ mod tests {
         // approved id — an unknown id throws there (invalid block). Mirror.
         let cfg = VotingConfig::testnet();
         let r = compute_boundary_parameters(
-            &cfg, 256, &base_params(), &tally_of(&[(99, 65)]), false, &[],
+            &cfg,
+            256,
+            &base_params(),
+            &tally_of(&[(99, 65)]),
+            false,
+            &[],
         );
-        assert!(r.is_err(), "approved unknown id must error like the JVM throw");
+        assert!(
+            r.is_err(),
+            "approved unknown id must error like the JVM throw"
+        );
     }
 
     #[test]
@@ -1533,7 +1569,12 @@ mod tests {
         // read — unknown ids without a majority are silently ignored.
         let cfg = VotingConfig::testnet();
         let (next, _) = compute_boundary_parameters(
-            &cfg, 256, &base_params(), &tally_of(&[(99, 10)]), false, &[],
+            &cfg,
+            256,
+            &base_params(),
+            &tally_of(&[(99, 10)]),
+            false,
+            &[],
         )
         .unwrap();
         assert_eq!(next, base_params());
@@ -1549,7 +1590,12 @@ mod tests {
         // closing epoch's 120 count alone must NOT create counters.
         let cfg = VotingConfig::testnet();
         let (next, activated) = compute_boundary_parameters(
-            &cfg, 256, &base_params(), &tally_of(&[(SOFT_FORK_VOTE, 128)]), false, &[],
+            &cfg,
+            256,
+            &base_params(),
+            &tally_of(&[(SOFT_FORK_VOTE, 128)]),
+            false,
+            &[],
         )
         .unwrap();
         assert_eq!(next, base_params(), "no 121/122 counters may appear");
@@ -1559,16 +1605,18 @@ mod tests {
     #[test]
     fn boundary_params_boundary_fork_vote_starts_round() {
         let cfg = VotingConfig::testnet();
-        let (next, _) = compute_boundary_parameters(
-            &cfg, 256, &base_params(), &[], true, &[],
-        )
-        .unwrap();
+        let (next, _) =
+            compute_boundary_parameters(&cfg, 256, &base_params(), &[], true, &[]).unwrap();
         assert_eq!(
             next.soft_fork_starting_height(),
             Some(256),
             "id 122 = boundary height on round start"
         );
-        assert_eq!(next.soft_fork_votes_collected(), Some(0), "id 121 starts at 0");
+        assert_eq!(
+            next.soft_fork_votes_collected(),
+            Some(0),
+            "id 121 starts at 0"
+        );
     }
 
     #[test]
@@ -1582,7 +1630,12 @@ mod tests {
             .parameters_table
             .insert(Parameter::SoftForkVotesCollected, 10);
         let (next, _) = compute_boundary_parameters(
-            &cfg, 256, &params, &tally_of(&[(SOFT_FORK_VOTE, 50)]), false, &[],
+            &cfg,
+            256,
+            &params,
+            &tally_of(&[(SOFT_FORK_VOTE, 50)]),
+            false,
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1606,11 +1659,13 @@ mod tests {
             .parameters_table
             .insert(Parameter::SoftForkVotesCollected, 3_700);
         let proposed = encode_disabled_rules(&[215]);
-        let (next, activated) = compute_boundary_parameters(
-            &cfg, 8_320, &params, &[], false, &proposed,
-        )
-        .unwrap();
-        assert_eq!(next.block_version(), 2, "voting-driven activation bumps BlockVersion");
+        let (next, activated) =
+            compute_boundary_parameters(&cfg, 8_320, &params, &[], false, &proposed).unwrap();
+        assert_eq!(
+            next.block_version(),
+            2,
+            "voting-driven activation bumps BlockVersion"
+        );
         assert_eq!(
             activated,
             rules_update(&[215]),
@@ -1630,10 +1685,8 @@ mod tests {
         params
             .parameters_table
             .insert(Parameter::SoftForkVotesCollected, 100); // below 3686
-        let (next, activated) = compute_boundary_parameters(
-            &cfg, 8_320, &params, &[], false, &[],
-        )
-        .unwrap();
+        let (next, activated) =
+            compute_boundary_parameters(&cfg, 8_320, &params, &[], false, &[]).unwrap();
         assert_eq!(next.block_version(), 1);
         assert_eq!(activated, empty_update());
     }
@@ -1650,10 +1703,7 @@ mod tests {
         params
             .parameters_table
             .insert(Parameter::SoftForkVotesCollected, 100);
-        let (next, _) = compute_boundary_parameters(
-            &cfg, 4_352, &params, &[], false, &[],
-        )
-        .unwrap();
+        let (next, _) = compute_boundary_parameters(&cfg, 4_352, &params, &[], false, &[]).unwrap();
         assert_eq!(next.soft_fork_starting_height(), None);
         assert_eq!(next.soft_fork_votes_collected(), None);
     }
@@ -1672,17 +1722,13 @@ mod tests {
             .parameters_table
             .insert(Parameter::SoftForkVotesCollected, 3_700);
         // Without forkVote: counters just clear.
-        let (cleared, _) = compute_boundary_parameters(
-            &cfg, 8_448, &params, &[], false, &[],
-        )
-        .unwrap();
+        let (cleared, _) =
+            compute_boundary_parameters(&cfg, 8_448, &params, &[], false, &[]).unwrap();
         assert_eq!(cleared.soft_fork_starting_height(), None);
         assert_eq!(cleared.soft_fork_votes_collected(), None);
         // With forkVote: cleanup then immediate restart.
-        let (restarted, _) = compute_boundary_parameters(
-            &cfg, 8_448, &params, &[], true, &[],
-        )
-        .unwrap();
+        let (restarted, _) =
+            compute_boundary_parameters(&cfg, 8_448, &params, &[], true, &[]).unwrap();
         assert_eq!(restarted.soft_fork_starting_height(), Some(8_448));
         assert_eq!(restarted.soft_fork_votes_collected(), Some(0));
     }
@@ -1693,12 +1739,14 @@ mod tests {
         // activated update stays empty — JVM does not wire activatedUpdate
         // for the forced path.
         let cfg = VotingConfig::mainnet();
-        let (next, activated) = compute_boundary_parameters(
-            &cfg, 417_792, &base_params(), &[], false, &[],
-        )
-        .unwrap();
+        let (next, activated) =
+            compute_boundary_parameters(&cfg, 417_792, &base_params(), &[], false, &[]).unwrap();
         assert_eq!(next.block_version(), 2);
-        assert_eq!(activated, empty_update(), "forced v2 does not activate the update");
+        assert_eq!(
+            activated,
+            empty_update(),
+            "forced v2 does not activate the update"
+        );
     }
 
     #[test]
@@ -1717,10 +1765,8 @@ mod tests {
             .insert(Parameter::SoftForkVotesCollected, 3_700);
 
         let with_409 = encode_disabled_rules(&[215, 409]);
-        let (next, activated) = compute_boundary_parameters(
-            &cfg, 8_320, &params, &[], false, &with_409,
-        )
-        .unwrap();
+        let (next, activated) =
+            compute_boundary_parameters(&cfg, 8_320, &params, &[], false, &with_409).unwrap();
         assert_eq!(next.block_version(), 4);
         assert_eq!(activated, rules_update(&[215, 409]));
         assert!(
@@ -1731,10 +1777,8 @@ mod tests {
         );
 
         let without_409 = encode_disabled_rules(&[215]);
-        let (next, _) = compute_boundary_parameters(
-            &cfg, 8_320, &params, &[], false, &without_409,
-        )
-        .unwrap();
+        let (next, _) =
+            compute_boundary_parameters(&cfg, 8_320, &params, &[], false, &without_409).unwrap();
         assert_eq!(next.block_version(), 4);
         assert_eq!(
             next.parameters_table
@@ -1752,10 +1796,7 @@ mod tests {
         let cfg = VotingConfig::testnet();
         let mut params = base_params();
         params.parameters_table.insert(Parameter::BlockVersion, 4);
-        let (next, _) = compute_boundary_parameters(
-            &cfg, 256, &params, &[], false, &[],
-        )
-        .unwrap();
+        let (next, _) = compute_boundary_parameters(&cfg, 256, &params, &[], false, &[]).unwrap();
         assert_eq!(
             next.parameters_table
                 .get(&Parameter::SubblocksPerBlock)
@@ -1780,7 +1821,10 @@ mod tests {
         let params = params_with_round(128, None);
         for h in [256u32, 4_352, 8_320, 8_448] {
             let r = compute_boundary_parameters(&cfg, h, &params, &[], false, &[]);
-            assert!(r.is_err(), "h={h} must force `votes` and error on absent 121");
+            assert!(
+                r.is_err(),
+                "h={h} must force `votes` and error on absent 121"
+            );
         }
     }
 
@@ -1856,7 +1900,12 @@ mod tests {
         // post-fork SNAPSHOT, so the LAST entry wins deterministically.
         let cfg = VotingConfig::testnet();
         let (plus_then_minus, _) = compute_boundary_parameters(
-            &cfg, 256, &base_params(), &tally_of(&[(1, 65), (-1, 65)]), false, &[],
+            &cfg,
+            256,
+            &base_params(),
+            &tally_of(&[(1, 65), (-1, 65)]),
+            false,
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1866,7 +1915,12 @@ mod tests {
         );
 
         let (minus_then_plus, _) = compute_boundary_parameters(
-            &cfg, 256, &base_params(), &tally_of(&[(-1, 65), (1, 65)]), false, &[],
+            &cfg,
+            256,
+            &base_params(),
+            &tally_of(&[(-1, 65), (1, 65)]),
+            false,
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1882,7 +1936,12 @@ mod tests {
         // snapshot, so the step applies once — not compounded.
         let cfg = VotingConfig::testnet();
         let (next, _) = compute_boundary_parameters(
-            &cfg, 256, &base_params(), &tally_of(&[(1, 65), (1, 65)]), false, &[],
+            &cfg,
+            256,
+            &base_params(),
+            &tally_of(&[(1, 65), (1, 65)]),
+            false,
+            &[],
         )
         .unwrap();
         assert_eq!(next.storage_fee_factor(), 1_275_000, "one step, not two");
@@ -1940,8 +1999,8 @@ mod tests {
     /// the sigma `RuleStatusSerializer` port (pin `75be067f`) — the
     /// payload is VALID, not lenient-tolerated.
     const MAINNET_V6_PAYLOAD: [u8; 18] = [
-        0x02, 0xD7, 0x01, 0x99, 0x03, 0x03, 0x0B, 0x01, 0x03,
-        0x10, 0x07, 0x01, 0x03, 0x11, 0x08, 0x01, 0x03, 0x12,
+        0x02, 0xD7, 0x01, 0x99, 0x03, 0x03, 0x0B, 0x01, 0x03, 0x10, 0x07, 0x01, 0x03, 0x11, 0x08,
+        0x01, 0x03, 0x12,
     ];
 
     #[test]
@@ -2144,8 +2203,7 @@ mod tests {
         // wrappers pre-swallow instead; see the chain-level test.
         let cfg = VotingConfig::testnet();
         let hostile = encode_disabled_rules(&[102]);
-        let r =
-            compute_boundary_parameters(&cfg, 256, &base_params(), &[], false, &hostile);
+        let r = compute_boundary_parameters(&cfg, 256, &base_params(), &[], false, &hostile);
         assert!(r.is_err());
     }
 
@@ -2240,8 +2298,14 @@ mod tests {
     #[test]
     fn check_header_votes_rule_212_count() {
         // votesCount = count(_ != 120) <= ParamVotesCount (= 2).
-        assert!(check_header_votes([1, 2, 120]).is_ok(), "2 ordinary + softfork");
-        assert!(check_header_votes([1, 120, 0]).is_ok(), "1 ordinary + softfork");
+        assert!(
+            check_header_votes([1, 2, 120]).is_ok(),
+            "2 ordinary + softfork"
+        );
+        assert!(
+            check_header_votes([1, 120, 0]).is_ok(),
+            "1 ordinary + softfork"
+        );
         // Three ordinary (non-120) votes is the only way to exceed 2.
         votes_err_names([1, 2, 3], "212");
     }
@@ -2250,7 +2314,10 @@ mod tests {
     fn check_header_votes_rule_213_duplicates() {
         votes_err_names([1, 1, 0], "213");
         assert!(check_header_votes([1, 2, 0]).is_ok(), "distinct ids pass");
-        assert!(check_header_votes([0, 0, 0]).is_ok(), "all zeros pass (no votes)");
+        assert!(
+            check_header_votes([0, 0, 0]).is_ok(),
+            "all zeros pass (no votes)"
+        );
     }
 
     #[test]
@@ -2266,8 +2333,14 @@ mod tests {
     #[test]
     fn check_header_votes_real_header_shapes_pass() {
         // Shapes that appear in real headers — must never break sync.
-        assert!(check_header_votes([4, 3, 0]).is_ok(), "canonical two-vote header");
-        assert!(check_header_votes([0, 0, 0]).is_ok(), "the overwhelmingly common no-vote header");
+        assert!(
+            check_header_votes([4, 3, 0]).is_ok(),
+            "canonical two-vote header"
+        );
+        assert!(
+            check_header_votes([0, 0, 0]).is_ok(),
+            "the overwhelmingly common no-vote header"
+        );
     }
 
     // ---- zombie family regression ----
@@ -2294,8 +2367,7 @@ mod tests {
         // Parameters.scala:127-128). The one legal zombie revival.
         let cfg = VotingConfig::testnet();
         let params = params_with_round(128, Some(100)); // never approved
-        let (next, _) =
-            compute_boundary_parameters(&cfg, 8_448, &params, &[], true, &[]).unwrap();
+        let (next, _) = compute_boundary_parameters(&cfg, 8_448, &params, &[], true, &[]).unwrap();
         assert_eq!(
             next.soft_fork_starting_height(),
             Some(8_448),
@@ -2309,7 +2381,7 @@ mod tests {
         let mut input: HashMap<i8, i32> = HashMap::new();
         input.insert(1, 1_250_000); // StorageFeeFactor
         input.insert(4, 1_000_000); // MaxBlockCost
-        input.insert(123, 2);       // BlockVersion
+        input.insert(123, 2); // BlockVersion
 
         let kv = pack_parameters_to_kv(&input);
         // Each entry is 2-byte key + 4-byte value
@@ -2392,7 +2464,7 @@ mod tests {
         let fields = vec![
             ([0x00u8, 0x01], 1_250_000i32.to_be_bytes().to_vec()),
             ([0x00u8, 0x7B], 2i32.to_be_bytes().to_vec()), // 0x7B = 123 = BlockVersion
-            ([0x01u8, 0x00], vec![0xCD; 33]),                // interlink-style field
+            ([0x01u8, 0x00], vec![0xCD; 33]),              // interlink-style field
         ];
 
         let packed = pack_extension_bytes(&header_id, &fields);
@@ -2416,11 +2488,11 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&[0xAAu8; 32]);
         bytes.push(0x02); // VLQ field_count = 2
-        // Field 1
+                          // Field 1
         bytes.extend_from_slice(&[0x00, 0x01]); // key
         bytes.push(4); // val_len
         bytes.extend_from_slice(&1_250_000i32.to_be_bytes()); // value
-        // Field 2
+                                                              // Field 2
         bytes.extend_from_slice(&[0x01, 0x00]); // key
         bytes.push(3); // val_len
         bytes.extend_from_slice(&[0xFF, 0xEE, 0xDD]); // value

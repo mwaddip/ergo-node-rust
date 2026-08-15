@@ -30,9 +30,22 @@ pub const TRANSACTION_TYPE_ID: u8 = 2;
 /// [`required_section_ids`] instead.
 pub fn section_ids(header: &Header) -> [(u8, [u8; 32]); 3] {
     [
-        (BLOCK_TRANSACTIONS_TYPE_ID, prefixed_hash(BLOCK_TRANSACTIONS_TYPE_ID, &header.id.0 .0, &header.transaction_root.0)),
-        (AD_PROOFS_TYPE_ID, prefixed_hash(AD_PROOFS_TYPE_ID, &header.id.0 .0, &header.ad_proofs_root.0)),
-        (EXTENSION_TYPE_ID, prefixed_hash(EXTENSION_TYPE_ID, &header.id.0 .0, &header.extension_root.0)),
+        (
+            BLOCK_TRANSACTIONS_TYPE_ID,
+            prefixed_hash(
+                BLOCK_TRANSACTIONS_TYPE_ID,
+                &header.id.0 .0,
+                &header.transaction_root.0,
+            ),
+        ),
+        (
+            AD_PROOFS_TYPE_ID,
+            prefixed_hash(AD_PROOFS_TYPE_ID, &header.id.0 .0, &header.ad_proofs_root.0),
+        ),
+        (
+            EXTENSION_TYPE_ID,
+            prefixed_hash(EXTENSION_TYPE_ID, &header.id.0 .0, &header.extension_root.0),
+        ),
     ]
 }
 

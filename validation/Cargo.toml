@@ -1,6 +1,6 @@
 [package]
 name = "ergo-validation"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "Block validation for the Ergo Rust node"
@@ -30,3 +30,7 @@ thiserror = "2"
 ergotree-interpreter = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
 ergotree-ir = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
 tempfile = "3"
+# `no-env-filter` is required, not cosmetic: without it the default filter
+# drops the emits under test and a "and warns" assertion silently passes on
+# an empty buffer.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }

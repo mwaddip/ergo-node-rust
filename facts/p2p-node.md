@@ -1,5 +1,39 @@
 # P2P Node API Contract
 
+## Module: `config::Config`
+
+### `from_toml_str(toml: &str) -> Result<Config>`
+
+Parse a `Config` from TOML **already in memory**.
+
+- **Precondition**: none. The caller owns where the text came from.
+- **Postcondition**: identical to what `load()` produces for a file with the
+  same contents. There is exactly one parse, and this is it.
+
+### `load(path: &str) -> Result<Config>`
+
+Unchanged signature and behaviour. Now defined as
+`from_toml_str(read_to_string(path)?)` rather than parsing independently, so the
+two entry points cannot drift.
+
+⚠ **Why this exists.** `load()` reading the file itself was the only way in, and
+it made the file on disk the unit of configuration. The node is moving to a
+layered `/etc/ergo-node/conf.d/` (see `facts/config.md`): several files are
+merged into one effective config, and **no single file on disk contains it**.
+A path-only entry point cannot express that.
+
+The node parses the same configuration twice — once into its own `RootConfig`,
+once into this `Config` for `[proxy]`, `[listen.*]`, `[outbound]` and
+`[identity]`. Once the first parse consumes a merged document and the second
+still reads one file, the two disagree about what the node was configured with,
+and the p2p half silently ignores every `conf.d` layer. **That is the whole
+point of this addition** — it is not a convenience overload.
+
+Do not solve it on the caller's side by serialising the merged config to a
+temporary file and passing its path. That is precisely the adapter the
+Interface Integrity rule in `CLAUDE.md` forbids: the mismatch is that this API
+names a file where it means a document, and the fix belongs here.
+
 ## Module: `node::P2pNode`
 
 The handle to a running P2P layer. Created by `P2pNode::start()`. The P2P layer runs as background tokio tasks — the caller owns the runtime.

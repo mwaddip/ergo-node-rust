@@ -129,7 +129,15 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Mode::Serve) => {
             tracing::info!(bind = %cfg.bind, "starting in serve-only mode");
-            api::serve(db, cfg.bind, start, cfg.node_url.clone(), health, shutdown_rx).await
+            api::serve(
+                db,
+                cfg.bind,
+                start,
+                cfg.node_url.clone(),
+                health,
+                shutdown_rx,
+            )
+            .await
         }
         None => {
             tracing::info!(bind = %cfg.bind, "starting in combined mode (sync + serve)");

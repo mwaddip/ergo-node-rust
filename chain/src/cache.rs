@@ -2,20 +2,21 @@
 //!
 //! Backs the migration from in-memory `Vec<Header>` / `Vec<BigUint>`
 //! to an LRU cache + lazy load from persistent storage. At mainnet
-//! scale (1.76M headers) the Vec alternative is ~1.4 GB; the cache at
-//! the default 16k capacity is ~10 MB across both caches. The
-//! integrator (main crate) wires [`HeaderLoader`] and [`ScoreLoader`]
-//! against `enr-store`.
+//! scale (1.76M headers) the Vec alternative was ~1.4 GB; the cache is
+//! bounded by [`DEFAULT_CACHE_CAPACITY`] regardless of chain length.
+//! The integrator (main crate) wires [`HeaderLoader`] and
+//! [`ScoreLoader`] against `enr-store`.
 //!
 //! Phase 1 role: cache and loaders are installed on
 //! [`crate::HeaderChain`] and kept coherent via write-through on
 //! push/pop/reorg. No reads are routed through the cache yet — that
 //! arrives in Phase 2.
 
+use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
-use ergo_chain_types::Header;
+use ergo_chain_types::{EcPoint, Header};
 use lru::LruCache;
 use num_bigint::BigUint;
 
@@ -26,24 +27,90 @@ use num_bigint::BigUint;
 ///   epoch_length` = 8 × 1024 = 8192 headers per incoming header), and
 /// - the deepest finalization-depth reorg (1440 blocks).
 ///
-/// At ~500 B/header + ~80 B/score this is ~10 MB total across both
-/// caches.
+/// Full at this capacity the two caches hold roughly 11 MB — but do not
+/// hand-carry that number anywhere. `header_entry_bytes` and
+/// `score_entry_bytes` below derive it from the actual types, and
+/// `LazyHeaderStore::header_cache_bytes` reports it at live occupancy.
 pub const DEFAULT_CACHE_CAPACITY: usize = 16_384;
+
+// ---- Memory attribution ----
+//
+// Formulas over type sizes and live counts, never measurements. They
+// live here, beside the caches they model, so a refactor of those
+// caches is editing the same file. See `facts/chain.md` § "Memory
+// attribution" and [`crate::ChainMemoryEstimate`].
+
+/// Bytes the `lru` crate spends on an entry regardless of its value:
+/// the `u32` height key and the two intrusive list pointers inside the
+/// boxed `LruEntry` node it allocates per entry.
+///
+/// `LruEntry` is private to `lru`, so the node is reconstructed from
+/// its fields rather than measured; the reconstruction ignores the few
+/// bytes of padding the real layout adds.
+const LRU_NODE_OVERHEAD_BYTES: u64 = (size_of::<u32>() + 2 * size_of::<usize>()) as u64;
+
+/// Bytes one entry occupies in the LRU's internal index, a
+/// `HashMap<KeyRef<u32>, NonNull<LruEntry<..>>>`: the two pointers of
+/// the slot plus hashbrown's one control byte per slot.
+const LRU_INDEX_SLOT_BYTES: u64 = (2 * size_of::<usize>() + 1) as u64;
+
+/// Payload of `AutolykosSolution::nonce`, a `Vec<u8>` that carries the
+/// 8-byte Autolykos nonce.
+const AUTOLYKOS_NONCE_BYTES: u64 = 8;
+
+/// Heap digits of one cumulative-difficulty `BigUint`.
+///
+/// `num-bigint` stores 64-bit digits on a 64-bit target. Mainnet total
+/// work sits around 2^71 — two digits, a 16-byte request — and this
+/// leaves room for the allocator's rounding of that request plus
+/// growth as the chain's total work climbs.
+const SCORE_DIGIT_BYTES: u64 = 32;
+
+/// Estimated bytes held by one resident entry of the header LRU.
+///
+/// Formula, not a measurement:
+/// - `size_of::<Header>()` — the value, stored inline in the boxed
+///   `LruEntry` node.
+/// - `2 × size_of::<EcPoint>()` — `Header::autolykos_solution`'s
+///   `miner_pk` and `pow_onetime_pk`, each a `Box<EcPoint>` pointing
+///   out of line. Both are populated in practice: parsing an Autolykos
+///   v2 solution materializes the group generator into
+///   `pow_onetime_pk`, mirroring the JVM's `wForV2`.
+/// - the nonce payload, the LRU node overhead, and the entry's slot in
+///   the LRU's index.
+///
+/// `Header::unparsed_bytes` and `AutolykosSolution::pow_distance` are
+/// not counted: both are empty / `None` in every header version the
+/// node accepts today.
+pub(crate) const fn header_entry_bytes() -> u64 {
+    size_of::<Header>() as u64
+        + 2 * size_of::<EcPoint>() as u64
+        + AUTOLYKOS_NONCE_BYTES
+        + LRU_NODE_OVERHEAD_BYTES
+        + LRU_INDEX_SLOT_BYTES
+}
+
+/// Estimated bytes held by one resident entry of the score LRU.
+///
+/// Formula, not a measurement: `size_of::<BigUint>()` for the value
+/// inline in the boxed `LruEntry` node, plus its heap digits, plus the
+/// node overhead and the entry's slot in the LRU's index.
+pub(crate) const fn score_entry_bytes() -> u64 {
+    size_of::<BigUint>() as u64 + SCORE_DIGIT_BYTES + LRU_NODE_OVERHEAD_BYTES + LRU_INDEX_SLOT_BYTES
+}
 
 /// Callback for loading a header by height from persistent storage.
 ///
 /// Returns `None` if no header is stored at that height. Wired by the
 /// integrator (main crate) to bridge `enr-store`.
-pub type HeaderLoader =
-    Arc<dyn Fn(u32) -> Option<Header> + Send + Sync + 'static>;
+pub type HeaderLoader = Arc<dyn Fn(u32) -> Option<Header> + Send + Sync + 'static>;
 
 /// Callback for loading a cumulative-difficulty score by height.
 ///
 /// Split from [`HeaderLoader`] so consumers that only need the header
 /// (NiPoPoW build, difficulty walk) don't pay `BigUint`
 /// deserialization on every lookup.
-pub type ScoreLoader =
-    Arc<dyn Fn(u32) -> Option<BigUint> + Send + Sync + 'static>;
+pub type ScoreLoader = Arc<dyn Fn(u32) -> Option<BigUint> + Send + Sync + 'static>;
 
 /// Paired LRU caches + loaders for headers and cumulative scores.
 ///
@@ -64,8 +131,7 @@ impl LazyHeaderStore {
     /// ([`DEFAULT_CACHE_CAPACITY`]).
     pub fn with_default_capacity() -> Self {
         Self::with_capacity(
-            NonZeroUsize::new(DEFAULT_CACHE_CAPACITY)
-                .expect("DEFAULT_CACHE_CAPACITY is nonzero"),
+            NonZeroUsize::new(DEFAULT_CACHE_CAPACITY).expect("DEFAULT_CACHE_CAPACITY is nonzero"),
         )
     }
 
@@ -149,6 +215,30 @@ impl LazyHeaderStore {
     pub fn clear(&self) {
         self.headers.lock().unwrap().clear();
         self.scores.lock().unwrap().clear();
+    }
+
+    /// Estimated bytes held by the header LRU **at its current
+    /// occupancy** — `entries × header_entry_bytes()`. A half-full
+    /// cache reports half; the capacity ceiling is not the answer.
+    ///
+    /// Constant time: reads `LruCache::len` and touches no entry.
+    ///
+    /// Not counted: the LRU's index table, which `LruCache::new`
+    /// preallocates at full capacity. Below full occupancy the real
+    /// footprint therefore exceeds this by the unused slots — roughly
+    /// half a megabyte for an empty default-capacity cache. The
+    /// contract asks for occupancy, and each resident entry's share of
+    /// that table is already included above.
+    pub fn header_cache_bytes(&self) -> u64 {
+        self.headers.lock().unwrap().len() as u64 * header_entry_bytes()
+    }
+
+    /// Estimated bytes held by the score LRU at its current occupancy —
+    /// `entries × score_entry_bytes()`. Same occupancy semantics,
+    /// constant-time guarantee, and index-table caveat as
+    /// [`Self::header_cache_bytes`].
+    pub fn score_cache_bytes(&self) -> u64 {
+        self.scores.lock().unwrap().len() as u64 * score_entry_bytes()
     }
 
     // ---- Test-only observers ----

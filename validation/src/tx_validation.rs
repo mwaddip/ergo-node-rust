@@ -10,6 +10,7 @@ use std::io::Cursor;
 
 use rayon::prelude::*;
 
+use ergo_chain_types::{ec_point, Header, PreHeader, Votes};
 use ergo_lib::chain::ergo_state_context::{ErgoStateContext, Headers};
 use ergo_lib::chain::parameters::Parameters;
 use ergo_lib::chain::transaction::Transaction;
@@ -18,7 +19,6 @@ use ergo_lib::ergotree_ir::serialization::constant_store::ConstantStore;
 use ergo_lib::ergotree_ir::serialization::sigma_byte_reader::SigmaByteReader;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_lib::wallet::tx_context::TransactionContext;
-use ergo_chain_types::{Header, PreHeader};
 
 use crate::ValidationError;
 
@@ -58,6 +58,103 @@ pub fn build_state_context(
     ErgoStateContext::new(pre_header, headers, parameters.clone())
 }
 
+/// Build an ErgoStateContext for a transaction that is **not yet in a block** —
+/// the mempool and API-submitted transactions. The preheader describes the
+/// *next* block, the one built on `last_header`.
+///
+/// `build_state_context` puts the block's own header in the preheader, which is
+/// right for a block that exists and wrong for one that does not: a wallet sets
+/// `creationHeight` to the block it expects to land in, ergo-lib enforces
+/// `creation_height <= pre_header.height` (`tx_context.rs` `verify_output`), so
+/// a preheader sitting at the tip rejects every well-formed transaction on the
+/// network by exactly one block. Which builder you call is a correctness
+/// decision (facts/validation.md, "Free Functions: state context").
+///
+/// # Caller contract
+///
+/// `preceding_headers` are the headers **strictly before `last_header`**,
+/// newest first — the same slice `build_state_context` takes for the block at
+/// `last_header`, so the two builders are interchangeable at a call site. It
+/// must NOT contain `last_header`; this function puts it at the head of the
+/// window itself, because for the *upcoming* block the tip is the newest
+/// preceding header.
+///
+/// That placement is load-bearing. ergo-lib derives `lastBlockUtxoRoot` from
+/// the newest header in the window (`signing.rs` `make_context`), and for an
+/// unconfirmed transaction that has to be the UTXO root *after* the tip, i.e.
+/// `last_header.state_root`. Pass a window whose head is the tip's parent and
+/// every mempool script reading the UTXO root sees the state of one block ago,
+/// silently and with no error anywhere.
+///
+/// Unlike `build_state_context` there is no non-empty requirement:
+/// `preceding_headers` may be empty (height 1), since `last_header` alone
+/// already satisfies the `Headers` lower bound. The window is `last_header`
+/// plus up to 9 of them — 10 total, the JVM's `LastHeadersInContext`.
+///
+/// # JVM reference
+///
+/// `ErgoStateContext.simplifiedUpcoming()` (`ErgoStateContext.scala:140`)
+/// composed with `PreHeader.apply` (`PreHeader.scala:49-63`) and
+/// `AutolykosPowScheme.derivedHeaderFields` (`AutolykosPowScheme.scala:455`).
+/// `UpcomingStateContext` overrides `sigmaLastHeaders` to the whole
+/// `lastHeaders` with no `drop(1)` (`ErgoStateContext.scala:46`) — that missing
+/// drop is precisely why the tip stays in the window here while block
+/// validation excludes its own header.
+///
+/// Two deliberate divergences, both recorded in the contract:
+/// - `parameters` are the caller's, active for `last_header`. The JVM
+///   recomputes them for `height + 1` inside `simplifiedUpcoming()`; the two
+///   differ only on a block that crosses an epoch boundary.
+/// - `votes` is `[0, 0, 0]` where the JVM passes an empty array. `Votes` is
+///   three fixed bytes and cannot represent empty; a script reading
+///   `CONTEXT.preHeader.votes` sees a 3-byte zero collection instead of an
+///   empty one. (The JVM's own `PreHeader.fake` uses three zero bytes.)
+///
+/// **Mining does not use this builder, deliberately** — it synthesizes a stub
+/// header at `height + 1` with a real wall-clock timestamp and a real miner key
+/// and feeds that to `build_state_context`. A miner knows both; the mempool
+/// knows neither.
+pub fn build_upcoming_state_context(
+    last_header: &Header,
+    preceding_headers: &[Header],
+    parameters: &Parameters,
+) -> ErgoStateContext {
+    debug_assert!(
+        preceding_headers
+            .first()
+            .is_none_or(|h| h.id != last_header.id),
+        "preceding_headers must hold only headers strictly before last_header — \
+         build_upcoming_state_context prepends last_header itself"
+    );
+
+    let pre_header = PreHeader {
+        version: last_header.version,
+        parent_id: last_header.id,
+        // The JVM's literal `lastHeader.timestamp + 1`, not wall clock: the
+        // mempool cannot know when the next block is mined. Saturating because
+        // a partial function has no business on a mempool-facing path — the
+        // input is chain data, but nothing here needs to be able to panic.
+        timestamp: last_header.timestamp.saturating_add(1),
+        n_bits: last_header.n_bits,
+        height: last_header.height.saturating_add(1),
+        // The next block's miner is unknown, so the group generator stands in.
+        // A script reading `CONTEXT.preHeader.minerPk` therefore sees a
+        // placeholder in the mempool and the real key once mined — the same
+        // divergence the JVM has, and the reason a transaction can pass here
+        // and still fail in a block.
+        miner_pk: Box::new(ec_point::generator()),
+        votes: Votes([0, 0, 0]),
+    };
+
+    let mut window = Vec::with_capacity(1 + preceding_headers.len().min(9));
+    window.push(last_header.clone());
+    window.extend(preceding_headers.iter().take(9).cloned());
+    let headers =
+        Headers::from_vec(window).expect("window always holds last_header, so it is never empty");
+
+    ErgoStateContext::new(pre_header, headers, parameters.clone())
+}
+
 /// Validate a single transaction against provided input and data-input boxes.
 ///
 /// Runs full ErgoScript evaluation via ergo-lib's TransactionContext.
@@ -68,18 +165,20 @@ pub fn validate_single_transaction(
     data_boxes: Vec<ErgoBox>,
     state_context: &ErgoStateContext,
 ) -> Result<u64, ValidationError> {
-    let tx_context = TransactionContext::new(tx.clone(), input_boxes, data_boxes)
-        .map_err(|e| ValidationError::TransactionInvalid {
-            index: 0,
-            reason: format!("context: {e}"),
-        })?;
-
-    let cost = tx_context.validate(state_context).map_err(|e| {
+    let tx_context = TransactionContext::new(tx.clone(), input_boxes, data_boxes).map_err(|e| {
         ValidationError::TransactionInvalid {
             index: 0,
-            reason: format!("{e}"),
+            reason: format!("context: {e}"),
         }
     })?;
+
+    let cost =
+        tx_context
+            .validate(state_context)
+            .map_err(|e| ValidationError::TransactionInvalid {
+                index: 0,
+                reason: format!("{e}"),
+            })?;
 
     Ok(cost)
 }
@@ -110,7 +209,10 @@ pub fn validate_transactions(
         // Can't build ErgoStateContext without preceding headers.
         // Only happens at height 1 (genesis) which has no standard transactions.
         // The SDK's `Headers` type (BoundedVec<_, 1, 10>) now also enforces ≥ 1.
-        tracing::warn!(height = header.height, "skipping tx validation: no preceding headers");
+        tracing::warn!(
+            height = header.height,
+            "skipping tx validation: no preceding headers"
+        );
         return Ok(0);
     }
 
@@ -129,19 +231,19 @@ pub fn validate_transactions(
         .par_iter()
         .enumerate()
         .map(|(tx_idx, tx)| {
-            let input_boxes: Vec<ErgoBox> = tx
-                .inputs
-                .iter()
-                .map(|input| {
-                    let id = box_id_bytes(&input.box_id);
-                    box_map.get(&id).cloned().ok_or_else(|| {
-                        ValidationError::TransactionInvalid {
-                            index: tx_idx,
-                            reason: format!("input box {} not found", hex::encode(id)),
-                        }
+            let input_boxes: Vec<ErgoBox> =
+                tx.inputs
+                    .iter()
+                    .map(|input| {
+                        let id = box_id_bytes(&input.box_id);
+                        box_map.get(&id).cloned().ok_or_else(|| {
+                            ValidationError::TransactionInvalid {
+                                index: tx_idx,
+                                reason: format!("input box {} not found", hex::encode(id)),
+                            }
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<Vec<_>, _>>()?;
 
             let data_boxes: Vec<ErgoBox> = tx
                 .data_inputs
@@ -162,13 +264,17 @@ pub fn validate_transactions(
                 .transpose()?
                 .unwrap_or_default();
 
-            validate_single_transaction(tx, input_boxes, data_boxes, &state_context)
-                .map_err(|e| match e {
+            validate_single_transaction(tx, input_boxes, data_boxes, &state_context).map_err(|e| {
+                match e {
                     ValidationError::TransactionInvalid { reason, .. } => {
-                        ValidationError::TransactionInvalid { index: tx_idx, reason }
+                        ValidationError::TransactionInvalid {
+                            index: tx_idx,
+                            reason,
+                        }
                     }
                     other => other,
-                })
+                }
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -191,10 +297,16 @@ fn enforce_block_cost(costs: &[u64], max_cost: u64) -> Result<u64, ValidationErr
     for &cost in costs {
         total = total
             .checked_add(cost)
-            .ok_or(ValidationError::BlockCostExceeded { cost: u64::MAX, max_cost })?;
+            .ok_or(ValidationError::BlockCostExceeded {
+                cost: u64::MAX,
+                max_cost,
+            })?;
     }
     if total > max_cost {
-        return Err(ValidationError::BlockCostExceeded { cost: total, max_cost });
+        return Err(ValidationError::BlockCostExceeded {
+            cost: total,
+            max_cost,
+        });
     }
     Ok(total)
 }
@@ -205,7 +317,7 @@ fn enforce_block_cost(costs: &[u64], max_cost: u64) -> Result<u64, ValidationErr
 /// Uses rayon par_iter internally for intra-block parallelism.
 /// On success returns the block-accumulated transaction cost (Σ per-tx
 /// costs, enforced ≤ `parameters.max_block_cost()`).
-pub fn evaluate_scripts(eval: &crate::DeferredEval) -> Result<u64, crate::ValidationError> {
+pub fn evaluate_scripts(eval: &crate::ScriptEvalInputs) -> Result<u64, crate::ValidationError> {
     validate_transactions(
         &eval.transactions,
         &eval.proof_boxes,
@@ -226,6 +338,7 @@ fn box_id_bytes(box_id: &ergo_lib::ergotree_ir::chain::ergo_box::BoxId) -> [u8; 
 mod block_342964_tests {
     use super::*;
 
+    use ergo_chain_types::{BlockId, EcPoint, Votes};
     use ergo_lib::chain::transaction::input::prover_result::ProverResult as ChainProverResult;
     use ergo_lib::chain::transaction::input::Input;
     use ergo_lib::chain::transaction::Transaction;
@@ -235,7 +348,6 @@ mod block_342964_tests {
     use ergo_lib::ergotree_ir::chain::tx_id::TxId;
     use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
     use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
-    use ergo_chain_types::{BlockId, EcPoint, Votes};
     use ergotree_interpreter::sigma_protocol::prover::ProofBytes;
     use ergotree_ir::chain::context_extension::ContextExtension;
 
@@ -286,12 +398,11 @@ mod block_342964_tests {
 
     fn make_pre_header() -> PreHeader {
         let miner_pk = EcPoint::from_base16_str(MINER_PK_HEX.to_string()).unwrap();
-        let parent_id_bytes: [u8; 32] = hex::decode(
-            "be5d64122592b6d2a07a3a619d4e68598e8df38e57ccbff732fc797bbdcf86ef",
-        )
-        .unwrap()
-        .try_into()
-        .unwrap();
+        let parent_id_bytes: [u8; 32] =
+            hex::decode("be5d64122592b6d2a07a3a619d4e68598e8df38e57ccbff732fc797bbdcf86ef")
+                .unwrap()
+                .try_into()
+                .unwrap();
 
         PreHeader {
             version: 1,
@@ -382,8 +493,7 @@ mod block_342964_tests {
         let pre_header = make_pre_header();
         let dummy_header = make_dummy_header();
         let headers = Headers::from_vec(vec![dummy_header.clone(); 10]).unwrap();
-        let state_context =
-            ErgoStateContext::new(pre_header, headers, Parameters::default());
+        let state_context = ErgoStateContext::new(pre_header, headers, Parameters::default());
 
         // Validate — this is where we expect the "ReducedToFalse" failure
         let input_boxes = vec![input0, input1, input2];
@@ -434,8 +544,7 @@ mod block_342964_tests {
         let pre_header = make_pre_header();
         let dummy_header = make_dummy_header();
         let headers = Headers::from_vec(vec![dummy_header.clone(); 10]).unwrap();
-        let state_context =
-            ErgoStateContext::new(pre_header, headers, Parameters::default());
+        let state_context = ErgoStateContext::new(pre_header, headers, Parameters::default());
 
         for (i, (value, creation_height, src_tx, src_idx)) in boxes.iter().enumerate() {
             let input_box = make_fee_box(*value, *creation_height, src_tx, *src_idx);
@@ -449,11 +558,9 @@ mod block_342964_tests {
             };
 
             let inputs = vec![make_empty_input(input_box.box_id())];
-            let tx =
-                Transaction::new_from_vec(inputs, vec![], vec![output_candidate]).unwrap();
+            let tx = Transaction::new_from_vec(inputs, vec![], vec![output_candidate]).unwrap();
 
-            let result =
-                validate_single_transaction(&tx, vec![input_box], vec![], &state_context);
+            let result = validate_single_transaction(&tx, vec![input_box], vec![], &state_context);
 
             match &result {
                 Ok(cost) => println!("  input[{i}]: PASS (cost={cost})"),
@@ -544,7 +651,9 @@ mod block_342964_tests {
             None,
         );
         // input[2]: P2S script, 0.001 ERG, with token and registers R4-R7
-        let r4_bytes = hex::decode("73b6c8cfa0ef80096cb7127fa0f943acb22053e87f77e824b4d2749ffe0336d2").unwrap();
+        let r4_bytes =
+            hex::decode("73b6c8cfa0ef80096cb7127fa0f943acb22053e87f77e824b4d2749ffe0336d2")
+                .unwrap();
         let r6_pk = EcPoint::from_base16_str(
             "0355e3409b35892e2b916a6362a93f742d06ce1726e2eaa688738b34b652d1142a".to_string(),
         )
@@ -552,7 +661,10 @@ mod block_342964_tests {
 
         let p2s_regs = NonMandatoryRegisters::new(vec![
             (NonMandatoryRegisterId::R4, Constant::from(r4_bytes)),
-            (NonMandatoryRegisterId::R5, Constant::from(100_000_000_000i64)),
+            (
+                NonMandatoryRegisterId::R5,
+                Constant::from(100_000_000_000i64),
+            ),
             (NonMandatoryRegisterId::R6, Constant::from(r6_pk)),
             (NonMandatoryRegisterId::R7, Constant::from(350_000i32)),
         ])
@@ -572,8 +684,7 @@ mod block_342964_tests {
             token_id,
             amount: token_amount,
         };
-        let tokens =
-            Some(ergotree_ir::chain::ergo_box::BoxTokens::from_vec(vec![token]).unwrap());
+        let tokens = Some(ergotree_ir::chain::ergo_box::BoxTokens::from_vec(vec![token]).unwrap());
 
         let input2 = make_box_with_regs(
             1_000_000,
@@ -587,11 +698,9 @@ mod block_342964_tests {
 
         // --- Output candidates for tx[1] ---
         // output[0]: 100 ERG, P2PK(0355e3...), R4=SInt(-1)
-        let out0_regs = NonMandatoryRegisters::new(vec![(
-            NonMandatoryRegisterId::R4,
-            Constant::from(-1i32),
-        )])
-        .unwrap();
+        let out0_regs =
+            NonMandatoryRegisters::new(vec![(NonMandatoryRegisterId::R4, Constant::from(-1i32))])
+                .unwrap();
         let out0 = ErgoBoxCandidate {
             value: BoxValue::try_from(100_000_000_000u64).unwrap(),
             ergo_tree: ErgoTree::sigma_parse_bytes(
@@ -641,8 +750,7 @@ mod block_342964_tests {
         let pre_header = make_pre_header();
         let dummy_header = make_dummy_header();
         let headers = Headers::from_vec(vec![dummy_header.clone(); 10]).unwrap();
-        let state_context =
-            ErgoStateContext::new(pre_header, headers, Parameters::default());
+        let state_context = ErgoStateContext::new(pre_header, headers, Parameters::default());
 
         // Build TransactionContext + evaluation context for input[2]
         let tx_context =
@@ -654,24 +762,22 @@ mod block_342964_tests {
         let result = reduce_to_crypto(&p2s_tree, &ctx);
 
         match &result {
-            Ok(rr) => {
-                match &rr.sigma_prop {
-                    SigmaBoolean::TrivialProp(true) => {
-                        println!("PASS — script reduces to TrivialProp(true) — no proof needed");
-                        println!("  This matches JVM behavior.");
-                    }
-                    SigmaBoolean::TrivialProp(false) => {
-                        println!("BUG — script reduces to TrivialProp(false)");
-                        println!("  JVM evaluates this as true. sigma-rust divergence!");
-                    }
-                    other => {
-                        println!("SIGMA — script reduces to: {:?}", other);
-                        println!("  If this is ProveDlog, it means the boolean condition is false");
-                        println!("  and the fallback path (needing a proof) is taken.");
-                        println!("  JVM accepts this without a proof, so this is a divergence.");
-                    }
+            Ok(rr) => match &rr.sigma_prop {
+                SigmaBoolean::TrivialProp(true) => {
+                    println!("PASS — script reduces to TrivialProp(true) — no proof needed");
+                    println!("  This matches JVM behavior.");
                 }
-            }
+                SigmaBoolean::TrivialProp(false) => {
+                    println!("BUG — script reduces to TrivialProp(false)");
+                    println!("  JVM evaluates this as true. sigma-rust divergence!");
+                }
+                other => {
+                    println!("SIGMA — script reduces to: {:?}", other);
+                    println!("  If this is ProveDlog, it means the boolean condition is false");
+                    println!("  and the fallback path (needing a proof) is taken.");
+                    println!("  JVM accepts this without a proof, so this is a divergence.");
+                }
+            },
             Err(e) => {
                 println!("ERROR — script evaluation failed: {e}");
                 println!("  This is an evaluation error, not a 'reduced to false'.");
@@ -700,66 +806,102 @@ mod block_342964_tests {
 
         // Build same context as p2s_script_selfboxindex_342964
         let input0 = make_box_with_regs(
-            10_000_000_000, 342_704,
+            10_000_000_000,
+            342_704,
             "0008cd02d84a11191f434daa5bed70e0e4db4e1563910622ee269f3dc219e0e854e108a5",
             "08c97e58d0ffc6356b31230b2c69ceb2e1a6883dcdde22cd1d41d5102e9e2503",
-            0, NonMandatoryRegisters::empty(), None,
+            0,
+            NonMandatoryRegisters::empty(),
+            None,
         );
         let input1 = make_box_with_regs(
-            100_000_000_000, 342_717,
+            100_000_000_000,
+            342_717,
             "0008cd02d84a11191f434daa5bed70e0e4db4e1563910622ee269f3dc219e0e854e108a5",
             "034c3ac56efe249edcf88dbbf974531596848a1c48aa39e17948689d5e78c877",
-            0, NonMandatoryRegisters::empty(), None,
+            0,
+            NonMandatoryRegisters::empty(),
+            None,
         );
 
-        let r4_bytes = hex::decode("73b6c8cfa0ef80096cb7127fa0f943acb22053e87f77e824b4d2749ffe0336d2").unwrap();
+        let r4_bytes =
+            hex::decode("73b6c8cfa0ef80096cb7127fa0f943acb22053e87f77e824b4d2749ffe0336d2")
+                .unwrap();
         let r6_pk = EcPoint::from_base16_str(
             "0355e3409b35892e2b916a6362a93f742d06ce1726e2eaa688738b34b652d1142a".to_string(),
-        ).unwrap();
+        )
+        .unwrap();
         let p2s_regs = NonMandatoryRegisters::new(vec![
             (NonMandatoryRegisterId::R4, Constant::from(r4_bytes)),
-            (NonMandatoryRegisterId::R5, Constant::from(100_000_000_000i64)),
+            (
+                NonMandatoryRegisterId::R5,
+                Constant::from(100_000_000_000i64),
+            ),
             (NonMandatoryRegisterId::R6, Constant::from(r6_pk)),
             (NonMandatoryRegisterId::R7, Constant::from(350_000i32)),
-        ]).unwrap();
+        ])
+        .unwrap();
 
-        let token_id_bytes: [u8; 32] = hex::decode("f9230aa721f97a319d91c6b701742403fcb4a8e069c9172d9e3370f3fcd01f47").unwrap().try_into().unwrap();
-        let token_id = ergo_lib::ergotree_ir::chain::token::TokenId::from(ergo_chain_types::Digest32::from(token_id_bytes));
-        let token_amount = ergo_lib::ergotree_ir::chain::token::TokenAmount::try_from(4_294_967_296u64).unwrap();
-        let token = ergo_lib::ergotree_ir::chain::token::Token { token_id, amount: token_amount };
+        let token_id_bytes: [u8; 32] =
+            hex::decode("f9230aa721f97a319d91c6b701742403fcb4a8e069c9172d9e3370f3fcd01f47")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let token_id = ergo_lib::ergotree_ir::chain::token::TokenId::from(
+            ergo_chain_types::Digest32::from(token_id_bytes),
+        );
+        let token_amount =
+            ergo_lib::ergotree_ir::chain::token::TokenAmount::try_from(4_294_967_296u64).unwrap();
+        let token = ergo_lib::ergotree_ir::chain::token::Token {
+            token_id,
+            amount: token_amount,
+        };
         let tokens = Some(ergotree_ir::chain::ergo_box::BoxTokens::from_vec(vec![token]).unwrap());
 
         let input2 = make_box_with_regs(
-            1_000_000, 342_935, P2S_TREE_HEX,
+            1_000_000,
+            342_935,
+            P2S_TREE_HEX,
             "e35caa4c6e257053381b1cd7b453bac84c7064a6b955c07ff02a57ea2c61a703",
-            0, p2s_regs, tokens.clone(),
+            0,
+            p2s_regs,
+            tokens.clone(),
         );
 
         // Output[0] with R4=SInt(-1)
-        let out0_regs = NonMandatoryRegisters::new(vec![
-            (NonMandatoryRegisterId::R4, Constant::from(-1i32)),
-        ]).unwrap();
+        let out0_regs =
+            NonMandatoryRegisters::new(vec![(NonMandatoryRegisterId::R4, Constant::from(-1i32))])
+                .unwrap();
         let out0 = ErgoBoxCandidate {
             value: BoxValue::try_from(100_000_000_000u64).unwrap(),
-            ergo_tree: ErgoTree::sigma_parse_bytes(&hex::decode(
-                "0008cd0355e3409b35892e2b916a6362a93f742d06ce1726e2eaa688738b34b652d1142a"
-            ).unwrap()).unwrap(),
+            ergo_tree: ErgoTree::sigma_parse_bytes(
+                &hex::decode(
+                    "0008cd0355e3409b35892e2b916a6362a93f742d06ce1726e2eaa688738b34b652d1142a",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
             tokens: None,
             additional_registers: out0_regs,
             creation_height: 342_935,
         };
         let out1 = ErgoBoxCandidate {
             value: BoxValue::try_from(10_000_000_000u64).unwrap(),
-            ergo_tree: ErgoTree::sigma_parse_bytes(&hex::decode(
-                "0008cd02d84a11191f434daa5bed70e0e4db4e1563910622ee269f3dc219e0e854e108a5"
-            ).unwrap()).unwrap(),
+            ergo_tree: ErgoTree::sigma_parse_bytes(
+                &hex::decode(
+                    "0008cd02d84a11191f434daa5bed70e0e4db4e1563910622ee269f3dc219e0e854e108a5",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
             tokens,
             additional_registers: NonMandatoryRegisters::empty(),
             creation_height: 342_935,
         };
         let out2 = ErgoBoxCandidate {
             value: BoxValue::try_from(1_000_000u64).unwrap(),
-            ergo_tree: ErgoTree::sigma_parse_bytes(&hex::decode(FEE_CONTRACT_HEX).unwrap()).unwrap(),
+            ergo_tree: ErgoTree::sigma_parse_bytes(&hex::decode(FEE_CONTRACT_HEX).unwrap())
+                .unwrap(),
             tokens: None,
             additional_registers: NonMandatoryRegisters::empty(),
             creation_height: 342_935,
@@ -777,7 +919,8 @@ mod block_342964_tests {
         let headers = Headers::from_vec(vec![dummy_header.clone(); 10]).unwrap();
         let state_context = ErgoStateContext::new(pre_header, headers, Parameters::default());
 
-        let tx_context = TransactionContext::new(tx.clone(), vec![input0, input1, input2], vec![]).unwrap();
+        let tx_context =
+            TransactionContext::new(tx.clone(), vec![input0, input1, input2], vec![]).unwrap();
         let ctx = make_context(&state_context, &tx_context, 2).unwrap();
 
         // Check selfBoxIndex by finding self_box position in inputs
@@ -786,7 +929,9 @@ mod block_342964_tests {
 
         // Check output[0].R4
         let out0_box = &ctx.outputs[0];
-        let r4_val = out0_box.additional_registers.get(NonMandatoryRegisterId::R4);
+        let r4_val = out0_box
+            .additional_registers
+            .get(NonMandatoryRegisterId::R4);
         println!("output[0].R4: {:?}", r4_val);
 
         // Check: do propositionBytes match?
@@ -794,41 +939,59 @@ mod block_342964_tests {
         let pk_hex = "0355e3409b35892e2b916a6362a93f742d06ce1726e2eaa688738b34b652d1142a";
         let expected_p2pk = format!("0008cd{}", pk_hex);
         let expected_bytes = hex::decode(&expected_p2pk).unwrap();
-        println!("output[0] ergoTree bytes: {}", hex::encode(&out0_script_bytes));
+        println!(
+            "output[0] ergoTree bytes: {}",
+            hex::encode(&out0_script_bytes)
+        );
         println!("expected proveDlog bytes: {}", expected_p2pk);
-        println!("propositionBytes match: {}", out0_script_bytes == expected_bytes);
+        println!(
+            "propositionBytes match: {}",
+            out0_script_bytes == expected_bytes
+        );
 
         // Now try evaluating simpler scripts to isolate the failing condition
         // Test: HEIGHT < SELF.R7
         println!("\nHEIGHT = {}", ctx.height);
         println!("SELF.R7 should be 350000");
-        println!("HEIGHT < R7 = {} < 350000 = {}", ctx.height, ctx.height < 350_000);
+        println!(
+            "HEIGHT < R7 = {} < 350000 = {}",
+            ctx.height,
+            ctx.height < 350_000
+        );
 
         // The real question: what does CONTEXT.selfBoxIndex evaluate to?
         // And does output[0].R4[Int] == selfBoxIndex?
-        println!("\nKey comparison: output[0].R4 = {:?} vs selfBoxIndex = {:?}",
-            r4_val, self_box_idx);
+        println!(
+            "\nKey comparison: output[0].R4 = {:?} vs selfBoxIndex = {:?}",
+            r4_val, self_box_idx
+        );
 
         // Verify R4 by constructing output[0] with the REAL tx_id and checking box_id
-        let real_tx_id_bytes: [u8; 32] = hex::decode(
-            "9302a2983d9cc3f2b9e271097aa3128581c6cad8b59f7b6bc3e08fa6cb63ad3f"
-        ).unwrap().try_into().unwrap();
+        let real_tx_id_bytes: [u8; 32] =
+            hex::decode("9302a2983d9cc3f2b9e271097aa3128581c6cad8b59f7b6bc3e08fa6cb63ad3f")
+                .unwrap()
+                .try_into()
+                .unwrap();
         let real_tx_id = TxId::from(ergo_chain_types::Digest32::from(real_tx_id_bytes));
 
         // Construct output[0] as ErgoBox with R4=SInt(-1)
         let out0_with_r4 = ErgoBox::new(
             BoxValue::try_from(100_000_000_000u64).unwrap(),
-            ErgoTree::sigma_parse_bytes(&hex::decode(
-                "0008cd0355e3409b35892e2b916a6362a93f742d06ce1726e2eaa688738b34b652d1142a"
-            ).unwrap()).unwrap(),
+            ErgoTree::sigma_parse_bytes(
+                &hex::decode(
+                    "0008cd0355e3409b35892e2b916a6362a93f742d06ce1726e2eaa688738b34b652d1142a",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
             None,
-            NonMandatoryRegisters::new(vec![
-                (NonMandatoryRegisterId::R4, Constant::from(-1i32)),
-            ]).unwrap(),
+            NonMandatoryRegisters::new(vec![(NonMandatoryRegisterId::R4, Constant::from(-1i32))])
+                .unwrap(),
             342_935,
             real_tx_id,
             0,
-        ).unwrap();
+        )
+        .unwrap();
 
         let computed_box_id = hex::encode(out0_with_r4.box_id().as_ref());
         let expected_box_id = "a384930961967f4112d71445feebe000706a064a5c467b483f3d5b982b52a502";
@@ -841,34 +1004,54 @@ mod block_342964_tests {
             // Try R4=SInt(0)
             let out0_r4_zero = ErgoBox::new(
                 BoxValue::try_from(100_000_000_000u64).unwrap(),
-                ErgoTree::sigma_parse_bytes(&hex::decode(
-                    "0008cd0355e3409b35892e2b916a6362a93f742d06ce1726e2eaa688738b34b652d1142a"
-                ).unwrap()).unwrap(),
+                ErgoTree::sigma_parse_bytes(
+                    &hex::decode(
+                        "0008cd0355e3409b35892e2b916a6362a93f742d06ce1726e2eaa688738b34b652d1142a",
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
                 None,
-                NonMandatoryRegisters::new(vec![
-                    (NonMandatoryRegisterId::R4, Constant::from(0i32)),
-                ]).unwrap(),
+                NonMandatoryRegisters::new(vec![(
+                    NonMandatoryRegisterId::R4,
+                    Constant::from(0i32),
+                )])
+                .unwrap(),
                 342_935,
                 real_tx_id,
                 0,
-            ).unwrap();
-            println!("  computed (R4=0):  {}", hex::encode(out0_r4_zero.box_id().as_ref()));
+            )
+            .unwrap();
+            println!(
+                "  computed (R4=0):  {}",
+                hex::encode(out0_r4_zero.box_id().as_ref())
+            );
 
             // Try R4=SInt(2) — would match selfBoxIndex
             let out0_r4_two = ErgoBox::new(
                 BoxValue::try_from(100_000_000_000u64).unwrap(),
-                ErgoTree::sigma_parse_bytes(&hex::decode(
-                    "0008cd0355e3409b35892e2b916a6362a93f742d06ce1726e2eaa688738b34b652d1142a"
-                ).unwrap()).unwrap(),
+                ErgoTree::sigma_parse_bytes(
+                    &hex::decode(
+                        "0008cd0355e3409b35892e2b916a6362a93f742d06ce1726e2eaa688738b34b652d1142a",
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
                 None,
-                NonMandatoryRegisters::new(vec![
-                    (NonMandatoryRegisterId::R4, Constant::from(2i32)),
-                ]).unwrap(),
+                NonMandatoryRegisters::new(vec![(
+                    NonMandatoryRegisterId::R4,
+                    Constant::from(2i32),
+                )])
+                .unwrap(),
                 342_935,
                 real_tx_id,
                 0,
-            ).unwrap();
-            println!("  computed (R4=2):  {}", hex::encode(out0_r4_two.box_id().as_ref()));
+            )
+            .unwrap();
+            println!(
+                "  computed (R4=2):  {}",
+                hex::encode(out0_r4_two.box_id().as_ref())
+            );
         }
     }
 }
@@ -877,9 +1060,7 @@ mod block_342964_tests {
 mod state_context_window_tests {
     use super::*;
 
-    use ergo_chain_types::{
-        ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint, Votes,
-    };
+    use ergo_chain_types::{ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint, Votes};
 
     fn header_at(height: u32) -> Header {
         Header {
@@ -931,6 +1112,211 @@ mod state_context_window_tests {
         assert_eq!(ctx.headers.len(), 10);
         assert_eq!(ctx.headers.first().height, 19);
         assert_eq!(ctx.headers.last().height, 10);
+    }
+}
+
+#[cfg(test)]
+mod upcoming_state_context_tests {
+    use super::*;
+
+    use ergo_chain_types::{ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint};
+    use ergo_lib::chain::transaction::input::prover_result::ProverResult;
+    use ergo_lib::chain::transaction::input::Input;
+    use ergo_lib::ergotree_ir::chain::ergo_box::{ErgoBoxCandidate, NonMandatoryRegisters};
+    use ergotree_interpreter::sigma_protocol::prover::ProofBytes;
+    use ergotree_ir::chain::context_extension::ContextExtension;
+
+    use crate::test_support::{make_box, sigma_bool_tree, SEED_HEIGHT};
+
+    fn tagged(height: u32) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&height.to_le_bytes());
+        bytes
+    }
+
+    fn tagged_root(height: u32) -> [u8; 33] {
+        let mut bytes = [0u8; 33];
+        bytes[..4].copy_from_slice(&height.to_le_bytes());
+        bytes
+    }
+
+    /// `id`, `parent_id` and `state_root` are all distinct per height — those
+    /// are exactly the fields a wrong window silently swaps.
+    fn header_at(height: u32) -> Header {
+        Header {
+            version: 3,
+            id: BlockId(Digest32::from(tagged(height))),
+            parent_id: BlockId(Digest32::from(tagged(height.wrapping_sub(1)))),
+            ad_proofs_root: Digest32::from([0u8; 32]),
+            state_root: ADDigest::from(tagged_root(height)),
+            transaction_root: Digest32::from([0u8; 32]),
+            timestamp: 1_600_000_000_000 + height as u64,
+            n_bits: 118_099_735,
+            height,
+            extension_root: Digest32::from([0u8; 32]),
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce: vec![0u8; 8],
+                pow_distance: None,
+            },
+            votes: Votes([0, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        }
+    }
+
+    /// What a wallet builds: spend one box, create one output declaring the
+    /// block it expects to land in.
+    fn tx_creating_at(creation_height: u32, source: &ErgoBox) -> Transaction {
+        let output = ErgoBoxCandidate {
+            value: source.value,
+            ergo_tree: sigma_bool_tree(true),
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height,
+        };
+        let input = Input::new(
+            source.box_id(),
+            ProverResult {
+                proof: ProofBytes::Empty,
+                extension: ContextExtension::empty(),
+            },
+        );
+        Transaction::new_from_vec(vec![input], vec![], vec![output]).expect("transaction")
+    }
+
+    /// The preheader is the *next* block: height `tip + 1`, parented on the tip
+    /// itself rather than on the tip's parent.
+    #[test]
+    fn preheader_describes_the_next_block() {
+        let last = header_at(1_850_410);
+        let ctx =
+            build_upcoming_state_context(&last, &[header_at(1_850_409)], &Parameters::default());
+
+        assert_eq!(ctx.pre_header.height, last.height + 1);
+        assert_eq!(
+            ctx.pre_header.parent_id, last.id,
+            "the next block is parented on the tip"
+        );
+        assert_ne!(
+            ctx.pre_header.parent_id, last.parent_id,
+            "PreHeader::from(Header) would have copied the tip's own parent"
+        );
+        assert_eq!(ctx.pre_header.version, last.version);
+        assert_eq!(ctx.pre_header.n_bits, last.n_bits);
+        assert_eq!(
+            ctx.pre_header.timestamp,
+            last.timestamp + 1,
+            "the JVM's literal +1, not wall clock"
+        );
+        assert_eq!(
+            *ctx.pre_header.miner_pk,
+            ec_point::generator(),
+            "no miner is known for a block nobody has mined"
+        );
+        assert_eq!(ctx.pre_header.votes, Votes([0, 0, 0]));
+    }
+
+    /// The live failure, in one test: at tip H a node rejected **every**
+    /// transaction the network offered it with `Creation height H+1 >
+    /// preheader height`, because the mempool validated against a preheader
+    /// sitting at H. Wallets target H+1; the upcoming context is the one that
+    /// admits them.
+    #[test]
+    fn tip_plus_one_creation_height_passes_upcoming_and_fails_at_the_tip() {
+        let last = header_at(SEED_HEIGHT);
+        let preceding = [header_at(SEED_HEIGHT - 1)];
+        let source = make_box(true, 0x11);
+        let tx = tx_creating_at(SEED_HEIGHT + 1, &source);
+
+        let upcoming = build_upcoming_state_context(&last, &preceding, &Parameters::default());
+        validate_single_transaction(&tx, vec![source.clone()], vec![], &upcoming)
+            .expect("a transaction targeting the next block must validate against it");
+
+        let at_tip = build_state_context(&last, &preceding, &Parameters::default());
+        let err = validate_single_transaction(&tx, vec![source], vec![], &at_tip)
+            .expect_err("the same transaction is one block early for a preheader at the tip");
+        let reason = format!("{err}");
+        assert!(
+            reason.contains(&format!(
+                "Creation height {} > preheader height",
+                SEED_HEIGHT + 1
+            )),
+            "expected the observed mempool rejection, got: {reason}"
+        );
+    }
+
+    /// The tip occupies a slot in the window, so ten ancestors become nine.
+    /// Total stays at the JVM's `LastHeadersInContext`.
+    #[test]
+    fn window_is_the_tip_plus_nine_ancestors() {
+        let last = header_at(20);
+        let preceding: Vec<Header> = (10..20).rev().map(header_at).collect();
+        let ctx = build_upcoming_state_context(&last, &preceding, &Parameters::default());
+
+        assert_eq!(ctx.headers.len(), 10);
+        assert_eq!(
+            ctx.headers.first().height,
+            20,
+            "the tip is the newest preceding header of the upcoming block"
+        );
+        assert_eq!(
+            ctx.headers.last().height,
+            11,
+            "the tenth ancestor (height 10) drops out to make room for the tip"
+        );
+    }
+
+    /// Near genesis the window is short rather than padded, same as the block
+    /// builder — and unlike it, an empty ancestor slice is legal, because the
+    /// tip alone already satisfies `Headers`' lower bound.
+    #[test]
+    fn short_window_is_not_padded_and_no_ancestors_is_legal() {
+        let ctx = build_upcoming_state_context(
+            &header_at(3),
+            &[header_at(2), header_at(1)],
+            &Parameters::default(),
+        );
+        assert_eq!(ctx.headers.len(), 3);
+        assert_eq!(ctx.headers.first().height, 3);
+        assert_eq!(ctx.headers.last().height, 1);
+
+        let genesis = build_upcoming_state_context(&header_at(1), &[], &Parameters::default());
+        assert_eq!(genesis.headers.len(), 1);
+        assert_eq!(genesis.headers.first().height, 1);
+        assert_eq!(genesis.pre_header.height, 2);
+    }
+
+    /// `lastBlockUtxoRoot` is derived from the newest header in the window
+    /// (ergo-lib `signing.rs` `make_context`), so `headers.first()` is the
+    /// observable proxy for it. A transaction in the mempool at tip H spends
+    /// the UTXO set as of H — the same set the block at H+1 will be validated
+    /// against — so the two windows must be the *same window*, not merely the
+    /// same length.
+    #[test]
+    fn utxo_root_matches_the_block_context_at_the_same_chain_position() {
+        let last = header_at(20);
+        let ancestors: Vec<Header> = (11..20).rev().map(header_at).collect();
+
+        let upcoming = build_upcoming_state_context(&last, &ancestors, &Parameters::default());
+
+        // The block at 21, once mined, validates against the tip and its nine
+        // ancestors — which is exactly what the mempool saw a moment earlier.
+        let mut preceding_for_next = vec![last.clone()];
+        preceding_for_next.extend(ancestors.iter().cloned());
+        let at_next =
+            build_state_context(&header_at(21), &preceding_for_next, &Parameters::default());
+
+        assert_eq!(
+            upcoming.headers.first().state_root,
+            last.state_root,
+            "the UTXO root is the state after the tip, not after its parent"
+        );
+        assert_eq!(
+            upcoming.headers.as_vec(),
+            at_next.headers.as_vec(),
+            "same chain position, same window"
+        );
     }
 }
 
@@ -998,12 +1384,11 @@ mod block_cost_tests {
     /// miner_pk/height the fee contract's SubstConstants check reads.
     fn block_header() -> Header {
         let miner_pk = EcPoint::from_base16_str(MINER_PK_HEX.to_string()).unwrap();
-        let parent_id_bytes: [u8; 32] = hex::decode(
-            "be5d64122592b6d2a07a3a619d4e68598e8df38e57ccbff732fc797bbdcf86ef",
-        )
-        .unwrap()
-        .try_into()
-        .unwrap();
+        let parent_id_bytes: [u8; 32] =
+            hex::decode("be5d64122592b6d2a07a3a619d4e68598e8df38e57ccbff732fc797bbdcf86ef")
+                .unwrap()
+                .try_into()
+                .unwrap();
         Header {
             version: 1,
             id: BlockId(Digest32::from([0u8; 32])),
@@ -1075,11 +1460,12 @@ mod block_cost_tests {
         let params = Parameters::default();
 
         let ctx = build_state_context(&header, &preceding, &params);
-        let cost_a =
-            validate_single_transaction(&tx_a, vec![box_a.clone()], vec![], &ctx).unwrap();
-        let cost_b =
-            validate_single_transaction(&tx_b, vec![box_b.clone()], vec![], &ctx).unwrap();
-        assert!(cost_a > 0 && cost_b > 0, "fixture txs must have nonzero cost");
+        let cost_a = validate_single_transaction(&tx_a, vec![box_a.clone()], vec![], &ctx).unwrap();
+        let cost_b = validate_single_transaction(&tx_b, vec![box_b.clone()], vec![], &ctx).unwrap();
+        assert!(
+            cost_a > 0 && cost_b > 0,
+            "fixture txs must have nonzero cost"
+        );
 
         let total = validate_transactions(
             &[tx_a, tx_b],
@@ -1109,10 +1495,10 @@ mod block_cost_tests {
         // units trips on the rounding residue): each tx fits, the pair doesn't.
         // Per-tx cost itself is independent of MaxBlockCost — it only sets limits.
         let baseline_ctx = build_state_context(&header, &preceding, &Parameters::default());
-        let cost_a = validate_single_transaction(&tx_a, vec![box_a.clone()], vec![], &baseline_ctx)
-            .unwrap();
-        let cost_b = validate_single_transaction(&tx_b, vec![box_b.clone()], vec![], &baseline_ctx)
-            .unwrap();
+        let cost_a =
+            validate_single_transaction(&tx_a, vec![box_a.clone()], vec![], &baseline_ctx).unwrap();
+        let cost_b =
+            validate_single_transaction(&tx_b, vec![box_b.clone()], vec![], &baseline_ctx).unwrap();
         let max = cost_a.max(cost_b) + 1;
         let params = params_with_max_cost(i32::try_from(max).unwrap());
 

@@ -1,0 +1,50 @@
+name: fmt
+
+# Gate formatting on every push and PR.
+#
+# Added 2026-08-13 with the first workspace-wide `cargo fmt` pass. Before that
+# nothing enforced formatting and 831 diffs had accumulated across every crate —
+# drift that is invisible until someone runs the command, and then arrives as a
+# 90-file diff on top of whatever they were actually doing.
+#
+# Formatting only. Tests and clippy are deliberately NOT gated here: the
+# workspace carries a pre-existing enr-p2p doc-lint that would fail a strict
+# clippy gate on day one, and a test job needs submodules plus the sigma-rust
+# git dependencies, which is a slower and separate decision. A gate that fails
+# for reasons unrelated to the change gets ignored, and an ignored gate is worse
+# than none.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  rustfmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        # No `submodules:` — chain/, p2p/, state/ and store/ were absorbed into
+        # this repo in 35802a8 and are ordinary directories now. release.yml
+        # still passes submodules: true, which is a harmless no-op there.
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check workspace formatting
+        run: cargo fmt --all --check
+
+      # The addons are `exclude`d from the workspace with their own lockfiles,
+      # so `--all` above does not reach them. They were formatted in the same
+      # pass and are checked explicitly here — otherwise they are exactly the
+      # code that drifts again, being the part no workspace command touches.
+      - name: Check addon formatting
+        run: |
+          cargo fmt --manifest-path addons/fastsync/Cargo.toml --all --check
+          cargo fmt --manifest-path addons/indexer/Cargo.toml --all --check

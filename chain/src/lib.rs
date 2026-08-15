@@ -20,30 +20,28 @@ mod tracker;
 pub mod voting;
 
 pub use cache::{HeaderLoader, ScoreLoader, DEFAULT_CACHE_CAPACITY};
-pub use chain::{AppendResult, HeaderChain, InstalledHeader};
+pub use chain::{AppendResult, ChainMemoryEstimate, HeaderChain, InstalledHeader};
 pub use config::{ChainConfig, Network};
 pub use ergo_chain_types::autolykos_pow_scheme::decode_compact_bits;
 pub use ergo_chain_types::{ADDigest, BlockId, Header};
 pub use error::{ChainError, RestoreError};
-pub use pow::verify_pow;
-pub use section::{
-    required_section_ids, section_ids,
-    AD_PROOFS_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, EXTENSION_TYPE_ID, HEADER_TYPE_ID,
-    TRANSACTION_TYPE_ID,
-};
-pub use state_type::StateType;
-pub use sync_info::{build_sync_info, parse_sync_info, SyncInfo};
-pub use num_bigint::{BigInt, BigUint};
-pub use tracker::HeaderTracker;
 pub use nipopow_proof::{
     build_nipopow_proof, compare_nipopow_proof_bytes, popow_header_by_id,
     verify_nipopow_proof_bytes, NipopowVerificationResult,
 };
+pub use num_bigint::{BigInt, BigUint};
+pub use pow::{pow_target, verify_pow};
+pub use section::{
+    required_section_ids, section_ids, AD_PROOFS_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID,
+    EXTENSION_TYPE_ID, HEADER_TYPE_ID, TRANSACTION_TYPE_ID,
+};
+pub use state_type::StateType;
+pub use sync_info::{build_sync_info, parse_sync_info, SyncInfo};
+pub use tracker::HeaderTracker;
 pub use voting::{
     check_fork_vote, compute_boundary_parameters, encode_validation_settings_update,
-    extract_disabling_rules_from_kv,
-    pack_extension_bytes, pack_parameters_to_kv, parse_extension_bytes,
-    parse_parameters_from_kv, parse_validation_settings_update,
+    extract_disabling_rules_from_kv, pack_extension_bytes, pack_parameters_to_kv,
+    parse_extension_bytes, parse_parameters_from_kv, parse_validation_settings_update,
     tally_votes_seeded, ExtensionField, RuleStatus, ValidationSettingsUpdate, VotingConfig,
     ID_BLOCK_VERSION, ID_SOFT_FORK_DISABLING_RULES, ID_SOFT_FORK_STARTING_HEIGHT,
     ID_SOFT_FORK_VOTES_COLLECTED, SOFT_FORK_VOTE,

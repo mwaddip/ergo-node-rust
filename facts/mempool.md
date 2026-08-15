@@ -75,13 +75,21 @@ intra-block output tracking.
 Also expose the state context builder for mempool use:
 
 ```rust
-/// Build an ErgoStateContext from a header and preceding headers.
-pub fn build_state_context(
-    header: &Header,
+/// Build an ErgoStateContext whose preheader describes the NEXT block.
+pub fn build_upcoming_state_context(
+    last_header: &Header,
     preceding_headers: &[Header],
     parameters: &Parameters,
 ) -> ErgoStateContext;
 ```
+
+⚠ **The mempool takes the *upcoming* context, never `build_state_context()`.**
+An unconfirmed transaction is a candidate for the block after the tip, and
+wallets set `creationHeight` accordingly. Validating against a preheader at the
+current tip rejects every well-formed transaction on the network with `Creation
+height H+1 > preheader height`. Full derivation and the JVM reference are in
+`facts/validation.md` § "Free Functions: state context". The mempool does not
+build this itself — the main crate publishes it after each applied block.
 
 Both functions are pure — no mutable state, no side effects.
 
@@ -211,8 +219,37 @@ pub struct MempoolConfig {
     pub cost_per_block: u64,
     /// Maximum validation cost budget per peer per block interval.
     pub cost_per_peer_per_block: u64,
+    /// Miner reward delay, the only input to the fee proposition tree.
+    /// Mainnet monetary constant: 720. Default 720.
+    pub reward_delay: i32,
 }
 ```
+
+**The fee proposition is built once, not per transaction.** `Mempool::new`
+derives it from `reward_delay` via
+`ergo_lib::chain::ergo_tree_predef::fee_proposition()` and stores it; step 7a
+compares each output's `ergo_tree` against the stored value. Deriving it per
+output would recompile a tree for every output of every transaction.
+
+`Mempool::new` stays **infallible** and panics if the tree cannot be built.
+`fee_proposition()` is a pure function of one integer with no external input, so
+a failure is a build-integrity fault rather than a runtime or configuration
+condition, and the only cheap fallback — treat the fee as zero — silently
+declines every transaction on the network, which is the defect step 7a exists to
+fix. A loud startup failure for an unreachable case beats a quiet one for a
+reachable one.
+
+⚠ **That reasoning depends on `reward_delay` not being user-settable.** It is a
+`MempoolConfig` field left at its default by both call sites today. If it is
+ever wired to an operator-facing key, the panic becomes reachable from a config
+file and `new` must become fallible.
+
+⚠ **`reward_delay` is a monetary constant, not a mining setting.** The node
+must extract fees whether or not mining is enabled, so this does **not** read
+`[mining].reward_delay`. It mirrors the JVM's
+`chainSettings.monetary.minerRewardDelay`. Networks with a different delay need
+this threaded from chain settings; today both default to 720 and mainnet is the
+only network this has been exercised on.
 
 ### `ExpiringCache<K>`
 
@@ -400,16 +437,38 @@ impl Mempool {
 
 ## Processing a Transaction: Detailed Flow
 
+⚠ **The fee check runs *after* validation, not before it.** Steps 3 and 4 used
+to be listed ahead of input resolution, which is not implementable: the fee is a
+function of the resolved input boxes. They are numbered 7 below, matching the
+code. Nothing may reorder them ahead of step 5.
+
 1. **Check invalidated**: If `tx_id` is in `invalidated`, return `Invalidated`.
 2. **Check duplicate**: If `tx_id` is in `by_id`, return `AlreadyInPool`.
-3. **Compute fee**: Sum output values going to the fee proposition address.
-4. **Check min fee**: If `fee < config.min_fee`, return `Declined`.
 5. **Resolve input boxes**: For each input, look up via `utxo_reader.box_by_id()`.
    If any input is missing, return `Declined` (not invalidated — input may appear later).
 6. **Resolve data-input boxes**: Same lookup for data inputs.
+6a. **Check creation height** (transient guard): if any output's `creation_height`
+   exceeds `state_context.pre_header.height`, return `Declined` — **not**
+   `Invalidated`. The transaction was built against a tip newer than ours and
+   becomes valid as soon as we apply the next block. Caching it as invalid
+   suppresses every rebroadcast for `invalidation_ttl` (1800s ≈ 15 blocks)
+   without re-validating, so a momentary propagation race turns into a half-hour
+   blackout for that transaction. Same reasoning as step 5's missing input.
 7. **Validate**: Call `validate_single_transaction(tx, inputs, data_inputs, state_context)`.
    On failure: return `Invalidated` (add to expiring cache).
    On success: receive `cost`.
+7a. **Compute fee**: sum the values of outputs whose `ergo_tree` equals the fee
+   proposition. **Not `input_sum - output_sum`.** ergo-lib enforces exact ERG
+   preservation (`ErgPreservationError` when `input_sum != output_sum`,
+   `wallet/tx_context.rs:122`), so a difference-based fee is structurally zero
+   for every transaction that reaches this point, and step 7b then declines all
+   of them. Ergo has no implicit change-to-fee remainder: the fee is an explicit
+   output guarded by the fee proposition. JVM parity —
+   `ErgoMemPool.extractFee` filters on
+   `settings.chainSettings.monetary.feeProposition`
+   (`ErgoMemPool.scala:304-309`).
+7b. **Check min fee**: If `fee < config.min_fee`, return `Declined` (fee may be
+   raised by a replacement; this is not an invalidation).
 8. **Compute weight**: `fee_per_factor = fee * 1024 / fee_factor` where `fee_factor`
    is `tx_bytes.len()` (FeePerByte) or `cost` (FeePerCycle, with `FakeCost = 1000`
    fallback if cost is 0).

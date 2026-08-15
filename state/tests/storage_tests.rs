@@ -3,9 +3,10 @@ use bytes::Bytes;
 use enr_state::{AVLTreeParams, CacheSize, RedbAVLStorage, SnapshotReader};
 use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
-use ergo_avltree_rust::batch_node::{AVLTree, Blake2b256};
+use ergo_avltree_rust::batch_node::{AVLTree, Blake2b256, Node, NodeId};
 use ergo_avltree_rust::operation::{Digest32, KeyValue, Operation};
 use ergo_avltree_rust::versioned_avl_storage::VersionedAVLStorage;
+use std::rc::Rc;
 use tempfile::tempdir;
 
 const KEY_LEN: usize = 32;
@@ -34,7 +35,8 @@ fn make_value(seed: u8, len: usize) -> Bytes {
 fn setup(keep_versions: u32) -> (RedbAVLStorage, BatchAVLProver, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("state.redb");
-    let mut storage = RedbAVLStorage::open(&path, params(), keep_versions, CacheSize::default()).unwrap();
+    let mut storage =
+        RedbAVLStorage::open(&path, params(), keep_versions, CacheSize::default()).unwrap();
 
     let resolver = storage.resolver();
     let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
@@ -407,8 +409,7 @@ fn flush_persists_state_across_reopen() {
 
     let expected_version;
     {
-        let mut storage =
-            RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+        let mut storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
         let resolver = storage.resolver();
         let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
         let mut prover = BatchAVLProver::new(tree, true);
@@ -473,8 +474,7 @@ fn flush_on_empty_storage_succeeds() {
     // Flush on a freshly opened storage with no updates must not error.
     let dir = tempdir().unwrap();
     let path = dir.path().join("state.redb");
-    let storage =
-        RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+    let storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
     assert!(storage.version().is_none());
     storage.flush().unwrap();
 }
@@ -528,8 +528,7 @@ fn parse_dfs_nodes(data: &[u8], key_length: usize) -> Vec<(Digest32, Vec<u8>)> {
             // Leaf: type(1) + key(key_length) + value_len(4) + value + next_key(key_length)
             let vlen_offset = pos + 1 + key_length;
             let value_len =
-                u32::from_be_bytes(data[vlen_offset..vlen_offset + 4].try_into().unwrap())
-                    as usize;
+                u32::from_be_bytes(data[vlen_offset..vlen_offset + 4].try_into().unwrap()) as usize;
             1 + key_length + 4 + value_len + key_length
         };
 
@@ -583,7 +582,10 @@ fn dump_snapshot_round_trip() {
 
     // 5. Verify metadata.
     assert_eq!(snap.root_hash, expected_root, "root hash mismatch");
-    assert_eq!(snap.tree_height, expected_height as u8, "tree height mismatch");
+    assert_eq!(
+        snap.tree_height, expected_height as u8,
+        "tree height mismatch"
+    );
 
     // 6. Verify manifest header.
     assert_eq!(snap.manifest[0], expected_height as u8);
@@ -594,7 +596,10 @@ fn dump_snapshot_round_trip() {
     assert!(!manifest_nodes.is_empty(), "manifest has no nodes");
 
     // First node's label should be the root hash.
-    assert_eq!(manifest_nodes[0].0, expected_root, "first manifest node is not root");
+    assert_eq!(
+        manifest_nodes[0].0, expected_root,
+        "first manifest node is not root"
+    );
 
     // 8. Verify chunks are non-empty.
     assert!(!snap.chunks.is_empty(), "no chunks produced");
@@ -684,9 +689,57 @@ fn cache_size_percent_returns_fraction_of_ram() {
     let half = CacheSize::Percent(0.5);
     let resolved = half.resolve();
     // On any machine running these tests, half of RAM should be >128MB.
-    assert!(resolved > 128 * 1024 * 1024, "half of RAM unexpectedly small: {resolved}");
+    assert!(
+        resolved > 128 * 1024 * 1024,
+        "half of RAM unexpectedly small: {resolved}"
+    );
     // And less than 1TB, just to catch parse failures returning garbage.
-    assert!(resolved < 1024 * 1024 * 1024 * 1024, "half of RAM unexpectedly large: {resolved}");
+    assert!(
+        resolved < 1024 * 1024 * 1024 * 1024,
+        "half of RAM unexpectedly large: {resolved}"
+    );
+}
+
+#[test]
+fn cache_occupancy_is_reported() {
+    let dir = tempdir().unwrap();
+    let storage = RedbAVLStorage::open(
+        &dir.path().join("s.redb"),
+        params(),
+        32,
+        CacheSize::Bytes(8 * 1024 * 1024),
+    )
+    .unwrap();
+    assert!(
+        storage.cache_bytes_used() > 0,
+        "cache_metrics disabled? used_bytes was 0"
+    );
+}
+
+#[test]
+fn snapshot_reader_reports_the_same_cache_occupancy() {
+    // The API's only handle on state is a SnapshotReader, so the figure has to
+    // be reachable from there — and it must be the same database, not a
+    // second one that happens to also report a number.
+    let dir = tempdir().unwrap();
+    let storage = RedbAVLStorage::open(
+        &dir.path().join("s.redb"),
+        params(),
+        32,
+        CacheSize::Bytes(8 * 1024 * 1024),
+    )
+    .unwrap();
+    let reader = storage.snapshot_reader();
+
+    assert!(
+        reader.cache_bytes_used() > 0,
+        "cache_metrics disabled? used_bytes was 0"
+    );
+    assert_eq!(
+        reader.cache_bytes_used(),
+        storage.cache_bytes_used(),
+        "reader and storage disagree — not the same Arc<Database>?"
+    );
 }
 
 // ── block_height persistence ─────────────────────────────────────────
@@ -696,8 +749,7 @@ fn update_persists_block_height() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("state.redb");
     {
-        let mut storage =
-            RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+        let mut storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
         let resolver = storage.resolver();
         let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
         let mut prover = BatchAVLProver::new(tree, true);
@@ -731,8 +783,7 @@ fn update_persists_block_height() {
 fn rollback_restores_block_height() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("state.redb");
-    let mut storage =
-        RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+    let mut storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
     let resolver = storage.resolver();
     let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
     let mut prover = BatchAVLProver::new(tree, true);
@@ -744,7 +795,9 @@ fn rollback_restores_block_height() {
             value: make_value(1, 64),
         }))
         .unwrap();
-    storage.update_with_height(&mut prover, vec![], 100).unwrap();
+    storage
+        .update_with_height(&mut prover, vec![], 100)
+        .unwrap();
     let digest_at_100 = storage.version().unwrap();
 
     // Update at height 101.
@@ -757,7 +810,9 @@ fn rollback_restores_block_height() {
             value: make_value(2, 64),
         }))
         .unwrap();
-    storage.update_with_height(&mut prover, vec![], 101).unwrap();
+    storage
+        .update_with_height(&mut prover, vec![], 101)
+        .unwrap();
 
     // Update at height 102.
     prover.base.tree.reset();
@@ -769,7 +824,9 @@ fn rollback_restores_block_height() {
             value: make_value(3, 64),
         }))
         .unwrap();
-    storage.update_with_height(&mut prover, vec![], 102).unwrap();
+    storage
+        .update_with_height(&mut prover, vec![], 102)
+        .unwrap();
 
     assert_eq!(storage.block_height(), Some(102));
 
@@ -786,8 +843,7 @@ fn load_snapshot_sets_block_height() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("state.redb");
     {
-        let mut storage =
-            RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+        let mut storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
 
         let resolver = storage.resolver();
         let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
@@ -837,8 +893,7 @@ fn crash_simulation_preserves_pre_update_block_height() {
     // 1. Commit block_height = 42 via the normal update path.
     let committed_version;
     {
-        let mut storage =
-            RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+        let mut storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
         let resolver = storage.resolver();
         let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
         let mut prover = BatchAVLProver::new(tree, true);
@@ -880,8 +935,7 @@ fn block_height_is_none_on_empty_storage() {
     // Invariant: block_height() returns None iff version() is None.
     let dir = tempdir().unwrap();
     let path = dir.path().join("state.redb");
-    let storage =
-        RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+    let storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
     assert!(storage.version().is_none());
     assert!(storage.block_height().is_none());
 }
@@ -925,7 +979,9 @@ fn churn_round(path: &Path, keys: u8, round: u8, value_len: usize, height: u32) 
             }))
             .unwrap();
     }
-    storage.update_with_height(&mut prover, vec![], height).unwrap();
+    storage
+        .update_with_height(&mut prover, vec![], height)
+        .unwrap();
     storage.flush().unwrap();
 }
 
@@ -963,12 +1019,7 @@ fn reachable_node_count(path: &Path) -> u64 {
     let nodes = txn.open_table(NODES_DEF).unwrap();
     let meta = txn.open_table(META_DEF).unwrap();
 
-    let root = meta
-        .get("top_node_hash")
-        .unwrap()
-        .unwrap()
-        .value()
-        .to_vec();
+    let root = meta.get("top_node_hash").unwrap().unwrap().value().to_vec();
 
     let mut stack = vec![root];
     let mut count = 0u64;
@@ -1071,7 +1122,10 @@ fn compact_to_reclaims_unreachable_rows() {
     );
 
     assert_eq!(stats.digest, version, "compaction must preserve the digest");
-    assert_eq!(stats.block_height, block_height, "block_height must carry over");
+    assert_eq!(
+        stats.block_height, block_height,
+        "block_height must carry over"
+    );
     assert_eq!(stats.nodes_written, reachable);
     assert_eq!(stats.source_bytes, source_before.len() as u64);
     assert_eq!(
@@ -1079,7 +1133,11 @@ fn compact_to_reclaims_unreachable_rows() {
         reachable,
         "dest must hold exactly the reachable nodes"
     );
-    assert_eq!(undo_row_count(&dest), 0, "dest must have an empty undo table");
+    assert_eq!(
+        undo_row_count(&dest),
+        0,
+        "dest must have an empty undo table"
+    );
     assert!(
         stats.dest_bytes < stats.source_bytes,
         "dest ({}) is not smaller than source ({})",
@@ -1184,7 +1242,8 @@ fn compact_to_fails_when_a_reachable_node_is_missing() {
         write_txn.set_quick_repair(true);
         {
             let mut meta = write_txn.open_table(META_DEF).unwrap();
-            meta.insert("top_node_hash", [0xABu8; 32].as_slice()).unwrap();
+            meta.insert("top_node_hash", [0xABu8; 32].as_slice())
+                .unwrap();
         }
         write_txn.commit().unwrap();
     }
@@ -1247,7 +1306,10 @@ fn compact_to_refuses_an_existing_destination() {
     std::fs::write(&dest, b"not mine").unwrap();
 
     let err = RedbAVLStorage::compact_to(&src, &dest, None).unwrap_err();
-    assert!(err.to_string().contains("already exists"), "unexpected error: {err}");
+    assert!(
+        err.to_string().contains("already exists"),
+        "unexpected error: {err}"
+    );
     // Refusing to overwrite means refusing to delete, too.
     assert_eq!(std::fs::read(&dest).unwrap(), b"not mine");
 }
@@ -1261,7 +1323,10 @@ fn compact_to_rejects_an_empty_source() {
     let dest = dir.path().join("state.redb.compacted");
     let err = RedbAVLStorage::compact_to(&src, &dest, None).unwrap_err();
 
-    assert!(err.to_string().contains("nothing to compact"), "unexpected error: {err}");
+    assert!(
+        err.to_string().contains("nothing to compact"),
+        "unexpected error: {err}"
+    );
     assert!(!dest.exists());
 }
 
@@ -1298,4 +1363,197 @@ fn compaction_stats_are_reported() {
     assert_eq!(stats.block_height, 5);
     // The AVL digest is the 32-byte root label plus the tree height byte.
     assert_eq!(stats.digest.len(), 33);
+}
+
+// ── SnapshotReader: read-only prover access ──────────────────────────
+//
+// resolver() + root_state() are everything mining needs to stand up a
+// read-only prover over the committed tree without reaching the validator.
+
+/// Storage with an internal root node — a single-key tree roots on a leaf,
+/// which has no child handles to compare.
+fn storage_with_internal_root() -> (RedbAVLStorage, tempfile::TempDir) {
+    let (mut storage, mut prover, dir) = setup(10);
+    for seed in 1..=8u8 {
+        prover
+            .perform_one_operation(&Operation::Insert(KeyValue {
+                key: make_key(seed),
+                value: make_value(seed, 64),
+            }))
+            .unwrap();
+    }
+    storage.update(&mut prover, vec![]).unwrap();
+    (storage, dir)
+}
+
+/// Left/right child handles of an internal node, or a failure naming what
+/// came back instead.
+fn child_handles(node: &Node) -> (NodeId, NodeId) {
+    match node {
+        Node::Internal(internal) => (internal.left.clone(), internal.right.clone()),
+        Node::Leaf(_) => panic!("expected an internal root, got a leaf"),
+        Node::LabelOnly(_) => panic!("resolver miss: node was not in storage"),
+    }
+}
+
+#[test]
+fn reader_resolver_returns_the_same_node_as_the_storage_resolver() {
+    let (storage, _dir) = storage_with_internal_root();
+    let (root, _) = storage.root_state().expect("no root state");
+
+    let via_storage = (storage.resolver())(&root);
+    let via_reader = (storage.snapshot_reader().resolver())(&root);
+
+    let (s_left, s_right) = child_handles(&via_storage);
+    let (r_left, r_right) = child_handles(&via_reader);
+
+    assert_eq!(s_left.borrow().get_label(), r_left.borrow().get_label());
+    assert_eq!(s_right.borrow().get_label(), r_right.borrow().get_label());
+}
+
+#[test]
+fn reader_resolver_hands_out_independent_node_handles() {
+    // The invariant that fails silently.  A reader resolver that shared node
+    // handles with the validator's prover would let a restored prover walk
+    // nodes still keyed in another prover's address-keyed map, and emit a
+    // *different proof for identical tree state* — same digest, different
+    // bytes.  Equal labels above prove it is the same node; distinct
+    // allocations here prove it is not the same memory.
+    let (storage, _dir) = storage_with_internal_root();
+    let (root, _) = storage.root_state().expect("no root state");
+
+    let (s_left, s_right) = child_handles(&(storage.resolver())(&root));
+    let (r_left, r_right) = child_handles(&(storage.snapshot_reader().resolver())(&root));
+
+    assert!(
+        !Rc::ptr_eq(&s_left, &r_left),
+        "reader and storage resolvers share a node handle"
+    );
+    assert!(
+        !Rc::ptr_eq(&s_right, &r_right),
+        "reader and storage resolvers share a node handle"
+    );
+}
+
+#[test]
+fn reader_resolver_allocates_fresh_handles_per_call() {
+    // Same guard, one resolver.  Caching resolved nodes is the "for
+    // performance" change that would break the invariant above from the
+    // inside, and it would keep every existing test green.
+    let (storage, _dir) = storage_with_internal_root();
+    let (root, _) = storage.root_state().expect("no root state");
+    let resolver = storage.snapshot_reader().resolver();
+
+    let (first, _) = child_handles(&resolver(&root));
+    let (second, _) = child_handles(&resolver(&root));
+
+    assert_eq!(first.borrow().get_label(), second.borrow().get_label());
+    assert!(
+        !Rc::ptr_eq(&first, &second),
+        "resolver is caching node handles between calls"
+    );
+}
+
+#[test]
+fn reader_resolver_survives_a_miss_with_the_label_intact() {
+    // A miss must still name the node the caller asked for, or a failed
+    // lookup loses the one piece of evidence that identifies it.
+    let (storage, _dir) = storage_with_internal_root();
+    let absent: Digest32 = [0xAB; 32];
+
+    let node = (storage.snapshot_reader().resolver())(&absent);
+
+    match node {
+        Node::LabelOnly(hdr) => assert_eq!(hdr.label, Some(absent)),
+        other => panic!("expected LabelOnly for an absent node, got {other:?}"),
+    }
+}
+
+#[test]
+fn reader_root_state_matches_storage_root_state() {
+    let (storage, _dir) = storage_with_internal_root();
+
+    assert_eq!(
+        storage.snapshot_reader().root_state(),
+        storage.root_state(),
+        "reader and storage disagree on the committed root"
+    );
+}
+
+#[test]
+fn reader_root_state_is_none_on_an_empty_tree() {
+    // A reader that exists has a database, so None means "empty", never
+    // "stale handle" — there is no liveness check to confuse it with.
+    let dir = tempdir().unwrap();
+    let storage = RedbAVLStorage::open(
+        &dir.path().join("state.redb"),
+        params(),
+        10,
+        CacheSize::default(),
+    )
+    .unwrap();
+
+    assert_eq!(storage.snapshot_reader().root_state(), None);
+}
+
+#[test]
+fn reader_root_state_ignores_uncommitted_prover_state() {
+    // root_state() is the committed root.  A prover mid-batch has a newer
+    // tree in memory; a reader must not see it, or mining would build a
+    // candidate on a root no peer has.
+    let (mut storage, mut prover, _dir) = setup(10);
+    prover
+        .perform_one_operation(&Operation::Insert(KeyValue {
+            key: make_key(1),
+            value: make_value(1, 64),
+        }))
+        .unwrap();
+    storage.update(&mut prover, vec![]).unwrap();
+    prover.base.tree.reset();
+    prover.base.changed_nodes_buffer.clear();
+    prover.base.changed_nodes_buffer_to_check.clear();
+
+    let reader = storage.snapshot_reader();
+    let committed = reader.root_state().expect("no root state");
+
+    // Uncommitted: performed on the prover, never handed to update().
+    prover
+        .perform_one_operation(&Operation::Insert(KeyValue {
+            key: make_key(2),
+            value: make_value(2, 64),
+        }))
+        .unwrap();
+    assert_ne!(
+        prover.digest().unwrap()[..32],
+        committed.0[..],
+        "test is not exercising anything — the prover root did not move"
+    );
+
+    assert_eq!(
+        reader.root_state(),
+        Some(committed),
+        "reader observed uncommitted prover state"
+    );
+}
+
+#[test]
+fn reader_resolver_is_read_only() {
+    // Resolving must not touch the tree, the version chain, or metadata.
+    let (storage, _dir) = storage_with_internal_root();
+    let before_root = storage.root_state();
+    let before_version = storage.version();
+    let before_targets: Vec<_> = storage.rollback_versions().collect();
+
+    let resolver = storage.snapshot_reader().resolver();
+    let (root, _) = before_root.expect("no root state");
+    for _ in 0..16 {
+        let _ = resolver(&root);
+    }
+
+    assert_eq!(storage.root_state(), before_root);
+    assert_eq!(storage.version(), before_version);
+    assert_eq!(
+        storage.rollback_versions().collect::<Vec<_>>(),
+        before_targets
+    );
 }

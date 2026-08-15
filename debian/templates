@@ -1,0 +1,155 @@
+Template: ergo-node-rust/network
+Type: select
+Choices: mainnet, testnet
+Default: mainnet
+Description: Which Ergo network should this node join?
+ mainnet is the live chain. Syncing it from genesis downloads roughly 25 GB
+ and takes hours to days depending on the machine.
+ .
+ testnet is the test chain: much smaller, and the right choice if you are
+ evaluating the node or developing against it.
+ .
+ This cannot be changed later by editing the config alone — a node that has
+ synced one network cannot be pointed at the other without discarding its
+ data directory.
+
+Template: ergo-node-rust/topics
+Type: multiselect
+Choices: Interfaces, Node type, Storage, Bootstrap, Mining, Memory, Peers
+Default:
+Description: Which settings would you like to configure?
+ Everything has a working default, so you can select nothing here and get a
+ running node. Pick only the topics you want to deviate on.
+ .
+ Interfaces: listen address, port, and the REST API bind address.
+ Node type: full UTXO, light, or digest — and how much block history to keep.
+ Storage: where the chain data lives.
+ Bootstrap: fast initial sync options.
+ Mining: miner public key and block-candidate settings.
+ Memory: how much RAM this node may use.
+ Peers: additional seed peers and connection counts.
+ .
+ You can return to this screen at any time with:
+ dpkg-reconfigure ergo-node-rust
+
+Template: ergo-node-rust/listen_port
+Type: string
+Default: 9030
+Description: P2P listen port:
+ The port other Ergo nodes connect to. 9030 is the convention; change it only
+ if something else on this machine already uses it.
+
+Template: ergo-node-rust/api_address
+Type: string
+Description: REST API bind address:
+ Leave blank to use the default for your network (0.0.0.0:9053 on mainnet,
+ 0.0.0.0:9052 on testnet).
+ .
+ WARNING: 0.0.0.0 exposes the API on every interface. The API has no
+ authentication unless you set an api_key, and some endpoints are not things
+ you want reachable from the internet. Bind to 127.0.0.1 unless you have
+ deliberately firewalled the port.
+
+Template: ergo-node-rust/max_inbound
+Type: string
+Default: 20
+Description: Maximum inbound peer connections:
+ How many other nodes may connect to you. Higher is more useful to the
+ network and costs more memory and bandwidth.
+
+Template: ergo-node-rust/state_type
+Type: select
+Choices: ${choices}
+Default: utxo
+Description: Node type:
+ utxo keeps the full UTXO set and can serve any query, mine, and validate
+ everything itself. It is the only type that can mine. It is also the only
+ type that holds the AVL prover tree in RAM, which is what makes 4 GB the
+ practical minimum.
+ .
+ light tracks headers only. The right choice on a small machine.
+ .
+ ${digest}
+
+Template: ergo-node-rust/blocks_to_keep
+Type: string
+Default: -1
+Description: Block history to retain:
+ -1 keeps everything (archival). 0 keeps only what is needed at the chain
+ tip. A positive number keeps that many recent blocks.
+ .
+ This is the single biggest lever on long-term disk and memory use. Archival
+ is the right default for a node others rely on, and the wrong one for a
+ small box.
+
+Template: ergo-node-rust/data_dir
+Type: string
+Default: /var/lib/ergo-node/data
+Description: Chain data directory:
+ Where the blockchain, UTXO state and indexes are written. Expect tens of
+ gigabytes on mainnet, growing over time. Point this at the volume that has
+ the room.
+
+Template: ergo-node-rust/fastsync
+Type: boolean
+Default: true
+Description: Use fast initial sync?
+ Bootstraps from a compressed chain snapshot instead of replaying every block
+ from genesis. Much faster, and the normal choice.
+
+Template: ergo-node-rust/miner_pk
+Type: string
+Description: Miner public key (hex):
+ The 33-byte compressed public key that block rewards are paid to. Leave
+ blank if you are not mining.
+ .
+ This is a public key, not a seed or a private key. Do not paste a mnemonic
+ or a wallet secret here — debconf stores answers in world-readable form.
+
+Template: ergo-node-rust/memory_budget_mb
+Type: string
+Description: Memory budget in MB:
+ Leave blank — recommended — and the node sizes itself from the systemd
+ MemoryMax setting if there is one, otherwise from total system RAM.
+ .
+ Setting a number here tells the node it may use that much and it will plan
+ accordingly. It does not enforce anything; only MemoryMax on the service
+ unit does that.
+
+Template: ergo-node-rust/seed_peers_add
+Type: string
+Description: Additional seed peers:
+ Comma-separated host:port entries, added to the peers shipped with the
+ package rather than replacing them. Leave blank unless you have specific
+ nodes you want to connect to.
+
+Template: ergo-node-rust/mem_refuse
+Type: note
+Description: Too little memory for a full node
+ Detected ${detected} MB of RAM. A full (utxo) node will REFUSE TO START below
+ 3 GB — it holds the UTXO tree in memory, and initial sync is the demanding
+ phase.
+ .
+ Under the "Node type" topic, choose light or digest. Neither holds that tree,
+ and both run well here.
+ .
+ Otherwise: add memory, or set ignore_memory_floor = true under [node] in
+ /etc/ergo-node/conf.d/99-local.toml to start anyway and risk an
+ out-of-memory kill during sync.
+ .
+ Installation continues either way — this is a warning, not a failure.
+
+Template: ergo-node-rust/mem_below_recommended
+Type: note
+Description: Slightly below the recommended memory for a full node
+ Detected ${detected} MB of RAM. 4 GB or more is recommended for a full (utxo)
+ node, so this machine is a little under.
+ .
+ A full node will start and run here — no action is needed. Initial sync is
+ the demanding phase; if it struggles, the levers are pruning
+ (blocks_to_keep under the "Node type" topic) or more memory.
+ .
+ If nothing states a memory budget, the node conservatively assumes it may use
+ only about half of total RAM. Setting MemoryMax on the systemd unit, or a
+ value under the "Memory" topic, roughly doubles what it will allow itself on
+ the same hardware.

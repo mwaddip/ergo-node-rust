@@ -130,17 +130,66 @@ inherit the cold-sync parent when unset.
 ```toml
 [node]
 # Cold sync
-cache_mb = 1024                       # redb cache during sync
+cache_mb = 1024                       # TOTAL redb cache across both databases
+cache_store_pct = 50                  # share to modifiers.redb; rest to state.redb
 flush_heap_threshold_mb = 2048        # live-heap trigger for redb flush
 flush_max_blocks = 100                # upper bound between flushes
 flush_min_blocks = 5                  # lower bound, prevents storm
 
 # At tip (optional; if unset, mirrors inherit the cold-sync value)
-synced_cache_mb = 256
+synced_cache_mb = 256                 # also a TOTAL; cache_store_pct applies
 synced_flush_heap_threshold_mb = 512
 synced_flush_max_blocks = 10
 synced_flush_min_blocks = 5
 ```
+
+### `cache_mb` is a total, and it changed meaning
+
+`cache_mb` is the **combined** page cache for `modifiers.redb` and
+`state.redb`, divided by `cache_store_pct`. Before this change it sized
+`state.redb` alone while `modifiers.redb` silently took redb's built-in 1 GiB
+default — so a config reading `cache_mb = 1024` actually consumed 2048 MB. If
+you carried a config across that change, the node now uses **less** memory than
+it did; raise `cache_mb` if sync throughput regresses.
+
+`cache_store_pct` must be 1–99. A zero share means a database with no page
+cache at all, which the node refuses to start with rather than running badly.
+
+**Judging whether a cache is big enough:** read `storeCacheEvictions` from
+`/debug/memory`, not `storeCacheBytes`. Occupancy reports the live working set,
+not the configured ceiling — it reads the same at 8 MiB as at 1 GiB under
+identical load. A rising eviction count is the signal that the cache is
+undersized.
+
+**An in-place at-tip resize only moves ~90% of the budget.** redb splits a
+cache size 90% read / 10% write, and the runtime resize path reaches only the
+read half; the write buffer is fixed when the database is opened. So
+`synced_cache_mb = 128` gives roughly 115 MB of read cache plus a write buffer
+sized from your cold-sync total. A full restart applies both halves.
+
+### Tuning the allocator
+
+Allocator settings live in the systemd unit, not `ergo.toml`, because
+`MALLOC_CONF` is read before the process starts and cannot come from a config
+file the node parses afterwards. The shipped defaults return freed memory to
+the OS promptly; you should not normally need to change them.
+
+The unit is package-owned and replaced on upgrade, so override with a drop-in
+rather than editing it:
+
+```bash
+sudo systemctl edit ergo-node-rust
+```
+
+```ini
+[Service]
+Environment=_RJEM_MALLOC_CONF=thp:never,background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000,narenas:16
+```
+
+**Copy the whole string and modify it.** systemd does not merge repeated
+assignments of the same variable — whatever you set here *replaces* the
+packaged value entirely, so omitting `thp:never` or `background_thread:true`
+silently disables them and RSS will grow.
 
 ### `flush_heap_threshold_mb` semantics
 

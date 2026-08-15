@@ -4,7 +4,12 @@ use ergo_sync::snapshot::parser::{
 };
 
 /// Helper: serialize an internal node into packed bytes.
-fn pack_internal(balance: i8, key: &[u8; 32], left_label: &[u8; 32], right_label: &[u8; 32]) -> Vec<u8> {
+fn pack_internal(
+    balance: i8,
+    key: &[u8; 32],
+    left_label: &[u8; 32],
+    right_label: &[u8; 32],
+) -> Vec<u8> {
     let mut buf = Vec::with_capacity(98);
     buf.push(PACKED_INTERNAL_PREFIX);
     buf.push(balance as u8);

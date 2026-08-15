@@ -1,6 +1,6 @@
-use ergo_validation::{validate_single_transaction, ErgoStateContext};
-use crate::types::UtxoReader;
 use crate::process;
+use crate::types::UtxoReader;
+use ergo_validation::{validate_single_transaction, ErgoStateContext};
 
 impl super::Mempool {
     /// Revalidate pool transactions against current state.
@@ -37,14 +37,37 @@ impl super::Mempool {
                 continue;
             }
 
+            // Same transient guard as process()'s step 6a, and it is reachable
+            // here for pooled transactions: a reorg moves the preheader
+            // backwards, and return_to_pool() re-inserts rolled-back
+            // transactions without validating them. Revalidating one of those
+            // against the older preheader yields ergo-lib's InvalidHeightError,
+            // which the Err arm below would cache for `invalidation_ttl` — the
+            // very transaction the reorg is about to re-mine. Leave it pooled
+            // and untouched: it is early, not invalid, and costs nothing to
+            // hold. Charged no cost budget because no validation ran.
+            if let Some(height) = process::output_above_preheader(&utx.tx, state_context) {
+                tracing::debug!(
+                    tx_id = %hex::encode(tx_id),
+                    creation_height = height,
+                    preheader_height = state_context.pre_header.height,
+                    "revalidation: skipping transaction built ahead of our tip"
+                );
+                continue;
+            }
+
             let cost = utx.cost as u64;
             cumulative_cost += cost;
 
             // Resolve inputs
             let input_ids = process::input_box_ids(&utx.tx);
-            let input_boxes: Option<Vec<_>> = input_ids.iter()
-                .map(|id| utxo_reader.box_by_id(id)
-                    .or_else(|| self.pool.unconfirmed_box(id).cloned()))
+            let input_boxes: Option<Vec<_>> = input_ids
+                .iter()
+                .map(|id| {
+                    utxo_reader
+                        .box_by_id(id)
+                        .or_else(|| self.pool.unconfirmed_box(id).cloned())
+                })
                 .collect();
 
             let input_boxes = match input_boxes {
@@ -56,12 +79,20 @@ impl super::Mempool {
                 }
             };
 
-            let data_boxes: Vec<_> = utx.tx.data_inputs.as_ref()
-                .map(|dis| dis.iter().filter_map(|di| {
-                    let id = process::input_box_id_raw(&di.box_id);
-                    utxo_reader.box_by_id(&id)
-                        .or_else(|| self.pool.unconfirmed_box(&id).cloned())
-                }).collect())
+            let data_boxes: Vec<_> = utx
+                .tx
+                .data_inputs
+                .as_ref()
+                .map(|dis| {
+                    dis.iter()
+                        .filter_map(|di| {
+                            let id = process::input_box_id_raw(&di.box_id);
+                            utxo_reader
+                                .box_by_id(&id)
+                                .or_else(|| self.pool.unconfirmed_box(&id).cloned())
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
 
             // Clone what we need before the mutable borrow
@@ -101,9 +132,9 @@ impl super::Mempool {
             if valid.len() >= self.config.rebroadcast_count {
                 break;
             }
-            let all_inputs_exist = process::input_box_ids(&utx.tx).iter().all(|id|
-                utxo_reader.box_by_id(id).is_some()
-            );
+            let all_inputs_exist = process::input_box_ids(&utx.tx)
+                .iter()
+                .all(|id| utxo_reader.box_by_id(id).is_some());
             if all_inputs_exist {
                 valid.push(utx);
             }

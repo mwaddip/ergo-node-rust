@@ -1,6 +1,6 @@
 [package]
 name = "ergo-sync"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "Chain sync state machine for the Ergo Rust node"
@@ -9,8 +9,6 @@ description = "Chain sync state machine for the Ergo Rust node"
 enr-p2p = { path = "../p2p" }
 enr-chain = { path = "../chain" }
 ergo-validation = { path = "../validation" }
-crossbeam-channel = "0.5"
-rayon = "1"
 blake2 = "0.10"
 redb = "4"
 thiserror = "2"

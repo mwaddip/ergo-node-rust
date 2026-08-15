@@ -45,8 +45,10 @@ impl<K: Eq + std::hash::Hash + Copy> ExpiringCache<K> {
     /// Remove all expired entries.
     pub fn prune(&mut self) {
         let now = Instant::now();
-        self.entries.retain(|_, inserted| now.duration_since(*inserted) < self.ttl);
-        self.insertion_order.retain(|k| self.entries.contains_key(k));
+        self.entries
+            .retain(|_, inserted| now.duration_since(*inserted) < self.ttl);
+        self.insertion_order
+            .retain(|k| self.entries.contains_key(k));
     }
 
     pub fn len(&self) -> usize {

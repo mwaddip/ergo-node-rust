@@ -18,7 +18,10 @@ fn store_and_retrieve_snapshot() {
             1000,
             manifest_id,
             &manifest_bytes,
-            &[(chunk_id_1, chunk_data_1.clone()), (chunk_id_2, chunk_data_2.clone())],
+            &[
+                (chunk_id_1, chunk_data_1.clone()),
+                (chunk_id_2, chunk_data_2.clone()),
+            ],
             2,
         )
         .unwrap();
@@ -37,14 +40,8 @@ fn store_and_retrieve_snapshot() {
     assert_eq!(store.get_manifest(&[0xFF; 32]).unwrap(), None);
 
     // Verify chunk lookup
-    assert_eq!(
-        store.get_chunk(&chunk_id_1).unwrap(),
-        Some(chunk_data_1)
-    );
-    assert_eq!(
-        store.get_chunk(&chunk_id_2).unwrap(),
-        Some(chunk_data_2)
-    );
+    assert_eq!(store.get_chunk(&chunk_id_1).unwrap(), Some(chunk_data_1));
+    assert_eq!(store.get_chunk(&chunk_id_2).unwrap(), Some(chunk_data_2));
     assert_eq!(store.get_chunk(&[0xFF; 32]).unwrap(), None);
 }
 

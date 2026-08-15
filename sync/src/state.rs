@@ -1,7 +1,5 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-
-use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 
 use enr_p2p::protocol::messages::ProtocolMessage;
 use enr_p2p::protocol::peer::ProtocolEvent;
@@ -13,8 +11,8 @@ use crate::apply_state_error::classify_apply_state_error;
 use crate::delivery::{DeliveryControl, DeliveryData, DeliveryTracker};
 use crate::sweep_backoff::StallDetail;
 use enr_chain::{
-    BlockId, StateType, SyncInfo, HEADER_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID,
-    EXTENSION_TYPE_ID, TRANSACTION_TYPE_ID,
+    BlockId, StateType, SyncInfo, AD_PROOFS_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, EXTENSION_TYPE_ID,
+    HEADER_TYPE_ID, TRANSACTION_TYPE_ID,
 };
 
 use crate::traits::{SyncChain, SyncStore, SyncTransport};
@@ -25,7 +23,10 @@ use ergo_validation::BlockValidator;
 /// backpressure, so this is capped below the JVM's `desiredInvObjects` (400).
 /// 64 per type × 2 types = 128 sections per cycle = 64 blocks/cycle.
 fn is_block_section_type(type_id: u8) -> bool {
-    matches!(type_id, BLOCK_TRANSACTIONS_TYPE_ID | AD_PROOFS_TYPE_ID | EXTENSION_TYPE_ID)
+    matches!(
+        type_id,
+        BLOCK_TRANSACTIONS_TYPE_ID | AD_PROOFS_TYPE_ID | EXTENSION_TYPE_ID
+    )
 }
 
 /// Max continuation header ids served to a behind/forked peer per incoming
@@ -45,26 +46,65 @@ fn sync_info_anchor_ids(info: &SyncInfo) -> Vec<BlockId> {
 
 /// Result of a paired state/store flush.
 ///
-/// Discriminates three cases:
+/// Discriminates four cases:
 /// - `Flushed(M)`: validator flushed successfully at height `M`; modifier
 ///   store's `validated_height` was advanced to `M`.
-/// - `NoValidator`: light-mode path; there is no state to flush, and
+/// - `NothingToPersist(M)`: the validator owns no persistent state
+///   (`state_persistence()` is `None` — digest mode). Nothing was fsynced,
+///   but the validator has a real `validated_height()` and the store side of
+///   the pair runs exactly as it does after a successful flush.
+/// - `NoValidator`: light-mode path; there is no validator at all, and
 ///   `validated_height` is not recorded.
 /// - `Failed`: validator's `flush()` returned an error; modifier store's
 ///   `validated_height` was NOT advanced.
+///
+/// ⚠ `NothingToPersist` and `NoValidator` are NOT interchangeable, and folding
+/// the first into the second is a behaviour change, not a simplification.
+/// Digest mode has a validator and a real height; before the v0.8.0 trait split
+/// it reached `Flushed(M)` through `BlockValidator`'s defaulted `flush` —
+/// returning `Ok(())` for work it never did — so the `set_validated_height(M)`
+/// write and the prune both happened. They must keep happening. Light mode
+/// deliberately skips both. See `../facts/sync.md` § "Flushing a validator that
+/// owns no state".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FlushOutcome {
     Flushed(u32),
+    NothingToPersist(u32),
     NoValidator,
     Failed,
 }
 
 impl FlushOutcome {
     /// Whether the caller should advance its `last_flush_height` bookkeeping.
-    /// Advances on either a successful flush or no-validator (light mode);
-    /// stays put on flush failure so the next `should_flush()` retries.
+    /// Advances on a successful flush, on nothing-to-persist (digest mode),
+    /// and on no-validator (light mode); stays put on flush failure so the
+    /// next `should_flush()` retries.
     pub(crate) fn advances_last_flush(self) -> bool {
-        matches!(self, FlushOutcome::Flushed(_) | FlushOutcome::NoValidator)
+        matches!(
+            self,
+            FlushOutcome::Flushed(_)
+                | FlushOutcome::NothingToPersist(_)
+                | FlushOutcome::NoValidator
+        )
+    }
+
+    /// The height the cross-DB pair may record and prune against, if any.
+    ///
+    /// `Some(M)` for both a real fsync and the nothing-to-persist case: the
+    /// store side of the handshake does not distinguish them, because step (1)
+    /// is either satisfied or vacuous. `None` for light mode (no height exists)
+    /// and for a failed flush (durability is UNKNOWN — advancing anything on
+    /// the strength of it is exactly the bug the split exists to prevent).
+    ///
+    /// Single decision point on purpose: the prune call sites match on the
+    /// outcome with `if let`, which the compiler does not check for
+    /// exhaustiveness, so a future variant must be considered here rather than
+    /// silently falling out of three separate patterns.
+    pub(crate) fn committed_height(self) -> Option<u32> {
+        match self {
+            FlushOutcome::Flushed(m) | FlushOutcome::NothingToPersist(m) => Some(m),
+            FlushOutcome::NoValidator | FlushOutcome::Failed => None,
+        }
     }
 }
 
@@ -89,12 +129,18 @@ pub(crate) fn try_flush_validator<V: BlockValidator>(
 ) -> FlushOutcome {
     match validator {
         None => FlushOutcome::NoValidator,
-        Some(v) => match v.flush() {
-            Ok(()) => FlushOutcome::Flushed(v.validated_height()),
-            Err(e) => {
-                tracing::warn!(height = height_context, error = %e, "validator flush failed");
-                FlushOutcome::Failed
-            }
+        // No `StatePersistence` = digest mode: nothing to fsync, which is not
+        // a failure and not the same as having no validator. See
+        // `FlushOutcome::NothingToPersist`.
+        Some(v) => match v.state_persistence() {
+            None => FlushOutcome::NothingToPersist(v.validated_height()),
+            Some(p) => match p.flush() {
+                Ok(()) => FlushOutcome::Flushed(v.validated_height()),
+                Err(e) => {
+                    tracing::warn!(height = height_context, error = %e, "validator flush failed");
+                    FlushOutcome::Failed
+                }
+            },
         },
     }
 }
@@ -103,16 +149,14 @@ pub(crate) fn try_flush_validator<V: BlockValidator>(
 ///
 /// Takes the outcome of [`try_flush_validator`] (validator already flushed)
 /// and finishes the durability handshake on the store side. Order is
-/// load-bearing: `set_validated_height(M)` (only on `Flushed`) then
-/// `store.flush()`. A failed validator flush MUST NOT advance the modifier
-/// store's recorded `validated_height`; light mode (no validator) skips the
-/// `set_validated_height` write entirely. The store flush always runs to
-/// fsync any accumulated section writes.
-pub(crate) async fn complete_store_flush_pair<S: SyncStore>(
-    outcome: FlushOutcome,
-    store: &S,
-) {
-    if let FlushOutcome::Flushed(m) = outcome {
+/// load-bearing: `set_validated_height(M)` (only when the outcome carries a
+/// height) then `store.flush()`. A failed validator flush MUST NOT advance the
+/// modifier store's recorded `validated_height`; light mode (no validator)
+/// skips the `set_validated_height` write entirely. Digest mode
+/// (`NothingToPersist`) does write it — see that variant's doc. The store flush
+/// always runs to fsync any accumulated section writes.
+pub(crate) async fn complete_store_flush_pair<S: SyncStore>(outcome: FlushOutcome, store: &S) {
+    if let Some(m) = outcome.committed_height() {
         store.set_validated_height(m).await;
     }
     store.flush().await;
@@ -154,11 +198,7 @@ pub(crate) async fn maybe_prune_at_horizon<S: SyncStore, C: SyncChain>(
         )
         .await
     {
-        Ok(n) => tracing::debug!(
-            pruned = n,
-            horizon,
-            "pruned modifier rows"
-        ),
+        Ok(n) => tracing::debug!(pruned = n, horizon, "pruned modifier rows"),
         Err(e) => tracing::warn!(
             error = %e,
             horizon,
@@ -238,6 +278,17 @@ pub struct SyncConfig {
     ///
     /// See ../facts/sync.md § "Block Body Retention".
     pub blocks_to_keep: i32,
+    // `eval_backlog_max_mb`, `eval_backlog_max_blocks`, `checkpoint_height`
+    // and `script_eval_inline` were removed in v0.8.0 with deferred
+    // evaluation. The first two bounded a queue that no longer exists; the
+    // last two existed only to tell sync where `script_verified_height` came
+    // from and how far down it had to be floored, and that watermark is gone.
+    //
+    // The checkpoint itself still matters — heights at or below it skip
+    // evaluation — but that is entirely `validation/`'s business now, fed
+    // straight from the node config to the validator. Sync never had an
+    // opinion about it beyond the floor. See `../facts/sync.md`
+    // § "Block Assembly (state_applied_height)".
 }
 
 impl Default for SyncConfig {
@@ -273,6 +324,44 @@ impl Default for SyncConfig {
         }
     }
 }
+
+/// What the sync machine's in-flight window holds right now.
+///
+/// [`crate::delivery::DeliveryTracker`] bookkeeping and nothing else — this
+/// crate holds no section payloads. See
+/// [`HeaderSync::window_memory_estimate`] for what is and is not counted, and
+/// `../facts/sync.md` § "Memory attribution".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncWindowEstimate {
+    /// Heap bytes held by [`crate::delivery::DeliveryTracker`]: its
+    /// pending-request map and its evicted-id vec. Id-keyed bookkeeping only —
+    /// downloaded sections go straight from the p2p pipeline into the modifier
+    /// store, and the validation sweep reads each block back out, applies it,
+    /// and drops it inside one loop iteration. Nothing between "downloaded"
+    /// and "applied" lives on sync's heap.
+    ///
+    /// A lower bound, by a bounded and one-directional margin: it counts the
+    /// live entries exactly and not the hash table's unused slots. See
+    /// [`crate::delivery::DeliveryTracker::memory_bytes`] for why the slack
+    /// cannot be counted honestly and how large it can get (≈2.3×).
+    pub tracker_bytes: u64,
+    /// Live entries behind that figure: in-flight requests in the pending map
+    /// plus ids in the evicted vec awaiting re-request.
+    ///
+    /// There is no separate download queue to count. `request_next_sections`
+    /// recomputes the window's missing sections into a local map on every
+    /// cycle and drops it before returning.
+    pub tracker_entries: u64,
+}
+
+/// Sentinel in the published window atomic meaning "sync has never written it".
+///
+/// Zero is a legitimate reading — an idle tracker really has allocated
+/// nothing — so absence needs a value no byte count can take. `u64::MAX` is
+/// 16 EiB. Readers MUST map this to absent rather than reporting 0, per
+/// `../facts/api.md` § "Component memory attribution": a node that has applied
+/// no blocks must not claim an empty window.
+pub const WINDOW_BYTES_UNSET: u64 = u64::MAX;
 
 /// Header chain sync state machine.
 ///
@@ -310,16 +399,18 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     /// Highest height where ALL required block sections are in the store.
     downloaded_height: u32,
     /// Highest height where apply_state() returned Ok (state advanced).
+    ///
+    /// Since v0.8.0 the only watermark the sweep keeps besides
+    /// `downloaded_height`. `apply_state` evaluates scripts before it persists,
+    /// so an `Ok` already means they passed and there is nothing left for a
+    /// second, trailing watermark to say. See `../facts/sync.md`
+    /// § "Block Assembly (state_applied_height)" for what the trailing one cost
+    /// before it was removed.
     state_applied_height: u32,
-    /// Highest height where evaluate_scripts() completed successfully.
-    /// Advances in-order as results arrive. Persisted for startup re-eval.
-    script_verified_height: u32,
-    /// Number of eval tasks dispatched but not yet drained from the channel.
-    evals_in_flight: u32,
-    /// Channel for sending eval results from rayon pool.
-    eval_tx: CrossbeamSender<(u32, Result<(), ergo_validation::ValidationError>)>,
-    /// Channel for receiving eval results.
-    eval_rx: CrossbeamReceiver<(u32, Result<(), ergo_validation::ValidationError>)>,
+    /// Interval gate for the periodic catch-up progress record. Diagnostic
+    /// only. In-memory: a restart re-baselines. See
+    /// [`crate::catchup_progress`].
+    catchup_progress: crate::catchup_progress::CatchUpProgressReporter,
     /// Shared downloaded_height for the API (read by fastsync to avoid redundant work).
     shared_downloaded_height: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Gate controlling whether block/header/tx ModifierRequest sends actually fire.
@@ -329,6 +420,14 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     /// Peer's chain tip, updated on every incoming SyncInfo to the max observed.
     /// Read by the main crate to compute the bootstrap gap.
     peer_chain_tip: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Published window memory estimate, written after each applied block.
+    ///
+    /// Publish, don't expose: `sync/` owns the validator and does not share it
+    /// (`../facts/validation.md`), so no HTTP path can call
+    /// [`Self::window_memory_estimate`] synchronously. The main crate hands in
+    /// this atomic and passes a clone to the API. Holds [`WINDOW_BYTES_UNSET`]
+    /// until the first block is applied.
+    shared_window_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Height of the most recent `validator.flush()` call. Used by the
     /// memory-aware flush policy to enforce `flush_min_blocks` spacing and
     /// `flush_max_blocks` upper bound.
@@ -343,10 +442,11 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     /// existing storage handle (no reopen, no second mmap).
     synced_cache_bytes: Option<usize>,
     /// Exponential backoff gating the validation sweep when the applied
-    /// tip fails to advance — a deterministic block failure (apply_state
-    /// error OR a deferred-eval rollback; both leave `validated_height()`
-    /// pinned). Derived purely from the validator's applied tip, so its
-    /// stall detection is blind to which subsystem rejected the block. Also
+    /// tip fails to advance — a deterministic `apply_state` failure, which
+    /// since v0.8.0 includes the script rejections that used to come back
+    /// asynchronously and roll the tip back from a drain. Derived purely from
+    /// the validator's applied tip, so its stall detection is blind to which
+    /// subsystem rejected the block. Also
     /// the single emitter of the contract `validation_stuck` event, fired
     /// once a frontier has stalled 5 sweeps in a row (the caller hands in
     /// the `error_kind`/`missing_key` label). Resets on real progress or a
@@ -364,10 +464,10 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
 }
 
 impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync<T, C, S, V> {
-    // 13-arg constructor reflects the dependency-inversion surface (4 trait
-    // objects + 6 channels/atomics + 3 config-ish args). Bundling these would
-    // hide the wiring without simplifying it. A builder is reasonable future
-    // work but not justified for one caller (`src/main.rs`).
+    // 15-arg constructor reflects the dependency-inversion surface (4 trait
+    // objects + 7 channels/atomics + 3 config-ish args + shutdown). Bundling
+    // these would hide the wiring without simplifying it. A builder is
+    // reasonable future work but not justified for one caller (`src/main.rs`).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: SyncConfig,
@@ -383,12 +483,17 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         shared_downloaded_height: std::sync::Arc<std::sync::atomic::AtomicU32>,
         block_request_gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
         peer_chain_tip: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        shared_window_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
         shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> Self {
-        let tracker = DeliveryTracker::with_config(config.delivery_timeout, config.max_delivery_checks);
+        let tracker =
+            DeliveryTracker::with_config(config.delivery_timeout, config.max_delivery_checks);
         let initial_validated = validator.as_ref().map_or(0, |v| v.validated_height());
-        let (eval_tx, eval_rx) = crossbeam_channel::unbounded();
         let last_flush_height = initial_validated;
+        // Stamp "never written" here rather than trusting the caller's initial
+        // value. Whatever the host constructed the atomic with, a reader that
+        // polls before the first applied block must see absent, not zero.
+        shared_window_bytes.store(WINDOW_BYTES_UNSET, std::sync::atomic::Ordering::Relaxed);
         Self {
             config,
             transport,
@@ -409,13 +514,11 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             sync_sent_count: 0,
             downloaded_height: initial_validated,
             state_applied_height: initial_validated,
-            script_verified_height: initial_validated,
-            evals_in_flight: 0,
-            eval_tx,
-            eval_rx,
+            catchup_progress: crate::catchup_progress::CatchUpProgressReporter::default(),
             shared_downloaded_height,
             block_request_gate,
             peer_chain_tip,
+            shared_window_bytes,
             last_flush_height,
             at_tip_request_tx: None,
             at_tip_validator_rx: None,
@@ -425,13 +528,57 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         }
     }
 
+    /// Bytes held by the in-flight delivery bookkeeping. `None` if not
+    /// computable.
+    ///
+    /// [`crate::delivery::DeliveryTracker`] is the whole of it: `sync/` holds
+    /// no section payloads and no persistent download queue.
+    ///
+    /// - Sections never pass through sync's heap. `ModifierResponse` is not a
+    ///   message this state machine handles at all — the p2p pipeline writes
+    ///   the bytes to the modifier store and notifies sync with ids only
+    ///   ([`crate::delivery::DeliveryData::Received`]). The validation sweep
+    ///   reads each block back out of the store, applies it, and drops it
+    ///   within one iteration of the loop in `advance_state_applied_height`.
+    ///   Downloaded-but-unapplied section bytes live in redb, and redb's cache
+    ///   is already attributed as `storeCacheBytes`.
+    /// - There is no download queue to size. `request_next_sections`
+    ///   recomputes the missing sections in the 192-block window into a local
+    ///   map every cycle and drops it before returning.
+    /// - What is left is the [`crate::delivery::DeliveryTracker`]: the
+    ///   pending-request map and the evicted-id queue, both id-keyed. Their
+    ///   footprint is counted from the live entries, so it rises when requests
+    ///   go in flight and falls as they are delivered — never derived from a
+    ///   per-block constant.
+    ///
+    /// Currently always `Some`: both structures are always present and always
+    /// measurable. The `Option` is in the contract so that a future in-flight
+    /// structure sync cannot size reports absence rather than quietly
+    /// publishing a total that omits it.
+    pub fn window_memory_estimate(&self) -> Option<SyncWindowEstimate> {
+        Some(SyncWindowEstimate {
+            tracker_bytes: self.tracker.memory_bytes(),
+            tracker_entries: (self.tracker.pending_count() + self.tracker.evicted_count()) as u64,
+        })
+    }
+
+    /// Publish the current window estimate to the shared atomic.
+    ///
+    /// Called after each applied block. Not `async` and takes `&self`: the
+    /// borrow never spans an `.await`, so the enclosing future stays `Send`
+    /// even though `V` is `!Sync`.
+    fn publish_window_estimate(&self) {
+        let bytes = self
+            .window_memory_estimate()
+            .map_or(WINDOW_BYTES_UNSET, |e| e.tracker_bytes);
+        self.shared_window_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Configure the at-tip transition. When `synced()` is first entered,
     /// `resize_cache()` is called on the validator with `synced_cache_bytes`
     /// to shrink the read cache without reopening the database.
-    pub fn set_at_tip_cache(
-        &mut self,
-        synced_cache_bytes: usize,
-    ) {
+    pub fn set_at_tip_cache(&mut self, synced_cache_bytes: usize) {
         self.synced_cache_bytes = Some(synced_cache_bytes);
     }
 
@@ -581,11 +728,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         // Idempotent: skipped on restart when the chain is non-empty.
         if self.config.state_type == StateType::Light && self.chain.chain_height().await == 0 {
             tracing::info!("light-client mode: running NiPoPoW bootstrap");
-            match crate::light_bootstrap::run_light_bootstrap(
-                &mut self.transport,
-                &self.chain,
-            )
-            .await
+            match crate::light_bootstrap::run_light_bootstrap(&mut self.transport, &self.chain)
+                .await
             {
                 Ok(()) => {
                     let height = self.chain.chain_height().await;
@@ -594,7 +738,10 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     // no validator running and no block sections to download.
                     self.downloaded_height = height;
                     self.state_applied_height = height;
-                    tracing::info!(height, "light bootstrap installed, entering tip-following sync");
+                    tracing::info!(
+                        height,
+                        "light bootstrap installed, entering tip-following sync"
+                    );
                 }
                 Err(e) => {
                     tracing::error!("light bootstrap failed: {e}");
@@ -607,32 +754,6 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         let tip = self.chain.chain_height().await;
         if tip > 0 {
             self.advance_downloaded_height().await;
-        }
-
-        // Startup: load persisted script_verified_height.
-        // If there's a gap (state applied but scripts not verified from a
-        // previous unclean shutdown), accept it — the AVL digest already
-        // proved state correctness. Proof boxes aren't available without
-        // re-running apply_state, so re-evaluation isn't feasible here.
-        if let Some(persisted_svh) = self.store.script_verified_height().await {
-            self.script_verified_height = persisted_svh.min(self.state_applied_height);
-            if persisted_svh < self.state_applied_height {
-                let gap = self.state_applied_height - persisted_svh;
-                tracing::info!(
-                    persisted_svh,
-                    state_applied_height = self.state_applied_height,
-                    gap,
-                    "startup: accepting script verification gap (AVL digest verified)"
-                );
-                // Advance to match — the gap blocks' state transitions are
-                // already proven correct by the AVL digest check in apply_state.
-                self.script_verified_height = self.state_applied_height;
-                // Lock in the new floor durably so a restart before the next
-                // flush doesn't re-discover the same gap. Without this the
-                // persisted SVH stays stuck at the old value across restarts.
-                self.store.set_script_verified_height(self.script_verified_height).await;
-                self.store.flush().await;
-            }
         }
 
         // Startup WARN: surface bodies older than the configured retention
@@ -753,7 +874,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         tracing::info!(height, "header sync exiting — flushing state");
         let outcome = try_flush_validator(self.validator.as_ref(), height);
         complete_store_flush_pair(outcome, &self.store).await;
-        if let FlushOutcome::Flushed(m) = outcome {
+        if let Some(m) = outcome.committed_height() {
             maybe_prune_at_horizon(&self.store, &self.chain, m, self.config.blocks_to_keep).await;
         }
         if outcome.advances_last_flush() {
@@ -820,9 +941,13 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         let mut sweep_ticker = tokio::time::interval(Duration::from_secs(10));
 
         loop {
-            let until_next = self.config.sync_interval
+            let until_next = self
+                .config
+                .sync_interval
                 .saturating_sub(self.last_scheduled_sync.elapsed());
-            let until_delivery = self.config.delivery_check_interval
+            let until_delivery = self
+                .config
+                .delivery_check_interval
                 .saturating_sub(last_delivery_check.elapsed());
 
             tokio::select! {
@@ -924,7 +1049,10 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     /// tracker before sending. Chunks into messages of at most 400 IDs
     /// to stay within the JVM's `desiredInvObjects` limit.
     async fn request_announced(&mut self, peer: PeerId, modifier_type: u8, ids: Vec<[u8; 32]>) {
-        if !self.block_request_gate.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self
+            .block_request_gate
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return;
         }
         // Filter out already-known and already-in-flight IDs
@@ -1009,7 +1137,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         if new_height > self.downloaded_height {
             let advanced = new_height - self.downloaded_height;
             self.downloaded_height = new_height;
-            self.shared_downloaded_height.store(new_height, std::sync::atomic::Ordering::Relaxed);
+            self.shared_downloaded_height
+                .store(new_height, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!(
                 downloaded_height = new_height,
                 advanced,
@@ -1028,8 +1157,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         // atomically with the AVL prover, so it is the single source of
         // truth for what state has actually been applied. The sweep MUST
         // resume from there, never from `state_applied_height`, which is a
-        // cache that a mid-sweep deferred-eval rollback can leave stale
-        // (ahead of the real tip). Deriving the start from the prover tip
+        // cache a reorg rollback can leave stale (ahead of the real tip).
+        // Deriving the start from the prover tip
         // makes it impossible to feed `apply_state` a non-consecutive block
         // — that was the wedge where the sweep skipped on-disk blocks and
         // looped forever on a `HeightMismatch`. See `../facts/sync.md`.
@@ -1133,34 +1262,34 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             // is sync and stateless w.r.t. chain state, so all chain queries
             // happen out-of-band before/after the call.
             let active_params = self.chain.active_parameters().await;
-            let (expected_boundary_params, expected_proposed_update) =
-                if self.chain.is_epoch_boundary(height).await {
-                    let block_proposed_update =
-                        match enr_chain::parse_extension_bytes(&extension) {
-                            Ok((_header_id, fields)) => {
-                                enr_chain::extract_disabling_rules_from_kv(&fields)
-                            }
-                            Err(e) => {
-                                tracing::error!(height, error = %e, "extension parse for proposed update failed");
-                                break;
-                            }
-                        };
-                    let params = match self
-                        .chain
-                        .compute_expected_parameters(height, &block_proposed_update)
-                        .await
-                    {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::error!(height, error = %e, "compute_expected_parameters failed");
-                            break;
-                        }
-                    };
-                    let expected_pu = self.chain.active_proposed_update_bytes().await;
-                    (Some(params), Some(expected_pu))
-                } else {
-                    (None, None)
+            let (expected_boundary_params, expected_proposed_update) = if self
+                .chain
+                .is_epoch_boundary(height)
+                .await
+            {
+                let block_proposed_update = match enr_chain::parse_extension_bytes(&extension) {
+                    Ok((_header_id, fields)) => enr_chain::extract_disabling_rules_from_kv(&fields),
+                    Err(e) => {
+                        tracing::error!(height, error = %e, "extension parse for proposed update failed");
+                        break;
+                    }
                 };
+                let params = match self
+                    .chain
+                    .compute_expected_parameters(height, &block_proposed_update)
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!(height, error = %e, "compute_expected_parameters failed");
+                        break;
+                    }
+                };
+                let expected_pu = self.chain.active_proposed_update_bytes().await;
+                (Some(params), Some(expected_pu))
+            } else {
+                (None, None)
+            };
 
             let result = self.validator.as_mut().unwrap().apply_state(
                 &header,
@@ -1194,47 +1323,31 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         "block applied"
                     );
 
-                    // Spawn deferred script evaluation on rayon pool
-                    if let Some(eval) = outcome.deferred_eval {
-                        let tx = self.eval_tx.clone();
-                        self.evals_in_flight += 1;
-                        rayon::spawn(move || {
-                            let h = eval.height;
-                            let result = ergo_validation::evaluate_scripts(&eval).map(|_cost| ());
-                            let _ = tx.send((h, result));
+                    // Publish the window estimate after each applied block —
+                    // the cadence the contract specifies, and the one that
+                    // matters: the window is at its widest during exactly the
+                    // catch-up sync this figure exists to characterise.
+                    self.publish_window_estimate();
+
+                    // Periodic catch-up record. Placed before the flush below so
+                    // the heap reading is the pre-flush peak. Time-gated and
+                    // catch-up-only inside `maybe_emit`; the probe closure runs
+                    // only when a record actually fires. See
+                    // [`crate::catchup_progress`] and `../facts/sync.md`.
+                    //
+                    // The height is read from the validator tip, not
+                    // `self.state_applied_height`: that field is a cache
+                    // reconciled after the loop, so mid-sweep it is frozen at
+                    // the pre-sweep tip and this record would report a height
+                    // the sweep passed some time ago.
+                    let applied = self
+                        .validator
+                        .as_ref()
+                        .map_or(validated_to, |v| v.validated_height());
+                    self.catchup_progress
+                        .maybe_emit(Instant::now(), sweep_size, applied, || {
+                            self.config.flush_probe.as_ref().map(|probe| probe())
                         });
-                    }
-
-                    // Non-blocking drain of completed eval results. A
-                    // deferred-eval failure inside the drain rolls the
-                    // validator back (and lowers `state_applied_height`).
-                    // Detect it by the validator's own tip moving backwards
-                    // across the drain — NOT by `state_applied_height` dipping
-                    // below its pre-sweep value, which misses a rollback that
-                    // lands exactly on the pre-sweep tip (the common case: the
-                    // failing block was applied earlier in THIS sweep). On any
-                    // backwards move, abort: continuing would feed `apply_state`
-                    // a block past the rolled-back tip and surface a misleading
-                    // `HeightMismatch`.
-                    let pre_drain_tip =
-                        self.validator.as_ref().map_or(validated_to, |v| v.validated_height());
-                    self.drain_eval_results(false).await;
-                    let post_drain_tip =
-                        self.validator.as_ref().map_or(pre_drain_tip, |v| v.validated_height());
-
-                    if post_drain_tip < pre_drain_tip {
-                        tracing::warn!(
-                            validated_to,
-                            rolled_back_to = post_drain_tip,
-                            "eval failure rolled back state during sweep — aborting"
-                        );
-                        validated_to = post_drain_tip;
-                        // If this rollback pins the frontier, the backoff's
-                        // validation_stuck must name the deferred-eval mode —
-                        // the path the retired apply_state tracker never saw.
-                        stall_detail = StallDetail::script_eval();
-                        break;
-                    }
 
                     // Progress report every 1000 blocks during large sweeps
                     let done = height - applied_tip;
@@ -1242,7 +1355,11 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         let elapsed = sweep_start.elapsed().as_secs().max(1);
                         let rate = done as f64 / elapsed as f64;
                         let remaining = sweep_to - height;
-                        let eta_secs = if rate > 0.0 { remaining as f64 / rate } else { 0.0 };
+                        let eta_secs = if rate > 0.0 {
+                            remaining as f64 / rate
+                        } else {
+                            0.0
+                        };
                         tracing::debug!(
                             height,
                             done,
@@ -1262,7 +1379,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     if self.should_flush(height) {
                         let outcome = try_flush_validator(self.validator.as_ref(), height);
                         complete_store_flush_pair(outcome, &self.store).await;
-                        if let FlushOutcome::Flushed(m) = outcome {
+                        if let Some(m) = outcome.committed_height() {
                             maybe_prune_at_horizon(
                                 &self.store,
                                 &self.chain,
@@ -1277,13 +1394,21 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     }
                 }
                 Err(e) => {
-                    let err_msg = e.to_string();
                     // Label the stall so the backoff's validation_stuck — if
                     // this frontier wedges for 5 sweeps — names the apply_state
                     // error kind and, for the AVL missing-key case, the key.
-                    let (error_kind, missing_key) = classify_apply_state_error(&err_msg);
-                    stall_detail = StallDetail { error_kind, missing_key };
-                    tracing::error!(height, error = %err_msg, "apply_state failed");
+                    //
+                    // Classified from the typed error, never from the rendered
+                    // string below. The string is for the human reading the log;
+                    // routing a contract field through it is how the
+                    // script-failure kind went missing without a compile error
+                    // when deferred evaluation was removed.
+                    let (error_kind, missing_key) = classify_apply_state_error(&e);
+                    stall_detail = StallDetail {
+                        error_kind,
+                        missing_key,
+                    };
+                    tracing::error!(height, error = %e, "apply_state failed");
                     break;
                 }
             }
@@ -1298,18 +1423,19 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         // what the prover actually holds; the cache must mirror it in both
         // directions. Persistence is handled atomically inside state.redb by
         // `UtxoValidator::apply_state` — no separate hint write needed.
-        let true_tip = self.validator.as_ref().map_or(validated_to, |v| v.validated_height());
+        let true_tip = self
+            .validator
+            .as_ref()
+            .map_or(validated_to, |v| v.validated_height());
 
         // Drive the sweep backoff off the authoritative applied tip. If the
         // sweep moved the tip past where it started, that is real progress —
         // clear any backoff. If it did not, the frontier is failing
-        // deterministically (apply_state error, or an eval rollback that
-        // pulled the tip back to where it began); arm/escalate the
-        // exponential delay so the next retry is throttled, and — once the
+        // deterministically on `apply_state` — which since v0.8.0 includes the
+        // script failures that used to come back asynchronously; arm/escalate
+        // the exponential delay so the next retry is throttled, and — once the
         // frontier has stalled 5 sweeps in a row — emit the contract
-        // `validation_stuck` event, labelled by `stall_detail`. The backoff
-        // owns that emission for BOTH modes now (apply_state and the
-        // deferred-eval rollback the retired tracker never saw). This
+        // `validation_stuck` event, labelled by `stall_detail`. This
         // per-engage WARN is the finer-grained signal — once per actual retry,
         // distinct from `validation_stuck` and deliberately not doubling it.
         if let Some(stall) =
@@ -1351,8 +1477,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     );
                 }
             } else {
-                // Cache was stale-ahead of the prover (e.g. a mid-sweep eval
-                // rollback) — pulled back down to the truth.
+                // Cache was stale-ahead of the prover (a reorg rollback that
+                // landed after the cache was last written) — pulled back down
+                // to the truth.
                 tracing::debug!(
                     state_applied_height = true_tip,
                     previous = prev,
@@ -1361,120 +1488,17 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             }
         }
 
-        // After sweep: drain remaining eval results.
-        // At chain tip (single block), drain synchronously to ensure
-        // scripts are verified before accepting the next peer block.
-        let blocking = sweep_size <= 1;
-        self.drain_eval_results(blocking).await;
-
         // Durable flush at sweep end — catches the tail of blocks that
         // didn't hit a heap-threshold or max-blocks trigger mid-sweep. The
         // tip-following path (single block per sweep) always reaches this.
-        let outcome =
-            try_flush_validator(self.validator.as_ref(), self.state_applied_height);
+        let outcome = try_flush_validator(self.validator.as_ref(), self.state_applied_height);
         complete_store_flush_pair(outcome, &self.store).await;
-        if let FlushOutcome::Flushed(m) = outcome {
+        if let Some(m) = outcome.committed_height() {
             maybe_prune_at_horizon(&self.store, &self.chain, m, self.config.blocks_to_keep).await;
         }
         if outcome.advances_last_flush() {
             self.last_flush_height = self.state_applied_height;
         }
-    }
-
-    /// Drain completed script evaluation results from the channel.
-    ///
-    /// `blocking`: if true, block until all in-flight evals complete.
-    /// If false, drain only what's immediately available (non-blocking).
-    async fn drain_eval_results(&mut self, blocking: bool) {
-        let mut verified: BTreeSet<u32> = BTreeSet::new();
-
-        while self.evals_in_flight > 0 {
-            let msg = if blocking {
-                match self.eval_rx.recv() {
-                    Ok(msg) => msg,
-                    Err(_) => break,
-                }
-            } else {
-                match self.eval_rx.try_recv() {
-                    Ok(msg) => msg,
-                    Err(_) => break,
-                }
-            };
-
-            self.evals_in_flight -= 1;
-            let (height, result) = msg;
-            match result {
-                Ok(()) => {
-                    verified.insert(height);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        height, error = %e,
-                        "script evaluation failed — rolling back"
-                    );
-                    self.handle_eval_failure(height).await;
-                    return;
-                }
-            }
-        }
-
-        // Advance script_verified_height sequentially
-        let prev = self.script_verified_height;
-        while verified.contains(&(self.script_verified_height + 1)) {
-            self.script_verified_height += 1;
-            verified.remove(&self.script_verified_height);
-        }
-        // Persist on every advance. With Durability::None the write hits the
-        // redb WAL only and gets fsynced when the paired store.flush() runs at
-        // the next state-flush point — so persisted SVH always tracks
-        // persisted state without an extra fsync per block.
-        if self.script_verified_height > prev {
-            self.store.set_script_verified_height(self.script_verified_height).await;
-        }
-    }
-
-    /// Handle a deferred script evaluation failure by rolling back state.
-    async fn handle_eval_failure(&mut self, failed_height: u32) {
-        // Drain and discard remaining results
-        while self.eval_rx.try_recv().is_ok() {}
-        self.evals_in_flight = 0;
-
-        let rollback_to = failed_height - 1;
-
-        if let Some(v) = self.validator.as_mut() {
-            if let Some(header) = self.chain.header_at(rollback_to).await {
-                if let Err(e) = v.reset_to(rollback_to, header.state_root) {
-                    // The rollback failed — the validator did NOT move
-                    // (contract: validated_height/digest/prover unchanged on
-                    // Err). Every watermark stays in place: retreating them
-                    // onto un-rolled state is the gap-wedge hole. The sweep
-                    // backoff retries the resulting stall; no separate retry
-                    // mechanism here. See `../facts/sync.md`.
-                    tracing::error!(
-                        height = rollback_to as u64,
-                        path = "eval_failure",
-                        error = %e,
-                        "validation rollback failed"
-                    );
-                    return;
-                }
-            } else {
-                tracing::error!(rollback_to, "cannot find header for rollback");
-                return;
-            }
-        }
-
-        self.state_applied_height = rollback_to;
-        self.script_verified_height = rollback_to;
-        self.store.set_script_verified_height(self.script_verified_height).await;
-        if self.downloaded_height > rollback_to {
-            self.downloaded_height = rollback_to;
-        }
-
-        tracing::warn!(
-            rollback_to,
-            "state rolled back due to script eval failure"
-        );
     }
 
     /// Handle a control-plane event (Reorg or NeedModifier).
@@ -1484,12 +1508,24 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 tracing::info!(type_id, "pipeline needs modifier for reorg");
                 self.request_announced(peer, type_id, vec![id]).await;
             }
-            DeliveryControl::Reorg { fork_point, old_tip, new_tip } => {
-                tracing::info!(fork_point, old_tip, new_tip, "reorg: adjusting section queue and watermark");
+            DeliveryControl::Reorg {
+                fork_point,
+                old_tip,
+                new_tip,
+            } => {
+                tracing::info!(
+                    fork_point,
+                    old_tip,
+                    new_tip,
+                    "reorg: adjusting section queue and watermark"
+                );
 
-                // Drain and discard in-flight eval results
-                while self.eval_rx.try_recv().is_ok() {}
-                self.evals_in_flight = 0;
+                // Nothing to drain. Since v0.8.0 a reorg cannot arrive between
+                // a block's application and its verification, because there is
+                // no gap between them — `apply_state` evaluates before it
+                // persists. The generation tagging, the reorder-buffer purge
+                // and the conditional invalidation this replaces all existed to
+                // decide which in-flight results a rollback had made wrong.
 
                 // Reset watermarks if they were above the fork point
                 if self.downloaded_height > fork_point {
@@ -1501,12 +1537,12 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     self.downloaded_height = fork_point;
                 }
                 if self.state_applied_height > fork_point {
-                    // The state watermarks may only retreat if the validator
+                    // The state watermark may only retreat if the validator
                     // actually rolled back — on a failed rollback the state
                     // genuinely sits where it was, and retreating the
-                    // watermarks onto un-rolled state is the gap-wedge hole
+                    // watermark onto un-rolled state is the gap-wedge hole
                     // (see `../facts/sync.md`). No validator (light mode) =
-                    // nothing to roll, watermarks are sync-local.
+                    // nothing to roll, the watermark is sync-local.
                     let rolled_back = match self.validator.as_mut() {
                         Some(v) => match self.chain.header_at(fork_point).await {
                             Some(fork_header) => {
@@ -1535,8 +1571,6 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     };
                     if rolled_back {
                         self.state_applied_height = fork_point;
-                        self.script_verified_height = fork_point;
-                        self.store.set_script_verified_height(self.script_verified_height).await;
                     }
                 }
 
@@ -1564,9 +1598,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 }
 
                 // Empty Inv: peer has no more headers
-                ProtocolMessage::Inv { modifier_type, .. }
-                    if modifier_type == HEADER_TYPE_ID =>
-                {
+                ProtocolMessage::Inv { modifier_type, .. } if modifier_type == HEADER_TYPE_ID => {
                     let height = self.chain.chain_height().await;
                     tracing::debug!(height, "peer reports no more headers");
                     EventResult::Synced
@@ -1576,7 +1608,11 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 ProtocolMessage::Inv { modifier_type, ids }
                     if is_block_section_type(modifier_type) && !ids.is_empty() =>
                 {
-                    tracing::debug!(type_id = modifier_type, count = ids.len(), "block section Inv → requesting");
+                    tracing::debug!(
+                        type_id = modifier_type,
+                        count = ids.len(),
+                        "block section Inv → requesting"
+                    );
                     self.request_announced(peer_id, modifier_type, ids).await;
                     EventResult::Continue
                 }
@@ -1600,7 +1636,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         if let Some(peer_tip) = peer_tip {
                             // Publish the max peer tip we've seen — main crate
                             // reads this for the bootstrap gap decision.
-                            let prev = self.peer_chain_tip
+                            let prev = self
+                                .peer_chain_tip
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             if peer_tip > prev {
                                 self.peer_chain_tip
@@ -1626,8 +1663,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         // peer = served from height 1. An empty own chain has
                         // nothing to serve. Runs even when `result` flips to
                         // Synced — a behind sync-peer still gets its Inv.
-                        let peer_strictly_ahead =
-                            peer_tip.is_some_and(|t| t > our_height);
+                        let peer_strictly_ahead = peer_tip.is_some_and(|t| t > our_height);
                         if our_height > 0 && !peer_strictly_ahead {
                             let anchors = sync_info_anchor_ids(&info);
                             let ids = self
@@ -1679,7 +1715,10 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     EventResult::Continue
                 }
 
-                ProtocolMessage::Inv { modifier_type, ref ids } => {
+                ProtocolMessage::Inv {
+                    modifier_type,
+                    ref ids,
+                } => {
                     tracing::debug!(
                         peer = %peer_id,
                         modifier_type,
@@ -1716,25 +1755,35 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     ) {
         // Re-request timed-out modifiers from a different peer
         if !result.retries.is_empty()
-            && self.block_request_gate.load(std::sync::atomic::Ordering::Relaxed)
+            && self
+                .block_request_gate
+                .load(std::sync::atomic::Ordering::Relaxed)
         {
             let peers = self.transport.outbound_peers().await;
             for retry in &result.retries {
-                let target = peers.iter()
+                let target = peers
+                    .iter()
                     .find(|&&p| p != retry.failed_peer)
                     .copied()
                     .unwrap_or(retry.failed_peer);
 
-                self.tracker.mark_requested(&[retry.id], target, retry.type_id);
-                let _ = self.transport.send_to(
-                    target,
-                    ProtocolMessage::ModifierRequest {
-                        modifier_type: retry.type_id,
-                        ids: vec![retry.id],
-                    },
-                ).await;
+                self.tracker
+                    .mark_requested(&[retry.id], target, retry.type_id);
+                let _ = self
+                    .transport
+                    .send_to(
+                        target,
+                        ProtocolMessage::ModifierRequest {
+                            modifier_type: retry.type_id,
+                            ids: vec![retry.id],
+                        },
+                    )
+                    .await;
             }
-            tracing::debug!(count = result.retries.len(), "re-requested timed-out modifiers");
+            tracing::debug!(
+                count = result.retries.len(),
+                "re-requested timed-out modifiers"
+            );
         }
 
         // Re-request evicted modifiers (LRU buffer evictions — headers only)
@@ -1759,7 +1808,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     async fn rerequest_from_any(&mut self, modifier_type: u8, ids: &[[u8; 32]]) {
         let peers = self.transport.outbound_peers().await;
         if let Some(&target) = peers.first() {
-            self.request_announced(target, modifier_type, ids.to_vec()).await;
+            self.request_announced(target, modifier_type, ids.to_vec())
+                .await;
             tracing::debug!(count = ids.len(), peer = %target, "re-requested modifiers");
         }
     }
@@ -1835,26 +1885,39 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
 
         // ── In-place cache resize (no reopen, no second mmap) ──
         if let Some(cache_bytes) = self.synced_cache_bytes.take() {
-            if let Some(ref validator) = self.validator {
-                if let Err(e) = validator.resize_cache(cache_bytes) {
-                    tracing::error!(
-                        cache_bytes,
-                        error = ?e,
-                        "at-tip: resize_cache failed; continuing with cold-sync cache size"
-                    );
-                } else {
-                    tracing::info!(
-                        cache_bytes,
-                        "at-tip: cache resized in-place on existing storage handle"
-                    );
+            // Only a validator that owns storage has a cache to resize. Digest
+            // mode has none, and must NOT reach the success log below — before
+            // the v0.8.0 trait split the defaulted `resize_cache` returned
+            // `Ok(())` there and this logged "cache resized in-place" for a
+            // resize that never happened. That false success is the reason the
+            // split exists (facts/validation.md).
+            match self.validator.as_ref().and_then(|v| v.state_persistence()) {
+                Some(persistence) => {
+                    if let Err(e) = persistence.resize_cache(cache_bytes) {
+                        tracing::error!(
+                            cache_bytes,
+                            error = ?e,
+                            "at-tip: resize_cache failed; continuing with cold-sync cache size"
+                        );
+                    } else {
+                        tracing::info!(
+                            cache_bytes,
+                            "at-tip: cache resized in-place on existing storage handle"
+                        );
+                    }
                 }
+                None => tracing::debug!(
+                    cache_bytes,
+                    "at-tip: validator owns no persistent state; no cache to resize"
+                ),
             }
         }
 
         // ── Storage reopen handshake (legacy, kept for digest-mode) ──
-        if let (Some(req_tx), Some(val_rx)) =
-            (self.at_tip_request_tx.take(), self.at_tip_validator_rx.take())
-        {
+        if let (Some(req_tx), Some(val_rx)) = (
+            self.at_tip_request_tx.take(),
+            self.at_tip_validator_rx.take(),
+        ) {
             if let Some(validator) = self.validator.take() {
                 let height = validator.validated_height();
                 // Persist any pending in-memory state BEFORE dropping. Without
@@ -1864,7 +1927,12 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 // (and the new validator's height field) believe state is at
                 // `height`, leaving an N-block gap where any later block that
                 // spends an output from the gap fails with "Key does not exist".
-                if let Err(e) = validator.flush() {
+                //
+                // A validator that owns no persistent state (digest mode) has
+                // no write tx to lose, so the absence of `StatePersistence`
+                // proceeds to the rebuild; only a real `Err` aborts it
+                // (../facts/sync.md § "At-tip Storage Reopen", step 1).
+                if let Some(Err(e)) = validator.state_persistence().map(|p| p.flush()) {
                     tracing::error!(
                         height,
                         error = ?e,
@@ -1874,7 +1942,10 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     return;
                 }
                 drop(validator); // releases AVL storage so main can reopen it
-                tracing::info!(height, "at-tip: requesting validator rebuild with synced cache");
+                tracing::info!(
+                    height,
+                    "at-tip: requesting validator rebuild with synced cache"
+                );
                 if req_tx.send(height).is_err() {
                     tracing::error!("at-tip: failed to signal main; continuing without rebuild");
                     return;
@@ -1890,7 +1961,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                         self.validator = Some(new_validator);
                     }
                     Err(_) => {
-                        tracing::error!("at-tip: validator rebuild channel closed; sync cannot proceed");
+                        tracing::error!(
+                            "at-tip: validator rebuild channel closed; sync cannot proceed"
+                        );
                     }
                 }
             }
@@ -2035,10 +2108,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             return;
         }
 
-        let window_end = std::cmp::min(
-            self.downloaded_height + Self::DOWNLOAD_WINDOW,
-            chain_height,
-        );
+        let window_end =
+            std::cmp::min(self.downloaded_height + Self::DOWNLOAD_WINDOW, chain_height);
 
         let mut by_type: HashMap<u8, Vec<[u8; 32]>> = HashMap::new();
         let mut total = 0usize;
@@ -2106,7 +2177,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         // Diagnostic: log SyncInfo content + first 40 hex bytes for wire analysis
         if let Ok(info) = self.chain.parse_sync_info(&body) {
             let heights = C::sync_info_heights(&info);
-            let hex_prefix: String = body.iter().take(40)
+            let hex_prefix: String = body
+                .iter()
+                .take(40)
                 .map(|b| format!("{:02x}", b))
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -2186,7 +2259,7 @@ mod cross_db_flush_tests {
     use super::*;
     use ergo_chain_types::{ADDigest, Header};
     use ergo_validation::{
-        ApplyStateOutcome, BlockValidator, Parameters, ValidationError,
+        ApplyStateOutcome, BlockValidator, Parameters, StatePersistence, ValidationError,
     };
     use std::sync::Mutex;
 
@@ -2223,14 +2296,6 @@ mod cross_db_flush_tests {
         }
 
         async fn get_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> Option<Vec<u8>> {
-            unimplemented!("not called in flush-ordering tests")
-        }
-
-        async fn script_verified_height(&self) -> Option<u32> {
-            unimplemented!("not called in flush-ordering tests")
-        }
-
-        async fn set_script_verified_height(&self, _height: u32) {
             unimplemented!("not called in flush-ordering tests")
         }
 
@@ -2314,17 +2379,68 @@ mod cross_db_flush_tests {
             &self.digest
         }
 
-        fn reset_to(
-            &mut self,
-            _height: u32,
-            _digest: ADDigest,
-        ) -> Result<(), ValidationError> {
+        fn reset_to(&mut self, _height: u32, _digest: ADDigest) -> Result<(), ValidationError> {
             unimplemented!("not called in flush-ordering tests")
         }
 
+        fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+            Some(self)
+        }
+    }
+
+    impl StatePersistence for FakeValidator {
         fn flush(&self) -> Result<(), ValidationError> {
             self.flush_result
                 .map_err(|s| ValidationError::ProofVerificationFailed(s.to_string()))
+        }
+
+        fn resize_cache(&self, _cache_bytes: usize) -> Result<(), ValidationError> {
+            unimplemented!("not called in flush-ordering tests")
+        }
+
+        /// No prover behind this double, so nothing to size.
+        fn prover_memory_estimate(&self) -> Option<ergo_validation::ProverMemoryEstimate> {
+            None
+        }
+    }
+
+    /// Digest-mode shape: a validator that owns no persistent state. Its
+    /// `state_persistence()` is `None`, which is NOT the light-mode
+    /// no-validator case — the store side of the pair still runs.
+    struct NoPersistenceValidator {
+        validated_height: u32,
+        digest: ADDigest,
+    }
+
+    impl BlockValidator for NoPersistenceValidator {
+        fn apply_state(
+            &mut self,
+            _header: &Header,
+            _block_txs: &[u8],
+            _ad_proofs: Option<&[u8]>,
+            _extension: &[u8],
+            _preceding_headers: &[Header],
+            _active_params: &Parameters,
+            _expected_boundary_params: Option<&Parameters>,
+            _expected_proposed_update: Option<&[u8]>,
+        ) -> Result<ApplyStateOutcome, ValidationError> {
+            unimplemented!("not called in flush-ordering tests")
+        }
+
+        fn validated_height(&self) -> u32 {
+            self.validated_height
+        }
+
+        fn current_digest(&self) -> &ADDigest {
+            &self.digest
+        }
+
+        fn reset_to(&mut self, _height: u32, _digest: ADDigest) -> Result<(), ValidationError> {
+            unimplemented!("not called in flush-ordering tests")
+        }
+
+        fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+            None
         }
     }
 
@@ -2339,10 +2455,7 @@ mod cross_db_flush_tests {
         assert_eq!(outcome, FlushOutcome::Flushed(1_785_000));
         assert_eq!(
             store.calls(),
-            vec![
-                StoreCall::SetValidatedHeight(1_785_000),
-                StoreCall::Flush,
-            ],
+            vec![StoreCall::SetValidatedHeight(1_785_000), StoreCall::Flush,],
             "set_validated_height MUST precede store.flush() (cross-DB handshake ordering)"
         );
     }
@@ -2380,11 +2493,51 @@ mod cross_db_flush_tests {
         );
     }
 
+    #[tokio::test]
+    async fn validator_without_persistence_still_records_validated_height() {
+        let store = MockStore::new();
+        let validator = NoPersistenceValidator {
+            validated_height: 1_785_000,
+            digest: ADDigest::zero(),
+        };
+
+        // Digest mode: `state_persistence()` is None, so nothing is fsynced —
+        // but the validator has a real height and the store side of the pair
+        // runs exactly as after a successful flush. Before the v0.8.0 trait
+        // split this height reached the store via a defaulted `flush` that
+        // returned Ok(()) without doing anything; the write must survive the
+        // split. See ../facts/sync.md § "Flushing a validator that owns no
+        // state".
+        let outcome = try_flush_validator(Some(&validator), 1_785_000);
+        complete_store_flush_pair(outcome, &store).await;
+
+        assert_eq!(outcome, FlushOutcome::NothingToPersist(1_785_000));
+        assert_eq!(
+            store.calls(),
+            vec![StoreCall::SetValidatedHeight(1_785_000), StoreCall::Flush,],
+            "nothing to persist is NOT the light-mode case — validated_height \
+             MUST still be recorded, before store.flush()"
+        );
+    }
+
     #[test]
-    fn flush_outcome_advances_last_flush_only_on_success_or_no_validator() {
+    fn flush_outcome_advances_last_flush_unless_the_flush_failed() {
         assert!(FlushOutcome::Flushed(42).advances_last_flush());
+        assert!(FlushOutcome::NothingToPersist(42).advances_last_flush());
         assert!(FlushOutcome::NoValidator.advances_last_flush());
         assert!(!FlushOutcome::Failed.advances_last_flush());
+    }
+
+    #[test]
+    fn committed_height_covers_flushed_and_nothing_to_persist_only() {
+        assert_eq!(FlushOutcome::Flushed(42).committed_height(), Some(42));
+        assert_eq!(
+            FlushOutcome::NothingToPersist(42).committed_height(),
+            Some(42),
+            "digest mode records and prunes at M exactly as a real flush does"
+        );
+        assert_eq!(FlushOutcome::NoValidator.committed_height(), None);
+        assert_eq!(FlushOutcome::Failed.committed_height(), None);
     }
 }
 
@@ -2402,9 +2555,9 @@ mod shutdown_flush_tests {
     use enr_chain::{ChainError, SyncInfo};
     use ergo_chain_types::{ADDigest, Header};
     use ergo_validation::{
-        ApplyStateOutcome, BlockValidator, Parameters, ValidationError,
+        ApplyStateOutcome, BlockValidator, Parameters, StatePersistence, ValidationError,
     };
-    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
     use std::sync::Mutex;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2419,7 +2572,9 @@ mod shutdown_flush_tests {
 
     impl MockStore {
         fn new() -> Self {
-            Self { calls: Mutex::new(Vec::new()) }
+            Self {
+                calls: Mutex::new(Vec::new()),
+            }
         }
 
         fn calls(&self) -> Vec<StoreCall> {
@@ -2434,14 +2589,6 @@ mod shutdown_flush_tests {
 
         async fn get_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> Option<Vec<u8>> {
             unreachable!("not called in shutdown-flush tests")
-        }
-
-        async fn script_verified_height(&self) -> Option<u32> {
-            None
-        }
-
-        async fn set_script_verified_height(&self, _height: u32) {
-            unreachable!("not called when script_verified_height returns None")
         }
 
         async fn validated_height(&self) -> Option<u32> {
@@ -2529,18 +2676,29 @@ mod shutdown_flush_tests {
             &self.digest
         }
 
-        fn reset_to(
-            &mut self,
-            _height: u32,
-            _digest: ADDigest,
-        ) -> Result<(), ValidationError> {
+        fn reset_to(&mut self, _height: u32, _digest: ADDigest) -> Result<(), ValidationError> {
             unreachable!("not called in shutdown-flush tests")
         }
 
+        fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+            Some(self)
+        }
+    }
+
+    impl StatePersistence for FakeValidator {
         fn flush(&self) -> Result<(), ValidationError> {
             *self.flush_count.lock().unwrap() += 1;
             self.flush_result
                 .map_err(|s| ValidationError::ProofVerificationFailed(s.to_string()))
+        }
+
+        fn resize_cache(&self, _cache_bytes: usize) -> Result<(), ValidationError> {
+            unreachable!("not called in shutdown-flush tests")
+        }
+
+        /// No prover behind this double, so nothing to size.
+        fn prover_memory_estimate(&self) -> Option<ergo_validation::ProverMemoryEstimate> {
+            None
         }
     }
 
@@ -2640,11 +2798,7 @@ mod shutdown_flush_tests {
             unreachable!("not called when state_type=Utxo")
         }
 
-        async fn is_better_nipopow(
-            &self,
-            _this: &[u8],
-            _than: &[u8],
-        ) -> Result<bool, ChainError> {
+        async fn is_better_nipopow(&self, _this: &[u8], _than: &[u8]) -> Result<bool, ChainError> {
             unreachable!("not called in shutdown-flush tests")
         }
 
@@ -2686,6 +2840,7 @@ mod shutdown_flush_tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU64::new(0)),
             shutdown_rx,
         )
     }
@@ -2699,7 +2854,9 @@ mod shutdown_flush_tests {
             shutdown_rx,
         );
 
-        shutdown_tx.send(()).expect("sync must be polling shutdown_rx");
+        shutdown_tx
+            .send(())
+            .expect("sync must be polling shutdown_rx");
         sync.run().await;
 
         assert_eq!(
@@ -2709,10 +2866,7 @@ mod shutdown_flush_tests {
         );
         assert_eq!(
             sync.store.calls(),
-            vec![
-                StoreCall::SetValidatedHeight(1_785_000),
-                StoreCall::Flush,
-            ],
+            vec![StoreCall::SetValidatedHeight(1_785_000), StoreCall::Flush,],
             "shutdown_flush must mirror the end-of-sweep ordering: \
              set_validated_height(M) precedes store.flush(), where \
              M = validator.validated_height()"
@@ -2783,15 +2937,14 @@ mod blocks_to_keep_tests {
     //!
     //! See `../facts/sync.md` § "Block Body Retention".
     use super::*;
+    use crate::test_support::capture_warn;
     use enr_chain::{ChainError, SyncInfo};
     use ergo_chain_types::{ADDigest, Header};
     use ergo_validation::{
-        ApplyStateOutcome, BlockValidator, Parameters, ValidationError,
+        ApplyStateOutcome, BlockValidator, Parameters, StatePersistence, ValidationError,
     };
-    use std::io;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
     use std::sync::{Arc, Mutex};
-    use std::sync::atomic::{AtomicBool, AtomicU32};
-    use tracing_subscriber::fmt::MakeWriter;
 
     /// Mock store recording prune + min_height calls in addition to the
     /// flush-pair calls. Tests assert on the recorded sequence.
@@ -2836,14 +2989,6 @@ mod blocks_to_keep_tests {
             unreachable!("not called in blocks_to_keep tests")
         }
 
-        async fn script_verified_height(&self) -> Option<u32> {
-            None
-        }
-
-        async fn set_script_verified_height(&self, _height: u32) {
-            unreachable!("not called when script_verified_height returns None")
-        }
-
         async fn validated_height(&self) -> Option<u32> {
             None
         }
@@ -2859,22 +3004,18 @@ mod blocks_to_keep_tests {
             self.calls.lock().unwrap().push(StoreCall::Flush);
         }
 
-        async fn prune_below_height(
-            &self,
-            horizon: u32,
-            type_ids: &[u8],
-        ) -> Result<usize, String> {
-            self.calls.lock().unwrap().push(StoreCall::PruneBelowHeight {
-                horizon,
-                type_ids: type_ids.to_vec(),
-            });
+        async fn prune_below_height(&self, horizon: u32, type_ids: &[u8]) -> Result<usize, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(StoreCall::PruneBelowHeight {
+                    horizon,
+                    type_ids: type_ids.to_vec(),
+                });
             Ok(0)
         }
 
-        async fn min_height_present(
-            &self,
-            type_id: u8,
-        ) -> Result<Option<u32>, String> {
+        async fn min_height_present(&self, type_id: u8) -> Result<Option<u32>, String> {
             if type_id == BLOCK_TRANSACTIONS_TYPE_ID {
                 Ok(*self.min_block_txs_height.lock().unwrap())
             } else {
@@ -2920,16 +3061,59 @@ mod blocks_to_keep_tests {
             &self.digest
         }
 
-        fn reset_to(
-            &mut self,
-            _height: u32,
-            _digest: ADDigest,
-        ) -> Result<(), ValidationError> {
+        fn reset_to(&mut self, _height: u32, _digest: ADDigest) -> Result<(), ValidationError> {
             unreachable!("not called in blocks_to_keep tests")
         }
 
+        fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+            Some(self)
+        }
+    }
+
+    impl StatePersistence for FakeValidator {
         fn flush(&self) -> Result<(), ValidationError> {
             Ok(())
+        }
+
+        fn resize_cache(&self, _cache_bytes: usize) -> Result<(), ValidationError> {
+            unreachable!("not called in blocks_to_keep tests")
+        }
+
+        /// No prover behind this double, so nothing to size.
+        fn prover_memory_estimate(&self) -> Option<ergo_validation::ProverMemoryEstimate> {
+            None
+        }
+    }
+
+    /// Digest-mode shape: no persistent state, so nothing to fsync — but the
+    /// flush pair still records and prunes at the validator's height.
+    struct NoPersistenceValidator(FakeValidator);
+
+    impl BlockValidator for NoPersistenceValidator {
+        fn apply_state(
+            &mut self,
+            _h: &Header,
+            _bt: &[u8],
+            _ap: Option<&[u8]>,
+            _e: &[u8],
+            _ph: &[Header],
+            _p: &Parameters,
+            _bp: Option<&Parameters>,
+            _pu: Option<&[u8]>,
+        ) -> Result<ApplyStateOutcome, ValidationError> {
+            unreachable!("not called in blocks_to_keep tests")
+        }
+        fn validated_height(&self) -> u32 {
+            self.0.validated_height
+        }
+        fn current_digest(&self) -> &ADDigest {
+            &self.0.digest
+        }
+        fn reset_to(&mut self, _h: u32, _d: ADDigest) -> Result<(), ValidationError> {
+            unreachable!("not called in blocks_to_keep tests")
+        }
+        fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+            None
         }
     }
 
@@ -3025,11 +3209,7 @@ mod blocks_to_keep_tests {
             unreachable!()
         }
 
-        async fn is_better_nipopow(
-            &self,
-            _this: &[u8],
-            _than: &[u8],
-        ) -> Result<bool, ChainError> {
+        async fn is_better_nipopow(&self, _this: &[u8], _than: &[u8]) -> Result<bool, ChainError> {
             unreachable!()
         }
 
@@ -3070,6 +3250,7 @@ mod blocks_to_keep_tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU64::new(0)),
             shutdown_rx,
         )
     }
@@ -3083,9 +3264,7 @@ mod blocks_to_keep_tests {
 
     fn last_prune_call(calls: &[StoreCall]) -> Option<(u32, Vec<u8>)> {
         calls.iter().rev().find_map(|c| match c {
-            StoreCall::PruneBelowHeight { horizon, type_ids } => {
-                Some((*horizon, type_ids.clone()))
-            }
+            StoreCall::PruneBelowHeight { horizon, type_ids } => Some((*horizon, type_ids.clone())),
             _ => None,
         })
     }
@@ -3101,7 +3280,9 @@ mod blocks_to_keep_tests {
             config_with_keep(50),
             Some(FakeValidator::at(1000)),
             MockStore::new(),
-            FixedVotingLengthChain { voting_length: 1024 },
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
             shutdown_rx,
         );
 
@@ -3133,7 +3314,9 @@ mod blocks_to_keep_tests {
             config_with_keep(50),
             Some(FakeValidator::at(2500)),
             MockStore::new(),
-            FixedVotingLengthChain { voting_length: 1024 },
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
             shutdown_rx,
         );
 
@@ -3157,7 +3340,9 @@ mod blocks_to_keep_tests {
             config_with_keep(-1),
             Some(FakeValidator::at(1000)),
             MockStore::new(),
-            FixedVotingLengthChain { voting_length: 1024 },
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
             shutdown_rx,
         );
 
@@ -3201,8 +3386,22 @@ mod blocks_to_keep_tests {
             fn reset_to(&mut self, _h: u32, _d: ADDigest) -> Result<(), ValidationError> {
                 unreachable!()
             }
+            fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+                Some(self)
+            }
+        }
+
+        impl StatePersistence for FailingValidator {
             fn flush(&self) -> Result<(), ValidationError> {
                 Err(ValidationError::ProofVerificationFailed("nope".into()))
+            }
+            fn resize_cache(&self, _cache_bytes: usize) -> Result<(), ValidationError> {
+                unreachable!()
+            }
+
+            /// No prover behind this double, so nothing to size.
+            fn prover_memory_estimate(&self) -> Option<ergo_validation::ProverMemoryEstimate> {
+                None
             }
         }
 
@@ -3218,7 +3417,9 @@ mod blocks_to_keep_tests {
         >::new(
             config_with_keep(50),
             HangingTransport,
-            FixedVotingLengthChain { voting_length: 1024 },
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
             MockStore::new(),
             Some(FailingValidator(FakeValidator::at(1000))),
             progress_rx,
@@ -3229,6 +3430,7 @@ mod blocks_to_keep_tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU64::new(0)),
             shutdown_rx,
         );
 
@@ -3241,58 +3443,55 @@ mod blocks_to_keep_tests {
         );
     }
 
+    #[tokio::test]
+    async fn prune_still_runs_when_validator_owns_no_persistent_state() {
+        // Digest mode: state_persistence() is None → FlushOutcome::
+        // NothingToPersist(M) → prune at the same horizon a real flush would
+        // use. Before the v0.8.0 trait split this path went through the
+        // defaulted `flush` returning Ok(()) and reached Flushed(M), so
+        // pruning happened; folding the case into NoValidator would silently
+        // stop a digest node from pruning. The prune call sites use `if let`,
+        // which the compiler does not exhaustiveness-check — this test is the
+        // guard the compiler cannot be.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (_progress_tx, progress_rx) = mpsc::channel(1);
+        let (_dc_tx, delivery_control_rx) = mpsc::unbounded_channel::<DeliveryControl>();
+        let (_dd_tx, delivery_data_rx) = mpsc::channel::<DeliveryData>(1);
+        let mut sync = HeaderSync::<
+            HangingTransport,
+            FixedVotingLengthChain,
+            MockStore,
+            NoPersistenceValidator,
+        >::new(
+            config_with_keep(50),
+            HangingTransport,
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
+            MockStore::new(),
+            Some(NoPersistenceValidator(FakeValidator::at(1000))),
+            progress_rx,
+            delivery_control_rx,
+            delivery_data_rx,
+            None,
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            shutdown_rx,
+        );
+
+        shutdown_tx.send(()).unwrap();
+        sync.run().await;
+
+        let calls = sync.store.calls();
+        let (horizon, _type_ids) = last_prune_call(&calls)
+            .expect("nothing-to-persist MUST still prune — same horizon as a real flush");
+        assert_eq!(horizon, 951, "raw horizon = validated_height - keep + 1");
+    }
+
     // ----- startup WARN capture -----
-
-    #[derive(Clone, Default)]
-    struct CaptureWriter {
-        buf: Arc<Mutex<Vec<u8>>>,
-    }
-
-    impl CaptureWriter {
-        fn captured(&self) -> String {
-            String::from_utf8(self.buf.lock().unwrap().clone()).unwrap()
-        }
-    }
-
-    impl io::Write for CaptureWriter {
-        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-            self.buf.lock().unwrap().extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for CaptureWriter {
-        type Writer = CaptureWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    // Takes the future directly rather than a closure so the caller can
-    // pass `sync.maybe_warn_reclaimable_bodies()` — a future borrowing
-    // `&mut sync` — without wrapping it in `move || async move {…}` to
-    // satisfy capture rules. The subscriber's `_guard` outlives the
-    // `await`, so emits from the future are captured.
-    async fn capture_warn<Fut>(f: Fut) -> String
-    where
-        Fut: std::future::Future<Output = ()>,
-    {
-        let writer = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(writer.clone())
-            .without_time()
-            .with_ansi(false)
-            .with_target(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        f.await;
-        drop(_guard);
-        writer.captured()
-    }
 
     #[tokio::test]
     async fn startup_warn_fires_when_archive_predates_horizon() {
@@ -3306,7 +3505,9 @@ mod blocks_to_keep_tests {
             config_with_keep(100),
             Some(FakeValidator::at(1000)),
             MockStore::with_min_block_txs(1),
-            FixedVotingLengthChain { voting_length: 1024 },
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
             shutdown_rx,
         );
 
@@ -3331,7 +3532,9 @@ mod blocks_to_keep_tests {
             config_with_keep(100),
             Some(FakeValidator::at(1000)),
             MockStore::with_min_block_txs(901),
-            FixedVotingLengthChain { voting_length: 1024 },
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
             shutdown_rx,
         );
 
@@ -3352,7 +3555,9 @@ mod blocks_to_keep_tests {
             config_with_keep(-1),
             Some(FakeValidator::at(1000)),
             MockStore::with_min_block_txs(1),
-            FixedVotingLengthChain { voting_length: 1024 },
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
             shutdown_rx,
         );
 
@@ -3374,7 +3579,9 @@ mod blocks_to_keep_tests {
             config_with_keep(100),
             None,
             MockStore::with_min_block_txs(1),
-            FixedVotingLengthChain { voting_length: 1024 },
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
             shutdown_rx,
         );
 
@@ -3393,23 +3600,32 @@ mod sweep_resume_tests {
     //!
     //! The bug: the sweep derived its start height from
     //! `state_applied_height` (a cache) instead of the validator's true
-    //! applied tip (`validated_height()`). A mid-sweep deferred-eval
-    //! rollback could leave the cache ahead of the prover; every later
-    //! sweep then fed `apply_state` a non-consecutive block, which the
-    //! validator's consecutiveness guard correctly rejected
-    //! (`expected N, got N+k`), looping forever even though the skipped
-    //! blocks were on disk.
+    //! applied tip (`validated_height()`). A rollback could leave the cache
+    //! ahead of the prover; every later sweep then fed `apply_state` a
+    //! non-consecutive block, which the validator's consecutiveness guard
+    //! correctly rejected (`expected N, got N+k`), looping forever even
+    //! though the skipped blocks were on disk.
+    //!
+    //! The rollback in question was a mid-sweep deferred-eval one when this
+    //! wedge was found. That path is gone as of v0.8.0, but the reorg
+    //! rollback reaches the same state and the anchoring is what prevents it
+    //! either way, so these tests outlive the mechanism that first exposed
+    //! them.
     //!
     //! The fix anchors both the sweep start AND the post-sweep cache on
     //! `validated_height()`. These tests construct the desynced state
     //! directly and assert the sweep resumes at `applied_tip + 1` and
     //! applies the intervening on-disk blocks instead of wedging.
     use super::*;
+    use crate::test_support::capture_async;
     use enr_chain::{ChainError, SyncInfo};
     use ergo_chain_types::{ADDigest, Header};
-    use ergo_validation::{ApplyStateOutcome, BlockValidator, Parameters, ValidationError};
-    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use ergo_validation::{
+        ApplyStateOutcome, BlockValidator, Parameters, StatePersistence, ValidationError,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
     use std::sync::Arc;
+    use tracing::level_filters::LevelFilter;
 
     fn fake_header(height: u32) -> Header {
         use ergo_chain_types::*;
@@ -3511,14 +3727,16 @@ mod sweep_resume_tests {
             }
             let expected = self.validated_height + 1;
             if header.height != expected {
-                return Err(ValidationError::HeightMismatch { expected, got: header.height });
+                return Err(ValidationError::HeightMismatch {
+                    expected,
+                    got: header.height,
+                });
             }
             self.validated_height = header.height;
             self.applied.push(header.height);
             Ok(ApplyStateOutcome {
                 epoch_boundary_params: None,
                 epoch_boundary_proposed_update: None,
-                deferred_eval: None,
             })
         }
 
@@ -3539,6 +3757,12 @@ mod sweep_resume_tests {
             }
             self.validated_height = height;
             Ok(())
+        }
+
+        /// These tests assert sweep/resume behaviour, not durability; there is
+        /// no storage to flush and none of them look at the flush pair.
+        fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+            None
         }
     }
 
@@ -3638,10 +3862,6 @@ mod sweep_resume_tests {
         async fn get_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> Option<Vec<u8>> {
             Some(vec![0])
         }
-        async fn script_verified_height(&self) -> Option<u32> {
-            None
-        }
-        async fn set_script_verified_height(&self, _height: u32) {}
         async fn validated_height(&self) -> Option<u32> {
             None
         }
@@ -3677,22 +3897,46 @@ mod sweep_resume_tests {
         }
     }
 
-    fn build_sync(
-        validator: SweepValidator,
-    ) -> HeaderSync<SweepTransport, SweepChain, SweepStore, SweepValidator> {
+    type SweepSync = HeaderSync<SweepTransport, SweepChain, SweepStore, SweepValidator>;
+
+    fn build_sync(validator: SweepValidator) -> SweepSync {
         build_sync_with_chain(validator, SweepChain::unbounded())
     }
 
-    fn build_sync_with_chain(
+    fn build_sync_with_chain(validator: SweepValidator, chain: SweepChain) -> SweepSync {
+        build_sync_full(
+            validator,
+            chain,
+            SyncConfig::default(),
+            Arc::new(AtomicU64::new(0)),
+        )
+    }
+
+    /// Same harness, but hands back the published window atomic so a test can
+    /// observe what the sweep wrote into it.
+    fn build_sync_with_window_sink(validator: SweepValidator) -> (SweepSync, Arc<AtomicU64>) {
+        let sink = Arc::new(AtomicU64::new(0));
+        let sync = build_sync_full(
+            validator,
+            SweepChain::unbounded(),
+            SyncConfig::default(),
+            Arc::clone(&sink),
+        );
+        (sync, sink)
+    }
+
+    fn build_sync_full(
         validator: SweepValidator,
         chain: SweepChain,
-    ) -> HeaderSync<SweepTransport, SweepChain, SweepStore, SweepValidator> {
+        config: SyncConfig,
+        window_sink: Arc<AtomicU64>,
+    ) -> SweepSync {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let (_progress_tx, progress_rx) = mpsc::channel(1);
         let (_dc_tx, delivery_control_rx) = mpsc::unbounded_channel::<DeliveryControl>();
         let (_dd_tx, delivery_data_rx) = mpsc::channel::<DeliveryData>(1);
         HeaderSync::new(
-            SyncConfig::default(),
+            config,
             SweepTransport,
             chain,
             SweepStore,
@@ -3705,6 +3949,7 @@ mod sweep_resume_tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU32::new(0)),
+            window_sink,
             shutdown_rx,
         )
     }
@@ -3730,7 +3975,11 @@ mod sweep_resume_tests {
             "sweep MUST resume at applied_tip+1 (2666) and apply consecutively, \
              not skip to the stale cache height"
         );
-        assert_eq!(v.validated_height(), 2670, "validator advanced to the downloaded tip");
+        assert_eq!(
+            v.validated_height(),
+            2670,
+            "validator advanced to the downloaded tip"
+        );
         assert_eq!(
             sync.state_applied_height, 2670,
             "cache reconciled to the validator's true tip — no lingering desync"
@@ -3749,7 +3998,10 @@ mod sweep_resume_tests {
         sync.advance_state_applied_height().await;
 
         let v = sync.validator.as_ref().unwrap();
-        assert!(v.applied.is_empty(), "no blocks past the applied tip — nothing to apply");
+        assert!(
+            v.applied.is_empty(),
+            "no blocks past the applied tip — nothing to apply"
+        );
         assert_eq!(
             sync.state_applied_height, 2665,
             "stale-ahead cache reconciled down to the validator tip"
@@ -3781,101 +4033,69 @@ mod sweep_resume_tests {
             vec![2668, 2669, 2670],
             "sweep re-applies from the rolled-back tip + 1, not from the stale cache"
         );
-        assert_eq!(sync.state_applied_height, 2670, "cache back in sync with the prover");
-    }
-
-    #[tokio::test]
-    async fn eval_failure_rollback_ok_retreats_watermarks() {
-        // The normal eval-failure path: scripts failed at 2669, the storage
-        // rollback succeeds, and all three watermarks retreat to 2668 with
-        // the validator.
-        let mut sync = build_sync(SweepValidator::at(2670));
-        sync.state_applied_height = 2670;
-        sync.script_verified_height = 2670;
-        sync.downloaded_height = 2670;
-
-        sync.handle_eval_failure(2669).await;
-
-        let v = sync.validator.as_ref().unwrap();
-        assert_eq!(v.resets, vec![2668], "rollback targeted failed_height - 1");
-        assert_eq!(v.validated_height(), 2668, "validator rolled back");
-        assert_eq!(sync.state_applied_height, 2668);
-        assert_eq!(sync.script_verified_height, 2668);
-        assert_eq!(sync.downloaded_height, 2668);
-    }
-
-    #[tokio::test]
-    async fn eval_failure_rollback_err_leaves_watermarks_untouched() {
-        // The gap-wedge hole, closed: the storage rollback FAILS, so the
-        // validator did not move — every watermark must stay exactly where
-        // it was. Retreating them would make sync believe state sits at
-        // 2668 while the prover still holds 2670 (the old logged-and-
-        // swallowed behavior). The sweep backoff owns the retry; this
-        // handler just logs loud and returns.
-        let mut sync = build_sync(SweepValidator::at(2670).failing_reset());
-        sync.state_applied_height = 2670;
-        sync.script_verified_height = 2670;
-        sync.downloaded_height = 2670;
-
-        sync.handle_eval_failure(2669).await;
-
-        let v = sync.validator.as_ref().unwrap();
-        assert_eq!(v.resets, vec![2668], "rollback was attempted");
-        assert_eq!(v.validated_height(), 2670, "validator unmoved on Err");
-        assert_eq!(sync.state_applied_height, 2670, "state watermark NOT retreated");
-        assert_eq!(sync.script_verified_height, 2670, "script watermark NOT retreated");
-        assert_eq!(sync.downloaded_height, 2670, "download watermark NOT retreated");
+        assert_eq!(
+            sync.state_applied_height, 2670,
+            "cache back in sync with the prover"
+        );
     }
 
     #[tokio::test]
     async fn reorg_rollback_ok_resets_then_revalidates_new_branch() {
         // Successful reorg rollback: validator rolls to the fork point, the
-        // state watermarks follow, and the handler's immediate rescan
+        // state watermark follows, and the handler's immediate rescan
         // re-applies the new branch's on-disk blocks from fork_point + 1.
-        let mut sync =
-            build_sync_with_chain(SweepValidator::at(2670), SweepChain::at_tip(2670));
+        let mut sync = build_sync_with_chain(SweepValidator::at(2670), SweepChain::at_tip(2670));
         sync.state_applied_height = 2670;
-        sync.script_verified_height = 2670;
         sync.downloaded_height = 2670;
 
         sync.handle_control_event(
-            DeliveryControl::Reorg { fork_point: 2667, old_tip: 2670, new_tip: 2670 },
+            DeliveryControl::Reorg {
+                fork_point: 2667,
+                old_tip: 2670,
+                new_tip: 2670,
+            },
             PeerId(0),
         )
         .await;
 
         let v = sync.validator.as_ref().unwrap();
-        assert_eq!(v.resets, vec![2667], "validator rolled back to the fork point");
+        assert_eq!(
+            v.resets,
+            vec![2667],
+            "validator rolled back to the fork point"
+        );
         assert_eq!(
             v.applied,
             vec![2668, 2669, 2670],
             "rescan re-applied the new branch from fork_point + 1"
         );
-        assert_eq!(sync.state_applied_height, 2670, "sweep re-advanced after the rollback");
         assert_eq!(
-            sync.script_verified_height, 2667,
-            "scripts above the fork point re-verify only via real evals"
+            sync.state_applied_height, 2670,
+            "sweep re-advanced after the rollback"
         );
     }
 
     #[tokio::test]
     async fn reorg_rollback_err_keeps_state_watermarks() {
         // Same reorg, but the storage rollback fails: the validator stays
-        // at 2670, so state_applied/script_verified MUST NOT retreat to the
-        // fork point — and nothing may be re-applied onto the un-rolled
-        // state. (downloaded_height legitimately resets and rescans: it
-        // tracks the store against the already-switched header chain, not
-        // the prover — facts/validation.md reorg steps 2 vs 5.)
+        // at 2670, so state_applied_height MUST NOT retreat to the fork
+        // point — and nothing may be re-applied onto the un-rolled state.
+        // (downloaded_height legitimately resets and rescans: it tracks the
+        // store against the already-switched header chain, not the prover —
+        // facts/validation.md reorg steps 2 vs 5.)
         let mut sync = build_sync_with_chain(
             SweepValidator::at(2670).failing_reset(),
             SweepChain::at_tip(2670),
         );
         sync.state_applied_height = 2670;
-        sync.script_verified_height = 2670;
         sync.downloaded_height = 2670;
 
         sync.handle_control_event(
-            DeliveryControl::Reorg { fork_point: 2667, old_tip: 2670, new_tip: 2670 },
+            DeliveryControl::Reorg {
+                fork_point: 2667,
+                old_tip: 2670,
+                new_tip: 2670,
+            },
             PeerId(0),
         )
         .await;
@@ -3883,31 +4103,44 @@ mod sweep_resume_tests {
         let v = sync.validator.as_ref().unwrap();
         assert_eq!(v.resets, vec![2667], "rollback was attempted");
         assert_eq!(v.validated_height(), 2670, "validator unmoved on Err");
-        assert!(v.applied.is_empty(), "nothing re-applied onto un-rolled state");
-        assert_eq!(sync.state_applied_height, 2670, "state watermark NOT retreated");
-        assert_eq!(sync.script_verified_height, 2670, "script watermark NOT retreated");
+        assert!(
+            v.applied.is_empty(),
+            "nothing re-applied onto un-rolled state"
+        );
+        assert_eq!(
+            sync.state_applied_height, 2670,
+            "state watermark NOT retreated"
+        );
     }
 
     #[tokio::test]
     async fn stalled_sweep_arms_backoff_and_gate_suppresses_retry() {
         // Frontier 2665 is wedged: block 2666 fails apply_state every attempt
-        // (modelling a deterministic divergence — equally an eval rollback,
-        // since the backoff keys on the tip stall, not the error). Blocks
-        // 2666..=2670 are all on disk, so without the gate the sweep would
-        // re-run at full tilt.
+        // (modelling a deterministic divergence — since v0.8.0 that includes a
+        // script rejection, which now comes back as an `apply_state` Err like
+        // any other). Blocks 2666..=2670 are all on disk, so without the gate
+        // the sweep would re-run at full tilt.
         let mut sync = build_sync(SweepValidator::at(2665).failing_at(2666));
         sync.downloaded_height = 2670;
 
         // First sweep: one attempt at 2666, it stalls, the tip stays pinned,
         // and the backoff arms at attempt 1.
         sync.advance_state_applied_height().await;
-        assert_eq!(sync.validator.as_ref().unwrap().attempts, 1, "sweep made one attempt");
+        assert_eq!(
+            sync.validator.as_ref().unwrap().attempts,
+            1,
+            "sweep made one attempt"
+        );
         assert_eq!(
             sync.validator.as_ref().unwrap().validated_height(),
             2665,
             "deterministic failure left the tip pinned"
         );
-        assert_eq!(sync.sweep_backoff.consecutive(), 1, "non-advancing sweep armed the backoff");
+        assert_eq!(
+            sync.sweep_backoff.consecutive(),
+            1,
+            "non-advancing sweep armed the backoff"
+        );
 
         // Immediate re-entry, well inside the backoff window: the gate must
         // short-circuit the sweep — no second apply_state attempt, no
@@ -3919,7 +4152,11 @@ mod sweep_resume_tests {
             1,
             "gate suppressed the retry inside the backoff window"
         );
-        assert_eq!(sync.sweep_backoff.consecutive(), 1, "still attempt 1 — no fresh stall recorded");
+        assert_eq!(
+            sync.sweep_backoff.consecutive(),
+            1,
+            "still attempt 1 — no fresh stall recorded"
+        );
     }
 
     #[tokio::test]
@@ -3937,7 +4174,286 @@ mod sweep_resume_tests {
             2670,
             "healthy sweep caught up to the downloaded tip"
         );
-        assert_eq!(sync.sweep_backoff.consecutive(), 0, "progress arms no backoff");
+        assert_eq!(
+            sync.sweep_backoff.consecutive(),
+            0,
+            "progress arms no backoff"
+        );
+    }
+
+    // ---- journal-event conformance (`../facts/journal-events.md`) ----
+    //
+    // Every assertion below runs the REAL emit site through this module's
+    // harness and reads the rendered line. That distinction is the whole point
+    // of the section: the conformance tests these replace called `info!()` with
+    // their own copy of the marker and then asserted the output contained that
+    // copy, which tests `tracing`'s formatter against itself and cannot fail
+    // when an emit site drifts. Two of the events below shipped not matching
+    // the contract under a green suite for exactly that reason.
+    //
+    // Break a marker or drop a field in `src/state.rs` and these go red.
+
+    /// Assert `output` renders `key=value` as a **whole field**.
+    ///
+    /// `contains("height=1785500")` is not sufficient and the difference is not
+    /// pedantic: it also matches `tip_height=1785500` — a renamed field, which
+    /// breaks a consumer exactly as hard as a dropped one — and it matches
+    /// `height=17855001`. Fields in the default formatter follow the message
+    /// and are space-separated, so a real field is a whole whitespace token,
+    /// which is also how a consumer's parser has to find it. Values containing
+    /// spaces (a Display-formatted error) need a substring assertion instead.
+    fn has_field(output: &str, key: &str, value: &str) -> bool {
+        let want = format!("{key}={value}");
+        output.split_whitespace().any(|token| token == want)
+    }
+
+    #[track_caller]
+    fn assert_field(output: &str, key: &str, value: &str) {
+        assert!(
+            has_field(output, key, value),
+            "missing field {key}={value}: {output}"
+        );
+    }
+
+    #[test]
+    fn has_field_rejects_a_renamed_or_truncated_field() {
+        // The self-check for the assertion helper: without it these three all
+        // look like a present `height=1785500`.
+        assert!(has_field(
+            " INFO chain tip reached height=1785500",
+            "height",
+            "1785500"
+        ));
+        assert!(
+            !has_field(
+                " INFO chain tip reached tip_height=1785500",
+                "height",
+                "1785500"
+            ),
+            "a renamed field must not satisfy the assertion"
+        );
+        assert!(
+            !has_field(
+                " INFO chain tip reached height=17855001",
+                "height",
+                "1785500"
+            ),
+            "a different value must not satisfy the assertion"
+        );
+    }
+
+    /// `validation_rollback_failed` — ERROR, `path="reorg"`.
+    ///
+    /// ⚠ The contract lists `path` as `eval_failure|reorg`. The
+    /// `eval_failure` emit site went with deferred evaluation in v0.8.0 —
+    /// `handle_eval_failure` was the only producer of that value — so the
+    /// reorg path is now the event's sole emitter. `facts/journal-events.md`
+    /// still documents both values and needs the narrowing; flagged to main.
+    #[tokio::test]
+    async fn journal_validation_rollback_failed_conforms() {
+        let mut sync = build_sync_with_chain(
+            SweepValidator::at(2670).failing_reset(),
+            SweepChain::at_tip(2670),
+        );
+        sync.state_applied_height = 2670;
+        sync.downloaded_height = 2670;
+
+        let output = capture_async(
+            LevelFilter::ERROR,
+            sync.handle_control_event(
+                DeliveryControl::Reorg {
+                    fork_point: 2668,
+                    old_tip: 2670,
+                    new_tip: 2671,
+                },
+                PeerId(0),
+            ),
+        )
+        .await;
+
+        assert!(
+            output.contains("validation rollback failed"),
+            "missing marker: {output}"
+        );
+        // The rollback TARGET (the fork point), not the tip it failed to leave.
+        assert_field(&output, "height", "2668");
+        assert_field(&output, "path", "\"reorg\"");
+        // `ValidationError`'s Display, not the bare message the validator
+        // constructed — the mirror this replaces asserted the bare string and
+        // passed, because it was matching its own `info!()` rather than the
+        // emit. The contract says "Display-formatted"; this is what that is.
+        assert!(
+            output.contains("error=UTXO state operation failed: rollback to height 2668 failed"),
+            "missing the Display-formatted underlying error: {output}"
+        );
+    }
+
+    /// `validation_sweep_started` / `block_applied` / `validation_sweep_complete`
+    /// in one pass — they are emitted by one sweep and a test that drives the
+    /// sweep gets all three.
+    #[tokio::test]
+    async fn journal_sweep_and_block_applied_conform() {
+        // The sweep markers are gated on `sweep_size > 100`, so the window has
+        // to be a real catch-up sweep rather than a tip follow.
+        let mut sync = build_sync(SweepValidator::at(1000));
+        sync.downloaded_height = 1150;
+
+        let output = capture_async(LevelFilter::INFO, sync.advance_state_applied_height()).await;
+
+        assert!(
+            output.contains("VALIDATION SWEEP STARTED"),
+            "missing started marker: {output}"
+        );
+        assert!(
+            output.contains("VALIDATION SWEEP COMPLETE"),
+            "missing complete marker: {output}"
+        );
+        // The marker is the literal prefix. The emit shape was once
+        // "=== VALIDATION SWEEP STARTED ===", which prefix-matches nothing.
+        assert!(
+            !output.contains("==="),
+            "markers are plain text, not decorated: {output}"
+        );
+        assert_field(&output, "from", "1001");
+        assert_field(&output, "to", "1150");
+        assert_field(&output, "blocks", "150");
+
+        // `block applied` once per block that advanced the tip, carrying the
+        // height and the 32-byte hex id. `fake_header` derives the id from the
+        // height, so this pins the Display rendering of a real `BlockId`.
+        assert_eq!(
+            output.matches("block applied").count(),
+            150,
+            "one per applied block: {output}"
+        );
+        let applied = output
+            .lines()
+            .find(|l| l.contains("block applied"))
+            .expect("counted above");
+        assert_field(applied, "height", "1001");
+        // fake_header(1001): BlockId(Digest32::from([1001 as u8; 32])) → 0xe9.
+        assert_field(applied, "id", &"e9".repeat(32));
+    }
+
+    /// `chain_tip_reached` — INFO, emitted on entry to `synced()`.
+    ///
+    /// `synced()` is a `select!` loop, but it is driveable here: the first
+    /// `ticker.tick()` completes immediately, finds `outbound_peers()` empty,
+    /// and returns. The emit is above the loop, so it has already fired.
+    #[tokio::test]
+    async fn journal_chain_tip_reached_conforms() {
+        let mut sync =
+            build_sync_with_chain(SweepValidator::at(1_785_500), SweepChain::at_tip(1_785_500));
+        sync.downloaded_height = 1_785_500;
+
+        let output = capture_async(LevelFilter::INFO, sync.synced()).await;
+
+        assert!(
+            output.contains("chain tip reached"),
+            "missing marker: {output}"
+        );
+        assert_field(&output, "height", "1785500");
+    }
+
+    // ---- Window memory attribution (`facts/sync.md` § "Memory attribution")
+    //
+    // These live here rather than in a module of their own because the thing
+    // under test fires after an applied block, and this is the harness that
+    // applies blocks.
+
+    #[tokio::test]
+    async fn window_estimate_tracks_the_delivery_tracker_and_falls_back_down() {
+        // The symptom under investigation is heap that only ever rises, so the
+        // figure has to be shown to come back down. It counts the tracker's
+        // live entries, so it rises as requests go in flight and falls as they
+        // are delivered.
+        let (mut sync, _sink) = build_sync_with_window_sink(SweepValidator::at(100));
+
+        let idle = sync.window_memory_estimate().expect("always computable");
+        assert_eq!(idle.tracker_bytes, 0);
+        assert_eq!(idle.tracker_entries, 0);
+
+        let ids: Vec<[u8; 32]> = (0u8..150).map(|n| [n; 32]).collect();
+        sync.tracker.mark_requested(&ids, PeerId(1), 102);
+
+        let loaded = sync.window_memory_estimate().unwrap();
+        assert_eq!(loaded.tracker_entries, 150, "150 sections in flight");
+        assert!(
+            loaded.tracker_bytes > 0,
+            "in-flight requests must report bytes"
+        );
+
+        // Fewer in flight ⇒ proportionally fewer bytes. Proves the figure is
+        // derived from the structure and not from a constant.
+        let (mut small, _) = build_sync_with_window_sink(SweepValidator::at(100));
+        small.tracker.mark_requested(&ids[..15], PeerId(1), 102);
+        let small_est = small.window_memory_estimate().unwrap();
+        assert_eq!(
+            small_est.tracker_bytes * 10,
+            loaded.tracker_bytes,
+            "15 in flight ({}) must be exactly a tenth of 150 in flight ({})",
+            small_est.tracker_bytes,
+            loaded.tracker_bytes
+        );
+
+        // Delivery drains the tracker and both fields come back down. A figure
+        // that only ever rises is measuring the wrong thing — that is the
+        // symptom under investigation.
+        for id in &ids {
+            sync.tracker.mark_received(id);
+        }
+        let drained = sync.window_memory_estimate().unwrap();
+        assert_eq!(drained.tracker_entries, 0, "the window emptied");
+        assert_eq!(
+            drained.tracker_bytes, 0,
+            "and the bytes it was holding came back"
+        );
+    }
+
+    #[tokio::test]
+    async fn window_atomic_reads_never_written_until_a_block_is_applied() {
+        let (mut sync, sink) = build_sync_with_window_sink(SweepValidator::at(2665));
+        assert_eq!(
+            sink.load(std::sync::atomic::Ordering::Relaxed),
+            WINDOW_BYTES_UNSET,
+            "constructed but nothing applied — the reader must see absent, \
+             not an assertion that the window is empty"
+        );
+
+        // A sweep that applies nothing must not stamp the atomic either.
+        sync.downloaded_height = 2665;
+        sync.advance_state_applied_height().await;
+        assert_eq!(
+            sink.load(std::sync::atomic::Ordering::Relaxed),
+            WINDOW_BYTES_UNSET,
+            "no block applied ⇒ still never-written"
+        );
+    }
+
+    #[tokio::test]
+    async fn window_atomic_is_written_after_an_applied_block() {
+        let (mut sync, sink) = build_sync_with_window_sink(SweepValidator::at(2665));
+        sync.downloaded_height = 2670;
+
+        // Put sections in flight so the published figure is non-zero and a
+        // written zero cannot be mistaken for the sentinel or the reverse.
+        let ids: Vec<[u8; 32]> = (0u8..64).map(|n| [n; 32]).collect();
+        sync.tracker.mark_requested(&ids, PeerId(1), 102);
+        let expected = sync.window_memory_estimate().unwrap().tracker_bytes;
+        assert!(expected > 0);
+
+        sync.advance_state_applied_height().await;
+
+        assert_eq!(
+            sync.validator.as_ref().unwrap().applied,
+            vec![2666, 2667, 2668, 2669, 2670],
+            "harness sanity: blocks really were applied"
+        );
+        assert_eq!(
+            sink.load(std::sync::atomic::Ordering::Relaxed),
+            expected,
+            "the estimate must be published after an applied block"
+        );
     }
 }
 
@@ -3958,9 +4474,9 @@ mod serve_continuation_tests {
     use enr_chain::{ChainError, SyncInfo};
     use ergo_chain_types::{ADDigest, Header};
     use ergo_validation::{
-        ApplyStateOutcome, BlockValidator, Parameters, ValidationError,
+        ApplyStateOutcome, BlockValidator, Parameters, StatePersistence, ValidationError,
     };
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// Test chain tip. Above the 400-id continuation cap so the fresh-peer
@@ -4028,7 +4544,9 @@ mod serve_continuation_tests {
 
     impl ServeChain {
         fn new() -> Self {
-            Self { continuation_calls: AtomicU32::new(0) }
+            Self {
+                continuation_calls: AtomicU32::new(0),
+            }
         }
     }
 
@@ -4045,7 +4563,9 @@ mod serve_continuation_tests {
         }
 
         async fn header_at(&self, height: u32) -> Option<Header> {
-            (1..=TIP).contains(&height).then(|| test_header(height, block_id_at(height)))
+            (1..=TIP)
+                .contains(&height)
+                .then(|| test_header(height, block_id_at(height)))
         }
 
         async fn header_state_root(&self, _height: u32) -> Option<[u8; 33]> {
@@ -4072,11 +4592,7 @@ mod serve_continuation_tests {
             Ok(SyncInfo::V2 { headers })
         }
 
-        async fn continuation_ids(
-            &self,
-            peer_last_ids: &[BlockId],
-            limit: usize,
-        ) -> Vec<[u8; 32]> {
+        async fn continuation_ids(&self, peer_last_ids: &[BlockId], limit: usize) -> Vec<[u8; 32]> {
             self.continuation_calls.fetch_add(1, Ordering::Relaxed);
             let common = if peer_last_ids.is_empty() {
                 0 // fresh peer — serve from height 1
@@ -4125,11 +4641,7 @@ mod serve_continuation_tests {
             unreachable!("not called in serve tests")
         }
 
-        async fn is_better_nipopow(
-            &self,
-            _this: &[u8],
-            _than: &[u8],
-        ) -> Result<bool, ChainError> {
+        async fn is_better_nipopow(&self, _this: &[u8], _than: &[u8]) -> Result<bool, ChainError> {
             unreachable!("not called in serve tests")
         }
 
@@ -4180,10 +4692,6 @@ mod serve_continuation_tests {
         async fn get_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> Option<Vec<u8>> {
             unreachable!("not called in serve tests")
         }
-        async fn script_verified_height(&self) -> Option<u32> {
-            None
-        }
-        async fn set_script_verified_height(&self, _height: u32) {}
         async fn validated_height(&self) -> Option<u32> {
             None
         }
@@ -4224,12 +4732,11 @@ mod serve_continuation_tests {
         fn current_digest(&self) -> &ADDigest {
             unreachable!("not called in serve tests")
         }
-        fn reset_to(
-            &mut self,
-            _height: u32,
-            _digest: ADDigest,
-        ) -> Result<(), ValidationError> {
+        fn reset_to(&mut self, _height: u32, _digest: ADDigest) -> Result<(), ValidationError> {
             unreachable!("not called in serve tests")
+        }
+        fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+            None
         }
     }
 
@@ -4247,7 +4754,9 @@ mod serve_continuation_tests {
         let (_dd_tx, delivery_data_rx) = mpsc::channel::<DeliveryData>(1);
         let sync = HeaderSync::new(
             SyncConfig::default(),
-            RecordingTransport { sent: Arc::clone(&sent) },
+            RecordingTransport {
+                sent: Arc::clone(&sent),
+            },
             ServeChain::new(),
             NoopStore,
             None,
@@ -4259,6 +4768,7 @@ mod serve_continuation_tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU64::new(0)),
             shutdown_rx,
         );
         (sync, sent)
@@ -4283,9 +4793,7 @@ mod serve_continuation_tests {
             .unwrap()
             .iter()
             .filter_map(|(p, m)| match m {
-                ProtocolMessage::Inv { modifier_type, ids }
-                    if *modifier_type == HEADER_TYPE_ID =>
-                {
+                ProtocolMessage::Inv { modifier_type, ids } if *modifier_type == HEADER_TYPE_ID => {
                     Some((*p, ids.clone()))
                 }
                 _ => None,
@@ -4294,15 +4802,11 @@ mod serve_continuation_tests {
     }
 
     /// Recipients of every SyncInfo recorded by the transport, in send order.
-    fn sent_sync_info_peers(
-        sent: &Mutex<Vec<(PeerId, ProtocolMessage)>>,
-    ) -> Vec<PeerId> {
+    fn sent_sync_info_peers(sent: &Mutex<Vec<(PeerId, ProtocolMessage)>>) -> Vec<PeerId> {
         sent.lock()
             .unwrap()
             .iter()
-            .filter_map(|(p, m)| {
-                matches!(m, ProtocolMessage::SyncInfo { .. }).then_some(*p)
-            })
+            .filter_map(|(p, m)| matches!(m, ProtocolMessage::SyncInfo { .. }).then_some(*p))
             .collect()
     }
 
@@ -4320,7 +4824,11 @@ mod serve_continuation_tests {
 
         assert!(matches!(result, EventResult::Continue));
         let invs = sent_header_invs(&sent);
-        assert_eq!(invs.len(), 1, "fresh peer must receive exactly one header Inv");
+        assert_eq!(
+            invs.len(),
+            1,
+            "fresh peer must receive exactly one header Inv"
+        );
         let (to, ids) = &invs[0];
         assert_eq!(*to, fresh_peer, "Inv goes to the SyncInfo sender");
         assert_eq!(ids.len(), 400, "continuation capped at 400 (JVM size)");
@@ -4349,7 +4857,10 @@ mod serve_continuation_tests {
         let (to, ids) = &invs[0];
         assert_eq!(*to, SYNC_PEER);
         let expected: Vec<[u8; 32]> = (451..=TIP).map(id_at).collect();
-        assert_eq!(*ids, expected, "ids ascend from the newest anchor + 1 to our tip");
+        assert_eq!(
+            *ids, expected,
+            "ids ascend from the newest anchor + 1 to our tip"
+        );
     }
 
     #[tokio::test]

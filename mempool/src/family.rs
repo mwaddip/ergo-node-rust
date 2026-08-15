@@ -1,5 +1,5 @@
-use std::time::Instant;
 use crate::pool::OrderedPool;
+use std::time::Instant;
 
 /// Maximum ancestor depth for family weight propagation (JVM: 500).
 const MAX_PARENT_SCAN_DEPTH: usize = 500;

@@ -50,10 +50,18 @@ fn allocator_benchmark() {
     let start = Instant::now();
     for i in 0..ITERS {
         match i % 4 {
-            0 => { black_box(Box::new([0u8; 32])); }
-            1 => { black_box(Box::new([0u8; 128])); }
-            2 => { black_box(Vec::<u8>::with_capacity(256)); }
-            3 => { black_box(String::with_capacity(64)); }
+            0 => {
+                black_box(Box::new([0u8; 32]));
+            }
+            1 => {
+                black_box(Box::new([0u8; 128]));
+            }
+            2 => {
+                black_box(Vec::<u8>::with_capacity(256));
+            }
+            3 => {
+                black_box(String::with_capacity(64));
+            }
             _ => unreachable!(),
         }
     }
@@ -63,7 +71,9 @@ fn allocator_benchmark() {
     // 4. Concurrent alloc/dealloc — mimics rayon par_iter validation
     //    (multiple threads allocating simultaneously)
     // =========================================================================
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     let per_thread = ITERS / threads;
     let start = Instant::now();
     std::thread::scope(|s| {
@@ -101,10 +111,26 @@ fn allocator_benchmark() {
     println!("Allocator: {alloc_name}  ({threads} threads available)");
     println!("{}", "=".repeat(60));
     println!();
-    println!("Small Box (64B) alloc+dealloc:  {:>6.1} ns/op  ({ITERS} ops)", ns(small_box, ITERS));
-    println!("Vec<u64> grow to 100:           {:>6.1} ns/op  ({} ops)", ns(vec_grow, ITERS / 10), ITERS / 10);
-    println!("Mixed sizes (32-256B):          {:>6.1} ns/op  ({ITERS} ops)", ns(mixed, ITERS));
-    println!("Concurrent ({threads}T, Box+Vec):     {:>6.1} ns/op  ({ITERS} ops)", ns(concurrent, ITERS));
-    println!("Churn (Box+Vec, build+discard): {:>6.1} ns/op  ({ITERS} ops)", ns(churn, ITERS));
+    println!(
+        "Small Box (64B) alloc+dealloc:  {:>6.1} ns/op  ({ITERS} ops)",
+        ns(small_box, ITERS)
+    );
+    println!(
+        "Vec<u64> grow to 100:           {:>6.1} ns/op  ({} ops)",
+        ns(vec_grow, ITERS / 10),
+        ITERS / 10
+    );
+    println!(
+        "Mixed sizes (32-256B):          {:>6.1} ns/op  ({ITERS} ops)",
+        ns(mixed, ITERS)
+    );
+    println!(
+        "Concurrent ({threads}T, Box+Vec):     {:>6.1} ns/op  ({ITERS} ops)",
+        ns(concurrent, ITERS)
+    );
+    println!(
+        "Churn (Box+Vec, build+discard): {:>6.1} ns/op  ({ITERS} ops)",
+        ns(churn, ITERS)
+    );
     println!("{}", "=".repeat(60));
 }

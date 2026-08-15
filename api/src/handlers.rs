@@ -165,6 +165,21 @@ fn subtle_constant_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 // GET /info
 // ---------------------------------------------------------------------------
 
+/// Map the raw `max_peer_height` atomic onto the `/info` field.
+///
+/// `0` is an unambiguous "not known yet" sentinel: the sync layer only ever
+/// stores a value strictly greater than the previous one, and Ergo's genesis
+/// is height 1, so a genuinely announced height is never 0. Reporting `0`
+/// would assert the network is at height 0 — omitting the field says
+/// "unknown", which is the truth. See `facts/api.md` § "Synced-state
+/// semantics".
+fn max_peer_height_field(raw: u32) -> Option<u32> {
+    match raw {
+        0 => None,
+        h => Some(h),
+    }
+}
+
 pub async fn get_info(State(state): State<ApiState>) -> Json<NodeInfo> {
     let headers_height = state.chain.height();
     let full_height = state
@@ -203,6 +218,12 @@ pub async fn get_info(State(state): State<ApiState>) -> Json<NodeInfo> {
         unconfirmed_count: pool_size,
         is_mining: false,
         current_time: now,
+        launch_time: state.node_info.launch_time,
+        max_peer_height: max_peer_height_field(
+            state
+                .max_peer_height
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
         journal_events_version: crate::JOURNAL_EVENTS_VERSION.to_string(),
         stats_version: state
             .stats_enabled
@@ -912,7 +933,9 @@ pub async fn get_mining_candidate(
     // there fails `cached.tip_height == current_tip_height` and returns 503
     // even though a valid candidate for the validated tip is cached.
     // (facts/mining.md — "GET /mining/candidate", height-source paragraph.)
-    let tip_height = state.validated_height.load(std::sync::atomic::Ordering::Relaxed);
+    let tip_height = state
+        .validated_height
+        .load(std::sync::atomic::Ordering::Relaxed);
     match mining.cached_work(tip_height) {
         Some(work) => Ok(Json(work)),
         None => err(
@@ -1221,12 +1244,15 @@ pub async fn info_wait(
 // GET /debug/memory
 // ---------------------------------------------------------------------------
 
-/// Average bytes per header in the in-memory chain. Real headers vary with
-/// interlink vector size; 800 is a coarse working estimate. Good enough to
-/// know whether chain is 0.5 GB or 2 GB of the total — don't use for anything
-/// that requires precision.
-const AVG_HEADER_BYTES: u64 = 800;
-
+/// Memory breakdown: kernel counters, allocator counters, and per-component
+/// figures reported by the crates that own the structures.
+///
+/// The component figures are transported, not computed. This handler must
+/// never size another crate's structure from a constant of its own: the
+/// removed `chainHeaderEstimateBytes` multiplied the header count by a local
+/// 800-bytes-per-header constant describing a `Vec<Header>` that `chain/`
+/// retired in Phase 3, and reported 1.48 GB for a structure that did not exist.
+/// See `facts/api.md` § "Component memory attribution".
 pub async fn get_debug_memory(State(state): State<ApiState>) -> Json<DebugMemory> {
     // Process memory from /proc/self/status. Fall back to zeros if any field
     // is missing — the endpoint is diagnostic, not mission-critical.
@@ -1244,12 +1270,30 @@ pub async fn get_debug_memory(State(state): State<ApiState>) -> Json<DebugMemory
         }
     });
 
+    let chain_memory = state.chain.memory_estimate();
     let chain_header_count = state.chain.height();
     let mempool_tx_count = state.mempool.lock().await.len() as u32;
 
+    // Transported verbatim from the owning crates — no arithmetic here. A
+    // `None` becomes an absent key, never a zero: a zero would assert the
+    // cache is empty, which is how a wrong figure hides in plain sight.
+    //
+    // The last three are read from gauges the owning crates publish into after
+    // each applied block, rather than pulled through a trait method — the AVL
+    // prover sits inside the validator that `sync/` owns and does not share.
+    // An unpublished gauge is `None` and drops out of the JSON, on the same
+    // terms as an unavailable redb stat.
     let components = ComponentMemory {
-        chain_header_estimate_bytes: chain_header_count as u64 * AVG_HEADER_BYTES,
+        chain_index_bytes: chain_memory.index_bytes,
+        chain_header_cache_bytes: chain_memory.header_cache_bytes,
+        chain_score_cache_bytes: chain_memory.score_cache_bytes,
         chain_header_count,
+        store_cache_bytes: state.store.cache_bytes_used(),
+        state_cache_bytes: state.utxo_reader.cache_bytes_used(),
+        store_cache_evictions: state.store.cache_evictions(),
+        prover_modified_nodes_bytes: state.prover_modified_nodes_bytes.get(),
+        prover_resident_nodes_bytes: state.prover_resident_nodes_bytes.get(),
+        sync_window_bytes: state.sync_window_bytes.get(),
         mempool_tx_count,
     };
 
@@ -2116,10 +2160,361 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // GET /info — launchTime / maxPeerHeight
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn max_peer_height_zero_means_unknown() {
+        // The sync layer stores a strict monotonic max and Ergo's genesis is
+        // height 1, so 0 can only mean "no SyncInfo parsed yet".
+        assert_eq!(max_peer_height_field(0), None);
+    }
+
+    #[test]
+    fn max_peer_height_nonzero_is_reported() {
+        assert_eq!(max_peer_height_field(1), Some(1));
+        assert_eq!(max_peer_height_field(1_500_000), Some(1_500_000));
+        assert_eq!(max_peer_height_field(u32::MAX), Some(u32::MAX));
+    }
+
+    #[test]
+    fn info_omits_max_peer_height_when_atomic_is_zero() {
+        let state = empty_state();
+        state
+            .max_peer_height
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let rt = build_runtime();
+        let Json(info) = rt.block_on(get_info(State(state)));
+        let json = serde_json::to_value(&info).unwrap();
+        let obj = json.as_object().expect("NodeInfo serializes as object");
+        assert!(
+            !obj.contains_key("maxPeerHeight"),
+            "maxPeerHeight must be absent — not 0 — before the first SyncInfo: {json}"
+        );
+    }
+
+    #[test]
+    fn info_emits_max_peer_height_when_atomic_is_set() {
+        let state = empty_state();
+        state
+            .max_peer_height
+            .store(1_500_000, std::sync::atomic::Ordering::Relaxed);
+        let rt = build_runtime();
+        let Json(info) = rt.block_on(get_info(State(state)));
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["maxPeerHeight"], serde_json::json!(1_500_000));
+    }
+
+    #[test]
+    fn info_always_emits_launch_time() {
+        let state = empty_state();
+        let rt = build_runtime();
+        let Json(info) = rt.block_on(get_info(State(state)));
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["launchTime"], serde_json::json!(TEST_LAUNCH_TIME));
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /debug/memory — component attribution
+    // -----------------------------------------------------------------------
+
+    /// Chain double for `/debug/memory`. Every reported figure is a distinct
+    /// nonzero value, so a handler that swapped two fields, dropped one, or
+    /// did arithmetic on any of them cannot produce a passing assertion.
+    struct MemoryChain;
+
+    impl MemoryChain {
+        const HEIGHT: u32 = 1_234_567;
+        const INDEX_BYTES: u64 = 111_000_111;
+        const HEADER_CACHE_BYTES: u64 = 222_000_222;
+        const SCORE_CACHE_BYTES: u64 = 333_000_333;
+    }
+
+    impl ChainAccess for MemoryChain {
+        fn height(&self) -> u32 {
+            Self::HEIGHT
+        }
+        fn header_at(&self, _h: u32) -> Option<Header> {
+            None
+        }
+        fn header_by_id(&self, _id: &[u8; 32]) -> Option<Header> {
+            None
+        }
+        fn tip(&self) -> Option<Header> {
+            None
+        }
+        fn build_nipopow_proof(
+            &self,
+            _m: u32,
+            _k: u32,
+            _id: Option<[u8; 32]>,
+        ) -> Result<Vec<u8>, String> {
+            Err("unused".into())
+        }
+        fn header_ids(&self, _offset: u32, _limit: u32) -> Vec<[u8; 32]> {
+            vec![]
+        }
+        fn popow_header_by_id(&self, _id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
+            Ok(None)
+        }
+        fn memory_estimate(&self) -> ChainMemory {
+            ChainMemory {
+                index_bytes: Self::INDEX_BYTES,
+                header_cache_bytes: Self::HEADER_CACHE_BYTES,
+                score_cache_bytes: Self::SCORE_CACHE_BYTES,
+            }
+        }
+    }
+
+    fn debug_memory_components_of(state: ApiState) -> serde_json::Value {
+        let rt = build_runtime();
+        let Json(body) = rt.block_on(get_debug_memory(State(state)));
+        serde_json::to_value(&body).unwrap()["components"].clone()
+    }
+
+    fn debug_memory_components(chain: Arc<dyn ChainAccess>) -> serde_json::Value {
+        debug_memory_components_of(test_state(chain))
+    }
+
+    /// The point of the whole change: what `ChainAccess::memory_estimate()`
+    /// reports is what the JSON carries — same values, same fields, no
+    /// arithmetic in this crate.
+    #[test]
+    fn debug_memory_transports_chain_figures_unmodified() {
+        let c = debug_memory_components(Arc::new(MemoryChain));
+        assert_eq!(
+            c["chainIndexBytes"],
+            serde_json::json!(MemoryChain::INDEX_BYTES)
+        );
+        assert_eq!(
+            c["chainHeaderCacheBytes"],
+            serde_json::json!(MemoryChain::HEADER_CACHE_BYTES)
+        );
+        assert_eq!(
+            c["chainScoreCacheBytes"],
+            serde_json::json!(MemoryChain::SCORE_CACHE_BYTES)
+        );
+        assert_eq!(
+            c["chainHeaderCount"],
+            serde_json::json!(MemoryChain::HEIGHT)
+        );
+        assert_eq!(c["mempoolTxCount"], serde_json::json!(0));
+    }
+
+    /// An accessor reporting `None` must produce JSON with NO such key — not
+    /// a zero, which would assert "the cache is empty". redb was the largest
+    /// single consumer during the 2026-08-11 genesis sync and a zero here
+    /// would have read as "not it", exactly the wrong answer.
+    #[test]
+    fn debug_memory_omits_cache_fields_when_unavailable() {
+        let c = debug_memory_components_of(test_state_with_cache(None, None, None));
+        assert!(c.get("storeCacheBytes").is_none());
+        assert!(c.get("stateCacheBytes").is_none());
+        assert!(c.get("storeCacheEvictions").is_none());
+    }
+
+    /// Three distinct values deliberately: a copy-paste wiring error where
+    /// all three fields read the same accessor would pass with identical
+    /// values and fail here. Also pins the three serialized key names
+    /// empirically rather than trusting what `rename_all` is assumed to do.
+    #[test]
+    fn debug_memory_transports_cache_figures_unmodified() {
+        let c = debug_memory_components_of(test_state_with_cache(Some(111), Some(222), Some(333)));
+        assert_eq!(c["storeCacheBytes"], serde_json::json!(111));
+        assert_eq!(c["stateCacheBytes"], serde_json::json!(222));
+        assert_eq!(c["storeCacheEvictions"], serde_json::json!(333));
+    }
+
+    /// The published gauges carry values into the JSON unchanged, and the
+    /// pulled figures beside them are undisturbed. Three distinct values: a
+    /// field wired to a sibling's gauge passes with identical ones.
+    #[test]
+    fn debug_memory_transports_published_figures_unmodified() {
+        let c = debug_memory_components_of(test_state_with_published(
+            Some(444_000_444),
+            Some(555_000_555),
+            Some(666_000_666),
+        ));
+        assert_eq!(
+            c["proverModifiedNodesBytes"],
+            serde_json::json!(444_000_444u64)
+        );
+        assert_eq!(
+            c["proverResidentNodesBytes"],
+            serde_json::json!(555_000_555u64)
+        );
+        assert_eq!(c["syncWindowBytes"], serde_json::json!(666_000_666u64));
+        assert_eq!(
+            c["chainIndexBytes"],
+            serde_json::json!(MemoryChain::INDEX_BYTES),
+            "publishing must not disturb the pulled figures"
+        );
+        assert_eq!(c["mempoolTxCount"], serde_json::json!(0));
+    }
+
+    /// Nothing has published: all three keys absent. This is every node's
+    /// state at startup, and the moment a zero here would read as "the prover
+    /// is empty, look elsewhere" — the answer that cost a day on 2026-08-11.
+    #[test]
+    fn debug_memory_omits_published_fields_until_written() {
+        let c = debug_memory_components_of(test_state_with_published(None, None, None));
+        assert!(c.get("proverModifiedNodesBytes").is_none());
+        assert!(c.get("proverResidentNodesBytes").is_none());
+        assert!(c.get("syncWindowBytes").is_none());
+    }
+
+    /// Absence is per-gauge. One publisher that never runs must not drag the
+    /// others out of the response, and a field reading a sibling's gauge would
+    /// surface here as a key that refuses to disappear.
+    #[test]
+    fn debug_memory_published_fields_are_individually_absent() {
+        let c = debug_memory_components_of(test_state_with_published(None, Some(2), Some(3)));
+        assert!(c.get("proverModifiedNodesBytes").is_none());
+        assert_eq!(c["proverResidentNodesBytes"], serde_json::json!(2));
+        assert_eq!(c["syncWindowBytes"], serde_json::json!(3));
+
+        let c = debug_memory_components_of(test_state_with_published(Some(1), None, Some(3)));
+        assert_eq!(c["proverModifiedNodesBytes"], serde_json::json!(1));
+        assert!(c.get("proverResidentNodesBytes").is_none());
+        assert_eq!(c["syncWindowBytes"], serde_json::json!(3));
+
+        let c = debug_memory_components_of(test_state_with_published(Some(1), Some(2), None));
+        assert_eq!(c["proverModifiedNodesBytes"], serde_json::json!(1));
+        assert_eq!(c["proverResidentNodesBytes"], serde_json::json!(2));
+        assert!(c.get("syncWindowBytes").is_none());
+    }
+
+    /// The whole reason these are gauges and not plain atomics: a measured
+    /// zero is a fact and renders as `0`; an unmeasured gauge renders as
+    /// nothing. Collapsing the two is the bug this field set exists to avoid.
+    #[test]
+    fn debug_memory_published_zero_renders_as_zero_not_absent() {
+        let c = debug_memory_components_of(test_state_with_published(Some(0), Some(0), Some(0)));
+        assert_eq!(c["proverModifiedNodesBytes"], serde_json::json!(0));
+        assert_eq!(c["proverResidentNodesBytes"], serde_json::json!(0));
+        assert_eq!(c["syncWindowBytes"], serde_json::json!(0));
+    }
+
+    /// The sentinel directly, independent of the handler: `unset()` is not a
+    /// zero, and a published zero is not unset.
+    #[test]
+    fn published_gauge_separates_unwritten_from_zero() {
+        let gauge = PublishedGauge::unset();
+        assert_eq!(gauge.get(), None);
+        gauge.publish(0);
+        assert_eq!(gauge.get(), Some(0));
+        gauge.publish(9_876_543_210);
+        assert_eq!(gauge.get(), Some(9_876_543_210));
+    }
+
+    /// The property the whole design rests on: gauges over one
+    /// `Arc<AtomicU64>` are two views of one value, not two values. The
+    /// producer lives in a crate that cannot name `PublishedGauge` and writes
+    /// the raw atomic; if adopting the `Arc` ever produced a separate
+    /// allocation, `/debug/memory` would read a gauge nothing writes and omit
+    /// the field forever — indistinguishable from a producer that never ran.
+    #[test]
+    fn published_gauges_over_one_storage_share_it() {
+        // How the main crate mints it: allocate through the gauge, because the
+        // sentinel is private and a hand-rolled atomic starts at a false zero.
+        let storage = PublishedGauge::unset().storage();
+        let reader = PublishedGauge::from_storage(Arc::clone(&storage));
+        let second = PublishedGauge::from_storage(Arc::clone(&storage));
+
+        assert_eq!(reader.get(), None, "minted storage is unpublished");
+        assert_eq!(second.get(), None, "and so is every view of it");
+
+        second.publish(1_234);
+        assert_eq!(
+            reader.get(),
+            Some(1_234),
+            "a publish through one view is visible through the other"
+        );
+
+        // What `sync/` actually does — it only ever sees the atomic.
+        storage.store(4_096, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(reader.get(), Some(4_096));
+        assert_eq!(second.get(), Some(4_096));
+    }
+
+    /// Pins the serialized key set empirically rather than trusting what
+    /// `rename_all = "camelCase"` is assumed to produce, and keeps
+    /// `chainHeaderEstimateBytes` from returning — including as an alias. It
+    /// was not a misnamed field, it was a wrong number: 1.48 GB attributed to
+    /// a `Vec<Header>` that `chain/` retired in Phase 3.
+    #[test]
+    fn debug_memory_component_keys_are_exactly_the_contract() {
+        fn sorted_keys(c: &serde_json::Value) -> Vec<&str> {
+            let mut keys: Vec<&str> = c
+                .as_object()
+                .expect("components serializes as object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            keys
+        }
+
+        let everything = test_state_with_cache(Some(1), Some(2), Some(3));
+        everything.prover_modified_nodes_bytes.publish(4);
+        everything.prover_resident_nodes_bytes.publish(5);
+        everything.sync_window_bytes.publish(6);
+        assert_eq!(
+            sorted_keys(&debug_memory_components_of(everything)),
+            [
+                "chainHeaderCacheBytes",
+                "chainHeaderCount",
+                "chainIndexBytes",
+                "chainScoreCacheBytes",
+                "mempoolTxCount",
+                "proverModifiedNodesBytes",
+                "proverResidentNodesBytes",
+                "stateCacheBytes",
+                "storeCacheBytes",
+                "storeCacheEvictions",
+                "syncWindowBytes",
+            ],
+            "component key set must match facts/openapi.yaml § ComponentMemory"
+        );
+
+        assert_eq!(
+            sorted_keys(&debug_memory_components_of(test_state_with_cache(
+                Some(1),
+                Some(2),
+                Some(3)
+            ))),
+            [
+                "chainHeaderCacheBytes",
+                "chainHeaderCount",
+                "chainIndexBytes",
+                "chainScoreCacheBytes",
+                "mempoolTxCount",
+                "stateCacheBytes",
+                "storeCacheBytes",
+                "storeCacheEvictions",
+            ],
+            "redb stats available but nothing published: the three published keys stay out"
+        );
+
+        assert_eq!(
+            sorted_keys(&debug_memory_components(Arc::new(MemoryChain))),
+            [
+                "chainHeaderCacheBytes",
+                "chainHeaderCount",
+                "chainIndexBytes",
+                "chainScoreCacheBytes",
+                "mempoolTxCount",
+            ],
+            "the three cache and three published keys are the only optional ones; \
+             the rest are required"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // NiPoPoW handler tests
     // -----------------------------------------------------------------------
 
-    use crate::ChainAccess;
+    use crate::{ChainAccess, ChainMemory};
     use ergo_chain_types::{
         ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint, Header, Votes,
     };
@@ -2167,6 +2562,21 @@ mod tests {
         }
         fn popow_header_by_id(&self, _id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
             Ok(None)
+        }
+        fn memory_estimate(&self) -> ChainMemory {
+            unreported_memory()
+        }
+    }
+
+    /// `ChainMemory` for doubles that never serve `/debug/memory`. The
+    /// transport assertions live on `MemoryChain`, which reports a distinct
+    /// nonzero value per field — zeros here mean "this double is not the one
+    /// under test", not "the chain uses no memory".
+    fn unreported_memory() -> ChainMemory {
+        ChainMemory {
+            index_bytes: 0,
+            header_cache_bytes: 0,
+            score_cache_bytes: 0,
         }
     }
 
@@ -2398,26 +2808,45 @@ mod tests {
 
     use crate::{
         BlockSubmitter, NodeMeta, PeerCounts, PeerInfo, PeerRestInfo, PeerStatusSummary,
-        SnapshotInfoEntry, StoreAccess, UtxoAccess,
+        PublishedGauge, SnapshotInfoEntry, StoreAccess, UtxoAccess,
     };
     use std::sync::atomic::AtomicU32;
 
-    /// Empty UTXO reader — every lookup returns None.
-    struct EmptyUtxoReader;
+    /// Empty UTXO reader — every lookup returns None. `cache_bytes` is
+    /// configurable so `/debug/memory` can be exercised both with redb stats
+    /// available and without; `Default` is the unavailable case.
+    #[derive(Default)]
+    struct EmptyUtxoReader {
+        cache_bytes: Option<u64>,
+    }
     impl UtxoAccess for EmptyUtxoReader {
         fn box_by_id(&self, _id: &[u8; 32]) -> Option<ergo_validation::ErgoBox> {
             None
         }
+        fn cache_bytes_used(&self) -> Option<u64> {
+            self.cache_bytes
+        }
     }
 
-    /// Empty store — every lookup returns None.
-    struct EmptyStore;
+    /// Empty store — every lookup returns None. Cache figures configurable,
+    /// `Default` reporting neither.
+    #[derive(Default)]
+    struct EmptyStore {
+        cache_bytes: Option<u64>,
+        cache_evictions: Option<u64>,
+    }
     impl StoreAccess for EmptyStore {
         fn get(&self, _type_id: u8, _id: &[u8; 32]) -> Option<Vec<u8>> {
             None
         }
         fn get_at_height(&self, _type_id: u8, _height: u32) -> Option<Vec<u8>> {
             None
+        }
+        fn cache_bytes_used(&self) -> Option<u64> {
+            self.cache_bytes
+        }
+        fn cache_evictions(&self) -> Option<u64> {
+            self.cache_evictions
         }
     }
 
@@ -2428,17 +2857,21 @@ mod tests {
         }
     }
 
+    /// Fixed `launch_time` for `test_state`, so `/info` assertions have
+    /// something deterministic to compare against.
+    const TEST_LAUNCH_TIME: u64 = 1_700_000_000_000;
+
     /// Build a minimal `ApiState` suitable for unit-testing handlers.
     /// Callers override the relevant fields before invoking handlers.
     fn test_state(chain: Arc<dyn ChainAccess>) -> ApiState {
         let (_tx, rx) = tokio::sync::watch::channel(0u32);
         ApiState {
             chain,
-            store: Arc::new(EmptyStore),
+            store: Arc::new(EmptyStore::default()),
             mempool: Arc::new(tokio::sync::Mutex::new(ergo_mempool::Mempool::new(
                 ergo_mempool::types::MempoolConfig::default(),
             ))),
-            utxo_reader: Arc::new(EmptyUtxoReader),
+            utxo_reader: Arc::new(EmptyUtxoReader::default()),
             state_context: Arc::new(tokio::sync::RwLock::new(None)),
             peer_count: Arc::new(|| PeerCounts { connected: 0 }),
             node_info: Arc::new(NodeMeta {
@@ -2446,11 +2879,13 @@ mod tests {
                 version: "0.0.0".into(),
                 network: "testnet".into(),
                 state_type: "utxo".into(),
+                launch_time: TEST_LAUNCH_TIME,
             }),
             mining: None,
             block_submitter: Some(Arc::new(UnusedSubmitter)),
             validated_height: Arc::new(AtomicU32::new(0)),
             downloaded_height: Arc::new(AtomicU32::new(0)),
+            max_peer_height: Arc::new(AtomicU32::new(0)),
             peer_api_urls: Arc::new(Vec::<PeerRestInfo>::new) as _,
             peer_all: Arc::new(Vec::<PeerInfo>::new) as _,
             peer_status: Arc::new(|| PeerStatusSummary {
@@ -2464,9 +2899,53 @@ mod tests {
             modifier_tx: None,
             height_watch: rx,
             jemalloc_probe: None,
+            prover_modified_nodes_bytes: Arc::new(PublishedGauge::unset()),
+            prover_resident_nodes_bytes: Arc::new(PublishedGauge::unset()),
+            sync_window_bytes: Arc::new(PublishedGauge::unset()),
             stats_enabled: false,
             capture: None,
         }
+    }
+
+    /// `test_state` over `MemoryChain`, with the store/state redb cache
+    /// figures forced to the given values. `None` models redb stats being
+    /// unavailable, which must omit the field rather than report a zero.
+    fn test_state_with_cache(
+        store_bytes: Option<u64>,
+        state_bytes: Option<u64>,
+        evictions: Option<u64>,
+    ) -> ApiState {
+        let mut state = test_state(Arc::new(MemoryChain));
+        state.store = Arc::new(EmptyStore {
+            cache_bytes: store_bytes,
+            cache_evictions: evictions,
+        });
+        state.utxo_reader = Arc::new(EmptyUtxoReader {
+            cache_bytes: state_bytes,
+        });
+        state
+    }
+
+    /// `test_state` over `MemoryChain` with the published gauges written to
+    /// the given values. A `None` leaves the gauge untouched — the state a
+    /// node is in before the owning crate has measured anything, which must
+    /// omit the key rather than report a zero.
+    fn test_state_with_published(
+        prover_modified: Option<u64>,
+        prover_resident: Option<u64>,
+        sync_window: Option<u64>,
+    ) -> ApiState {
+        let state = test_state(Arc::new(MemoryChain));
+        for (gauge, value) in [
+            (&state.prover_modified_nodes_bytes, prover_modified),
+            (&state.prover_resident_nodes_bytes, prover_resident),
+            (&state.sync_window_bytes, sync_window),
+        ] {
+            if let Some(bytes) = value {
+                gauge.publish(bytes);
+            }
+        }
+        state
     }
 
     /// Mock chain that returns a configurable list of header IDs.
@@ -2504,6 +2983,9 @@ mod tests {
         }
         fn popow_header_by_id(&self, _id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
             Ok(None)
+        }
+        fn memory_estimate(&self) -> ChainMemory {
+            unreported_memory()
         }
     }
 
@@ -2993,6 +3475,9 @@ mod tests {
         fn popow_header_by_id(&self, _id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
             Ok(None)
         }
+        fn memory_estimate(&self) -> ChainMemory {
+            unreported_memory()
+        }
     }
 
     /// Store mock: returns pre-loaded bytes keyed by `(type_id, modifier_id)`.
@@ -3004,6 +3489,13 @@ mod tests {
             self.by_key.get(&(type_id, *id)).cloned()
         }
         fn get_at_height(&self, _t: u8, _h: u32) -> Option<Vec<u8>> {
+            None
+        }
+        /// Models no cache: unavailable, not empty.
+        fn cache_bytes_used(&self) -> Option<u64> {
+            None
+        }
+        fn cache_evictions(&self) -> Option<u64> {
             None
         }
     }
@@ -3178,7 +3670,10 @@ mod tests {
                 assert_eq!(status, StatusCode::NOT_FOUND);
                 assert_eq!(body.error, 404);
                 assert_eq!(body.reason, "block-not-found");
-                assert_eq!(body.detail.as_deref(), Some(format!("headerId={}", "aa".repeat(32)).as_str()));
+                assert_eq!(
+                    body.detail.as_deref(),
+                    Some(format!("headerId={}", "aa".repeat(32)).as_str())
+                );
             }
             Ok(_) => panic!("expected 404 for unknown headerId"),
         }
@@ -3249,8 +3744,8 @@ mod tests {
             // full canonical bytes are non-empty hex and re-parse to the same tx
             assert!(!frag.bytes.is_empty(), "tx[{i}] bytes must be non-empty");
             let raw = hex::decode(&frag.bytes).expect("bytes is hex");
-            let reparsed = Transaction::sigma_parse_bytes(&raw)
-                .expect("bytes must re-parse to a Transaction");
+            let reparsed =
+                Transaction::sigma_parse_bytes(&raw).expect("bytes must re-parse to a Transaction");
             assert_eq!(
                 reparsed.id().0 .0,
                 parsed.transactions[i].id().0 .0,
@@ -3634,6 +4129,9 @@ mod tests {
         fn popow_header_by_id(&self, _id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
             Ok(None)
         }
+        fn memory_estimate(&self) -> ChainMemory {
+            unreported_memory()
+        }
     }
 
     /// Submitter that accepts everything — the happy-path stand-in.
@@ -3853,6 +4351,9 @@ mod tests {
         }
         fn popow_header_by_id(&self, _id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
             Ok(None)
+        }
+        fn memory_estimate(&self) -> ChainMemory {
+            unreported_memory()
         }
     }
 

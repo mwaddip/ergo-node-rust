@@ -2,7 +2,7 @@ mod handlers;
 pub mod stats;
 pub mod types;
 
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::Router;
@@ -18,7 +18,7 @@ pub use stats::{
 
 /// Version of the journal-events contract this build promises.
 /// Bumped atomically with `facts/journal-events.md`.
-pub const JOURNAL_EVENTS_VERSION: &str = "1.3";
+pub const JOURNAL_EVENTS_VERSION: &str = "2.1";
 
 /// Version of the operator stats endpoint schema this build promises.
 /// Bumped atomically with `facts/stats.md`.
@@ -57,6 +57,14 @@ pub struct ApiState {
     pub validated_height: Arc<AtomicU32>,
     /// Highest height with all block sections downloaded (updated by sync layer).
     pub downloaded_height: Arc<AtomicU32>,
+    /// Highest header height announced by any peer in a `SyncInfo` since
+    /// process start (updated by the sync layer). Monotonic high-water mark —
+    /// never decreases, including on peer disconnect or reorg. `0` means no
+    /// `SyncInfo` has been parsed yet; `/info` reports that as an absent
+    /// field rather than height 0. Peer-supplied and unverified — advisory
+    /// display data only, never an input to a consensus, validation, or
+    /// storage decision.
+    pub max_peer_height: Arc<AtomicU32>,
     /// Peer REST URL callback — returns connected peers with their socket addr and REST URL.
     pub peer_api_urls: Arc<dyn Fn() -> Vec<PeerRestInfo> + Send + Sync>,
     /// All known peers (connected + disconnected). For `GET /peers/all`.
@@ -82,6 +90,15 @@ pub struct ApiState {
     /// jemalloc; None with mimalloc or system allocator. The `/debug/memory`
     /// handler calls this to read live allocator counters.
     pub jemalloc_probe: Option<Arc<dyn Fn() -> JemallocSnapshot + Send + Sync>>,
+    /// AVL prover modified-node working set, published after each applied
+    /// block by the crate that owns the prover. Absent from `/debug/memory`
+    /// until something publishes — see [`PublishedGauge`].
+    pub prover_modified_nodes_bytes: Arc<PublishedGauge>,
+    /// AVL prover resident-node working set, published by the same writer as
+    /// [`ApiState::prover_modified_nodes_bytes`].
+    pub prover_resident_nodes_bytes: Arc<PublishedGauge>,
+    /// `sync/`'s in-flight download window, published by `sync/`.
+    pub sync_window_bytes: Arc<PublishedGauge>,
     /// Whether the operator stats endpoint is enabled. Overwritten by
     /// `serve()` based on its `stats_config` + `p2p_counters` arguments;
     /// callers should leave this `false`. When `true`, `/info` emits
@@ -92,6 +109,109 @@ pub struct ApiState {
     /// `/debug/p2p-capture/*` handlers return a disabled-shaped response
     /// (200 `{"enabled": false}` for `/info`, 404 for `/dump` and `/reset`).
     pub capture: Option<Arc<dyn enr_p2p::capture::CaptureAccess>>,
+}
+
+/// A byte figure **published** into shared state by the crate that owns the
+/// structure it measures, rather than read through an accessor.
+///
+/// Every other `/debug/memory` component figure is pulled synchronously via a
+/// trait method. These cannot be: the AVL prover lives inside the UTXO
+/// validator, which `sync/` owns and deliberately does not wrap in an
+/// `Arc<Mutex>` (`facts/validation.md`), so there is nothing for an HTTP
+/// handler to call. The owning crate computes its estimate and stores it here
+/// after each applied block — the mechanism already used for `shared_height` —
+/// and this crate reads it. Do not "simplify" this into a direct accessor: a
+/// synchronous read needs either a lock on an HTTP path or the `Arc<Mutex>`
+/// that was rejected on its own merits.
+///
+/// The `Option` discipline of the pulled figures survives intact. A gauge
+/// nothing has published to reports `None`, and `/debug/memory` omits the key;
+/// a published `0` reports `Some(0)` and renders as `0`. A node that has
+/// applied no blocks must not claim an empty prover — that is the same class of
+/// falsehood as the removed `chainHeaderEstimateBytes`. The two states are kept
+/// apart by a sentinel, so a gauge cannot report zero before anything has
+/// measured it — provided its storage was minted by
+/// [`unset`](PublishedGauge::unset), which is what sets the sentinel.
+///
+/// **The gauge is a view over an `Arc<AtomicU64>`, not the owner of an
+/// atomic.** The producer lives in a crate that cannot name this type — `api/`
+/// and `sync/` do not depend on each other, and none of the crates they share
+/// is a sensible home for an observability primitive. So the storage is a plain
+/// `Arc<AtomicU64>` that the main crate allocates once and hands to both ends:
+/// the producer publishes into it, and a gauge
+/// [adopts](PublishedGauge::from_storage) the same `Arc` to read it. Two views,
+/// one allocation.
+///
+/// See `facts/api.md` § "Component memory attribution".
+pub struct PublishedGauge(Arc<AtomicU64>);
+
+impl PublishedGauge {
+    /// Sentinel for "nothing has published yet". 16 EiB is not a byte count any
+    /// structure in this process can reach; see [`PublishedGauge::publish`].
+    const UNSET: u64 = u64::MAX;
+
+    /// A gauge over freshly allocated storage nothing has published to. Reports
+    /// `None` until [`publish`](PublishedGauge::publish) is called.
+    ///
+    /// This is also how the shared storage gets minted. The sentinel is
+    /// private, so an `Arc<AtomicU64>` allocated anywhere else starts at `0`
+    /// and reads as a published zero. Allocate here, then hand
+    /// [`storage`](PublishedGauge::storage) to the producer.
+    pub fn unset() -> Self {
+        Self(Arc::new(AtomicU64::new(Self::UNSET)))
+    }
+
+    /// A gauge over storage that already exists — the reading end of an `Arc`
+    /// whose writing end is a producer in another crate.
+    ///
+    /// The storage must have come from [`unset`](PublishedGauge::unset), or at
+    /// minimum have been initialised to the never-published sentinel. An
+    /// `AtomicU64::new(0)` adopted here reports `Some(0)`: a claim that
+    /// something measured an empty structure, which is precisely the falsehood
+    /// the sentinel exists to prevent.
+    pub fn from_storage(storage: Arc<AtomicU64>) -> Self {
+        Self(storage)
+    }
+
+    /// The storage this gauge reads, for handing to the producer in the crate
+    /// that owns the measured structure. Every view of one allocation sees
+    /// every [`publish`](PublishedGauge::publish) through any other.
+    pub fn storage(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.0)
+    }
+
+    /// Publish a freshly measured figure. Called by the owning crate after each
+    /// applied block; never called from this crate.
+    ///
+    /// Publishing `u64::MAX` is indistinguishable from never publishing and is
+    /// a caller bug. Debug builds assert; release builds report the field as
+    /// absent, which is a refusal to answer rather than a wrong answer.
+    pub fn publish(&self, bytes: u64) {
+        debug_assert!(
+            bytes != Self::UNSET,
+            "u64::MAX is the never-published sentinel; publishing it reports as absent"
+        );
+        self.0.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The last published figure, or `None` if nothing has published yet.
+    ///
+    /// `Relaxed` throughout: each gauge is an independent diagnostic reading
+    /// with no ordering relationship to any other value, and a reader that
+    /// catches the previous block's figure has caught a figure that was true
+    /// two seconds ago.
+    pub fn get(&self) -> Option<u64> {
+        match self.0.load(Ordering::Relaxed) {
+            Self::UNSET => None,
+            bytes => Some(bytes),
+        }
+    }
+}
+
+impl Default for PublishedGauge {
+    fn default() -> Self {
+        Self::unset()
+    }
 }
 
 /// Snapshot of jemalloc stats at a moment in time. The probe calls
@@ -112,6 +232,9 @@ pub struct NodeMeta {
     pub version: String,
     pub network: String,
     pub state_type: String,
+    /// Unix epoch ms at which this process began serving. Constant for the
+    /// process lifetime — consumers derive uptime as `currentTime - launchTime`.
+    pub launch_time: u64,
 }
 
 /// Peer count summary.
@@ -148,6 +271,34 @@ pub struct PeerStatusSummary {
 pub struct SnapshotInfoEntry {
     pub height: u32,
     pub digest: [u8; 32],
+}
+
+/// Memory attribution for the header chain's in-process structures, as
+/// reported by the crate that owns them.
+///
+/// Every field is a formula over a live count or capacity — never a
+/// measurement — and it is computed by `chain/`, not here. The API layer
+/// transports these numbers into `GET /debug/memory`; it must never derive
+/// them from a local constant describing another crate's internals. The
+/// removed `chainHeaderEstimateBytes` did exactly that (`header_count * 800`
+/// for a `Vec<Header>` that `chain/` retired in Phase 3) and reported 1.48 GB
+/// for a structure that no longer existed.
+///
+/// Deliberately api-local: this crate does not depend on `enr-chain`, and it
+/// does not acquire that dependency just to share a struct. The main crate's
+/// adapter maps `chain/`'s `ChainMemoryEstimate` onto this type — that mapping
+/// is the integration seam, not licence to reintroduce sizing arithmetic here.
+/// See `facts/api.md` § "Component memory attribution".
+pub struct ChainMemory {
+    /// `HeaderChain::by_id` (BlockId → height). Unbounded — grows with chain
+    /// length for the life of the node and is never evicted.
+    pub index_bytes: u64,
+    /// `LazyHeaderStore` header LRU, current occupancy. Bounded by the
+    /// configured cache capacity.
+    pub header_cache_bytes: u64,
+    /// `LazyHeaderStore` cumulative-score LRU, current occupancy. Bounded by
+    /// the configured cache capacity.
+    pub score_cache_bytes: u64,
 }
 
 /// Trait for chain access — avoids API depending on enr-chain internals.
@@ -196,6 +347,15 @@ pub trait ChainAccess: Send + Sync {
     /// - `Ok(None)` — header not in chain (handler returns 404).
     /// - `Err(reason)` — chain-internal failure (e.g., extension missing for an interlink ancestor); handler returns 500.
     fn popow_header_by_id(&self, id: &[u8; 32]) -> Result<Option<Vec<u8>>, String>;
+
+    /// Memory attribution for the chain's in-process structures.
+    ///
+    /// The implementor computes these figures; `GET /debug/memory` reports
+    /// them verbatim and performs no arithmetic on them. Deliberately has no
+    /// default body — a default would let an implementor that forgot to
+    /// override it silently report zeros, which is precisely how the wrong
+    /// `chainHeaderEstimateBytes` survived unnoticed.
+    fn memory_estimate(&self) -> ChainMemory;
 }
 
 /// Trait for block store access.
@@ -205,12 +365,38 @@ pub trait StoreAccess: Send + Sync {
     /// Get raw modifier bytes by type ID and block height.
     /// Looks up the modifier ID at that height first, then fetches the data.
     fn get_at_height(&self, type_id: u8, height: u32) -> Option<Vec<u8>>;
+
+    /// `modifiers.redb` page cache occupancy, `None` when unavailable.
+    ///
+    /// NEVER return 0 for "unknown" — a zero asserts the cache is empty, the
+    /// same class of falsehood as the removed `chainHeaderEstimateBytes`.
+    /// `GET /debug/memory` omits the field entirely when this is `None`.
+    ///
+    /// Deliberately has no default body: a default would let an implementor
+    /// that forgot to override it silently report a wrong value, which is
+    /// structurally how `AVG_HEADER_BYTES` survived four months describing a
+    /// struct that had been deleted. A compile error at every implementation
+    /// site is the point.
+    fn cache_bytes_used(&self) -> Option<u64>;
+
+    /// Cumulative `modifiers.redb` cache evictions, `None` when unavailable.
+    ///
+    /// A rising count is the signal that the cache is undersized — otherwise
+    /// an undersized cache is indistinguishable from a comfortably large one.
+    /// No default body, for the reason given on [`StoreAccess::cache_bytes_used`].
+    fn cache_evictions(&self) -> Option<u64>;
 }
 
 /// Trait for UTXO lookups.
 pub trait UtxoAccess: Send + Sync {
     /// Look up a box by its ID in the confirmed UTXO set.
     fn box_by_id(&self, box_id: &[u8; 32]) -> Option<ergo_validation::ErgoBox>;
+
+    /// `state.redb` page cache occupancy, `None` when unavailable.
+    ///
+    /// NEVER return 0 for "unknown". No default body, for the reason given on
+    /// [`StoreAccess::cache_bytes_used`].
+    fn cache_bytes_used(&self) -> Option<u64>;
 }
 
 /// Trait for submitting locally-mined blocks to the node's processing pipeline.

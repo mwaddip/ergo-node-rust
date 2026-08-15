@@ -359,6 +359,8 @@ mod tests {
             unconfirmed_count: 0,
             is_mining: false,
             current_time: 0,
+            launch_time: 0,
+            max_peer_height: None,
             journal_events_version: JOURNAL_EVENTS_VERSION.to_string(),
             stats_version,
         }

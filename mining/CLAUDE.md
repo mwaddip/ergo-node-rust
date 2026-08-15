@@ -37,7 +37,11 @@ This crate does NOT own:
 - `ergo-chain-types` — Header, Autolykos PoW, compact nBits
 - `ergo-merkle-tree` — transactions root
 - `sigma-ser` — serialization
-- `enr-chain` — header/PoW primitives
+- `enr-chain` — header/PoW primitives, and `pow_target(n_bits)`: the single
+  sanctioned definition of the Autolykos target served as `WorkMessage.b`.
+  Never re-derive it from `decode_compact_bits` here — that returns the
+  difficulty, and re-deriving it is exactly how v0.8.0 shipped a serve path
+  no miner could satisfy.
 
 ## JVM Reference
 

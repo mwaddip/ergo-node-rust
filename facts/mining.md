@@ -64,6 +64,11 @@ current candidate is lost; miners just poll for a new one.
 - `ergo-chain-types` — `Header`, `AutolykosPowScheme`, `AutolykosSolution`,
   `ADDigest`, header serialization
 - `ergo-nipopow` — interlink vector computation for extension section
+- `enr-chain` — `pow_target(n_bits)`, the single definition of the Autolykos
+  mining target served as `WorkMessage.b`. The crate consumed
+  `ergo-chain-types` directly and re-derived the target itself — from the
+  crate's completion through `v0.7.11` — which is how it came to serve the
+  difficulty instead. No cycle: `chain/` has no in-repo path dependencies.
 - `ergo-validation` — `compute_state_changes`, `validate_single_transaction`,
   `build_state_context`, `Parameters`
 - `ergo_avltree_rust` — via UtxoValidator (temporary prover operations for
@@ -119,8 +124,10 @@ pub struct CandidateBlock {
     pub parent: Header,
     /// Block version.
     pub version: u8,
-    /// Encoded difficulty target for this block.
-    pub n_bits: u64,
+    /// Compact-encoded **difficulty** for this block (not the mining target —
+    /// see `WorkMessage.b`). `u32`, matching `Header.n_bits`; serialized as 4
+    /// raw big-endian bytes, the one non-VLQ integer in the header.
+    pub n_bits: u32,
     /// New state root after applying selected transactions.
     pub state_root: ADDigest,
     /// Serialized AD proofs for the state transition.
@@ -144,7 +151,9 @@ pub struct CandidateBlock {
 pub struct WorkMessage {
     /// Blake2b256 hash of the serialized HeaderWithoutPow.
     pub msg: [u8; 32],
-    /// Target value derived from nBits. Solution must satisfy hit < b.
+    /// Autolykos target: `q / decode_compact_bits(nBits)`, i.e.
+    /// `enr_chain::pow_target(nBits)` — NOT the decoded nBits itself, which
+    /// is the difficulty. Solution must satisfy hit < b.
     pub b: BigInt,
     /// Block height (used in Autolykos v2 index calculation).
     pub h: u32,
@@ -312,6 +321,31 @@ struct SolvedLatch {
 }
 ```
 
+### Startup: the proof cache must be seeded
+
+`main` holds a `MiningProofData` cache — the parent header and emission box the
+mining task builds each candidate from. It is written by
+`Validator::update_mining_proofs`, which runs **only on the post-apply path**,
+and the mining task refuses to build when it is absent or its `tip_height`
+does not match the current validated height.
+
+⚠ **`main` MUST seed it at startup from the restored tip.** Otherwise a node
+restarted while already at the chain tip serves 503 from `/mining/candidate`
+until a peer delivers the next block — and for a node that is the only miner
+on its network, never: no candidate, so no block, so no application, so no
+candidate. Observed in the field as an hour of 503s after an at-tip restart,
+with three peers connected.
+
+The gap is invisible during sync, which is why it survived: a catching-up node
+applies a block within seconds and the cache fills itself. Only an at-tip
+restart exposes it.
+
+Seeding depends on `emission_box_id()` being valid on a freshly constructed
+validator — see `facts/validation.md` § "Recovering `emission_box_id` on
+resume". **Seeding the cache alone does not fix this**; without that recovery
+`update_mining_proofs` returns early at the emission-box check and the symptom
+is unchanged, which makes it look like the diagnosis was wrong.
+
 ### Lifecycle API
 
 ```rust
@@ -387,6 +421,77 @@ contention becomes an issue, the solution is a dedicated read-only prover
 sharing the storage backend.
 
 ## Candidate Assembly
+
+### Regeneration triggers
+
+A cached candidate is rebuilt when **either**:
+
+- the validated tip advances, or
+- **the cached candidate has aged past `candidate_ttl`** (default 15 s).
+
+⚠ **The second trigger was missing until v0.8.0, and its absence made mining
+unusable.** Regeneration was gated on tip change alone, while `cached_work`
+invalidates on TTL — so `/mining/candidate` served work for 15 s after each
+block and returned **503 for the remaining ~105 s** of a mainnet interval. A
+miner could fetch work for roughly 12% of each block. The config key is
+documented as "maximum candidate lifetime before forced regeneration"; only the
+invalidation half existed.
+
+Regenerating on expiry also keeps the candidate's `timestamp` current and, with
+transaction selection wired, picks up transactions that arrived *after* the
+last block — rather than repeatedly mining the near-empty mempool that block
+left behind. **That failure mode — full mempool, empty blocks — is a caching
+and trigger problem, not a selection problem**, and wiring selection without
+this fix would not have produced fuller blocks.
+
+### Ownership — `generate_candidate` is the only entry point
+
+**Callers ask `mining` for a candidate. They do not assemble one.**
+`ergo_mining::generate_candidate` performs steps 1–8 below and is the sole
+supported path; constructing a `CandidateBlock` field-by-field outside this
+crate is a contract violation regardless of whether the result happens to be
+well-formed.
+
+⚠ **This was violated until v0.8.0, and the violation is what made steps 3 and
+4 dead code. Fixed in `3aecc7f`; the history stays because the failure was
+invisible for months.** `src/main.rs` built `CandidateBlock { .. }` inline — parent,
+n_bits, state root, AD proofs, its own copy of the
+`max(now, parent.timestamp + 1)` rule, `transactions: vec![emission_tx]` — and
+never called `generate_candidate`. So the crate's entry point had no production
+caller, and `select_transactions` and `build_fee_tx` had none either: the path
+that would have called them was not the path that ran. Mined blocks carried the
+emission transaction alone and miners collected no fees.
+
+The lesson generalises past mining: **a crate function with no caller outside
+its own tests is not "not yet wired", it is a second implementation waiting to
+diverge.** Here the timestamp rule already existed twice.
+
+`generate_candidate` therefore needs everything steps 3–4 require, passed in
+rather than reached for — the caller owns the mempool and the UTXO set, the
+crate owns the assembly:
+
+- the candidate transactions, prioritised (`mempool.all_prioritized()`), each
+  with its serialized size
+- the **active** `Parameters` — `stateContext.currentParameters` in JVM terms,
+  not `boundary_params`, which is the epoch-boundary *proposal* and is a
+  different input
+- **ancestor headers**, newest first, for the upcoming-block `ErgoStateContext`
+- a UTXO lookup, for validating each candidate against accumulated state
+
+⚠ **The ancestor headers are not optional padding.** Selection validates each
+transaction against a context built by `build_state_context(stub,
+preceding_headers, parameters)`. Built from the parent alone that context
+exposes a **one-header** `CONTEXT.headers` window, where block validation
+exposes up to ten. A script reading `headers[5]` would then fail *during
+selection* and the transaction would be evicted from the mempool as invalid —
+a valid transaction destroyed by a selection-only artefact. Pass
+`chain.headers_from(parent.height - 9, 10)` reversed, minus the parent; the
+parent is prepended internally.
+
+`generate_candidate` returns `GeneratedCandidate { block, work, invalid_txs }`.
+⚠ **`invalid_txs` MUST be routed to the mempool for eviction** or Step 3.6 is
+silently lost — the crate identifies unusable transactions and has no way to
+remove them itself.
 
 ### Overview
 
@@ -488,17 +593,83 @@ protocol limits.
 
 3. Get prioritized transactions from mempool: `mempool.all_prioritized()`.
 
+`select_transactions` implements this sequence and is bounded by both limits.
+See "Ownership" above for why it spent v0.8.0 development with no caller.
+
 4. For each candidate transaction (in priority order):
-   a. Check cumulative cost: if adding this tx exceeds `max_block_cost`,
-      skip.
-   b. Check cumulative size: if adding this tx exceeds `max_block_size`,
-      skip.
-   c. Validate the transaction against the "accumulated state" — the UTXO
+   a. Check cumulative size: if adding this tx exceeds `max_block_size`,
+      skip. Size is known from the serialized bytes without validating.
+   b. Validate the transaction against the "accumulated state" — the UTXO
       set augmented with outputs from the emission tx and already-selected
       transactions. Use `validate_single_transaction()` with the upcoming
-      state context.
-   d. If validation fails: record tx ID for mempool elimination, skip.
-   e. If valid: add to selected set, accumulate cost and size.
+      state context. **It returns the transaction's cost** — that return
+      value is the only source of the number step (d) needs.
+   c. If validation fails: record tx ID for mempool elimination, skip.
+   d. Check cumulative cost: if `accumulated_cost + tx_cost` would exceed
+      `max_block_cost`, skip **this** transaction — do not stop the scan, a
+      later cheaper transaction may still fit.
+   e. Otherwise add to selected set and accumulate both cost and size.
+
+   ⚠ **The cost check cannot precede validation**, and an earlier draft of
+   this list had it first. A transaction's cost is produced *by*
+   `validate_single_transaction`; there is nothing to check against before
+   that call returns.
+
+   ⚠ **The size bound is over the serialized SECTION, not the sum of
+   transaction sizes.** Validators enforce `max_block_size` against the
+   BlockTransactions section, which is
+   `[header_id: 32B][ver_or_count: VLQ][tx_count: VLQ if ver>1][txs…]` —
+   **37 bytes** for a current-version block under 128 transactions, 33 for v1.
+
+   The middle field is not a version byte. The JVM writes
+   `putUInt(MaxTransactionsInBlock + blockVersion)`, i.e. a VLQ of ~10,000,00X,
+   which is **4 bytes**, and the sentinel is what tells a parser this is a
+   versioned section rather than a v1 one whose first field is the transaction
+   count. So the overhead is `32 + 4 + vlq_len(tx_count)`, and a "1-byte
+   version" reading of the layout undercounts by three. A candidate landing within that margin
+   of the limit is over it by the rule that actually decides validity.
+
+   The JVM generator sums transaction sizes and carries the same undercount;
+   we do not copy it. **This is not a safety margin** — the overhead is
+   deterministic and computable, so counting it is accuracy, not headroom, and
+   the no-`safeGap` decision above is untouched.
+
+   ⚠ **An UNRESOLVABLE input is skipped, not evicted — and that applies to
+   data inputs too.** A box that cannot be resolved is not evidence the
+   transaction is invalid; it may be a reorg race, a fastsync gap, or the
+   at-tip storage swap window, and the box may resolve on the next rebuild 15
+   seconds later. Evicting there removes a valid transaction from the mempool
+   for the invalidation TTL.
+
+   This must hold for **both** input kinds. Resolving data inputs with a
+   filter that silently drops misses produces a short `data_boxes`, which
+   `TransactionContext::new` rejects deterministically as
+   `DataInputBoxNotFound` — so the transaction is reported *invalid* rather
+   than *skipped*, and the caller evicts it. The truncation is caught, so
+   nothing is validated against a mismatched context; the damage is the wrong
+   verdict, not a wrong evaluation.
+
+   ⚠ **A double-spend loser is skipped, not evicted.** Two mempool
+   transactions spending the same box both validate in isolation — validation
+   sees one transaction at a time and the box is unspent on chain — so
+   selection must reject the second against the accumulated block, before
+   script evaluation (the JVM's ordering, to save time). The JVM *evicts* the
+   loser; we skip it and leave it in the pool, because conflict resolution is
+   the mempool's job and a candidate is a poor place to adjudicate it. The
+   transaction may well be the winner next block.
+
+   ⚠ **Bound at `accumulated + tx_cost <= max_block_cost`, with NO safety
+   margin.** The JVM subtracts a `safeGap` first — 0 below a 1M limit,
+   150,000 below 5M, 500,000 above (`CandidateGenerator.scala:585`) —
+   because, in its own words, "different interpreter version can estimate
+   cost differently due to bugs in AOT costing". That guards against *its
+   own* historical costing divergence. Ours were closed and are graded by
+   SANTA, so we bound exactly, and the comparator matches our validator's:
+   `validation/src/tx_validation.rs` rejects on `total > max_cost`, and the
+   JVM's own validation accepts on `maxCost >= startCost` — the same
+   semantics. **Do not reintroduce a gap by citing the JVM generator**; its
+   strict `<` at `CandidateGenerator.scala:831` is generator conservatism,
+   not a consensus rule.
 
 5. Stop when limits are reached or all mempool transactions are checked.
 
@@ -508,6 +679,49 @@ protocol limits.
 transaction and fee transaction (zero-fee). This is valid.
 
 ### Step 4: Fee Transaction
+
+⚠ **Cap aggregated fee tokens by serialized BOX SIZE, not by token count.**
+
+`MaxAssetsPerBox` (255) is **not** the binding limit and capping there does not
+collect the fees. The consensus rule is `txBoxSize` —
+`out.bytes.length <= MaxBoxSize` (4096), `ErgoTransaction.scala`. Measured at
+`reward_delay = 720`: a miner reward box holds **121** minimal tokens at
+**4087 bytes**; 122 is over. A 255-token box is **8509** bytes and can never
+validate, so a count cap only moves the failure from "box will not build" to
+"box will not validate": the block still ships collecting **zero** fees.
+
+⚠ **Measure `out.bytes`, not the candidate.** `txBoxSize` applies to the
+serialized `ErgoBox`, which carries 32 bytes of transaction id plus the output
+index on top of the `ErgoBoxCandidate` body — 33 bytes that an
+estimate-from-the-candidate misses. Earlier drafts of this section said 122 and
+8476 for exactly that reason. Any implementation must grow the real box and
+measure it rather than assuming a per-token width.
+
+The JVM caps by the same wrong constant — `flatMap(_.additionalTokens).take(MaxAssetsPerBox)`,
+unsorted — and loses the same fees. **We diverge deliberately.** Which fee
+boxes a miner collects is miner policy, not consensus: the rule constrains the
+box it produces, not the choice of what to put in it, and uncollected fee boxes
+simply remain spendable later. So capping by size is legal, strictly better for
+the miner, and not a parity break in any sense that matters.
+
+⚠ **The dust rule cannot bind here, and a guard for it would only misfire.**
+`value >= bytes * minValuePerByte` is already satisfied by construction: every
+fee box collected has cleared that rule while carrying the same tokens under
+the *larger* fee-proposition tree (105 bytes against the reward script's 54),
+values add across the collected boxes while the box overhead is paid once, and
+duplicate token ids collapse to a single entry. The reward box is strictly
+cheaper per byte than the boxes that fed it. A guard would also have to
+hardcode `minValuePerByte` rather than read the block's voted value, which
+`build_fee_tx` is not given — so it could only ever fire wrongly and burn
+tokens that would have validated. Recorded because it looks like an obvious
+second check to add.
+
+⚠ **The surviving tokens must be selected deterministically**, in a stable
+traversal order — first-seen across the fee boxes, never hash-map iteration
+order. The fee box's bytes determine its box id, which determines the
+transaction id, which feeds the transactions root the miner hashes. A
+seed-dependent order makes two runs over identical input produce different
+work. This bit once, via `HashMap` aggregation.
 
 Collect fees from all selected transactions and create a single fee output
 for the miner.
@@ -654,7 +868,35 @@ Convert the candidate into the data miners need.
 
 3. **Hash:** `msg = Blake2b256(serialized_header_without_pow)`.
 
-4. **Target:** `b = decode_compact_bits(candidate.n_bits)`.
+4. **Target:** `b = enr_chain::pow_target(candidate.n_bits)`.
+
+   ⚠ **Not `decode_compact_bits(candidate.n_bits)` — that is the difficulty.**
+   The target is `q / difficulty` where `q` is the secp256k1 group order, and
+   `pow_target` in `facts/chain.md` § "Phase 2" is the single definition of it.
+   This step said `decode_compact_bits` and the implementation faithfully
+   matched it, so the serve path advertised a target tens of orders of
+   magnitude harder than the one `check_pow` actually enforces. Zero shares
+   submitted, at any hashrate.
+
+   ⚠ **This is not a v0.8.0 regression. It dates to `5b65e49`, the commit that
+   completed this crate, and is present in every tagged release from `v0.1.0`
+   through `v0.7.11` — 42 of them.** External mining has never worked in a
+   released build of this node. It was caught on the `release/v0.8.0` branch,
+   before that tag existed, only because an operator pointed a real GPU at it.
+
+   Nothing that came before could have caught it. "Verified at runtime against
+   mainnet tip" meant candidate *assembly* was correct — well-formed, JVM-shaped,
+   byte-identical `msg`. Even the two earlier JVM-compat serve fixes (`b` as a
+   bare number, `proof` omitted when empty) were about making a real miner
+   **parse** the candidate; once it parsed, it mined against an impossible bound
+   and the only symptom was silence. **A miner that receives, parses and accepts
+   your candidate and then reports nothing is not idle — check `b`.**
+
+   The two numbers are not close enough to be confused at a glance: at testnet
+   height 485,897 the difficulty was `3912040448` (10 digits) and the target
+   `29598898778389163379010897437604384363675568080188445020547283242588`
+   (68 digits). Anything under ~20 digits appearing in `b` is a bug, not a
+   low-difficulty epoch.
 
 5. **Assemble WorkMessage:**
    ```rust
@@ -726,7 +968,12 @@ The candidate is cached and served to multiple miner polls:
 
 5. **Verify PoW:** `AutolykosPowScheme::validate(header)`.
    - Compute `hit = pow_hit(header)` using the Autolykos v2 algorithm
-   - Verify `hit < target` where `target = decode_compact_bits(n_bits)`
+   - Verify `hit < target` where `target = enr_chain::pow_target(n_bits)`,
+     i.e. `q / decode_compact_bits(n_bits)` — the same value served as
+     `WorkMessage.b`. Serving one number and validating against another is
+     precisely the defect fixed in v0.8.0 (present since v0.1.0 — see
+     § "Candidate Assembly" step 4); these two must not be allowed to drift
+     apart again.
    - On failure (all candidates tried): return 400 "invalid PoW solution"
 
 6. **Assemble full block:**
@@ -1029,14 +1276,46 @@ return 503 with `"reason": "mining not configured"`.
     voting bytes are included. Epoch boundary produces parameter updates.
 
 12. **JVM compatibility:** Generate a candidate from the same chain state
-    as a JVM node. Compare `WorkMessage.msg` byte-for-byte. This is the
-    ultimate correctness test — if `msg` matches, the header serialization
-    is correct.
+    as a JVM node. Compare `WorkMessage.msg` byte-for-byte — if `msg`
+    matches, the header serialization is correct.
 
-13. **Digest mode rejection:** Start node in digest mode, verify
+    ⚠ **`msg` matching proves header serialization and nothing else.** This
+    item claimed to be "the ultimate correctness test" and it is not: a
+    candidate can have a byte-perfect `msg` and still be unmineable, which is
+    exactly what shipped in every release from v0.1.0 to v0.7.11. Compare
+    **every** served field against the JVM's, `b` included.
+
+13. **Target vector (regression):** Assert the served `b` against a fixed
+    known-good pair captured from a Scala node, not against our own formula —
+    a test that recomputes `pow_target` the way the implementation does will
+    pass on any consistent-but-wrong definition.
+
+    ```
+    n_bits     83945773            (0x0500e92d)
+    difficulty 3912040448
+    b          29598898778389163379010897437604384363675568080188445020547283242588
+    ```
+
+    Captured at testnet height 485,897. The `difficulty` and `b` values are
+    observed — `b` was cross-checked digit for digit against a Scala node
+    serving the same height, remainder `1309294913`. **`n_bits` is derived**,
+    by canonical compact-bits encoding of the observed difficulty, and was not
+    read off the wire. So assert the round-trip
+    `decode_compact_bits(83945773) == 3912040448` **first**: if the derivation
+    is wrong, that fails loudly instead of the target assertion quietly
+    testing some other difficulty. The pre-fix code served `3912040448` as
+    `b`.
+
+    The three pre-existing tests over `b` asserted that it was non-empty
+    (`mine_blocks.rs`), stable across polls (`candidate_generator.rs`), and
+    emitted as a bare JSON number rather than a quoted string (`types.rs`).
+    All three passed throughout. **A field can be present, consistent and
+    well-typed while being the wrong quantity** — assert the value.
+
+14. **Digest mode rejection:** Start node in digest mode, verify
     `/mining/candidate` returns 503.
 
-14. **No miner PK:** Start with empty `miner_pk` config, verify 503.
+15. **No miner PK:** Start with empty `miner_pk` config, verify 503.
 
-15. **Prover rollback:** After `proofs_for_transactions()`, verify the
+16. **Prover rollback:** After `proofs_for_transactions()`, verify the
     validator's prover digest is identical to before the call.

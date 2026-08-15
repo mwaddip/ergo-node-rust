@@ -1,6 +1,6 @@
 [package]
 name = "ergo-mining"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "Block candidate assembly and PoW solution validation for external miners"
@@ -10,6 +10,12 @@ ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922"
 ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
 ergo-nipopow = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
 ergo-merkle-tree = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
+# pow_target(n_bits) — the single sanctioned definition of the Autolykos
+# mining target served as WorkMessage.b. This crate re-derived it from
+# decode_compact_bits until v0.8.0 and stopped one division short, which is
+# how it came to serve the difficulty. No cycle: chain/ has no in-repo path
+# dependencies. BigInt is re-exported from the crate root.
+enr-chain = { path = "../chain" }
 ergo-validation = { path = "../validation" }
 sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
 blake2 = "0.10"

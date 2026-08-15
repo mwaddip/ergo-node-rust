@@ -2,11 +2,11 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use reqwest::Client;
 
 use crate::types::IngestResponse;
-use crate::wire::{Modifier, encode_ingest_body};
+use crate::wire::{encode_ingest_body, Modifier};
 
 /// Ingest client targeting the local node.
 pub struct IngestClient {

@@ -4,9 +4,18 @@ use ergo_mempool::stats::FeeStats;
 fn empty_stats_returns_none() {
     let stats = FeeStats::new(100);
 
-    assert!(stats.histogram(5).is_empty(), "empty stats should produce empty histogram");
-    assert!(stats.expected_wait(1000).is_none(), "empty stats should return None for expected_wait");
-    assert!(stats.recommended_fee(1000).is_none(), "empty stats should return None for recommended_fee");
+    assert!(
+        stats.histogram(5).is_empty(),
+        "empty stats should produce empty histogram"
+    );
+    assert!(
+        stats.expected_wait(1000).is_none(),
+        "empty stats should return None for expected_wait"
+    );
+    assert!(
+        stats.recommended_fee(1000).is_none(),
+        "empty stats should return None for recommended_fee"
+    );
 }
 
 #[test]
@@ -21,16 +30,25 @@ fn record_and_histogram() {
     }
 
     let buckets = stats.histogram(3);
-    assert!(!buckets.is_empty(), "histogram should not be empty after recording data");
+    assert!(
+        !buckets.is_empty(),
+        "histogram should not be empty after recording data"
+    );
 
     // Total entries across all buckets should equal 10
     let total: usize = buckets.iter().map(|b| b.count).sum();
-    assert_eq!(total, 10, "total bucket counts should equal number of recorded confirmations");
+    assert_eq!(
+        total, 10,
+        "total bucket counts should equal number of recorded confirmations"
+    );
 
     // Buckets should be non-overlapping and cover the fee range
     for b in &buckets {
         assert!(b.count > 0, "empty buckets should be filtered out");
-        assert!(b.min_fee < b.max_fee, "bucket min_fee should be less than max_fee");
+        assert!(
+            b.min_fee < b.max_fee,
+            "bucket min_fee should be less than max_fee"
+        );
         assert!(b.avg_wait_ms > 0, "avg_wait should be positive");
     }
 }
@@ -45,7 +63,11 @@ fn histogram_single_fee_value() {
     }
 
     let buckets = stats.histogram(3);
-    assert_eq!(buckets.len(), 1, "single fee value produces a single bucket");
+    assert_eq!(
+        buckets.len(),
+        1,
+        "single fee value produces a single bucket"
+    );
     assert_eq!(buckets[0].count, 5);
     assert_eq!(buckets[0].avg_wait_ms, 3000);
 }
@@ -56,7 +78,10 @@ fn histogram_zero_buckets() {
     stats.record_confirmation(1000, 3000);
 
     let buckets = stats.histogram(0);
-    assert!(buckets.is_empty(), "zero buckets should produce empty result");
+    assert!(
+        buckets.is_empty(),
+        "zero buckets should produce empty result"
+    );
 }
 
 #[test]
@@ -72,7 +97,10 @@ fn expected_wait() {
     assert_eq!(wait, 1000, "exact fee match should return exact wait time");
 
     let wait_low = stats.expected_wait(1000).unwrap();
-    assert_eq!(wait_low, 5000, "exact low fee match should return high wait");
+    assert_eq!(
+        wait_low, 5000,
+        "exact low fee match should return high wait"
+    );
 
     // Query for a fee between the two — should find closest
     let wait_mid = stats.expected_wait(3000).unwrap();
@@ -98,15 +126,18 @@ fn recommended_fee() {
     let mut stats = FeeStats::new(100);
 
     stats.record_confirmation(1000, 10000); // low fee, 10s wait
-    stats.record_confirmation(3000, 5000);  // mid fee, 5s wait
-    stats.record_confirmation(5000, 2000);  // high fee, 2s wait
-    stats.record_confirmation(8000, 500);   // very high fee, 0.5s wait
+    stats.record_confirmation(3000, 5000); // mid fee, 5s wait
+    stats.record_confirmation(5000, 2000); // high fee, 2s wait
+    stats.record_confirmation(8000, 500); // very high fee, 0.5s wait
 
     // Target 6000ms — fees 1000 (10000ms) and 3000 (5000ms) and 5000 (2000ms) and 8000 (500ms)
     // Fees with wait <= 6000: 3000 (5000ms), 5000 (2000ms), 8000 (500ms)
     // Lowest qualifying fee: 3000
     let fee = stats.recommended_fee(6000).unwrap();
-    assert_eq!(fee, 3000, "should recommend the lowest fee that achieved target wait");
+    assert_eq!(
+        fee, 3000,
+        "should recommend the lowest fee that achieved target wait"
+    );
 
     // Target 100ms — only fee 8000 has wait <= 100... actually 500 > 100
     // None qualify

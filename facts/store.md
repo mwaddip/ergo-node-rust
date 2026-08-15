@@ -570,6 +570,61 @@ overwrites BEST_CHAIN at each height. This is the single write path
 for main-chain headers and keeps the invariant "main-chain is
 authoritative for its height slot" without a second atomic-swap API.
 
+## Page cache (added 2026-08-12)
+
+### `RedbModifierStore::new(path: &Path, cache_bytes: usize) -> Result<Self, StoreError>`
+
+`cache_bytes` sizes the redb page cache via `Builder::set_cache_size`.
+
+This constructor previously called bare `Database::create`, which inherits
+redb's default of **1 GiB per handle** (`Builder::new()` ends with
+`set_cache_size(1024*1024*1024)` — `patches/redb/src/db.rs:1143`). That
+gigabyte was never chosen by anyone, was invisible to `/debug/memory`, and
+heap profiling during the 2026-08-11 genesis resync put **89.3%** of
+header-phase growth under `put_batch` →
+`redb::tree_store::btree::BtreeMut::insert`.
+
+`cache_bytes` is a plain byte count, deliberately **not** `state/`'s
+`CacheSize` enum: `store/` does not depend on `state/` and must not acquire
+that dependency to share a type. The caller computes the split.
+
+### `RedbModifierStore::cache_bytes_used(&self) -> u64`
+
+`Database::cache_stats().used_bytes()`.
+
+### `RedbModifierStore::cache_evictions(&self) -> u64`
+
+`Database::cache_stats().evictions()`. A rising count is the signal that the
+cache is undersized; without it, an undersized cache is indistinguishable from
+a comfortable one.
+
+**Evictions are the only accessor that responds to `cache_bytes` (measured
+2026-08-12).** `used_bytes()` reports the live working set, not the configured
+ceiling: under an identical 2000 x 256 B load it returned 798,720 bytes at both
+an 8 MiB and a 1 GiB cache, with zero evictions in each. Any `used <= N`
+assertion loose enough to pass for a correctly-configured store therefore also
+passes for one that ignores `cache_bytes` completely.
+
+Consequences:
+
+- A test that the budget is in force must drive enough data to exceed the small
+  cache and assert `evictions > 0`, with a large-cache control asserting zero.
+- **`storeCacheBytes` on `/debug/memory` is not evidence that the configured
+  budget is being applied.** It answers "how much is cached right now", not
+  "is the ceiling what I set". `storeCacheEvictions` is the field to read for
+  the latter.
+
+Both require redb's `cache_metrics` feature, declared in this crate's
+`Cargo.toml` as well as the workspace root — a root-only declaration is not
+unified into a standalone `cargo test -p enr-store` build, and the accessors
+would silently return 0.
+
+**`cache_bytes` is not one cache.** `set_cache_size(n)` splits it 90% read /
+10% write (`patches/redb/src/db.rs:1177`), and `used_bytes()` reports the sum.
+The store has no in-place resize path, so both halves are fixed at `new()` —
+unlike `state/`, where an at-tip resize moves only the read half. See
+`facts/state.md` § "An in-place resize moves only 90% of the budget".
+
 ## Open-time cost
 
 `RedbModifierStore::new` must run in single-digit seconds even on a

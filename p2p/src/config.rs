@@ -153,15 +153,23 @@ pub struct IdentityConfig {
 }
 
 impl Config {
-    /// Load config from a TOML file.
+    /// Parse a config from TOML text **already in memory**.
+    ///
+    /// The unit of configuration is a document, not a file. A layered
+    /// `/etc/ergo-node/conf.d/` merges several files into one effective
+    /// config that exists nowhere on disk; this is the entry point that can
+    /// express it. Do not serialise a merged document to a temp file to reach
+    /// [`Config::load`] — that is the adapter the Interface Integrity rule
+    /// forbids.
     ///
     /// # Contract
-    /// - **Precondition**: `path` points to a readable TOML file.
-    /// - **Postcondition**: Returns a valid `Config` with at least one listener
-    ///   and at least one seed peer, or an error.
-    pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
+    /// - **Precondition**: none. The caller owns where the text came from.
+    /// - **Postcondition**: identical to what [`Config::load`] produces for a
+    ///   file with the same contents — there is exactly one parse, and this is
+    ///   it. Returns a valid `Config` with at least one listener and at least
+    ///   one seed peer, or an error.
+    pub fn from_toml_str(toml: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let config: Config = toml::from_str(toml)?;
 
         if config.listen.ipv4.is_none() && config.listen.ipv6.is_none() {
             return Err("At least one listener (ipv4 or ipv6) must be configured".into());
@@ -176,6 +184,20 @@ impl Config {
         }
 
         Ok(config)
+    }
+
+    /// Load config from a TOML file.
+    ///
+    /// Defined as [`Config::from_toml_str`] over the file's contents, so the
+    /// two entry points cannot drift.
+    ///
+    /// # Contract
+    /// - **Precondition**: `path` points to a readable TOML file.
+    /// - **Postcondition**: Returns a valid `Config` with at least one listener
+    ///   and at least one seed peer, or an error.
+    pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let content = std::fs::read_to_string(path)?;
+        Self::from_toml_str(&content)
     }
 
     /// Returns network settings, using defaults if the `[network]` section is absent.
@@ -246,5 +268,128 @@ protocol_version = "5.0.25"
         let config: Config = toml::from_str(&toml_str).unwrap();
         assert!(config.upnp.enabled);
         assert_eq!(config.upnp.discover_timeout_secs, 5);
+    }
+
+    /// Exercises every section, so the equivalence check below compares more
+    /// than the handful of fields validation happens to touch.
+    const FULL_TOML: &str = r#"
+[proxy]
+network = "mainnet"
+
+[listen.ipv4]
+address = "0.0.0.0:9030"
+mode = "full"
+max_inbound = 30
+
+[listen.ipv6]
+address = "[::]:9030"
+mode = "full"
+max_inbound = 30
+
+[outbound]
+min_peers = 4
+max_peers = 20
+seed_peers = ["213.239.193.208:9030", "[2a01:4f8:1c17:6bf::2]:9030"]
+
+[identity]
+agent_name = "ergo-node-rust"
+peer_name = "equivalence-fixture"
+protocol_version = "5.0.25"
+
+[network]
+get_peers_interval_secs = 90
+desired_inv_objects = 200
+filter_bogus_addresses = false
+
+[upnp]
+enabled = true
+discover_timeout_secs = 7
+"#;
+
+    #[test]
+    fn from_toml_str_parses_minimal_config() {
+        let config = Config::from_toml_str(MINIMAL_TOML).expect("minimal config is valid");
+
+        assert_eq!(config.proxy.network, Network::Testnet);
+        assert_eq!(config.outbound.min_peers, 1);
+        assert_eq!(config.outbound.max_peers, 5);
+        assert_eq!(config.outbound.seed_peers.len(), 1);
+        assert_eq!(config.identity.agent_name, "ergo-test");
+        assert_eq!(config.identity.protocol_version, "5.0.25");
+        assert!(config.listen.ipv4.is_some());
+        assert!(config.listen.ipv6.is_none());
+        // No [network] section: absent, with `network_settings()` filling defaults.
+        assert!(config.network.is_none());
+        assert!(!config.upnp.enabled);
+    }
+
+    /// The property this whole split exists to protect: identical text must
+    /// produce an identical `Config` whether it arrived via a path or in
+    /// memory. `Config` derives `Debug` but not `PartialEq`; the derived
+    /// `Debug` rendering covers every field of every nested struct, so
+    /// comparing it is a full structural comparison — not merely the three
+    /// fields validation happens to read — without adding a trait the crate
+    /// does not otherwise need.
+    #[test]
+    fn from_toml_str_matches_load_for_identical_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ergo.toml");
+        std::fs::write(&path, FULL_TOML).unwrap();
+
+        let from_file = Config::load(path.to_str().unwrap()).expect("fixture loads from disk");
+        let from_memory = Config::from_toml_str(FULL_TOML).expect("fixture parses in memory");
+
+        assert_eq!(format!("{:?}", from_file), format!("{:?}", from_memory));
+    }
+
+    /// Equivalence on the error side too: a `from_toml_str` that accepted a
+    /// document `load` rejects would hand the caller a config the node was
+    /// never meant to run with.
+    #[test]
+    fn from_toml_str_enforces_the_same_validation_as_load() {
+        let no_listener = MINIMAL_TOML.replace("[listen.ipv4]", "[listen.unused]");
+        let no_seeds = MINIMAL_TOML.replace(
+            r#"seed_peers = ["213.239.193.208:9030"]"#,
+            "seed_peers = []",
+        );
+        let inverted_peers = MINIMAL_TOML.replace("min_peers = 1", "min_peers = 9");
+
+        // The expected message is asserted too — without it the test would
+        // still pass if both entry points failed in the *parser* instead,
+        // which is not the equivalence being claimed.
+        let cases = [
+            (&no_listener, "At least one listener"),
+            (&no_seeds, "At least one seed peer"),
+            (&inverted_peers, "min_peers must be <= max_peers"),
+        ];
+
+        for (invalid, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ergo.toml");
+            std::fs::write(&path, invalid).unwrap();
+
+            let file_err = Config::load(path.to_str().unwrap())
+                .expect_err("load must reject this document")
+                .to_string();
+            let memory_err = Config::from_toml_str(invalid)
+                .expect_err("from_toml_str must reject this document")
+                .to_string();
+
+            assert!(
+                memory_err.contains(expected),
+                "expected validation error containing {expected:?}, got {memory_err:?}"
+            );
+            assert_eq!(file_err, memory_err);
+        }
+    }
+
+    #[test]
+    fn from_toml_str_rejects_malformed_toml() {
+        // Unterminated table header — never a valid document.
+        assert!(Config::from_toml_str("[proxy\nnetwork = \"mainnet\"").is_err());
+        // Well-formed TOML, but not a Config.
+        assert!(Config::from_toml_str("hello = \"world\"").is_err());
+        // Empty input.
+        assert!(Config::from_toml_str("").is_err());
     }
 }

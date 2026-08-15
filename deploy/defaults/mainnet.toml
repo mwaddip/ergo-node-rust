@@ -1,0 +1,54 @@
+# Ergo Node Rust — mainnet defaults
+#
+# PACKAGE-OWNED. Installed to /usr/share/ergo-node-rust/defaults/mainnet.toml
+# and copied by postinst to /etc/ergo-node/conf.d/00-defaults.toml.
+#
+# ⚠ Do not edit either copy. Both are replaced on every package upgrade, which
+# is deliberate — it is what lets a corrected seed-peer list actually reach
+# existing installs instead of being frozen in a conffile forever.
+#
+# To change any of this, put your value in /etc/ergo-node/conf.d/99-local.toml.
+# Files in conf.d/ are merged in lexical order, so 99- wins over 00-. See
+# ergo-node-rust.conf(5) and facts/config.md.
+#
+# This file holds only what is genuinely network-dependent, plus the peer
+# counts the package has an opinion about. It deliberately does NOT set:
+#
+#   api_address  — the node already defaults it per network
+#                  (0.0.0.0:9053 mainnet, 0.0.0.0:9052 testnet)
+#   data_dir     — an install choice, written to 50-debconf.toml
+#   cache_mb and the other memory knobs — derived at runtime from the
+#                  memory budget. Writing a number here would freeze it, and
+#                  the floor it is derived against grows with the chain.
+
+[proxy]
+network = "mainnet"
+
+[listen.ipv6]
+address = "[::]:9030"
+mode = "full"
+max_inbound = 20
+
+[outbound]
+min_peers = 3
+max_peers = 10
+# To add your own without losing these, use `seed_peers_add` in
+# 99-local.toml — a bare `seed_peers` there replaces the list entirely.
+seed_peers = [
+    "213.239.193.208:9030",
+    "159.65.11.55:9030",
+    "165.227.26.175:9030",
+    "159.89.116.15:9030",
+    "136.244.110.145:9030",
+    "94.130.108.35:9030",
+    "221.165.214.185:9030",
+    "217.182.197.196:9030",
+    "173.212.220.9:9030",
+    "213.152.106.56:9030",
+    "[2001:41d0:700:6662::]:29031",
+]
+
+[identity]
+agent_name = "ergo-node-rust"
+peer_name = "ergo-node-rust"
+protocol_version = "6.0.3"

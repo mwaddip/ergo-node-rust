@@ -424,7 +424,10 @@ mod tests {
         }
 
         fn add_compare(&self, this: Vec<u8>, than: Vec<u8>, result: CompareResult) {
-            self.compare_results.lock().unwrap().push((this, than, result));
+            self.compare_results
+                .lock()
+                .unwrap()
+                .push((this, than, result));
         }
 
         fn installed(&self) -> Option<(Header, Vec<Header>)> {
@@ -433,10 +436,18 @@ mod tests {
     }
 
     impl crate::traits::SyncChain for MockChain {
-        async fn chain_height(&self) -> u32 { 0 }
-        async fn build_sync_info(&self) -> Vec<u8> { vec![] }
-        async fn header_at(&self, _h: u32) -> Option<Header> { None }
-        async fn header_state_root(&self, _h: u32) -> Option<[u8; 33]> { None }
+        async fn chain_height(&self) -> u32 {
+            0
+        }
+        async fn build_sync_info(&self) -> Vec<u8> {
+            vec![]
+        }
+        async fn header_at(&self, _h: u32) -> Option<Header> {
+            None
+        }
+        async fn header_state_root(&self, _h: u32) -> Option<[u8; 33]> {
+            None
+        }
         fn parse_sync_info(&self, _b: &[u8]) -> Result<enr_chain::SyncInfo, ChainError> {
             unimplemented!()
         }
@@ -451,16 +462,25 @@ mod tests {
         async fn active_parameters(&self) -> ergo_validation::Parameters {
             unimplemented!()
         }
-        async fn is_epoch_boundary(&self, _h: u32) -> bool { false }
+        async fn is_epoch_boundary(&self, _h: u32) -> bool {
+            false
+        }
         async fn compute_expected_parameters(
-            &self, _h: u32, _pu: &[u8],
+            &self,
+            _h: u32,
+            _pu: &[u8],
         ) -> Result<ergo_validation::Parameters, ChainError> {
             unimplemented!()
         }
         async fn apply_epoch_boundary_parameters(
-            &self, _p: ergo_validation::Parameters, _pu: Vec<u8>,
-        ) {}
-        async fn active_proposed_update_bytes(&self) -> Vec<u8> { Vec::new() }
+            &self,
+            _p: ergo_validation::Parameters,
+            _pu: Vec<u8>,
+        ) {
+        }
+        async fn active_proposed_update_bytes(&self) -> Vec<u8> {
+            Vec::new()
+        }
 
         async fn verify_nipopow_envelope(
             &self,
@@ -475,7 +495,9 @@ mod tests {
                     };
                 }
             }
-            Err(ChainError::Nipopow("unexpected envelope body in mock".into()))
+            Err(ChainError::Nipopow(
+                "unexpected envelope body in mock".into(),
+            ))
         }
 
         async fn is_better_nipopow(
@@ -544,13 +566,13 @@ mod tests {
         let chain = MockChain::new();
         chain.add_verify(body_a.clone(), VerifyResult::Err("bad proof".into()));
 
-        let mut transport = MockTransport::new(
-            vec![peer_a],
-            vec![proof_event(peer_a, body_a)],
-        );
+        let mut transport = MockTransport::new(vec![peer_a], vec![proof_event(peer_a, body_a)]);
 
         let result = run_light_bootstrap(&mut transport, &chain).await;
-        assert!(matches!(result, Err(LightBootstrapError::AllPeersHostile(_))));
+        assert!(matches!(
+            result,
+            Err(LightBootstrapError::AllPeersHostile(_))
+        ));
         assert!(chain.installed().is_none());
     }
 
@@ -562,10 +584,7 @@ mod tests {
         let chain = MockChain::new();
         chain.add_verify(body_a.clone(), VerifyResult::Ok(headers.clone()));
 
-        let mut transport = MockTransport::new(
-            vec![peer_a],
-            vec![proof_event(peer_a, body_a)],
-        );
+        let mut transport = MockTransport::new(vec![peer_a], vec![proof_event(peer_a, body_a)]);
 
         let result = run_light_bootstrap(&mut transport, &chain).await;
         assert!(result.is_ok());
@@ -588,10 +607,7 @@ mod tests {
 
         let mut transport = MockTransport::new(
             vec![peer_a, peer_b],
-            vec![
-                proof_event(peer_a, body_a),
-                proof_event(peer_b, body_b),
-            ],
+            vec![proof_event(peer_a, body_a), proof_event(peer_b, body_b)],
         );
 
         let result = run_light_bootstrap(&mut transport, &chain).await;
@@ -615,10 +631,7 @@ mod tests {
 
         let mut transport = MockTransport::new(
             vec![peer_a, peer_b],
-            vec![
-                proof_event(peer_a, body_a),
-                proof_event(peer_b, body_b),
-            ],
+            vec![proof_event(peer_a, body_a), proof_event(peer_b, body_b)],
         );
 
         let result = run_light_bootstrap(&mut transport, &chain).await;
@@ -639,14 +652,15 @@ mod tests {
         chain.add_verify(body_a.clone(), VerifyResult::Ok(headers_a));
         chain.add_verify(body_b.clone(), VerifyResult::Ok(headers_b));
         // Comparison fails — should fall back to incumbent (peer A, first valid).
-        chain.add_compare(body_b.clone(), body_a.clone(), CompareResult::Err("parse failed".into()));
+        chain.add_compare(
+            body_b.clone(),
+            body_a.clone(),
+            CompareResult::Err("parse failed".into()),
+        );
 
         let mut transport = MockTransport::new(
             vec![peer_a, peer_b],
-            vec![
-                proof_event(peer_a, body_a),
-                proof_event(peer_b, body_b),
-            ],
+            vec![proof_event(peer_a, body_a), proof_event(peer_b, body_b)],
         );
 
         let result = run_light_bootstrap(&mut transport, &chain).await;
@@ -742,14 +756,14 @@ mod tests {
         let chain = MockChain::new();
         chain.add_verify(body_a.clone(), VerifyResult::Ok(headers));
 
-        let mut transport = MockTransport::new(
-            vec![peer_a],
-            vec![proof_event(peer_a, body_a)],
-        );
+        let mut transport = MockTransport::new(vec![peer_a], vec![proof_event(peer_a, body_a)]);
 
         let result = run_light_bootstrap(&mut transport, &chain).await;
         // Proof with fewer headers than k is treated as hostile.
-        assert!(matches!(result, Err(LightBootstrapError::AllPeersHostile(_))));
+        assert!(matches!(
+            result,
+            Err(LightBootstrapError::AllPeersHostile(_))
+        ));
         assert!(chain.installed().is_none());
     }
 
@@ -761,28 +775,47 @@ mod tests {
         // Chain already has headers — MockChain returns 0, we need a non-zero one.
         struct PopulatedChain;
         impl crate::traits::SyncChain for PopulatedChain {
-            async fn chain_height(&self) -> u32 { 100 }
-            async fn build_sync_info(&self) -> Vec<u8> { vec![] }
-            async fn header_at(&self, _h: u32) -> Option<Header> { None }
-            async fn header_state_root(&self, _h: u32) -> Option<[u8; 33]> { None }
+            async fn chain_height(&self) -> u32 {
+                100
+            }
+            async fn build_sync_info(&self) -> Vec<u8> {
+                vec![]
+            }
+            async fn header_at(&self, _h: u32) -> Option<Header> {
+                None
+            }
+            async fn header_state_root(&self, _h: u32) -> Option<[u8; 33]> {
+                None
+            }
             fn parse_sync_info(&self, _b: &[u8]) -> Result<enr_chain::SyncInfo, ChainError> {
                 unimplemented!()
             }
-            async fn continuation_ids(
-                &self, _ids: &[BlockId], _limit: usize,
-            ) -> Vec<[u8; 32]> {
+            async fn continuation_ids(&self, _ids: &[BlockId], _limit: usize) -> Vec<[u8; 32]> {
                 // Bootstrap-skip test — no SyncInfo traffic.
                 Vec::new()
             }
-            async fn active_parameters(&self) -> ergo_validation::Parameters { unimplemented!() }
-            async fn is_epoch_boundary(&self, _h: u32) -> bool { false }
+            async fn active_parameters(&self) -> ergo_validation::Parameters {
+                unimplemented!()
+            }
+            async fn is_epoch_boundary(&self, _h: u32) -> bool {
+                false
+            }
             async fn compute_expected_parameters(
-                &self, _h: u32, _pu: &[u8],
-            ) -> Result<ergo_validation::Parameters, ChainError> { unimplemented!() }
+                &self,
+                _h: u32,
+                _pu: &[u8],
+            ) -> Result<ergo_validation::Parameters, ChainError> {
+                unimplemented!()
+            }
             async fn apply_epoch_boundary_parameters(
-                &self, _p: ergo_validation::Parameters, _pu: Vec<u8>,
-            ) {}
-            async fn active_proposed_update_bytes(&self) -> Vec<u8> { Vec::new() }
+                &self,
+                _p: ergo_validation::Parameters,
+                _pu: Vec<u8>,
+            ) {
+            }
+            async fn active_proposed_update_bytes(&self) -> Vec<u8> {
+                Vec::new()
+            }
             async fn verify_nipopow_envelope(&self, _b: &[u8]) -> Result<Vec<Header>, ChainError> {
                 unimplemented!()
             }
@@ -790,9 +823,15 @@ mod tests {
                 unimplemented!()
             }
             async fn install_nipopow_suffix(
-                &self, _h: Header, _t: Vec<Header>,
-            ) -> Result<(), ChainError> { unimplemented!() }
-            async fn voting_length(&self) -> u32 { 1024 }
+                &self,
+                _h: Header,
+                _t: Vec<Header>,
+            ) -> Result<(), ChainError> {
+                unimplemented!()
+            }
+            async fn voting_length(&self) -> u32 {
+                1024
+            }
         }
 
         let result = run_light_bootstrap(&mut transport, &PopulatedChain).await;
@@ -807,10 +846,7 @@ mod tests {
         let chain = MockChain::new();
         chain.add_verify(body.clone(), VerifyResult::Ok(headers));
 
-        let mut transport = MockTransport::new(
-            peers.clone(),
-            vec![proof_event(PeerId(1), body)],
-        );
+        let mut transport = MockTransport::new(peers.clone(), vec![proof_event(PeerId(1), body)]);
 
         let _ = run_light_bootstrap(&mut transport, &chain).await;
 

@@ -49,7 +49,8 @@ pub fn build_sync_info(chain: &HeaderChain) -> Vec<u8> {
     }
 
     let tip_height = chain.height();
-    let base_height = chain.header_at(tip_height - (chain.len() as u32 - 1))
+    let base_height = chain
+        .header_at(tip_height - (chain.len() as u32 - 1))
         .map(|h| h.height)
         .unwrap_or(1);
 
@@ -90,7 +91,9 @@ pub fn parse_sync_info(body: &[u8]) -> Result<SyncInfo, ChainError> {
     }
 
     let mut r = Cursor::new(body);
-    let count = r.get_u16().map_err(|e| ChainError::SyncInfo(e.to_string()))?;
+    let count = r
+        .get_u16()
+        .map_err(|e| ChainError::SyncInfo(e.to_string()))?;
 
     if count > 0 {
         parse_v1(&mut r, count)
@@ -118,14 +121,18 @@ fn parse_v1(r: &mut Cursor<&[u8]>, count: u16) -> Result<SyncInfo, ChainError> {
 }
 
 fn parse_v2(r: &mut Cursor<&[u8]>) -> Result<SyncInfo, ChainError> {
-    let mode = r.get_u8().map_err(|e| ChainError::SyncInfo(format!("missing V2 mode byte: {e}")))?;
+    let mode = r
+        .get_u8()
+        .map_err(|e| ChainError::SyncInfo(format!("missing V2 mode byte: {e}")))?;
     if mode != V2_MODE_BYTE {
         return Err(ChainError::SyncInfo(format!(
             "expected V2 mode byte 0xFF, got 0x{mode:02X}"
         )));
     }
 
-    let count = r.get_u8().map_err(|e| ChainError::SyncInfo(format!("missing V2 count: {e}")))?;
+    let count = r
+        .get_u8()
+        .map_err(|e| ChainError::SyncInfo(format!("missing V2 count: {e}")))?;
     if count > MAX_V2_HEADERS {
         return Err(ChainError::SyncInfo(format!(
             "V2 header count {count} exceeds max {MAX_V2_HEADERS}"
@@ -134,9 +141,9 @@ fn parse_v2(r: &mut Cursor<&[u8]>) -> Result<SyncInfo, ChainError> {
 
     let mut headers = Vec::with_capacity(count as usize);
     for i in 0..count {
-        let size = r.get_u16().map_err(|e| {
-            ChainError::SyncInfo(format!("V2 header {i} size: {e}"))
-        })?;
+        let size = r
+            .get_u16()
+            .map_err(|e| ChainError::SyncInfo(format!("V2 header {i} size: {e}")))?;
         if size > MAX_V2_HEADER_SIZE {
             return Err(ChainError::SyncInfo(format!(
                 "V2 header {i} size {size} exceeds max {MAX_V2_HEADER_SIZE}"

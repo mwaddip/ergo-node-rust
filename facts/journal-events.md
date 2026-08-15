@@ -1,6 +1,6 @@
 # Journal Events Contract
 
-Version: 1.3.0
+Version: 2.1.0
 
 Stable contract for parseable events in the node's structured log
 output. Consumers (e.g. the Ergo Node Doctor adapter) write parsers
@@ -20,11 +20,42 @@ are promised stable.
 The node advertises this contract's version in `/info`:
 
 ```json
-{ "journalEventsVersion": "1.0", ... }
+{ "journalEventsVersion": "2.1", ... }
 ```
 
 Consumers refuse to parse on unrecognized major. Additive changes (new
 events, new optional fields) are minor bumps.
+
+### 2.1.0 — memory budget derivation (v0.8.0)
+
+Additive: one new event, `memory_budget_derived`. Minor bump; consumers pinned
+to major 2 are unaffected.
+
+### 2.0.0 — deferred script evaluation removed (v0.8.0)
+
+A major bump, because three **stable** events were removed outright and two
+field domains narrowed. Per the stability rules below, that is exactly what a
+major is for.
+
+| Change | Was |
+|---|---|
+| `deferred_eval_backlog` removed | 1.5, replaced by `catchup_progress` |
+| `deferred_eval_gate_engaged` removed | 1.6 |
+| `eval_frontier_hole` removed | 1.6 |
+| `validation_rollback_failed.path` loses `eval_failure` | now only `reorg` |
+| `validation_stuck.error_kind` loses `script_eval` | replaced by `transaction_invalid` |
+
+The first four describe deferred script evaluation, which no longer exists:
+`apply_state` evaluates before persisting, so there is no queue to report on,
+no dispatch gate to engage, and no verification frontier to fall behind.
+
+⚠ **The stability rules below also require a deprecation release, and this did
+not get one.** The events went in the same release that removed the machinery
+behind them, because emitting a deprecated `eval_frontier_hole` from a node
+with no frontier would mean fabricating the fields. Consumers pinned to major 1
+— the Doctor adapter among them — will refuse to parse a v0.8.0 node until they
+are updated. That is a real cost and it was accepted knowingly rather than
+overlooked.
 
 ## Format conventions
 
@@ -37,11 +68,42 @@ human-readable subscriber. The line carries:
 - Zero or more **fields**: `key=value` pairs appended via tracing's
   named-field syntax. Keys are snake_case ASCII. String-recorded values
   are surrounded by double quotes in the default formatter (e.g.
-  `error_kind="script_eval"`); numeric and `Display`-formatted values
+  `error_kind="missing_key"`); numeric and `Display`-formatted values
   are not. Parsers MUST tolerate optional surrounding quotes on any
   value.
 - Optional **free-text suffix** after the marker, for human
   readability. Parsers MUST tolerate arbitrary suffix content.
+
+Two rules follow from parsers matching on the *prefix*, both learned by
+breaking them on 2026-08-12:
+
+- **No marker may be a prefix of another marker.** A parser keyed on the
+  shorter one matches both events and then fails looking for fields that only
+  the shorter one carries. `"deferred eval backlog at bound …"` began with the
+  whole of `"deferred eval backlog"` and did exactly this; it became
+  `"eval dispatch gate engaged"`. When adding an event, check its marker
+  against every existing one in both directions.
+- **Markers are ASCII.** The free-text suffix may contain anything — an em dash
+  there is fine and several markers have one — but the matched portion must
+  survive being retyped from a report, a terminal, or a grep. The same event
+  shipped with a U+2014 inside its marker while this document specified a
+  hyphen, so the documented literal matched nothing.
+
+One field-level convention, which applies to **every** event that carries it:
+
+- **`state_applied_height` is always `validator.validated_height()`, never
+  `HeaderSync`'s struct field of the same name.** That field is a cache
+  reconciled at sweep *end*; any event emitted mid-sweep reads it frozen at the
+  pre-sweep tip. This is stated once here rather than per entry because it has
+  caught two events before either was retired in 2.0 — `deferred_eval_backlog`,
+  where the stale read would peg `eval_lag` at 0 by saturation and report a
+  healthy node while the queue grew, and `eval_frontier_hole`, reached from the
+  dispatch gate's mid-sweep drain. Both are gone; the trap is not. `catchup_progress`
+  carries the field today and reads it from the validator for exactly this
+  reason. Assume the next event that carries it has the same trap.
+
+A parser consuming these cannot tell a stale value from a fresh one, which is
+why the rule lives in the contract rather than in a comment at each emit site.
 
 Example emit:
 
@@ -240,12 +302,53 @@ phase's `_started`.
 - **Emitted:** when the validated frontier (`validated_height`) fails
   to advance past the same height for `attempts >= 5` consecutive
   sweeps — the next block is failing deterministically. Covers both
-  failure modes: an `apply_state` error (state-DB inconsistency such
-  as `missing_key`) and a deferred script-eval rejection (the
-  evaluator refusing a transaction). `error_kind` names the mode — an
-  `apply_state` error kind, or `script_eval` for an eval-failure
-  stall; `missing_key` is present only for the `apply_state`
-  `missing_key` case. Surfaces the silent retry loop that previously
+  failure modes, though since 2.0 they arrive by one route: an
+  `apply_state` error (state-DB inconsistency such as `missing_key`)
+  and a script rejection, which `apply_state` now returns directly
+  because evaluation happens inside it. `error_kind` names the mode
+  via `classify_apply_state_error`; `missing_key` is present only for
+  the `apply_state` `missing_key` case.
+
+  **`error_kind` domain as of 2.0:** `missing_key` (the AVL tree lacks a key
+  the block spends), `transaction_invalid` (the block was rejected because a
+  transaction in it did not validate — a consensus problem), `other`
+  (everything else). `missing_key` is accompanied by the `missing_key` field;
+  the others are not.
+
+  ⚠ **`missing_key` arrives through two variants, not one, and means
+  different things in each.** The prose is raised once in
+  `ergo_avltree_rust`'s shared `operation.rs`, which both the prover and the
+  verifier use — so it surfaces as `StateOperationFailed` in UTXO mode and as
+  `ProofVerificationFailed` in digest mode. The classifier matches both.
+  In UTXO mode it means the node's own state store lacks the key, which is a
+  local storage problem. In digest mode the node holds no UTXO set at all, so
+  it means the *proof* did not contain the key it needed — closer to a bad
+  block or a bad peer. An adapter that reads `missing_key` as "this node's
+  database is damaged" is right only for a UTXO-mode node, and should consult
+  `stateType` from `/info` before recommending a resync.
+
+  *An earlier draft of this section described a single `String`-carrying
+  variant and called the kind a state-DB problem outright. Both were wrong,
+  and matching only the UTXO arm would have dropped `missing_key` on every
+  digest-mode node — silently, which is the exact failure this rewrite exists
+  to prevent.*
+
+  *`script_eval` is gone and `transaction_invalid` is not a rename of it.*
+  The old value named the deferred eval-failure **path**, which no longer
+  exists. The new one names the **fact** — `ValidationError::TransactionInvalid`
+  — which covers a failed script and equally a failed ERG or token
+  preservation check. That is the distinction the Doctor actually needs: is
+  this node stuck because its state store is damaged, or because it keeps
+  refusing a block the network accepted?
+
+  ⚠ **Classification is on the error variant, not on its Display string.**
+  `classify_apply_state_error` took a `&str` and grepped it for
+  `"does not exist"`, while its caller held the typed `ValidationError` and
+  stringified it one line earlier. That is why the distinction disappeared
+  silently when deferred evaluation was removed — nothing referenced the
+  variant, so nothing broke. It now takes `&ValidationError`. The one place
+  a string is still parsed is inside `missing_key`, where the key really
+  does arrive as prose from the storage layer. Surfaces the silent retry loop that previously
   buried a stuck frontier in INFO-level logs. The Doctor adapter
   treats this as a primary "node stuck" signal. Emitted at most once
   per height; re-emits when the height changes or after real progress
@@ -253,16 +356,65 @@ phase's `_started`.
   `apply_state` path — a deferred eval-failure stall (the loop that
   hammered on a wrongly-rejected script) did not emit it.
 
+#### `memory_budget_derived`
+- **Level:** INFO
+- **Marker:** `"memory budget derived"`
+- **Fields:** `source` (string: `config`|`cgroup`|`meminfo` — where the ceiling
+  came from), `ceiling_mb` (u64), `usable_mb` (u64: ceiling × the fraction that
+  source justifies), `baseline_mb` (u64), `chain_index_mb` (u64),
+  `available_mb` (u64: usable − floor), `cache_mb` (u64),
+  `cache_store_pct` (u64), `store_cache_mb` (u64), `state_cache_mb` (u64),
+  `flush_heap_threshold_mb` (u64), `synced_cache_mb` (u64)
+- **Since:** 2.1
+- **Stability:** stable
+- **Emitted:** once at startup, after the header chain is restored, **only when
+  at least one memory setting was derived**. A node with every memory key set
+  explicitly derives nothing and emits nothing — absence of this event means
+  the operator configured everything, not that derivation failed.
+- **Why it exists:** the node sizes its own caches from its cgroup limit rather
+  than from config. Auto-sizing's failure mode is not being wrong, it is being
+  wrong **invisibly** — without this line an operator asking "why is my cache
+  this size" has nothing to point at. Every input and every output is present
+  so the arithmetic can be checked from the log alone.
+
+  A second INFO line follows when `source` is `meminfo`, noting that setting
+  `MemoryMax` on the unit or `memory_budget_mb` in `ergo.toml` would let the
+  node use more. That path takes a deliberately conservative share, because
+  nothing said the node owns the machine.
+
+#### `catchup_progress`
+- **Level:** INFO
+- **Marker:** `"catch-up progress"`
+- **Fields:** `state_applied_height` (u64: the **applied tip**, read from the
+  validator rather than from sync's struct field), `jemalloc_allocated`
+  (u64, **omitted entirely** when no heap probe is wired — an absent field
+  rather than a rendered `None`, same convention as `validation_stuck`'s
+  optional `missing_key`)
+- **Since:** 2.0 (replaces `deferred_eval_backlog`, 1.5–1.6)
+- **Stability:** stable
+- **Emitted:** at most once per 5 s during catch-up, from the sweep loop. Not
+  emitted at tip.
+- **Why it exists:** catch-up is otherwise silent between flushes, and an
+  operator watching a long sync needs to know it is moving. The applied tip is
+  read from the validator because sync's own field lags it within a sweep.
+
+*Replaced `deferred_eval_backlog` in 2.0. That event carried four more fields
+— `evals_in_flight`, `script_verified_height`, `eval_lag`, and
+`eval_bytes_in_flight` — all describing the deferred-eval queue, which no
+longer exists. Anything quoting `eval_lag` from a v0.7.x journal is quoting a
+number that was frozen by the reorder-buffer bug until 2026-08-12 anyway; see
+facts/sync.md § "Block Assembly".*
+
 #### `validation_rollback_failed`
 - **Level:** ERROR
 - **Marker:** `"validation rollback failed"`
 - **Fields:** `height` (u64: the rollback TARGET height), `path`
-  (string: `eval_failure`|`reorg`), `error` (string: the underlying
+  (string: `reorg` — the only value since 2.0; see below), `error` (string: the underlying
   storage/rollback error, Display-formatted)
 - **Since:** 1.4 (added 2026-06-12 with `reset_to → Result`)
 - **Stability:** stable
 - **Emitted:** when `BlockValidator::reset_to` returns Err on the
-  deferred-eval-failure path or the reorg-control path — the underlying
+  reorg-control path — the underlying
   state rollback failed and the validator did NOT move (its height and
   digest are unchanged; facts/validation.md `reset_to` Err
   postcondition). Sync holds every watermark in place rather than
