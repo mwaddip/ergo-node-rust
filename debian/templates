@@ -67,10 +67,9 @@ Description: Node type:
  type that holds the AVL prover tree in RAM, which is what makes 4 GB the
  practical minimum.
  .
- digest validates blocks against proofs rather than holding the state, and
- needs far less memory.
- .
  light tracks headers only. The right choice on a small machine.
+ .
+ ${digest}
 
 Template: ergo-node-rust/blocks_to_keep
 Type: string
@@ -124,20 +123,33 @@ Description: Additional seed peers:
  package rather than replacing them. Leave blank unless you have specific
  nodes you want to connect to.
 
-Template: ergo-node-rust/lowmem_warning
+Template: ergo-node-rust/mem_refuse
 Type: note
-Description: This machine has less memory than a full node needs
- Detected ${detected} MB of RAM. A full (utxo) node needs 4 GB or more, and
- refuses to start below 3 GB — cold sync is the demanding phase, and it peaked
- at about 3 GB on a well-provisioned machine.
+Description: Too little memory for a full node
+ Detected ${detected} MB of RAM. A full (utxo) node will REFUSE TO START below
+ 3 GB — it holds the UTXO tree in memory, and initial sync is the demanding
+ phase.
  .
- Your options, in the order worth trying:
+ Under the "Node type" topic, choose light or digest. Neither holds that tree,
+ and both run well here.
  .
-  - Choose the "Node type" topic and pick light or digest. Neither holds the
-    UTXO tree in memory, and both work well on a small machine.
-  - Add memory or swap.
-  - Set ignore_memory_floor = true under [node] in
-    /etc/ergo-node/conf.d/99-local.toml to start anyway, accepting the risk of
-    an out-of-memory kill during sync.
+ Otherwise: add memory, or set ignore_memory_floor = true under [node] in
+ /etc/ergo-node/conf.d/99-local.toml to start anyway and risk an
+ out-of-memory kill during sync.
  .
- Installation will continue either way — this is a warning, not a failure.
+ Installation continues either way — this is a warning, not a failure.
+
+Template: ergo-node-rust/mem_below_recommended
+Type: note
+Description: Slightly below the recommended memory for a full node
+ Detected ${detected} MB of RAM. 4 GB or more is recommended for a full (utxo)
+ node, so this machine is a little under.
+ .
+ A full node will start and run here — no action is needed. Initial sync is
+ the demanding phase; if it struggles, the levers are pruning
+ (blocks_to_keep under the "Node type" topic) or more memory.
+ .
+ If nothing states a memory budget, the node conservatively assumes it may use
+ only about half of total RAM. Setting MemoryMax on the systemd unit, or a
+ value under the "Memory" topic, roughly doubles what it will allow itself on
+ the same hardware.

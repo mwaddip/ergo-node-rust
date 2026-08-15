@@ -72,17 +72,32 @@ db_go || true
 db_get ergo-node-rust/topics
 TOPICS="$RET"
 
-# ── Low-memory notice ───────────────────────────────────────────────────
+# ── Memory notices ──────────────────────────────────────────────────────
 #
-# Shown before the topic questions so that an operator on a small box can pick
-# "Node type" and choose light/digest in the same pass, rather than finding out
-# from a failed start afterwards. 4096 MB, matching MEMORY_RECOMMENDED_BYTES.
+# Shown before the topic questions so an operator on a small box can pick
+# "Node type" in the same pass rather than finding out from a failed start.
+#
+# ⚠ TWO notices, not one, and the distinction is the point. A single warning
+# below 4096 MB told a 3915 MB machine it "has less memory than a full node
+# needs" and listed "pick light or digest" as the first remedy — so the
+# operator picked light, on a box where a full node runs perfectly well. The
+# notice talked someone out of the mode they wanted.
+#
+# 3072 MB is where the node actually refuses (MEMORY_FLOOR_BYTES); 4096 is only
+# a recommendation (MEMORY_RECOMMENDED_BYTES). Below the floor, steer. Between
+# the two, inform and explicitly say no action is needed.
 
 MEM_MB=$(mem_total_mb)
-if [ -n "$MEM_MB" ] && [ "$MEM_MB" -lt 4096 ]; then
-    db_subst ergo-node-rust/lowmem_warning detected "$MEM_MB" || true
-    db_input high ergo-node-rust/lowmem_warning || true
-    db_go || true
+if [ -n "$MEM_MB" ]; then
+    if [ "$MEM_MB" -lt 3072 ]; then
+        db_subst ergo-node-rust/mem_refuse detected "$MEM_MB" || true
+        db_input high ergo-node-rust/mem_refuse || true
+        db_go || true
+    elif [ "$MEM_MB" -lt 4096 ]; then
+        db_subst ergo-node-rust/mem_below_recommended detected "$MEM_MB" || true
+        db_input high ergo-node-rust/mem_below_recommended || true
+        db_go || true
+    fi
 fi
 
 # ── 3. Interfaces ───────────────────────────────────────────────────────
@@ -97,7 +112,11 @@ if topic_selected "Interfaces"; then
     db_input high ergo-node-rust/listen_port || true
 
     db_input high ergo-node-rust/api_address || true
-    db_input medium ergo-node-rust/max_inbound || true
+    # `high`, not `medium`. debconf's default priority IS high, so a medium
+    # question is silently skipped — the operator checks the Interfaces topic,
+    # is never asked, and gets the default anyway. A question inside a topic
+    # the operator explicitly selected must not be filtered by priority.
+    db_input high ergo-node-rust/max_inbound || true
     db_go || true
 fi
 
@@ -109,10 +128,18 @@ fi
 # something more fundamental was misunderstood.
 
 if topic_selected "Node type"; then
+    # The description has to move with the choice list. Describing digest on a
+    # screen that does not offer it reads as a bug in the menu rather than a
+    # deliberate exclusion — and leaves the operator hunting for an option that
+    # is not there.
     if topic_selected "Mining"; then
         db_subst ergo-node-rust/state_type choices "utxo, light" || true
+        db_subst ergo-node-rust/state_type digest \
+            "digest is not offered here because you selected the Mining topic, and only utxo can mine. Deselect Mining to choose it." || true
     else
         db_subst ergo-node-rust/state_type choices "utxo, light, digest" || true
+        db_subst ergo-node-rust/state_type digest \
+            "digest validates blocks against proofs rather than holding the state, and needs far less memory than utxo. It cannot mine." || true
     fi
     db_input high ergo-node-rust/state_type || true
     db_go || true
