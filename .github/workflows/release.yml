@@ -56,7 +56,24 @@ jobs:
             echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          version=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          # Read the literal out of [workspace.package] — the one place it
+          # exists, since every member inherits it via version.workspace.
+          # Scoped to the section rather than "first ^version line": that was
+          # correct only by accident of section ordering, and this is the step
+          # that decides what gets tagged.
+          version=$(awk '
+              /^\[workspace\.package\]/ { in_section = 1; next }
+              /^\[/                     { in_section = 0 }
+              in_section && /^version[[:space:]]*=/ {
+                  match($0, /"[^"]*"/)
+                  print substr($0, RSTART + 1, RLENGTH - 2)
+                  exit
+              }
+          ' Cargo.toml)
+          if ! printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::could not read a version from [workspace.package] in Cargo.toml (got '${version}')"
+            exit 1
+          fi
           tag="v${version}"
           if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
             echo "::error::tag ${tag} already exists — bump the workspace version before merging a release branch"
@@ -65,7 +82,21 @@ jobs:
           # Annotated, with the CHANGELOG section as the message: the release
           # body is sourced from the annotation further down, and a lightweight
           # tag would leave it empty.
-          notes=$(awk -v v="## ${tag}" '$0 ~ "^" v {f=1; next} /^## v/ {f=0} f' CHANGELOG.md)
+          #
+          # Prefer the release's "### Release summary" subsection: one line per
+          # change, no reasoning, which is what belongs on a release page. The
+          # rest of the CHANGELOG entry is the durable record and reads as a
+          # wall of text there.
+          #
+          # Falls back to the whole section when that subsection is absent, so
+          # re-tagging any older release still produces the body it always did.
+          section=$(awk -v v="## ${tag}" '$0 ~ "^" v {f=1; next} /^## v/ {f=0} f' CHANGELOG.md)
+          notes=$(printf '%s\n' "$section" | awk '
+              /^### Release summary/ { f=1; next }
+              /^### / { f=0 }
+              f
+          ' | sed '/^$/d')
+          [ -z "$notes" ] && notes="$section"
           [ -z "$notes" ] && notes="Release ${tag}"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

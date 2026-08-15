@@ -2,6 +2,40 @@
 
 ## v0.8.0 — 2026-08-13
 
+<!--
+  ### Release summary is what the GitHub release page shows: one line per
+  change, no reasoning. The workflow extracts this subsection alone and falls
+  back to the whole release section when it is absent. Everything below it is
+  the durable record — that is where the reasoning belongs, not on the release
+  page. Keep them in step: a change worth a section is worth a line here.
+-->
+
+### Release summary
+
+- Deferred script evaluation removed; scripts always evaluate before persisting.
+- Config keys `script_eval`, `eval_backlog_max_mb`, `eval_backlog_max_blocks` removed.
+- `cache_mb` is now the total redb cache across both databases, split by the new `cache_store_pct`.
+- Default `cache_mb` is 512.
+- Cache sizes and flush thresholds are derived from the memory budget when not set.
+- New `memory_budget_mb` and `ignore_memory_floor` settings.
+- A `utxo` node refuses to start below a 3 GiB memory ceiling; `digest` and `light` are unaffected.
+- jemalloc runs with `background_thread:true` and 5 s decay windows.
+- Journal events contract 1.6 → 2.1; consumers pinned to major 1 must be updated.
+- `validation_stuck.error_kind` is derived from the error variant, not its text.
+- `BlockValidator` split into `BlockValidator`, `StatePersistence` and `MiningState`.
+- Configuration is layered across `/etc/ergo-node/conf.d/`.
+- `/etc/ergo-node/ergo.toml` is migrated to `conf.d/99-local.toml` on upgrade and is no longer a conffile.
+- The systemd unit no longer passes a config path.
+- New debconf first-install interview for the `.deb`.
+- `install.sh` reads the shipped per-network defaults.
+- Workspace member crates inherit their version from `[workspace.package]`.
+- `/debug/memory` reports `storeCacheBytes`, `stateCacheBytes` and `storeCacheEvictions`.
+- Fixed: external miners were served the difficulty as `b` instead of the Autolykos target, so no solution was ever found.
+- Fixed: a node restarted at the chain tip served no mining candidate until the next block arrived.
+- Fixed: the mempool rejected every transaction offered to it.
+- Fixed: the shipped man page had the mainnet and testnet API ports inverted.
+- Fixed: `MiningCandidate.b` was documented as a JSON string but is emitted as a number.
+
 ### Removed
 
 - **BREAKING — deferred script evaluation is gone.** `apply_state` now always
@@ -25,6 +59,27 @@
   Nothing reads it; there is no migration step.
 
 ### Changed
+
+- **BREAKING (packaging) — `/etc/ergo-node/ergo.toml` is no longer a conffile.**
+  On upgrade it is moved, once, to `/etc/ergo-node/conf.d/99-local.toml`, and
+  keeps winning over the package defaults exactly as before. Your settings are
+  preserved byte for byte; nothing is merged into or rewritten in that file.
+
+  The systemd unit no longer passes a config path — it would name a file that
+  the upgrade has just moved. The node searches `./ergo.toml`,
+  `~/.config/ergo-node/ergo.toml` and `/etc/ergo-node/ergo.toml`, then layers a
+  sibling `conf.d/` on top, and either half may stand alone. Tarball installs
+  with a single `ergo.toml` and no `conf.d` keep working unchanged.
+
+  Verified as an in-place upgrade of a live mainnet node at tip: the migrated
+  file was byte-identical, every configured value survived the merge, and the
+  service came back up on the merged document.
+
+- Workspace member crates inherit their version from `[workspace.package]`
+  instead of each pinning `0.1.0`. They are internal path dependencies and the
+  numbers had not moved since each crate was absorbed, so `cargo metadata`
+  reported a 0.1.0 workspace for a 0.8.0 node. The excluded addons keep their
+  own versions and cadence.
 
 - **BREAKING — `cache_mb` now means the TOTAL redb page cache across both
   databases**, split by the new `cache_store_pct` (default 50, valid 1–99).
@@ -104,6 +159,32 @@
   a memory budget.
 
 ### Fixed
+
+- **A node restarted at the chain tip served no mining candidate at all.**
+  `/mining/candidate` returned 503 until a peer delivered the next block —
+  observed in the field as over an hour with three peers connected. Where the
+  restarted node is the only miner, it never recovered: no candidate, so no
+  block, so no application, so no candidate.
+
+  `UtxoValidator` reconstructed none of its derived mining state on resume.
+  `emission_box_id` is discovered by scanning a block's insertions during
+  `apply_state`, so a freshly constructed validator reported `None` — which is
+  also the documented value for "all ERG has been emitted", making the two
+  indistinguishable. The mining proof cache had the same shape one level up.
+
+  Both are now recovered at startup: the emission box from the block at the
+  resume height (the coinbase recreates it every block, so one block carries
+  it), and the proof cache seeded from the restored tip. Verified against a
+  parked mainnet tip at height 1,851,751 with no reachable peers: 503 for 40s
+  before, a candidate two seconds after startup now.
+
+  Predates this release. It could not be hit before it, because external
+  mining did not work at all — see the entry below.
+
+- **The shipped man page had the REST API ports inverted.** `ergo-node-rust(8)`
+  said mainnet 9052 / testnet 9053; it is the other way round. The markdown
+  source was corrected in v0.6.10 and `man/build` was never re-run, so the
+  installed `.gz` carried the wrong values from v0.6.0 onward.
 
 - **External mining could never find a block — in any release before this one.**
   `GET /mining/candidate` served the **difficulty** in the `b` field where the
@@ -212,6 +293,49 @@
   Read `storeCacheEvictions`, not `storeCacheBytes`, to tell whether a cache
   is under pressure: occupancy tracks the live working set, not the configured
   ceiling, and reads identically at 8 MiB and 1 GiB under the same load.
+
+- **Layered configuration under `/etc/ergo-node/conf.d/`**, and a debconf
+  first-install interview for the `.deb`.
+
+  Three layers, merged in filename order: `00-defaults.toml` (per-network
+  package defaults, refreshed from `/usr/share/ergo-node-rust/defaults/` on
+  every upgrade), `50-debconf.toml` (your interview answers, rewritten on
+  every upgrade and `dpkg-reconfigure`), and `99-local.toml` (**yours** — the
+  package never writes it). Put your changes in `99-local.toml`; edits to the
+  other two are lost on the next upgrade.
+
+  Merging is per key, not per file: setting `max_peers` in a later layer does
+  not drop `seed_peers` from the same section. A bare array replaces; three
+  fields — `seed_peers`, and `include_ips`/`exclude_ips` under
+  `[debug.p2p_capture]` — also accept an `_add` suffix that appends to the
+  shipped list instead.
+
+  The interview asks two things unconditionally — network, then a checklist of
+  topics — and then only the questions belonging to checked topics. Skip
+  everything and you still get a working mainnet node.
+  `DEBIAN_FRONTEND=noninteractive` completes without prompting.
+
+  This exists because "what a first config looks like" was written down in
+  four places that had already drifted, and a debconf template hardcoding
+  ports and seeds would have become the fifth. Network-dependent values now
+  have exactly one home. `install.sh` reads the same files.
+
+- **Startup memory floor.** A **utxo** node now refuses to start when its
+  resolved memory ceiling is below **3 GiB**, and warns below 4 GiB. `digest`
+  and `light` hold no AVL prover tree and are never refused — on a small
+  machine, those are the modes to run. `ignore_memory_floor = true` under
+  `[node]` downgrades the refusal to a warning.
+
+  The check is on the ceiling, not on free memory at the moment you start, so
+  it gives the same answer every time rather than one that depends on what the
+  page cache happens to be holding.
+
+  A second warning fires when the *derived* budget lands under the measured
+  cold-sync peak. These are not the same test: with nothing stating a budget
+  the node takes a conservative share of `MemTotal`, so 4 GB of RAM becomes a
+  2 GB budget — it clears the ceiling check and is the configuration most
+  likely to struggle. Setting `MemoryMax` on the unit, or `memory_budget_mb`,
+  roughly doubles what the node will allow itself on the same hardware.
 
 ### Known limitation
 
