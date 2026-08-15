@@ -2961,8 +2961,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     snapshot_reader: Arc::new(sr),
                     generator: g.clone(),
                 });
+                // Recover `emission_box_id` from the block at the resume
+                // height. The coinbase spends and recreates the emission box
+                // in every block that has one, so this block's insertions
+                // carry the current one — see facts/validation.md
+                // § "Recovering emission_box_id on resume".
+                //
+                // Without this the field stays None, which is the documented
+                // value for "all ERG emitted", and a node restarted AT TIP
+                // serves no mining candidate until a peer delivers the next
+                // block. For a solo miner that never happens: no candidate,
+                // no block, no application, no candidate.
+                let resume_block_txs: Option<Vec<u8>> =
+                    chain_guard.header_at(height).and_then(|h| {
+                        let (type_id, section_id) = enr_chain::section_ids(&h)[0];
+                        store.get(type_id, &section_id).ok().flatten()
+                    });
+                let emission_source = match resume_block_txs {
+                    Some(ref bytes) => ergo_validation::EmissionSource::TipBlock(bytes),
+                    // Pruned or incomplete store. Says which, because an
+                    // unexplained None here is byte-identical to the
+                    // legitimate one — the exact ambiguity being removed.
+                    None => ergo_validation::EmissionSource::Unavailable(
+                        "block transactions for the resume height are not in the store",
+                    ),
+                };
+
                 Some(Validator::new(
-                    ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint)),
+                    ValidatorInner::Utxo(UtxoValidator::new(
+                        storage,
+                        prover,
+                        height,
+                        checkpoint,
+                        emission_source,
+                    )),
                     shared_validated_height.clone(),
                     shared_state_context.clone(),
                     block_applied_tx.clone(),
@@ -2983,11 +3015,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let tree = AVLTree::with_resolver(resolver, 32, None);
                 let mut prover = BatchAVLProver::new(tree, true);
 
-                for (box_id, box_bytes) in build_genesis_boxes(network) {
+                // Bound to a local rather than consumed by the loop: one of
+                // these three carries the emission contract, and the validator
+                // recovers `emission_box_id` from them below. At height 0 there
+                // is no block to read it from.
+                let genesis_boxes = build_genesis_boxes(network);
+
+                for (box_id, box_bytes) in &genesis_boxes {
                     prover
                         .perform_one_operation(&Operation::Insert(KeyValue {
-                            key: Bytes::copy_from_slice(&box_id),
-                            value: Bytes::copy_from_slice(&box_bytes),
+                            key: Bytes::copy_from_slice(box_id),
+                            value: Bytes::copy_from_slice(box_bytes),
                         }))
                         .expect("genesis box insert failed");
                 }
@@ -3035,7 +3073,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 Some(Validator::new(
                     ValidatorInner::Utxo({
-                        let mut uv = UtxoValidator::new(storage, prover, 0, checkpoint);
+                        let mut uv = UtxoValidator::new(
+                            storage,
+                            prover,
+                            0,
+                            checkpoint,
+                            ergo_validation::EmissionSource::GenesisBoxes(&genesis_boxes),
+                        );
                         // Diagnostic: regenerate historical ADProofs that UTXO mode does
                         // not store. Set ENR_DUMP_ADPROOFS_AT=h1,h2,... for a one-shot
                         // genesis replay; writes adproofs-<H>.104 (raw type-104 section)
@@ -3332,6 +3376,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Seed the mining proof cache from the restored tip.
+    //
+    // `update_mining_proofs` otherwise runs ONLY on the post-apply path, so a
+    // node restarted while already at the chain tip has an empty cache and the
+    // mining task refuses to build — `/mining/candidate` returns 503 until a
+    // peer delivers the next block. Where the restarted node is the only miner
+    // it never recovers: no candidate, no block, no application, no candidate.
+    // Observed in the field as an hour of 503s with three peers connected.
+    //
+    // Runs AFTER the reconciliation handshake above, deliberately: that block
+    // can `reset_to` a lower height, and seeding beforehand would cache proofs
+    // for a tip the validator has since rolled back off. The mining task
+    // compares `tip_height` against the validated height and would discard
+    // them anyway — silently, which is worse than not having tried.
+    //
+    // See facts/mining.md § "Startup: the proof cache must be seeded".
+    if let Some(ref v) = validator {
+        let h = v.validated_height();
+        if h > 0 {
+            let tip_header = {
+                let chain_guard = chain.lock().await;
+                chain_guard.header_at(h)
+            };
+            match tip_header {
+                Some(header) => v.update_mining_proofs(&header),
+                // Not an error for a node that is not mining, and not worth
+                // refusing to start over — but say so, because the symptom is
+                // otherwise an unexplained 503 from a healthy-looking node.
+                None => tracing::warn!(
+                    height = h,
+                    "no header at the validated height — mining proofs not seeded; \
+                     /mining/candidate will 503 until the next block is applied"
+                ),
+            }
+        }
+    }
+
     // Start sync in a background task
     let api_downloaded_height = shared_downloaded_height.clone();
     let sync_shared_downloaded_height = shared_downloaded_height.clone();
@@ -3487,7 +3568,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let validator = Validator::new(
                         ValidatorInner::Utxo(UtxoValidator::new(
-                            storage, prover, height, checkpoint,
+                            storage,
+                            prover,
+                            height,
+                            checkpoint,
+                            // Snapshot bootstrap installs a state tree at a
+                            // height whose block transactions were never
+                            // downloaded, so there is nothing to recover from.
+                            // Harmless today — mining ctx is None here — but it
+                            // stops being harmless the moment that TODO below
+                            // is done, so it states the reason rather than
+                            // leaving a bare None to be puzzled over.
+                            ergo_validation::EmissionSource::Unavailable(
+                                "utxo snapshot bootstrap — the block at the snapshot height was never downloaded",
+                            ),
                         )),
                         shared_validated_height.clone(),
                         shared_state_context.clone(),
@@ -4771,7 +4865,13 @@ mod tests {
             .expect("empty first commit");
 
         let utxo = wrap(ValidatorInner::Utxo(UtxoValidator::new(
-            storage, prover, 0, 0,
+            storage,
+            prover,
+            0,
+            0,
+            // This test is about which traits the wrapper exposes, not about
+            // emission tracking, and the tree here is empty anyway.
+            ergo_validation::EmissionSource::Unavailable("trait-surface test fixture"),
         )));
         assert!(
             utxo.state_persistence().is_some(),
