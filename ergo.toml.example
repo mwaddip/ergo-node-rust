@@ -167,6 +167,31 @@ protocol_version = "6.0.3"
 # conservative share of MemTotal.
 # memory_budget_mb = 2048
 
+# ── Startup memory floor ───────────────────────────────────────────────
+#
+# A UTXO node REFUSES TO START when its resolved ceiling is under 3 GiB, and
+# warns under 4 GiB. 4 GB is the practical minimum and more is better: cold
+# sync is the tightest phase, and it peaked at 3.02 GB on a well-provisioned
+# box. `digest` and `light` do not hold the AVL prover tree and are never
+# refused — on a small box, those are the modes to run.
+#
+# The check is on the CEILING, not on free memory at the moment you start, so
+# it is the same answer every time rather than one that depends on what the
+# page cache happens to be holding.
+#
+# ⚠ The source of the ceiling changes what it buys. Nothing stating a budget
+# means MemTotal, and the node takes a conservative 50% of it — so 4 GB of RAM
+# becomes a 2 GB budget, under the cold-sync peak. A MemoryMax on the unit, or
+# memory_budget_mb above, raises that to 90% or 100%. Declaring the same RAM
+# honestly is worth roughly 40% more budget, and the node says so at startup
+# when it notices.
+#
+# Downgrade the refusal to a warning. For when you have a real reason to cross
+# the floor — a heavily pruned node, or a box we are simply wrong about. It is
+# a config key rather than a flag so it survives a restart and is greppable,
+# and startup says when it is set.
+# ignore_memory_floor = false
+
 # ── Cold-sync values (in use until the chain reaches tip) ───────────────
 
 # TOTAL redb page cache across BOTH databases, in megabytes.

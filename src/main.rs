@@ -1062,6 +1062,18 @@ struct NodeConfig {
     /// Total memory the node may use, MB. Absent = read the cgroup limit,
     /// else a conservative share of MemTotal.
     memory_budget_mb: Option<u64>,
+    /// Downgrade the startup memory floor from a refusal to a warning.
+    ///
+    /// A UTXO node refuses to start under a 3 GiB ceiling (facts/memory.md
+    /// § "Startup floor"). That floor is a rule of thumb, and a competent
+    /// operator may have a real reason to cross it — a heavily pruned node, a
+    /// mode we have not measured, or a box we are simply wrong about. A check
+    /// with no override turns our estimate into somebody else's outage.
+    ///
+    /// Deliberately a config key rather than a CLI flag: it survives a
+    /// restart, it is greppable, and startup states when it is set.
+    #[serde(default)]
+    ignore_memory_floor: bool,
     /// Percentage of `cache_mb` given to `modifiers.redb`; the remainder goes
     /// to `state.redb`. Valid 1-99, validated at startup.
     cache_store_pct: Option<u32>,
@@ -1146,6 +1158,7 @@ impl Default for NodeConfig {
             fastsync_peer_wait_timeout_sec: default_fastsync_peer_wait_timeout_sec(),
             cache_mb: None,
             memory_budget_mb: None,
+            ignore_memory_floor: false,
             cache_store_pct: None,
             flush_heap_threshold_mb: None,
             flush_max_blocks: None,
@@ -1377,6 +1390,109 @@ fn detect_memory_budget(explicit_mb: Option<u64>) -> MemoryBudget {
     }
 }
 
+// ── Startup memory floor (facts/memory.md § "Startup floor") ─────────────
+
+/// Ceiling below which a UTXO node refuses to start.
+const MEMORY_FLOOR_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+
+/// Ceiling below which any node warns.
+const MEMORY_RECOMMENDED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Measured cold-sync RSS peak: mainnet genesis→595k, 32-core box, 1 GB cache
+/// budget, inline evaluation. A *usable* budget under this is the number that
+/// predicts trouble, and it is not the same test as the ceiling.
+const COLD_SYNC_PEAK_BYTES: u64 = 3_020_000_000;
+
+/// Refuse, or warn, before any work begins.
+///
+/// ⚠ Keys on the **ceiling**, not `MemAvailable`. `MemAvailable` moves with
+/// page cache, so keying on it means a node that came up at boot refuses after
+/// a busy hour — nondeterministic, for a reason the operator cannot see and did
+/// not cause.
+///
+/// ⚠ The refusal is **UTXO-only**. 4 GiB is a UTXO figure — that is where the
+/// AVL prover tree lives. `digest` runs the verifier rather than the persistent
+/// prover and `light` holds no tree at all, so refusing them would block the
+/// one mode a small box should be running.
+fn check_memory_floor(
+    budget: &MemoryBudget,
+    state_type: StateType,
+    ignore_floor: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ceiling_mb = budget.ceiling_bytes / MIB;
+    let usable_mb = budget.usable_bytes / MIB;
+    let under_floor = budget.ceiling_bytes < MEMORY_FLOOR_BYTES;
+
+    if under_floor && state_type == StateType::Utxo {
+        if ignore_floor {
+            tracing::warn!(
+                ceiling_mb,
+                floor_mb = MEMORY_FLOOR_BYTES / MIB,
+                "memory ceiling is below the floor for a UTXO node, but \
+                 ignore_memory_floor is set — starting anyway. If this node is \
+                 OOM-killed during cold sync, this is why."
+            );
+        } else {
+            return Err(format!(
+                "memory ceiling {ceiling_mb} MB is below the {} MB floor for a UTXO node \
+                 (source: {}). A UTXO node holds the AVL prover tree in RAM and cold sync \
+                 peaked at {} MB on a well-provisioned box; 4 GB or more is recommended. \
+                 Options: give it more memory; set MemoryMax on the systemd unit or \
+                 memory_budget_mb in the config if this box has more than the node can see; \
+                 run state_type = \"light\" or \"digest\", which do not hold the tree; or set \
+                 ignore_memory_floor = true in [node] to start anyway.",
+                MEMORY_FLOOR_BYTES / MIB,
+                budget.source.as_str(),
+                COLD_SYNC_PEAK_BYTES / MIB,
+            )
+            .into());
+        }
+    } else if under_floor {
+        tracing::warn!(
+            ceiling_mb,
+            floor_mb = MEMORY_FLOOR_BYTES / MIB,
+            state_type = ?state_type,
+            "memory ceiling is below the UTXO floor; this mode does not hold the \
+             AVL prover tree, so it is allowed — but it is unmeasured territory"
+        );
+    } else if budget.ceiling_bytes < MEMORY_RECOMMENDED_BYTES {
+        tracing::warn!(
+            ceiling_mb,
+            recommended_mb = MEMORY_RECOMMENDED_BYTES / MIB,
+            "memory ceiling is below the recommended minimum — the node will run, \
+             but cold sync is the tightest phase and more memory is better"
+        );
+    }
+
+    // A separate test, and the one that catches the case the ceiling check
+    // waves through: 4 GiB of RAM with no cgroup resolves to MemTotal at 50%,
+    // so 2 GiB usable — under the cold-sync peak, while passing above.
+    if budget.usable_bytes < COLD_SYNC_PEAK_BYTES {
+        let advice = match budget.source {
+            BudgetSource::MemTotal => {
+                "nothing states how much this node may use, so it is taking a conservative \
+                 50% of MemTotal. Setting MemoryMax on the systemd unit, or memory_budget_mb \
+                 in [node], raises that to 90% or 100% — the same RAM, declared honestly, is \
+                 a substantially larger budget"
+            }
+            BudgetSource::Cgroup => {
+                "raise MemoryMax on the systemd unit if this box has more to give"
+            }
+            BudgetSource::Explicit => {
+                "raise memory_budget_mb in [node] if this box has more to give"
+            }
+        };
+        tracing::warn!(
+            usable_mb,
+            cold_sync_peak_mb = COLD_SYNC_PEAK_BYTES / MIB,
+            source = budget.source.as_str(),
+            "derived budget is below the measured cold-sync peak — {advice}"
+        );
+    }
+
+    Ok(())
+}
+
 /// Budget left for caches and write buffers after the parts nothing governs.
 /// `chain_index_bytes` is 0 in phase 1, when the store has not been opened and
 /// the index is not yet knowable.
@@ -1602,6 +1718,215 @@ fn locate_config(args: &[String]) -> Option<String> {
     None
 }
 
+// ── Layered configuration (facts/config.md) ──────────────────────────────
+//
+// A base `ergo.toml` and a sibling `conf.d/` are merged into ONE document.
+// Either half alone is valid: a base file with no `conf.d` (tarball installs)
+// and a `conf.d` with no base file (the .deb end state after migration).
+
+/// Fields where a `<field>_add` sibling appends instead of replacing.
+///
+/// ⚠ Three names, by name — **not** a general mechanism applied to every
+/// array. `_add` names the operation rather than the provenance (provenance is
+/// already implied by which file the line is in) and leaves room for a future
+/// `_remove`. See facts/config.md § "Merge semantics".
+const ADDITIVE_FIELDS: [&str; 3] = ["seed_peers", "include_ips", "exclude_ips"];
+
+/// The merged configuration document, and the files it came from.
+#[derive(Debug)]
+struct ConfigDocument {
+    /// Merged TOML, re-serialized. **Both** parsers consume exactly this
+    /// string — `RootConfig` here and `enr_p2p::config::Config` via
+    /// `from_toml_str`. Handing p2p a path instead would make it read one file
+    /// and silently ignore every `conf.d` layer.
+    text: String,
+    /// The base file, when one was found. `None` is valid: `conf.d` alone.
+    base: Option<std::path::PathBuf>,
+    /// `conf.d` files layered on, in the order applied.
+    layers: Vec<std::path::PathBuf>,
+}
+
+/// Layer `overlay` onto `acc`.
+///
+/// Scalars: later wins, **per key, not per table** — setting `max_peers` must
+/// not drop `seed_peers` from the same table. Bare arrays replace wholesale,
+/// which deliberately discards any `_add` contributions accumulated so far:
+/// an operator writing a bare array is stating the complete list.
+fn merge_config_table(acc: &mut toml::Table, overlay: toml::Table) {
+    for (key, val) in overlay {
+        if let Some(field) = key.strip_suffix("_add") {
+            if ADDITIVE_FIELDS.contains(&field) {
+                append_additive(acc, field, &key, val);
+                continue;
+            }
+            // Not one of the three. Almost certainly a typo or a wrong
+            // assumption about how general `_add` is, and silently accepting
+            // it would look like it worked — the key would land in the merged
+            // document and be dropped by serde without a word.
+            tracing::warn!(
+                key = %key,
+                additive_fields = ?ADDITIVE_FIELDS,
+                "`_add` is a convention for three fields only — this key is being \
+                 taken literally and will be ignored by the config parser"
+            );
+        }
+        match (acc.get_mut(&key), val) {
+            // Recurse so sibling keys survive.
+            (Some(toml::Value::Table(existing)), toml::Value::Table(incoming)) => {
+                merge_config_table(existing, incoming);
+            }
+            // A table we have not seen yet still has to be *merged*, not
+            // inserted wholesale: `_add` is handled per level, so inserting the
+            // incoming table verbatim would carry a nested `seed_peers_add`
+            // straight through to the parser, which drops it silently. The
+            // first file to mention a table is the easy case to get wrong,
+            // because every later one takes the branch above.
+            (_, toml::Value::Table(incoming)) => {
+                let mut fresh = toml::Table::new();
+                merge_config_table(&mut fresh, incoming);
+                acc.insert(key, toml::Value::Table(fresh));
+            }
+            (_, incoming) => {
+                acc.insert(key, incoming);
+            }
+        }
+    }
+}
+
+fn append_additive(acc: &mut toml::Table, field: &str, key: &str, val: toml::Value) {
+    let toml::Value::Array(items) = val else {
+        tracing::warn!(key = %key, "`_add` value is not an array — ignoring");
+        return;
+    };
+    match acc.get_mut(field) {
+        Some(toml::Value::Array(existing)) => existing.extend(items),
+        // Nothing to append to yet: the `_add` becomes the field. A later bare
+        // array still replaces it, which is the documented precedence.
+        _ => {
+            acc.insert(field.to_string(), toml::Value::Array(items));
+        }
+    }
+}
+
+/// The `conf.d` directory that applies, or None.
+///
+/// With a base file it is that file's sibling and nothing else — the search
+/// does not continue past the tier that won. Without one, the same three tiers
+/// are searched for a bare `conf.d`.
+fn locate_conf_d(base: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    if let Some(b) = base {
+        let d = b
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("conf.d");
+        return d.is_dir().then_some(d);
+    }
+
+    let pwd = std::path::PathBuf::from("./conf.d");
+    if pwd.is_dir() {
+        return Some(pwd);
+    }
+    let xdg_dir = std::env::var("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .ok()
+        .or_else(|| {
+            std::env::var("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".config"))
+                .ok()
+        });
+    if let Some(d) = xdg_dir {
+        let candidate = d.join("ergo-node/conf.d");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    let etc = std::path::PathBuf::from("/etc/ergo-node/conf.d");
+    etc.is_dir().then_some(etc)
+}
+
+/// `*.toml` in a `conf.d`, in lexical filename order.
+///
+/// Lexical order IS the mechanism — a file that wants to win names itself
+/// later. Sorting on the full path would be equivalent here but breaks the
+/// moment a caller passes a directory whose name sorts differently, so sort on
+/// the file name.
+fn conf_d_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, std::io::Error> {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "toml"))
+        .collect();
+    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    Ok(files)
+}
+
+/// Every search location, for the error a maintenance subcommand prints when
+/// it finds nothing. The daemon does not use this — it writes a bootstrap
+/// config instead of failing.
+const NO_CONFIG_FOUND: &str = "no config found (pass an explicit path, or place one at \
+     ./ergo.toml, ~/.config/ergo-node/ergo.toml, or /etc/ergo-node/ergo.toml, \
+     or a conf.d/ directory beside any of them)";
+
+/// Merge the base file and any `conf.d` into one document.
+///
+/// `Ok(None)` means neither half exists — the caller writes a bootstrap config.
+/// A `conf.d` that exists but holds no `*.toml` counts as present: the operator
+/// made the directory, and silently falling through to "no config found" would
+/// be a worse answer than an empty one.
+fn load_config_document(
+    args: &[String],
+) -> Result<Option<ConfigDocument>, Box<dyn std::error::Error>> {
+    let base_path = locate_config(args).map(std::path::PathBuf::from);
+    let conf_d = locate_conf_d(base_path.as_deref());
+
+    if base_path.is_none() && conf_d.is_none() {
+        return Ok(None);
+    }
+
+    merge_config_sources(base_path.as_deref(), conf_d.as_deref()).map(Some)
+}
+
+/// The half of loading that does not consult the search path.
+///
+/// Split out so it can be tested against temp directories: the search path
+/// reaches `/etc/ergo-node`, and a test that walks it would read whatever this
+/// machine happens to have installed.
+fn merge_config_sources(
+    base: Option<&std::path::Path>,
+    conf_d: Option<&std::path::Path>,
+) -> Result<ConfigDocument, Box<dyn std::error::Error>> {
+    let mut merged = toml::Table::new();
+
+    if let Some(p) = base {
+        // A named base file that is missing is an error, not an empty layer —
+        // it is either the operator's explicit argument or a path the search
+        // just confirmed exists.
+        let text = std::fs::read_to_string(p)
+            .map_err(|e| format!("reading config {}: {e}", p.display()))?;
+        let table: toml::Table =
+            toml::from_str(&text).map_err(|e| format!("parsing config {}: {e}", p.display()))?;
+        merge_config_table(&mut merged, table);
+    }
+
+    let mut layers = Vec::new();
+    if let Some(dir) = conf_d {
+        for f in conf_d_files(dir).map_err(|e| format!("reading {}: {e}", dir.display()))? {
+            let text = std::fs::read_to_string(&f)
+                .map_err(|e| format!("reading config layer {}: {e}", f.display()))?;
+            let table: toml::Table = toml::from_str(&text)
+                .map_err(|e| format!("parsing config layer {}: {e}", f.display()))?;
+            merge_config_table(&mut merged, table);
+            layers.push(f);
+        }
+    }
+
+    Ok(ConfigDocument {
+        text: toml::to_string(&merged)?,
+        base: base.map(|p| p.to_path_buf()),
+        layers,
+    })
+}
+
 /// Minimal config written to `./ergo.toml` on first run when no config file
 /// was found in any search location. Testnet, full archival node, IPv6
 /// listener — data_dir falls through to the in-pwd `./ergo-node-data`
@@ -1656,13 +1981,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // hidden from --help. Takes the same config path arg as the daemon so
     // the data_dir is resolved consistently.
     if args.iter().any(|a| a == "--reset-scores-migration") {
-        let config_path = locate_config(&args).ok_or_else(|| -> Box<dyn std::error::Error> {
-            "no config found (pass an explicit path, or place one at ./ergo.toml, \
-             ~/.config/ergo-node/ergo.toml, or /etc/ergo-node/ergo.toml)"
-                .into()
-        })?;
-        let config_content = std::fs::read_to_string(&config_path)?;
-        let root_config: RootConfig = toml::from_str(&config_content)?;
+        let doc = load_config_document(&args)?
+            .ok_or_else(|| -> Box<dyn std::error::Error> { NO_CONFIG_FOUND.into() })?;
+        let root_config: RootConfig = toml::from_str(&doc.text)?;
         let node_config = root_config.node.unwrap_or_default();
         let data_dir = std::path::PathBuf::from(node_config.data_dir.clone());
         // Deliberately small: this path deletes one chain-meta key and exits.
@@ -1684,13 +2005,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // deliberate operator step, so that a compaction whose stats look wrong
     // costs nothing. Requires the node to be stopped (redb file lock).
     if args.iter().any(|a| a == "--compact-state") {
-        let config_path = locate_config(&args).ok_or_else(|| -> Box<dyn std::error::Error> {
-            "no config found (pass an explicit path, or place one at ./ergo.toml, \
-             ~/.config/ergo-node/ergo.toml, or /etc/ergo-node/ergo.toml)"
-                .into()
-        })?;
-        let config_content = std::fs::read_to_string(&config_path)?;
-        let root_config: RootConfig = toml::from_str(&config_content)?;
+        let doc = load_config_document(&args)?
+            .ok_or_else(|| -> Box<dyn std::error::Error> { NO_CONFIG_FOUND.into() })?;
+        let root_config: RootConfig = toml::from_str(&doc.text)?;
         let node_config = root_config.node.unwrap_or_default();
         let data_dir = std::path::PathBuf::from(node_config.data_dir);
         let source = data_dir.join("state.redb");
@@ -1753,8 +2070,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let config_path = match locate_config(&args) {
-        Some(p) => p,
+    let config_doc = match load_config_document(&args)? {
+        Some(d) => d,
         None => {
             std::fs::write("./ergo.toml", COLD_BOOTSTRAP_CONFIG)?;
             tracing::warn!(
@@ -1763,11 +2080,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "no config found — wrote a default (testnet, full archival, state in ./ergo-node-data). \
                  Edit ./ergo.toml or run ./install.sh for interactive setup."
             );
-            "./ergo.toml".to_string()
+            load_config_document(&args)?.ok_or_else(|| -> Box<dyn std::error::Error> {
+                "wrote ./ergo.toml but still could not load it".into()
+            })?
         }
     };
 
-    let config = enr_p2p::config::Config::load(&config_path)?;
+    // Which files produced the effective config. Logged unconditionally: with
+    // layering, "what is this node actually configured with" stops being
+    // answerable by looking at one file, and an operator debugging a surprising
+    // value needs to know which layers were in play and in what order.
+    tracing::info!(
+        base = config_doc.base.as_ref().map(|p| p.display().to_string()),
+        layers = ?config_doc.layers.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "configuration loaded"
+    );
+
+    // Both parsers consume the merged document, not a path — see
+    // facts/config.md § "One document, parsed twice".
+    let config = enr_p2p::config::Config::from_toml_str(&config_doc.text)?;
 
     // Derive chain config from P2P network setting
     let network = config.proxy.network;
@@ -1793,9 +2124,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Ergo node starting"
     );
 
-    // Parse node config from the same TOML file
-    let config_content = std::fs::read_to_string(&config_path)?;
-    let root_config: RootConfig = toml::from_str(&config_content)?;
+    // Parse node config from the same merged document
+    let root_config: RootConfig = toml::from_str(&config_doc.text)?;
     let stats_config = root_config.stats.clone();
     let capture_config = root_config.debug.clone().and_then(|d| d.p2p_capture);
     let node_config = root_config.node.unwrap_or_default();
@@ -1892,6 +2222,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // half of the floor is not knowable yet and enters as 0; phase 2 re-derives
     // with the real figure for everything opened later.
     let memory_budget = detect_memory_budget(node_config.memory_budget_mb);
+
+    // Before anything is opened. A node that cannot finish should not create a
+    // data directory and half a database first.
+    check_memory_floor(&memory_budget, state_type, node_config.ignore_memory_floor)?;
+
     let plan_phase1 = derive_memory_plan(&node_config, &memory_budget, 0);
     let (store_cache_bytes, _) = cache_split_bytes(&plan_phase1);
 
@@ -4027,6 +4362,326 @@ mod tests {
     use ergo_avltree_rust::batch_node::{AVLTree, Node, NodeHeader};
     use ergo_avltree_rust::operation::{KeyValue, Operation};
     use std::sync::Arc;
+
+    // ── Layered config loading (facts/config.md) ─────────────────────────
+
+    fn table(toml_str: &str) -> toml::Table {
+        toml::from_str(toml_str).expect("test fixture parses")
+    }
+
+    /// Merge a sequence of TOML fragments in order, as `conf.d` would.
+    fn merged(fragments: &[&str]) -> toml::Table {
+        let mut acc = toml::Table::new();
+        for f in fragments {
+            merge_config_table(&mut acc, table(f));
+        }
+        acc
+    }
+
+    #[test]
+    fn later_file_wins_for_scalars() {
+        let m = merged(&["[outbound]\nmax_peers = 10", "[outbound]\nmax_peers = 40"]);
+        assert_eq!(m["outbound"]["max_peers"].as_integer(), Some(40));
+    }
+
+    /// The rule most easily got wrong: the naive `insert` of the later table
+    /// over the earlier one passes every test where the later file sets every
+    /// key, and fails the moment someone sets one.
+    #[test]
+    fn later_file_does_not_clobber_sibling_keys() {
+        let m = merged(&[
+            "[outbound]\nmin_peers = 3\nmax_peers = 10\nseed_peers = [\"a:1\"]",
+            "[outbound]\nmax_peers = 40",
+        ]);
+        assert_eq!(m["outbound"]["max_peers"].as_integer(), Some(40));
+        assert_eq!(
+            m["outbound"]["min_peers"].as_integer(),
+            Some(3),
+            "setting one key must not drop its siblings"
+        );
+        assert_eq!(
+            m["outbound"]["seed_peers"].as_array().map(Vec::len),
+            Some(1),
+            "setting a scalar must not drop an array in the same table"
+        );
+    }
+
+    #[test]
+    fn nested_tables_merge_per_key() {
+        let m = merged(&[
+            "[listen.ipv6]\naddress = \"[::]:9030\"\nmode = \"full\"",
+            "[listen.ipv6]\nmax_inbound = 20",
+        ]);
+        assert_eq!(m["listen"]["ipv6"]["mode"].as_str(), Some("full"));
+        assert_eq!(m["listen"]["ipv6"]["max_inbound"].as_integer(), Some(20));
+    }
+
+    #[test]
+    fn bare_array_replaces_wholesale() {
+        let m = merged(&[
+            "[outbound]\nseed_peers = [\"a:1\", \"b:2\"]",
+            "[outbound]\nseed_peers = [\"c:3\"]",
+        ]);
+        let peers = m["outbound"]["seed_peers"].as_array().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].as_str(), Some("c:3"));
+    }
+
+    #[test]
+    fn add_appends_in_file_order() {
+        let m = merged(&[
+            "[outbound]\nseed_peers = [\"a:1\"]",
+            "[outbound]\nseed_peers_add = [\"b:2\"]",
+            "[outbound]\nseed_peers_add = [\"c:3\"]",
+        ]);
+        let peers: Vec<&str> = m["outbound"]["seed_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(peers, ["a:1", "b:2", "c:3"]);
+        assert!(
+            !m["outbound"]
+                .as_table()
+                .unwrap()
+                .contains_key("seed_peers_add"),
+            "_add is consumed by the merge, not passed through to the parser"
+        );
+    }
+
+    /// The documented precedence: an operator writing a bare array is stating
+    /// the complete list, so silently retaining an earlier `_add` would make
+    /// that statement untrue.
+    #[test]
+    fn bare_array_discards_prior_add_contributions() {
+        let m = merged(&[
+            "[outbound]\nseed_peers = [\"a:1\"]",
+            "[outbound]\nseed_peers_add = [\"b:2\"]",
+            "[outbound]\nseed_peers = [\"c:3\"]",
+        ]);
+        let peers: Vec<&str> = m["outbound"]["seed_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(peers, ["c:3"]);
+    }
+
+    #[test]
+    fn add_with_no_prior_field_becomes_the_field() {
+        let m = merged(&["[outbound]\nseed_peers_add = [\"a:1\"]"]);
+        assert_eq!(
+            m["outbound"]["seed_peers"].as_array().map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn add_applies_to_capture_ip_lists() {
+        for field in ["include_ips", "exclude_ips"] {
+            let m = merged(&[
+                &format!("[debug.p2p_capture]\n{field} = [\"1.1.1.1\"]"),
+                &format!("[debug.p2p_capture]\n{field}_add = [\"2.2.2.2\"]"),
+            ]);
+            assert_eq!(
+                m["debug"]["p2p_capture"][field].as_array().map(Vec::len),
+                Some(2),
+                "{field} should accept _add"
+            );
+        }
+    }
+
+    /// `_add` is a convention for three named fields, not a general mechanism.
+    /// An unrecognised one is taken literally (and warned about) rather than
+    /// silently appending to something.
+    #[test]
+    fn add_on_an_unlisted_field_is_not_additive() {
+        let m = merged(&["[outbound]\nmin_peers = 3\nmin_peers_add = [7]"]);
+        assert_eq!(
+            m["outbound"]["min_peers"].as_integer(),
+            Some(3),
+            "an unlisted _add must not modify its base field"
+        );
+        assert!(m["outbound"]
+            .as_table()
+            .unwrap()
+            .contains_key("min_peers_add"));
+    }
+
+    #[test]
+    fn conf_d_files_are_lexical_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["99-local.toml", "00-defaults.toml", "50-debconf.toml"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        std::fs::write(dir.path().join("notes.txt"), "").unwrap();
+
+        let files = conf_d_files(dir.path()).expect("read conf.d");
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            ["00-defaults.toml", "50-debconf.toml", "99-local.toml"],
+            "lexical order IS the mechanism; non-toml files are skipped"
+        );
+    }
+
+    /// Both halves are independently valid: a base file with no conf.d
+    /// (tarball installs) and a conf.d with no base file (the .deb end state
+    /// after migration).
+    #[test]
+    fn either_half_alone_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("ergo.toml");
+        std::fs::write(&base, "[outbound]\nmax_peers = 10\n").unwrap();
+        let confd = dir.path().join("conf.d");
+        std::fs::create_dir(&confd).unwrap();
+        std::fs::write(confd.join("50-x.toml"), "[outbound]\nmin_peers = 7\n").unwrap();
+
+        let base_only = merge_config_sources(Some(&base), None).expect("base only");
+        let t: toml::Table = toml::from_str(&base_only.text).unwrap();
+        assert_eq!(t["outbound"]["max_peers"].as_integer(), Some(10));
+        assert!(base_only.layers.is_empty());
+
+        let confd_only = merge_config_sources(None, Some(&confd)).expect("conf.d only");
+        let t: toml::Table = toml::from_str(&confd_only.text).unwrap();
+        assert_eq!(t["outbound"]["min_peers"].as_integer(), Some(7));
+        assert!(confd_only.base.is_none());
+        assert_eq!(confd_only.layers.len(), 1);
+
+        let both = merge_config_sources(Some(&base), Some(&confd)).expect("both");
+        let t: toml::Table = toml::from_str(&both.text).unwrap();
+        assert_eq!(t["outbound"]["max_peers"].as_integer(), Some(10));
+        assert_eq!(t["outbound"]["min_peers"].as_integer(), Some(7));
+    }
+
+    /// The merged text is what BOTH parsers consume, so it has to survive a
+    /// round-trip through `toml::to_string` — including tables, which TOML
+    /// requires be emitted after plain values.
+    #[test]
+    fn merged_document_reparses() {
+        let doc = {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let base = dir.path().join("ergo.toml");
+            std::fs::write(
+                &base,
+                "[proxy]\nnetwork = \"mainnet\"\n\n[outbound]\nmin_peers = 3\nseed_peers = [\"a:1\"]\n\n[listen.ipv6]\naddress = \"[::]:9030\"\n",
+            )
+            .unwrap();
+            merge_config_sources(Some(&base), None).expect("load")
+        };
+        let t: toml::Table = toml::from_str(&doc.text).expect("merged text reparses");
+        assert_eq!(t["proxy"]["network"].as_str(), Some("mainnet"));
+        assert_eq!(t["listen"]["ipv6"]["address"].as_str(), Some("[::]:9030"));
+    }
+
+    #[test]
+    fn a_named_base_file_that_is_missing_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("nope.toml");
+        assert!(merge_config_sources(Some(&missing), None).is_err());
+    }
+
+    #[test]
+    fn a_malformed_layer_names_its_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let confd = dir.path().join("conf.d");
+        std::fs::create_dir(&confd).unwrap();
+        std::fs::write(confd.join("50-bad.toml"), "this is not = = toml").unwrap();
+
+        let err = merge_config_sources(None, Some(&confd))
+            .expect_err("malformed layer must fail")
+            .to_string();
+        assert!(
+            err.contains("50-bad.toml"),
+            "the error must name the offending file, got: {err}"
+        );
+    }
+
+    // ── Startup memory floor (facts/memory.md) ───────────────────────────
+
+    /// A budget as `detect_memory_budget` would build it: usable derived from
+    /// the ceiling by the source's own fraction. Named apart from the existing
+    /// `budget(usable_mb)` helper below, which fixes *usable* directly — these
+    /// two test different halves and conflating them would hide the source
+    /// fraction, which is the whole point here.
+    fn budget_for(source: BudgetSource, ceiling_bytes: u64) -> MemoryBudget {
+        MemoryBudget {
+            source,
+            ceiling_bytes,
+            usable_bytes: (ceiling_bytes as f64 * source.usable_fraction()) as u64,
+        }
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn utxo_refuses_below_the_floor() {
+        let b = budget_for(BudgetSource::MemTotal, 2 * GIB);
+        assert!(check_memory_floor(&b, StateType::Utxo, false).is_err());
+    }
+
+    #[test]
+    fn light_and_digest_are_allowed_below_the_floor() {
+        let b = budget_for(BudgetSource::MemTotal, 2 * GIB);
+        for st in [StateType::Light, StateType::Digest] {
+            assert!(
+                check_memory_floor(&b, st, false).is_ok(),
+                "{st:?} holds no prover tree — refusing it would block the one \
+                 mode a small box should run"
+            );
+        }
+    }
+
+    #[test]
+    fn ignore_memory_floor_downgrades_the_refusal() {
+        let b = budget_for(BudgetSource::MemTotal, 2 * GIB);
+        assert!(check_memory_floor(&b, StateType::Utxo, true).is_ok());
+    }
+
+    #[test]
+    fn at_or_above_the_floor_starts() {
+        for ceiling in [3 * GIB, 4 * GIB, 32 * GIB] {
+            let b = budget_for(BudgetSource::Cgroup, ceiling);
+            assert!(check_memory_floor(&b, StateType::Utxo, false).is_ok());
+        }
+    }
+
+    /// The regime distinction the contract insists on: the SAME 3 GiB is a
+    /// working node when a cgroup states it (90% → 2.7 GB usable, the
+    /// configuration that synced 831k blocks with zero OOM kills) and a much
+    /// tighter one when it is merely how much RAM the box has (50% → 1.5 GB).
+    #[test]
+    fn source_decides_how_much_the_same_ceiling_buys() {
+        let stated = budget_for(BudgetSource::Cgroup, 3 * GIB);
+        let observed = budget_for(BudgetSource::MemTotal, 3 * GIB);
+        assert_eq!(stated.ceiling_bytes, observed.ceiling_bytes);
+        assert!(
+            stated.usable_bytes > observed.usable_bytes * 3 / 2,
+            "a stated budget must buy materially more than an observed one"
+        );
+        // Both clear the ceiling check — the ceiling is not the whole story,
+        // which is why the cold-sync-peak warning exists separately.
+        assert!(check_memory_floor(&stated, StateType::Utxo, false).is_ok());
+        assert!(check_memory_floor(&observed, StateType::Utxo, false).is_ok());
+    }
+
+    /// 4 GiB of RAM with nothing stating a budget resolves to 2 GiB usable —
+    /// under the measured cold-sync peak, while passing the ceiling check.
+    /// This is the case the second warning exists for.
+    #[test]
+    fn recommended_ram_unstated_lands_under_the_cold_sync_peak() {
+        let b = budget_for(BudgetSource::MemTotal, 4 * GIB);
+        assert!(check_memory_floor(&b, StateType::Utxo, false).is_ok());
+        assert!(
+            b.usable_bytes < COLD_SYNC_PEAK_BYTES,
+            "4 GiB at MemTotal's conservative share is below the cold-sync peak"
+        );
+    }
 
     #[test]
     fn cache_store_pct_out_of_range_is_rejected() {
