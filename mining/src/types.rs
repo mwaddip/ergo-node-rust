@@ -39,7 +39,10 @@ pub struct CandidateBlock {
     pub parent: Header,
     /// Block version.
     pub version: u8,
-    /// Encoded difficulty target (compact bits).
+    /// Compact-encoded **difficulty** for this block — not the mining target,
+    /// which is `enr_chain::pow_target(n_bits)` and is what `WorkMessage.b`
+    /// carries. Serialized into the header as 4 raw big-endian bytes, the one
+    /// non-VLQ integer there.
     pub n_bits: u32,
     /// New state root after applying selected transactions.
     pub state_root: ADDigest,
@@ -62,10 +65,19 @@ pub struct CandidateBlock {
 pub struct WorkMessage {
     /// Blake2b256(serialized HeaderWithoutPow) — hex-encoded.
     pub msg: String,
-    /// Target value from nBits. Held as a decimal string internally, but
-    /// serialized as a BARE JSON number to match JVM `ExternalCandidateBlock`
-    /// (jsmn-based miner/pool parsers reject a quoted target). See
-    /// `serialize_b_as_number`.
+    /// The Autolykos target: `enr_chain::pow_target(n_bits)`, i.e.
+    /// `q / decode_compact_bits(n_bits)` for the secp256k1 group order `q`.
+    /// A solution is valid when `pow_hit < b`.
+    ///
+    /// ⚠ **Not `decode_compact_bits(n_bits)` — that is the difficulty**, and
+    /// serving it here is the v0.8.0 defect that made the node unmineable.
+    /// The two are never close: at testnet height 485,897 the difficulty was
+    /// 10 digits and the target 68. Anything under ~20 digits landing in this
+    /// field is a bug, not a low-difficulty epoch.
+    ///
+    /// Held as a decimal string internally, but serialized as a BARE JSON
+    /// number to match JVM `ExternalCandidateBlock` (jsmn-based miner/pool
+    /// parsers reject a quoted target). See `serialize_b_as_number`.
     #[serde(serialize_with = "serialize_b_as_number")]
     pub b: String,
     /// Block height.
@@ -100,10 +112,19 @@ pub struct WorkMessage {
 /// serializer, which is the only serializer WorkMessage ever sees (axum's
 /// `Json` in production, `serde_json::to_string` in tests).
 ///
-/// `b` is always the decimal string from `decode_compact_bits(..).to_string()`
+/// `b` is always the decimal string from `enr_chain::pow_target(..).to_string()`
 /// (a non-negative `BigInt`: valid JSON, no leading zeros, no sign), so the
 /// RawValue construction never fails in practice — but we surface it as a
 /// serialization error rather than panic if that invariant is ever violated.
+///
+/// This doc comment said `decode_compact_bits(..)` until the v0.8.0 fix, which
+/// is the serve bug written down as an invariant in the very function that
+/// emits the field. The escape hatch itself was never in question and is now
+/// **more** load-bearing, not less: a real target is ~68 digits and genuinely
+/// cannot survive serde's numeric model, whereas the difficulty we were
+/// accidentally serving fit in a `u64` and would have encoded fine naively.
+/// The b-as-number fix was solving a real problem — it was just guarding the
+/// wrong number.
 fn serialize_b_as_number<S>(b: &str, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -135,6 +156,17 @@ pub struct CachedCandidate {
 mod tests {
     use super::*;
 
+    /// A plausible `b` for the shape tests below: the target a Scala node
+    /// served at testnet height 485,897.
+    ///
+    /// These tests are about JSON *shape*, not semantics, so any decimal
+    /// string would exercise them — but this was `12237864960` until v0.8.0,
+    /// a difficulty-magnitude value that now reads as an example of the serve
+    /// bug rather than as a target. A real target is ~68 digits. The
+    /// arbitrary-precision test below keeps its own (larger) literal.
+    const OBSERVED_TARGET: &str =
+        "29598898778389163379010897437604384363675568080188445020547283242588";
+
     /// A basic candidate WorkMessage (proof `None` — the only shape the node
     /// produces today), parameterized by the target `b`.
     fn work_with_b(b: &str) -> WorkMessage {
@@ -149,13 +181,13 @@ mod tests {
 
     #[test]
     fn b_serializes_as_bare_number() {
-        let json = serde_json::to_string(&work_with_b("12237864960")).unwrap();
+        let json = serde_json::to_string(&work_with_b(OBSERVED_TARGET)).unwrap();
         assert!(
-            json.contains(r#""b":12237864960"#),
+            json.contains(&format!(r#""b":{OBSERVED_TARGET}"#)),
             "b must be a bare JSON number, got: {json}"
         );
         assert!(
-            !json.contains(r#""b":"12237864960""#),
+            !json.contains(&format!(r#""b":"{OBSERVED_TARGET}""#)),
             "b must NOT be a quoted string, got: {json}"
         );
     }
@@ -181,7 +213,7 @@ mod tests {
     fn surviving_fields_keep_their_shape() {
         // msg/pk stay quoted hex strings, h stays a bare number. (proof
         // omission is asserted separately in basic_candidate_omits_proof.)
-        let json = serde_json::to_string(&work_with_b("12237864960")).unwrap();
+        let json = serde_json::to_string(&work_with_b(OBSERVED_TARGET)).unwrap();
         assert!(
             json.contains(r#""msg":"0000"#),
             "msg must stay a hex string: {json}"
@@ -203,7 +235,7 @@ mod tests {
         // parses with a fixed jsmn REQ_LEN=11 token buffer. A nested proof
         // object overflows it ("Jsmn failed to parse latest block"), so the
         // `proof` key must be ABSENT, not `null`.
-        let json = serde_json::to_string(&work_with_b("12237864960")).unwrap();
+        let json = serde_json::to_string(&work_with_b(OBSERVED_TARGET)).unwrap();
 
         assert!(
             !json.contains("proof"),
@@ -221,7 +253,7 @@ mod tests {
         // The four expected keys are present, b still bare.
         assert!(json.contains(r#""msg":"#), "msg present: {json}");
         assert!(
-            json.contains(r#""b":12237864960"#),
+            json.contains(&format!(r#""b":{OBSERVED_TARGET}"#)),
             "b present and bare: {json}"
         );
         assert!(json.contains(r#""h":271235"#), "h present: {json}");

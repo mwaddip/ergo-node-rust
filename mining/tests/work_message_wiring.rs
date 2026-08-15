@@ -27,7 +27,11 @@
 //! canonical hex in our own test suite. It catches drift on future
 //! sigma-rust bumps without us having to also run sigma-rust's tests.
 
+use std::str::FromStr;
+
 use blake2::Digest as Blake2Digest;
+use enr_chain::BigInt;
+use ergo_chain_types::autolykos_pow_scheme::{decode_compact_bits, AutolykosPowScheme};
 use ergo_chain_types::{
     ADDigest, AutolykosSolution, BlockId, Digest, Digest32, EcPoint, Header, Votes,
 };
@@ -38,7 +42,11 @@ use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
 use ergo_mining::candidate::{build_work_message, transactions_root};
 use ergo_mining::emission::{build_emission_tx, ReemissionRules};
 use ergo_mining::extension::extension_digest;
+use ergo_mining::solution::validate_solution;
 use ergo_mining::types::*;
+use ergo_mining::MiningError;
+use num_bigint::ToBigInt;
+use sigma_ser::ScorexSerializable;
 
 type Blake2b256 = blake2::Blake2b<blake2::digest::typenum::U32>;
 
@@ -278,6 +286,235 @@ fn sigma_rust_serialize_without_pow_matches_jvm_canonical_height_614400() {
          for height 614400. Either sigma-rust changed its serialization \
          (which would be a hard fork on the wire) or our blake2b256 \
          wrapper is producing different bytes than sigma-rust's."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WorkMessage.b — the target served to external miners
+//
+// v0.8.0 served `decode_compact_bits(n_bits)` here: the DIFFICULTY, not the
+// target. A GPU miner ran nine minutes at 143 MH/s against the released node
+// and submitted zero shares, because the bound it was handed was tens of
+// orders of magnitude tighter than the one `check_pow` on the solution path
+// actually enforces. Three tests over `b` (non-empty, stable across polls,
+// bare JSON number) passed continuously throughout — present, consistent,
+// well-typed, and the wrong quantity. These two assert the value.
+// ---------------------------------------------------------------------------
+
+/// Compact-bits encoding of the difficulty at testnet height 485,897.
+/// **DERIVED**, not observed — see `served_b_matches_scala_node_vector`.
+const SCALA_N_BITS: u32 = 83_945_773; // 0x0500e92d
+
+/// Difficulty reported by a live Scala node at testnet height 485,897.
+/// **Observed.**
+const SCALA_DIFFICULTY: u64 = 3_912_040_448;
+
+/// The `b` that same Scala node served for that height. **Observed**, and
+/// cross-checked digit for digit against `floor(q / 3912040448)` (remainder
+/// 1309294913).
+const SCALA_TARGET: &str = "29598898778389163379010897437604384363675568080188445020547283242588";
+
+/// Compact-bits encoding of a small integer difficulty. For `size == 3` the
+/// mantissa *is* the value, so this is just `0x03000000 | d`.
+fn n_bits_for_difficulty(d: u32) -> u32 {
+    assert!(d <= 0x007f_ffff, "difficulty must fit the 23-bit mantissa");
+    0x0300_0000 | d
+}
+
+/// The wiring-test fixture at a chosen difficulty encoding. Only `n_bits`
+/// varies, so the header bytes — and therefore the PoW hit — are a
+/// deterministic function of `n_bits` and the nonce.
+fn candidate_at_n_bits(n_bits: u32) -> CandidateBlock {
+    let parent = parent_for_wiring_test();
+    let settings = MonetarySettings::default();
+    let pks = founder_pks();
+    let (emission_box, _, _) = genesis::genesis_boxes(&settings, &pks, 2, TEST_PROOFS).unwrap();
+    let height = parent.height + 1;
+    let emission_tx = build_emission_tx(
+        &emission_box,
+        height,
+        &test_miner_pk(),
+        720,
+        &ReemissionRules::mainnet(),
+    )
+    .unwrap();
+
+    CandidateBlock {
+        parent,
+        version: 2,
+        n_bits,
+        state_root: ADDigest::from([0xAA; 33]),
+        ad_proof_bytes: vec![0xCC; 16],
+        transactions: vec![emission_tx],
+        timestamp: 1_700_000_000_500,
+        extension: ExtensionCandidate {
+            fields: vec![([0x01, 0x00], vec![0xEE; 32])],
+        },
+        votes: [0, 0, 0],
+        header_bytes: vec![],
+    }
+}
+
+/// The header `validate_solution` assembles for `candidate` + `nonce`, rebuilt
+/// here because `pow_hit` needs a `Header` and the solution path only hands one
+/// back when it accepts. Every accepted solution below cross-checks the two
+/// serialize identically, so the hit read out of this really is the hit the
+/// solution path compared.
+fn header_for_nonce(candidate: &CandidateBlock, nonce: u64) -> Header {
+    Header {
+        version: candidate.version,
+        id: BlockId(Digest::from([0u8; 32])),
+        parent_id: candidate.parent.id,
+        ad_proofs_root: Digest32::from(blake2b256_bytes(&candidate.ad_proof_bytes)),
+        state_root: candidate.state_root,
+        transaction_root: transactions_root(&candidate.transactions, candidate.version).unwrap(),
+        timestamp: candidate.timestamp,
+        n_bits: candidate.n_bits,
+        height: candidate.parent.height + 1,
+        extension_root: Digest32::from(extension_digest(&candidate.extension).unwrap()),
+        autolykos_solution: solution_with_nonce(nonce),
+        votes: Votes(candidate.votes),
+        unparsed_bytes: Box::new([]),
+    }
+}
+
+fn solution_with_nonce(nonce: u64) -> AutolykosSolution {
+    AutolykosSolution {
+        miner_pk: Box::new(*test_miner_pk().h),
+        pow_onetime_pk: None,
+        nonce: nonce.to_be_bytes().to_vec(),
+        pow_distance: None,
+    }
+}
+
+/// (a) The served `b` against a fixed pair captured from a Scala node.
+///
+/// Provenance, because the three numbers are not the same kind of thing:
+/// `SCALA_DIFFICULTY` and `SCALA_TARGET` were **observed** — read off a live
+/// Scala node at testnet height 485,897 and compared digit for digit.
+/// `SCALA_N_BITS` is **derived**, computed by canonical compact-bits encoding
+/// of the observed difficulty rather than read off the wire. So the round-trip
+/// is asserted first: a bad derivation then fails loudly here instead of
+/// letting the target assertion quietly pass against some other difficulty.
+///
+/// Asserted against the literal on purpose. `assert_eq!(work.b,
+/// pow_target(n).to_string())` would restate the implementation and pass on
+/// any self-consistent definition — including the one that shipped.
+///
+/// `chain/` carries the same vector against `pow_target` directly
+/// (`chain/src/tests.rs::pow_target_matches_scala_node`). That is deliberate,
+/// not duplication to consolidate: this one covers the whole serve path out to
+/// the string a miner receives, that one covers the function.
+#[test]
+fn served_b_matches_scala_node_vector() {
+    assert_eq!(
+        decode_compact_bits(SCALA_N_BITS),
+        BigInt::from(SCALA_DIFFICULTY),
+        "n_bits derivation is wrong — the target assertion below would be \
+         testing a difficulty the Scala node never reported"
+    );
+
+    let candidate = candidate_at_n_bits(SCALA_N_BITS);
+    let (_, work) = build_work_message(&candidate, &test_miner_pk().h).unwrap();
+
+    assert_eq!(
+        work.b, SCALA_TARGET,
+        "served b diverged from the value a Scala node published for the same \
+         nBits. Miners hash against this number; a wrong one costs them every \
+         share they find."
+    );
+
+    // The specific wrong answer, named. 10 digits against 68.
+    assert_ne!(
+        work.b,
+        SCALA_DIFFICULTY.to_string(),
+        "b is the difficulty again — that is the v0.8.0 defect exactly"
+    );
+}
+
+/// (b) Serve/verify agreement: the number handed to the miner is the number the
+/// solution path checks a hit against.
+///
+/// That is the property that was actually violated — two paths, two numbers,
+/// nothing tying them together — and a test pinning only the literal above
+/// would still pass if the solution side later drifted.
+///
+/// `check_pow` is upstream's and opaque (it returns a bool, not its target), so
+/// the target is observed at its boundary instead: for each nonce, the node's
+/// own accept/reject verdict must agree with `hit < b_served`. At difficulty 2
+/// roughly half the nonces clear the bar, so the scan sees both verdicts and
+/// brackets `b` from both sides. Under the v0.8.0 bug `b` was 2, every hit is a
+/// ~77-digit number, so every `hit < b` would read false while the node
+/// accepted half of them — the first accepted nonce fails this.
+#[test]
+fn served_b_is_the_bound_the_solution_path_enforces() {
+    const NONCES: u64 = 32;
+
+    let n_bits = n_bits_for_difficulty(2);
+    assert_eq!(
+        decode_compact_bits(n_bits),
+        BigInt::from(2u32),
+        "compact-bits encoding helper is wrong"
+    );
+
+    let candidate = candidate_at_n_bits(n_bits);
+    let (_, work) = build_work_message(&candidate, &test_miner_pk().h).unwrap();
+    let b = BigInt::from_str(&work.b).expect("served b must be a decimal integer");
+
+    let pow = AutolykosPowScheme::default();
+    let (mut accepted, mut rejected) = (0u32, 0u32);
+
+    for nonce in 0..NONCES {
+        let header = header_for_nonce(&candidate, nonce);
+        let hit = pow
+            .pow_hit(&header)
+            .expect("pow_hit on a well-formed v2 header")
+            .to_bigint()
+            .expect("unsigned -> signed conversion never fails");
+
+        // The real entry point — the same call the /mining/solution handler makes.
+        let node_accepts = match validate_solution(&candidate, solution_with_nonce(nonce)) {
+            Ok(validated) => {
+                // Prove the header whose hit we just read is the header the
+                // solution path validated. `id` is not serialized, so equal
+                // bytes means equal header.
+                assert_eq!(
+                    header.scorex_serialize_bytes().unwrap(),
+                    validated.scorex_serialize_bytes().unwrap(),
+                    "reconstructed header diverged from the one validate_solution \
+                     built, so the hit below is for a different header"
+                );
+                true
+            }
+            Err(MiningError::InvalidSolution(_)) => false,
+            Err(e) => panic!("unexpected mining error at nonce {nonce}: {e}"),
+        };
+
+        assert_eq!(
+            node_accepts,
+            hit < b,
+            "serve/verify disagreement at nonce {nonce}: the node {} this \
+             solution, but against the served b={b} the hit {hit} says the \
+             opposite. The number miners are given and the number the node \
+             checks must be the same number.",
+            if node_accepts { "ACCEPTED" } else { "REJECTED" }
+        );
+
+        if node_accepts {
+            accepted += 1;
+        } else {
+            rejected += 1;
+        }
+    }
+
+    // Both verdicts must actually occur or the loop above asserted nothing
+    // about where the boundary is. The fixture is fixed, so this is a
+    // deterministic property of it — it fails only if someone changes the
+    // fixture or the difficulty and makes the scan one-sided.
+    assert!(
+        accepted > 0 && rejected > 0,
+        "scan went one-sided ({accepted} accepted, {rejected} rejected) — it no \
+         longer brackets the target and proves nothing"
     );
 }
 

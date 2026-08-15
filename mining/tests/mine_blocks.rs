@@ -190,7 +190,20 @@ fn generate_candidate_and_mine_block() {
     // Verify WorkMessage fields
     assert_eq!(work.h, 2, "block height should be 2 (genesis is 1)");
     assert!(!work.msg.is_empty(), "msg should be non-empty hex");
-    assert!(!work.b.is_empty(), "b (target) should be non-empty");
+    // `b` is the Autolykos TARGET (q / difficulty), never the difficulty. This
+    // was `!work.b.is_empty()` until v0.8.0, and it passed continuously while
+    // the serve path emitted "1" and no miner on earth could find a share. A
+    // correct b has a known minimum magnitude — the target only shrinks below
+    // 20 digits at a difficulty around 10^57, which no network has ever seen —
+    // so anything short here is the difficulty leaking through again, not a
+    // low-difficulty epoch. Exact values are pinned in
+    // `tests/work_message_wiring.rs` against a Scala-node vector.
+    assert!(
+        work.b.len() >= 20,
+        "b must be the target, not the difficulty: got {} digits ({})",
+        work.b.len(),
+        work.b
+    );
     assert!(!work.pk.is_empty(), "pk should be non-empty hex");
     assert!(
         work.proof.is_none(),
