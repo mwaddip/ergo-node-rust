@@ -64,6 +64,11 @@ current candidate is lost; miners just poll for a new one.
 - `ergo-chain-types` — `Header`, `AutolykosPowScheme`, `AutolykosSolution`,
   `ADDigest`, header serialization
 - `ergo-nipopow` — interlink vector computation for extension section
+- `enr-chain` — `pow_target(n_bits)`, the single definition of the Autolykos
+  mining target served as `WorkMessage.b`. The crate consumed
+  `ergo-chain-types` directly and re-derived the target itself until v0.8.0,
+  which is how it came to serve the difficulty instead. No cycle: `chain/` has
+  no in-repo path dependencies.
 - `ergo-validation` — `compute_state_changes`, `validate_single_transaction`,
   `build_state_context`, `Parameters`
 - `ergo_avltree_rust` — via UtxoValidator (temporary prover operations for
@@ -119,8 +124,10 @@ pub struct CandidateBlock {
     pub parent: Header,
     /// Block version.
     pub version: u8,
-    /// Encoded difficulty target for this block.
-    pub n_bits: u64,
+    /// Compact-encoded **difficulty** for this block (not the mining target —
+    /// see `WorkMessage.b`). `u32`, matching `Header.n_bits`; serialized as 4
+    /// raw big-endian bytes, the one non-VLQ integer in the header.
+    pub n_bits: u32,
     /// New state root after applying selected transactions.
     pub state_root: ADDigest,
     /// Serialized AD proofs for the state transition.
@@ -144,7 +151,9 @@ pub struct CandidateBlock {
 pub struct WorkMessage {
     /// Blake2b256 hash of the serialized HeaderWithoutPow.
     pub msg: [u8; 32],
-    /// Target value derived from nBits. Solution must satisfy hit < b.
+    /// Autolykos target: `q / decode_compact_bits(nBits)`, i.e.
+    /// `enr_chain::pow_target(nBits)` — NOT the decoded nBits itself, which
+    /// is the difficulty. Solution must satisfy hit < b.
     pub b: BigInt,
     /// Block height (used in Autolykos v2 index calculation).
     pub h: u32,
@@ -834,7 +843,21 @@ Convert the candidate into the data miners need.
 
 3. **Hash:** `msg = Blake2b256(serialized_header_without_pow)`.
 
-4. **Target:** `b = decode_compact_bits(candidate.n_bits)`.
+4. **Target:** `b = enr_chain::pow_target(candidate.n_bits)`.
+
+   ⚠ **Not `decode_compact_bits(candidate.n_bits)` — that is the difficulty.**
+   The target is `q / difficulty` where `q` is the secp256k1 group order, and
+   `pow_target` in `facts/chain.md` § "Phase 2" is the single definition of it.
+   This step said `decode_compact_bits` until v0.8.0 and the implementation
+   faithfully matched it, which is how a released node spent its serve path
+   advertising a target ~10^58 times harder than the one its own
+   `check_pow` validates against. Zero shares submitted, at any hashrate.
+
+   The two numbers are not close enough to be confused at a glance: at testnet
+   height 485,897 the difficulty was `3912040448` (10 digits) and the target
+   `29598898778389163379010897437604384363675568080188445020547283242588`
+   (68 digits). Anything under ~20 digits appearing in `b` is a bug, not a
+   low-difficulty epoch.
 
 5. **Assemble WorkMessage:**
    ```rust
@@ -906,7 +929,11 @@ The candidate is cached and served to multiple miner polls:
 
 5. **Verify PoW:** `AutolykosPowScheme::validate(header)`.
    - Compute `hit = pow_hit(header)` using the Autolykos v2 algorithm
-   - Verify `hit < target` where `target = decode_compact_bits(n_bits)`
+   - Verify `hit < target` where `target = enr_chain::pow_target(n_bits)`,
+     i.e. `q / decode_compact_bits(n_bits)` — the same value served as
+     `WorkMessage.b`. Serving one number and validating against another is
+     precisely the v0.8.0 defect; these two must not be allowed to drift
+     apart again.
    - On failure (all candidates tried): return 400 "invalid PoW solution"
 
 6. **Assemble full block:**
@@ -1209,14 +1236,46 @@ return 503 with `"reason": "mining not configured"`.
     voting bytes are included. Epoch boundary produces parameter updates.
 
 12. **JVM compatibility:** Generate a candidate from the same chain state
-    as a JVM node. Compare `WorkMessage.msg` byte-for-byte. This is the
-    ultimate correctness test — if `msg` matches, the header serialization
-    is correct.
+    as a JVM node. Compare `WorkMessage.msg` byte-for-byte — if `msg`
+    matches, the header serialization is correct.
 
-13. **Digest mode rejection:** Start node in digest mode, verify
+    ⚠ **`msg` matching proves header serialization and nothing else.** This
+    item claimed to be "the ultimate correctness test" and it is not: a
+    candidate can have a byte-perfect `msg` and still be unmineable, which is
+    exactly what shipped in v0.8.0. Compare **every** served field against the
+    JVM's, `b` included.
+
+13. **Target vector (regression):** Assert the served `b` against a fixed
+    known-good pair captured from a Scala node, not against our own formula —
+    a test that recomputes `pow_target` the way the implementation does will
+    pass on any consistent-but-wrong definition.
+
+    ```
+    n_bits     83945773            (0x0500e92d)
+    difficulty 3912040448
+    b          29598898778389163379010897437604384363675568080188445020547283242588
+    ```
+
+    Captured at testnet height 485,897. The `difficulty` and `b` values are
+    observed — `b` was cross-checked digit for digit against a Scala node
+    serving the same height, remainder `1309294913`. **`n_bits` is derived**,
+    by canonical compact-bits encoding of the observed difficulty, and was not
+    read off the wire. So assert the round-trip
+    `decode_compact_bits(83945773) == 3912040448` **first**: if the derivation
+    is wrong, that fails loudly instead of the target assertion quietly
+    testing some other difficulty. The pre-fix code served `3912040448` as
+    `b`.
+
+    The three pre-existing tests over `b` asserted that it was non-empty
+    (`mine_blocks.rs`), stable across polls (`candidate_generator.rs`), and
+    emitted as a bare JSON number rather than a quoted string (`types.rs`).
+    All three passed throughout. **A field can be present, consistent and
+    well-typed while being the wrong quantity** — assert the value.
+
+14. **Digest mode rejection:** Start node in digest mode, verify
     `/mining/candidate` returns 503.
 
-14. **No miner PK:** Start with empty `miner_pk` config, verify 503.
+15. **No miner PK:** Start with empty `miner_pk` config, verify 503.
 
-15. **Prover rollback:** After `proofs_for_transactions()`, verify the
+16. **Prover rollback:** After `proofs_for_transactions()`, verify the
     validator's prover digest is identical to before the call.

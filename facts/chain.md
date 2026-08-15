@@ -31,10 +31,38 @@ Stateless observer. Tracks headers seen on the network without validating chain 
 
 ## Phase 2: PoW Verification
 
+### `pow_target(n_bits: u32) -> BigInt`
+
+The Autolykos mining target: `order_bigint() / decode_compact_bits(n_bits)`,
+where `order_bigint()` is the secp256k1 group order `q`.
+
+- **Postcondition**: Returns the value a `pow_hit` must fall strictly below.
+- **Invariant**: Never equal to `decode_compact_bits(n_bits)`. That function
+  returns the **difficulty**, and the target is `q` divided by it. Since
+  `q ≈ 1.16 × 10^77`, the two differ by roughly `77 − 2·log₁₀(difficulty)`
+  decimal orders of magnitude — tens of orders at any real difficulty, so
+  they are never plausibly mistaken for each other in a log line.
+
+⚠ **This is the only sanctioned way to obtain a target, and it exists because
+the formula was independently re-derived once and got it wrong.** `mining/`
+sent `decode_compact_bits(n_bits)` directly as the `WorkMessage.b` field, so
+external miners were handed a target ~10^58 times harder than the real one and
+submitted zero shares while the node's own `check_pow` — which computes the
+target correctly — stood ready to accept blocks nobody could find. Serve-side
+and verify-side must resolve to the same number by construction, not by two
+call sites agreeing to spell out the same division. **Do not inline
+`order_bigint() / decode_compact_bits(..)` at a new call site; call this.**
+
+The naming is the trap: `decode_compact_bits` sounds like it yields the thing
+you compare a hash against, and every other consumer in this repo binds it to a
+variable named `difficulty` — which is correct, and is what made the one site
+that named it `target` invisible in review.
+
 ### `verify_pow(header: &Header) -> Result<()>`
 - **Precondition**: Header is parsed (Phase 1).
-- **Postcondition**: Ok if `pow_hit(header) <= target(header.n_bits)`. Err otherwise.
-- **Uses**: `ergo-chain-types::AutolykosPowScheme::pow_hit()`.
+- **Postcondition**: Ok if `pow_hit(header) < pow_target(header.n_bits)`,
+  strictly. Err otherwise.
+- **Uses**: `ergo-chain-types::AutolykosPowScheme::pow_hit()`, `pow_target`.
 - **Cost**: One hash computation. Cheap enough to call on every header before forwarding.
 - **Invariant**: A header that fails PoW is never valid regardless of chain context.
 
