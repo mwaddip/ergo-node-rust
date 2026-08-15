@@ -30,7 +30,7 @@ pub use nipopow_proof::{
     verify_nipopow_proof_bytes, NipopowVerificationResult,
 };
 pub use num_bigint::{BigInt, BigUint};
-pub use pow::verify_pow;
+pub use pow::{pow_target, verify_pow};
 pub use section::{
     required_section_ids, section_ids, AD_PROOFS_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID,
     EXTENSION_TYPE_ID, HEADER_TYPE_ID, TRANSACTION_TYPE_ID,

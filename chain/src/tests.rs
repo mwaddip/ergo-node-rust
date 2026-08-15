@@ -215,6 +215,47 @@ mod pow_tests {
         assert_eq!(parsed.id, from_json.id);
         assert!(verify_pow(&parsed).is_ok());
     }
+
+    /// `pow_target` against values observed on a live Scala node.
+    ///
+    /// Provenance — which numbers are evidence and which is arithmetic:
+    ///   - `difficulty` (3912040448) and `target` (the 68-digit literal) were read
+    ///     off a Scala node at testnet height 485,897 and compared digit for digit.
+    ///     These are observations.
+    ///   - `n_bits` (83945773 = 0x0500e92d) is **derived** — computed here by
+    ///     canonical compact-bits encoding of the observed difficulty, not read
+    ///     off the wire. The round-trip assertion below runs first so a bad
+    ///     derivation fails loudly instead of quietly testing a different
+    ///     difficulty than the one the target was observed against.
+    ///
+    /// Asserted as literals on purpose. Restating the formula
+    /// (`pow_target(n) == order_bigint() / decode_compact_bits(n)`) would pass on
+    /// any self-consistent definition, including the wrong one that shipped in
+    /// `mining/` and handed miners an impossible target.
+    #[test]
+    fn pow_target_matches_scala_node() {
+        use crate::{decode_compact_bits, pow_target, BigInt};
+        use std::str::FromStr;
+
+        const N_BITS: u32 = 83945773; // 0x0500e92d — derived, see above
+        const DIFFICULTY: u64 = 3912040448; // observed
+        const TARGET: &str = // observed
+            "29598898778389163379010897437604384363675568080188445020547283242588";
+
+        // Derivation check first: does this n_bits actually encode that difficulty?
+        assert_eq!(
+            decode_compact_bits(N_BITS),
+            BigInt::from(DIFFICULTY),
+            "n_bits derivation is wrong — the target assertion below would be \
+             testing a difficulty the Scala node never reported"
+        );
+
+        assert_eq!(pow_target(N_BITS), BigInt::from_str(TARGET).unwrap());
+
+        // The invariant the contract states: the target is never the difficulty.
+        // At this difficulty they are ~58 decimal orders of magnitude apart.
+        assert_ne!(pow_target(N_BITS), decode_compact_bits(N_BITS));
+    }
 }
 
 #[cfg(test)]
