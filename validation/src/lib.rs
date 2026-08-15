@@ -18,12 +18,14 @@ pub use sections::{
     parse_block_transactions, parse_extension, serialize_ad_proofs, serialize_block_transactions,
     serialize_extension, ExtensionField, ParsedAdProofs, ParsedBlockTransactions, ParsedExtension,
 };
-pub use state_changes::{compute_state_changes, transactions_to_summaries, StateChanges};
+pub use state_changes::{
+    compute_state_changes, transactions_to_summaries, Insertion, StateChanges,
+};
 pub use tx_validation::{
     build_state_context, build_upcoming_state_context, deserialize_box, evaluate_scripts,
     validate_single_transaction,
 };
-pub use utxo::{proofs_from_storage, UtxoValidator};
+pub use utxo::{proofs_from_storage, EmissionSource, UtxoValidator};
 pub use voting::{pack_parameters, parse_parameters_from_extension};
 
 // Re-export types needed by mempool callers
@@ -218,6 +220,11 @@ pub trait MiningState {
     ///
     /// `None` means **all ERG has been emitted** — nothing else. It no longer
     /// doubles as the digest-mode signal.
+    ///
+    /// ⚠ **Valid immediately after construction, not only after the first
+    /// applied block.** [`UtxoValidator::new`] recovers it from a required
+    /// [`EmissionSource`]; see facts/validation.md, "Recovering
+    /// `emission_box_id` on resume".
     fn emission_box_id(&self) -> Option<[u8; 32]>;
 }
 

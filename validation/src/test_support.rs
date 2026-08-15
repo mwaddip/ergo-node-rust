@@ -79,10 +79,19 @@ pub fn serialized_box(ergo_box: &ErgoBox) -> Vec<u8> {
 /// preserved exactly — Ergo forbids burning ERG, and an unbalanced tx would
 /// fail for a reason that has nothing to do with what these tests measure.
 pub fn spend_tx(inputs: &[ErgoBox]) -> Transaction {
+    spend_tx_to(inputs, sigma_bool_tree(true))
+}
+
+/// As [`spend_tx`], but the single output is guarded by `output_tree`.
+///
+/// Output scripts are never evaluated — only inputs' are — so any tree works
+/// here, including the emission contract, which is what the emission-recovery
+/// tests need a block to create.
+pub fn spend_tx_to(inputs: &[ErgoBox], output_tree: ErgoTree) -> Transaction {
     let total: u64 = inputs.iter().map(|b| *b.value.as_u64()).sum();
     let output = ErgoBoxCandidate {
         value: BoxValue::try_from(total).expect("output value above the minimum"),
-        ergo_tree: sigma_bool_tree(true),
+        ergo_tree: output_tree,
         tokens: None,
         additional_registers: NonMandatoryRegisters::empty(),
         creation_height: BLOCK_HEIGHT,

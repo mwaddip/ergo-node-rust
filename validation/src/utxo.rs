@@ -16,13 +16,55 @@ use ergo_chain_types::{blake2b256_hash, ADDigest, Header};
 use ergo_lib::chain::parameters::Parameters;
 
 use crate::sections::{parse_block_transactions, parse_extension};
-use crate::state_changes::{compute_state_changes, transactions_to_summaries};
+use crate::state_changes::{compute_state_changes, transactions_to_summaries, Insertion};
 use crate::tx_validation;
 use crate::voting;
 use crate::{
     ApplyStateOutcome, BlockValidator, MiningState, ProverMemoryEstimate, ScriptEvalInputs,
     StatePersistence, ValidationError,
 };
+
+/// Where a freshly constructed [`UtxoValidator`] recovers `emission_box_id`
+/// from.
+///
+/// [`UtxoValidator::new`] takes one of these by value, so a caller cannot
+/// build a validator without saying where the emission box comes from. That
+/// is the whole design: `emission_box_id` is derived state maintained by
+/// `apply_state`, so a validator that has applied nothing reports `None` —
+/// the value that means **all ERG has been emitted**. `main`'s
+/// `update_mining_proofs` returns early on it, so a node restarted at the
+/// chain tip served no mining candidate at all until a peer delivered the
+/// next block; for a solo miner that is a deadlock, not a delay
+/// (facts/validation.md, "Recovering `emission_box_id` on resume").
+///
+/// The variants are deliberately not an `Option`. "No block exists yet"
+/// (genesis) and "I could not read the block" are different facts with
+/// different consequences, and collapsing them into one `None` is the exact
+/// overload this type exists to remove.
+pub enum EmissionSource<'a> {
+    /// Raw BlockTransactions (type-102) section bytes of the block at the
+    /// validator's resume height.
+    ///
+    /// The coinbase spends and recreates the emission box in every block that
+    /// has one, so this block's insertions contain the current emission box.
+    /// One block to parse — **not** a UTXO-set scan, which would be O(millions
+    /// of boxes) on the startup path.
+    TipBlock(&'a [u8]),
+
+    /// The boxes a genesis bootstrap just inserted, for a validator starting
+    /// at height 0 where no block exists yet. One of them carries the emission
+    /// contract.
+    GenesisBoxes(&'a [Insertion]),
+
+    /// Neither is obtainable — e.g. UTXO snapshot bootstrap, which loads a
+    /// state tree at a height whose block transactions were never downloaded.
+    ///
+    /// `emission_box_id` stays `None` and `reason` is logged at WARN. Stating
+    /// a reason is the price of this variant: an unexplained `None` here is
+    /// indistinguishable from the legitimate one, which is how the defect this
+    /// type addresses stayed invisible.
+    Unavailable(&'a str),
+}
 
 /// UTXO-mode block validator.
 ///
@@ -67,11 +109,21 @@ impl UtxoValidator {
     /// scripts are evaluated: at or below it they are skipped, above it they
     /// always run. There is no mode to configure and no way for a caller to
     /// end up holding an evaluation this validator did not perform.
+    ///
+    /// `emission_source` is required, not optional, because forgetting it is
+    /// the defect: `emission_box_id` used to start at `None` and only ever be
+    /// written from `apply_state`, so a validator constructed at the tip
+    /// reported "all ERG emitted" until a block arrived. See
+    /// [`EmissionSource`]. The returned validator's `emission_box_id()` is
+    /// valid immediately — there is no second call to remember, and no
+    /// defaulted method a wrapper can silently swallow the way the enum
+    /// wrapper in `src/main.rs` swallowed `resize_cache`.
     pub fn new(
         storage: RedbAVLStorage,
         prover: BatchAVLProver,
         height: u32,
         checkpoint_height: u32,
+        emission_source: EmissionSource<'_>,
     ) -> Self {
         let digest_bytes = prover.digest().expect("prover has no root");
         let digest = bytes_to_ad_digest(&digest_bytes);
@@ -90,13 +142,16 @@ impl UtxoValidator {
                 Vec::new()
             };
 
+        let emission_box_id =
+            recover_emission_box_id(&emission_source, &emission_tree_bytes, height);
+
         Self {
             storage,
             prover,
             validated_height: height,
             checkpoint_height,
             current_digest: digest,
-            emission_box_id: None,
+            emission_box_id,
             emission_tree_bytes,
             adproof_dump_heights: HashSet::new(),
             adproof_dump_dir: None,
@@ -112,6 +167,135 @@ impl UtxoValidator {
         self.adproof_dump_heights = heights;
         self.adproof_dump_dir = Some(dir);
     }
+}
+
+/// Which of `insertions` carries the emission contract, if any.
+///
+/// **The single implementation of "which box is the emission box."** Step 9 of
+/// `apply_state_internal` and construction-time recovery both call it, and
+/// neither may grow its own copy: two implementations of this match is
+/// precisely the divergence facts/validation.md exists to prevent, and if they
+/// ever disagreed the node would mine against the wrong box. The equivalence
+/// is asserted in `recovery_at_the_tip_matches_applying_the_same_block`, not
+/// merely asserted here in prose.
+///
+/// `None` means no insertion carries the contract. Read against a block that
+/// was parsed successfully, that means emission has ended — see
+/// [`recover_emission_box_id`] for why the caller must not treat every `None`
+/// alike.
+fn find_emission_box(insertions: &[Insertion], emission_tree_bytes: &[u8]) -> Option<[u8; 32]> {
+    use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+
+    insertions.iter().find_map(|(box_id, box_bytes)| {
+        let ergo_box = tx_validation::deserialize_box(box_bytes).ok()?;
+        let tree_bytes = ergo_box.ergo_tree.sigma_serialize_bytes().ok()?;
+        (tree_bytes == emission_tree_bytes).then_some(*box_id)
+    })
+}
+
+/// The insertions a block's transactions produce, by the same route
+/// `apply_state_internal` takes to them.
+///
+/// Routed through `compute_state_changes` rather than reading `tx.outputs`
+/// directly, so intra-block netting and ordering are identical to the apply
+/// path by construction. A second derivation here could disagree with the
+/// first and nothing would notice.
+fn insertions_of_block(section_bytes: &[u8]) -> Result<Vec<Insertion>, ValidationError> {
+    let parsed = parse_block_transactions(section_bytes)?;
+    let summaries = transactions_to_summaries(&parsed.transactions)?;
+    Ok(compute_state_changes(summaries)?.insertions)
+}
+
+/// Resolve `emission_box_id` for a validator that has applied no block yet.
+///
+/// Both outcomes are `None`-shaped and only one of them is benign, so they are
+/// logged differently:
+///
+/// - **Read the source, found no emission output** → emission has ended. The
+///   documented meaning of `None`; logged at INFO.
+/// - **Could not read the source** → unknown. Logged at WARN, because a silent
+///   `None` here is byte-identical to the legitimate answer above, and that
+///   indistinguishability is how the original defect survived: during sync a
+///   block lands within seconds and the field fills itself, so only an at-tip
+///   restart ever exposed it.
+///
+/// It does not fail construction. An unreadable tip block costs mining until
+/// the next applied block; it is not a reason to refuse to start a node that
+/// can still validate, serve, and sync.
+fn recover_emission_box_id(
+    source: &EmissionSource<'_>,
+    emission_tree_bytes: &[u8],
+    height: u32,
+) -> Option<[u8; 32]> {
+    // No contract bytes means the match can never succeed, so every answer
+    // below would be a `None` that says "emission ended" about a scan that
+    // never ran. Same trap, one level earlier.
+    if emission_tree_bytes.is_empty() {
+        tracing::warn!(
+            height,
+            "emission contract ErgoTree could not be built — emission_box_id \
+             cannot be tracked at all and mining will produce no candidates"
+        );
+        return None;
+    }
+
+    let found = match source {
+        EmissionSource::TipBlock(section_bytes) => match insertions_of_block(section_bytes) {
+            Ok(insertions) => {
+                let found = find_emission_box(&insertions, emission_tree_bytes);
+                if found.is_none() {
+                    tracing::info!(
+                        height,
+                        "block at resume height created no emission output — \
+                         all ERG has been emitted"
+                    );
+                }
+                found
+            }
+            Err(e) => {
+                tracing::warn!(
+                    height,
+                    error = %e,
+                    "emission_box_id recovery failed: the block at the resume \
+                     height could not be read; mining is unavailable until the \
+                     next block is applied"
+                );
+                return None;
+            }
+        },
+        EmissionSource::GenesisBoxes(boxes) => {
+            let found = find_emission_box(boxes, emission_tree_bytes);
+            if found.is_none() {
+                // Emission cannot have ended at genesis, so this is a broken
+                // bootstrap rather than the legitimate `None`.
+                tracing::warn!(
+                    height,
+                    box_count = boxes.len(),
+                    "emission_box_id recovery failed: no genesis box carries the \
+                     emission contract"
+                );
+            }
+            found
+        }
+        EmissionSource::Unavailable(reason) => {
+            tracing::warn!(
+                height,
+                reason,
+                "emission_box_id could not be recovered; mining is unavailable \
+                 until the next block is applied"
+            );
+            return None;
+        }
+    };
+
+    if let Some(id) = found {
+        tracing::info!(
+            height,
+            emission_box_id = %hex::encode(id),
+            "recovered emission box at construction"
+        );
+    }
+    found
 }
 
 impl BlockValidator for UtxoValidator {
@@ -482,20 +666,13 @@ impl UtxoValidator {
             }
         }
 
-        // 9. Track emission box: scan new outputs for emission contract
+        // 9. Track emission box: scan new outputs for the emission contract.
+        //    [`find_emission_box`] is shared with construction-time recovery —
+        //    the two paths must not drift, or a resumed node mines against a
+        //    different box than an applying one.
         if !self.emission_tree_bytes.is_empty() {
-            self.emission_box_id = None;
-            for (box_id, box_bytes) in &changes.insertions {
-                if let Ok(ergo_box) = tx_validation::deserialize_box(box_bytes) {
-                    use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
-                    if let Ok(tree_bytes) = ergo_box.ergo_tree.sigma_serialize_bytes() {
-                        if tree_bytes == self.emission_tree_bytes {
-                            self.emission_box_id = Some(*box_id);
-                            break;
-                        }
-                    }
-                }
-            }
+            self.emission_box_id =
+                find_emission_box(&changes.insertions, &self.emission_tree_bytes);
         }
 
         // 10. Advance state
@@ -680,7 +857,9 @@ mod tests {
     use enr_state::{AVLTreeParams, CacheSize, RedbAVLStorage};
     use ergo_chain_types::Digest32;
     use ergo_lib::chain::transaction::Transaction;
+    use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
     use tempfile::TempDir;
+    use tracing_test::traced_test;
 
     const KEY_LEN: usize = 32;
 
@@ -726,7 +905,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut storage = open_storage(&dir);
         let prover = seed(&mut storage, boxes);
-        (UtxoValidator::new(storage, prover, SEED_HEIGHT, 0), dir)
+        (
+            UtxoValidator::new(
+                storage,
+                prover,
+                SEED_HEIGHT,
+                0,
+                EmissionSource::Unavailable("seeded fixture: no tip block"),
+            ),
+            dir,
+        )
     }
 
     /// What the block under test must claim to be accepted: the post-block
@@ -917,7 +1105,13 @@ mod tests {
         let prover = seed(&mut storage, std::slice::from_ref(&input));
         // Checkpoint at the block's own height: `height > checkpoint` is
         // false, so the unsatisfiable script is never looked at.
-        let mut validator = UtxoValidator::new(storage, prover, SEED_HEIGHT, BLOCK_HEIGHT);
+        let mut validator = UtxoValidator::new(
+            storage,
+            prover,
+            SEED_HEIGHT,
+            BLOCK_HEIGHT,
+            EmissionSource::Unavailable("checkpoint fixture: no tip block"),
+        );
 
         block
             .apply(&mut validator)
@@ -1177,6 +1371,211 @@ mod tests {
         assert_eq!(
             released.resident_nodes_bytes, idle.resident_nodes_bytes,
             "lookups changed the resident figure"
+        );
+    }
+
+    // ── Emission box recovery at construction ────────────────────────────
+    //
+    // `emission_box_id` is derived state that step 9 of `apply_state`
+    // maintains. What these cover is the value a validator reports *before*
+    // it has applied anything — the state a node restarted at the chain tip
+    // is in, where `None` reads as "all ERG has been emitted" and mining
+    // therefore never starts.
+
+    fn emission_tree() -> ErgoTree {
+        use ergo_lib::chain::emission::MonetarySettings;
+        use ergo_lib::chain::ergo_tree_predef;
+        ergo_tree_predef::emission_box_prop(&MonetarySettings::default())
+            .expect("the emission contract builds")
+    }
+
+    /// A block at `BLOCK_HEIGHT` whose single transaction recreates the
+    /// emission box, plus the input it spends — the shape of every real
+    /// coinbase, which is what makes the tip block a sufficient source.
+    fn emission_block(seed: u8) -> (ErgoBox, Transaction, Block) {
+        let input = make_box(true, seed);
+        let tx = spend_tx_to(std::slice::from_ref(&input), emission_tree());
+        let ops = block_operations(std::slice::from_ref(&tx));
+        let (state_root, ad_root) = oracle(std::slice::from_ref(&input), &ops);
+        let block = Block::new(std::slice::from_ref(&tx), state_root, ad_root);
+        (input, tx, block)
+    }
+
+    /// The whole point of the change, and the structural assertion that both
+    /// paths run one implementation: a validator that has applied nothing must
+    /// already name **the same box** applying the block would have named.
+    ///
+    /// Asserting only `is_some()` would pass on a second, divergent scan that
+    /// picked a different output — the failure mode where a resumed node mines
+    /// against the wrong box and every block it produces is rejected.
+    #[test]
+    fn recovery_at_the_tip_matches_applying_the_same_block() {
+        let (input, tx, block) = emission_block(7);
+
+        // The applying path.
+        let (mut applied, _applied_dir) = seeded_validator(std::slice::from_ref(&input));
+        assert_eq!(
+            applied.emission_box_id(),
+            None,
+            "fixture is degenerate — this validator already knew the answer \
+             before applying anything"
+        );
+        block.apply(&mut applied).expect("valid block applies");
+        let after_apply = applied
+            .emission_box_id()
+            .expect("the applied block recreated the emission box");
+
+        // The resume path: a fresh validator over the post-block box set,
+        // handed that block's section bytes and nothing else. (`seed` commits
+        // at SEED_HEIGHT while the validator resumes at BLOCK_HEIGHT —
+        // immaterial, because recovery reads the section bytes, never the
+        // tree. Which is exactly why it costs one block to parse instead of a
+        // UTXO-set scan.)
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut storage = open_storage(&dir);
+        let prover = seed(&mut storage, tx.outputs.as_vec());
+        let resumed = UtxoValidator::new(
+            storage,
+            prover,
+            BLOCK_HEIGHT,
+            0,
+            EmissionSource::TipBlock(&block.txs),
+        );
+
+        assert_eq!(
+            resumed.validated_height(),
+            BLOCK_HEIGHT,
+            "the resumed validator is not where the tip block left it"
+        );
+        assert_eq!(
+            resumed.emission_box_id(),
+            Some(after_apply),
+            "a validator resumed at the tip names a different emission box \
+             than one that applied the same block"
+        );
+    }
+
+    /// `None` from a source that read cleanly is the documented answer rather
+    /// than a failure: the tip block created no emission output, so emission
+    /// has ended.
+    #[test]
+    fn a_tip_block_without_an_emission_output_recovers_none() {
+        let input = make_box(true, 8);
+        let tx = spend_tx(std::slice::from_ref(&input));
+        let (txs, _extension) = sections(std::slice::from_ref(&tx));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut storage = open_storage(&dir);
+        let prover = seed(&mut storage, std::slice::from_ref(&input));
+        let validator = UtxoValidator::new(
+            storage,
+            prover,
+            BLOCK_HEIGHT,
+            0,
+            EmissionSource::TipBlock(&txs),
+        );
+
+        assert_eq!(
+            validator.emission_box_id(),
+            None,
+            "a block whose outputs carry no emission contract reported one"
+        );
+    }
+
+    /// The case that must never be silent. `None` here is byte-identical to
+    /// the legitimate answer above, so without the WARN an operator cannot
+    /// tell "emission ended" from "I could not read the block" — which is how
+    /// the original defect survived to reach the field.
+    #[traced_test]
+    #[test]
+    fn an_unreadable_tip_block_recovers_none_and_warns() {
+        // A well-formed header id followed by a claim of five transactions and
+        // no transaction bytes: parses far enough to be a real section and
+        // then fails, rather than being rejected on length alone.
+        let mut malformed = vec![0u8; 32];
+        malformed.push(5);
+
+        let input = make_box(true, 9);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut storage = open_storage(&dir);
+        let prover = seed(&mut storage, std::slice::from_ref(&input));
+        let validator = UtxoValidator::new(
+            storage,
+            prover,
+            BLOCK_HEIGHT,
+            0,
+            EmissionSource::TipBlock(&malformed),
+        );
+
+        assert_eq!(validator.emission_box_id(), None);
+        assert!(
+            logs_contain("emission_box_id recovery failed"),
+            "an unreadable tip block left `None` silently"
+        );
+    }
+
+    /// The caller that cannot supply a source at all — UTXO snapshot
+    /// bootstrap, which loads a tree at a height whose block transactions were
+    /// never downloaded. It must say why, and the why must reach the log.
+    #[traced_test]
+    #[test]
+    fn an_unavailable_source_recovers_none_and_names_its_reason() {
+        let input = make_box(true, 10);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut storage = open_storage(&dir);
+        let prover = seed(&mut storage, std::slice::from_ref(&input));
+        let validator = UtxoValidator::new(
+            storage,
+            prover,
+            BLOCK_HEIGHT,
+            0,
+            EmissionSource::Unavailable("snapshot bootstrap: no block at the snapshot height"),
+        );
+
+        assert_eq!(validator.emission_box_id(), None);
+        assert!(
+            logs_contain("snapshot bootstrap: no block at the snapshot height"),
+            "the caller's reason never reached the log"
+        );
+    }
+
+    /// The genesis arm. At height 0 there is no tip block, and the emission box
+    /// is one of the three boxes the bootstrap just inserted. Left uncovered, a
+    /// node mining a fresh chain would deadlock at height 1 for exactly the
+    /// reason an at-tip restart did.
+    ///
+    /// Built from `ergo-lib`'s own `genesis_boxes`, which is what `main` calls,
+    /// so this also pins the assumption underneath the whole file: that the
+    /// genesis emission box carries the same `emission_box_prop` tree
+    /// `UtxoValidator::new` computes.
+    #[test]
+    fn genesis_boxes_recover_the_emission_box() {
+        use ergo_lib::chain::emission::MonetarySettings;
+        use ergo_lib::chain::genesis::genesis_boxes;
+        use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
+
+        let founders = vec![ProveDlog::new(ergo_chain_types::EcPoint::default())];
+        let (emission, no_premine, founders_box) =
+            genesis_boxes(&MonetarySettings::default(), &founders, 1, &[])
+                .expect("genesis boxes construct");
+
+        let boxes: Vec<([u8; 32], Vec<u8>)> = [&emission, &no_premine, &founders_box]
+            .into_iter()
+            .map(|b| (box_key(b), serialized_box(b)))
+            .collect();
+
+        let input = make_box(true, 11);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut storage = open_storage(&dir);
+        let prover = seed(&mut storage, std::slice::from_ref(&input));
+        let validator =
+            UtxoValidator::new(storage, prover, 0, 0, EmissionSource::GenesisBoxes(&boxes));
+
+        assert_eq!(
+            validator.emission_box_id(),
+            Some(box_key(&emission)),
+            "the genesis emission box was not recognised — `emission_box_prop` \
+             and the genesis bootstrap have diverged"
         );
     }
 }

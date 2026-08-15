@@ -15,14 +15,22 @@ pub struct TxSummary {
     pub output_entries: Vec<([u8; 32], Vec<u8>)>,
 }
 
+/// One box entering the UTXO set: `(box_id, serialized_box_bytes)`.
+///
+/// The same pair the genesis bootstrap produces, which is why
+/// [`crate::EmissionSource::GenesisBoxes`] carries it too — the emission-box
+/// scan reads insertions and does not care which side of the chain's first
+/// block they came from.
+pub type Insertion = ([u8; 32], Vec<u8>);
+
 /// AVL+ tree operations derived from a block's transactions.
 pub struct StateChanges {
     /// Data input lookups (box_id). Applied first.
     pub lookups: Vec<[u8; 32]>,
     /// Input removals (box_id). Applied second.
     pub removals: Vec<[u8; 32]>,
-    /// Output insertions (box_id, serialized_box_bytes). Applied third.
-    pub insertions: Vec<([u8; 32], Vec<u8>)>,
+    /// Output insertions. Applied third.
+    pub insertions: Vec<Insertion>,
 }
 
 /// Compute AVL+ tree operations from transaction summaries.
@@ -43,7 +51,7 @@ pub fn compute_state_changes(
     let mut removals: Vec<[u8; 32]> = Vec::new();
     let mut lookups: Vec<[u8; 32]> = Vec::new();
     // Preserve transaction output order for insertions
-    let mut all_inserts: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+    let mut all_inserts: Vec<Insertion> = Vec::new();
 
     for summary in &tx_summaries {
         for &input_id in &summary.input_ids {
@@ -75,7 +83,7 @@ pub fn compute_state_changes(
     // Lookups preserve transaction order (data inputs don't modify the tree).
     removals.sort();
 
-    let mut insertions: Vec<([u8; 32], Vec<u8>)> = all_inserts
+    let mut insertions: Vec<Insertion> = all_inserts
         .into_iter()
         .filter(|(id, _)| !netted.contains(id))
         .collect();
