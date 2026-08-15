@@ -2163,15 +2163,16 @@ components:
             Autolykos mining target: `q / decode_compact_bits(nBits)`, where
             `q` is the secp256k1 group order. A solution is valid when its
             `pow_hit` is strictly below this. **Not the difficulty** — that is
-            the decoded `nBits`, and serving it here instead is the v0.8.0
-            defect that left external miners unable to find anything (see
-            `facts/mining.md` § "Candidate Assembly" step 4).
+            the decoded `nBits`, and serving it here instead is the defect
+            fixed in v0.8.0 that left external miners unable to find anything.
+            Present in every release from v0.1.0 through v0.7.11 — see
+            `facts/mining.md` § "Candidate Assembly" step 4.
 
             Emitted as a **bare JSON number**, matching JVM's
             `ExternalCandidateBlock` — not a quoted string, which is what this
-            schema claimed until v0.8.0 while the wire has always sent a
-            number. A client generated from the old spec did not merely lose
-            precision, it failed to parse.
+            schema claimed until it was corrected in v0.8.0, while the wire has
+            always sent a number. A client generated from the old spec did not
+            merely lose precision, it failed to parse.
 
             Ranges to ~2^256 (typically ~68 decimal digits), so it exceeds
             IEEE-754 double precision. Consumers must parse it with an
@@ -2191,7 +2192,7 @@ components:
             header-without-PoW, hex) plus `txProofs` (Merkle membership proofs
             for mandatory transactions), letting a miner verify it is working
             on a real candidate. Nothing to do with sigma proofs, which is what
-            this description claimed until v0.8.0.
+            this description claimed until it was corrected in v0.8.0.
 
             Omitted entirely today: the basic candidate carries only the
             emission transaction, so there are no mandatory-tx proofs, and the

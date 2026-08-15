@@ -66,9 +66,9 @@ current candidate is lost; miners just poll for a new one.
 - `ergo-nipopow` — interlink vector computation for extension section
 - `enr-chain` — `pow_target(n_bits)`, the single definition of the Autolykos
   mining target served as `WorkMessage.b`. The crate consumed
-  `ergo-chain-types` directly and re-derived the target itself until v0.8.0,
-  which is how it came to serve the difficulty instead. No cycle: `chain/` has
-  no in-repo path dependencies.
+  `ergo-chain-types` directly and re-derived the target itself — from the
+  crate's completion through `v0.7.11` — which is how it came to serve the
+  difficulty instead. No cycle: `chain/` has no in-repo path dependencies.
 - `ergo-validation` — `compute_state_changes`, `validate_single_transaction`,
   `build_state_context`, `Parameters`
 - `ergo_avltree_rust` — via UtxoValidator (temporary prover operations for
@@ -848,10 +848,24 @@ Convert the candidate into the data miners need.
    ⚠ **Not `decode_compact_bits(candidate.n_bits)` — that is the difficulty.**
    The target is `q / difficulty` where `q` is the secp256k1 group order, and
    `pow_target` in `facts/chain.md` § "Phase 2" is the single definition of it.
-   This step said `decode_compact_bits` until v0.8.0 and the implementation
-   faithfully matched it, which is how a released node spent its serve path
-   advertising a target ~10^58 times harder than the one its own
-   `check_pow` validates against. Zero shares submitted, at any hashrate.
+   This step said `decode_compact_bits` and the implementation faithfully
+   matched it, so the serve path advertised a target tens of orders of
+   magnitude harder than the one `check_pow` actually enforces. Zero shares
+   submitted, at any hashrate.
+
+   ⚠ **This is not a v0.8.0 regression. It dates to `5b65e49`, the commit that
+   completed this crate, and is present in every tagged release from `v0.1.0`
+   through `v0.7.11` — 42 of them.** External mining has never worked in a
+   released build of this node. It was caught on the `release/v0.8.0` branch,
+   before that tag existed, only because an operator pointed a real GPU at it.
+
+   Nothing that came before could have caught it. "Verified at runtime against
+   mainnet tip" meant candidate *assembly* was correct — well-formed, JVM-shaped,
+   byte-identical `msg`. Even the two earlier JVM-compat serve fixes (`b` as a
+   bare number, `proof` omitted when empty) were about making a real miner
+   **parse** the candidate; once it parsed, it mined against an impossible bound
+   and the only symptom was silence. **A miner that receives, parses and accepts
+   your candidate and then reports nothing is not idle — check `b`.**
 
    The two numbers are not close enough to be confused at a glance: at testnet
    height 485,897 the difficulty was `3912040448` (10 digits) and the target
@@ -932,7 +946,8 @@ The candidate is cached and served to multiple miner polls:
    - Verify `hit < target` where `target = enr_chain::pow_target(n_bits)`,
      i.e. `q / decode_compact_bits(n_bits)` — the same value served as
      `WorkMessage.b`. Serving one number and validating against another is
-     precisely the v0.8.0 defect; these two must not be allowed to drift
+     precisely the defect fixed in v0.8.0 (present since v0.1.0 — see
+     § "Candidate Assembly" step 4); these two must not be allowed to drift
      apart again.
    - On failure (all candidates tried): return 400 "invalid PoW solution"
 
@@ -1242,8 +1257,8 @@ return 503 with `"reason": "mining not configured"`.
     ⚠ **`msg` matching proves header serialization and nothing else.** This
     item claimed to be "the ultimate correctness test" and it is not: a
     candidate can have a byte-perfect `msg` and still be unmineable, which is
-    exactly what shipped in v0.8.0. Compare **every** served field against the
-    JVM's, `b` included.
+    exactly what shipped in every release from v0.1.0 to v0.7.11. Compare
+    **every** served field against the JVM's, `b` included.
 
 13. **Target vector (regression):** Assert the served `b` against a fixed
     known-good pair captured from a Scala node, not against our own formula —
