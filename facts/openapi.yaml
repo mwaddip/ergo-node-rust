@@ -2158,8 +2158,25 @@ components:
           $ref: '#/components/schemas/HexString'
           description: Pre-image bytes the miner hashes against.
         b:
-          type: string
-          description: Difficulty target as decimal big-int string.
+          type: number
+          description: |
+            Autolykos mining target: `q / decode_compact_bits(nBits)`, where
+            `q` is the secp256k1 group order. A solution is valid when its
+            `pow_hit` is strictly below this. **Not the difficulty** — that is
+            the decoded `nBits`, and serving it here instead is the v0.8.0
+            defect that left external miners unable to find anything (see
+            `facts/mining.md` § "Candidate Assembly" step 4).
+
+            Emitted as a **bare JSON number**, matching JVM's
+            `ExternalCandidateBlock` — not a quoted string, which is what this
+            schema claimed until v0.8.0 while the wire has always sent a
+            number. A client generated from the old spec did not merely lose
+            precision, it failed to parse.
+
+            Ranges to ~2^256 (typically ~68 decimal digits), so it exceeds
+            IEEE-754 double precision. Consumers must parse it with an
+            arbitrary-precision integer type, reading the raw token rather
+            than going through a native JSON number.
         h:
           type: integer
           format: int64
@@ -2169,7 +2186,19 @@ components:
           description: Miner public key (hex-encoded).
         proof:
           type: object
-          description: Optional sigma-proof fields when the candidate requires them.
+          description: |
+            `ProofOfUpcomingTransactions` — `msgPreimage` (the serialized
+            header-without-PoW, hex) plus `txProofs` (Merkle membership proofs
+            for mandatory transactions), letting a miner verify it is working
+            on a real candidate. Nothing to do with sigma proofs, which is what
+            this description claimed until v0.8.0.
+
+            Omitted entirely today: the basic candidate carries only the
+            emission transaction, so there are no mandatory-tx proofs, and the
+            JVM encoder drops a `None` proof rather than emitting it. Omission
+            is also load-bearing — a nested proof object overflows the
+            reference Autolykos2 miner's fixed jsmn token buffer and it stops
+            mining.
 
     SolutionSubmission:
       type: object
