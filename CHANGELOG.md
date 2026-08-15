@@ -105,6 +105,52 @@
 
 ### Fixed
 
+- **External mining could never find a block — in any release before this one.**
+  `GET /mining/candidate` served the **difficulty** in the `b` field where the
+  Autolykos **target** belongs. The target is `q / difficulty` for the secp256k1
+  group order `q`; we sent the undivided difficulty, a bound tens of orders of
+  magnitude tighter than the one the node itself enforces. A miner given it
+  searches for a hash that will effectively never occur.
+
+  The symptom is silence, which is why it survived so long. The candidate is
+  well-formed, a real miner parses and accepts it, and then simply never submits
+  anything. Against a live node at testnet height 485,897 we served
+  `3912040448` where the Scala node served
+  `29598898778389163379010897437604384363675568080188445020547283242588`. A GPU
+  at 143 MH/s ran nine minutes and submitted **zero shares** — not zero accepted,
+  zero found. The same rig against a Scala node had a block accepted in 16
+  seconds.
+
+  Solution *validation* was never affected: it goes through `check_pow`, which
+  divides correctly. Serve-side and verify-side disagreed and verify-side was
+  right, so the node stood ready the whole time to accept a block it had made
+  impossible to find — confirmed by patching only the miner's bridge to
+  substitute the correct target, with no change to the node: block found and
+  accepted 50 seconds later.
+
+  **This is not a v0.8.0 regression.** It dates to the commit that completed the
+  mining crate and is present in every tagged release, `v0.1.0` through
+  `v0.7.11`. If you have ever pointed an external miner at this node and
+  concluded your hardware or pool setup was at fault, it was not. Block
+  validation, consensus and solo-mining-via-the-node's-own-candidate-assembly
+  were never affected — only the number handed to external miners.
+
+  The target is now a named primitive, `enr_chain::pow_target(n_bits)`, called
+  by both the serve path and PoW verification, rather than a division open-coded
+  at each call site. Regression tests pin the served `b` to the value observed
+  on a Scala node and assert that it is the same bound the solution path
+  enforces.
+
+- **`MiningCandidate.b` was documented as a JSON string** in
+  `facts/openapi.yaml` while the wire has always emitted a bare number. A client
+  generated from the published spec did not lose precision, it failed to parse.
+  Now `number`, with the arbitrary-precision caveat stated — a real target is
+  ~68 digits and must be read as a raw token, not an IEEE-754 double. The
+  schema's `proof` field was also described as "sigma-proof fields"; it is
+  `msgPreimage` plus Merkle membership proofs, and is omitted rather than empty
+  because a nested object overflows the reference miner's fixed jsmn token
+  buffer.
+
 - **The mempool accepted nothing.** A synced node rejected every transaction the
   network offered it with `Creation height H+1 > preheader height`, so it held a
   permanently empty pool: no relay, no fees, and mining candidates carrying only
