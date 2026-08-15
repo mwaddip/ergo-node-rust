@@ -1,0 +1,45 @@
+# Ergo Node Rust — testnet defaults
+#
+# PACKAGE-OWNED. Installed to /usr/share/ergo-node-rust/defaults/testnet.toml
+# and copied by postinst to /etc/ergo-node/conf.d/00-defaults.toml.
+#
+# ⚠ Do not edit either copy. Both are replaced on every package upgrade, which
+# is deliberate — it is what lets a corrected seed-peer list actually reach
+# existing installs instead of being frozen in a conffile forever.
+#
+# To change any of this, put your value in /etc/ergo-node/conf.d/99-local.toml.
+# Files in conf.d/ are merged in lexical order, so 99- wins over 00-. See
+# ergo-node-rust.conf(5) and facts/config.md.
+#
+# Keep this file structurally identical to mainnet.toml — same sections, same
+# keys, differing only in values. A key present in one and absent from the
+# other is the drift this layout exists to prevent.
+#
+# ⚠ Testnet peers move. The February 2026 reset changed the magic bytes
+# ([2,0,2,3] -> [2,3,2,3]) and the default port (9022 -> 9023), and these
+# addresses are survivors of it rather than a maintained list. If a fresh
+# testnet install finds no peers, suspect this list before suspecting the node.
+
+[proxy]
+network = "testnet"
+
+[listen.ipv6]
+address = "[::]:9030"
+mode = "full"
+max_inbound = 20
+
+[outbound]
+min_peers = 3
+max_peers = 10
+# To add your own without losing these, use `seed_peers_add` in
+# 99-local.toml — a bare `seed_peers` there replaces the list entirely.
+seed_peers = [
+    "213.239.193.208:9023",
+    "128.253.41.110:9020",
+    "176.9.15.237:9021",
+]
+
+[identity]
+agent_name = "ergo-node-rust"
+peer_name = "ergo-node-rust"
+protocol_version = "6.0.3"

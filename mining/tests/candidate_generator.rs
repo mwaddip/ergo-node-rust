@@ -10,12 +10,14 @@ use ergo_chain_types::{
 };
 use ergo_lib::chain::emission::MonetarySettings;
 use ergo_lib::chain::genesis;
+use ergo_lib::chain::parameters::Parameters;
+use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
 use ergo_mining::emission::ReemissionRules;
 use ergo_mining::solution::validate_solution;
 use ergo_mining::types::*;
-use ergo_mining::{CandidateGenerator, ValidatorProofsResult};
+use ergo_mining::{CandidateGenerator, GeneratedCandidate, ValidatorProofsResult};
 
 const INITIAL_N_BITS: u32 = 16842752;
 
@@ -25,16 +27,22 @@ const FOUNDER_PKS: &[&str] = &[
     "0352ac2a471339b0d23b3d2c5ce0db0e81c969f77891b9edf0bda7fd39a78184e7",
 ];
 const PROOFS: &[&str] = &[
-    "test-proof-1", "test-proof-2", "test-proof-3",
-    "test-proof-4", "test-proof-5",
+    "test-proof-1",
+    "test-proof-2",
+    "test-proof-3",
+    "test-proof-4",
+    "test-proof-5",
 ];
 
 fn founder_pks() -> Vec<ProveDlog> {
-    FOUNDER_PKS.iter().map(|hex_str| {
-        let bytes = hex::decode(hex_str).unwrap();
-        let point = EcPoint::sigma_parse_bytes(&bytes).unwrap();
-        ProveDlog::new(point)
-    }).collect()
+    FOUNDER_PKS
+        .iter()
+        .map(|hex_str| {
+            let bytes = hex::decode(hex_str).unwrap();
+            let point = EcPoint::sigma_parse_bytes(&bytes).unwrap();
+            ProveDlog::new(point)
+        })
+        .collect()
 }
 
 fn test_miner_pk() -> ProveDlog {
@@ -76,10 +84,34 @@ fn test_config() -> MinerConfig {
     }
 }
 
-fn mock_proofs(
-    _txs: &[ergo_lib::chain::transaction::Transaction],
-) -> ValidatorProofsResult {
+fn mock_proofs(_txs: &[ergo_lib::chain::transaction::Transaction]) -> ValidatorProofsResult {
     Some(Ok((vec![0u8; 64], ADDigest::from([0u8; 33]))))
+}
+
+/// `generate_candidate` with an empty mempool — the shape every test in this
+/// file needs. With no candidate transactions, selection and fee collection
+/// short-circuit, so the parameters, ancestor headers and UTXO lookup are
+/// never consulted.
+fn gen_empty_mempool(
+    config: &MinerConfig,
+    parent: &Header,
+    interlinks: &[BlockId],
+    emission_box: &ErgoBox,
+) -> Result<GeneratedCandidate, ergo_mining::MiningError> {
+    ergo_mining::generate_candidate(
+        config,
+        parent,
+        INITIAL_N_BITS,
+        interlinks,
+        emission_box,
+        None,
+        &[],
+        &[],
+        &Parameters::default(),
+        &[],
+        &|_| None,
+        &mock_proofs,
+    )
 }
 
 /// Generate a candidate at the given parent.
@@ -87,9 +119,8 @@ fn gen_candidate(config: &MinerConfig, parent: &Header) -> (CandidateBlock, Work
     let settings = MonetarySettings::default();
     let pks = founder_pks();
     let (emission_box, _, _) = genesis::genesis_boxes(&settings, &pks, 2, PROOFS).unwrap();
-    ergo_mining::generate_candidate(
-        config, parent, INITIAL_N_BITS, &[], &emission_box, None, &[], &mock_proofs,
-    ).unwrap()
+    let generated = gen_empty_mempool(config, parent, &[], &emission_box).unwrap();
+    (generated.block, generated.work)
 }
 
 /// CPU mine with trivial difficulty.
@@ -123,7 +154,8 @@ fn cached_work_returns_same_result_within_ttl() {
 
     // Multiple polls at the same tip height should return the cached work
     for _ in 0..20 {
-        let w = gen.cached_work(parent.height)
+        let w = gen
+            .cached_work(parent.height)
             .expect("should return cached work");
         assert_eq!(w.h, work.h);
         assert_eq!(w.msg, work.msg);
@@ -157,7 +189,10 @@ fn cached_work_returns_none_after_ttl_expires() {
     gen.cache_candidate(block, work, parent.height);
 
     std::thread::sleep(Duration::from_millis(5));
-    assert!(gen.cached_work(parent.height).is_none(), "should expire after TTL");
+    assert!(
+        gen.cached_work(parent.height).is_none(),
+        "should expire after TTL"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +228,9 @@ fn stale_solution_accepted_after_regeneration() {
     gen.cache_candidate(block2, work2, parent.height);
 
     // The previous candidate should still be accessible
-    let prev = gen.previous_block().expect("previous candidate should exist");
+    let prev = gen
+        .previous_block()
+        .expect("previous candidate should exist");
     assert_eq!(prev.timestamp, block1.timestamp);
 
     // Solution for the OLD candidate should still validate
@@ -304,9 +341,9 @@ fn mined_block_advances_emission_box() {
 
     // Generate and mine block 2
     let interlinks_1: Vec<BlockId> = vec![];
-    let (candidate_2, _) = ergo_mining::generate_candidate(
-        &config, &parent, INITIAL_N_BITS, &interlinks_1, &emission_box, None, &[], &mock_proofs,
-    ).unwrap();
+    let candidate_2 = gen_empty_mempool(&config, &parent, &interlinks_1, &emission_box)
+        .unwrap()
+        .block;
     let header_2 = cpu_mine(&candidate_2);
     assert_eq!(header_2.height, 2);
 
@@ -318,9 +355,9 @@ fn mined_block_advances_emission_box() {
         .expect("interlinks update");
 
     // Generate block 3 using the updated emission box
-    let (candidate_3, _) = ergo_mining::generate_candidate(
-        &config, &header_2, INITIAL_N_BITS, &interlinks_2, &new_emission_box, None, &[], &mock_proofs,
-    ).unwrap();
+    let candidate_3 = gen_empty_mempool(&config, &header_2, &interlinks_2, &new_emission_box)
+        .unwrap()
+        .block;
     let header_3 = cpu_mine(&candidate_3);
     assert_eq!(header_3.height, 3);
 
@@ -329,10 +366,7 @@ fn mined_block_advances_emission_box() {
     let reward_2 = emission_rules.miners_reward_at_height(2);
     let reward_3 = emission_rules.miners_reward_at_height(3);
     let original_value = emission_box.value.as_i64();
-    assert_eq!(
-        new_emission_box.value.as_i64(),
-        original_value - reward_2,
-    );
+    assert_eq!(new_emission_box.value.as_i64(), original_value - reward_2,);
     let final_emission_box = candidate_3.transactions[0].outputs.get(0).unwrap();
     assert_eq!(
         final_emission_box.value.as_i64(),
@@ -369,7 +403,10 @@ fn on_block_applied_own_block_drops_slots_and_clears_latch() {
     gen.on_block_applied(&solved.id, solved.height);
     assert!(gen.cached_block().is_none(), "current must be dropped");
     assert!(gen.previous_block().is_none(), "previous must be dropped");
-    assert!(!gen.solved_pending(), "latch must clear on own block applied");
+    assert!(
+        !gen.solved_pending(),
+        "latch must clear on own block applied"
+    );
 }
 
 #[test]
@@ -415,18 +452,9 @@ fn on_block_applied_keeps_candidate_building_on_applied_block() {
     let interlinks_2 = ergo_nipopow::NipopowAlgos::update_interlinks(parent, vec![])
         .expect("interlinks update for header_2");
     let emission_box_2 = block_a.transactions[0].outputs.get(0).unwrap().clone();
-    let (block_c2, work_c2) = ergo_mining::generate_candidate(
-        &config,
-        &header_2,
-        INITIAL_N_BITS,
-        &interlinks_2,
-        &emission_box_2,
-        None,
-        &[],
-        &mock_proofs,
-    )
-    .expect("candidate on header_2");
-    gen.cache_candidate(block_c2, work_c2, header_2.height);
+    let generated = gen_empty_mempool(&config, &header_2, &interlinks_2, &emission_box_2)
+        .expect("candidate on header_2");
+    gen.cache_candidate(generated.block, generated.work, header_2.height);
 
     // header_2 applies: current still builds on the tip → survives;
     // previous (genesis parent) does not → dropped. Per-slot independence.
@@ -474,7 +502,10 @@ fn solved_latch_survives_application_below_latch_height() {
     // Reorg re-application below the latched height must not clear the
     // latch — our solved block's height has not been reached yet.
     gen.on_block_applied(&block_id(0x01), 9);
-    assert!(gen.solved_pending(), "latch must survive lower-height application");
+    assert!(
+        gen.solved_pending(),
+        "latch must survive lower-height application"
+    );
 }
 
 #[test]

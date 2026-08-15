@@ -22,7 +22,9 @@ pub struct TxWeight {
 
 impl Ord for TxWeight {
     fn cmp(&self, other: &Self) -> Ordering {
-        other.weight.cmp(&self.weight)
+        other
+            .weight
+            .cmp(&self.weight)
             .then(self.tx_id.cmp(&other.tx_id))
     }
 }
@@ -48,10 +50,18 @@ impl TxWeight {
         let fee_factor = match strategy {
             FeeStrategy::FeePerByte => tx_byte_size as u64,
             FeeStrategy::FeePerCycle => {
-                if cost == 0 { FAKE_COST as u64 } else { cost as u64 }
+                if cost == 0 {
+                    FAKE_COST as u64
+                } else {
+                    cost as u64
+                }
             }
         };
-        let fee_per_factor = if fee_factor == 0 { 0 } else { fee * 1024 / fee_factor };
+        let fee_per_factor = if fee_factor == 0 {
+            0
+        } else {
+            fee * 1024 / fee_factor
+        };
         Self {
             weight: fee_per_factor,
             fee_per_factor,

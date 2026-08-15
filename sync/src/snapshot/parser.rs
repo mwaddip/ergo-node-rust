@@ -177,10 +177,7 @@ pub fn parse_node(data: &[u8], key_length: usize) -> Result<(ParsedNode, usize),
 
 /// Parse a complete DFS byte stream into a sequence of parsed nodes.
 /// Used for both manifest and chunk reconstruction.
-pub fn parse_dfs_stream(
-    data: &[u8],
-    key_length: usize,
-) -> Result<Vec<ParsedNode>, ParseError> {
+pub fn parse_dfs_stream(data: &[u8], key_length: usize) -> Result<Vec<ParsedNode>, ParseError> {
     let mut nodes = Vec::new();
     let mut offset = 0;
 

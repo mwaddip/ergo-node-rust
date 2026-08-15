@@ -13,21 +13,33 @@ fn fee_per_byte_computation() {
     // fee_per_factor = fee * 1024 / size = 1_000_000 * 1024 / 500 = 2_048_000
     let w = TxWeight::new(make_tx_id(1), 1_000_000, 500, 0, FeeStrategy::FeePerByte);
     assert_eq!(w.fee_per_factor, 1_000_000 * 1024 / 500);
-    assert_eq!(w.weight, w.fee_per_factor, "initial weight equals fee_per_factor");
+    assert_eq!(
+        w.weight, w.fee_per_factor,
+        "initial weight equals fee_per_factor"
+    );
 }
 
 #[test]
 fn fee_per_byte_zero_size() {
     // Zero-size tx should not divide by zero
     let w = TxWeight::new(make_tx_id(1), 1_000_000, 0, 0, FeeStrategy::FeePerByte);
-    assert_eq!(w.fee_per_factor, 0, "zero-size tx gives zero fee_per_factor");
+    assert_eq!(
+        w.fee_per_factor, 0,
+        "zero-size tx gives zero fee_per_factor"
+    );
 }
 
 #[test]
 fn fee_per_cycle_computation() {
     // fee = 2_000_000, cost = 1000
     // fee_per_factor = fee * 1024 / cost = 2_000_000 * 1024 / 1000 = 2_048_000
-    let w = TxWeight::new(make_tx_id(1), 2_000_000, 500, 1000, FeeStrategy::FeePerCycle);
+    let w = TxWeight::new(
+        make_tx_id(1),
+        2_000_000,
+        500,
+        1000,
+        FeeStrategy::FeePerCycle,
+    );
     assert_eq!(w.fee_per_factor, 2_000_000 * 1024 / 1000);
 }
 
@@ -84,7 +96,11 @@ fn ord_consistent_for_same_weight_and_id() {
     let id = make_tx_id(1);
     let w1 = TxWeight::new(id, 1_000_000, 500, 0, FeeStrategy::FeePerByte);
     let w2 = TxWeight::new(id, 1_000_000, 500, 0, FeeStrategy::FeePerByte);
-    assert_eq!(w1.cmp(&w2), Ordering::Equal, "same weight+id should be Ordering::Equal");
+    assert_eq!(
+        w1.cmp(&w2),
+        Ordering::Equal,
+        "same weight+id should be Ordering::Equal"
+    );
     assert_eq!(w1.weight, w2.weight);
     assert_eq!(w1.fee_per_factor, w2.fee_per_factor);
     assert_eq!(w1.tx_id, w2.tx_id);

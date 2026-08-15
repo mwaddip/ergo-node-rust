@@ -46,8 +46,8 @@ impl FeeStats {
         let max_fee = self.history.iter().map(|(f, _)| *f).max().unwrap();
 
         if min_fee == max_fee {
-            let avg_wait = self.history.iter().map(|(_, w)| *w).sum::<u64>()
-                / self.history.len() as u64;
+            let avg_wait =
+                self.history.iter().map(|(_, w)| *w).sum::<u64>() / self.history.len() as u64;
             return vec![FeeBucket {
                 count: self.history.len(),
                 min_fee,
@@ -68,14 +68,17 @@ impl FeeStats {
             buckets[idx].1 += wait;
         }
 
-        buckets.iter().enumerate().filter(|(_, (count, _))| *count > 0).map(|(i, (count, total_wait))| {
-            FeeBucket {
+        buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, (count, _))| *count > 0)
+            .map(|(i, (count, total_wait))| FeeBucket {
                 count: *count,
                 min_fee: min_fee + i as u64 * bucket_width,
                 max_fee: min_fee + (i as u64 + 1) * bucket_width,
                 avg_wait_ms: *total_wait / *count as u64,
-            }
-        }).collect()
+            })
+            .collect()
     }
 
     /// Estimated wait time for a transaction with given fee_per_factor.
@@ -101,7 +104,11 @@ impl FeeStats {
             }
         }
 
-        if count == 0 { None } else { Some(closest_wait / count) }
+        if count == 0 {
+            None
+        } else {
+            Some(closest_wait / count)
+        }
     }
 
     /// Recommended fee_per_factor to achieve target wait time.
@@ -111,7 +118,8 @@ impl FeeStats {
         }
 
         // Find the lowest fee that achieved wait_ms <= target
-        self.history.iter()
+        self.history
+            .iter()
             .filter(|(_, wait)| *wait <= target_wait_ms)
             .map(|(fee, _)| *fee)
             .min()

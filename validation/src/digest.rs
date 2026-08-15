@@ -16,7 +16,9 @@ use crate::sections::{parse_ad_proofs, parse_block_transactions, parse_extension
 use crate::state_changes::{compute_state_changes, transactions_to_summaries};
 use crate::tx_validation;
 use crate::voting;
-use crate::{ApplyStateOutcome, BlockValidator, ValidationError};
+use crate::{
+    ApplyStateOutcome, BlockValidator, ScriptEvalInputs, StatePersistence, ValidationError,
+};
 
 /// Key length for Ergo's UTXO AVL+ tree (BoxId = 32 bytes).
 pub(crate) const KEY_LENGTH: usize = 32;
@@ -100,24 +102,24 @@ impl BlockValidator for DigestValidator {
         // Uses JVM v6 matchParameters60 semantics: local can have fewer
         // entries than received, every entry in local must match received.
         // At v4+ the proposedUpdate byte-for-byte comparison also runs.
-        let (epoch_boundary_params, epoch_boundary_proposed_update) =
-            match expected_boundary_params {
-                Some(expected) => {
-                    let parsed = voting::parse_parameters_from_extension(&parsed_ext)?;
-                    let parsed_pu = voting::extract_proposed_update(&parsed_ext);
-                    let expected_pu = expected_proposed_update.unwrap_or(&[]);
-                    voting::check_parameters_v6(
-                        expected,
-                        &parsed,
-                        header.height,
-                        header.version,
-                        expected_pu,
-                        &parsed_pu,
-                    )?;
-                    (Some(parsed), Some(parsed_pu))
-                }
-                None => (None, None),
-            };
+        let (epoch_boundary_params, epoch_boundary_proposed_update) = match expected_boundary_params
+        {
+            Some(expected) => {
+                let parsed = voting::parse_parameters_from_extension(&parsed_ext)?;
+                let parsed_pu = voting::extract_proposed_update(&parsed_ext);
+                let expected_pu = expected_proposed_update.unwrap_or(&[]);
+                voting::check_parameters_v6(
+                    expected,
+                    &parsed,
+                    header.height,
+                    header.version,
+                    expected_pu,
+                    &parsed_pu,
+                )?;
+                (Some(parsed), Some(parsed_pu))
+            }
+            None => (None, None),
+        };
 
         // 1b. Block-version gate (consensus check — JVM exBlockVersion).
         // Boundary-only: the JVM checks header.version against the newly
@@ -130,10 +132,9 @@ impl BlockValidator for DigestValidator {
         }
 
         // 2. Verify AD proofs digest matches header
-        let proof_digest: [u8; 32] = blake2::Blake2b::<blake2::digest::typenum::U32>::digest(
-            &parsed_proofs.proof_bytes,
-        )
-        .into();
+        let proof_digest: [u8; 32] =
+            blake2::Blake2b::<blake2::digest::typenum::U32>::digest(&parsed_proofs.proof_bytes)
+                .into();
         let expected_digest: [u8; 32] = header.ad_proofs_root.into();
         if proof_digest != expected_digest {
             return Err(ValidationError::ProofDigestMismatch {
@@ -183,11 +184,9 @@ impl BlockValidator for DigestValidator {
         let mut proof_box_bytes: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
 
         for (i, op) in operations.iter().enumerate() {
-            let result = verifier
-                .perform_one_operation(op)
-                .map_err(|e| ValidationError::ProofVerificationFailed(
-                    format!("operation {i} failed: {e}"),
-                ))?;
+            let result = verifier.perform_one_operation(op).map_err(|e| {
+                ValidationError::ProofVerificationFailed(format!("operation {i} failed: {e}"))
+            })?;
 
             if validate_txs {
                 if let Some(value) = result {
@@ -221,24 +220,34 @@ impl BlockValidator for DigestValidator {
             }
         }
 
-        // 7. Build DeferredEval for deferred script verification
-        let deferred_eval = if validate_txs {
+        // 7. Script evaluation. Always here, never the caller's — an Ok from
+        // this function means the block's scripts passed.
+        //
+        // Same ordering rule as UTXO mode (state-root check first, it is
+        // cheap and rejects malformed blocks before the expensive step), and
+        // the same single entry point through `evaluate_scripts` so the two
+        // validators cannot drift on a consensus path. Nothing to roll back
+        // on the Err path: step 8 below is the only mutation in the whole
+        // function, and it has not happened yet.
+        if validate_txs {
             let mut proof_boxes = HashMap::with_capacity(proof_box_bytes.len());
             for (id, bytes) in &proof_box_bytes {
                 proof_boxes.insert(*id, tx_validation::deserialize_box(bytes)?);
             }
 
-            Some(crate::DeferredEval {
+            let eval = ScriptEvalInputs {
                 height: header.height,
                 transactions: parsed_txs.transactions,
                 proof_boxes,
                 header: header.clone(),
                 preceding_headers: preceding_headers.to_vec(),
                 parameters: active_params.clone(),
-            })
-        } else {
-            None
-        };
+            };
+
+            // Cost discarded, not unchecked — the maxBlockCost gate runs
+            // inside evaluate_scripts.
+            tx_validation::evaluate_scripts(&eval)?;
+        }
 
         // 8. Advance state
         self.current_digest = header.state_root;
@@ -249,7 +258,6 @@ impl BlockValidator for DigestValidator {
         Ok(ApplyStateOutcome {
             epoch_boundary_params,
             epoch_boundary_proposed_update,
-            deferred_eval,
         })
     }
 
@@ -268,5 +276,158 @@ impl BlockValidator for DigestValidator {
         self.current_digest = digest;
         tracing::info!(height, "validator reset to fork point");
         Ok(())
+    }
+
+    /// Digest mode owns no persistent state — there is nothing to flush and
+    /// no cache to resize, so there is no [`StatePersistence`] to hand out.
+    ///
+    /// ⚠ The absence of a [`StatePersistence`] impl is the mode signal. Do
+    /// not "helpfully" give `DigestValidator` a no-op one — a defaulted
+    /// `resize_cache` on `BlockValidator` is exactly what let the enum
+    /// wrapper in `src/main.rs` drop the at-tip cache resize for the life of
+    /// the feature while logging success.
+    fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Digest-mode script evaluation. The blocks here are real: a
+    //! `BatchAVLProver` builds the tree and emits the block's AD proof, which
+    //! is what the validator's `BatchAVLVerifier` replays — the same
+    //! prover→verifier path a digest-mode node walks against a serving peer.
+
+    use super::*;
+    use crate::test_support::*;
+    use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
+    use ergo_avltree_rust::operation::{KeyValue, Operation};
+    use ergo_chain_types::blake2b256_hash;
+    use ergo_lib::chain::transaction::Transaction;
+    use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
+
+    /// A block ready to feed `apply_state`, with the AD proof that backs it.
+    struct Fixture {
+        pre_digest: ADDigest,
+        header: Header,
+        txs: Vec<u8>,
+        proofs: Vec<u8>,
+        extension: Vec<u8>,
+        preceding: Vec<Header>,
+    }
+
+    /// Seed a tree with `boxes`, then run `transactions` over it, keeping the
+    /// resulting proof. The trailing `generate_proof` after seeding is what
+    /// makes the block's proof cover the block's operations and nothing else.
+    fn fixture(boxes: &[ErgoBox], transactions: &[Transaction]) -> Fixture {
+        let tree = AVLTree::with_resolver(label_preserving_resolver(), KEY_LENGTH, None);
+        let mut prover = BatchAVLProver::new(tree, false);
+
+        for b in boxes {
+            prover
+                .perform_one_operation(&Operation::Insert(KeyValue {
+                    key: Bytes::copy_from_slice(&box_key(b)),
+                    value: Bytes::from(serialized_box(b)),
+                }))
+                .expect("seed insert");
+        }
+        let _ = prover.generate_proof();
+        let pre_digest = ad_digest(&prover.digest().expect("seeded tree has a root"));
+
+        for op in block_operations(transactions) {
+            prover.perform_one_operation(&op).expect("block operation");
+        }
+        let post_digest = ad_digest(&prover.digest().expect("post-block root"));
+        let proof = prover.generate_proof();
+
+        let (txs, extension) = sections(transactions);
+        Fixture {
+            pre_digest,
+            header: make_header(BLOCK_HEIGHT, post_digest, blake2b256_hash(proof.as_ref())),
+            txs,
+            proofs: crate::sections::serialize_ad_proofs(&HEADER_ID, proof.as_ref()),
+            extension,
+            preceding: preceding_headers(),
+        }
+    }
+
+    impl Fixture {
+        fn validator(&self) -> DigestValidator {
+            DigestValidator::from_state(self.pre_digest, SEED_HEIGHT, 0)
+        }
+
+        fn apply(
+            &self,
+            validator: &mut DigestValidator,
+        ) -> Result<ApplyStateOutcome, ValidationError> {
+            validator.apply_state(
+                &self.header,
+                &self.txs,
+                Some(&self.proofs),
+                &self.extension,
+                &self.preceding,
+                &Parameters::default(),
+                None,
+                None,
+            )
+        }
+    }
+
+    /// The accept arm, and the reason the rejection tests below are not
+    /// vacuous: a block whose scripts are satisfied is accepted and advances
+    /// state. Without this a validator that rejected everything would pass
+    /// the rest of this module.
+    #[test]
+    fn a_valid_block_is_accepted_and_advances_state() {
+        let input = make_box(true, 11);
+        let tx = spend_tx(std::slice::from_ref(&input));
+        let f = fixture(std::slice::from_ref(&input), std::slice::from_ref(&tx));
+
+        let mut validator = f.validator();
+        f.apply(&mut validator).expect("valid block applies");
+
+        assert_eq!(validator.validated_height(), BLOCK_HEIGHT);
+        assert_eq!(*validator.current_digest(), f.header.state_root);
+    }
+
+    /// Digest mode has no prover and no persistence — its whole state is two
+    /// fields written at the very end — so "Err leaves nothing behind" means
+    /// those two fields never move.
+    #[test]
+    fn script_failure_leaves_state_unchanged() {
+        let input = make_box(false, 12);
+        let tx = spend_tx(std::slice::from_ref(&input));
+        let f = fixture(std::slice::from_ref(&input), std::slice::from_ref(&tx));
+
+        let mut validator = f.validator();
+        let err = f
+            .apply(&mut validator)
+            .expect_err("an unsatisfied script must be rejected");
+        assert!(
+            matches!(err, ValidationError::TransactionInvalid { .. }),
+            "expected a script failure, got: {err:?}"
+        );
+        assert_eq!(validator.validated_height(), SEED_HEIGHT);
+        assert_eq!(*validator.current_digest(), f.pre_digest);
+    }
+
+    /// At or below the checkpoint no script is looked at — the AD proof
+    /// replay alone is the guarantee. The block below carries an
+    /// unsatisfiable script and is accepted anyway, which is the whole
+    /// observable: had it been evaluated, the test above shows what happens.
+    #[test]
+    fn the_checkpoint_skips_evaluation_entirely() {
+        let input = make_box(false, 13);
+        let tx = spend_tx(std::slice::from_ref(&input));
+        let f = fixture(std::slice::from_ref(&input), std::slice::from_ref(&tx));
+
+        // Checkpoint at the block's own height: `height > checkpoint` is
+        // false, so the unsatisfiable script is never looked at.
+        let mut validator = DigestValidator::from_state(f.pre_digest, SEED_HEIGHT, BLOCK_HEIGHT);
+        f.apply(&mut validator)
+            .expect("checkpointed block applies without script evaluation");
+
+        assert_eq!(validator.validated_height(), BLOCK_HEIGHT);
+        assert_eq!(*validator.current_digest(), f.header.state_root);
     }
 }

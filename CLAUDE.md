@@ -26,12 +26,13 @@ Full Ergo blockchain node in Rust. Not a port of the JVM node — a ground-up im
 
 **Main session does not edit crate-internal source files.** All work
 inside `sync/`, `validation/`, `state/`, `store/`, `mempool/`, `api/`,
-`mining/`, `p2p/`, `chain/`, or `addons/*/` is dispatched to a
+`mining/`, `p2p/`, or `chain/` is dispatched to a
 per-crate Claude session via the `dispatching-prompts` skill. Main
 session edits are limited to top-level orchestration: `Cargo.toml`
 (workspace), `README.md`, `CHANGELOG.md`, `LICENSE`, `build-deb`,
 `deploy/`, `man/`, top-level docs, scripts under repo root, the
-prompt files in `prompts/`, **and the `facts/` directory** — the
+prompt files in `prompts/`, **the `addons/` tree** (see below),
+**and the `facts/` directory** — the
 contracts are main session's responsibility. Dispatched sessions
 read contracts via `../facts/` and deliver code that conforms to
 them; they do not edit those contracts. When a contract needs
@@ -42,6 +43,17 @@ The dispatched session runs in `cd <crate>` and operates within that
 directory's boundary — it does not edit parent or sibling
 directories. The repo-root `facts/` directory is the single source
 of truth for cross-crate contracts.
+
+**`addons/` is main session's, including source.** `addons/fastsync`
+and `addons/indexer` are small, focused packages that don't warrant
+their own session and the scaffolding it needs — and they have none
+of it: no per-crate `CLAUDE.md`, no `SPECIAL.md`, no contract in
+`facts/`. They are also `exclude`d from the workspace with their own
+lockfiles. Dispatching into them would land a session in a directory
+with none of the context the dispatch protocol assumes. Main session
+edits them directly, source included. (Their version bumps and
+lockfile re-syncs at release time were always main's anyway, under
+the mechanical-housekeeping exception below.)
 
 **Exception — mechanical housekeeping crosses boundaries.** Uniform,
 cross-cutting metadata edits applied identically across the workspace —
@@ -60,7 +72,7 @@ dependency decision — which still dispatches.
 
 ## Goal
 
-Replace the JVM reference node with a Rust implementation that is memory-safe, efficient, and IPv6-native. The P2P layer (`ergo-proxy-node`) is complete and running on testnet. This project builds everything above it: header validation, block validation, UTXO state management, mempool, chain sync, and storage.
+Replace the JVM reference node with a Rust implementation that is memory-safe, efficient, and IPv6-native. The P2P layer lives in this repo as the `p2p/` crate — handshake, framing, routing, IPv4/IPv6 — and everything above it is built here too: header validation, block validation, UTXO state management, mempool, chain sync, and storage.
 
 ## Architecture
 
@@ -79,8 +91,8 @@ Single-repo, multi-session development:
 | Chain sync | `sync/` | **Done** | State machine + snapshot bootstrap |
 | Block/modifier storage | `store/` | **Done** | redb backend, height-indexed |
 | Mempool | `mempool/` | **Done** | Validate-on-entry, replace-by-fee |
-| REST API | `api/` | **Done** | 23 endpoints + `/debug/memory` |
-| Mining | `mining/` | **Done** | Autolykos v2 candidate assembly |
+| REST API | `api/` | **Done** | 43 endpoints — 38 JVM-compatible + `/debug/memory`, 3 × `/debug/p2p-capture/*`, `/stats/p2p` |
+| Mining | `mining/` | **Done** | Autolykos v2 candidate assembly: mempool selection bounded by cost and serialized section size, fee collection capped by measured box size, candidate regenerated on TTL expiry. Verified at runtime against mainnet tip |
 | Soft-fork voting | (in `chain/`, `validation/`) | **Done** | Epoch-boundary parameter tracking, v6.0.3-compatible |
 | At-tip memory tuning | (in `sync/`) | **Done** | Runtime AVL DB cache resize on synced() (v0.4.0+) |
 | Contracts | `facts/` | — | Per-component contract markdown |
@@ -90,26 +102,33 @@ Single-repo, multi-session development:
 - **Design by Contract**: every component boundary has explicit preconditions, postconditions, and invariants. Contracts are documented in `facts/` and enforced via `debug_assert!`.
 - **The wire is the spec**: the Ergo P2P protocol has no formal specification. Protocol behavior was reverse-engineered from the JVM reference node and verified against pcap captures. See `docs/protocol/` for the wire format spec.
 - **Reuse before building**: the Rust Ergo ecosystem has substantial existing components. Use them. See the ecosystem inventory below.
-- **Incremental validation**: each phase adds one capability without breaking what came before. The node starts as a proxy and gains validation layers progressively.
+- **Incremental validation**: each phase adds one capability without breaking what came before. Early builds forwarded traffic without understanding it and gained validation layers progressively; the `[proxy]` config section is a leftover of that era, not a statement about what the node does now.
 
 ## Existing Rust Ecosystem (Inventory)
 
 ### Ready to Use
 
-| Component | Crate | Version | Last Active | What it does |
+*Dates are the upstream repo's last push, checked 2026-08-13 via the GitHub API
+— not the crates.io release date, which is much older: `ergo-lib-v0.28.0` was
+published 2024-08-09. Every sigma-rust crate shares one repo and therefore one
+date. We consume them from `mwaddip/sigma-rust` pinned by rev, not from
+crates.io, so the version column is the last published release rather than what
+the build actually resolves.*
+
+
+| Component | Crate | Version | Upstream last push | What it does |
 |---|---|---|---|---|
-| ErgoTree interpreter | `ergotree-interpreter` | 0.28.0 | Feb 2026 | Full script evaluator, 70+ opcodes, sigma protocols |
-| Transaction validation | `ergo-lib` | 0.28.0 | Feb 2026 | Stateful: ERG/token preservation, script verification, storage rent |
-| Transaction signing | `ergo-lib` | 0.28.0 | Feb 2026 | Wallet, multi-sig, BIP-39/44, coin selection, tx builder |
-| Box/UTXO primitives | `ergo-lib` | 0.28.0 | Feb 2026 | ErgoBox, registers, tokens, ErgoStateContext |
-| Block header types | `ergo-chain-types` | 0.15.0 | Feb 2026 | Full Header struct with Autolykos solution |
-| Autolykos v2 PoW | `ergo-chain-types` | 0.15.0 | Feb 2026 | `pow_hit()`, compact bits, table size growth |
-| NiPoPoW verification | `ergo-nipopow` | 0.15.0 | Dec 2021 | Full KMZ17 algorithm, proof comparison, best chain |
-| AVL+ authenticated tree | `ergo_avltree_rust` | fork | Apr 2026 | Prover + verifier, batch operations — forked to fix `Resolver` type for persistence ([PR #10](https://github.com/ergoplatform/ergo_avltree_rust/pull/10)) |
-| Merkle proofs | `ergo-merkle-tree` | 0.15.0 | Feb 2026 | Tree, proof, batch multiproof |
-| ErgoScript compiler | `ergoscript-compiler` | 0.24.0 | Feb 2026 | Source to ErgoTree |
-| Scorex serialization | `sigma-ser` | — | Feb 2026 | VLQ, ZigZag, binary encoding |
-| P2P networking | `ergo-proxy-node` | 0.1.0 | Mar 2026 | Handshake, framing, message routing, IPv6 |
+| ErgoTree interpreter | `ergotree-interpreter` | 0.28.0 | 2026-08-04 | Full script evaluator, 70+ opcodes, sigma protocols |
+| Transaction validation | `ergo-lib` | 0.28.0 | 2026-08-04 | Stateful: ERG/token preservation, script verification, storage rent |
+| Transaction signing | `ergo-lib` | 0.28.0 | 2026-08-04 | Wallet, multi-sig, BIP-39/44, coin selection, tx builder |
+| Box/UTXO primitives | `ergo-lib` | 0.28.0 | 2026-08-04 | ErgoBox, registers, tokens, ErgoStateContext |
+| Block header types | `ergo-chain-types` | 0.15.0 | 2026-08-04 | Full Header struct with Autolykos solution |
+| Autolykos v2 PoW | `ergo-chain-types` | 0.15.0 | 2026-08-04 | `pow_hit()`, compact bits, table size growth |
+| NiPoPoW verification | `ergo-nipopow` | 0.15.0 | 2026-08-04 | Full KMZ17 algorithm, proof comparison, best chain |
+| AVL+ authenticated tree | `ergo_avltree_rust` | fork, pinned by rev | 2026-08-03 | Prover + verifier, batch operations. Fork carries persistent-prover support ([PR #27](https://github.com/ergoplatform/ergo_avltree_rust/pull/27)); `Resolver` is [#16](https://github.com/ergoplatform/ergo_avltree_rust/pull/16), superseding the closed #10 |
+| Merkle proofs | `ergo-merkle-tree` | 0.15.0 | 2026-08-04 | Tree, proof, batch multiproof |
+| ErgoScript compiler | `ergoscript-compiler` | 0.24.0 | 2026-08-04 | Source to ErgoTree. **Available, not a dependency** — the node never compiles source |
+| Scorex serialization | `sigma-ser` | 0.19.0 | 2026-08-04 | VLQ, ZigZag, binary encoding |
 
 ### Built (this project)
 
@@ -144,7 +163,8 @@ operators today. Listed for awareness:
 | Crate | Status |
 |---|---|
 | `ergo-utilities-rust` | Abandoned, pinned to ergo-lib 0.13 (current: 0.28) |
-| sigma-rust `ergo-p2p` | Architecture only, codec is `todo!()`. Our proxy supersedes this. |
+| sigma-rust `ergo-p2p` | Architecture only, codec is `todo!()`. This repo's `p2p/` crate supersedes it. |
+| P2P **relay proxy** (the original `ergo-proxy-node` concept) | Abandoned as impractical. Several nodes sharing one proxy share one peer identity, so a single misbehaving node behind it gets **the proxy banned for everybody** — the well-behaved nodes lose their peers for someone else's conduct, with no way to attribute or isolate the offender. The networking code was worth keeping and is now `p2p/`; the relay in front of it was not. |
 | `ogre` (TypeScript) | Abandoned light node attempt (April 2023) |
 
 ## Phased Build Order
@@ -165,9 +185,11 @@ Validate blocks in digest mode (AD proofs, `BatchAVLVerifier`) and UTXO mode (`P
 Persistent AVL+ tree over redb (`enr-state` crate). Implements `VersionedAVLStorage` from forked `ergo_avltree_rust`. Undo-log rollback, configurable version retention, crash-safe atomic writes. Genesis bootstrap from chain parameters via ported `ErgoTreePredef`. Sliding 192-block download window for sequential sync. **Done.**
 
 ### Phase 6: Full Node — **Done**
-Mempool, REST API (23 endpoints + `/debug/memory`), mining API,
+Mempool, REST API (43 endpoints, 38 of them JVM-compatible), mining API,
 soft-fork voting, NiPoPoW serve/verify, UTXO snapshot bootstrap, light
-client mode, at-tip memory tuning. Released as v0.4.x.
+client mode, at-tip memory tuning. First released as v0.4.x; current release
+is **v0.8.0**, which removed deferred script evaluation and split
+`BlockValidator` into three traits (see `CHANGELOG.md`).
 
 ## Protocol Reference
 
@@ -184,5 +206,5 @@ A local checkout for reference is at `~/projects/ergo-node-build` (v6.0.3 branch
 
 ## Related Projects
 
-- `~/projects/ergo-proxy-node` — P2P relay proxy (this project's networking layer). GitHub: `mwaddip/ergo-proxy`
+- `~/projects/ergo-proxy-node` — where the P2P layer was originally written, now vendored here as `p2p/`. GitHub: `mwaddip/ergo-proxy`. The **relay** idea it was named for is abandoned; see "Dead / Superseded".
 - `~/projects/blockhost-ergo/ergo-relay` — BlockHost signing service and peer discovery

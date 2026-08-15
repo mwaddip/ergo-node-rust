@@ -11,24 +11,27 @@ use std::sync::Arc;
 use bytes::Bytes;
 use enr_chain::{ChainConfig, HeaderChain, StateType, HEADER_TYPE_ID};
 use enr_state::{AVLTreeParams, CacheSize, RedbAVLStorage, SnapshotReader};
+use enr_store::{ModifierStore, RedbModifierStore};
 use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
 use ergo_avltree_rust::batch_node::AVLTree;
 use ergo_avltree_rust::operation::{KeyValue, Operation};
 use ergo_avltree_rust::versioned_avl_storage::VersionedAVLStorage;
 use ergo_chain_types::ADDigest;
+use ergo_chain_types::EcPoint;
 use ergo_lib::chain::emission::MonetarySettings;
 use ergo_lib::chain::genesis;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
-use ergo_chain_types::EcPoint;
-use enr_store::{ModifierStore, RedbModifierStore};
 use ergo_node_rust::{
     restore_nipopow_difficulty_context_from_store, P2pTransport, PeerStorageAdapter, SharedChain,
     SharedStore, ValidationPipeline,
 };
 use ergo_sync::{HeaderSync, SyncConfig, SyncStore};
-use ergo_validation::{ApplyStateOutcome, BlockValidator, DigestValidator, UtxoValidator, ValidationError};
+use ergo_validation::{
+    ApplyStateOutcome, BlockValidator, DigestValidator, MiningState, StatePersistence,
+    UtxoValidator, ValidationError,
+};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
@@ -103,14 +106,17 @@ fn build_genesis_boxes(network: enr_p2p::types::Network) -> Vec<([u8; 32], Vec<u
         &founder_pks,
         2, // 2-of-3 threshold
         proof_strings,
-    ).expect("genesis box construction failed");
+    )
+    .expect("genesis box construction failed");
 
     [emission, no_premine, founders]
         .into_iter()
         .map(|b| {
             let mut id = [0u8; 32];
             id.copy_from_slice(b.box_id().as_ref());
-            let bytes = b.sigma_serialize_bytes().expect("genesis box serialization failed");
+            let bytes = b
+                .sigma_serialize_bytes()
+                .expect("genesis box serialization failed");
             (id, bytes)
         })
         .collect()
@@ -132,11 +138,18 @@ fn reemission_rules_for(
 /// Pre-computed state proofs for mining candidate generation.
 /// Written by the validator after each block, read by the mining task.
 #[derive(Clone)]
+/// What the post-apply hook can supply that the mining task cannot get for
+/// itself: the parent it was applied against, and the emission box — whose id
+/// comes from `MiningState`, i.e. from the validator, which the mining task
+/// cannot reach.
+///
+/// It no longer carries AD proofs or a pre-built emission transaction. Those
+/// were computed for an emission-ONLY block; with transaction selection the
+/// proofs must cover the assembled list, so `generate_candidate` computes them
+/// through `proofs_from_storage` against the reader.
 struct MiningProofData {
     parent: ergo_chain_types::Header,
-    ad_proof_bytes: Vec<u8>,
-    state_root: ADDigest,
-    emission_tx: ergo_validation::Transaction,
+    emission_box: ergo_validation::ErgoBox,
     tip_height: u32,
 }
 
@@ -144,7 +157,9 @@ type MiningProofCache = Arc<std::sync::Mutex<Option<MiningProofData>>>;
 
 /// Context for mining proof pre-computation inside the validator callback.
 struct MiningCtx {
-    config: ergo_mining::MinerConfig,
+    // No `config` here: the hook stopped building the emission transaction when
+    // assembly moved into `generate_candidate`, and the mining task reads the
+    // config off the generator it already holds.
     proof_cache: MiningProofCache,
     snapshot_reader: Arc<SnapshotReader>,
     /// Candidate lifecycle handle — the post-apply hook calls
@@ -184,7 +199,38 @@ struct Validator {
     height_watch_tx: tokio::sync::watch::Sender<u32>,
     /// Mining proof pre-computation (None if mining not configured or digest mode).
     mining: Option<MiningCtx>,
+    /// AVL prover memory gauges, published every
+    /// [`PROVER_GAUGE_INTERVAL_BLOCKS`] applied blocks and read by
+    /// `/debug/memory`. Digest mode never writes them, so they stay unset and
+    /// the endpoint omits the fields — correct, digest mode has no prover.
+    prover_modified_nodes_bytes: Arc<std::sync::atomic::AtomicU64>,
+    prover_resident_nodes_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// Applied blocks since the gauges were last written.
+    blocks_since_prover_gauge: u32,
+    /// When the gauges were last written, for the at-tip fallback.
+    last_prover_gauge: std::time::Instant,
 }
+
+/// How often the prover memory gauges are recomputed, in applied blocks.
+///
+/// `prover_memory_estimate` walks the resident tree — O(resident nodes), the
+/// same order as applying a block at mainnet scale — so this must never run per
+/// block (`facts/validation.md`). The structure it measures grows monotonically
+/// over hundreds of thousands of blocks, so a coarse gauge loses nothing.
+const PROVER_GAUGE_INTERVAL_BLOCKS: u32 = 512;
+
+/// Wall-clock ceiling between publishes, whichever trigger fires first.
+///
+/// The block interval alone is a sync-shaped rule: 512 blocks is seconds during
+/// catch-up and roughly seventeen HOURS at tip, where blocks arrive every two
+/// minutes. A gauge that updates twice a day cannot show a growth curve on a
+/// synced node, which is the case an operator actually watches.
+///
+/// The cost that motivated the block interval does not exist at tip — one walk
+/// per two-minute block is free — so the two triggers do not conflict: during
+/// sync the block count is reached long before this elapses, and at tip this
+/// one carries it.
+const PROVER_GAUGE_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
 // Size difference between variants is fundamental: UTXO mode carries a
 // persistent AVL+ prover (~384 bytes); digest mode doesn't (~44 bytes).
@@ -205,6 +251,8 @@ impl Validator {
         block_applied_tx: tokio::sync::mpsc::Sender<Vec<ergo_validation::Transaction>>,
         height_watch_tx: tokio::sync::watch::Sender<u32>,
         mining: Option<MiningCtx>,
+        prover_modified_nodes_bytes: Arc<std::sync::atomic::AtomicU64>,
+        prover_resident_nodes_bytes: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         let h = match &inner {
             ValidatorInner::Digest(v) => v.validated_height(),
@@ -212,7 +260,36 @@ impl Validator {
         };
         shared_height.store(h, std::sync::atomic::Ordering::Relaxed);
         let _ = height_watch_tx.send(h);
-        Self { inner, shared_height, shared_state_context, block_applied_tx, height_watch_tx, mining }
+        Self {
+            inner,
+            shared_height,
+            shared_state_context,
+            block_applied_tx,
+            height_watch_tx,
+            mining,
+            prover_modified_nodes_bytes,
+            prover_resident_nodes_bytes,
+            // Publish on the first applied block rather than after 512, so a
+            // node that is restarted often still reports something.
+            blocks_since_prover_gauge: PROVER_GAUGE_INTERVAL_BLOCKS,
+            last_prover_gauge: std::time::Instant::now(),
+        }
+    }
+
+    /// The active variant's mining support. `None` in digest mode, where
+    /// candidate assembly has no UTXO set to work from.
+    ///
+    /// Inherent rather than a `BlockValidator` method because `main` is its
+    /// only consumer and does name this type. Putting it on the trait would
+    /// force six `sync/` test stubs to declare a capability nothing asks them
+    /// for. See facts/validation.md § "How callers reach the split traits" —
+    /// the asymmetry with `state_persistence` follows the consumers and is
+    /// deliberate.
+    fn mining_state(&self) -> Option<&dyn MiningState> {
+        match &self.inner {
+            ValidatorInner::Digest(_) => None,
+            ValidatorInner::Utxo(v) => Some(v),
+        }
     }
 
     /// Pre-compute mining proofs after a successful block validation.
@@ -222,10 +299,18 @@ impl Validator {
             None => return,
         };
 
-        let next_height = header.height + 1;
-        let emission_id = match self.emission_box_id() {
-            Some(id) => id,
+        // Digest mode implements no MiningState — candidate assembly needs a
+        // live UTXO set. `self.mining` is already None there, so this arm is
+        // belt-and-braces; the point is that "wrong mode" and "all ERG
+        // emitted" are now two distinct returns instead of one shared None.
+        let mining_state = match self.mining_state() {
+            Some(s) => s,
             None => return,
+        };
+
+        let emission_id = match mining_state.emission_box_id() {
+            Some(id) => id,
+            None => return, // all ERG emitted — and now that is all it means
         };
 
         let box_bytes = match mining.snapshot_reader.lookup_key(&emission_id) {
@@ -244,37 +329,54 @@ impl Validator {
             }
         };
 
-        let emission_tx = match ergo_mining::emission::build_emission_tx(
-            &emission_box,
-            next_height,
-            &mining.config.miner_pk,
-            mining.config.reward_delay,
-            &mining.config.reemission_rules,
-        ) {
-            Ok(tx) => tx,
-            Err(e) => {
-                tracing::warn!("mining: failed to build emission tx: {e}");
-                return;
-            }
-        };
-
-        let (ad_proof_bytes, state_root) = match self.proofs_for_transactions(std::slice::from_ref(&emission_tx)) {
-            Some(Ok(result)) => result,
-            Some(Err(e)) => {
-                tracing::warn!("mining: proof computation failed: {e}");
-                return;
-            }
-            None => return, // digest mode
-        };
-
+        // Deliberately stops here. Building the emission tx and its proofs
+        // belongs to `generate_candidate`, which knows the full transaction
+        // list; doing it here would compute proofs for a block that is not the
+        // one we are about to mine.
         let mut guard = mining.proof_cache.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(MiningProofData {
             parent: header.clone(),
-            ad_proof_bytes,
-            state_root,
-            emission_tx,
+            emission_box,
             tip_height: header.height,
         });
+    }
+
+    /// Recompute and publish the prover memory gauges, at most once every
+    /// [`PROVER_GAUGE_INTERVAL_BLOCKS`] applied blocks.
+    ///
+    /// The walk is O(resident nodes), so the interval is the point — see
+    /// `facts/validation.md`. Digest mode returns `None` from
+    /// `state_persistence()` and nothing is ever written, which is why
+    /// `/debug/memory` omits the fields there instead of reporting zero.
+    fn publish_prover_gauges(&mut self) {
+        self.blocks_since_prover_gauge = self.blocks_since_prover_gauge.saturating_add(1);
+        let due_by_blocks = self.blocks_since_prover_gauge >= PROVER_GAUGE_INTERVAL_BLOCKS;
+        let due_by_time = self.last_prover_gauge.elapsed() >= PROVER_GAUGE_MAX_INTERVAL;
+        if !due_by_blocks && !due_by_time {
+            return;
+        }
+        let Some(estimate) = self
+            .state_persistence()
+            .and_then(|p| p.prover_memory_estimate())
+        else {
+            return;
+        };
+        self.blocks_since_prover_gauge = 0;
+        self.last_prover_gauge = std::time::Instant::now();
+        self.prover_modified_nodes_bytes.store(
+            estimate.modified_nodes_bytes,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.prover_resident_nodes_bytes.store(
+            estimate.resident_nodes_bytes,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        tracing::debug!(
+            modified_nodes_bytes = estimate.modified_nodes_bytes,
+            resident_nodes_bytes = estimate.resident_nodes_bytes,
+            node_count = estimate.node_count,
+            "prover memory gauges published"
+        );
     }
 }
 
@@ -292,23 +394,49 @@ impl BlockValidator for Validator {
     ) -> Result<ApplyStateOutcome, ValidationError> {
         let result = match &mut self.inner {
             ValidatorInner::Digest(v) => v.apply_state(
-                header, block_txs, ad_proofs, extension, preceding_headers,
-                active_params, expected_boundary_params, expected_proposed_update,
+                header,
+                block_txs,
+                ad_proofs,
+                extension,
+                preceding_headers,
+                active_params,
+                expected_boundary_params,
+                expected_proposed_update,
             ),
             ValidatorInner::Utxo(v) => v.apply_state(
-                header, block_txs, ad_proofs, extension, preceding_headers,
-                active_params, expected_boundary_params, expected_proposed_update,
+                header,
+                block_txs,
+                ad_proofs,
+                extension,
+                preceding_headers,
+                active_params,
+                expected_boundary_params,
+                expected_proposed_update,
             ),
         };
         if result.is_ok() {
             let h = self.validated_height();
-            self.shared_height.store(h, std::sync::atomic::Ordering::Relaxed);
+            self.shared_height
+                .store(h, std::sync::atomic::Ordering::Relaxed);
             let _ = self.height_watch_tx.send(h);
 
             // Publish state context for mempool/API transaction validation.
-            // Only when we have preceding headers (height > 0).
+            //
+            // The UPCOMING context, not `build_state_context`: its consumers
+            // validate transactions that are not in a block yet, and those
+            // target the block after this one. `header` is the block just
+            // applied, so it is the *last* header here, not the preheader —
+            // and `preceding_headers` is unchanged, since the builder prepends
+            // `header` itself (facts/validation.md § Free Functions: state
+            // context). Publishing the current-tip context instead rejects
+            // every well-formed transaction on the network with
+            // "Creation height H+1 > preheader height".
+            //
+            // The guard no longer protects the builder — `header` alone
+            // satisfies `Headers` — but a context published at height 0 has no
+            // meaningful UTXO root for its consumers, so it stays.
             if !preceding_headers.is_empty() {
-                let ctx = ergo_validation::build_state_context(
+                let ctx = ergo_validation::build_upcoming_state_context(
                     header,
                     preceding_headers,
                     active_params,
@@ -336,6 +464,8 @@ impl BlockValidator for Validator {
 
             // Pre-compute mining proofs for the next block.
             self.update_mining_proofs(header);
+
+            self.publish_prover_gauges();
         }
         result
     }
@@ -362,32 +492,36 @@ impl BlockValidator for Validator {
         // Republish the validator's ACTUAL height: the new one on Ok, the
         // unchanged one on Err (reset_to Err = validator unmoved).
         let h = self.validated_height();
-        self.shared_height.store(h, std::sync::atomic::Ordering::Relaxed);
+        self.shared_height
+            .store(h, std::sync::atomic::Ordering::Relaxed);
         let _ = self.height_watch_tx.send(h);
         result
     }
 
-    fn flush(&self) -> Result<(), ValidationError> {
-        match &self.inner {
-            ValidatorInner::Digest(v) => v.flush(),
-            ValidatorInner::Utxo(v) => v.flush(),
-        }
-    }
+    // The four forwards that used to live here — flush, resize_cache,
+    // proofs_for_transactions, emission_box_id — are gone. One of them was
+    // silently missing for the life of the feature; the narrative is kept in
+    // facts/validation.md § "Traits", where it documents why the split
+    // happened rather than sitting next to code that no longer exists.
+    //
+    // Storage and mining are reached through the two accessors below. There
+    // is no per-method forwarding left to forget.
 
-    fn proofs_for_transactions(
-        &self,
-        txs: &[ergo_validation::Transaction],
-    ) -> Option<Result<(Vec<u8>, ADDigest), ValidationError>> {
+    /// The active variant's storage lifecycle. `None` in digest mode, which
+    /// owns no redb.
+    ///
+    /// `None` means "nothing to persist" — never "the flush failed". Callers
+    /// must keep those apart; collapsing them is the shape that produced the
+    /// `resize_cache` bug documented above. See facts/sync.md § "Flushing a
+    /// validator that owns no state".
+    ///
+    /// This one is a trait method rather than an inherent accessor because
+    /// `sync/` is generic over `V: BlockValidator` and never names this type,
+    /// so an inherent method here would be out of reach of its only caller.
+    fn state_persistence(&self) -> Option<&dyn StatePersistence> {
         match &self.inner {
-            ValidatorInner::Utxo(v) => v.proofs_for_transactions(txs),
             ValidatorInner::Digest(_) => None,
-        }
-    }
-
-    fn emission_box_id(&self) -> Option<[u8; 32]> {
-        match &self.inner {
-            ValidatorInner::Utxo(v) => v.emission_box_id(),
-            ValidatorInner::Digest(_) => None,
+            ValidatorInner::Utxo(v) => Some(v),
         }
     }
 }
@@ -413,9 +547,7 @@ async fn penalize(
         Some(addr) => addr.ip().to_string(),
         None => "unknown".to_string(),
     };
-    tracing::warn!(
-        "PENALTY peer_ip={ip} type={penalty_type} reason=\"{reason}\""
-    );
+    tracing::warn!("PENALTY peer_ip={ip} type={penalty_type} reason=\"{reason}\"");
     if disconnect {
         p2p.disconnect_peer(peer_id).await;
     }
@@ -444,7 +576,14 @@ async fn handle_nipopow_event(
             let req = match nipopow_serve::parse_get_nipopow_proof(body) {
                 Ok(r) => r,
                 Err(e) => {
-                    penalize(p2p, peer_id, "misbehavior", &format!("GetNipopowProof parse failed: {e}"), false).await;
+                    penalize(
+                        p2p,
+                        peer_id,
+                        "misbehavior",
+                        &format!("GetNipopowProof parse failed: {e}"),
+                        false,
+                    )
+                    .await;
                     return;
                 }
             };
@@ -465,8 +604,8 @@ async fn handle_nipopow_event(
                 let anchor = match req.header_id {
                     Some(id) => Some(id),
                     None => {
-                        let validated_h = shared_validated_height
-                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let validated_h =
+                            shared_validated_height.load(std::sync::atomic::Ordering::Relaxed);
                         if validated_h == 0 {
                             tracing::warn!(
                                 peer = %peer_id,
@@ -524,7 +663,14 @@ async fn handle_nipopow_event(
             let disposition = match nipopow_serve::classify_unsolicited_nipopow_proof(body) {
                 Ok(disposition) => disposition,
                 Err(e) => {
-                    penalize(p2p, peer_id, "misbehavior", &format!("NipopowProof parse failed: {e}"), false).await;
+                    penalize(
+                        p2p,
+                        peer_id,
+                        "misbehavior",
+                        &format!("NipopowProof parse failed: {e}"),
+                        false,
+                    )
+                    .await;
                     return;
                 }
             };
@@ -546,7 +692,10 @@ async fn handle_nipopow_event(
 
         _ => {
             // is_nipopow_message guarantees code is 90 or 91; this branch is unreachable.
-            debug_assert!(false, "handle_nipopow_event called with non-nipopow code {code}");
+            debug_assert!(
+                false,
+                "handle_nipopow_event called with non-nipopow code {code}"
+            );
         }
     }
 }
@@ -561,7 +710,10 @@ struct MempoolUtxoReader {
 }
 
 impl ergo_mempool::types::UtxoReader for MempoolUtxoReader {
-    fn box_by_id(&self, box_id: &[u8; 32]) -> Option<ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox> {
+    fn box_by_id(
+        &self,
+        box_id: &[u8; 32],
+    ) -> Option<ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox> {
         let reader = self.reader.as_ref()?;
         let value_bytes = reader.lookup_key(box_id)?;
         ergo_validation::deserialize_box(&value_bytes).ok()
@@ -606,8 +758,25 @@ impl ergo_api::ChainAccess for HeaderChainAdapter {
     fn tip(&self) -> Option<ergo_chain_types::Header> {
         self.with_chain(|c| {
             let h = c.height();
-            if h == 0 { None } else { c.header_at(h) }
+            if h == 0 {
+                None
+            } else {
+                c.header_at(h)
+            }
         })
+    }
+    /// Maps `chain/`'s estimate onto the api-local mirror type. `api/`
+    /// deliberately does not depend on `enr-chain`, so this adapter is the
+    /// single seam between the two — and it stays a pure field mapping. Any
+    /// arithmetic here would recreate the split that let `AVG_HEADER_BYTES`
+    /// go stale against a structure `chain/` had already retired.
+    fn memory_estimate(&self) -> ergo_api::ChainMemory {
+        let e = self.with_chain(|c| c.memory_estimate());
+        ergo_api::ChainMemory {
+            index_bytes: e.index_bytes,
+            header_cache_bytes: e.header_cache_bytes,
+            score_cache_bytes: e.score_cache_bytes,
+        }
     }
     fn build_nipopow_proof(
         &self,
@@ -615,12 +784,10 @@ impl ergo_api::ChainAccess for HeaderChainAdapter {
         k: u32,
         header_id: Option<[u8; 32]>,
     ) -> Result<Vec<u8>, String> {
-        let block_id = header_id.map(|id| {
-            ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(id))
-        });
+        let block_id =
+            header_id.map(|id| ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(id)));
         self.with_chain(|c| {
-            enr_chain::build_nipopow_proof(c, m, k, block_id)
-                .map_err(|e| e.to_string())
+            enr_chain::build_nipopow_proof(c, m, k, block_id).map_err(|e| e.to_string())
         })
     }
     fn header_ids(&self, offset: u32, limit: u32) -> Vec<[u8; 32]> {
@@ -638,7 +805,9 @@ impl ergo_api::ChainAccess for HeaderChainAdapter {
                     id.copy_from_slice(header.id.0.as_ref());
                     out.push(id);
                 }
-                if h == 0 { break; }
+                if h == 0 {
+                    break;
+                }
                 h -= 1;
             }
             out
@@ -646,9 +815,7 @@ impl ergo_api::ChainAccess for HeaderChainAdapter {
     }
     fn popow_header_by_id(&self, id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
         let block_id = ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(*id));
-        self.with_chain(|c| {
-            enr_chain::popow_header_by_id(c, &block_id).map_err(|e| e.to_string())
-        })
+        self.with_chain(|c| enr_chain::popow_header_by_id(c, &block_id).map_err(|e| e.to_string()))
     }
 }
 
@@ -666,6 +833,17 @@ impl ergo_api::StoreAccess for StoreAdapter {
         let modifier_id = self.store.get_id_at(type_id, height).ok().flatten()?;
         self.store.get(type_id, &modifier_id).ok().flatten()
     }
+
+    /// Always available — the store handle outlives the adapter.
+    fn cache_bytes_used(&self) -> Option<u64> {
+        Some(self.store.cache_bytes_used())
+    }
+
+    /// Evictions, not occupancy, are what respond to the configured cache
+    /// size. See facts/store.md.
+    fn cache_evictions(&self) -> Option<u64> {
+        Some(self.store.cache_evictions())
+    }
 }
 
 /// Adapter: SwappableReader → UtxoAccess for the API crate.
@@ -682,6 +860,13 @@ impl ergo_api::UtxoAccess for ApiUtxoReader {
         let reader = self.swap_reader.current()?;
         let value_bytes = reader.lookup_key(box_id)?;
         ergo_validation::deserialize_box(&value_bytes).ok()
+    }
+
+    /// `None` during the reopen window, when no reader exists — the same
+    /// condition under which every other lookup here returns `None`. Omitting
+    /// the field is correct then; reporting 0 would claim an empty cache.
+    fn cache_bytes_used(&self) -> Option<u64> {
+        Some(self.swap_reader.current()?.cache_bytes_used())
     }
 }
 
@@ -724,9 +909,27 @@ impl ergo_api::BlockSubmitter for MinedBlockSubmitter {
         // Pre-store all sections in the modifier store so the sync task can
         // find them when the chain advances.
         let entries = vec![
-            (enr_chain::BLOCK_TRANSACTIONS_TYPE_ID, block_txs_id, header.height, block_txs_bytes, None),
-            (enr_chain::AD_PROOFS_TYPE_ID, ad_proofs_id, header.height, ad_proofs_bytes, None),
-            (enr_chain::EXTENSION_TYPE_ID, extension_id, header.height, extension_bytes, None),
+            (
+                enr_chain::BLOCK_TRANSACTIONS_TYPE_ID,
+                block_txs_id,
+                header.height,
+                block_txs_bytes,
+                None,
+            ),
+            (
+                enr_chain::AD_PROOFS_TYPE_ID,
+                ad_proofs_id,
+                header.height,
+                ad_proofs_bytes,
+                None,
+            ),
+            (
+                enr_chain::EXTENSION_TYPE_ID,
+                extension_id,
+                header.height,
+                extension_bytes,
+                None,
+            ),
         ];
         self.store
             .put_batch(&entries)
@@ -752,6 +955,7 @@ impl ergo_api::BlockSubmitter for MinedBlockSubmitter {
 
 /// Mining config parsed from `[node.mining]` in ergo.toml.
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 struct MiningConfig {
     /// Miner public key (hex-encoded compressed EC point, 33 bytes).
     /// Empty = mining disabled.
@@ -768,12 +972,19 @@ struct MiningConfig {
     candidate_ttl_secs: u64,
 }
 
-fn default_votes() -> String { "000000".to_string() }
-fn default_reward_delay() -> i32 { 720 }
-fn default_candidate_ttl() -> u64 { 15 }
+fn default_votes() -> String {
+    "000000".to_string()
+}
+fn default_reward_delay() -> i32 {
+    720
+}
+fn default_candidate_ttl() -> u64 {
+    15
+}
 
 /// Node-level config parsed from the `[node]` section of ergo.toml.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NodeConfig {
     #[serde(default = "default_data_dir")]
     data_dir: String,
@@ -833,23 +1044,48 @@ struct NodeConfig {
     /// If no peer reports a tip within this window, fastsync is skipped.
     #[serde(default = "default_fastsync_peer_wait_timeout_sec")]
     fastsync_peer_wait_timeout_sec: u64,
-    /// redb cache size in megabytes (default: 256).
-    #[serde(default = "default_cache_mb")]
-    cache_mb: u64,
+    /// TOTAL redb page cache across BOTH databases, in megabytes (default: 512).
+    ///
+    /// Breaking change: this previously sized `state.redb` alone while
+    /// `modifiers.redb` silently took redb's built-in 1 GiB default, so a
+    /// config saying 1024 actually used 2048 MB.
+    /// Absent = derived from the memory budget (facts/memory.md).
+    cache_mb: Option<u64>,
+    /// Total memory the node may use, MB. Absent = read the cgroup limit,
+    /// else a conservative share of MemTotal.
+    memory_budget_mb: Option<u64>,
+    /// Downgrade the startup memory floor from a refusal to a warning.
+    ///
+    /// A UTXO node refuses to start under a 3 GiB ceiling (facts/memory.md
+    /// § "Startup floor"). That floor is a rule of thumb, and a competent
+    /// operator may have a real reason to cross it — a heavily pruned node, a
+    /// mode we have not measured, or a box we are simply wrong about. A check
+    /// with no override turns our estimate into somebody else's outage.
+    ///
+    /// Deliberately a config key rather than a CLI flag: it survives a
+    /// restart, it is greppable, and startup states when it is set.
+    #[serde(default)]
+    ignore_memory_floor: bool,
+    /// Percentage of `cache_mb` given to `modifiers.redb`; the remainder goes
+    /// to `state.redb`. Valid 1-99, validated at startup.
+    cache_store_pct: Option<u32>,
     /// Live-heap threshold (MB) above which the validation sweep commits
     /// the redb write transaction mid-sweep. 0 disables the memory trigger
     /// and flushes degenerate to every `flush_max_blocks`. Default tuned to
     /// 4 GB, empirically the point where the redb write-tx dirty-page
     /// cache starts dominating live heap during initial sync.
-    #[serde(default = "default_flush_heap_threshold_mb")]
-    flush_heap_threshold_mb: u64,
+    flush_heap_threshold_mb: Option<u64>,
     /// Upper bound on blocks between flushes. Bounds crash-recovery work.
-    #[serde(default = "default_flush_max_blocks")]
-    flush_max_blocks: u32,
+    flush_max_blocks: Option<u32>,
     /// Lower bound on blocks between flushes. Prevents storm-flushing when
     /// heap growth is driven by something other than the redb write tx.
-    #[serde(default = "default_flush_min_blocks")]
-    flush_min_blocks: u32,
+    flush_min_blocks: Option<u32>,
+
+    // ── Deferred-eval backpressure ───────────────────────────────────────
+    // Bounds the queue of script evaluations dispatched to rayon but not
+    // yet drained. Governs a pool of memory DISJOINT from the redb dirty
+    // pages that flush_heap_threshold_mb controls — flushing redb does not
+    // free a queued eval, so the two must not share a budget.
 
     // ── At-tip memory mirrors ────────────────────────────────────────────
     // These take effect once chain sync reaches tip. Until then the cold-
@@ -857,7 +1093,6 @@ struct NodeConfig {
     // and reopens the AVL state DB once with the synced_cache_mb value.
     // Default: each mirror equals its cold-sync parent (= no-op until
     // configured), so existing configs keep their current behavior.
-
     /// redb cache size (MB) used at tip. Smaller = lower steady-state RSS;
     /// the tradeoff is more disk reads when cold-restarting at tip (cache
     /// has to re-warm from the working set).
@@ -913,10 +1148,13 @@ impl Default for NodeConfig {
             fastsync_peer: None,
             fastsync_threshold_blocks: default_fastsync_threshold_blocks(),
             fastsync_peer_wait_timeout_sec: default_fastsync_peer_wait_timeout_sec(),
-            cache_mb: default_cache_mb(),
-            flush_heap_threshold_mb: default_flush_heap_threshold_mb(),
-            flush_max_blocks: default_flush_max_blocks(),
-            flush_min_blocks: default_flush_min_blocks(),
+            cache_mb: None,
+            memory_budget_mb: None,
+            ignore_memory_floor: false,
+            cache_store_pct: None,
+            flush_heap_threshold_mb: None,
+            flush_max_blocks: None,
+            flush_min_blocks: None,
             synced_cache_mb: None,
             synced_flush_heap_threshold_mb: None,
             synced_flush_max_blocks: None,
@@ -933,6 +1171,9 @@ fn default_data_dir() -> String {
 fn default_state_type() -> String {
     "utxo".to_string()
 }
+/// Deferred until a slow box tells us what inline actually costs. Changing
+/// this default is a durability decision, not a tuning one — see
+/// facts/validation.md § "Script evaluation modes".
 fn default_verify_transactions() -> bool {
     true
 }
@@ -960,12 +1201,366 @@ fn default_fastsync_threshold_blocks() -> u32 {
 fn default_fastsync_peer_wait_timeout_sec() -> u64 {
     30
 }
-fn default_cache_mb() -> u64 {
-    256
+
+fn default_cache_store_pct() -> u32 {
+    50
 }
-fn default_flush_heap_threshold_mb() -> u64 {
-    4096
+
+/// One-shot maintenance subcommands open the store to touch a handful of keys
+/// and exit. They have no working set worth caching, so they take a small
+/// fixed budget rather than the operator's configured total — 256 MB to delete
+/// one chain-meta key would be absurd.
+const MAINTENANCE_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Reject a split that starves either database. A zero share means a database
+/// with no page cache at all, which is a configuration mistake rather than a
+/// tuning choice, and should fail at startup rather than produce a node that
+/// technically runs.
+fn validate_cache_split(cfg: &NodeConfig) -> Result<(), String> {
+    // Only an operator-supplied value can be out of range; derivation never
+    // produces one. Absent is valid and means "derive".
+    if let Some(pct) = cfg.cache_store_pct {
+        if !(1..=99).contains(&pct) {
+            return Err(format!("cache_store_pct must be 1-99, got {pct}"));
+        }
+    }
+    Ok(())
 }
+
+/// `(modifiers_bytes, state_bytes)`. Integer split with the remainder given to
+/// state, so the two always sum to exactly `cache_mb` regardless of rounding.
+///
+/// Note that redb splits whatever it receives a further 90% read / 10% write
+/// (`patches/redb/src/db.rs:1177`), and an at-tip in-place resize moves only
+/// the read half — see `facts/state.md`.
+fn cache_split_bytes(plan: &MemoryPlan) -> (usize, usize) {
+    split_cache_mb(plan.cache_mb, plan.cache_store_pct)
+}
+
+/// Split an arbitrary MB budget by the store percentage. Used for both the
+/// cold-sync `cache_mb` and the at-tip `synced_cache_mb`, so the ratio is one
+/// concept rather than two.
+fn split_cache_mb(total_mb: u64, store_pct: u32) -> (usize, usize) {
+    let total = total_mb as usize * 1024 * 1024;
+    let store = total * store_pct as usize / 100;
+    (store, total - store)
+}
+// ── Memory budget derivation ─────────────────────────────────────────────
+//
+// See facts/memory.md. The node reads its own ceiling rather than being told
+// it: a systemd unit with MemoryMax, or a container with --memory, already
+// states how much this node may use, and until v0.8.0 the node never looked.
+
+/// Where the ceiling came from. Decides how much of it we are willing to
+/// spend — an explicit budget or a cgroup limit is somebody stating this node
+/// may have that much; `MemTotal` states only that the machine has it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetSource {
+    Explicit,
+    Cgroup,
+    MemTotal,
+}
+
+impl BudgetSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            BudgetSource::Explicit => "config",
+            BudgetSource::Cgroup => "cgroup",
+            BudgetSource::MemTotal => "meminfo",
+        }
+    }
+
+    fn usable_fraction(self) -> f64 {
+        match self {
+            BudgetSource::Explicit => 1.00,
+            BudgetSource::Cgroup => 0.90,
+            BudgetSource::MemTotal => 0.50,
+        }
+    }
+}
+
+/// This process's cgroup memory limit, or None when unconfined.
+///
+/// Walks the v2 hierarchy upward and takes the MINIMUM: our own cgroup may say
+/// `max` while a parent slice carries the real limit, and the effective
+/// ceiling is the tightest one on the path.
+fn cgroup_memory_limit() -> Option<u64> {
+    let self_cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+
+    // cgroup v2 — one line, "0::/path".
+    if let Some(path) = self_cgroup.lines().find_map(|l| l.strip_prefix("0::")) {
+        let mut best: Option<u64> = None;
+        let root = std::path::Path::new("/sys/fs/cgroup");
+        let mut cur = root.join(path.trim_start_matches('/'));
+        loop {
+            if let Ok(txt) = std::fs::read_to_string(cur.join("memory.max")) {
+                let t = txt.trim();
+                // The literal "max" means no limit at this level, not zero.
+                if t != "max" {
+                    if let Ok(v) = t.parse::<u64>() {
+                        best = Some(best.map_or(v, |b: u64| b.min(v)));
+                    }
+                }
+            }
+            if cur == root || !cur.pop() {
+                break;
+            }
+        }
+        return best;
+    }
+
+    // cgroup v1 — "hierarchy:controllers:path", memory controller.
+    for line in self_cgroup.lines() {
+        let mut parts = line.splitn(3, ':');
+        let (_, ctrl, path) = (parts.next()?, parts.next()?, parts.next()?);
+        if ctrl.split(',').any(|c| c == "memory") {
+            let f = format!("/sys/fs/cgroup/memory{path}/memory.limit_in_bytes");
+            if let Ok(txt) = std::fs::read_to_string(f) {
+                if let Ok(v) = txt.trim().parse::<u64>() {
+                    // v1 signals unlimited with a page-count sentinel near u64::MAX
+                    // rather than a word, so treat implausibly large as absent.
+                    if v < (1u64 << 62) {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn meminfo_total_bytes() -> Option<u64> {
+    let txt = std::fs::read_to_string("/proc/meminfo").ok()?;
+    txt.lines().find_map(|line| {
+        let rest = line.strip_prefix("MemTotal:")?;
+        let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+        Some(kb * 1024)
+    })
+}
+
+/// Anonymous heap the node holds that no cache knob governs. Measured at tip
+/// on mainnet 1.85M: jemalloc `allocated` 703 MB against 402 MB of tracked
+/// components. Excludes jemalloc's own overhead (a further ~260 MB between
+/// `allocated` and `resident`), which is not ours to allocate against.
+const BASELINE_ANON_BYTES: u64 = 300 * 1024 * 1024;
+
+/// Shares of the available budget. ⚠ Calibrated on a 32-core box; the
+/// constrained-box run that settles them is still in flight (facts/memory.md).
+const CACHE_SHARE: f64 = 0.40;
+const WRITE_SHARE: f64 = 0.40;
+const SYNCED_RATIO: f64 = 0.25;
+
+#[derive(Debug, Clone, Copy)]
+struct MemoryBudget {
+    source: BudgetSource,
+    ceiling_bytes: u64,
+    usable_bytes: u64,
+}
+
+/// Resolve the ceiling, in the priority order facts/memory.md specifies.
+fn detect_memory_budget(explicit_mb: Option<u64>) -> MemoryBudget {
+    let mem_total = meminfo_total_bytes();
+
+    let (ceiling, source) = if let Some(mb) = explicit_mb {
+        (mb.saturating_mul(1024 * 1024), BudgetSource::Explicit)
+    } else if let Some(cg) = cgroup_memory_limit() {
+        // A cgroup limit above physical RAM is not a licence to use more than
+        // exists, so the ceiling is the tighter of the two.
+        (cg.min(mem_total.unwrap_or(u64::MAX)), BudgetSource::Cgroup)
+    } else if let Some(mt) = mem_total {
+        (mt, BudgetSource::MemTotal)
+    } else {
+        // No cgroup, no /proc — assume a small box rather than a large one.
+        (1024 * 1024 * 1024, BudgetSource::MemTotal)
+    };
+
+    let usable = (ceiling as f64 * source.usable_fraction()) as u64;
+    MemoryBudget {
+        source,
+        ceiling_bytes: ceiling,
+        usable_bytes: usable,
+    }
+}
+
+// ── Startup memory floor (facts/memory.md § "Startup floor") ─────────────
+
+/// Ceiling below which a UTXO node refuses to start.
+const MEMORY_FLOOR_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+
+/// Ceiling below which any node warns.
+const MEMORY_RECOMMENDED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Measured cold-sync RSS peak: mainnet genesis→595k, 32-core box, 1 GB cache
+/// budget, inline evaluation. A *usable* budget under this is the number that
+/// predicts trouble, and it is not the same test as the ceiling.
+const COLD_SYNC_PEAK_BYTES: u64 = 3_020_000_000;
+
+/// Refuse, or warn, before any work begins.
+///
+/// ⚠ Keys on the **ceiling**, not `MemAvailable`. `MemAvailable` moves with
+/// page cache, so keying on it means a node that came up at boot refuses after
+/// a busy hour — nondeterministic, for a reason the operator cannot see and did
+/// not cause.
+///
+/// ⚠ The refusal is **UTXO-only**. 4 GiB is a UTXO figure — that is where the
+/// AVL prover tree lives. `digest` runs the verifier rather than the persistent
+/// prover and `light` holds no tree at all, so refusing them would block the
+/// one mode a small box should be running.
+fn check_memory_floor(
+    budget: &MemoryBudget,
+    state_type: StateType,
+    ignore_floor: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ceiling_mb = budget.ceiling_bytes / MIB;
+    let usable_mb = budget.usable_bytes / MIB;
+    let under_floor = budget.ceiling_bytes < MEMORY_FLOOR_BYTES;
+
+    if under_floor && state_type == StateType::Utxo {
+        if ignore_floor {
+            tracing::warn!(
+                ceiling_mb,
+                floor_mb = MEMORY_FLOOR_BYTES / MIB,
+                "memory ceiling is below the floor for a UTXO node, but \
+                 ignore_memory_floor is set — starting anyway. If this node is \
+                 OOM-killed during cold sync, this is why."
+            );
+        } else {
+            return Err(format!(
+                "memory ceiling {ceiling_mb} MB is below the {} MB floor for a UTXO node \
+                 (source: {}). A UTXO node holds the AVL prover tree in RAM and cold sync \
+                 peaked at {} MB on a well-provisioned box; 4 GB or more is recommended. \
+                 Options: give it more memory; set MemoryMax on the systemd unit or \
+                 memory_budget_mb in the config if this box has more than the node can see; \
+                 run state_type = \"light\" or \"digest\", which do not hold the tree; or set \
+                 ignore_memory_floor = true in [node] to start anyway.",
+                MEMORY_FLOOR_BYTES / MIB,
+                budget.source.as_str(),
+                COLD_SYNC_PEAK_BYTES / MIB,
+            )
+            .into());
+        }
+    } else if under_floor {
+        tracing::warn!(
+            ceiling_mb,
+            floor_mb = MEMORY_FLOOR_BYTES / MIB,
+            state_type = ?state_type,
+            "memory ceiling is below the UTXO floor; this mode does not hold the \
+             AVL prover tree, so it is allowed — but it is unmeasured territory"
+        );
+    } else if budget.ceiling_bytes < MEMORY_RECOMMENDED_BYTES {
+        tracing::warn!(
+            ceiling_mb,
+            recommended_mb = MEMORY_RECOMMENDED_BYTES / MIB,
+            "memory ceiling is below the recommended minimum — the node will run, \
+             but cold sync is the tightest phase and more memory is better"
+        );
+    }
+
+    // A separate test, and the one that catches the case the ceiling check
+    // waves through: 4 GiB of RAM with no cgroup resolves to MemTotal at 50%,
+    // so 2 GiB usable — under the cold-sync peak, while passing above.
+    if budget.usable_bytes < COLD_SYNC_PEAK_BYTES {
+        let advice = match budget.source {
+            BudgetSource::MemTotal => {
+                "nothing states how much this node may use, so it is taking a conservative \
+                 50% of MemTotal. Setting MemoryMax on the systemd unit, or memory_budget_mb \
+                 in [node], raises that to 90% or 100% — the same RAM, declared honestly, is \
+                 a substantially larger budget"
+            }
+            BudgetSource::Cgroup => {
+                "raise MemoryMax on the systemd unit if this box has more to give"
+            }
+            BudgetSource::Explicit => {
+                "raise memory_budget_mb in [node] if this box has more to give"
+            }
+        };
+        tracing::warn!(
+            usable_mb,
+            cold_sync_peak_mb = COLD_SYNC_PEAK_BYTES / MIB,
+            source = budget.source.as_str(),
+            "derived budget is below the measured cold-sync peak — {advice}"
+        );
+    }
+
+    Ok(())
+}
+
+/// Budget left for caches and write buffers after the parts nothing governs.
+/// `chain_index_bytes` is 0 in phase 1, when the store has not been opened and
+/// the index is not yet knowable.
+fn available_bytes(budget: &MemoryBudget, chain_index_bytes: u64) -> u64 {
+    let floor = BASELINE_ANON_BYTES.saturating_add(chain_index_bytes);
+    budget.usable_bytes.saturating_sub(floor)
+}
+
+/// Every memory setting, resolved: derived from the budget unless the operator
+/// stated it. An absent config key derives; a present one is obeyed exactly.
+#[derive(Debug, Clone, Copy)]
+struct MemoryPlan {
+    cache_mb: u64,
+    cache_store_pct: u32,
+    flush_heap_threshold_mb: u64,
+    flush_max_blocks: u32,
+    flush_min_blocks: u32,
+    synced_cache_mb: Option<u64>,
+    synced_flush_heap_threshold_mb: Option<u64>,
+    synced_flush_max_blocks: Option<u32>,
+    synced_flush_min_blocks: Option<u32>,
+    /// True when any field came from derivation rather than the config —
+    /// decides whether the startup record is worth emitting.
+    derived_any: bool,
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// Resolve every memory setting. `chain_index_bytes` is 0 in phase 1, before
+/// the store is open and the index is knowable — see facts/memory.md.
+fn derive_memory_plan(
+    cfg: &NodeConfig,
+    budget: &MemoryBudget,
+    chain_index_bytes: u64,
+) -> MemoryPlan {
+    let avail = available_bytes(budget, chain_index_bytes);
+
+    let derived_cache_mb = ((avail as f64 * CACHE_SHARE) as u64 / MIB).max(64);
+
+    // An ABSOLUTE heap level, not a share: the trigger compares against total
+    // jemalloc `allocated`, which already contains the caches. A threshold
+    // below the cache size would fire on every check forever.
+    let derived_flush_mb = (BASELINE_ANON_BYTES
+        + chain_index_bytes
+        + (avail as f64 * CACHE_SHARE) as u64
+        + (avail as f64 * WRITE_SHARE) as u64)
+        / MIB;
+
+    let cache_mb = cfg.cache_mb.unwrap_or(derived_cache_mb);
+    let derived_any = cfg.cache_mb.is_none()
+        || cfg.flush_heap_threshold_mb.is_none()
+        || cfg.synced_cache_mb.is_none();
+
+    MemoryPlan {
+        cache_mb,
+        cache_store_pct: cfg.cache_store_pct.unwrap_or_else(default_cache_store_pct),
+        flush_heap_threshold_mb: cfg.flush_heap_threshold_mb.unwrap_or(derived_flush_mb),
+        // Not derived: block counts bound crash-recovery work, and nothing
+        // measured relates a block count to a memory budget.
+        flush_max_blocks: cfg
+            .flush_max_blocks
+            .unwrap_or_else(default_flush_max_blocks),
+        flush_min_blocks: cfg
+            .flush_min_blocks
+            .unwrap_or_else(default_flush_min_blocks),
+        synced_cache_mb: Some(
+            cfg.synced_cache_mb
+                .unwrap_or(((cache_mb as f64 * SYNCED_RATIO) as u64).max(32)),
+        ),
+        synced_flush_heap_threshold_mb: cfg.synced_flush_heap_threshold_mb,
+        synced_flush_max_blocks: cfg.synced_flush_max_blocks,
+        synced_flush_min_blocks: cfg.synced_flush_min_blocks,
+        derived_any,
+    }
+}
+
 fn default_flush_max_blocks() -> u32 {
     100
 }
@@ -975,8 +1570,12 @@ fn default_flush_min_blocks() -> u32 {
 fn default_reconciliation_trust_threshold() -> u32 {
     100
 }
-
 /// Top-level config wrapper.
+// ⚠ NO `deny_unknown_fields` here, deliberately. This same file is parsed a
+// second time into `enr_p2p`'s own `Config` for [proxy], [listen.*],
+// [outbound] and [identity] — sections RootConfig does not declare. Denying
+// unknown fields at THIS level would reject every real config at startup.
+// The nested sections below are wholly owned by this crate and do deny.
 #[derive(Debug, Deserialize)]
 struct RootConfig {
     #[serde(default)]
@@ -989,6 +1588,7 @@ struct RootConfig {
 
 /// `[debug]` toml section — opt-in container for diagnostic subsystems.
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 struct DebugConfig {
     #[serde(default)]
     p2p_capture: Option<enr_p2p::capture::CaptureConfig>,
@@ -996,6 +1596,7 @@ struct DebugConfig {
 
 /// `[stats]` toml section — opt-in. See `facts/stats.md`.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 struct StatsConfig {
     #[serde(default = "default_stats_bind")]
     bind_address: std::net::SocketAddr,
@@ -1080,8 +1681,6 @@ fn conv_snapshot_map(
     out
 }
 
-/// At-tip storage reopen handler. Awaits a one-shot from sync's `synced()`
-
 fn locate_config(args: &[String]) -> Option<String> {
     if let Some(p) = args.iter().skip(1).find(|a| !a.starts_with("--")).cloned() {
         return Some(p);
@@ -1109,6 +1708,215 @@ fn locate_config(args: &[String]) -> Option<String> {
         return Some("/etc/ergo-node/ergo.toml".to_string());
     }
     None
+}
+
+// ── Layered configuration (facts/config.md) ──────────────────────────────
+//
+// A base `ergo.toml` and a sibling `conf.d/` are merged into ONE document.
+// Either half alone is valid: a base file with no `conf.d` (tarball installs)
+// and a `conf.d` with no base file (the .deb end state after migration).
+
+/// Fields where a `<field>_add` sibling appends instead of replacing.
+///
+/// ⚠ Three names, by name — **not** a general mechanism applied to every
+/// array. `_add` names the operation rather than the provenance (provenance is
+/// already implied by which file the line is in) and leaves room for a future
+/// `_remove`. See facts/config.md § "Merge semantics".
+const ADDITIVE_FIELDS: [&str; 3] = ["seed_peers", "include_ips", "exclude_ips"];
+
+/// The merged configuration document, and the files it came from.
+#[derive(Debug)]
+struct ConfigDocument {
+    /// Merged TOML, re-serialized. **Both** parsers consume exactly this
+    /// string — `RootConfig` here and `enr_p2p::config::Config` via
+    /// `from_toml_str`. Handing p2p a path instead would make it read one file
+    /// and silently ignore every `conf.d` layer.
+    text: String,
+    /// The base file, when one was found. `None` is valid: `conf.d` alone.
+    base: Option<std::path::PathBuf>,
+    /// `conf.d` files layered on, in the order applied.
+    layers: Vec<std::path::PathBuf>,
+}
+
+/// Layer `overlay` onto `acc`.
+///
+/// Scalars: later wins, **per key, not per table** — setting `max_peers` must
+/// not drop `seed_peers` from the same table. Bare arrays replace wholesale,
+/// which deliberately discards any `_add` contributions accumulated so far:
+/// an operator writing a bare array is stating the complete list.
+fn merge_config_table(acc: &mut toml::Table, overlay: toml::Table) {
+    for (key, val) in overlay {
+        if let Some(field) = key.strip_suffix("_add") {
+            if ADDITIVE_FIELDS.contains(&field) {
+                append_additive(acc, field, &key, val);
+                continue;
+            }
+            // Not one of the three. Almost certainly a typo or a wrong
+            // assumption about how general `_add` is, and silently accepting
+            // it would look like it worked — the key would land in the merged
+            // document and be dropped by serde without a word.
+            tracing::warn!(
+                key = %key,
+                additive_fields = ?ADDITIVE_FIELDS,
+                "`_add` is a convention for three fields only — this key is being \
+                 taken literally and will be ignored by the config parser"
+            );
+        }
+        match (acc.get_mut(&key), val) {
+            // Recurse so sibling keys survive.
+            (Some(toml::Value::Table(existing)), toml::Value::Table(incoming)) => {
+                merge_config_table(existing, incoming);
+            }
+            // A table we have not seen yet still has to be *merged*, not
+            // inserted wholesale: `_add` is handled per level, so inserting the
+            // incoming table verbatim would carry a nested `seed_peers_add`
+            // straight through to the parser, which drops it silently. The
+            // first file to mention a table is the easy case to get wrong,
+            // because every later one takes the branch above.
+            (_, toml::Value::Table(incoming)) => {
+                let mut fresh = toml::Table::new();
+                merge_config_table(&mut fresh, incoming);
+                acc.insert(key, toml::Value::Table(fresh));
+            }
+            (_, incoming) => {
+                acc.insert(key, incoming);
+            }
+        }
+    }
+}
+
+fn append_additive(acc: &mut toml::Table, field: &str, key: &str, val: toml::Value) {
+    let toml::Value::Array(items) = val else {
+        tracing::warn!(key = %key, "`_add` value is not an array — ignoring");
+        return;
+    };
+    match acc.get_mut(field) {
+        Some(toml::Value::Array(existing)) => existing.extend(items),
+        // Nothing to append to yet: the `_add` becomes the field. A later bare
+        // array still replaces it, which is the documented precedence.
+        _ => {
+            acc.insert(field.to_string(), toml::Value::Array(items));
+        }
+    }
+}
+
+/// The `conf.d` directory that applies, or None.
+///
+/// With a base file it is that file's sibling and nothing else — the search
+/// does not continue past the tier that won. Without one, the same three tiers
+/// are searched for a bare `conf.d`.
+fn locate_conf_d(base: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    if let Some(b) = base {
+        let d = b
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("conf.d");
+        return d.is_dir().then_some(d);
+    }
+
+    let pwd = std::path::PathBuf::from("./conf.d");
+    if pwd.is_dir() {
+        return Some(pwd);
+    }
+    let xdg_dir = std::env::var("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .ok()
+        .or_else(|| {
+            std::env::var("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".config"))
+                .ok()
+        });
+    if let Some(d) = xdg_dir {
+        let candidate = d.join("ergo-node/conf.d");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    let etc = std::path::PathBuf::from("/etc/ergo-node/conf.d");
+    etc.is_dir().then_some(etc)
+}
+
+/// `*.toml` in a `conf.d`, in lexical filename order.
+///
+/// Lexical order IS the mechanism — a file that wants to win names itself
+/// later. Sorting on the full path would be equivalent here but breaks the
+/// moment a caller passes a directory whose name sorts differently, so sort on
+/// the file name.
+fn conf_d_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, std::io::Error> {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "toml"))
+        .collect();
+    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    Ok(files)
+}
+
+/// Every search location, for the error a maintenance subcommand prints when
+/// it finds nothing. The daemon does not use this — it writes a bootstrap
+/// config instead of failing.
+const NO_CONFIG_FOUND: &str = "no config found (pass an explicit path, or place one at \
+     ./ergo.toml, ~/.config/ergo-node/ergo.toml, or /etc/ergo-node/ergo.toml, \
+     or a conf.d/ directory beside any of them)";
+
+/// Merge the base file and any `conf.d` into one document.
+///
+/// `Ok(None)` means neither half exists — the caller writes a bootstrap config.
+/// A `conf.d` that exists but holds no `*.toml` counts as present: the operator
+/// made the directory, and silently falling through to "no config found" would
+/// be a worse answer than an empty one.
+fn load_config_document(
+    args: &[String],
+) -> Result<Option<ConfigDocument>, Box<dyn std::error::Error>> {
+    let base_path = locate_config(args).map(std::path::PathBuf::from);
+    let conf_d = locate_conf_d(base_path.as_deref());
+
+    if base_path.is_none() && conf_d.is_none() {
+        return Ok(None);
+    }
+
+    merge_config_sources(base_path.as_deref(), conf_d.as_deref()).map(Some)
+}
+
+/// The half of loading that does not consult the search path.
+///
+/// Split out so it can be tested against temp directories: the search path
+/// reaches `/etc/ergo-node`, and a test that walks it would read whatever this
+/// machine happens to have installed.
+fn merge_config_sources(
+    base: Option<&std::path::Path>,
+    conf_d: Option<&std::path::Path>,
+) -> Result<ConfigDocument, Box<dyn std::error::Error>> {
+    let mut merged = toml::Table::new();
+
+    if let Some(p) = base {
+        // A named base file that is missing is an error, not an empty layer —
+        // it is either the operator's explicit argument or a path the search
+        // just confirmed exists.
+        let text = std::fs::read_to_string(p)
+            .map_err(|e| format!("reading config {}: {e}", p.display()))?;
+        let table: toml::Table =
+            toml::from_str(&text).map_err(|e| format!("parsing config {}: {e}", p.display()))?;
+        merge_config_table(&mut merged, table);
+    }
+
+    let mut layers = Vec::new();
+    if let Some(dir) = conf_d {
+        for f in conf_d_files(dir).map_err(|e| format!("reading {}: {e}", dir.display()))? {
+            let text = std::fs::read_to_string(&f)
+                .map_err(|e| format!("reading config layer {}: {e}", f.display()))?;
+            let table: toml::Table = toml::from_str(&text)
+                .map_err(|e| format!("parsing config layer {}: {e}", f.display()))?;
+            merge_config_table(&mut merged, table);
+            layers.push(f);
+        }
+    }
+
+    Ok(ConfigDocument {
+        text: toml::to_string(&merged)?,
+        base: base.map(|p| p.to_path_buf()),
+        layers,
+    })
 }
 
 /// Minimal config written to `./ergo.toml` on first run when no config file
@@ -1165,18 +1973,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // hidden from --help. Takes the same config path arg as the daemon so
     // the data_dir is resolved consistently.
     if args.iter().any(|a| a == "--reset-scores-migration") {
-        let config_path = locate_config(&args).ok_or_else(|| -> Box<dyn std::error::Error> {
-            "no config found (pass an explicit path, or place one at ./ergo.toml, \
-             ~/.config/ergo-node/ergo.toml, or /etc/ergo-node/ergo.toml)".into()
-        })?;
-        let config_content = std::fs::read_to_string(&config_path)?;
-        let root_config: RootConfig = toml::from_str(&config_content)?;
+        let doc = load_config_document(&args)?
+            .ok_or_else(|| -> Box<dyn std::error::Error> { NO_CONFIG_FOUND.into() })?;
+        let root_config: RootConfig = toml::from_str(&doc.text)?;
         let node_config = root_config.node.unwrap_or_default();
-        let data_dir = std::path::PathBuf::from(node_config.data_dir);
-        let store = RedbModifierStore::new(&data_dir.join("modifiers.redb"))?;
+        let data_dir = std::path::PathBuf::from(node_config.data_dir.clone());
+        // Deliberately small: this path deletes one chain-meta key and exits.
+        let store =
+            RedbModifierStore::new(&data_dir.join("modifiers.redb"), MAINTENANCE_CACHE_BYTES)?;
         store.chain_meta_delete(b"scores_migrated_v1")?;
         store.flush()?;
-        tracing::info!("scores-migration sentinel cleared; next normal start will re-run the migration");
+        tracing::info!(
+            "scores-migration sentinel cleared; next normal start will re-run the migration"
+        );
         return Ok(());
     }
 
@@ -1188,12 +1997,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // deliberate operator step, so that a compaction whose stats look wrong
     // costs nothing. Requires the node to be stopped (redb file lock).
     if args.iter().any(|a| a == "--compact-state") {
-        let config_path = locate_config(&args).ok_or_else(|| -> Box<dyn std::error::Error> {
-            "no config found (pass an explicit path, or place one at ./ergo.toml, \
-             ~/.config/ergo-node/ergo.toml, or /etc/ergo-node/ergo.toml)".into()
-        })?;
-        let config_content = std::fs::read_to_string(&config_path)?;
-        let root_config: RootConfig = toml::from_str(&config_content)?;
+        let doc = load_config_document(&args)?
+            .ok_or_else(|| -> Box<dyn std::error::Error> { NO_CONFIG_FOUND.into() })?;
+        let root_config: RootConfig = toml::from_str(&doc.text)?;
         let node_config = root_config.node.unwrap_or_default();
         let data_dir = std::path::PathBuf::from(node_config.data_dir);
         let source = data_dir.join("state.redb");
@@ -1256,8 +2062,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let config_path = match locate_config(&args) {
-        Some(p) => p,
+    let config_doc = match load_config_document(&args)? {
+        Some(d) => d,
         None => {
             std::fs::write("./ergo.toml", COLD_BOOTSTRAP_CONFIG)?;
             tracing::warn!(
@@ -1266,11 +2072,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "no config found — wrote a default (testnet, full archival, state in ./ergo-node-data). \
                  Edit ./ergo.toml or run ./install.sh for interactive setup."
             );
-            "./ergo.toml".to_string()
+            load_config_document(&args)?.ok_or_else(|| -> Box<dyn std::error::Error> {
+                "wrote ./ergo.toml but still could not load it".into()
+            })?
         }
     };
 
-    let config = enr_p2p::config::Config::load(&config_path)?;
+    // Which files produced the effective config. Logged unconditionally: with
+    // layering, "what is this node actually configured with" stops being
+    // answerable by looking at one file, and an operator debugging a surprising
+    // value needs to know which layers were in play and in what order.
+    tracing::info!(
+        base = config_doc.base.as_ref().map(|p| p.display().to_string()),
+        layers = ?config_doc.layers.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "configuration loaded"
+    );
+
+    // Both parsers consume the merged document, not a path — see
+    // facts/config.md § "One document, parsed twice".
+    let config = enr_p2p::config::Config::from_toml_str(&config_doc.text)?;
 
     // Derive chain config from P2P network setting
     let network = config.proxy.network;
@@ -1278,6 +2098,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         enr_p2p::types::Network::Testnet => ChainConfig::testnet(),
         enr_p2p::types::Network::Mainnet => ChainConfig::mainnet(),
     };
+
+    // Wall-clock start, surfaced as `launchTime` on GET /info (see
+    // ../facts/api.md). Epoch milliseconds rather than Instant because it
+    // leaves the process; consumers derive uptime as currentTime - launchTime.
+    let launch_time_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -1288,9 +2116,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Ergo node starting"
     );
 
-    // Parse node config from the same TOML file
-    let config_content = std::fs::read_to_string(&config_path)?;
-    let root_config: RootConfig = toml::from_str(&config_content)?;
+    // Parse node config from the same merged document
+    let root_config: RootConfig = toml::from_str(&config_doc.text)?;
     let stats_config = root_config.stats.clone();
     let capture_config = root_config.debug.clone().and_then(|d| d.p2p_capture);
     let node_config = root_config.node.unwrap_or_default();
@@ -1309,14 +2136,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let capture_tap = capture_handle.as_ref().map(|h| h.tap());
-    let capture_access: Option<Arc<dyn enr_p2p::capture::CaptureAccess>> =
-        capture_handle.as_ref().map(|h| h.clone() as Arc<dyn enr_p2p::capture::CaptureAccess>);
+    let capture_access: Option<Arc<dyn enr_p2p::capture::CaptureAccess>> = capture_handle
+        .as_ref()
+        .map(|h| h.clone() as Arc<dyn enr_p2p::capture::CaptureAccess>);
     let state_type = match node_config.state_type.as_str() {
         "utxo" => StateType::Utxo,
         "digest" => StateType::Digest,
         "light" => StateType::Light,
         other => {
-            return Err(format!("unknown state_type '{}' (expected 'utxo', 'digest', or 'light')", other).into());
+            return Err(format!(
+                "unknown state_type '{}' (expected 'utxo', 'digest', or 'light')",
+                other
+            )
+            .into());
         }
     };
     let verify_transactions = node_config.verify_transactions;
@@ -1332,7 +2164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         checkpoint_height = ?configured_checkpoint,
         storing_snapshots = node_config.storing_snapshots,
         snapshot_interval = node_config.snapshot_interval,
-        cache_mb = node_config.cache_mb,
+        cache_mb = ?node_config.cache_mb,
         "node config"
     );
 
@@ -1351,10 +2183,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if node_config.mining.votes.is_empty() || node_config.mining.votes == "000000" {
             [0, 0, 0]
         } else {
-            let v = hex::decode(&node_config.mining.votes)
-                .map_err(|e| format!("invalid mining votes hex '{}': {e}", node_config.mining.votes))?;
+            let v = hex::decode(&node_config.mining.votes).map_err(|e| {
+                format!(
+                    "invalid mining votes hex '{}': {e}",
+                    node_config.mining.votes
+                )
+            })?;
             if v.len() != 3 {
-                return Err(format!("mining votes must be exactly 3 bytes, got {}", v.len()).into());
+                return Err(
+                    format!("mining votes must be exactly 3 bytes, got {}", v.len()).into(),
+                );
             }
             [v[0], v[1], v[2]]
         }
@@ -1368,10 +2206,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(miner_pk = %pk_hex, votes = %node_config.mining.votes, "mining configured");
     }
 
-    let data_dir = std::path::PathBuf::from(node_config.data_dir);
+    validate_cache_split(&node_config).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    // Phase 1 of memory derivation (facts/memory.md). The modifier store must
+    // open before the header chain can be restored — the chain is restored FROM
+    // it — and redb fixes its cache at open with no resize path. So the index
+    // half of the floor is not knowable yet and enters as 0; phase 2 re-derives
+    // with the real figure for everything opened later.
+    let memory_budget = detect_memory_budget(node_config.memory_budget_mb);
+
+    // Before anything is opened. A node that cannot finish should not create a
+    // data directory and half a database first.
+    check_memory_floor(&memory_budget, state_type, node_config.ignore_memory_floor)?;
+
+    let plan_phase1 = derive_memory_plan(&node_config, &memory_budget, 0);
+    let (store_cache_bytes, _) = cache_split_bytes(&plan_phase1);
+
+    let data_dir = std::path::PathBuf::from(node_config.data_dir.clone());
     std::fs::create_dir_all(&data_dir)?;
-    tracing::info!(path = %data_dir.join("modifiers.redb").display(), "opening modifier store");
-    let store = Arc::new(RedbModifierStore::new(&data_dir.join("modifiers.redb"))?);
+    tracing::info!(
+        path = %data_dir.join("modifiers.redb").display(),
+        cache_bytes = store_cache_bytes,
+        "opening modifier store"
+    );
+    let store = Arc::new(RedbModifierStore::new(
+        &data_dir.join("modifiers.redb"),
+        store_cache_bytes,
+    )?);
     tracing::info!("modifier store opened");
 
     // One-shot scores backfill migration. v0.4.x stored empty
@@ -1384,21 +2245,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let entries = store.best_chain_entries()?;
         let total = entries.len();
         if total > 0 {
-            tracing::info!(
-                total,
-                "scores migration: starting (one-time backfill)"
-            );
+            tracing::info!(total, "scores migration: starting (one-time backfill)");
             const CHUNK_SIZE: usize = 50_000;
             let mut prev_score = enr_chain::BigUint::default();
             let mut batch: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(CHUNK_SIZE);
             for (i, (height, header_id)) in entries.iter().enumerate() {
-                let data = store
-                    .get(HEADER_TYPE_ID, header_id)?
-                    .ok_or_else(|| format!(
+                let data = store.get(HEADER_TYPE_ID, header_id)?.ok_or_else(|| {
+                    format!(
                         "scores migration: header at h={} missing from PRIMARY (id={})",
                         height,
                         hex::encode(header_id),
-                    ))?;
+                    )
+                })?;
                 let header = enr_chain::parse_header(&data)
                     .map_err(|e| format!("scores migration: parse_header at h={}: {e}", height))?;
                 let difficulty = enr_chain::decode_compact_bits(header.n_bits)
@@ -1423,7 +2281,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::info!(done, total, "scores migration: progress");
                 }
             }
-            tracing::info!(headers = total, "scores migration: complete, persisting sentinel");
+            tracing::info!(
+                headers = total,
+                "scores migration: complete, persisting sentinel"
+            );
             store.flush()?;
         }
         store.chain_meta_put(b"scores_migrated_v1", &[1u8])?;
@@ -1447,7 +2308,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(*id_bytes))
     });
     let restore_entries = best_chain_entries.into_iter().map(|(h, id_bytes)| {
-        (h, ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(id_bytes)))
+        (
+            h,
+            ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(id_bytes)),
+        )
     });
     let mut chain = HeaderChain::restore(chain_config, restore_entries)
         .map_err(|e| format!("header chain restore failed: {e:?}"))?;
@@ -1459,10 +2323,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tip = %tip,
             "header chain restored",
         ),
-        None => tracing::info!(
-            headers = 0u64,
-            "header chain restored",
-        ),
+        None => tracing::info!(headers = 0u64, "header chain restored",),
+    }
+
+    // Phase 2: the header index is real now, so re-derive everything that has
+    // not been allocated yet — the state cache and the flush thresholds.
+    let chain_index_bytes = chain.memory_estimate().index_bytes;
+    let memory_plan = derive_memory_plan(&node_config, &memory_budget, chain_index_bytes);
+    let (_, state_cache_bytes) = cache_split_bytes(&memory_plan);
+
+    if memory_plan.derived_any {
+        // Every input and every output, because auto-sizing's failure mode is
+        // not being wrong — it is being wrong invisibly, leaving the operator
+        // no line to point at. facts/journal-events.md § memory_budget_derived.
+        tracing::info!(
+            source = memory_budget.source.as_str(),
+            ceiling_mb = memory_budget.ceiling_bytes / MIB,
+            usable_mb = memory_budget.usable_bytes / MIB,
+            baseline_mb = BASELINE_ANON_BYTES / MIB,
+            chain_index_mb = chain_index_bytes / MIB,
+            available_mb = available_bytes(&memory_budget, chain_index_bytes) / MIB,
+            cache_mb = memory_plan.cache_mb,
+            cache_store_pct = memory_plan.cache_store_pct,
+            store_cache_mb = store_cache_bytes as u64 / MIB,
+            state_cache_mb = state_cache_bytes as u64 / MIB,
+            flush_heap_threshold_mb = memory_plan.flush_heap_threshold_mb,
+            synced_cache_mb = memory_plan.synced_cache_mb.unwrap_or(0),
+            "memory budget derived"
+        );
+        if memory_budget.source == BudgetSource::MemTotal {
+            tracing::info!(
+                "memory budget came from MemTotal and takes a conservative share; \
+                 set MemoryMax on the unit or memory_budget_mb in ergo.toml to let \
+                 the node use more"
+            );
+        }
     }
 
     // Wire the extension loader so chain can read epoch-boundary extensions
@@ -1542,9 +2437,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             match store_for_score_loader.header_score(&header_id) {
-                Ok(Some(bytes)) if !bytes.is_empty() => Some(enr_chain::BigUint::from_bytes_be(&bytes)),
+                Ok(Some(bytes)) if !bytes.is_empty() => {
+                    Some(enr_chain::BigUint::from_bytes_be(&bytes))
+                }
                 Ok(_) => {
-                    tracing::warn!(height, "score_loader: empty or missing score (post-migration store bug?)");
+                    tracing::warn!(
+                        height,
+                        "score_loader: empty or missing score (post-migration store bug?)"
+                    );
                     None
                 }
                 Err(e) => {
@@ -1575,10 +2475,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         const LINKAGE_CHECK_DEPTH: u32 = 4096;
         match chain.verify_best_chain_linkage(Some(LINKAGE_CHECK_DEPTH)) {
             Ok(()) => {
-                tracing::info!(
-                    depth = LINKAGE_CHECK_DEPTH,
-                    "best-chain linkage verified"
-                );
+                tracing::info!(depth = LINKAGE_CHECK_DEPTH, "best-chain linkage verified");
             }
             Err(e) => {
                 tracing::error!(
@@ -1625,14 +2522,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             StateType::Digest | StateType::Light => 1,
         },
         verifying: verify_transactions && state_type != StateType::Light,
-        blocks_to_keep: if state_type == StateType::Light { 0 } else { blocks_to_keep as i32 },
+        blocks_to_keep: if state_type == StateType::Light {
+            0
+        } else {
+            blocks_to_keep as i32
+        },
     };
 
     // Start P2P with modifier sink (no validator)
     let peer_storage = Box::new(PeerStorageAdapter::new(store.clone()));
     // capture_tap from [debug.p2p_capture] in ergo.toml — None when the
     // section is absent or `enabled = false`. See facts/p2p-capture.md.
-    let p2p = Arc::new(enr_p2p::node::P2pNode::start(config, Some(modifier_tx), mode_config, peer_storage, capture_tap).await?);
+    let p2p = Arc::new(
+        enr_p2p::node::P2pNode::start(
+            config,
+            Some(modifier_tx),
+            mode_config,
+            peer_storage,
+            capture_tap,
+        )
+        .await?,
+    );
 
     // Register message codes consumed by the main crate's event stream so
     // the router doesn't blindly forward them to all peers.
@@ -1645,9 +2555,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Store-blind router, store-aware closure. redb reads are sync + cheap.
     {
         let serve_store = store.clone();
-        p2p.set_local_serve(std::sync::Arc::new(move |modifier_type: u8, id: &[u8; 32]| {
-            serve_store.get(modifier_type, id).ok().flatten()
-        }))
+        p2p.set_local_serve(std::sync::Arc::new(
+            move |modifier_type: u8, id: &[u8; 32]| {
+                serve_store.get(modifier_type, id).ok().flatten()
+            },
+        ))
         .await;
     }
 
@@ -1670,8 +2582,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pipeline_store = store.clone();
     tokio::spawn(async move {
-        let mut pipeline =
-            ValidationPipeline::new(modifier_rx, pipeline_chain, pipeline_store, progress_tx, delivery_control_tx, delivery_data_tx);
+        let mut pipeline = ValidationPipeline::new(
+            modifier_rx,
+            pipeline_chain,
+            pipeline_store,
+            progress_tx,
+            delivery_control_tx,
+            delivery_data_tx,
+        );
         pipeline.set_tx_sender(tx_tx);
         pipeline.run().await;
     });
@@ -1694,9 +2612,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Snapshot store: open if serving is enabled
     let snapshot_store = if node_config.storing_snapshots > 0 {
-        let store = ergo_node_rust::snapshot_store::SnapshotStore::open(
-            &data_dir.join("snapshots.redb"),
-        )?;
+        let store =
+            ergo_node_rust::snapshot_store::SnapshotStore::open(&data_dir.join("snapshots.redb"))?;
         Some(std::sync::Arc::new(store))
     } else {
         None
@@ -1715,7 +2632,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Some(event) = events.recv().await {
                 let handled = if let enr_p2p::protocol::peer::ProtocolEvent::Message {
                     peer_id,
-                    message: enr_p2p::protocol::messages::ProtocolMessage::Unknown { code, ref body },
+                    message:
+                        enr_p2p::protocol::messages::ProtocolMessage::Unknown { code, ref body },
                 } = event
                 {
                     // Snapshot serving (codes 76, 78, 80)
@@ -1771,10 +2689,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     false
                 };
 
-                if !handled
-                    && sync_events_tx.send(event).await.is_err() {
-                        break;
-                    }
+                if !handled && sync_events_tx.send(event).await.is_err() {
+                    break;
+                }
             }
         });
     }
@@ -1789,8 +2706,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         enr_p2p::types::Network::Mainnet => MAINNET_GENESIS_DIGEST,
     };
     let genesis_bytes = hex::decode(genesis_digest_hex).expect("invalid genesis digest hex");
-    let genesis_digest = ADDigest::try_from(genesis_bytes.as_slice())
-        .expect("invalid genesis digest length");
+    let genesis_digest =
+        ADDigest::try_from(genesis_bytes.as_slice()).expect("invalid genesis digest length");
 
     // Candidate generator — constructed before the validator so the
     // post-apply lifecycle hook (CandidateGenerator::on_block_applied) can
@@ -1816,22 +2733,87 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (block_applied_tx, block_applied_rx) =
         tokio::sync::mpsc::channel::<Vec<ergo_validation::Transaction>>(64);
     let (height_watch_tx, height_watch_rx) = tokio::sync::watch::channel(0u32);
+
+    // Memory gauges for /debug/memory. Storage is a plain Arc<AtomicU64> so one
+    // allocation serves a producer in `validation/`-via-`Validator` or `sync/`
+    // and a reader in `api/` — those crates cannot name each other's types
+    // (facts/api.md). `u64::MAX` is the never-published sentinel on both ends,
+    // which is what makes an unmeasured field an absent JSON key rather than a
+    // zero asserting an empty prover.
+    // Minted through the reader's own constructor so the sentinel has one
+    // definition at the mint site rather than two that happen to agree.
+    let unset_gauge = || ergo_api::PublishedGauge::unset().storage();
+    let prover_modified_nodes_bytes = unset_gauge();
+    let prover_resident_nodes_bytes = unset_gauge();
+    let shared_window_bytes = unset_gauge();
+
+    // `sync/` re-stamps its own `WINDOW_BYTES_UNSET` into the window gauge in
+    // `HeaderSync::new`, and that constant is defined independently of the
+    // reader's. They agree today and nothing enforces it: if they diverged, an
+    // unmeasured window would render as a ~16 EiB reading instead of an absent
+    // key — a wrong answer wearing the shape of a right one, which is the exact
+    // failure `/debug/memory` exists to avoid.
+    debug_assert!(
+        {
+            let probe = Arc::new(std::sync::atomic::AtomicU64::new(
+                ergo_sync::WINDOW_BYTES_UNSET,
+            ));
+            ergo_api::PublishedGauge::from_storage(probe)
+                .get()
+                .is_none()
+        },
+        "ergo_sync::WINDOW_BYTES_UNSET is not the sentinel PublishedGauge reads as unset"
+    );
     let mut chain_guard = chain.lock().await;
 
     let swap_reader = Arc::new(ergo_node_rust::SwappableReader::empty());
 
+    // The checkpoint the validator is ACTUALLY constructed with, captured from
+    // whichever branch below runs. It decides which blocks skip script
+    // evaluation entirely: at or below it, `apply_state` builds no
+    // `ScriptEvalInputs` and runs nothing.
+    //
+    // It used to have a second consumer — `sync` floored `script_verified_height`
+    // at this value, and the two had to be the same number or a checkpointed
+    // node left a permanent frontier hole. That watermark is gone with deferred
+    // evaluation, so the coupling is gone with it; the value now has exactly
+    // one meaning and one reader.
+    //
+    // This is deliberately NOT `configured_checkpoint.unwrap_or(0)`. Digest
+    // mode resuming from a stored tip defaults to `height - 100`, not 0 — so
+    // that one expression would put the floor up to a whole chain below the
+    // eval-skip boundary on an unconfigured digest node.
+    //
+    // Every branch obtains its checkpoint through `resolve_checkpoint` so a
+    // future branch computing one directly stands out from its neighbours.
+    let effective_checkpoint = std::cell::Cell::new(0u32);
+    let resolve_checkpoint = |checkpoint: u32| -> u32 {
+        effective_checkpoint.set(checkpoint);
+        checkpoint
+    };
+
     let mut validator: Option<Validator> = match state_type {
         StateType::Utxo => {
             let state_path = data_dir.join("state.redb");
-            let params = AVLTreeParams { key_length: 32, value_length: None };
+            let params = AVLTreeParams {
+                key_length: 32,
+                value_length: None,
+            };
             let keep_versions = 256u32;
             tracing::info!(
                 path = %state_path.display(),
-                cache_mb = node_config.cache_mb,
+                // The split, not the configured total — logging cache_mb here
+                // would claim this database got the whole budget.
+                cache_bytes = state_cache_bytes,
                 "opening UTXO state storage"
             );
-            let mut storage = RedbAVLStorage::open(&state_path, params, keep_versions, CacheSize::Bytes(node_config.cache_mb as usize * 1024 * 1024))
-                .expect("failed to open UTXO state storage");
+            let mut storage = RedbAVLStorage::open(
+                &state_path,
+                params,
+                keep_versions,
+                CacheSize::Bytes(state_cache_bytes),
+            )
+            .expect("failed to open UTXO state storage");
 
             // `revalidate` in UTXO mode: the state tree cannot be rolled back
             // to genesis in place (the undo log holds keep_versions, not the
@@ -1849,14 +2831,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .expect("revalidate: failed to remove UTXO state file");
                 storage = RedbAVLStorage::open(
                     &state_path,
-                    AVLTreeParams { key_length: 32, value_length: None },
+                    AVLTreeParams {
+                        key_length: 32,
+                        value_length: None,
+                    },
                     keep_versions,
-                    CacheSize::Bytes(node_config.cache_mb as usize * 1024 * 1024),
+                    CacheSize::Bytes(state_cache_bytes),
                 )
                 .expect("revalidate: failed to re-open UTXO state storage");
             }
 
-            let checkpoint = configured_checkpoint.unwrap_or(0);
+            let checkpoint = resolve_checkpoint(configured_checkpoint.unwrap_or(0));
 
             if let Some(current_version) = storage.version() {
                 // Resume branch: storage has data, load its root into a fresh
@@ -1883,7 +2868,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 prover.restore_root(root, tree_height);
 
                 let prover_digest = prover.digest().expect("prover has no root");
-                let prover_digest_arr: [u8; 33] = prover_digest.as_ref().try_into()
+                let prover_digest_arr: [u8; 33] = prover_digest
+                    .as_ref()
+                    .try_into()
                     .expect("prover digest should be 33 bytes");
                 let chain_height = chain_guard.height();
                 let stored_height = storage.block_height();
@@ -1964,18 +2951,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // processed.
                 shared_validated_height.store(height, std::sync::atomic::Ordering::Relaxed);
                 let mining_ctx = mining_generator.as_ref().map(|g| MiningCtx {
-                    config: g.config.clone(),
                     proof_cache: mining_proof_cache.clone(),
                     snapshot_reader: Arc::new(sr),
                     generator: g.clone(),
                 });
+                // Recover `emission_box_id` from the block at the resume
+                // height. The coinbase spends and recreates the emission box
+                // in every block that has one, so this block's insertions
+                // carry the current one — see facts/validation.md
+                // § "Recovering emission_box_id on resume".
+                //
+                // Without this the field stays None, which is the documented
+                // value for "all ERG emitted", and a node restarted AT TIP
+                // serves no mining candidate until a peer delivers the next
+                // block. For a solo miner that never happens: no candidate,
+                // no block, no application, no candidate.
+                let resume_block_txs: Option<Vec<u8>> =
+                    chain_guard.header_at(height).and_then(|h| {
+                        let (type_id, section_id) = enr_chain::section_ids(&h)[0];
+                        store.get(type_id, &section_id).ok().flatten()
+                    });
+                let emission_source = match resume_block_txs {
+                    Some(ref bytes) => ergo_validation::EmissionSource::TipBlock(bytes),
+                    // Pruned or incomplete store. Says which, because an
+                    // unexplained None here is byte-identical to the
+                    // legitimate one — the exact ambiguity being removed.
+                    None => ergo_validation::EmissionSource::Unavailable(
+                        "block transactions for the resume height are not in the store",
+                    ),
+                };
+
                 Some(Validator::new(
-                    ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint)),
+                    ValidatorInner::Utxo(UtxoValidator::new(
+                        storage,
+                        prover,
+                        height,
+                        checkpoint,
+                        emission_source,
+                    )),
                     shared_validated_height.clone(),
                     shared_state_context.clone(),
                     block_applied_tx.clone(),
                     height_watch_tx.clone(),
                     mining_ctx,
+                    prover_modified_nodes_bytes.clone(),
+                    prover_resident_nodes_bytes.clone(),
                 ))
             } else if utxo_bootstrap {
                 // Snapshot bootstrap — validator will be created after snapshot download
@@ -1989,11 +3009,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let tree = AVLTree::with_resolver(resolver, 32, None);
                 let mut prover = BatchAVLProver::new(tree, true);
 
-                for (box_id, box_bytes) in build_genesis_boxes(network) {
-                    prover.perform_one_operation(&Operation::Insert(KeyValue {
-                        key: Bytes::copy_from_slice(&box_id),
-                        value: Bytes::copy_from_slice(&box_bytes),
-                    })).expect("genesis box insert failed");
+                // Bound to a local rather than consumed by the loop: one of
+                // these three carries the emission contract, and the validator
+                // recovers `emission_box_id` from them below. At height 0 there
+                // is no block to read it from.
+                let genesis_boxes = build_genesis_boxes(network);
+
+                for (box_id, box_bytes) in &genesis_boxes {
+                    prover
+                        .perform_one_operation(&Operation::Insert(KeyValue {
+                            key: Bytes::copy_from_slice(box_id),
+                            value: Bytes::copy_from_slice(box_bytes),
+                        }))
+                        .expect("genesis box insert failed");
                 }
 
                 // First update commits genesis state with block_height=0
@@ -2017,11 +3045,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let actual = prover.digest().expect("prover has no root after genesis");
                 let expected: [u8; 33] = genesis_digest.into();
                 assert_eq!(
-                    actual.as_ref(), &expected[..],
+                    actual.as_ref(),
+                    &expected[..],
                     "genesis UTXO state digest mismatch"
                 );
 
-                tracing::info!(checkpoint, "block validator starting from genesis (UTXO mode)");
+                tracing::info!(
+                    checkpoint,
+                    "block validator starting from genesis (UTXO mode)"
+                );
 
                 // Genesis resync — recompute(0) is a no-op per the chain
                 // contract; active_parameters stays at construction defaults
@@ -2029,21 +3061,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // will carry).
                 let _ = chain_guard.recompute_active_parameters_from_storage(0);
                 let mining_ctx = mining_generator.as_ref().map(|g| MiningCtx {
-                    config: g.config.clone(),
                     proof_cache: mining_proof_cache.clone(),
                     snapshot_reader: Arc::new(sr),
                     generator: g.clone(),
                 });
                 Some(Validator::new(
                     ValidatorInner::Utxo({
-                        let mut uv = UtxoValidator::new(storage, prover, 0, checkpoint);
+                        let mut uv = UtxoValidator::new(
+                            storage,
+                            prover,
+                            0,
+                            checkpoint,
+                            ergo_validation::EmissionSource::GenesisBoxes(&genesis_boxes),
+                        );
                         // Diagnostic: regenerate historical ADProofs that UTXO mode does
                         // not store. Set ENR_DUMP_ADPROOFS_AT=h1,h2,... for a one-shot
                         // genesis replay; writes adproofs-<H>.104 (raw type-104 section)
                         // into data_dir at each listed height. Empty/unset = no-op.
                         if let Ok(spec) = std::env::var("ENR_DUMP_ADPROOFS_AT") {
-                            let heights: std::collections::HashSet<u32> =
-                                spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                            let heights: std::collections::HashSet<u32> = spec
+                                .split(',')
+                                .filter_map(|s| s.trim().parse().ok())
+                                .collect();
                             if !heights.is_empty() {
                                 tracing::warn!(
                                     ?heights, dir = %data_dir.display(),
@@ -2059,6 +3098,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     block_applied_tx.clone(),
                     height_watch_tx.clone(),
                     mining_ctx,
+                    prover_modified_nodes_bytes.clone(),
+                    prover_resident_nodes_bytes.clone(),
                 ))
             }
         }
@@ -2068,7 +3109,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let tip = chain_guard.tip();
                 let height = chain_guard.height();
                 let digest = tip.state_root;
-                let checkpoint = configured_checkpoint.unwrap_or_else(|| height.saturating_sub(100));
+                let checkpoint = resolve_checkpoint(
+                    configured_checkpoint.unwrap_or_else(|| height.saturating_sub(100)),
+                );
                 tracing::info!(
                     height,
                     checkpoint,
@@ -2081,7 +3124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 shared_validated_height.store(height, std::sync::atomic::Ordering::Relaxed);
                 DigestValidator::from_state(digest, height, checkpoint)
             } else if revalidate && chain_guard.height() > 0 {
-                let checkpoint = configured_checkpoint.unwrap_or(0);
+                let checkpoint = resolve_checkpoint(configured_checkpoint.unwrap_or(0));
                 let chain_height = chain_guard.height();
 
                 // Scan forward to find the first height with all required sections.
@@ -2102,7 +3145,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if start_from == 0 {
-                    tracing::warn!("revalidate: no complete blocks found in store, starting from genesis");
+                    tracing::warn!(
+                        "revalidate: no complete blocks found in store, starting from genesis"
+                    );
                     DigestValidator::new(genesis_digest, checkpoint)
                 } else {
                     let prev_height = start_from - 1;
@@ -2120,12 +3165,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Revalidation resets the effective validated
                     // height to prev_height — publish it so the
                     // atomic doesn't lie about the node's state.
-                    shared_validated_height.store(prev_height, std::sync::atomic::Ordering::Relaxed);
+                    shared_validated_height
+                        .store(prev_height, std::sync::atomic::Ordering::Relaxed);
                     DigestValidator::from_state(digest, prev_height, checkpoint)
                 }
             } else {
-                let checkpoint = configured_checkpoint.unwrap_or(0);
-                tracing::info!(checkpoint, "block validator starting from genesis (digest mode)");
+                let checkpoint = resolve_checkpoint(configured_checkpoint.unwrap_or(0));
+                tracing::info!(
+                    checkpoint,
+                    "block validator starting from genesis (digest mode)"
+                );
                 DigestValidator::new(genesis_digest, checkpoint)
             };
             Some(Validator::new(
@@ -2135,6 +3184,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 block_applied_tx.clone(),
                 height_watch_tx.clone(),
                 None, // mining requires UTXO mode
+                prover_modified_nodes_bytes.clone(),
+                prover_resident_nodes_bytes.clone(),
             ))
         }
 
@@ -2172,6 +3223,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build sync config from P2P network settings
     let net = net_settings;
+    // Source for the pacing constants at the bottom of this literal. See the
+    // comment there for why they are named individually rather than swept in
+    // with `..SyncConfig::default()`.
+    let sync_defaults = SyncConfig::default();
     let sync_config = SyncConfig {
         delivery_timeout: std::time::Duration::from_secs(net.delivery_timeout_secs),
         max_delivery_checks: net.max_delivery_checks,
@@ -2179,29 +3234,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         utxo_bootstrap,
         min_snapshot_peers,
         data_dir: data_dir.clone(),
-        flush_heap_threshold_mb: node_config.flush_heap_threshold_mb,
-        flush_max_blocks: node_config.flush_max_blocks,
-        flush_min_blocks: node_config.flush_min_blocks,
-        synced_flush_heap_threshold_mb: node_config.synced_flush_heap_threshold_mb,
-        synced_flush_max_blocks: node_config.synced_flush_max_blocks,
-        synced_flush_min_blocks: node_config.synced_flush_min_blocks,
+        flush_heap_threshold_mb: memory_plan.flush_heap_threshold_mb,
+        flush_max_blocks: memory_plan.flush_max_blocks,
+        flush_min_blocks: memory_plan.flush_min_blocks,
+        // Derived from THE mode binding, never re-parsed from node_config —
+        // sync doing deferred bookkeeping while the validator evaluates
+        // inline freezes the frontier; the reverse advances it over blocks
+        // nothing verified. Omitting this line used to compile, because the
+        // literal ended in `..SyncConfig::default()` and this would have taken
+        // `false` in silence. It no longer does; see the note at the bottom.
+        synced_flush_heap_threshold_mb: memory_plan.synced_flush_heap_threshold_mb,
+        synced_flush_max_blocks: memory_plan.synced_flush_max_blocks,
+        synced_flush_min_blocks: memory_plan.synced_flush_min_blocks,
         flush_probe,
         reconciliation_trust_threshold: node_config.reconciliation_trust_threshold,
         // Mirror the handshake's Light-mode override (line above) — in Light
         // there are no bodies to prune anyway, so 0 keeps sync/pruning + the
         // wire advertisement consistent.
-        blocks_to_keep: if state_type == StateType::Light { 0 } else { blocks_to_keep as i32 },
-        ..SyncConfig::default()
+        blocks_to_keep: if state_type == StateType::Light {
+            0
+        } else {
+            blocks_to_keep as i32
+        },
+
+        // Pacing constants: deliberately not operator-tunable, not derived from
+        // config, and not consensus-, memory-, or durability-relevant.
+        //
+        // Named individually instead of riding `..SyncConfig::default()` so that
+        // a 25th field on SyncConfig is a COMPILE ERROR here rather than a
+        // silent default. That trap already came close once: `script_eval_inline`
+        // would have taken `false` through the fallthrough and left sync doing
+        // deferred bookkeeping while the validator evaluated inline — green
+        // build, wrong node.
+        //
+        // Values still come from the Default impl, so there is one source of
+        // truth for them. Only the *enumeration* is restated here, which is
+        // precisely the part we want the compiler to police.
+        //
+        // Note this works because struct literals without `..` are exhaustively
+        // checked — unlike a `match` on an enum, where `if let` and `matches!`
+        // let a new variant through in silence.
+        sync_interval: sync_defaults.sync_interval,
+        stall_timeout: sync_defaults.stall_timeout,
+        synced_poll_interval: sync_defaults.synced_poll_interval,
+        delivery_check_interval: sync_defaults.delivery_check_interval,
+        min_sync_send_interval: sync_defaults.min_sync_send_interval,
     };
 
     // Snapshot bootstrap channels — only created when needed
-    let (snapshot_tx, snapshot_rx, validator_tx_send, validator_rx) = if validator.is_none() && utxo_bootstrap {
-        let (stx, srx) = tokio::sync::oneshot::channel::<ergo_sync::snapshot::SnapshotData>();
-        let (vtx, vrx) = tokio::sync::oneshot::channel::<Validator>();
-        (Some(stx), Some(srx), Some(vtx), Some(vrx))
-    } else {
-        (None, None, None, None)
-    };
+    let (snapshot_tx, snapshot_rx, validator_tx_send, validator_rx) =
+        if validator.is_none() && utxo_bootstrap {
+            let (stx, srx) = tokio::sync::oneshot::channel::<ergo_sync::snapshot::SnapshotData>();
+            let (vtx, vrx) = tokio::sync::oneshot::channel::<Validator>();
+            (Some(stx), Some(srx), Some(vtx), Some(vrx))
+        } else {
+            (None, None, None, None)
+        };
 
     // Cross-DB durability handshake — startup reconciliation.
     // Detect drift between state.redb's META_BLOCK_HEIGHT (canonical) and
@@ -2282,6 +3370,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Seed the mining proof cache from the restored tip.
+    //
+    // `update_mining_proofs` otherwise runs ONLY on the post-apply path, so a
+    // node restarted while already at the chain tip has an empty cache and the
+    // mining task refuses to build — `/mining/candidate` returns 503 until a
+    // peer delivers the next block. Where the restarted node is the only miner
+    // it never recovers: no candidate, no block, no application, no candidate.
+    // Observed in the field as an hour of 503s with three peers connected.
+    //
+    // Runs AFTER the reconciliation handshake above, deliberately: that block
+    // can `reset_to` a lower height, and seeding beforehand would cache proofs
+    // for a tip the validator has since rolled back off. The mining task
+    // compares `tip_height` against the validated height and would discard
+    // them anyway — silently, which is worse than not having tried.
+    //
+    // See facts/mining.md § "Startup: the proof cache must be seeded".
+    if let Some(ref v) = validator {
+        let h = v.validated_height();
+        if h > 0 {
+            let tip_header = {
+                let chain_guard = chain.lock().await;
+                chain_guard.header_at(h)
+            };
+            match tip_header {
+                Some(header) => v.update_mining_proofs(&header),
+                // Not an error for a node that is not mining, and not worth
+                // refusing to start over — but say so, because the symptom is
+                // otherwise an unexplained 503 from a healthy-looking node.
+                None => tracing::warn!(
+                    height = h,
+                    "no header at the validated height — mining proofs not seeded; \
+                     /mining/candidate will 503 until the next block is applied"
+                ),
+            }
+        }
+    }
+
     // Start sync in a background task
     let api_downloaded_height = shared_downloaded_height.clone();
     let sync_shared_downloaded_height = shared_downloaded_height.clone();
@@ -2293,10 +3418,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // clones of the P2P node. See facts/sync.md "Graceful shutdown".
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let mut sync = HeaderSync::new(
-        sync_config, transport, sync_chain, sync_store, validator,
-        progress_rx, delivery_control_rx, delivery_data_rx,
-        snapshot_tx, validator_rx, sync_shared_downloaded_height,
-        sync_block_request_gate, sync_peer_chain_tip,
+        sync_config,
+        transport,
+        sync_chain,
+        sync_store,
+        validator,
+        progress_rx,
+        delivery_control_rx,
+        delivery_data_rx,
+        snapshot_tx,
+        validator_rx,
+        sync_shared_downloaded_height,
+        sync_block_request_gate,
+        sync_peer_chain_tip,
+        shared_window_bytes.clone(),
         shutdown_rx,
     );
 
@@ -2304,11 +3439,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // layer calls resize_cache() on the existing storage handle at first
     // synced() entry — no second Database handle, no mmap coherency bug.
     if state_type == StateType::Utxo {
-        if let Some(synced_cache_mb) = node_config.synced_cache_mb {
-            let cache_bytes = synced_cache_mb as usize * 1024 * 1024;
-            sync.set_at_tip_cache(cache_bytes);
+        if let Some(synced_cache_mb) = memory_plan.synced_cache_mb {
+            // `synced_cache_mb` is the at-tip TOTAL, mirroring `cache_mb`, so
+            // the same store/state split applies. Only the state side is
+            // resizable in place — the modifier store has no resize path.
+            //
+            // Note this moves less than it appears to: redb splits its budget
+            // 90% read / 10% write, and the in-place resize reaches only the
+            // read half. See facts/state.md § "An in-place resize moves only
+            // 90% of the budget".
+            let (_, synced_state_bytes) =
+                split_cache_mb(synced_cache_mb, memory_plan.cache_store_pct);
+            sync.set_at_tip_cache(synced_state_bytes);
             tracing::info!(
                 synced_cache_mb,
+                synced_state_bytes,
                 "at-tip cache resize wired; will fire on first synced() entry"
             );
         }
@@ -2322,12 +3467,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(snapshot_rx) = snapshot_rx {
         let state_path = data_dir.join("state.redb");
         let validator_tx = validator_tx_send.unwrap();
+        // Not routed through `resolve_checkpoint`: this validator is built
+        // after `sync_config` already exists, so recording here would be too
+        // late to reach it. Safe because this is the UTXO snapshot path, whose
+        // match branch above recorded the identical `unwrap_or(0)`. If this
+        // ever gains a different default the way digest-resume has, the floor
+        // and the eval-skip boundary diverge and `sync` must be told directly.
         let checkpoint = configured_checkpoint.unwrap_or(0);
         let shared_validated_height = shared_validated_height.clone();
         let shared_state_context = shared_state_context.clone();
         let block_applied_tx = block_applied_tx.clone();
         let snapshot_swap_reader = swap_reader.clone();
         let snapshot_chain = chain.clone();
+        let prover_modified_nodes_bytes = prover_modified_nodes_bytes.clone();
+        let prover_resident_nodes_bytes = prover_resident_nodes_bytes.clone();
         tokio::spawn(async move {
             match snapshot_rx.await {
                 Ok(snapshot_data) => {
@@ -2337,9 +3490,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "loading snapshot into state"
                     );
 
-                    let params = AVLTreeParams { key_length: 32, value_length: None };
-                    let mut storage = RedbAVLStorage::open(&state_path, params, 256, CacheSize::Bytes(node_config.cache_mb as usize * 1024 * 1024))
-                        .expect("failed to open state storage for snapshot");
+                    let params = AVLTreeParams {
+                        key_length: 32,
+                        value_length: None,
+                    };
+                    let mut storage = RedbAVLStorage::open(
+                        &state_path,
+                        params,
+                        256,
+                        CacheSize::Bytes(state_cache_bytes),
+                    )
+                    .expect("failed to open state storage for snapshot");
 
                     let root_hash = snapshot_data.root_hash;
                     let tree_height = snapshot_data.tree_height as usize;
@@ -2351,11 +3512,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     version_bytes.push(snapshot_data.tree_height);
                     let version = Bytes::from(version_bytes);
 
-                    let nodes_iter = snapshot_data.nodes.into_iter().map(|(label, packed)| {
-                        (label, Bytes::from(packed))
-                    });
+                    let nodes_iter = snapshot_data
+                        .nodes
+                        .into_iter()
+                        .map(|(label, packed)| (label, Bytes::from(packed)));
 
-                    storage.load_snapshot(nodes_iter, root_hash, tree_height, version.clone(), height)
+                    storage
+                        .load_snapshot(nodes_iter, root_hash, tree_height, version.clone(), height)
                         .expect("failed to load snapshot into state");
 
                     tracing::info!("snapshot loaded, creating validator");
@@ -2368,7 +3531,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Mirrors the resume branch in the UTXO validator block.
                     {
                         let mut chain_guard = snapshot_chain.lock().await;
-                        if let Err(e) = chain_guard.recompute_active_parameters_from_storage(height) {
+                        if let Err(e) = chain_guard.recompute_active_parameters_from_storage(height)
+                        {
                             tracing::warn!(
                                 error = %e,
                                 resume_height = height,
@@ -2397,12 +3561,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     prover.restore_root(root, tree_h);
 
                     let validator = Validator::new(
-                        ValidatorInner::Utxo(UtxoValidator::new(storage, prover, height, checkpoint)),
+                        ValidatorInner::Utxo(UtxoValidator::new(
+                            storage,
+                            prover,
+                            height,
+                            checkpoint,
+                            // Snapshot bootstrap installs a state tree at a
+                            // height whose block transactions were never
+                            // downloaded, so there is nothing to recover from.
+                            // Harmless today — mining ctx is None here — but it
+                            // stops being harmless the moment that TODO below
+                            // is done, so it states the reason rather than
+                            // leaving a bare None to be puzzled over.
+                            ergo_validation::EmissionSource::Unavailable(
+                                "utxo snapshot bootstrap — the block at the snapshot height was never downloaded",
+                            ),
+                        )),
                         shared_validated_height.clone(),
                         shared_state_context.clone(),
                         block_applied_tx.clone(),
                         height_watch_tx.clone(),
                         None, // TODO: mining ctx for snapshot bootstrap
+                        prover_modified_nodes_bytes.clone(),
+                        prover_resident_nodes_bytes.clone(),
                     );
 
                     // Publish the bootstrap snapshot height to the
@@ -2510,7 +3691,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             });
-            tracing::info!(snapshot_interval, storing_snapshots, "snapshot creation trigger active");
+            tracing::info!(
+                snapshot_interval,
+                storing_snapshots,
+                "snapshot creation trigger active"
+            );
         }
     }
 
@@ -2690,7 +3875,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // REST API server
     {
-        let api_bind_addr: std::net::SocketAddr = node_config.api_address
+        let api_bind_addr: std::net::SocketAddr = node_config
+            .api_address
             .as_deref()
             .unwrap_or(match network {
                 enr_p2p::types::Network::Testnet => "0.0.0.0:9052",
@@ -2720,12 +3906,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mining_height = shared_validated_height.clone();
             let mining_chain = chain.clone();
             let mining_store = store.clone();
+            // Read-only state access for proofs and UTXO lookups. Re-read per
+            // iteration via `current()` rather than captured once, so the
+            // at-tip storage reopen swaps underneath us correctly.
+            let mining_swap_reader = swap_reader.clone();
+            let mining_mempool = mempool.clone();
             tokio::spawn(async move {
                 let mut last_height = 0u32;
                 loop {
                     tokio::time::sleep(MINING_POLL_INTERVAL).await;
                     let current = mining_height.load(std::sync::atomic::Ordering::Relaxed);
-                    if current == last_height || current == 0 {
+                    if current == 0 {
+                        continue;
+                    }
+                    // Rebuild on a new tip OR when the cached candidate has aged
+                    // out. `candidate_ttl` (default 15s) invalidates the cache,
+                    // but nothing used to regenerate on expiry — and the tip only
+                    // moves every ~2 min on mainnet, so /mining/candidate served
+                    // work for 15s after each block and returned 503 for the
+                    // remaining ~105. The knob is documented as "maximum candidate
+                    // lifetime before forced regeneration"; this is the forced
+                    // regeneration half.
+                    //
+                    // Refreshing also keeps the candidate's timestamp current and,
+                    // once mempool selection is wired in, picks up transactions
+                    // that arrived after the last block rather than mining the
+                    // near-empty pool left behind by it.
+                    let stale = gen.cached_work(current).is_none();
+                    if current == last_height && !stale {
                         continue;
                     }
                     last_height = current;
@@ -2788,11 +3996,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // The parent extension lookup mirrors the chain extension loader:
                     // header → section_ids[2] → extension bytes → mining helper.
                     let parent_interlinks = {
-                        let parent_extension_id =
-                            enr_chain::section_ids(&proof_data.parent)[2].1;
-                        match mining_store
-                            .get(enr_chain::EXTENSION_TYPE_ID, &parent_extension_id)
-                        {
+                        let parent_extension_id = enr_chain::section_ids(&proof_data.parent)[2].1;
+                        match mining_store.get(enr_chain::EXTENSION_TYPE_ID, &parent_extension_id) {
                             Ok(Some(ext_bytes)) => {
                                 ergo_mining::extension::unpack_parent_interlinks(&ext_bytes)
                             }
@@ -2809,51 +4014,104 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
 
-                    // Build extension + header + WorkMessage
-                    let extension = match ergo_mining::extension::build_extension(
+                    // Everything below used to be assembled inline here —
+                    // extension, CandidateBlock, work message — which is why
+                    // `generate_candidate` had no production caller and mined
+                    // blocks carried the emission transaction alone. The crate
+                    // owns assembly; this task supplies what only it can reach.
+                    // See facts/mining.md § "Ownership".
+
+                    let reader = match mining_swap_reader.current() {
+                        Some(r) => r,
+                        // Mid-swap at the at-tip storage reopen. Skipping costs
+                        // one poll interval; the next iteration re-reads.
+                        None => continue,
+                    };
+
+                    // Prioritised mempool transactions, with the serialized size
+                    // selection bounds against.
+                    let candidate_txs: Vec<(ergo_validation::Transaction, usize)> = {
+                        let pool = mining_mempool.lock().await;
+                        pool.all_prioritized()
+                            .into_iter()
+                            .map(|u| (u.tx.clone(), u.tx_bytes.len()))
+                            .collect()
+                    };
+
+                    // Ancestors for the upcoming-block context, newest first,
+                    // WITHOUT the parent — generate_candidate prepends it. A
+                    // one-header window here would fail any script reading
+                    // headers[5] and get a valid transaction evicted.
+                    let (active_params, ancestor_headers) = {
+                        let chain_guard = mining_chain.lock().await;
+                        let params = chain_guard.active_parameters().clone();
+                        let mut hs = chain_guard
+                            .headers_from(proof_data.parent.height.saturating_sub(9), 10);
+                        hs.reverse();
+                        hs.retain(|h| h.height != proof_data.parent.height);
+                        (params, hs)
+                    };
+
+                    let lookup_reader = reader.clone();
+                    let utxo_lookup = move |id: &[u8; 32]| -> Option<ergo_validation::ErgoBox> {
+                        let bytes = lookup_reader.lookup_key(id)?;
+                        ergo_validation::deserialize_box(&bytes).ok()
+                    };
+
+                    // Proofs without the validator: sync/ owns it and it is
+                    // !Sync. This reads the committed tree through the reader
+                    // and builds its own prover, so it cannot disturb
+                    // validation. facts/validation.md § "Free Function".
+                    let proof_reader = reader.clone();
+                    // Always `Some`: the Option layer means "no UTXO access at
+                    // all" (digest mode), and we hold a reader by this point.
+                    let validator_proofs = move |txs: &[ergo_validation::Transaction]| {
+                        Some(ergo_validation::proofs_from_storage(
+                            proof_reader.resolver(),
+                            proof_reader.root_state(),
+                            txs,
+                        ))
+                    };
+
+                    match ergo_mining::generate_candidate(
+                        &gen.config,
                         &proof_data.parent,
+                        n_bits,
                         &parent_interlinks,
+                        &proof_data.emission_box,
                         boundary_params.as_ref(),
                         &proposed_update_bytes,
+                        &candidate_txs,
+                        &active_params,
+                        &ancestor_headers,
+                        &utxo_lookup,
+                        &validator_proofs,
                     ) {
-                        Ok(ext) => ext,
-                        Err(e) => {
-                            tracing::warn!("mining: extension build failed: {e}");
-                            continue;
-                        }
-                    };
-
-                    let candidate = ergo_mining::CandidateBlock {
-                        parent: proof_data.parent.clone(),
-                        version: proof_data.parent.version,
-                        n_bits,
-                        state_root: proof_data.state_root,
-                        ad_proof_bytes: proof_data.ad_proof_bytes.clone(),
-                        transactions: vec![proof_data.emission_tx.clone()],
-                        timestamp: {
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as u64;
-                            std::cmp::max(now, proof_data.parent.timestamp + 1)
-                        },
-                        extension,
-                        votes: gen.config.votes,
-                        header_bytes: vec![],
-                    };
-
-                    match ergo_mining::candidate::build_work_message(
-                        &candidate,
-                        &gen.config.miner_pk.h,
-                    ) {
-                        Ok((header_bytes, work)) => {
-                            let mut candidate = candidate;
-                            candidate.header_bytes = header_bytes;
-                            gen.cache_candidate(candidate, work, current);
-                            tracing::debug!(height = current + 1, "mining candidate cached");
+                        Ok(generated) => {
+                            // Step 3.6: the crate identifies unusable
+                            // transactions and cannot remove them itself.
+                            // Dropping these on the floor silently re-selects
+                            // and re-rejects them every 15s forever.
+                            if !generated.invalid_txs.is_empty() {
+                                let mut pool = mining_mempool.lock().await;
+                                for id in &generated.invalid_txs {
+                                    pool.invalidate(id);
+                                }
+                                tracing::debug!(
+                                    count = generated.invalid_txs.len(),
+                                    "mining: evicted transactions rejected during selection"
+                                );
+                            }
+                            let tx_count = generated.block.transactions.len();
+                            gen.cache_candidate(generated.block, generated.work, current);
+                            tracing::debug!(
+                                height = current + 1,
+                                transactions = tx_count,
+                                "mining candidate cached"
+                            );
                         }
                         Err(e) => {
-                            tracing::warn!("mining: work message build failed: {e}");
+                            tracing::warn!("mining: candidate generation failed: {e}");
                         }
                     }
                 }
@@ -2871,8 +4129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             state_context: api_state_ctx,
             peer_count: Arc::new(move || {
                 let count = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(p2p_for_api.peer_count())
+                    tokio::runtime::Handle::current().block_on(p2p_for_api.peer_count())
                 });
                 ergo_api::PeerCounts { connected: count }
             }),
@@ -2885,10 +4142,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
             validated_height: shared_validated_height.clone(),
             downloaded_height: api_downloaded_height.clone(),
+            // Memory gauges. Views over the same storage the producers write:
+            // `Validator` for the two prover figures every
+            // PROVER_GAUGE_INTERVAL_BLOCKS, `HeaderSync` for the window after
+            // each applied block. Never written = absent JSON key, so digest
+            // mode omits the prover fields rather than claiming an empty one.
+            prover_modified_nodes_bytes: Arc::new(ergo_api::PublishedGauge::from_storage(
+                prover_modified_nodes_bytes.clone(),
+            )),
+            prover_resident_nodes_bytes: Arc::new(ergo_api::PublishedGauge::from_storage(
+                prover_resident_nodes_bytes.clone(),
+            )),
+            sync_window_bytes: Arc::new(ergo_api::PublishedGauge::from_storage(
+                shared_window_bytes.clone(),
+            )),
+            // Same atomic the fastsync gap decision reads — sync maintains it
+            // as a monotonic max over every peer's SyncInfo. Advisory only.
+            max_peer_height: peer_chain_tip.clone(),
             peer_api_urls: Arc::new(move || {
                 tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(p2p_for_api_urls.peer_rest_urls())
+                    tokio::runtime::Handle::current().block_on(p2p_for_api_urls.peer_rest_urls())
                 })
                 .into_iter()
                 .map(|(peer_id, addr, rest_url)| ergo_api::PeerRestInfo {
@@ -2900,8 +4173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
             peer_all: Arc::new(move || {
                 tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(p2p_for_all.all_peers())
+                    tokio::runtime::Handle::current().block_on(p2p_for_all.all_peers())
                 })
                 .into_iter()
                 .map(|entry| ergo_api::PeerInfo {
@@ -2917,8 +4189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
             peer_status: Arc::new(move || {
                 let status = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(p2p_for_status.network_status())
+                    tokio::runtime::Handle::current().block_on(p2p_for_status.network_status())
                 });
                 ergo_api::PeerStatusSummary {
                     last_incoming_message: status.last_incoming_message_ms,
@@ -2937,16 +4208,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .block_on(p2p_for_connect.queue_outbound_connection(addr))
                 })
             }),
-            snapshots_info: Arc::new(move || {
-                match &snapshot_store_for_api {
-                    Some(store) => store
-                        .snapshots_info()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|(height, digest)| ergo_api::SnapshotInfoEntry { height, digest })
-                        .collect(),
-                    None => Vec::new(),
-                }
+            snapshots_info: Arc::new(move || match &snapshot_store_for_api {
+                Some(store) => store
+                    .snapshots_info()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(height, digest)| ergo_api::SnapshotInfoEntry { height, digest })
+                    .collect(),
+                None => Vec::new(),
             }),
             api_key_hash: None,
             modifier_tx: Some(modifier_tx_for_mining.clone()),
@@ -2957,11 +4226,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(Arc::new(|| {
                         let _ = tikv_jemalloc_ctl::epoch::advance();
                         ergo_api::JemallocSnapshot {
-                            allocated: tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0) as u64,
+                            allocated: tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0)
+                                as u64,
                             active: tikv_jemalloc_ctl::stats::active::read().unwrap_or(0) as u64,
-                            resident: tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0) as u64,
-                            retained: tikv_jemalloc_ctl::stats::retained::read().unwrap_or(0) as u64,
-                            metadata: tikv_jemalloc_ctl::stats::metadata::read().unwrap_or(0) as u64,
+                            resident: tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0)
+                                as u64,
+                            retained: tikv_jemalloc_ctl::stats::retained::read().unwrap_or(0)
+                                as u64,
+                            metadata: tikv_jemalloc_ctl::stats::metadata::read().unwrap_or(0)
+                                as u64,
                         }
                     }))
                 }
@@ -2973,6 +4246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             node_info: std::sync::Arc::new(ergo_api::NodeMeta {
                 name: "ergo-node-rust".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                launch_time: launch_time_ms,
                 network: match network {
                     enr_p2p::types::Network::Testnet => "testnet".to_string(),
                     enr_p2p::types::Network::Mainnet => "mainnet".to_string(),
@@ -2999,13 +4273,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
 
         tokio::spawn(async move {
-            if let Err(e) = ergo_api::serve(
-                api_state,
-                api_bind_addr,
-                api_stats_config,
-                api_p2p_counters,
-            )
-            .await
+            if let Err(e) =
+                ergo_api::serve(api_state, api_bind_addr, api_stats_config, api_p2p_counters).await
             {
                 tracing::error!("REST API server failed: {e}");
             }
@@ -3018,9 +4287,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let fastsync_enabled = node_config.fastsync;
         let fastsync_peer = node_config.fastsync_peer.clone();
         let fastsync_threshold = node_config.fastsync_threshold_blocks;
-        let fastsync_peer_wait = std::time::Duration::from_secs(
-            node_config.fastsync_peer_wait_timeout_sec,
-        );
+        let fastsync_peer_wait =
+            std::time::Duration::from_secs(node_config.fastsync_peer_wait_timeout_sec);
         let api_port = api_bind_addr.port();
         let bootstrap_gate = block_request_gate.clone();
         let bootstrap_peer_tip = peer_chain_tip.clone();
@@ -3070,7 +4338,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if gap <= fastsync_threshold {
                 tracing::info!(
-                    peer_tip, downloaded, gap, threshold = fastsync_threshold,
+                    peer_tip,
+                    downloaded,
+                    gap,
+                    threshold = fastsync_threshold,
                     "gap at/below fastsync threshold — going straight to P2P"
                 );
                 bootstrap_gate.store(true, Ordering::Relaxed);
@@ -3078,13 +4349,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             tracing::info!(
-                peer_tip, downloaded, gap, threshold = fastsync_threshold,
+                peer_tip,
+                downloaded,
+                gap,
+                threshold = fastsync_threshold,
                 "gap exceeds fastsync threshold — spawning fastsync"
             );
             let node_url = format!("http://127.0.0.1:{api_port}");
             let mut cmd = tokio::process::Command::new("ergo-fastsync");
             cmd.arg("--node-url").arg(&node_url);
-            cmd.arg("--handoff-distance").arg(fastsync_threshold.to_string());
+            cmd.arg("--handoff-distance")
+                .arg(fastsync_threshold.to_string());
             if let Some(ref peer) = fastsync_peer {
                 cmd.arg("--peer-url").arg(peer);
             }
@@ -3176,6 +4451,561 @@ mod tests {
     use ergo_avltree_rust::operation::{KeyValue, Operation};
     use std::sync::Arc;
 
+    // ── Layered config loading (facts/config.md) ─────────────────────────
+
+    fn table(toml_str: &str) -> toml::Table {
+        toml::from_str(toml_str).expect("test fixture parses")
+    }
+
+    /// Merge a sequence of TOML fragments in order, as `conf.d` would.
+    fn merged(fragments: &[&str]) -> toml::Table {
+        let mut acc = toml::Table::new();
+        for f in fragments {
+            merge_config_table(&mut acc, table(f));
+        }
+        acc
+    }
+
+    #[test]
+    fn later_file_wins_for_scalars() {
+        let m = merged(&["[outbound]\nmax_peers = 10", "[outbound]\nmax_peers = 40"]);
+        assert_eq!(m["outbound"]["max_peers"].as_integer(), Some(40));
+    }
+
+    /// The rule most easily got wrong: the naive `insert` of the later table
+    /// over the earlier one passes every test where the later file sets every
+    /// key, and fails the moment someone sets one.
+    #[test]
+    fn later_file_does_not_clobber_sibling_keys() {
+        let m = merged(&[
+            "[outbound]\nmin_peers = 3\nmax_peers = 10\nseed_peers = [\"a:1\"]",
+            "[outbound]\nmax_peers = 40",
+        ]);
+        assert_eq!(m["outbound"]["max_peers"].as_integer(), Some(40));
+        assert_eq!(
+            m["outbound"]["min_peers"].as_integer(),
+            Some(3),
+            "setting one key must not drop its siblings"
+        );
+        assert_eq!(
+            m["outbound"]["seed_peers"].as_array().map(Vec::len),
+            Some(1),
+            "setting a scalar must not drop an array in the same table"
+        );
+    }
+
+    #[test]
+    fn nested_tables_merge_per_key() {
+        let m = merged(&[
+            "[listen.ipv6]\naddress = \"[::]:9030\"\nmode = \"full\"",
+            "[listen.ipv6]\nmax_inbound = 20",
+        ]);
+        assert_eq!(m["listen"]["ipv6"]["mode"].as_str(), Some("full"));
+        assert_eq!(m["listen"]["ipv6"]["max_inbound"].as_integer(), Some(20));
+    }
+
+    #[test]
+    fn bare_array_replaces_wholesale() {
+        let m = merged(&[
+            "[outbound]\nseed_peers = [\"a:1\", \"b:2\"]",
+            "[outbound]\nseed_peers = [\"c:3\"]",
+        ]);
+        let peers = m["outbound"]["seed_peers"].as_array().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].as_str(), Some("c:3"));
+    }
+
+    #[test]
+    fn add_appends_in_file_order() {
+        let m = merged(&[
+            "[outbound]\nseed_peers = [\"a:1\"]",
+            "[outbound]\nseed_peers_add = [\"b:2\"]",
+            "[outbound]\nseed_peers_add = [\"c:3\"]",
+        ]);
+        let peers: Vec<&str> = m["outbound"]["seed_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(peers, ["a:1", "b:2", "c:3"]);
+        assert!(
+            !m["outbound"]
+                .as_table()
+                .unwrap()
+                .contains_key("seed_peers_add"),
+            "_add is consumed by the merge, not passed through to the parser"
+        );
+    }
+
+    /// The documented precedence: an operator writing a bare array is stating
+    /// the complete list, so silently retaining an earlier `_add` would make
+    /// that statement untrue.
+    #[test]
+    fn bare_array_discards_prior_add_contributions() {
+        let m = merged(&[
+            "[outbound]\nseed_peers = [\"a:1\"]",
+            "[outbound]\nseed_peers_add = [\"b:2\"]",
+            "[outbound]\nseed_peers = [\"c:3\"]",
+        ]);
+        let peers: Vec<&str> = m["outbound"]["seed_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(peers, ["c:3"]);
+    }
+
+    #[test]
+    fn add_with_no_prior_field_becomes_the_field() {
+        let m = merged(&["[outbound]\nseed_peers_add = [\"a:1\"]"]);
+        assert_eq!(
+            m["outbound"]["seed_peers"].as_array().map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn add_applies_to_capture_ip_lists() {
+        for field in ["include_ips", "exclude_ips"] {
+            let m = merged(&[
+                &format!("[debug.p2p_capture]\n{field} = [\"1.1.1.1\"]"),
+                &format!("[debug.p2p_capture]\n{field}_add = [\"2.2.2.2\"]"),
+            ]);
+            assert_eq!(
+                m["debug"]["p2p_capture"][field].as_array().map(Vec::len),
+                Some(2),
+                "{field} should accept _add"
+            );
+        }
+    }
+
+    /// `_add` is a convention for three named fields, not a general mechanism.
+    /// An unrecognised one is taken literally (and warned about) rather than
+    /// silently appending to something.
+    #[test]
+    fn add_on_an_unlisted_field_is_not_additive() {
+        let m = merged(&["[outbound]\nmin_peers = 3\nmin_peers_add = [7]"]);
+        assert_eq!(
+            m["outbound"]["min_peers"].as_integer(),
+            Some(3),
+            "an unlisted _add must not modify its base field"
+        );
+        assert!(m["outbound"]
+            .as_table()
+            .unwrap()
+            .contains_key("min_peers_add"));
+    }
+
+    #[test]
+    fn conf_d_files_are_lexical_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["99-local.toml", "00-defaults.toml", "50-debconf.toml"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        std::fs::write(dir.path().join("notes.txt"), "").unwrap();
+
+        let files = conf_d_files(dir.path()).expect("read conf.d");
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            ["00-defaults.toml", "50-debconf.toml", "99-local.toml"],
+            "lexical order IS the mechanism; non-toml files are skipped"
+        );
+    }
+
+    /// Both halves are independently valid: a base file with no conf.d
+    /// (tarball installs) and a conf.d with no base file (the .deb end state
+    /// after migration).
+    #[test]
+    fn either_half_alone_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("ergo.toml");
+        std::fs::write(&base, "[outbound]\nmax_peers = 10\n").unwrap();
+        let confd = dir.path().join("conf.d");
+        std::fs::create_dir(&confd).unwrap();
+        std::fs::write(confd.join("50-x.toml"), "[outbound]\nmin_peers = 7\n").unwrap();
+
+        let base_only = merge_config_sources(Some(&base), None).expect("base only");
+        let t: toml::Table = toml::from_str(&base_only.text).unwrap();
+        assert_eq!(t["outbound"]["max_peers"].as_integer(), Some(10));
+        assert!(base_only.layers.is_empty());
+
+        let confd_only = merge_config_sources(None, Some(&confd)).expect("conf.d only");
+        let t: toml::Table = toml::from_str(&confd_only.text).unwrap();
+        assert_eq!(t["outbound"]["min_peers"].as_integer(), Some(7));
+        assert!(confd_only.base.is_none());
+        assert_eq!(confd_only.layers.len(), 1);
+
+        let both = merge_config_sources(Some(&base), Some(&confd)).expect("both");
+        let t: toml::Table = toml::from_str(&both.text).unwrap();
+        assert_eq!(t["outbound"]["max_peers"].as_integer(), Some(10));
+        assert_eq!(t["outbound"]["min_peers"].as_integer(), Some(7));
+    }
+
+    /// The merged text is what BOTH parsers consume, so it has to survive a
+    /// round-trip through `toml::to_string` — including tables, which TOML
+    /// requires be emitted after plain values.
+    #[test]
+    fn merged_document_reparses() {
+        let doc = {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let base = dir.path().join("ergo.toml");
+            std::fs::write(
+                &base,
+                "[proxy]\nnetwork = \"mainnet\"\n\n[outbound]\nmin_peers = 3\nseed_peers = [\"a:1\"]\n\n[listen.ipv6]\naddress = \"[::]:9030\"\n",
+            )
+            .unwrap();
+            merge_config_sources(Some(&base), None).expect("load")
+        };
+        let t: toml::Table = toml::from_str(&doc.text).expect("merged text reparses");
+        assert_eq!(t["proxy"]["network"].as_str(), Some("mainnet"));
+        assert_eq!(t["listen"]["ipv6"]["address"].as_str(), Some("[::]:9030"));
+    }
+
+    #[test]
+    fn a_named_base_file_that_is_missing_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("nope.toml");
+        assert!(merge_config_sources(Some(&missing), None).is_err());
+    }
+
+    #[test]
+    fn a_malformed_layer_names_its_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let confd = dir.path().join("conf.d");
+        std::fs::create_dir(&confd).unwrap();
+        std::fs::write(confd.join("50-bad.toml"), "this is not = = toml").unwrap();
+
+        let err = merge_config_sources(None, Some(&confd))
+            .expect_err("malformed layer must fail")
+            .to_string();
+        assert!(
+            err.contains("50-bad.toml"),
+            "the error must name the offending file, got: {err}"
+        );
+    }
+
+    // ── Startup memory floor (facts/memory.md) ───────────────────────────
+
+    /// A budget as `detect_memory_budget` would build it: usable derived from
+    /// the ceiling by the source's own fraction. Named apart from the existing
+    /// `budget(usable_mb)` helper below, which fixes *usable* directly — these
+    /// two test different halves and conflating them would hide the source
+    /// fraction, which is the whole point here.
+    fn budget_for(source: BudgetSource, ceiling_bytes: u64) -> MemoryBudget {
+        MemoryBudget {
+            source,
+            ceiling_bytes,
+            usable_bytes: (ceiling_bytes as f64 * source.usable_fraction()) as u64,
+        }
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn utxo_refuses_below_the_floor() {
+        let b = budget_for(BudgetSource::MemTotal, 2 * GIB);
+        assert!(check_memory_floor(&b, StateType::Utxo, false).is_err());
+    }
+
+    #[test]
+    fn light_and_digest_are_allowed_below_the_floor() {
+        let b = budget_for(BudgetSource::MemTotal, 2 * GIB);
+        for st in [StateType::Light, StateType::Digest] {
+            assert!(
+                check_memory_floor(&b, st, false).is_ok(),
+                "{st:?} holds no prover tree — refusing it would block the one \
+                 mode a small box should run"
+            );
+        }
+    }
+
+    #[test]
+    fn ignore_memory_floor_downgrades_the_refusal() {
+        let b = budget_for(BudgetSource::MemTotal, 2 * GIB);
+        assert!(check_memory_floor(&b, StateType::Utxo, true).is_ok());
+    }
+
+    #[test]
+    fn at_or_above_the_floor_starts() {
+        for ceiling in [3 * GIB, 4 * GIB, 32 * GIB] {
+            let b = budget_for(BudgetSource::Cgroup, ceiling);
+            assert!(check_memory_floor(&b, StateType::Utxo, false).is_ok());
+        }
+    }
+
+    /// The regime distinction the contract insists on: the SAME 3 GiB is a
+    /// working node when a cgroup states it (90% → 2.7 GB usable, the
+    /// configuration that synced 831k blocks with zero OOM kills) and a much
+    /// tighter one when it is merely how much RAM the box has (50% → 1.5 GB).
+    #[test]
+    fn source_decides_how_much_the_same_ceiling_buys() {
+        let stated = budget_for(BudgetSource::Cgroup, 3 * GIB);
+        let observed = budget_for(BudgetSource::MemTotal, 3 * GIB);
+        assert_eq!(stated.ceiling_bytes, observed.ceiling_bytes);
+        assert!(
+            stated.usable_bytes > observed.usable_bytes * 3 / 2,
+            "a stated budget must buy materially more than an observed one"
+        );
+        // Both clear the ceiling check — the ceiling is not the whole story,
+        // which is why the cold-sync-peak warning exists separately.
+        assert!(check_memory_floor(&stated, StateType::Utxo, false).is_ok());
+        assert!(check_memory_floor(&observed, StateType::Utxo, false).is_ok());
+    }
+
+    /// 4 GiB of RAM with nothing stating a budget resolves to 2 GiB usable —
+    /// under the measured cold-sync peak, while passing the ceiling check.
+    /// This is the case the second warning exists for.
+    #[test]
+    fn recommended_ram_unstated_lands_under_the_cold_sync_peak() {
+        let b = budget_for(BudgetSource::MemTotal, 4 * GIB);
+        assert!(check_memory_floor(&b, StateType::Utxo, false).is_ok());
+        assert!(
+            b.usable_bytes < COLD_SYNC_PEAK_BYTES,
+            "4 GiB at MemTotal's conservative share is below the cold-sync peak"
+        );
+    }
+
+    #[test]
+    fn cache_store_pct_out_of_range_is_rejected() {
+        for pct in [0u32, 100, 250] {
+            let cfg = NodeConfig {
+                cache_store_pct: Some(pct),
+                ..NodeConfig::default()
+            };
+            assert!(
+                validate_cache_split(&cfg).is_err(),
+                "cache_store_pct {pct} should be rejected — a zero share means a \
+                 database with no page cache at all"
+            );
+        }
+        for pct in [1u32, 50, 99] {
+            let cfg = NodeConfig {
+                cache_store_pct: Some(pct),
+                ..NodeConfig::default()
+            };
+            assert!(
+                validate_cache_split(&cfg).is_ok(),
+                "pct {pct} should be accepted"
+            );
+        }
+    }
+
+    /// Build a `Validator` around either variant, with throwaway channels.
+    fn wrap(inner: ValidatorInner) -> Validator {
+        let (block_tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (height_tx, _hrx) = tokio::sync::watch::channel(0u32);
+        Validator::new(
+            inner,
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            Arc::new(tokio::sync::RwLock::new(None)),
+            block_tx,
+            height_tx,
+            None,
+            ergo_api::PublishedGauge::unset().storage(),
+            ergo_api::PublishedGauge::unset().storage(),
+        )
+    }
+
+    #[test]
+    fn the_wrapper_hands_out_utxo_persistence_and_withholds_digest_persistence() {
+        // A missing forward here does NOT break visibly. `state_persistence`
+        // returning None for both arms compiles, and `sync/` reads None as
+        // "nothing to persist" — so the node simply stops flushing and loses
+        // state on the next unclean shutdown. The compiler forces the method
+        // to exist, never to be right.
+        //
+        // BOTH arms are asserted deliberately: a test that only checked the
+        // digest side would pass with both arms wrongly returning None, which
+        // is precisely the bug it is meant to catch.
+
+        let digest = wrap(ValidatorInner::Digest(DigestValidator::new(
+            ergo_chain_types::ADDigest::zero(),
+            0,
+        )));
+        assert!(
+            digest.state_persistence().is_none(),
+            "digest mode owns no redb and must hand out no persistence"
+        );
+        assert!(
+            digest.mining_state().is_none(),
+            "digest mode has no UTXO set to assemble candidates from"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let params = AVLTreeParams {
+            key_length: 32,
+            value_length: None,
+        };
+        let mut storage = RedbAVLStorage::open(
+            &dir.path().join("state.redb"),
+            params,
+            16,
+            CacheSize::Bytes(1024 * 1024),
+        )
+        .expect("open state storage");
+
+        // Establish a version so UtxoValidator::new's precondition holds —
+        // the empty first commit documented on that constructor.
+        let mut prover =
+            BatchAVLProver::new(AVLTree::with_resolver(storage.resolver(), 32, None), true);
+        storage
+            .update_with_height(&mut prover, vec![], 0)
+            .expect("empty first commit");
+
+        let utxo = wrap(ValidatorInner::Utxo(UtxoValidator::new(
+            storage,
+            prover,
+            0,
+            0,
+            // This test is about which traits the wrapper exposes, not about
+            // emission tracking, and the tree here is empty anyway.
+            ergo_validation::EmissionSource::Unavailable("trait-surface test fixture"),
+        )));
+        assert!(
+            utxo.state_persistence().is_some(),
+            "UTXO mode owns state.redb — handing out None here silently stops \
+             every flush in the node"
+        );
+        assert!(
+            utxo.mining_state().is_some(),
+            "UTXO mode can assemble candidates and must expose MiningState"
+        );
+    }
+
+    fn budget(usable_mb: u64) -> MemoryBudget {
+        MemoryBudget {
+            source: BudgetSource::Explicit,
+            ceiling_bytes: usable_mb * MIB,
+            usable_bytes: usable_mb * MIB,
+        }
+    }
+
+    #[test]
+    fn an_absent_key_is_derived_and_a_present_one_is_obeyed_exactly() {
+        let b = budget(4096);
+
+        let derived = derive_memory_plan(&NodeConfig::default(), &b, 0);
+        assert!(
+            derived.cache_mb > 0,
+            "absent cache_mb must derive a real size"
+        );
+        assert!(derived.derived_any);
+
+        let stated = NodeConfig {
+            cache_mb: Some(777),
+            ..NodeConfig::default()
+        };
+        let plan = derive_memory_plan(&stated, &b, 0);
+        assert_eq!(
+            plan.cache_mb, 777,
+            "a stated value must be obeyed exactly, not adjusted — silently \
+             overriding it is the failure this design exists to prevent"
+        );
+        assert_ne!(
+            plan.flush_heap_threshold_mb, 0,
+            "stating one key must not disable derivation of the others"
+        );
+    }
+
+    #[test]
+    fn the_flush_trigger_always_sits_above_the_cache_it_must_outlive() {
+        // The trigger compares against total jemalloc `allocated`, which
+        // already contains the caches. A threshold at or below cache size
+        // fires on every check forever — a pathology that produces a node
+        // that runs and flushes constantly rather than one that fails.
+        for usable_mb in [512u64, 1024, 2048, 4096, 16384] {
+            let plan = derive_memory_plan(&NodeConfig::default(), &budget(usable_mb), 0);
+            assert!(
+                plan.flush_heap_threshold_mb > plan.cache_mb,
+                "usable {usable_mb} MB: flush trigger {} must exceed cache {}",
+                plan.flush_heap_threshold_mb,
+                plan.cache_mb
+            );
+        }
+    }
+
+    #[test]
+    fn a_budget_smaller_than_the_floor_still_yields_a_usable_cache() {
+        // 128 MB is below BASELINE_ANON_BYTES, so `available` saturates to
+        // zero. Deriving a zero-byte cache would be worse than a small one:
+        // redb with no page cache makes the startup chain walk ~70x slower.
+        let plan = derive_memory_plan(&NodeConfig::default(), &budget(128), 0);
+        assert!(
+            plan.cache_mb >= 64,
+            "a starved budget must still floor at a usable cache, got {}",
+            plan.cache_mb
+        );
+    }
+
+    #[test]
+    fn the_growing_chain_index_shrinks_the_derived_cache() {
+        let b = budget(4096);
+        let early = derive_memory_plan(&NodeConfig::default(), &b, 10 * MIB);
+        let late = derive_memory_plan(&NodeConfig::default(), &b, 400 * MIB);
+        assert!(
+            late.cache_mb < early.cache_mb,
+            "the index is part of the floor and grows with the chain, so the \
+             cache derived against it must shrink: early {} late {}",
+            early.cache_mb,
+            late.cache_mb
+        );
+    }
+
+    #[test]
+    fn budget_source_decides_how_much_of_the_ceiling_is_spent() {
+        // A cgroup limit is somebody stating this node may have that much.
+        // MemTotal states only that the machine has it.
+        assert_eq!(BudgetSource::Explicit.usable_fraction(), 1.00);
+        assert!(BudgetSource::Cgroup.usable_fraction() > BudgetSource::MemTotal.usable_fraction());
+    }
+
+    /// A plan with only the two fields the split reads. Built directly rather
+    /// than through derivation so these tests keep asserting the split's
+    /// arithmetic and not the budget calibration, which moves.
+    fn plan_for_test(cache_mb: u64, cache_store_pct: u32) -> MemoryPlan {
+        MemoryPlan {
+            cache_mb,
+            cache_store_pct,
+            flush_heap_threshold_mb: 0,
+            flush_max_blocks: 0,
+            flush_min_blocks: 0,
+            synced_cache_mb: None,
+            synced_flush_heap_threshold_mb: None,
+            synced_flush_max_blocks: None,
+            synced_flush_min_blocks: None,
+            derived_any: false,
+        }
+    }
+
+    #[test]
+    fn cache_split_divides_the_total_exactly() {
+        let plan = plan_for_test(512, 25);
+        let (store, state) = cache_split_bytes(&plan);
+        assert_eq!(store, 128 * 1024 * 1024);
+        assert_eq!(state, 384 * 1024 * 1024);
+        assert_eq!(
+            store + state,
+            512 * 1024 * 1024,
+            "the split must sum to cache_mb exactly"
+        );
+    }
+
+    #[test]
+    fn cache_split_rounding_loses_no_bytes() {
+        // 333 is deliberately awkward: 777 MB * 33% does not divide evenly.
+        // The remainder must land in state rather than vanishing, or the
+        // configured total silently under-delivers.
+        let plan = plan_for_test(777, 33);
+        let (store, state) = cache_split_bytes(&plan);
+        assert_eq!(store + state, 777 * 1024 * 1024);
+    }
+
     #[test]
     fn testnet_genesis_boxes_produce_correct_digest() {
         let boxes = build_genesis_boxes(enr_p2p::types::Network::Testnet);
@@ -3188,12 +5018,7 @@ mod tests {
             "5527430474b673e4aafb08e0079c639de23e6a17e87edd00f78662b43c88aeda",
         ];
         for (i, (id, _)) in boxes.iter().enumerate() {
-            assert_eq!(
-                hex::encode(id),
-                expected_ids[i],
-                "box {} ID mismatch",
-                i
-            );
+            assert_eq!(hex::encode(id), expected_ids[i], "box {} ID mismatch", i);
         }
 
         // Insert into AVL+ tree and verify genesis state digest
@@ -3234,12 +5059,7 @@ mod tests {
             "5527430474b673e4aafb08e0079c639de23e6a17e87edd00f78662b43c88aeda",
         ];
         for (i, (id, _)) in boxes.iter().enumerate() {
-            assert_eq!(
-                hex::encode(id),
-                expected_ids[i],
-                "box {} ID mismatch",
-                i
-            );
+            assert_eq!(hex::encode(id), expected_ids[i], "box {} ID mismatch", i);
         }
 
         // Insert into AVL+ tree and verify genesis state digest

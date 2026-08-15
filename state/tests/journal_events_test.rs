@@ -80,8 +80,7 @@ fn reopen_with_committed_state_emits_digest_hex() {
     // emission below has to be distinguished from it by content, not
     // by presence/absence. `logs_assert` scans the line set.
     {
-        let mut storage =
-            RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+        let mut storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
         let resolver = storage.resolver();
         let tree = AVLTree::with_resolver(resolver, KEY_LEN, None);
         let mut prover = BatchAVLProver::new(tree, true);

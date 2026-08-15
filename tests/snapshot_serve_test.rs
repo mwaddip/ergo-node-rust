@@ -60,7 +60,10 @@ fn handle_get_manifest_unknown_id_returns_none() {
     let store = SnapshotStore::open(&dir.path().join("snapshots.redb")).unwrap();
 
     let response = handle_snapshot_request(GET_MANIFEST, &[0xFF; 32], &store);
-    assert!(response.is_none(), "unknown manifest should return no response");
+    assert!(
+        response.is_none(),
+        "unknown manifest should return no response"
+    );
 }
 
 #[test]
@@ -71,7 +74,13 @@ fn handle_get_chunk_returns_stored_chunk() {
     let chunk_id = [0xCC; 32];
     let chunk_data = vec![0x01, 0x03, 0x04, 0x05];
     store
-        .write_snapshot(7000, [0xDD; 32], &[0x10], &[(chunk_id, chunk_data.clone())], 2)
+        .write_snapshot(
+            7000,
+            [0xDD; 32],
+            &[0x10],
+            &[(chunk_id, chunk_data.clone())],
+            2,
+        )
         .unwrap();
 
     let response = handle_snapshot_request(GET_UTXO_SNAPSHOT_CHUNK, &chunk_id, &store);

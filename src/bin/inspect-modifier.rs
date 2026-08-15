@@ -21,12 +21,9 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
-const PRIMARY: TableDefinition<(u8, [u8; 32]), &[u8]> =
-    TableDefinition::new("primary");
-const BEST_CHAIN: TableDefinition<u32, [u8; 32]> =
-    TableDefinition::new("best_chain");
-const HEADER_FORKS: TableDefinition<(u32, u32), [u8; 32]> =
-    TableDefinition::new("header_forks");
+const PRIMARY: TableDefinition<(u8, [u8; 32]), &[u8]> = TableDefinition::new("primary");
+const BEST_CHAIN: TableDefinition<u32, [u8; 32]> = TableDefinition::new("best_chain");
+const HEADER_FORKS: TableDefinition<(u32, u32), [u8; 32]> = TableDefinition::new("header_forks");
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -51,7 +48,10 @@ fn main() -> Result<()> {
     println!("  id:      {}", hex::encode(id));
     println!();
     match &in_primary {
-        Some(g) => println!("PRIMARY[(type_id, id)] -> PRESENT, {} bytes", g.value().len()),
+        Some(g) => println!(
+            "PRIMARY[(type_id, id)] -> PRESENT, {} bytes",
+            g.value().len()
+        ),
         None => println!("PRIMARY[(type_id, id)] -> ABSENT"),
     }
 

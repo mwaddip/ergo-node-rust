@@ -281,9 +281,8 @@ async fn check_parent_linkage(
         return Ok(None);
     }
     let stored_parent = db.get_block_id_at(last_indexed).await?;
-    let target_parent_bytes = hex::decode(target_parent_id).with_context(|| {
-        format!("invalid parent_id hex on block {target}: {target_parent_id}")
-    })?;
+    let target_parent_bytes = hex::decode(target_parent_id)
+        .with_context(|| format!("invalid parent_id hex on block {target}: {target_parent_id}"))?;
     if stored_parent.as_deref() == Some(target_parent_bytes.as_slice()) {
         return Ok(None);
     }
@@ -388,7 +387,13 @@ mod tests {
         AxumState(state): AxumState<Arc<TokioMutex<MockNode>>>,
     ) -> AxumJson<Vec<String>> {
         let s = state.lock().await;
-        AxumJson(s.canonical_at_height.get(&height).cloned().into_iter().collect())
+        AxumJson(
+            s.canonical_at_height
+                .get(&height)
+                .cloned()
+                .into_iter()
+                .collect(),
+        )
     }
 
     async fn handle_header(
@@ -445,7 +450,9 @@ mod tests {
     async fn parent_linkage_match_is_noop() {
         let (db, _td) = open_test_db();
         let header_at_100 = [0xaa; 32];
-        db.insert_block(&empty_block(header_at_100, 100)).await.unwrap();
+        db.insert_block(&empty_block(header_at_100, 100))
+            .await
+            .unwrap();
 
         // Match path returns early — the NodeClient is never touched.
         let client = NodeClient::new("http://127.0.0.1:1").unwrap();
@@ -472,8 +479,12 @@ mod tests {
         let canonical_100 = [0xaa; 32];
         let orphan_101 = [0xbb; 32];
         let canonical_101 = [0xcc; 32];
-        db.insert_block(&empty_block(canonical_100, 100)).await.unwrap();
-        db.insert_block(&empty_block(orphan_101, 101)).await.unwrap();
+        db.insert_block(&empty_block(canonical_100, 100))
+            .await
+            .unwrap();
+        db.insert_block(&empty_block(orphan_101, 101))
+            .await
+            .unwrap();
 
         let mock_state = Arc::new(TokioMutex::new(MockNode::default()));
         {
@@ -486,10 +497,9 @@ mod tests {
         let url = start_mock_node(mock_state).await;
         let client = NodeClient::new(&url).unwrap();
 
-        let result =
-            check_parent_linkage(&db, &client, 101, 102, &hex::encode(canonical_101))
-                .await
-                .unwrap();
+        let result = check_parent_linkage(&db, &client, 101, 102, &hex::encode(canonical_101))
+            .await
+            .unwrap();
         assert_eq!(result, Some(100));
         assert_eq!(db.get_indexed_height().await.unwrap(), Some(100));
         assert_eq!(db.get_block_id_at(101).await.unwrap(), None);

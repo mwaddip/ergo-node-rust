@@ -1,10 +1,7 @@
 //! Header construction and WorkMessage derivation for mining candidates.
 
 use blake2::Digest as Blake2Digest;
-use ergo_chain_types::autolykos_pow_scheme::decode_compact_bits;
-use ergo_chain_types::{
-    AutolykosSolution, BlockId, Digest, Digest32, EcPoint, Header, Votes,
-};
+use ergo_chain_types::{AutolykosSolution, BlockId, Digest, Digest32, EcPoint, Header, Votes};
 use ergo_lib::chain::transaction::Transaction;
 use ergo_merkle_tree::{MerkleNode, MerkleTree};
 
@@ -21,10 +18,7 @@ type Blake2b256 = blake2::Blake2b<blake2::digest::typenum::U32>;
 /// witness IDs (`txIds ++ witnessIds` — two concatenated lists, not
 /// interleaved). Mainnet and testnet are both version >= 2 today, so a
 /// tx-IDs-only root is rejected by every JVM peer.
-pub fn transactions_root(
-    txs: &[Transaction],
-    block_version: u8,
-) -> Result<Digest32, MiningError> {
+pub fn transactions_root(txs: &[Transaction], block_version: u8) -> Result<Digest32, MiningError> {
     if txs.is_empty() {
         return Err(MiningError::AssemblyFailed("no transactions".into()));
     }
@@ -124,8 +118,15 @@ pub fn build_work_message(
         hash
     };
 
-    // b = target from nBits
-    let target = decode_compact_bits(candidate.n_bits);
+    // b = the Autolykos TARGET: q / decode_compact_bits(n_bits), where q is the
+    // secp256k1 group order. It is NOT decode_compact_bits(n_bits) itself —
+    // that is the DIFFICULTY, and serving it is what made v0.8.0 unmineable:
+    // external miners were handed a bound tens of orders of magnitude too tight
+    // and submitted zero shares at any hashrate, while `check_pow` on the
+    // solution path — dividing correctly — stood ready to accept a block nobody
+    // could find. `enr_chain::pow_target` is the one definition of this value;
+    // do not re-derive the division here. See ../facts/chain.md § "Phase 2".
+    let target = enr_chain::pow_target(candidate.n_bits);
 
     // pk = compressed EcPoint hex
     let pk_hex: String = (*miner_pk).into();

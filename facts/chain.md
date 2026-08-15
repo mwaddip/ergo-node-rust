@@ -31,10 +31,38 @@ Stateless observer. Tracks headers seen on the network without validating chain 
 
 ## Phase 2: PoW Verification
 
+### `pow_target(n_bits: u32) -> BigInt`
+
+The Autolykos mining target: `order_bigint() / decode_compact_bits(n_bits)`,
+where `order_bigint()` is the secp256k1 group order `q`.
+
+- **Postcondition**: Returns the value a `pow_hit` must fall strictly below.
+- **Invariant**: Never equal to `decode_compact_bits(n_bits)`. That function
+  returns the **difficulty**, and the target is `q` divided by it. Since
+  `q ≈ 1.16 × 10^77`, the two differ by roughly `77 − 2·log₁₀(difficulty)`
+  decimal orders of magnitude — tens of orders at any real difficulty, so
+  they are never plausibly mistaken for each other in a log line.
+
+⚠ **This is the only sanctioned way to obtain a target, and it exists because
+the formula was independently re-derived once and got it wrong.** `mining/`
+sent `decode_compact_bits(n_bits)` directly as the `WorkMessage.b` field, so
+external miners were handed a target ~10^58 times harder than the real one and
+submitted zero shares while the node's own `check_pow` — which computes the
+target correctly — stood ready to accept blocks nobody could find. Serve-side
+and verify-side must resolve to the same number by construction, not by two
+call sites agreeing to spell out the same division. **Do not inline
+`order_bigint() / decode_compact_bits(..)` at a new call site; call this.**
+
+The naming is the trap: `decode_compact_bits` sounds like it yields the thing
+you compare a hash against, and every other consumer in this repo binds it to a
+variable named `difficulty` — which is correct, and is what made the one site
+that named it `target` invisible in review.
+
 ### `verify_pow(header: &Header) -> Result<()>`
 - **Precondition**: Header is parsed (Phase 1).
-- **Postcondition**: Ok if `pow_hit(header) <= target(header.n_bits)`. Err otherwise.
-- **Uses**: `ergo-chain-types::AutolykosPowScheme::pow_hit()`.
+- **Postcondition**: Ok if `pow_hit(header) < pow_target(header.n_bits)`,
+  strictly. Err otherwise.
+- **Uses**: `ergo-chain-types::AutolykosPowScheme::pow_hit()`, `pow_target`.
 - **Cost**: One hash computation. Cheap enough to call on every header before forwarding.
 - **Invariant**: A header that fails PoW is never valid regardless of chain context.
 
@@ -1277,6 +1305,50 @@ peer on demand. Tracked as a follow-up.
   authenticated format; their own validation does not repair V1.
 - `reorg_floor()` is consulted before any reorg execution. Reorgs whose
   fork point falls below the floor are rejected.
+
+## Memory attribution (added 2026-08-11)
+
+### `HeaderChain::memory_estimate() -> ChainMemoryEstimate`
+
+```rust
+pub struct ChainMemoryEstimate {
+    /// `by_id` (BlockId → height). Unbounded — grows with chain length.
+    pub index_bytes: u64,
+    /// `LazyHeaderStore` header LRU, current occupancy. Bounded by capacity.
+    pub header_cache_bytes: u64,
+    /// `LazyHeaderStore` score LRU, current occupancy. Bounded by capacity.
+    pub score_cache_bytes: u64,
+}
+```
+
+Reported by `GET /debug/memory` via `ChainAccess::memory_estimate`.
+
+**This function must live in this crate, beside the fields it models.** It
+replaces a constant (`AVG_HEADER_BYTES = 800`) that sat in `api/` and sized
+the `Vec<Header>` retired in Phase 3. Nothing connected the two, so after the
+retirement the endpoint reported ~1.48 GB for a structure that no longer
+existed — larger than the entire process RSS — and that figure was quoted as a
+leading suspect during a real memory investigation.
+
+The invariant is therefore not "use the right constant" but **the formula
+lives with the data**. A future refactor that retires or reshapes a field will
+be editing this file, with the estimate visible in it.
+
+Requirements:
+
+- Every returned value is a **formula over live counts and capacities**, never
+  a measurement. Callers must treat it as attribution guidance, not truth; a
+  heap profile is the ground truth.
+- Cache figures are **current occupancy**, not capacity ceilings — an LRU that
+  is half full must not report as if it were full.
+- `index_bytes` must account for real map overhead (control bytes and load
+  factor), not just `entries × (key + value)`. Under-reporting the one
+  unbounded structure is the failure mode that matters here.
+- Constant-time. `/debug/memory` is an operator diagnostic and must not walk
+  the chain, the caches, or storage to answer.
+- Headers themselves are **not resident** and must not appear in the result.
+  If a future change makes them resident again, that is a new field with a new
+  name, decided deliberately.
 
 ## Does NOT own
 

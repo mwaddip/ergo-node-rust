@@ -466,7 +466,7 @@ mod tests {
         inner.put_u32(6).unwrap(); // m
         inner.put_u32(10).unwrap(); // k
         inner.put_u32(0).unwrap(); // num_prefixes = 0
-        // suffix_head_size + minimal header placeholder
+                                   // suffix_head_size + minimal header placeholder
         inner.put_u32(1).unwrap(); // suffix_head_size
         inner.push(0x00); // bogus header byte (will fail parse)
 

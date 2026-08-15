@@ -67,9 +67,19 @@ pub fn expected_difficulty(parent: &Header, chain: &HeaderChain) -> Result<u32, 
 
         let headers: Vec<&Header> = owned_headers.iter().collect();
         if config.eip37_active(parent.height + 1) {
-            eip37_calculate(&headers, epoch_length, config.block_interval_ms, config.initial_n_bits)
+            eip37_calculate(
+                &headers,
+                epoch_length,
+                config.block_interval_ms,
+                config.initial_n_bits,
+            )
         } else {
-            calculate(&headers, epoch_length, config.block_interval_ms, config.initial_n_bits)
+            calculate(
+                &headers,
+                epoch_length,
+                config.block_interval_ms,
+                config.initial_n_bits,
+            )
         }
     } else {
         // Within an epoch: carry forward parent's difficulty
@@ -179,7 +189,11 @@ pub fn normalize_to_n_bits(difficulty: &BigInt, initial_n_bits: u32) -> u32 {
     let encoded = encode_compact_bits(difficulty);
     let n_bits = encoded as u32;
     // If roundtrip produces 0, use initial difficulty
-    if n_bits == 0 { initial_n_bits } else { n_bits }
+    if n_bits == 0 {
+        initial_n_bits
+    } else {
+        n_bits
+    }
 }
 
 /// Pre-EIP-37 difficulty calculation using linear regression.
@@ -204,9 +218,7 @@ pub fn calculate(
         ChainError::DifficultyCalc("no headers for difficulty calculation".into())
     })?;
 
-    let uncompressed = if headers.len() == 1
-        || first_header.timestamp >= last_header.timestamp
-    {
+    let uncompressed = if headers.len() == 1 || first_header.timestamp >= last_header.timestamp {
         // Single header or timestamps not increasing: return first header's difficulty
         required_difficulty(first_header)
     } else {
@@ -219,8 +231,7 @@ pub fn calculate(
                 let start = pair[0];
                 let end = pair[1];
                 let time_delta = end.timestamp as i64 - start.timestamp as i64;
-                let diff =
-                    required_difficulty(end) * &desired_ms / BigInt::from(time_delta);
+                let diff = required_difficulty(end) * &desired_ms / BigInt::from(time_delta);
                 (end.height as i64, diff)
             })
             .collect();
@@ -239,11 +250,7 @@ pub fn calculate(
 /// Classic Bitcoin-style difficulty adjustment (no capping).
 ///
 /// Matches JVM `DifficultyAdjustment.bitcoinCalculate()`.
-fn bitcoin_calculate(
-    headers: &[&Header],
-    epoch_length: u32,
-    block_interval_ms: u64,
-) -> BigInt {
+fn bitcoin_calculate(headers: &[&Header], epoch_length: u32, block_interval_ms: u64) -> BigInt {
     let last_two: Vec<&Header> = headers.iter().rev().take(2).rev().cloned().collect();
     let start = last_two[0];
     let end = last_two[1];
@@ -332,7 +339,10 @@ pub fn interpolate(data: &[(i64, BigInt)], epoch_length: i64) -> BigInt {
     // Sums for linear regression
     let xy_sum: BigInt = data.iter().map(|(x, y)| BigInt::from(*x) * y).sum();
     let x_sum: BigInt = data.iter().map(|(x, _)| BigInt::from(*x)).sum();
-    let x2_sum: BigInt = data.iter().map(|(x, _)| BigInt::from(*x) * BigInt::from(*x)).sum();
+    let x2_sum: BigInt = data
+        .iter()
+        .map(|(x, _)| BigInt::from(*x) * BigInt::from(*x))
+        .sum();
     let y_sum: BigInt = data.iter().map(|(_, y)| y.clone()).sum();
     let n_big = BigInt::from(n);
 
@@ -521,13 +531,22 @@ mod tests {
         let reference = BigInt::from(1000);
 
         // Within range: unchanged
-        assert_eq!(cap_difficulty(&BigInt::from(1200), &reference), BigInt::from(1200));
+        assert_eq!(
+            cap_difficulty(&BigInt::from(1200), &reference),
+            BigInt::from(1200)
+        );
 
         // Above 150%: capped to 1500
-        assert_eq!(cap_difficulty(&BigInt::from(2000), &reference), BigInt::from(1500));
+        assert_eq!(
+            cap_difficulty(&BigInt::from(2000), &reference),
+            BigInt::from(1500)
+        );
 
         // Below 50%: floored to 500
-        assert_eq!(cap_difficulty(&BigInt::from(100), &reference), BigInt::from(500));
+        assert_eq!(
+            cap_difficulty(&BigInt::from(100), &reference),
+            BigInt::from(500)
+        );
     }
 
     #[test]

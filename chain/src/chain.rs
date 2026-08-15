@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -11,8 +12,7 @@ use crate::cache::LazyHeaderStore;
 use crate::config::ChainConfig;
 use crate::error::{ChainError, RestoreError};
 use crate::voting::{
-    default_parameters, default_proposed_update_bytes, ValidationSettingsUpdate,
-    SOFT_FORK_VOTE,
+    default_parameters, default_proposed_update_bytes, ValidationSettingsUpdate, SOFT_FORK_VOTE,
 };
 
 /// Map a signed parameter ID (1-8) to its [`Parameter`] enum variant.
@@ -36,8 +36,7 @@ fn ordinary_param(signed_id: i8) -> Option<Parameter> {
 ///
 /// Wired by the integrator (main crate) to bridge `enr-store`. Returns
 /// `None` if no extension is available at that height.
-pub type ExtensionLoader =
-    Arc<dyn Fn(u32) -> Option<Vec<u8>> + Send + Sync + 'static>;
+pub type ExtensionLoader = Arc<dyn Fn(u32) -> Option<Vec<u8>> + Send + Sync + 'static>;
 
 /// Result of a successful `try_append` call.
 #[derive(Debug)]
@@ -94,11 +93,14 @@ pub struct HeaderChain {
     base_height: Option<u32>,
     /// Map from header ID to height for O(1) containment / height
     /// lookup. Kept as an in-memory index because hitting storage on
-    /// every `contains()` / `height_of()` check is not worth the save
-    /// (~64 MB at mainnet scale — an order of magnitude below the
-    /// retired header Vec, which was ~1.4 GB). Also the canonical
-    /// source for [`Self::height`] / [`Self::len`] — chain length is
-    /// `by_id.len()` and the tip height is `base_height + by_id.len() - 1`.
+    /// every `contains()` / `height_of()` check is not worth the save —
+    /// it costs ~75 MB at mainnet scale, an order of magnitude below
+    /// the retired header Vec's ~1.4 GB. That figure is derived, not
+    /// asserted: [`by_id_bytes`] computes it from this map's live
+    /// capacity, and it is the unbounded term in
+    /// [`HeaderChain::memory_estimate`]. Also the canonical source for
+    /// [`Self::height`] / [`Self::len`] — chain length is `by_id.len()`
+    /// and the tip height is `base_height + by_id.len() - 1`.
     by_id: HashMap<BlockId, u32>,
     /// Legacy V1 sparse epoch-boundary headers selected by height. They are
     /// difficulty-context mechanics only: never best-chain entries, score
@@ -156,6 +158,77 @@ pub struct HeaderChain {
     /// returns `None`) is treated as "absent" exactly as the contract
     /// specifies.
     lazy: LazyHeaderStore,
+}
+
+/// Estimated in-memory footprint of a [`HeaderChain`], broken down by
+/// the structure that holds it.
+///
+/// **Every field is a formula over live counts and capacities, never a
+/// measurement.** Read it as attribution guidance — *which structure is
+/// the memory in* — not as truth; a heap profile is the ground truth.
+/// Each field names the member it models, so a grep for that member
+/// reaches the formula.
+///
+/// Headers themselves are **not resident** — they are served by the
+/// registered `HeaderLoader` through the LRU — and so do not appear
+/// here. If a future change makes them resident again, that is a new
+/// field with a new name, decided deliberately; it is not slack folded
+/// into one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChainMemoryEstimate {
+    /// `HeaderChain::by_id` — the `HashMap<BlockId, u32>` header index.
+    /// The only unbounded structure in this crate: it grows with chain
+    /// length and is never evicted, so it is the figure an operator
+    /// actually needs. See `by_id_bytes` for the accounting.
+    pub index_bytes: u64,
+    /// The header LRU inside `LazyHeaderStore`, at its current
+    /// occupancy. Bounded by the cache capacity
+    /// ([`crate::DEFAULT_CACHE_CAPACITY`] unless retuned).
+    pub header_cache_bytes: u64,
+    /// The cumulative-score LRU inside `LazyHeaderStore`, at its
+    /// current occupancy. Bounded by the same capacity.
+    pub score_cache_bytes: u64,
+}
+
+/// Buckets `std::collections::HashMap` has allocated for a table
+/// reporting `capacity` usable slots.
+///
+/// `capacity()` is the only O(1) window into the allocation from
+/// outside hashbrown, and it reports the *usable* slot count, not the
+/// allocated one. hashbrown sizes tables in powers of two and keeps
+/// 12.5% of the slots empty above 8 buckets (`capacity = buckets / 8 *
+/// 7`); at or below that it reserves exactly one (`capacity = buckets -
+/// 1`). Inverting both branches recovers the bucket count exactly.
+///
+/// Saturates rather than panicking on a capacity no real chain can
+/// reach — this backs an operator diagnostic, which must not be the
+/// thing that takes the node down.
+fn hashbrown_buckets(capacity: usize) -> usize {
+    let unrounded = match capacity {
+        0 => return 0,
+        c if c < 8 => c + 1,
+        c => c.div_ceil(7).saturating_mul(8),
+    };
+    unrounded.checked_next_power_of_two().unwrap_or(usize::MAX)
+}
+
+/// Estimated bytes held by [`HeaderChain::by_id`].
+///
+/// Formula, not a measurement: `buckets × (slot + 1 control byte)`,
+/// where `slot` is the `(BlockId, u32)` pair hashbrown stores per
+/// bucket and the bucket count comes from [`hashbrown_buckets`].
+///
+/// Counting `entries × size_of::<(BlockId, u32)>()` instead would
+/// under-report by the control bytes and by the 12.5% of slots the load
+/// factor keeps empty — and under-reporting the one unbounded structure
+/// is the failure mode that matters here. Note also that the map never
+/// shrinks on removal, so a chain that reorged down still holds its
+/// high-water allocation; reporting from `capacity()` rather than
+/// `len()` is what makes that visible.
+fn by_id_bytes(by_id: &HashMap<BlockId, u32>) -> u64 {
+    let buckets = hashbrown_buckets(by_id.capacity()) as u64;
+    let slot_bytes = size_of::<(BlockId, u32)>() as u64;
+    buckets * (slot_bytes + 1)
 }
 
 /// All-zeros parent ID expected for the genesis header.
@@ -296,7 +369,9 @@ impl HeaderChain {
                     got: header.height,
                 });
             }
-            Ok(AppendResult::Forked { fork_height: parent_height })
+            Ok(AppendResult::Forked {
+                fork_height: parent_height,
+            })
         } else {
             Err(ChainError::ParentNotFound {
                 parent_id: header.parent_id,
@@ -442,6 +517,32 @@ impl HeaderChain {
     /// Whether the chain is empty.
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
+    }
+
+    /// Estimated in-memory footprint of this chain, by structure.
+    ///
+    /// Constant time: reads `HashMap::capacity` and `LruCache::len`, and
+    /// walks neither the chain, the caches, nor storage. Backs
+    /// `GET /debug/memory` through the integrator's `ChainAccess`.
+    ///
+    /// The values are formulas — see [`ChainMemoryEstimate`] for what
+    /// that does and does not entitle a caller to conclude.
+    ///
+    /// This lives here, beside the fields it models, deliberately. The
+    /// previous arrangement kept a constant (`AVG_HEADER_BYTES = 800`)
+    /// in the API crate sizing a `Vec<Header>` that this crate had
+    /// already retired; nothing connected the two, so the endpoint went
+    /// on reporting ~1.48 GB for a structure that no longer existed —
+    /// more than the whole process RSS — and that figure was taken as a
+    /// leading suspect during a real memory investigation. A refactor
+    /// that reshapes `by_id` or the caches is now editing the same
+    /// files as the estimate.
+    pub fn memory_estimate(&self) -> ChainMemoryEstimate {
+        ChainMemoryEstimate {
+            index_bytes: by_id_bytes(&self.by_id),
+            header_cache_bytes: self.lazy.header_cache_bytes(),
+            score_cache_bytes: self.lazy.score_cache_bytes(),
+        }
     }
 
     /// Cumulative difficulty score at the chain tip.
@@ -624,9 +725,7 @@ impl HeaderChain {
         }
 
         let loader = self.extension_loader.as_ref().ok_or_else(|| {
-            ChainError::Voting(
-                "extension loader not set; cannot recompute parameters".into(),
-            )
+            ChainError::Voting("extension loader not set; cannot recompute parameters".into())
         })?;
 
         let extension_bytes = loader(boundary_height).ok_or_else(|| {
@@ -637,9 +736,7 @@ impl HeaderChain {
 
         let (header_id, fields) = crate::voting::parse_extension_bytes(&extension_bytes)?;
         let expected = self.header_at(boundary_height).ok_or_else(|| {
-            ChainError::Voting(format!(
-                "no header at boundary height {boundary_height}"
-            ))
+            ChainError::Voting(format!("no header at boundary height {boundary_height}"))
         })?;
         if header_id != expected.id {
             return Err(ChainError::Voting(format!(
@@ -798,8 +895,7 @@ impl HeaderChain {
             return Ok(Vec::new());
         }
 
-        let mut window: Vec<(u32, [u8; 3])> =
-            Vec::with_capacity((end - start + 1) as usize);
+        let mut window: Vec<(u32, [u8; 3])> = Vec::with_capacity((end - start + 1) as usize);
         for h in start..=end {
             let header = self.header_at(h).ok_or_else(|| {
                 ChainError::Voting(format!(
@@ -958,9 +1054,7 @@ impl HeaderChain {
     ) -> Result<Vec<(i8, u32)>, ChainError> {
         let voting_length = self.config.voting.voting_length;
         if voting_length == 0 {
-            return Err(ChainError::Voting(
-                "voting_length must be > 0".into(),
-            ));
+            return Err(ChainError::Voting("voting_length must be > 0".into()));
         }
         let boundary_height = epoch_end_height.checked_add(1).ok_or_else(|| {
             ChainError::Voting(format!(
@@ -1213,8 +1307,7 @@ impl HeaderChain {
             crate::verify_pow(&suffix_head)?;
         }
 
-        let mut installed: Vec<InstalledHeader> =
-            Vec::with_capacity(1 + suffix_tail.len());
+        let mut installed: Vec<InstalledHeader> = Vec::with_capacity(1 + suffix_tail.len());
 
         // Push suffix_head bypassing validate_genesis: it is rarely actually
         // genesis (height 1) and its parent_id is whatever the upstream chain
@@ -1412,10 +1505,7 @@ impl HeaderChain {
     ///   `height` field disagrees with its slot), or not in `by_id`.
     ///
     /// Empty and single-header chains verify trivially.
-    pub fn verify_best_chain_linkage(
-        &self,
-        max_depth: Option<u32>,
-    ) -> Result<(), ChainError> {
+    pub fn verify_best_chain_linkage(&self, max_depth: Option<u32>) -> Result<(), ChainError> {
         let Some(base) = self.base_height else {
             return Ok(());
         };
@@ -1458,13 +1548,13 @@ impl HeaderChain {
     /// silent-`None` divergence masking so the walk can DESCRIBE the
     /// divergence instead of reporting a bare gap.
     fn load_for_linkage_walk(&self, height: u32) -> Result<Header, ChainError> {
-        let header = self.lazy.get_header(height).ok_or_else(|| {
-            ChainError::IndexInconsistency {
-                height,
-                detail: "header unresolvable (cache miss and loader returned None)"
-                    .into(),
-            }
-        })?;
+        let header =
+            self.lazy
+                .get_header(height)
+                .ok_or_else(|| ChainError::IndexInconsistency {
+                    height,
+                    detail: "header unresolvable (cache miss and loader returned None)".into(),
+                })?;
         if header.height != height {
             return Err(ChainError::IndexInconsistency {
                 height,
@@ -1763,14 +1853,10 @@ impl HeaderChain {
             // header would save the wrong branch for rollback and
             // remove nothing from `by_id` below. Bail pre-mutation.
             let hdr = self.header_at(h).ok_or_else(|| {
-                ChainError::Reorg(format!(
-                    "header at height {h} unavailable for reorg drain"
-                ))
+                ChainError::Reorg(format!("header at height {h} unavailable for reorg drain"))
             })?;
             let score = self.score_at(h).ok_or_else(|| {
-                ChainError::Reorg(format!(
-                    "score at height {h} unavailable for reorg drain"
-                ))
+                ChainError::Reorg(format!("score at height {h} unavailable for reorg drain"))
             })?;
             saved_headers.push(hdr);
             saved_scores.push(score);
@@ -1886,10 +1972,7 @@ impl HeaderChain {
     /// Append a header skipping PoW verification.
     /// For tests that need to validate chain logic without real mining solutions.
     #[cfg(test)]
-    pub(crate) fn try_append_no_pow(
-        &mut self,
-        header: Header,
-    ) -> Result<AppendResult, ChainError> {
+    pub(crate) fn try_append_no_pow(&mut self, header: Header) -> Result<AppendResult, ChainError> {
         if self.is_empty() {
             self.validate_genesis_no_pow(&header)?;
             self.push_header(header);
@@ -1908,7 +1991,9 @@ impl HeaderChain {
                     got: header.height,
                 });
             }
-            Ok(AppendResult::Forked { fork_height: parent_height })
+            Ok(AppendResult::Forked {
+                fork_height: parent_height,
+            })
         } else {
             Err(ChainError::ParentNotFound {
                 parent_id: header.parent_id,
@@ -1939,7 +2024,9 @@ impl HeaderChain {
     #[cfg(test)]
     fn validate_genesis_no_pow(&self, header: &Header) -> Result<(), ChainError> {
         if header.parent_id != genesis_parent_id() {
-            return Err(ChainError::InvalidGenesisParent { got: header.parent_id });
+            return Err(ChainError::InvalidGenesisParent {
+                got: header.parent_id,
+            });
         }
         if header.height != 1 {
             return Err(ChainError::InvalidGenesisHeight { got: header.height });
@@ -1968,7 +2055,9 @@ impl HeaderChain {
         let tip = self.tip();
 
         if header.parent_id != tip.id {
-            return Err(ChainError::ParentNotFound { parent_id: header.parent_id });
+            return Err(ChainError::ParentNotFound {
+                parent_id: header.parent_id,
+            });
         }
 
         if header.height != tip.height + 1 {
@@ -2009,9 +2098,7 @@ impl HeaderChain {
         }
 
         if header.height != 1 {
-            return Err(ChainError::InvalidGenesisHeight {
-                got: header.height,
-            });
+            return Err(ChainError::InvalidGenesisHeight { got: header.height });
         }
 
         if header.n_bits != self.config.initial_n_bits {

@@ -1,9 +1,9 @@
 Package: ergo-node-rust
-Version: 0.1.0
+Version: 0.8.0
 Section: net
 Priority: optional
 Architecture: amd64
-Depends: libc6
+Depends: libc6, debconf (>= 0.5) | debconf-2.0
 Suggests: fail2ban, rrdtool
 Conflicts: ergo-proxy-node
 Replaces: ergo-proxy-node

@@ -78,5 +78,8 @@ pub fn handle_snapshot_request(
 /// Returns true if `code` is a snapshot request that should be intercepted
 /// for serving (not forwarded to the sync machine).
 pub fn is_snapshot_request(code: u8) -> bool {
-    matches!(code, GET_SNAPSHOTS_INFO | GET_MANIFEST | GET_UTXO_SNAPSHOT_CHUNK)
+    matches!(
+        code,
+        GET_SNAPSHOTS_INFO | GET_MANIFEST | GET_UTXO_SNAPSHOT_CHUNK
+    )
 }

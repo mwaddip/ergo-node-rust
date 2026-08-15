@@ -62,7 +62,10 @@ impl ChunkDownloadStore {
         {
             let mut meta = txn.open_table(METADATA)?;
             meta.insert(META_MANIFEST_ID, manifest_id.as_slice())?;
-            meta.insert(META_SNAPSHOT_HEIGHT, &snapshot_height.to_be_bytes() as &[u8])?;
+            meta.insert(
+                META_SNAPSHOT_HEIGHT,
+                &snapshot_height.to_be_bytes() as &[u8],
+            )?;
             meta.insert(META_MANIFEST_BYTES, manifest_bytes)?;
             meta.insert(META_TOTAL_CHUNKS, &total_chunks.to_be_bytes() as &[u8])?;
         }
@@ -86,7 +89,8 @@ impl ChunkDownloadStore {
         let meta = txn.open_table(METADATA)?;
 
         let manifest_id = read_meta_fixed::<32>(&meta, META_MANIFEST_ID)?;
-        let snapshot_height = u32::from_be_bytes(read_meta_fixed::<4>(&meta, META_SNAPSHOT_HEIGHT)?);
+        let snapshot_height =
+            u32::from_be_bytes(read_meta_fixed::<4>(&meta, META_SNAPSHOT_HEIGHT)?);
         let total_chunks = u32::from_be_bytes(read_meta_fixed::<4>(&meta, META_TOTAL_CHUNKS)?);
 
         drop(meta);

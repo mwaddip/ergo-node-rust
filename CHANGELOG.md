@@ -1,5 +1,351 @@
 # Changelog
 
+## v0.8.0 — 2026-08-13
+
+<!--
+  ### Release summary is what the GitHub release page shows: one line per
+  change, no reasoning. The workflow extracts this subsection alone and falls
+  back to the whole release section when it is absent. Everything below it is
+  the durable record — that is where the reasoning belongs, not on the release
+  page. Keep them in step: a change worth a section is worth a line here.
+-->
+
+### Release summary
+
+- Deferred script evaluation removed; scripts always evaluate before persisting.
+- Config keys `script_eval`, `eval_backlog_max_mb`, `eval_backlog_max_blocks` removed.
+- `cache_mb` is now the total redb cache across both databases, split by the new `cache_store_pct`.
+- Default `cache_mb` is 512.
+- Cache sizes and flush thresholds are derived from the memory budget when not set.
+- New `memory_budget_mb` and `ignore_memory_floor` settings.
+- A `utxo` node refuses to start below a 3 GiB memory ceiling; `digest` and `light` are unaffected.
+- jemalloc runs with `background_thread:true` and 5 s decay windows.
+- Journal events contract 1.6 → 2.1; consumers pinned to major 1 must be updated.
+- `validation_stuck.error_kind` is derived from the error variant, not its text.
+- `BlockValidator` split into `BlockValidator`, `StatePersistence` and `MiningState`.
+- Configuration is layered across `/etc/ergo-node/conf.d/`.
+- `/etc/ergo-node/ergo.toml` is migrated to `conf.d/99-local.toml` on upgrade and is no longer a conffile.
+- The systemd unit no longer passes a config path.
+- New debconf first-install interview for the `.deb`.
+- `install.sh` reads the shipped per-network defaults.
+- Workspace member crates inherit their version from `[workspace.package]`.
+- `/debug/memory` reports `storeCacheBytes`, `stateCacheBytes` and `storeCacheEvictions`.
+- Fixed: external miners were served the difficulty as `b` instead of the Autolykos target, so no solution was ever found.
+- Fixed: a node restarted at the chain tip served no mining candidate until the next block arrived.
+- Fixed: the mempool rejected every transaction offered to it.
+- Fixed: the shipped man page had the mainnet and testnet API ports inverted.
+- Fixed: `MiningCandidate.b` was documented as a JSON string but is emitted as a number.
+
+### Removed
+
+- **BREAKING — deferred script evaluation is gone.** `apply_state` now always
+  evaluates a block's scripts itself, after the state-root check and **before
+  persisting**, so `Ok` means the scripts passed and no block whose scripts are
+  unverified reaches `state.redb`. The config key **`script_eval` is removed**
+  (a node whose `ergo.toml` still sets it will fail to start with an unknown-key
+  error), along with `eval_backlog_max_mb` and `eval_backlog_max_blocks`, which
+  bounded a queue that no longer exists.
+
+  This release both bounded that queue and then deleted it; only the deletion is
+  in the product. Deferred evaluation let application run ahead of verification,
+  which bought sync throughput and cost a crash-consistency window plus a second
+  source of truth for how far the chain was verified. Every bug in it had that
+  one root: a drain-local reorder buffer that froze a watermark for 190,000
+  blocks; an in-flight counter zeroed while its tasks still held their heap; and
+  an unbounded backlog that killed a 4-thread 1.8 GHz host at 10.62 GiB. The
+  lag is gone, so the class is gone.
+
+  Nodes upgrading keep a stale `script_verified_height` key in `chain_meta`.
+  Nothing reads it; there is no migration step.
+
+### Changed
+
+- **BREAKING (packaging) — `/etc/ergo-node/ergo.toml` is no longer a conffile.**
+  On upgrade it is moved, once, to `/etc/ergo-node/conf.d/99-local.toml`, and
+  keeps winning over the package defaults exactly as before. Your settings are
+  preserved byte for byte; nothing is merged into or rewritten in that file.
+
+  The systemd unit no longer passes a config path — it would name a file that
+  the upgrade has just moved. The node searches `./ergo.toml`,
+  `~/.config/ergo-node/ergo.toml` and `/etc/ergo-node/ergo.toml`, then layers a
+  sibling `conf.d/` on top, and either half may stand alone. Tarball installs
+  with a single `ergo.toml` and no `conf.d` keep working unchanged.
+
+  Verified as an in-place upgrade of a live mainnet node at tip: the migrated
+  file was byte-identical, every configured value survived the merge, and the
+  service came back up on the merged document.
+
+- Workspace member crates inherit their version from `[workspace.package]`
+  instead of each pinning `0.1.0`. They are internal path dependencies and the
+  numbers had not moved since each crate was absorbed, so `cargo metadata`
+  reported a 0.1.0 workspace for a 0.8.0 node. The excluded addons keep their
+  own versions and cadence.
+
+- **BREAKING — `cache_mb` now means the TOTAL redb page cache across both
+  databases**, split by the new `cache_store_pct` (default 50, valid 1–99).
+  It previously sized `state.redb` alone while `modifiers.redb` silently took
+  redb's built-in 1 GiB default, so a config saying `cache_mb = 1024` actually
+  used 2048 MB. Existing configs will use **less** memory than before; raise
+  `cache_mb` if sync throughput regresses. `synced_cache_mb` is likewise a
+  total and the same split applies to the at-tip resize.
+
+- Default `cache_mb` is now 512. In real terms that is a reduction: the old
+  effective default was 256 (state) + 1024 (modifiers, unchosen) = 1280 MB.
+
+- jemalloc now runs with `background_thread:true` and 5 s decay windows.
+  Without a background thread an arena's dirty pages decay only when a thread
+  next touches that arena, and with 4 × ncpu arenas the quiet ones never get
+  touched — measured at 1021 MB of freed-but-unreturned memory during a
+  genesis sync.
+
+- **BREAKING — the journal-events contract goes 1.6 → 2.1** (`journalEventsVersion`
+  in `/info`). **2.0 is the breaking step**; 2.1 is additive on top of it and
+  adds `memory_budget_derived` (see the memory-sizing entry above), so a
+  consumer updated for major 2 needs nothing further.
+
+  Three **stable** events were removed — `deferred_eval_backlog`
+  (replaced by `catchup_progress`), `deferred_eval_gate_engaged` and
+  `eval_frontier_hole` — and two field domains narrowed:
+  `validation_rollback_failed.path` loses `eval_failure`, and
+  `validation_stuck.error_kind` loses `script_eval` in favour of
+  `transaction_invalid`. All of them described the deferred queue.
+
+  **Consumers pinned to major 1 will refuse to parse a v0.8.0 node until they
+  are updated**, the Ergo Node Doctor adapter among them. The contract's own
+  rules also call for a deprecation release, which this did not get: emitting a
+  deprecated `eval_frontier_hole` from a node that has no frontier would mean
+  fabricating its fields.
+
+- `validation_stuck.error_kind` is now derived from the `ValidationError`
+  **variant** rather than by matching its `Display` string. The string-based
+  classifier is why the script-failure case silently stopped being distinguished
+  when deferred evaluation was removed — nothing referenced the variant, so
+  nothing broke. `missing_key` reaches the classifier through two variants and
+  means different things in each: local storage damage in UTXO mode, a deficient
+  proof in digest mode. Check `stateType` before recommending a resync on it.
+
+- `BlockValidator` is split into three traits: the consensus core, plus
+  `StatePersistence` (`flush`, `resize_cache`) and `MiningState`
+  (`proofs_for_transactions`, `emission_box_id`), both implemented only by the
+  UTXO validator. Digest mode signals itself by *not* implementing them rather
+  than by returning a harmless value — the shape that let a missing
+  `resize_cache` forward return `Ok(())` and log success for a resize that never
+  happened. Affects anyone building against `ergo-validation`.
+
+- **The node sizes its own memory.** Every key in the memory section is now
+  optional and **derived when absent**: the node reads its ceiling from its
+  cgroup limit (systemd `MemoryMax`, container `--memory`) or, failing that,
+  takes a conservative share of `MemTotal`, and sizes caches and the flush
+  threshold from what is left after the parts no knob governs. A key that IS
+  set is obeyed exactly, and disables derivation for that key alone — partial
+  configuration is normal.
+
+  New optional `memory_budget_mb` states the budget directly. Prefer
+  `MemoryMax` on the unit: a cgroup limit bounds the node for real, whereas
+  the config key only tells it what to aim for.
+
+  This closes a gap that was invisible until it was measured: a node run under
+  `MemoryMax=1500M` had no idea, sizing itself from a TOML file while the
+  kernel knew the answer exactly. It also fixes `flush_heap_threshold_mb`
+  defaulting to 4096 — above total RAM on any box small enough to care, so the
+  trigger it governs was inert exactly where it was needed.
+
+  Derivation is logged at startup as `memory budget derived` with every input
+  and output (journal-events **2.1**), because auto-sizing's failure mode is
+  not being wrong, it is being wrong invisibly.
+
+  `flush_max_blocks` and `flush_min_blocks` are **not** derived — they bound
+  crash-recovery work in blocks, and nothing measured relates a block count to
+  a memory budget.
+
+### Fixed
+
+- **A node restarted at the chain tip served no mining candidate at all.**
+  `/mining/candidate` returned 503 until a peer delivered the next block —
+  observed in the field as over an hour with three peers connected. Where the
+  restarted node is the only miner, it never recovered: no candidate, so no
+  block, so no application, so no candidate.
+
+  `UtxoValidator` reconstructed none of its derived mining state on resume.
+  `emission_box_id` is discovered by scanning a block's insertions during
+  `apply_state`, so a freshly constructed validator reported `None` — which is
+  also the documented value for "all ERG has been emitted", making the two
+  indistinguishable. The mining proof cache had the same shape one level up.
+
+  Both are now recovered at startup: the emission box from the block at the
+  resume height (the coinbase recreates it every block, so one block carries
+  it), and the proof cache seeded from the restored tip. Verified against a
+  parked mainnet tip at height 1,851,751 with no reachable peers: 503 for 40s
+  before, a candidate two seconds after startup now.
+
+  Predates this release. It could not be hit before it, because external
+  mining did not work at all — see the entry below.
+
+- **The shipped man page had the REST API ports inverted.** `ergo-node-rust(8)`
+  said mainnet 9052 / testnet 9053; it is the other way round. The markdown
+  source was corrected in v0.6.10 and `man/build` was never re-run, so the
+  installed `.gz` carried the wrong values from v0.6.0 onward.
+
+- **External mining could never find a block — in any release before this one.**
+  `GET /mining/candidate` served the **difficulty** in the `b` field where the
+  Autolykos **target** belongs. The target is `q / difficulty` for the secp256k1
+  group order `q`; we sent the undivided difficulty, a bound tens of orders of
+  magnitude tighter than the one the node itself enforces. A miner given it
+  searches for a hash that will effectively never occur.
+
+  The symptom is silence, which is why it survived so long. The candidate is
+  well-formed, a real miner parses and accepts it, and then simply never submits
+  anything. Against a live node at testnet height 485,897 we served
+  `3912040448` where the Scala node served
+  `29598898778389163379010897437604384363675568080188445020547283242588`. A GPU
+  at 143 MH/s ran nine minutes and submitted **zero shares** — not zero accepted,
+  zero found. The same rig against a Scala node had a block accepted in 16
+  seconds.
+
+  Solution *validation* was never affected: it goes through `check_pow`, which
+  divides correctly. Serve-side and verify-side disagreed and verify-side was
+  right, so the node stood ready the whole time to accept a block it had made
+  impossible to find — confirmed by patching only the miner's bridge to
+  substitute the correct target, with no change to the node: block found and
+  accepted 50 seconds later.
+
+  **This is not a v0.8.0 regression.** It dates to the commit that completed the
+  mining crate and is present in every tagged release, `v0.1.0` through
+  `v0.7.11`. If you have ever pointed an external miner at this node and
+  concluded your hardware or pool setup was at fault, it was not. Block
+  validation, consensus and solo-mining-via-the-node's-own-candidate-assembly
+  were never affected — only the number handed to external miners.
+
+  The target is now a named primitive, `enr_chain::pow_target(n_bits)`, called
+  by both the serve path and PoW verification, rather than a division open-coded
+  at each call site. Regression tests pin the served `b` to the value observed
+  on a Scala node and assert that it is the same bound the solution path
+  enforces.
+
+- **`MiningCandidate.b` was documented as a JSON string** in
+  `facts/openapi.yaml` while the wire has always emitted a bare number. A client
+  generated from the published spec did not lose precision, it failed to parse.
+  Now `number`, with the arbitrary-precision caveat stated — a real target is
+  ~68 digits and must be read as a raw token, not an IEEE-754 double. The
+  schema's `proof` field was also described as "sigma-proof fields"; it is
+  `msgPreimage` plus Merkle membership proofs, and is omitted rather than empty
+  because a nested object overflows the reference miner's fixed jsmn token
+  buffer.
+
+- **The mempool accepted nothing.** A synced node rejected every transaction the
+  network offered it with `Creation height H+1 > preheader height`, so it held a
+  permanently empty pool: no relay, no fees, and mining candidates carrying only
+  the emission transaction.
+
+  The state context published to the mempool and the REST API was built with the
+  block just applied as its preheader, leaving it at the current tip. Wallets set
+  `creationHeight` to the block they expect to land in, and ergo-lib enforces
+  `creationHeight <= preHeader.height`, so the check failed by exactly one block
+  for every well-formed transaction. The node now publishes an **upcoming**
+  context — `build_upcoming_state_context`, preheader at tip+1 — matching the
+  JVM, which validates mempool transactions against
+  `ErgoStateContext.simplifiedUpcoming()`.
+
+  Block validation was never affected: there the block's own header is the
+  correct preheader, so consensus was not at risk. Mining was never affected
+  either; it builds its own stub at height+1, which is why candidate assembly
+  kept working while the mempool starved.
+
+- **The fee was read as zero for every transaction.** `extract_fee` computed
+  `input_sum - output_sum`, but ergo-lib enforces exact ERG preservation, so that
+  expression is structurally zero for anything that validates — Ergo has no
+  implicit change-to-fee remainder. Every transaction was then declined against
+  `min_fee`. Fees are now summed from outputs guarded by the fee proposition,
+  matching `ErgoMemPool.extractFee`, with the tree built once at construction.
+
+  This was masked by the preheader defect: validation failed first, so nothing
+  ever reached the fee check. Fixing either alone would have left the mempool
+  empty.
+
+- **A transaction one block ahead of us was cached as invalid** for
+  `invalidation_ttl` (1800 s ≈ 15 blocks), suppressing every rebroadcast without
+  re-validating it. The condition is transient — the sender is simply ahead, and
+  the transaction is valid once the next block applies — so it is now `Declined`
+  rather than `Invalidated`, the same treatment a not-yet-visible input box
+  already received. `cleanup.rs` carried the same flaw on the reorg path, where a
+  reorg moves the preheader backwards over transactions re-pooled unvalidated.
+
+  Verified on live mainnet traffic at tip: the pool fills and drains with each
+  block, and candidates reached 47 transactions.
+
+- `ergo_avltree_rust` moves to fork rev `b955790`. `BatchAVLProver::restore_root`
+  now clears `base.modified_nodes` itself, and `PersistentBatchAVLProver::rollback`
+  delegates to it rather than hand-rolling a second rewind. Previously every
+  rejected block pinned its touched node set for the life of the process.
+  Upstream as PR #27.
+
+- `addons/indexer/Cargo.lock` recorded `0.2.7` against a manifest at `0.2.8`,
+  left behind by the previous release. The addons are excluded from the
+  workspace with their own lockfiles, so no workspace build would ever have
+  caught it.
+
+### Added
+
+- `/debug/memory` reports `storeCacheBytes`, `stateCacheBytes` and
+  `storeCacheEvictions`. redb was the largest single consumer during cold sync
+  and was entirely invisible to this endpoint.
+
+  Read `storeCacheEvictions`, not `storeCacheBytes`, to tell whether a cache
+  is under pressure: occupancy tracks the live working set, not the configured
+  ceiling, and reads identically at 8 MiB and 1 GiB under the same load.
+
+- **Layered configuration under `/etc/ergo-node/conf.d/`**, and a debconf
+  first-install interview for the `.deb`.
+
+  Three layers, merged in filename order: `00-defaults.toml` (per-network
+  package defaults, refreshed from `/usr/share/ergo-node-rust/defaults/` on
+  every upgrade), `50-debconf.toml` (your interview answers, rewritten on
+  every upgrade and `dpkg-reconfigure`), and `99-local.toml` (**yours** — the
+  package never writes it). Put your changes in `99-local.toml`; edits to the
+  other two are lost on the next upgrade.
+
+  Merging is per key, not per file: setting `max_peers` in a later layer does
+  not drop `seed_peers` from the same section. A bare array replaces; three
+  fields — `seed_peers`, and `include_ips`/`exclude_ips` under
+  `[debug.p2p_capture]` — also accept an `_add` suffix that appends to the
+  shipped list instead.
+
+  The interview asks two things unconditionally — network, then a checklist of
+  topics — and then only the questions belonging to checked topics. Skip
+  everything and you still get a working mainnet node.
+  `DEBIAN_FRONTEND=noninteractive` completes without prompting.
+
+  This exists because "what a first config looks like" was written down in
+  four places that had already drifted, and a debconf template hardcoding
+  ports and seeds would have become the fifth. Network-dependent values now
+  have exactly one home. `install.sh` reads the same files.
+
+- **Startup memory floor.** A **utxo** node now refuses to start when its
+  resolved memory ceiling is below **3 GiB**, and warns below 4 GiB. `digest`
+  and `light` hold no AVL prover tree and are never refused — on a small
+  machine, those are the modes to run. `ignore_memory_floor = true` under
+  `[node]` downgrades the refusal to a warning.
+
+  The check is on the ceiling, not on free memory at the moment you start, so
+  it gives the same answer every time rather than one that depends on what the
+  page cache happens to be holding.
+
+  A second warning fires when the *derived* budget lands under the measured
+  cold-sync peak. These are not the same test: with nothing stating a budget
+  the node takes a conservative share of `MemTotal`, so 4 GB of RAM becomes a
+  2 GB budget — it clears the ceiling check and is the configuration most
+  likely to struggle. Setting `MemoryMax` on the unit, or `memory_budget_mb`,
+  roughly doubles what the node will allow itself on the same hardware.
+
+### Known limitation
+
+- An **in-place** at-tip cache resize moves only ~90% of the budget.
+  `set_cache_size` splits its argument 90% read / 10% write, and the in-place
+  path reaches only the read half; the write buffer is fixed at open time and
+  redb exposes no setter for it. `synced_cache_mb = 128` therefore yields
+  roughly 115 MB of read cache plus a write buffer sized from the cold-sync
+  total. A full restart applies both halves.
+
 ## v0.7.11 — 2026-08-03
 
 - **Fix demoted headers clobbering `BEST_CHAIN` after a reorg — the node

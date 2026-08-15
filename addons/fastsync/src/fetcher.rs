@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use ergo_chain_types::Header;
 use reqwest::Client;
 
@@ -38,12 +38,7 @@ impl PeerFetcher {
     /// GET /info — peer's current chain state.
     pub async fn peer_info(&self) -> Result<PeerNodeInfo> {
         let url = format!("{}/info", self.base_url);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .context("GET /info")?;
+        let resp = self.client.get(&url).send().await.context("GET /info")?;
         if !resp.status().is_success() {
             bail!("GET /info returned {}", resp.status());
         }
@@ -54,11 +49,7 @@ impl PeerFetcher {
     ///
     /// Returns parsed Headers. The JVM returns header JSON objects;
     /// sigma-rust deserializes them directly.
-    pub async fn chain_slice(
-        &self,
-        from_height: u32,
-        to_height: u32,
-    ) -> Result<Vec<Header>> {
+    pub async fn chain_slice(&self, from_height: u32, to_height: u32) -> Result<Vec<Header>> {
         let url = format!(
             "{}/blocks/chainSlice?fromHeight={}&toHeight={}",
             self.base_url, from_height, to_height
@@ -85,10 +76,7 @@ impl PeerFetcher {
     /// POST /blocks/headerIds — fetch full blocks by header ID batch.
     ///
     /// JVM returns `Seq[ErgoFullBlock]` as JSON array.
-    pub async fn blocks_by_ids(
-        &self,
-        header_ids: &[String],
-    ) -> Result<Vec<JvmFullBlock>> {
+    pub async fn blocks_by_ids(&self, header_ids: &[String]) -> Result<Vec<JvmFullBlock>> {
         let url = format!("{}/blocks/headerIds", self.base_url);
         let resp = self
             .client
@@ -96,9 +84,7 @@ impl PeerFetcher {
             .json(header_ids)
             .send()
             .await
-            .with_context(|| {
-                format!("POST /blocks/headerIds ({} ids)", header_ids.len())
-            })?;
+            .with_context(|| format!("POST /blocks/headerIds ({} ids)", header_ids.len()))?;
         if !resp.status().is_success() {
             bail!(
                 "POST /blocks/headerIds returned {} ({} ids)",
@@ -110,7 +96,6 @@ impl PeerFetcher {
             .await
             .with_context(|| format!("parse headerIds response ({} ids)", header_ids.len()))
     }
-
 }
 
 /// Batch size for POST /blocks/headerIds.

@@ -1,0 +1,194 @@
+#!/bin/sh
+# debconf first-install interview. Runs BEFORE unpack, so it may only rely on
+# things already on the system — no node binary, no shipped defaults.
+#
+# Two unconditional screens (network, then a topic checklist), then only the
+# questions belonging to checked topics. Everything has a default, so
+# DEBIAN_FRONTEND=noninteractive completes without prompting.
+#
+# This script asks. It does not write config — postinst does, from the answers.
+set -e
+
+. /usr/share/debconf/confmodule
+
+# ── Helpers ─────────────────────────────────────────────────────────────
+
+# Is this topic in the selection?
+#
+# ⚠ debconf returns a multiselect as "A, B, C" — comma AND space. Matching on
+# the comma alone silently honours only the FIRST selected topic and skips
+# every other question, which looks like the operator simply was not asked.
+# Strip spaces from both sides before comparing.
+topic_selected() {
+    _have=$(printf '%s' "$TOPICS" | tr -d ' ')
+    _want=$(printf '%s' "$1" | tr -d ' ')
+    case ",$_have," in
+        *",$_want,"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Total RAM in MB, or empty if it cannot be read. Advisory only.
+mem_total_mb() {
+    [ -r /proc/meminfo ] || return 0
+    awk '/^MemTotal:/ { print int($2 / 1024); exit }' /proc/meminfo 2>/dev/null || true
+}
+
+# Is a TCP port already listening? Advisory — used to prefill a default, never
+# to block. `ss` may be absent, in which case we simply do not probe.
+port_in_use() {
+    command -v ss >/dev/null 2>&1 || return 1
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
+}
+
+# First free port at or above $1, giving up after 20 tries so a pathological
+# machine cannot hang the install.
+first_free_port() {
+    _p="$1"
+    _n=0
+    while [ "$_n" -lt 20 ]; do
+        port_in_use "$_p" || { echo "$_p"; return; }
+        _p=$((_p + 1))
+        _n=$((_n + 1))
+    done
+    echo "$1"
+}
+
+# ── 1. Network ──────────────────────────────────────────────────────────
+#
+# First because every other topic's defaults depend on it, and because it is
+# the one setting with no safe guess: both are legitimate and picking wrong is
+# the bug this interview exists to fix.
+
+db_input high ergo-node-rust/network || true
+db_go || true
+db_get ergo-node-rust/network
+NETWORK="$RET"
+
+# ── 2. Topic checklist ──────────────────────────────────────────────────
+
+db_input high ergo-node-rust/topics || true
+db_go || true
+db_get ergo-node-rust/topics
+TOPICS="$RET"
+
+# ── Memory notices ──────────────────────────────────────────────────────
+#
+# Shown before the topic questions so an operator on a small box can pick
+# "Node type" in the same pass rather than finding out from a failed start.
+#
+# ⚠ TWO notices, not one, and the distinction is the point. A single warning
+# below 4096 MB told a 3915 MB machine it "has less memory than a full node
+# needs" and listed "pick light or digest" as the first remedy — so the
+# operator picked light, on a box where a full node runs perfectly well. The
+# notice talked someone out of the mode they wanted.
+#
+# 3072 MB is where the node actually refuses (MEMORY_FLOOR_BYTES); 4096 is only
+# a recommendation (MEMORY_RECOMMENDED_BYTES). Below the floor, steer. Between
+# the two, inform and explicitly say no action is needed.
+
+MEM_MB=$(mem_total_mb)
+if [ -n "$MEM_MB" ]; then
+    if [ "$MEM_MB" -lt 3072 ]; then
+        db_subst ergo-node-rust/mem_refuse detected "$MEM_MB" || true
+        db_input high ergo-node-rust/mem_refuse || true
+        db_go || true
+    elif [ "$MEM_MB" -lt 4096 ]; then
+        db_subst ergo-node-rust/mem_below_recommended detected "$MEM_MB" || true
+        db_input high ergo-node-rust/mem_below_recommended || true
+        db_go || true
+    fi
+fi
+
+# ── 3. Interfaces ───────────────────────────────────────────────────────
+
+if topic_selected "Interfaces"; then
+    db_get ergo-node-rust/listen_port
+    # Only probe when the answer is still the shipped default; an operator who
+    # already chose a port should not have it moved out from under them.
+    if [ "$RET" = "9030" ]; then
+        db_set ergo-node-rust/listen_port "$(first_free_port 9030)" || true
+    fi
+    db_input high ergo-node-rust/listen_port || true
+
+    db_input high ergo-node-rust/api_address || true
+    # `high`, not `medium`. debconf's default priority IS high, so a medium
+    # question is silently skipped — the operator checks the Interfaces topic,
+    # is never asked, and gets the default anyway. A question inside a topic
+    # the operator explicitly selected must not be filtered by priority.
+    db_input high ergo-node-rust/max_inbound || true
+    db_go || true
+fi
+
+# ── 4. Node type ────────────────────────────────────────────────────────
+#
+# Mining requires utxo. Rather than letting the operator pick digest and then
+# reporting a conflict, digest is simply not offered when Mining is checked —
+# there is no dependency-resolution ceremony for a combination that means
+# something more fundamental was misunderstood.
+
+if topic_selected "Node type"; then
+    # The description has to move with the choice list. Describing digest on a
+    # screen that does not offer it reads as a bug in the menu rather than a
+    # deliberate exclusion — and leaves the operator hunting for an option that
+    # is not there.
+    if topic_selected "Mining"; then
+        db_subst ergo-node-rust/state_type choices "utxo, light" || true
+        db_subst ergo-node-rust/state_type digest \
+            "digest is not offered here because you selected the Mining topic, and only utxo can mine. Deselect Mining to choose it." || true
+    else
+        db_subst ergo-node-rust/state_type choices "utxo, light, digest" || true
+        db_subst ergo-node-rust/state_type digest \
+            "digest validates blocks against proofs rather than holding the state, and needs far less memory than utxo. It cannot mine." || true
+    fi
+    db_input high ergo-node-rust/state_type || true
+    db_go || true
+
+    db_get ergo-node-rust/state_type
+    if [ "$RET" = "utxo" ]; then
+        db_input high ergo-node-rust/blocks_to_keep || true
+        db_go || true
+    fi
+fi
+
+# ── 5. Storage ──────────────────────────────────────────────────────────
+
+if topic_selected "Storage"; then
+    db_input high ergo-node-rust/data_dir || true
+    db_go || true
+fi
+
+# ── 6. Bootstrap ────────────────────────────────────────────────────────
+
+if topic_selected "Bootstrap"; then
+    db_input high ergo-node-rust/fastsync || true
+    db_go || true
+fi
+
+# ── 7. Mining ───────────────────────────────────────────────────────────
+
+if topic_selected "Mining"; then
+    db_input high ergo-node-rust/miner_pk || true
+    db_go || true
+fi
+
+# ── 8. Memory ───────────────────────────────────────────────────────────
+#
+# One question. There are no memory profiles: the node derives every cache and
+# threshold from its ceiling at runtime, against a floor that grows with the
+# chain, so a number frozen at install time is correct on the day and wrong
+# thereafter.
+
+if topic_selected "Memory"; then
+    db_input high ergo-node-rust/memory_budget_mb || true
+    db_go || true
+fi
+
+# ── 9. Peers ────────────────────────────────────────────────────────────
+
+if topic_selected "Peers"; then
+    db_input high ergo-node-rust/seed_peers_add || true
+    db_go || true
+fi
+
+exit 0

@@ -1,7 +1,10 @@
 openapi: 3.1.0
 info:
   title: Ergo Node Rust REST API
-  version: 0.6.5
+  # Tracks the node version. Bump with the workspace version at release —
+  # it sat at 0.6.5 through six releases because nothing tied the two
+  # together. Moves with Cargo.toml, the addons, and their lockfiles.
+  version: 0.8.0
   description: |
     REST surface exposed by the `api/` crate. Most endpoints aim for byte- or
     shape-compatibility with the JVM reference node (`ergoplatform/ergo`) so
@@ -1563,6 +1566,7 @@ components:
         - unconfirmedCount
         - isMining
         - currentTime
+        - launchTime
         - journalEventsVersion
       properties:
         name:
@@ -1612,12 +1616,36 @@ components:
           type: integer
           format: int64
           description: Local clock in Unix epoch milliseconds.
+        launchTime:
+          type: integer
+          format: int64
+          description: |
+            Unix epoch milliseconds at which this process began serving.
+            Constant for the process lifetime; `currentTime - launchTime`
+            is uptime. Present for JVM parity.
+        maxPeerHeight:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Highest header height announced by any peer in a SyncInfo message
+            since process start. Monotonic high-water mark — never decreases,
+            including on peer disconnect or reorg.
+
+            OMITTED (not zero) until the first SyncInfo is parsed: a zero would
+            assert the network is at height 0. Consumers must treat absence as
+            unknown.
+
+            Peer-supplied and unverified — advisory display data only
+            (`headersHeight / maxPeerHeight` = sync progress). Never an input
+            to consensus, validation, or storage decisions.
         journalEventsVersion:
           type: string
           description: |
             Version of the journal-events contract this build emits — see
-            `facts/journal-events.md`.
-          example: '1.0'
+            `facts/journal-events.md`. Major 2 as of v0.8.0; consumers pinned
+            to major 1 refuse to parse.
+          example: '2.0'
         statsVersion:
           type: string
           description: |
@@ -2130,8 +2158,26 @@ components:
           $ref: '#/components/schemas/HexString'
           description: Pre-image bytes the miner hashes against.
         b:
-          type: string
-          description: Difficulty target as decimal big-int string.
+          type: number
+          description: |
+            Autolykos mining target: `q / decode_compact_bits(nBits)`, where
+            `q` is the secp256k1 group order. A solution is valid when its
+            `pow_hit` is strictly below this. **Not the difficulty** — that is
+            the decoded `nBits`, and serving it here instead is the defect
+            fixed in v0.8.0 that left external miners unable to find anything.
+            Present in every release from v0.1.0 through v0.7.11 — see
+            `facts/mining.md` § "Candidate Assembly" step 4.
+
+            Emitted as a **bare JSON number**, matching JVM's
+            `ExternalCandidateBlock` — not a quoted string, which is what this
+            schema claimed until it was corrected in v0.8.0, while the wire has
+            always sent a number. A client generated from the old spec did not
+            merely lose precision, it failed to parse.
+
+            Ranges to ~2^256 (typically ~68 decimal digits), so it exceeds
+            IEEE-754 double precision. Consumers must parse it with an
+            arbitrary-precision integer type, reading the raw token rather
+            than going through a native JSON number.
         h:
           type: integer
           format: int64
@@ -2141,7 +2187,19 @@ components:
           description: Miner public key (hex-encoded).
         proof:
           type: object
-          description: Optional sigma-proof fields when the candidate requires them.
+          description: |
+            `ProofOfUpcomingTransactions` — `msgPreimage` (the serialized
+            header-without-PoW, hex) plus `txProofs` (Merkle membership proofs
+            for mandatory transactions), letting a miner verify it is working
+            on a real candidate. Nothing to do with sigma proofs, which is what
+            this description claimed until it was corrected in v0.8.0.
+
+            Omitted entirely today: the basic candidate carries only the
+            emission transaction, so there are no mandatory-tx proofs, and the
+            JVM encoder drops a `None` proof rather than emitting it. Omission
+            is also load-bearing — a nested proof object overflows the
+            reference Autolykos2 miner's fixed jsmn token buffer and it stops
+            mining.
 
     SolutionSubmission:
       type: object
@@ -2241,16 +2299,122 @@ components:
 
     ComponentMemory:
       type: object
-      required: [chainHeaderEstimateBytes, chainHeaderCount, mempoolTxCount]
+      description: |
+        Per-component memory attribution. Every `*Bytes` field is a FORMULA
+        over a live count or capacity, never a measurement — ground truth for
+        "where did the memory go" is a heap profile, not this endpoint.
+
+        Each formula is computed by the crate that owns the structure it
+        models and passed to the API layer. It is never computed in the API
+        layer from a constant describing another crate's internals: the
+        removed `chainHeaderEstimateBytes` sized a `Vec<Header>` that `chain/`
+        retired, and reported 1.48 GB for a structure that no longer existed.
+
+        Headers themselves are NOT resident — they have been served lazily
+        from storage since the Phase 3 retirement of the header Vec. Do not
+        reintroduce a field claiming to size resident headers.
+      required:
+        - chainIndexBytes
+        - chainHeaderCacheBytes
+        - chainScoreCacheBytes
+        - chainHeaderCount
+        - mempoolTxCount
       properties:
-        chainHeaderEstimateBytes:
+        chainIndexBytes:
           type: integer
           format: int64
           minimum: 0
+          description: |
+            `HeaderChain::by_id` (BlockId → height). **Unbounded** — grows with
+            chain length for the life of the node and is never evicted. The
+            one chain structure whose growth an operator must plan for.
+        chainHeaderCacheBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            `LazyHeaderStore` header LRU, current occupancy. Bounded by the
+            configured cache capacity.
+        chainScoreCacheBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            `LazyHeaderStore` cumulative-score LRU, current occupancy. Bounded
+            by the configured cache capacity.
         chainHeaderCount:
           type: integer
           format: int64
           minimum: 0
+          description: Chain length. A count, not an estimate.
+        storeCacheBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            `modifiers.redb` page cache occupancy, from redb's own
+            `cache_stats()`. OMITTED — never zero — when unavailable; a zero
+            would assert the cache is empty.
+
+            Historically the largest single consumer during cold sync and
+            entirely invisible here: it took redb's unconfigured 1 GiB default
+            until the cache budget landed.
+        stateCacheBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            `state.redb` page cache occupancy. OMITTED, never zero, when
+            unavailable.
+        storeCacheEvictions:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Cumulative `modifiers.redb` cache evictions. A rising count is the
+            signal that the cache is undersized — otherwise indistinguishable
+            from one that is comfortably large. OMITTED when unavailable.
+        proverModifiedNodesBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            AVL prover pending modified-node buffer, cleared on flush. OMITTED
+            — never zero — until the owning crate has published a figure; a
+            zero here asserts an empty buffer, which is a different claim from
+            an unmeasured one.
+
+            PUBLISHED, not read on demand: the prover lives inside the UTXO
+            validator, which `sync/` owns and does not share, so no request
+            path can reach it. UTXO mode only — digest mode has no prover and
+            omits all three.
+        proverResidentNodesBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            AVL prover tree nodes held resident between blocks. Same publish
+            and omission rules as `proverModifiedNodesBytes`.
+        syncWindowBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            `DeliveryTracker` bookkeeping in `sync/` — an id-keyed pending map
+            and evicted vec, bounded by the 192-block window. Same publish and
+            omission rules.
+
+            Expect tens of kilobytes, not megabytes. `sync/` holds no section
+            payloads: the P2P pipeline writes bytes to the modifier store and
+            notifies sync with ids only, so downloaded-but-unapplied bytes are
+            already counted in `storeCacheBytes`. A large figure here means the
+            tracker is leaking entries, not that the node is buffering blocks.
+
+            Added with the two prover fields on 2026-08-14: a node that had
+            caught up ~27k blocks held 1356 MB of live heap — 87% — that no
+            crate could name, while a node at the same tip that had not synced
+            held 214 MB unattributed. These three exist to close that gap; this
+            one closed it by exoneration.
         mempoolTxCount:
           type: integer
           format: int64

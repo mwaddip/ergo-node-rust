@@ -13,7 +13,9 @@ use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
 use ergo_avltree_rust::batch_node::AVLTree;
 use ergo_avltree_rust::operation::{KeyValue, Operation};
 use ergo_chain_types::ADDigest;
-use ergo_validation::{BlockValidator, DigestValidator, UtxoValidator, ValidationError};
+use ergo_validation::{
+    BlockValidator, DigestValidator, EmissionSource, MiningState, UtxoValidator, ValidationError,
+};
 use tempfile::TempDir;
 
 const KEY_LEN: usize = 32;
@@ -73,7 +75,16 @@ fn utxo_validator_with_history() -> (UtxoValidator, ADDigest, ADDigest, TempDir)
     storage.update_with_height(&mut prover, vec![], 2).unwrap();
     let digest_h2 = prover_ad_digest(&prover);
 
-    let validator = UtxoValidator::new(storage, prover, 2, 0);
+    // These fixtures insert raw 16-byte values, not serialized boxes, so no
+    // source could yield an emission box here — say so rather than feeding
+    // the recovery something it will fail to parse.
+    let validator = UtxoValidator::new(
+        storage,
+        prover,
+        2,
+        0,
+        EmissionSource::Unavailable("reset_to fixture: synthetic non-box values"),
+    );
     (validator, digest_h1, digest_h2, dir)
 }
 
@@ -82,7 +93,6 @@ fn utxo_validator_with_history() -> (UtxoValidator, ADDigest, ADDigest, TempDir)
 fn observed_prover_digest(validator: &UtxoValidator) -> ADDigest {
     let (_, digest) = validator
         .proofs_for_transactions(&[])
-        .expect("UTXO mode computes proofs")
         .expect("empty-ops proof generation succeeds");
     digest
 }

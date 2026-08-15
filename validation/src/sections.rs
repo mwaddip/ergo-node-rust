@@ -48,7 +48,10 @@ fn section_parse_err(section_type: u8, reason: impl Into<String>) -> ValidationE
 pub fn parse_ad_proofs(data: &[u8]) -> Result<ParsedAdProofs, ValidationError> {
     const TYPE_ID: u8 = 104;
     if data.len() < 33 {
-        return Err(section_parse_err(TYPE_ID, "too short for header_id + proof_size"));
+        return Err(section_parse_err(
+            TYPE_ID,
+            "too short for header_id + proof_size",
+        ));
     }
     let header_id: [u8; 32] = data[..32].try_into().unwrap();
     let mut cursor = Cursor::new(&data[32..]);
@@ -162,10 +165,7 @@ pub fn parse_extension(data: &[u8]) -> Result<ParsedExtension, ValidationError> 
         fields.push(ExtensionField { key, value });
     }
 
-    Ok(ParsedExtension {
-        header_id,
-        fields,
-    })
+    Ok(ParsedExtension { header_id, fields })
 }
 
 // ---------------------------------------------------------------------------
@@ -213,9 +213,9 @@ pub fn serialize_block_transactions(
 
     // Transactions
     for (i, tx) in transactions.iter().enumerate() {
-        let tx_bytes = tx.sigma_serialize_bytes().map_err(|e| {
-            section_parse_err(102, format!("transaction {i} serialize: {e}"))
-        })?;
+        let tx_bytes = tx
+            .sigma_serialize_bytes()
+            .map_err(|e| section_parse_err(102, format!("transaction {i} serialize: {e}")))?;
         out.extend_from_slice(&tx_bytes);
     }
 

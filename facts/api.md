@@ -86,6 +86,101 @@ lives at `api/src/lib.rs::ApiState`. The roles, summarized:
 - Optional P2P-capture handle (`None` when `[debug.p2p_capture]` is off)
 - Mining state and block submitter (`None` outside UTXO mode with a miner PK)
 
+### Component memory attribution (added 2026-08-11)
+
+`ChainAccess` carries a `memory_estimate()` returning an api-local
+`ChainMemory { index_bytes, header_cache_bytes, score_cache_bytes }`, surfaced
+by `GET /debug/memory` as `chainIndexBytes` / `chainHeaderCacheBytes` /
+`chainScoreCacheBytes`.
+
+**The API layer must not compute these numbers.** It reports what the owning
+crate tells it. The removed `chainHeaderEstimateBytes` was computed here from
+a local `AVG_HEADER_BYTES = 800` describing a `Vec<Header>` inside `chain/`;
+when `chain/` retired that Vec in Phase 3, this constant kept multiplying it
+by the header count and reported ~1.48 GB for a structure that did not exist —
+a figure exceeding total process RSS, which went unnoticed because nothing
+cross-checked the two crates.
+
+This crate deliberately does not depend on `enr-chain`; it reaches the chain
+only through `ChainAccess`. `ChainMemory` is therefore an api-local type, and
+the integrator's adapter in the main crate maps `chain/`'s
+`ChainMemoryEstimate` onto it. That mapping is the adapter's job as the
+integration seam — it is not licence to reintroduce sizing arithmetic here.
+
+Any future per-component memory field follows the same rule: the crate that
+owns the structure computes the figure; this crate transports it.
+
+**Extended 2026-08-12** with `storeCacheBytes`, `stateCacheBytes` and
+`storeCacheEvictions`, sourced from `redb::Database::cache_stats()` in `store/`
+and `state/` respectively, reached through `StoreAccess::cache_bytes_used`,
+`StoreAccess::cache_evictions` and `UtxoAccess::cache_bytes_used`.
+
+redb was the single largest consumer during a genesis sync and was entirely
+invisible to this endpoint — 2701 MB of a 2859 MB process was unattributed,
+which is what made the 2026-08-11 investigation take a day.
+
+All three accessors return `Option<u64>` and the fields are omitted when the
+value is `None`. Reporting `0` would assert an empty cache, the same class of
+falsehood as the removed `chainHeaderEstimateBytes`. The traits declare these
+methods **without default bodies**: a default would let an implementor silently
+return a wrong value, which is structurally how `AVG_HEADER_BYTES` survived
+four months.
+
+**Extended 2026-08-14** with `proverModifiedNodesBytes`, `proverResidentNodesBytes`
+and `syncWindowBytes`.
+
+The 2026-08-12 extension attributed redb and left the rest. Measured on two
+v0.8.0 nodes at the same tip on the same machine: a node that had applied ~27k
+blocks to catch up held **2175 MB rssAnon with 1356 MB (87% of live heap)
+unattributed**, while a node already at tip held 430 MB with 214 MB
+unattributed. Same version, same height, and the catch-up node had the *shorter*
+uptime — so the growth follows block application and is not released when sync
+ends. The at-tip cache resize fires correctly and does not help, because the
+bulk was never cache: that node's caches were down to 34 MB state / 18 MB store.
+
+The suspects are the AVL prover's working set and `sync/`'s in-flight window,
+neither of which any crate reports today.
+
+⚠ **These three cannot be read synchronously, unlike every field above.** The
+prover lives inside the UTXO validator, which `sync/` owns and does not share
+(`facts/validation.md` — the validator is moved into `HeaderSync`, not wrapped
+in an `Arc<Mutex>`). The API therefore cannot call an accessor on it. They are
+**published** instead: the owning crate computes its estimate, the main crate
+stores it in a `PublishedGauge` — the mechanism already used for
+`shared_height` — and this crate reads that. The `Option` discipline is
+unchanged: a gauge that has never been written reports absent, not zero, so a
+node that has applied no blocks does not claim an empty prover.
+
+⚠ **`Arc<AtomicU64>` is the interchange type; `PublishedGauge` is a view over
+one.** `api/` and `sync/` cannot name each other's types — neither depends on
+the other, and their only shared crates are `enr-p2p`, `ergo-chain-types` and
+`ergo-validation`, none of which is a sensible home for an observability
+primitive. So the *storage* is a plain `Arc<AtomicU64>` that the main crate
+allocates once and hands to both ends: the producer publishes into it, and
+`PublishedGauge` adopts the same `Arc` to read it. Two views, one allocation.
+
+`PublishedGauge` must therefore be constructible from an existing
+`Arc<AtomicU64>` and able to hand its own back. A gauge that owns its
+`AtomicU64` outright cannot be shared with a producer in another crate, which
+is the whole requirement.
+
+Both ends already agree on `u64::MAX` as the never-published sentinel and on
+`Relaxed` ordering. Relaxed is right: this is a monotonic diagnostic gauge with
+a single writer, never a synchronisation edge, and nothing downstream orders
+other reads against it.
+
+⚠ **The two cadences differ, deliberately.** `syncWindowBytes` is cheap and
+publishes after each applied block. The prover figures walk the resident tree —
+O(resident nodes), the same order as applying a block at mainnet scale — so they
+publish at **flush cadence**. Per-block publication there is a measurable sync
+regression for no benefit: the structure grows monotonically, so a slow gauge
+loses nothing. Do not "make it consistent" by moving the prover onto the
+per-block path.
+
+Do not "simplify" this into a direct accessor. A synchronous read would need
+either a lock on the validator on an HTTP path or an `Arc<Mutex>` around it,
+and the second was rejected on its own merits.
+
 ### State Context Lifecycle
 
 `state_context` is rebuilt whenever the validated tip advances:
@@ -257,6 +352,28 @@ hit the cap must check the returned length against the requested limit.
   exist in the store. Rust-specific addition used by fastsync; after a state
   wipe `fullHeight` resets to 0 while `downloadedHeight` reflects what is
   still on disk.
+- `maxPeerHeight` — highest header height announced by **any** peer in a
+  `SyncInfo` message since process start. Present for JVM parity; consumers
+  compute sync progress as `headersHeight / maxPeerHeight`.
+
+`maxPeerHeight` has three properties a consumer must account for:
+
+1. **Monotonic within a process.** It never decreases, including when the
+   announcing peer disconnects or the chain reorgs below it. It is a
+   high-water mark, not a live poll of current peers.
+2. **Absent until the first `SyncInfo` is parsed**, rather than reported as
+   `0`. A zero would assert "the network is at height 0", which is false and
+   worse than saying nothing. Consumers must treat absence as "unknown" —
+   the JVM types this field optional and so do we.
+3. **Peer-supplied and unverified.** A peer announcing a bogus height inflates
+   it for the lifetime of the process. It is advisory display data and must
+   never feed a consensus, validation, or storage decision. The value that
+   *does* drive behaviour (the fastsync gap) reads the same underlying atomic
+   but is bounded by a threshold check.
+
+`launchTime` — Unix epoch milliseconds at which this process began serving.
+Constant for the process lifetime. Present for JVM parity; consumers derive
+uptime as `currentTime - launchTime`.
 
 `/info/wait?after=H` long-polls until `fullHeight > H` (30s deadline, then
 204).

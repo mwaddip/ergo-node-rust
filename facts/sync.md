@@ -40,14 +40,10 @@ How the sync machine queries persistent storage.
 - Returns None if not found. Used during validation sweeps to load
   block sections (transactions, AD proofs, extensions) by type and ID.
 
-#### `script_verified_height() -> Option<u32>`
-- Read the persisted script_verified_height. Returns None if not set.
-- Used on startup to detect the gap between script-verified and
-  state-applied heights after an unclean shutdown.
-
-#### `set_script_verified_height(height)`
-- Persist the script_verified_height. Called every 100 blocks during
-  the sweep's drain of deferred eval results.
+*(`script_verified_height()` / `set_script_verified_height()` were removed from
+this trait in v0.8.0 with deferred evaluation. The metadata key they wrote
+remains in `chain_meta` on existing nodes and is simply never read again — a
+few stale bytes, no migration.)*
 
 #### `validated_height() -> Option<u32>`
 - Read the durably-recorded validated_height from
@@ -59,9 +55,14 @@ How the sync machine queries persistent storage.
 
 #### `set_validated_height(height)`
 - Persist `validated_height` to `chain_meta` with `Durability::Immediate`.
-- **Precondition**: caller MUST have called `validator.flush()` before
-  invoking this — see the flush ordering rule under "Cross-DB
-  Durability Handshake" below.
+- **Precondition**: caller MUST have flushed the validator before invoking
+  this — see the flush ordering rule under "Cross-DB Durability Handshake"
+  below. Since v0.8.0 that flush is reached through
+  `validator.state_persistence()` — a required `BlockValidator` method, so it
+  is callable from sync's generic `V: BlockValidator` bound — which returns
+  `None` in digest mode; see
+  "Flushing a validator that owns no state" below for what the precondition
+  means there.
 
 ### `SyncChain`
 
@@ -95,6 +96,12 @@ How the sync machine queries and updates chain state.
   download phase is a no-op without special-casing in the sync loop.
 - `store`: `SyncStore` for checking modifier existence
 - `validator`: `Option<BlockValidator>` for digest/UTXO-mode block validation.
+  Since v0.8.0 the storage-lifecycle methods live on a separate
+  `StatePersistence` trait reached through `state_persistence()`, so there are
+  two independent "absent" signals and they are **not** interchangeable: no
+  validator at all (light mode, below) bypasses the watermark scanner
+  entirely, while a validator whose `state_persistence()` is `None` (digest
+  mode) validates normally and merely has nothing to fsync.
   **`None` in `StateType::Light`** — the main crate's startup wiring branches
   on `state_type` and constructs no validator for light mode. The watermark
   scanner (`advance_state_applied_height`) is bypassed entirely when `validator`
@@ -261,11 +268,12 @@ arrives that creates a better chain (higher cumulative difficulty), the pipeline
 3. Executes `HeaderChain::try_reorg_deep()` to atomically swap the best chain.
 4. Sends `DeliveryControl::Reorg { fork_point, old_tip, new_tip }` to the sync machine.
 
-The sync machine responds by draining in-flight eval results, clearing its section
-queue, resetting all three watermarks (`downloaded_height`, `state_applied_height`,
-and `script_verified_height`) to the fork point, resetting the block validator's
-state root, re-queuing sections for the new branch, and re-scanning the download
-watermark.
+The sync machine responds by clearing its section queue, resetting both
+watermarks (`downloaded_height` and `state_applied_height`) to the fork point,
+resetting the block validator's state root, re-queuing sections for the new
+branch, and re-scanning the download watermark. There are no in-flight eval
+results to drain — a reorg cannot arrive between a block's application and its
+verification, because there is no longer any gap between them.
 
 For incomplete fork chains (parent not in store), the pipeline sends
 `DeliveryControl::NeedModifier` to request the missing parent header. Once it
@@ -324,8 +332,10 @@ channels are consumed and re-entries are no-ops.
 
 **Sequence:**
 
-1. `validator.flush()` to persist any in-memory write-tx state.
-   Failure reinstates the old validator and skips the rebuild.
+1. `validator.state_persistence()` → `flush()` to persist any in-memory
+   write-tx state. Failure reinstates the old validator and skips the
+   rebuild; `None` (digest mode) proceeds — there is no write-tx state to
+   lose, and the reopen is a cache-size change either way.
 2. `drop(validator)` — releases the AVL storage `Arc<Database>`.
    All other holders (mempool, REST API, mining) must release
    their `Arc<SnapshotReader>`s in parallel for redb's exclusive
@@ -362,8 +372,9 @@ can leave them on different durability horizons.
 
 On every flush point in the sync sweep loop:
 
-1. `validator.flush()` — state.redb fsync with `Durability::Immediate`.
-   State is now durable at height M = `validator.validated_height()`.
+1. `validator.state_persistence()` → `flush()` — state.redb fsync with
+   `Durability::Immediate`. State is now durable at height
+   M = `validator.validated_height()`.
 2. `store.set_validated_height(M)` — modifiers.redb chain_meta write
    with `Durability::Immediate`. Records that state was durable at M.
 3. `store.flush()` — modifiers.redb fsync covering section writes and
@@ -374,6 +385,43 @@ of the recorded `validated_height` — handled by startup reconciliation
 below. A crash between (2) and (3) is covered by (2)'s Immediate
 commit; only ancillary modifier writes get rolled back, which sync
 re-fetches naturally.
+
+### Flushing a validator that owns no state (added v0.8.0)
+
+`state_persistence()` returns `None` in digest mode, because
+`DigestValidator` owns no redb and has nothing to fsync. That is **not** a
+flush failure and must not be treated as one.
+
+Three distinct cases, and the middle one is the new spelling of what used to
+be a defaulted `Ok(())`:
+
+| Case | Meaning | Effect on step (2)/(3) and pruning |
+|---|---|---|
+| `Some(p)`, `p.flush()` → `Ok` | state durable at M | proceed |
+| `None` | nothing to persist | proceed — step (1) is vacuously satisfied, **and (2) still runs** |
+| `Some(p)`, `p.flush()` → `Err` | durability UNKNOWN | **stop**: no `set_validated_height`, no prune |
+
+⚠ **`None` is NOT `FlushOutcome::NoValidator`.** That variant is light mode —
+no validator at all — and it deliberately skips `set_validated_height`. Digest
+mode has a validator and a real `validated_height()`, and today it reaches
+`FlushOutcome::Flushed(M)` by way of the defaulted `flush` returning `Ok(())`,
+so the store write happens. **It must keep happening**; reusing `NoValidator`
+would silently drop it and turn a refactor into a behaviour change.
+
+A distinct outcome is therefore required — one that advances `last_flush` and
+completes the store pair, while not claiming an fsync occurred. Digest mode
+does not *resume* from this value (it rescans for the first complete block and
+recovers state roots from headers — `src/main.rs`, the `StateType::Digest`
+branch), so the write is bookkeeping rather than load-bearing. It is preserved
+anyway, because the split is a refactor: dropping it is a separate decision
+that would need its own justification, not a side effect of moving a method
+between traits.
+
+⚠ The `None` and `Err` arms must not be collapsed. "Nothing to flush" and
+"the flush failed" differ by exactly the bug this split was made to prevent —
+a validator reporting success for work it never did. `sync/` already models
+the shape (`FlushOutcome`, and the no-validator case in `StateType::Light`);
+digest mode joins that arm rather than growing a new one.
 
 ### Startup reconciliation
 
@@ -596,14 +644,17 @@ unclean shutdowns; clean shutdowns should preserve everything.
 In all three cases `run()` MUST flush before returning, using the same
 sequence as the per-flush-trigger ordering (see "Flush ordering"):
 
-1. `validator.flush()` — state.redb fsync with `Durability::Immediate`.
-2. `store.set_validated_height(M)` if (1) succeeded, where M is the
-   validator's reported `validated_height()` after flushing.
+1. `validator.state_persistence()` → `flush()` — state.redb fsync with
+   `Durability::Immediate`.
+2. `store.set_validated_height(M)` if (1) succeeded **or was vacuous**
+   (`state_persistence()` was `None`), where M is the validator's reported
+   `validated_height()` after flushing.
 3. `store.flush()` — modifiers.redb fsync.
 
-Failure of `validator.flush()` is logged but MUST NOT block return —
-the host must be able to exit. The next startup's reconciliation
-re-validates whatever gap results.
+A flush *failure* is logged but MUST NOT block return — the host must be able
+to exit, and the next startup's reconciliation re-validates whatever gap
+results. A `None` is not a failure and is not logged as one; see "Flushing a
+validator that owns no state".
 
 The structural pattern: `run_inner` owns the loop body; `run` wraps the
 `run_inner` call in `tokio::select!` against the shutdown receiver,
@@ -763,6 +814,66 @@ JVM has no light-mode analog at the section-id level (it gates the entire
 download phase via `nipopowBootstrap`); our chain crate folds the gating into
 `required_section_ids` returning empty, which keeps the sync loop unchanged.
 
+### Memory attribution (added 2026-08-14)
+
+`HeaderSync` exposes a best-effort estimate of what its in-flight structures
+hold:
+
+```rust
+/// Bytes held by in-flight delivery bookkeeping. `None` if not computable.
+pub fn window_memory_estimate(&self) -> Option<SyncWindowEstimate>;
+
+pub struct SyncWindowEstimate {
+    /// `DeliveryTracker`'s pending map and evicted vec. Id-keyed
+    /// bookkeeping only — see below, this crate holds no payloads.
+    pub tracker_bytes: u64,
+    /// Live entries behind that figure.
+    pub tracker_entries: u64,
+}
+```
+
+⚠ **An earlier revision of this contract named the first field
+`buffered_section_bytes` and described it as "section payloads received and
+awaiting application". No such thing exists in this crate** — that was my
+assumption, not the architecture, and it is corrected here.
+
+**The window is cleared as a suspect for the unattributed heap.** `sync/` holds
+**zero** section payload bytes and keeps no persistent download queue.
+`ModifierResponse` is not a message this state machine handles: the P2P pipeline
+writes bytes into the modifier store and notifies sync with **ids only**. The
+sweep reads each block back out of the store, applies it, and drops it within a
+single loop iteration. Downloaded-but-unapplied section bytes therefore live in
+redb and are already attributed as `storeCacheBytes` — counting them here would
+double-count.
+
+What remains is `DeliveryTracker` alone: an id-keyed pending map plus an evicted
+vec, bounded by the 192-block window at roughly 64 B per entry — tens of
+kilobytes. It cannot be the 1356 MB. That leaves the AVL prover as the sole
+remaining suspect, which `facts/state.md` § "Resolution is one-way" then
+identified.
+
+⚠ **Size the tracker from live entry counts, never `HashMap::capacity()`.**
+`capacity()` returns items plus growth-left, and erasing only returns a slot to
+growth-left when the probe sequence permits `EMPTY` over `DELETED` — which
+depends on `RandomState`'s per-process seed. The identical workload reported
+16640 B on one run and 8320 B on the next. Count live entries and document the
+figure as a lower bound: real allocation is at most ~2.3× (power-of-two buckets,
+7/8 load factor, one control byte per slot). `Vec::capacity()` is not affected
+and is the honest figure there, since the allocation survives `clear()`.
+
+**Publish it, do not expose it.** `sync/` owns the validator and is not shared,
+so no HTTP path can call this. `HeaderSync` writes the figure into a caller-
+supplied `Arc<AtomicU64>` after each applied block — the same mechanism as
+`shared_height` — and the main crate hands that atomic to the API. An atomic
+never written must read as absent rather than zero (`facts/api.md`).
+
+Motivation: 1356 MB of live heap on a caught-up node is unattributed, and the
+sliding window is one of the two structures that could hold it. Sizing this
+either implicates the window or clears it, and both outcomes are progress.
+
+Compute from the actual buffers. A per-block constant times a block count is
+the failure mode that produced a 1.48 GB phantom in `facts/api.md`.
+
 ### Download queue
 
 The sync machine maintains an internal queue of `(type_id, modifier_id)` pairs
@@ -904,7 +1015,7 @@ existing ingestion endpoints (see `facts/api.md`). The main node:
 - Receives headers and block sections, stores them via the normal store
   write path, and advances `downloaded_height` via the watermark scanner.
 - Runs the validation pipeline on delivered data concurrently, advancing
-  `state_applied_height` and `script_verified_height` normally.
+  `state_applied_height` normally.
 
 The main node does NOT supervise fastsync's peer selection, fetch strategy,
 or internal state. It waits for the subprocess to exit and then transitions
@@ -939,78 +1050,72 @@ the mean block interval. The "far behind while running" case is rare enough
 that the added complexity of continuous monitoring and mode transitions
 isn't justified. Restart is an acceptable recovery mechanism.
 
-## Block Assembly (state_applied_height / script_verified_height)
+## Block Assembly (state_applied_height)
 
-The sync machine tracks three watermarks:
+The sync machine tracks two watermarks:
 
 - **`downloaded_height`** — highest height where all required block sections
   are present in the store.
 - **`state_applied_height`** — highest height where `apply_state()` returned Ok.
   External consumers (API, mempool, mining) see this height.
-- **`script_verified_height`** — highest height where `evaluate_scripts()` has
-  completed successfully. Internal bookkeeping for rollback decisions.
-  Advances in-order as eval results arrive via crossbeam channel.
 
-`downloaded_height` and `state_applied_height` are initialized from
-`validator.validated_height()` on startup. `script_verified_height` is
-persisted separately and loaded on startup.
+**`script_verified_height` was deleted in v0.8.0**, along with deferred
+evaluation itself. It tracked how far script verification trailed state
+application; `apply_state` now evaluates before persisting, so `Ok` already
+means the scripts passed, and a second watermark could only ever disagree with
+the first. Everything hanging off it went too: the reorder buffer and its
+`eval_generation` stamp, the dispatch gate and its byte/count bounds, the
+failure-rollback path, the startup gap repair, and the checkpoint frontier
+floor.
+
+*The history is kept because it is the argument against reintroducing any of
+it.* The reorder buffer was drain-local until 2026-08-12, so any eval result
+that overtook its predecessor was found non-contiguous and discarded — and the
+channel never resends, so the frontier could never pass that hole for the life
+of the process. Block 3522 (3 txs, 17 inputs, the first non-coinbase-only block
+in its region) was overtaken by the trivial 3523 on a two-thread pool, and the
+watermark froze there for **190,000+ blocks** while `eval_lag` read **187,711**
+against `evals_in_flight` of **1** and flat memory. Scripts were still
+evaluated and failures still rolled back, so it was bookkeeping rather than a
+verification skip — but every consumer reading that watermark as "validated up
+to here" was lied to from the first overtake onwards, which on a low-thread
+host is almost immediate.
+
+That bug, the `handle_eval_failure` zeroing of `evals_in_flight` while its
+rayon tasks still ran and still held their heap, and the unbounded backlog that
+killed a 4-thread 1.8 GHz host at anon-rss 10.62 GiB, were three faces of one
+root: **verification lagging application**. Removing the lag removed the class,
+and it is the reason a "just make it async again for throughput" proposal
+should be treated as a request to reopen all three.
+
+Both watermarks initialize from `validator.validated_height()` on startup.
+Nothing script-related is persisted separately any more.
 
 ### Invariants
 
-- `script_verified_height <= state_applied_height <= downloaded_height <= chain_height`
-- `state_applied_height` is monotonically increasing (except on reorg or eval failure)
-- Heights at or below `script_verified_height` are fully validated (state + scripts)
+- `state_applied_height <= downloaded_height <= chain_height`
+- `state_applied_height` is monotonically increasing (except on reorg)
+- Heights at or below `state_applied_height` have had their state applied, and
+  their scripts either **verified** or **explicitly skipped by
+  `checkpoint_height` configuration**. One watermark carrying both facts, which
+  is what all of its consumers actually needed.
 
-### Eval dispatch
+### Catch-up progress instrumentation
 
-Script evaluation is dispatched to the rayon thread pool via `rayon::spawn`.
-Results are sent through `crossbeam_channel::Sender<(u32, Result<(), ValidationError>)>`.
-The sync layer drains the receiver non-blocking between blocks during the
-sweep, and blocking after the sweep completes.
+A periodic INFO record during catch-up:
 
-No backpressure. Memory per DeferredEval is ~25KB typical, ~410KB worst case.
+| Field | Source |
+|---|---|
+| `state_applied_height` | **the applied tip — `validator.validated_height()`**, NOT the struct field |
+| `jemalloc_allocated` | the existing probe; the field is **omitted** when no probe is wired |
 
-### At chain tip
+Reduced in v0.8.0 from six fields to two. `evals_in_flight`,
+`script_verified_height`, `eval_lag` and `eval_bytes_in_flight` all described a
+queue that no longer exists.
 
-When `sweep_size == 1`, drain the eval channel synchronously after applying
-state. No pipeline benefit for a single block during live sync.
-
-### Eval failure handling
-
-Eval failures are detected in `drain_eval_results` during the sweep loop.
-Two detection points:
-
-**In-loop detection:** After each non-blocking drain, the sweep compares
-`state_applied_height` against its pre-drain value. If `handle_eval_failure`
-reduced it during the drain, the sweep corrects `validated_to` and breaks
-immediately — preventing the post-loop code from overwriting the rolled-back
-watermark with the stale `validated_to`. Without this check, the sweep would
-continue feeding blocks to a rolled-back validator (height mismatch) and then
-clobber `state_applied_height` back to the pre-rollback value.
-
-**Post-sweep detection:** The blocking drain after sweep completion can also
-find failures. `handle_eval_failure` sets the correct watermarks directly;
-no post-drain code overwrites them.
-
-`handle_eval_failure` sequence:
-1. Drain and discard remaining channel results
-2. Look up digest via `chain.header_at(failed_height - 1).state_root`
-3. Call `validator.reset_to(failed_height - 1, digest)`
-4. **On Ok**: reset `state_applied_height` and `script_verified_height`
-   to `failed_height - 1`, reset `downloaded_height` to match
-5. **On Err (2026-06-12)**: the validator did NOT move — watermarks stay
-   exactly where they are (NO resets; retreating them onto un-rolled
-   state is the gap-wedge hole). Log loud (`validation_rollback_failed`)
-   and resume — the sweep/backoff machinery (v0.6.11) retries the stall.
-   Same rule for the Reorg-control path (the other `reset_to` site).
-6. Log the error, resume sync
-
-### Startup gap handling
-
-On startup, if persisted `script_verified_height < state_applied_height`,
-the gap is accepted — the AVL digest already proved state correctness during
-`apply_state`, and proof boxes aren't available without re-running apply_state.
-`script_verified_height` is advanced to match `state_applied_height`.
+⚠ **Anything quoting `eval_lag` from a pre-2026-08-12 run is quoting a frozen
+number** — see the watermark history above. Field reports and journals from
+that era should not be used to argue about backlog depth.
 
 ### Watermark scanner
 

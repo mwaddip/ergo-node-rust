@@ -31,13 +31,7 @@ pub trait ModifierStore: Send + Sync {
     /// always go through `put_batch` so the cumulative score is carried
     /// alongside the data in a single atomic write. Single-header writes
     /// from the validation pipeline use `put_batch` with a one-element slice.
-    fn put(
-        &self,
-        type_id: u8,
-        id: &[u8; 32],
-        height: u32,
-        data: &[u8],
-    ) -> Result<(), Self::Error>;
+    fn put(&self, type_id: u8, id: &[u8; 32], height: u32, data: &[u8]) -> Result<(), Self::Error>;
 
     /// Store a batch of modifiers atomically.
     /// All entries are written in a single transaction — all succeed or none do.
@@ -47,38 +41,20 @@ pub trait ModifierStore: Send + Sync {
     /// `type_id == 101`; `None` for all other modifier types. A
     /// `type_id == 101` entry with `score == None` is rejected and
     /// no entries from the batch are written.
-    fn put_batch(
-        &self,
-        entries: &[ModifierBatchEntry],
-    ) -> Result<(), Self::Error>;
+    fn put_batch(&self, entries: &[ModifierBatchEntry]) -> Result<(), Self::Error>;
 
     /// Retrieve a modifier by type and ID.
-    fn get(
-        &self,
-        type_id: u8,
-        id: &[u8; 32],
-    ) -> Result<Option<Vec<u8>>, Self::Error>;
+    fn get(&self, type_id: u8, id: &[u8; 32]) -> Result<Option<Vec<u8>>, Self::Error>;
 
     /// Retrieve the modifier ID at a given height for a type.
-    fn get_id_at(
-        &self,
-        type_id: u8,
-        height: u32,
-    ) -> Result<Option<[u8; 32]>, Self::Error>;
+    fn get_id_at(&self, type_id: u8, height: u32) -> Result<Option<[u8; 32]>, Self::Error>;
 
     /// Check whether a modifier exists without reading its data.
-    fn contains(
-        &self,
-        type_id: u8,
-        id: &[u8; 32],
-    ) -> Result<bool, Self::Error>;
+    fn contains(&self, type_id: u8, id: &[u8; 32]) -> Result<bool, Self::Error>;
 
     /// Returns the tip (highest height and its modifier ID) for a type.
     /// None if no modifiers of that type have been stored.
-    fn tip(
-        &self,
-        type_id: u8,
-    ) -> Result<Option<(u32, [u8; 32])>, Self::Error>;
+    fn tip(&self, type_id: u8) -> Result<Option<(u32, [u8; 32])>, Self::Error>;
 
     /// Store a header with its fork number and cumulative score.
     /// Writes to PRIMARY (type_id=101), HEADER_FORKS, HEADER_SCORES.
@@ -95,10 +71,7 @@ pub trait ModifierStore: Send + Sync {
 
     /// Get all header IDs at a given height across all forks.
     /// Returns Vec<(header_id, fork_number)> sorted by fork number.
-    fn header_ids_at_height(
-        &self,
-        height: u32,
-    ) -> Result<Vec<([u8; 32], u32)>, Self::Error>;
+    fn header_ids_at_height(&self, height: u32) -> Result<Vec<([u8; 32], u32)>, Self::Error>;
 
     /// Get the cumulative score for a header.
     ///
@@ -106,10 +79,7 @@ pub trait ModifierStore: Send + Sync {
     /// bytes. Populated for **every** header — main-chain and forks
     /// alike — after the one-shot scores backfill migration runs at
     /// store open. Returns `None` only when `id` was never written.
-    fn header_score(
-        &self,
-        id: &[u8; 32],
-    ) -> Result<Option<Vec<u8>>, Self::Error>;
+    fn header_score(&self, id: &[u8; 32]) -> Result<Option<Vec<u8>>, Self::Error>;
 
     /// Update only the score for an existing header.
     ///
@@ -121,11 +91,7 @@ pub trait ModifierStore: Send + Sync {
     /// Returns Err if `id` is not present in PRIMARY (would be a
     /// caller bug — the migration walks BEST_CHAIN which is consistent
     /// with PRIMARY).
-    fn put_header_score(
-        &self,
-        id: &[u8; 32],
-        score: &[u8],
-    ) -> Result<(), Self::Error>;
+    fn put_header_score(&self, id: &[u8; 32], score: &[u8]) -> Result<(), Self::Error>;
 
     /// Batch variant of [`put_header_score`] — writes many `(id, score)`
     /// pairs in a single redb write transaction.
@@ -145,10 +111,7 @@ pub trait ModifierStore: Send + Sync {
     /// the migration also leaves substantial redb recovery work for
     /// the next unclean restart (~6 min open time observed) —
     /// chunking into ~50_000-entry batches collapses that.
-    fn put_header_score_batch(
-        &self,
-        entries: &[([u8; 32], Vec<u8>)],
-    ) -> Result<(), Self::Error>;
+    fn put_header_score_batch(&self, entries: &[([u8; 32], Vec<u8>)]) -> Result<(), Self::Error>;
 
     /// Delete all modifier rows of the given `type_ids` at heights strictly
     /// less than `horizon`. Atomic in a single redb write transaction.
@@ -162,11 +125,7 @@ pub trait ModifierStore: Send + Sync {
     /// Used by sync's flush_pair to delete non-header section bodies
     /// (102 BlockTransactions, 104 ADProofs, 108 Extension) older than
     /// the `blocks_to_keep`-derived horizon.
-    fn prune_below_height(
-        &self,
-        horizon: u32,
-        type_ids: &[u8],
-    ) -> Result<usize, Self::Error>;
+    fn prune_below_height(&self, horizon: u32, type_ids: &[u8]) -> Result<usize, Self::Error>;
 
     /// Returns the lowest height present in HEIGHT_INDEX for `type_id`,
     /// or None if no entries exist for that type. Mirror of `tip(type_id)`.
@@ -174,10 +133,7 @@ pub trait ModifierStore: Send + Sync {
     ///
     /// For `type_id == 101` routes to BEST_CHAIN's lowest entry (same
     /// pattern as `tip(101)` routing to `best_header_tip`).
-    fn min_height_present(
-        &self,
-        type_id: u8,
-    ) -> Result<Option<u32>, Self::Error>;
+    fn min_height_present(&self, type_id: u8) -> Result<Option<u32>, Self::Error>;
 
     /// Read a value from the chain_meta table.
     ///
@@ -185,34 +141,21 @@ pub trait ModifierStore: Send + Sync {
     /// migration sentinels and per-chain-state flags. Keys are
     /// stable byte strings (see `facts/store.md` for assigned keys);
     /// values are treated as opaque bytes by the store crate.
-    fn chain_meta_get(
-        &self,
-        key: &[u8],
-    ) -> Result<Option<Vec<u8>>, Self::Error>;
+    fn chain_meta_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
 
     /// Write a value to the chain_meta table. Overwrites any
     /// previous value at the same key.
-    fn chain_meta_put(
-        &self,
-        key: &[u8],
-        value: &[u8],
-    ) -> Result<(), Self::Error>;
+    fn chain_meta_put(&self, key: &[u8], value: &[u8]) -> Result<(), Self::Error>;
 
     /// Remove a value from the chain_meta table.
     ///
     /// Idempotent: removing a key that does not exist is `Ok(())`.
     /// Primary use case is operator-driven re-runs of one-shot
     /// migrations (delete the migration's sentinel and restart).
-    fn chain_meta_delete(
-        &self,
-        key: &[u8],
-    ) -> Result<(), Self::Error>;
+    fn chain_meta_delete(&self, key: &[u8]) -> Result<(), Self::Error>;
 
     /// Get the best chain header ID at a height.
-    fn best_header_at(
-        &self,
-        height: u32,
-    ) -> Result<Option<[u8; 32]>, Self::Error>;
+    fn best_header_at(&self, height: u32) -> Result<Option<[u8; 32]>, Self::Error>;
 
     /// Get the best chain tip (highest height and header ID).
     fn best_header_tip(&self) -> Result<Option<(u32, [u8; 32])>, Self::Error>;
@@ -234,10 +177,7 @@ pub trait ModifierStore: Send + Sync {
     /// best-chain header is recorded at `height`. The returned bytes are
     /// the caller-provided `data` passed to `put` / `put_batch` /
     /// `put_header`; this method does not parse them.
-    fn read_header_at(
-        &self,
-        height: u32,
-    ) -> Result<Option<Vec<u8>>, Self::Error>;
+    fn read_header_at(&self, height: u32) -> Result<Option<Vec<u8>>, Self::Error>;
 
     /// Write or overwrite a peer record.
     ///
@@ -246,18 +186,11 @@ pub trait ModifierStore: Send + Sync {
     /// the store; the p2p crate owns the schema.
     ///
     /// Overwrites any prior value at the same address.
-    fn put_peer(
-        &self,
-        addr: SocketAddr,
-        record: &[u8],
-    ) -> Result<(), Self::Error>;
+    fn put_peer(&self, addr: SocketAddr, record: &[u8]) -> Result<(), Self::Error>;
 
     /// Remove a peer record. Idempotent: removing an absent address
     /// is `Ok(())`.
-    fn delete_peer(
-        &self,
-        addr: SocketAddr,
-    ) -> Result<(), Self::Error>;
+    fn delete_peer(&self, addr: SocketAddr) -> Result<(), Self::Error>;
 
     /// Read every peer record. Single read transaction. Returns a
     /// `Vec<(addr, record_bytes)>` with no ordering guarantee — caller
@@ -266,9 +199,7 @@ pub trait ModifierStore: Send + Sync {
     /// Rows whose key cannot be decoded as a `SocketAddr` are skipped
     /// with a `tracing::warn!` rather than aborting the call; the
     /// store is not the place to nuke the p2p layer over a corrupt row.
-    fn list_peers(
-        &self,
-    ) -> Result<Vec<(SocketAddr, Vec<u8>)>, Self::Error>;
+    fn list_peers(&self) -> Result<Vec<(SocketAddr, Vec<u8>)>, Self::Error>;
 
     /// Force a durable commit — fsync all pending writes to disk.
     ///

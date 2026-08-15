@@ -7,22 +7,53 @@ Wants=network-online.target
 Type=simple
 User=ergo-node
 Group=ergo-node
-ExecStart=/usr/bin/ergo-node-rust /etc/ergo-node/ergo.toml
+# No config path argument, deliberately.
+#
+# Configuration is now layered across /etc/ergo-node/conf.d/ — package
+# defaults, debconf answers, and the operator's own file — with no single file
+# holding the result. Naming a path here would pin the node to one layer.
+#
+# ⚠ It specifically must not name /etc/ergo-node/ergo.toml any more. preinst
+# MOVES that file to conf.d/99-local.toml on upgrade, so an explicit argument
+# pointing at it would name a file that no longer exists and the service would
+# fail to start on the first upgrade after this change.
+#
+# With no argument the node searches ./ergo.toml, ~/.config/ergo-node/, then
+# /etc/ergo-node/ — and layers a sibling conf.d/ onto whichever it finds, or
+# uses conf.d alone. WorkingDirectory is pinned below so "./" is a known
+# location rather than whatever systemd happened to pick.
+WorkingDirectory=/var/lib/ergo-node
+ExecStart=/usr/bin/ergo-node-rust
 Restart=on-failure
 RestartSec=10
 # stdout/stderr default to journald — the shipped fail2ban jail uses
 # backend=systemd and journalmatch=_SYSTEMD_UNIT=ergo-node-rust.service,
 # so PENALTY lines must reach the journal to be acted on.
 Environment=RUST_LOG=info
-# Opt jemalloc out of Transparent Huge Pages.
-# With kernel THP=always, jemalloc cannot effectively return memory to
-# the OS via madvise(MADV_DONTNEED) — partial THP regions can't be
-# reclaimed without splitting, so RSS grows over time even when
-# allocated stays flat. Setting thp:never tells jemalloc to
-# madvise(MADV_NOHUGEPAGE) its arenas, restoring granular reclaim.
-# The _RJEM_ prefix is required by tikv-jemallocator (jemalloc symbols
-# are mangled — standard MALLOC_CONF is silently ignored).
-Environment=_RJEM_MALLOC_CONF=thp:never
+# jemalloc tuning. The _RJEM_ prefix is required by tikv-jemallocator
+# (jemalloc symbols are mangled — a plain MALLOC_CONF is silently ignored).
+#
+# thp:never — with kernel THP=always, jemalloc cannot effectively return
+# memory to the OS via madvise(MADV_DONTNEED); partial THP regions can't be
+# reclaimed without splitting, so RSS grows over time even when allocated
+# stays flat. This makes jemalloc madvise(MADV_NOHUGEPAGE) its arenas,
+# restoring granular reclaim.
+#
+# background_thread:true — jemalloc defaults this to FALSE on Linux. Without
+# it, an arena's dirty pages decay only when a thread next touches that
+# arena, and jemalloc runs 4 x ncpu arenas (128 on a 32-core host), so quiet
+# arenas hold their pages indefinitely. Measured during a genesis sync
+# 2026-08-11: 1021 MB of resident-minus-active, a third of the process.
+#
+# dirty_decay_ms / muzzy_decay_ms — halved from jemalloc's 10s default.
+#
+# narenas is deliberately NOT set. Reducing it would also cut per-arena
+# retention, and changing both at once makes any result unattributable.
+#
+# NOTE: a systemd drop-in that sets this variable REPLACES this value
+# entirely — systemd does not merge repeated assignments of the same
+# variable. Copy the whole string when overriding.
+Environment=_RJEM_MALLOC_CONF=thp:never,background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000
 
 NoNewPrivileges=yes
 ProtectSystem=strict

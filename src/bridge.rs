@@ -168,7 +168,11 @@ impl SyncChain for SharedChain {
     }
 
     async fn active_proposed_update_bytes(&self) -> Vec<u8> {
-        self.chain.lock().await.active_proposed_update_bytes().to_vec()
+        self.chain
+            .lock()
+            .await
+            .active_proposed_update_bytes()
+            .to_vec()
     }
 
     async fn verify_nipopow_envelope(
@@ -270,14 +274,10 @@ impl SharedStore {
     }
 }
 
-/// Reserved type_id for sync metadata (not a real modifier type).
-const SYNC_META_TYPE_ID: u8 = 255;
-/// Fixed key for script_verified_height metadata.
-const SCRIPT_VERIFIED_HEIGHT_KEY: [u8; 32] = {
-    let mut k = [0u8; 32];
-    k[0] = b's'; k[1] = b'v'; k[2] = b'h'; // "svh" prefix
-    k
-};
+// SYNC_META_TYPE_ID (255) and SCRIPT_VERIFIED_HEIGHT_KEY ("svh") lived here to
+// persist the script-verification watermark. Both went with deferred evaluation
+// in v0.8.0 and had no other users. Nodes upgraded from an earlier version keep
+// the stale key in their store; nothing reads it, and there is no migration.
 
 impl SyncStore for SharedStore {
     async fn has_modifier(&self, type_id: u8, id: &[u8; 32]) -> bool {
@@ -320,44 +320,6 @@ impl SyncStore for SharedStore {
         }
     }
 
-    async fn script_verified_height(&self) -> Option<u32> {
-        let store = self.store.clone();
-        match tokio::task::spawn_blocking(move || {
-            match store.get(SYNC_META_TYPE_ID, &SCRIPT_VERIFIED_HEIGHT_KEY) {
-                Ok(Some(bytes)) if bytes.len() == 4 => {
-                    Some(u32::from_le_bytes(bytes[..4].try_into().unwrap()))
-                }
-                _ => None,
-            }
-        })
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!(?e, "spawn_blocking panicked: script_verified_height");
-                None
-            }
-        }
-    }
-
-    async fn set_script_verified_height(&self, height: u32) {
-        let store = self.store.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || {
-            if let Err(e) = store.put(
-                SYNC_META_TYPE_ID,
-                &SCRIPT_VERIFIED_HEIGHT_KEY,
-                0, // metadata, no meaningful height
-                &height.to_le_bytes(),
-            ) {
-                tracing::warn!(height, "failed to persist script_verified_height: {e}");
-            }
-        })
-        .await
-        {
-            tracing::error!(?e, height, "spawn_blocking panicked: set_script_verified_height");
-        }
-    }
-
     async fn flush(&self) {
         let store = self.store.clone();
         if let Err(e) = tokio::task::spawn_blocking(move || {
@@ -373,13 +335,11 @@ impl SyncStore for SharedStore {
 
     async fn validated_height(&self) -> Option<u32> {
         let store = self.store.clone();
-        match tokio::task::spawn_blocking(move || {
-            match store.chain_meta_get(b"validated_height") {
-                Ok(Some(bytes)) if bytes.len() == 4 => {
-                    Some(u32::from_be_bytes(bytes[..4].try_into().unwrap()))
-                }
-                _ => None,
+        match tokio::task::spawn_blocking(move || match store.chain_meta_get(b"validated_height") {
+            Ok(Some(bytes)) if bytes.len() == 4 => {
+                Some(u32::from_be_bytes(bytes[..4].try_into().unwrap()))
             }
+            _ => None,
         })
         .await
         {
@@ -394,9 +354,7 @@ impl SyncStore for SharedStore {
     async fn set_validated_height(&self, height: u32) {
         let store = self.store.clone();
         if let Err(e) = tokio::task::spawn_blocking(move || {
-            if let Err(e) =
-                store.chain_meta_put(b"validated_height", &height.to_be_bytes())
-            {
+            if let Err(e) = store.chain_meta_put(b"validated_height", &height.to_be_bytes()) {
                 tracing::warn!(height, "failed to persist validated_height: {e}");
                 return;
             }
@@ -413,11 +371,7 @@ impl SyncStore for SharedStore {
         }
     }
 
-    async fn prune_below_height(
-        &self,
-        horizon: u32,
-        type_ids: &[u8],
-    ) -> Result<usize, String> {
+    async fn prune_below_height(&self, horizon: u32, type_ids: &[u8]) -> Result<usize, String> {
         let store = self.store.clone();
         let type_ids = type_ids.to_vec();
         match tokio::task::spawn_blocking(move || {
@@ -438,9 +392,7 @@ impl SyncStore for SharedStore {
     async fn min_height_present(&self, type_id: u8) -> Result<Option<u32>, String> {
         let store = self.store.clone();
         match tokio::task::spawn_blocking(move || {
-            store
-                .min_height_present(type_id)
-                .map_err(|e| e.to_string())
+            store.min_height_present(type_id).map_err(|e| e.to_string())
         })
         .await
         {
@@ -459,6 +411,8 @@ mod tests {
     use enr_chain::ChainConfig;
     use ergo_chain_types::{ADDigest, AutolykosSolution, Digest32, EcPoint, Votes};
     use sigma_ser::ScorexSerializable;
+
+    const TEST_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
     fn synthetic_header(height: u32, parent_id: BlockId, n_bits: u32) -> Header {
         let zero32 = Digest32::zero();
@@ -493,7 +447,7 @@ mod tests {
     #[test]
     fn restored_light_chain_fails_closed_when_difficulty_context_is_absent() {
         let dir = tempfile::tempdir().expect("temporary store directory");
-        let store = RedbModifierStore::new(&dir.path().join("modifiers.redb"))
+        let store = RedbModifierStore::new(&dir.path().join("modifiers.redb"), TEST_CACHE_BYTES)
             .expect("open modifier store");
         let suffix_head_id = BlockId(Digest32::from([0x37; 32]));
         let mut chain = HeaderChain::restore(ChainConfig::testnet(), [(375, suffix_head_id)])
@@ -508,7 +462,7 @@ mod tests {
     #[test]
     fn restored_light_chain_fails_closed_when_difficulty_context_is_corrupt() {
         let dir = tempfile::tempdir().expect("temporary store directory");
-        let store = RedbModifierStore::new(&dir.path().join("modifiers.redb"))
+        let store = RedbModifierStore::new(&dir.path().join("modifiers.redb"), TEST_CACHE_BYTES)
             .expect("open modifier store");
         store
             .chain_meta_put(enr_chain::NIPOPOW_DIFFICULTY_CONTEXT_META_KEY, b"corrupt")
@@ -526,7 +480,7 @@ mod tests {
     #[test]
     fn restored_full_chain_does_not_require_nipopow_context() {
         let dir = tempfile::tempdir().expect("temporary store directory");
-        let store = RedbModifierStore::new(&dir.path().join("modifiers.redb"))
+        let store = RedbModifierStore::new(&dir.path().join("modifiers.redb"), TEST_CACHE_BYTES)
             .expect("open modifier store");
         store
             .chain_meta_put(
@@ -547,7 +501,7 @@ mod tests {
     async fn continuous_install_persists_and_restores_bound_difficulty_context() {
         let dir = tempfile::tempdir().expect("temporary store directory");
         let store = Arc::new(
-            RedbModifierStore::new(&dir.path().join("modifiers.redb"))
+            RedbModifierStore::new(&dir.path().join("modifiers.redb"), TEST_CACHE_BYTES)
                 .expect("open modifier store"),
         );
         let config = ChainConfig::testnet();

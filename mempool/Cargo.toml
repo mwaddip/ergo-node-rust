@@ -1,6 +1,6 @@
 [package]
 name = "ergo-mempool"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "In-memory transaction pool for the Ergo Rust node"

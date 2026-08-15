@@ -92,7 +92,13 @@ async fn discover_snapshot<T: SyncTransport, C: SyncChain>(
     let (code, body) = SnapshotMessage::GetSnapshotsInfo.encode();
     for &peer in &peers {
         if let Err(e) = transport
-            .send_to(peer, ProtocolMessage::Unknown { code, body: body.clone() })
+            .send_to(
+                peer,
+                ProtocolMessage::Unknown {
+                    code,
+                    body: body.clone(),
+                },
+            )
             .await
         {
             tracing::warn!(%peer, "failed to send GetSnapshotsInfo: {e}");
@@ -115,7 +121,11 @@ async fn discover_snapshot<T: SyncTransport, C: SyncChain>(
 
         if let ProtocolEvent::Message {
             peer_id,
-            message: ProtocolMessage::Unknown { code: SNAPSHOTS_INFO, body },
+            message:
+                ProtocolMessage::Unknown {
+                    code: SNAPSHOTS_INFO,
+                    body,
+                },
         } = event
         {
             if let Ok(SnapshotMessage::SnapshotsInfo(entries)) =
@@ -167,7 +177,13 @@ async fn download_manifest<T: SyncTransport>(
 
     for &peer in &snapshot.peers {
         if let Err(e) = transport
-            .send_to(peer, ProtocolMessage::Unknown { code, body: body.clone() })
+            .send_to(
+                peer,
+                ProtocolMessage::Unknown {
+                    code,
+                    body: body.clone(),
+                },
+            )
             .await
         {
             tracing::warn!(%peer, "failed to send GetManifest: {e}");
@@ -180,7 +196,11 @@ async fn download_manifest<T: SyncTransport>(
 
             match event {
                 Ok(Some(ProtocolEvent::Message {
-                    message: ProtocolMessage::Unknown { code: MANIFEST, body },
+                    message:
+                        ProtocolMessage::Unknown {
+                            code: MANIFEST,
+                            body,
+                        },
                     ..
                 })) => {
                     if let Ok(SnapshotMessage::Manifest(data)) =
@@ -286,7 +306,7 @@ async fn download_chunks<T: SyncTransport>(
             }
             Ok(Some(_)) => {} // other message type, ignore
             Ok(None) => return Err(SnapshotError::StreamClosed),
-            Err(_) => {}      // poll timeout, check for stale requests
+            Err(_) => {} // poll timeout, check for stale requests
         }
 
         // Re-queue timed-out requests
@@ -354,8 +374,7 @@ pub async fn run_snapshot_sync<T: SyncTransport, C: SyncChain>(
     config: &SnapshotConfig,
 ) -> Result<SnapshotData, SnapshotError> {
     let download_path = config.data_dir.join("snapshot_download.redb");
-    let chunk_timeout =
-        Duration::from_secs(config.chunk_timeout_multiplier as u64 * 10);
+    let chunk_timeout = Duration::from_secs(config.chunk_timeout_multiplier as u64 * 10);
 
     // ── Crash recovery: check for interrupted download ──────────────────
     if download_path.exists() {
@@ -385,8 +404,7 @@ pub async fn run_snapshot_sync<T: SyncTransport, C: SyncChain>(
                     store.total_chunks()
                 );
                 let peers = transport.outbound_peers().await;
-                download_chunks(transport, &store, &subtree_ids, &peers, chunk_timeout)
-                    .await?;
+                download_chunks(transport, &store, &subtree_ids, &peers, chunk_timeout).await?;
                 let data = assemble_snapshot(&manifest_bytes, &store, height)?;
                 ChunkDownloadStore::cleanup(&download_path).ok();
                 return Ok(data);
@@ -413,8 +431,7 @@ pub async fn run_snapshot_sync<T: SyncTransport, C: SyncChain>(
     );
 
     // ── Download manifest ───────────────────────────────────────────────
-    let manifest_bytes =
-        download_manifest(transport, &snapshot, Duration::from_secs(30)).await?;
+    let manifest_bytes = download_manifest(transport, &snapshot, Duration::from_secs(30)).await?;
     tracing::info!("manifest downloaded: {} bytes", manifest_bytes.len());
 
     let subtree_ids = extract_subtree_ids(&manifest_bytes, 32)?;

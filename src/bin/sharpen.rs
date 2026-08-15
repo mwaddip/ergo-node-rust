@@ -16,25 +16,18 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use enr_chain::{
-    AD_PROOFS_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, EXTENSION_TYPE_ID, HEADER_TYPE_ID,
-};
-use ergo_avltree_rust::versioned_avl_storage::VersionedAVLStorage;
+use enr_chain::{AD_PROOFS_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, EXTENSION_TYPE_ID, HEADER_TYPE_ID};
 use enr_state::{AVLTreeParams, CacheSize, RedbAVLStorage};
+use ergo_avltree_rust::versioned_avl_storage::VersionedAVLStorage;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use sigma_ser::ScorexSerializable;
 
 // Must match store/src/redb.rs — sharpen opens the DB directly.
-const PRIMARY: TableDefinition<(u8, [u8; 32]), &[u8]> =
-    TableDefinition::new("primary");
-const HEIGHT_INDEX: TableDefinition<(u8, u32), [u8; 32]> =
-    TableDefinition::new("height_index");
-const HEADER_FORKS: TableDefinition<(u32, u32), [u8; 32]> =
-    TableDefinition::new("header_forks");
-const HEADER_SCORES: TableDefinition<[u8; 32], &[u8]> =
-    TableDefinition::new("header_scores");
-const BEST_CHAIN: TableDefinition<u32, [u8; 32]> =
-    TableDefinition::new("best_chain");
+const PRIMARY: TableDefinition<(u8, [u8; 32]), &[u8]> = TableDefinition::new("primary");
+const HEIGHT_INDEX: TableDefinition<(u8, u32), [u8; 32]> = TableDefinition::new("height_index");
+const HEADER_FORKS: TableDefinition<(u32, u32), [u8; 32]> = TableDefinition::new("header_forks");
+const HEADER_SCORES: TableDefinition<[u8; 32], &[u8]> = TableDefinition::new("header_scores");
+const BEST_CHAIN: TableDefinition<u32, [u8; 32]> = TableDefinition::new("best_chain");
 
 /// Cut the node's chain tip off above a given height.
 ///
@@ -137,11 +130,8 @@ fn main() -> Result<()> {
     //    and best-chain entries above target.
     print!("truncating modifiers.redb ... ");
     let modifiers = Database::open(&modifiers_path)?;
-    let (headers_deleted, sections_deleted) =
-        truncate_modifiers(&modifiers, target, current_tip)?;
-    println!(
-        "done ({headers_deleted} headers + forks, {sections_deleted} block sections)"
-    );
+    let (headers_deleted, sections_deleted) = truncate_modifiers(&modifiers, target, current_tip)?;
+    println!("done ({headers_deleted} headers + forks, {sections_deleted} block sections)");
 
     // 3. Optional: truncate indexer SQLite DB above target. Uses the same
     //    cascade as the indexer's internal rollback_to().
@@ -200,10 +190,7 @@ fn load_best_tip_height(db: &Database) -> Result<Option<u32>> {
 }
 
 /// Read and parse the header at a given height (from the best chain).
-fn read_header(
-    db: &Database,
-    height: u32,
-) -> Result<Option<ergo_chain_types::Header>> {
+fn read_header(db: &Database, height: u32) -> Result<Option<ergo_chain_types::Header>> {
     let read_txn = db.begin_read()?;
     let best = read_txn.open_table(BEST_CHAIN)?;
     let id = match best.get(height)? {
@@ -216,18 +203,14 @@ fn read_header(
         .context("header ID in BEST_CHAIN but not in PRIMARY")?
         .value()
         .to_vec();
-    let header = ergo_chain_types::Header::scorex_parse_bytes(&raw)
-        .context("header parse failed")?;
+    let header =
+        ergo_chain_types::Header::scorex_parse_bytes(&raw).context("header parse failed")?;
     Ok(Some(header))
 }
 
 /// Delete all data at heights > target. Returns (header-like entries
 /// removed, block-section entries removed).
-fn truncate_modifiers(
-    db: &Database,
-    target: u32,
-    current_tip: u32,
-) -> Result<(usize, usize)> {
+fn truncate_modifiers(db: &Database, target: u32, current_tip: u32) -> Result<(usize, usize)> {
     // First pass: collect everything we need to delete. Can't iterate
     // and delete in the same pass because redb tables are borrowed
     // mutably for deletion.
@@ -254,12 +237,8 @@ fn truncate_modifiers(
                 // Derive the section IDs the header announces so we can
                 // delete PRIMARY[(type_id, derived_id)] entries too.
                 if let Some(raw) = primary.get((HEADER_TYPE_ID, id))? {
-                    if let Ok(header) =
-                        ergo_chain_types::Header::scorex_parse_bytes(raw.value())
-                    {
-                        for (type_id, derived_id) in
-                            required_section_ids(&header)
-                        {
+                    if let Ok(header) = ergo_chain_types::Header::scorex_parse_bytes(raw.value()) {
+                        for (type_id, derived_id) in required_section_ids(&header) {
                             section_keys_to_delete.push((type_id, derived_id));
                         }
                     }
@@ -328,9 +307,7 @@ fn truncate_modifiers(
 
 /// Compute the (type_id, id) keys for block sections of a given header.
 /// Mirrors chain/src/section.rs::section_ids.
-fn required_section_ids(
-    header: &ergo_chain_types::Header,
-) -> [(u8, [u8; 32]); 3] {
+fn required_section_ids(header: &ergo_chain_types::Header) -> [(u8, [u8; 32]); 3] {
     [
         (
             BLOCK_TRANSACTIONS_TYPE_ID,
@@ -342,29 +319,17 @@ fn required_section_ids(
         ),
         (
             AD_PROOFS_TYPE_ID,
-            prefixed_hash(
-                AD_PROOFS_TYPE_ID,
-                &header.id.0 .0,
-                &header.ad_proofs_root.0,
-            ),
+            prefixed_hash(AD_PROOFS_TYPE_ID, &header.id.0 .0, &header.ad_proofs_root.0),
         ),
         (
             EXTENSION_TYPE_ID,
-            prefixed_hash(
-                EXTENSION_TYPE_ID,
-                &header.id.0 .0,
-                &header.extension_root.0,
-            ),
+            prefixed_hash(EXTENSION_TYPE_ID, &header.id.0 .0, &header.extension_root.0),
         ),
     ]
 }
 
 /// `Blake2b256(prefix || data1 || data2)` — Scorex `Algos.hash.prefixedHash`.
-fn prefixed_hash(
-    prefix: u8,
-    data1: &[u8; 32],
-    data2: &[u8; 32],
-) -> [u8; 32] {
+fn prefixed_hash(prefix: u8, data1: &[u8; 32], data2: &[u8; 32]) -> [u8; 32] {
     let mut buf = Vec::with_capacity(1 + 32 + 32);
     buf.push(prefix);
     buf.extend_from_slice(data1);

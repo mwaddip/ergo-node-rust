@@ -23,17 +23,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ergo_chain_types::{BlockId, Digest32};
 use enr_p2p::blacklist::Blacklist;
 use enr_p2p::protocol::counters::TrafficCounters;
 use enr_p2p::transport::connection::Connection;
 use enr_p2p::transport::frame::Frame;
 use enr_p2p::transport::handshake::{HandshakeConfig, ModeConfig};
 use enr_p2p::types::{Network, ProxyMode, Version};
+use ergo_chain_types::{BlockId, Digest32};
 
-use ergo_node_rust::nipopow_serve::{
-    parse_nipopow_proof, GET_NIPOPOW_PROOF, NIPOPOW_PROOF,
-};
+use ergo_node_rust::nipopow_serve::{parse_nipopow_proof, GET_NIPOPOW_PROOF, NIPOPOW_PROOF};
 
 use sigma_ser::vlq_encode::WriteSigmaVlqExt;
 
@@ -100,10 +98,13 @@ async fn nipopow_serve_round_trip_against_running_node() {
     let network = Network::Testnet;
 
     eprintln!("connecting to {addr}");
-    let stream = timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS), TcpStream::connect(addr))
-        .await
-        .expect("connect timed out")
-        .expect("tcp connect failed");
+    let stream = timeout(
+        Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        TcpStream::connect(addr),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("tcp connect failed");
 
     let hs_config = HandshakeConfig {
         agent_name: "ergo-rust-test-client".into(),
@@ -147,10 +148,16 @@ async fn nipopow_serve_round_trip_against_running_node() {
     body.extend_from_slice(&anchor.0 .0);
     body.put_u16(0).expect("vec write"); // pad_len = 0
 
-    eprintln!("sending GetNipopowProof code={GET_NIPOPOW_PROOF} body_len={}", body.len());
-    conn.write_frame(&Frame { code: GET_NIPOPOW_PROOF, body })
-        .await
-        .expect("write frame failed");
+    eprintln!(
+        "sending GetNipopowProof code={GET_NIPOPOW_PROOF} body_len={}",
+        body.len()
+    );
+    conn.write_frame(&Frame {
+        code: GET_NIPOPOW_PROOF,
+        body,
+    })
+    .await
+    .expect("write frame failed");
 
     // Read frames until we see code 91 NipopowProof or time out. The peer
     // may interleave SyncInfo, Inv, and other messages — ignore them.
@@ -160,10 +167,13 @@ async fn nipopow_serve_round_trip_against_running_node() {
                 .read_frame(&Blacklist::new())
                 .await
                 .expect("read frame failed");
-            eprintln!("received frame code={} body_len={}", frame.code, frame.body.len());
+            eprintln!(
+                "received frame code={} body_len={}",
+                frame.code,
+                frame.body.len()
+            );
             if frame.code == NIPOPOW_PROOF {
-                return parse_nipopow_proof(&frame.body)
-                    .expect("parse_nipopow_proof failed");
+                return parse_nipopow_proof(&frame.body).expect("parse_nipopow_proof failed");
             }
         }
     })
@@ -222,10 +232,13 @@ async fn nipopow_serve_full_chain_round_trip() {
     let network = Network::Testnet;
 
     eprintln!("[full-chain] connecting to {addr}");
-    let stream = timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS), TcpStream::connect(addr))
-        .await
-        .expect("connect timed out")
-        .expect("tcp connect failed");
+    let stream = timeout(
+        Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        TcpStream::connect(addr),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("tcp connect failed");
 
     let hs_config = HandshakeConfig {
         agent_name: "ergo-rust-test-client".into(),
@@ -270,30 +283,29 @@ async fn nipopow_serve_full_chain_round_trip() {
         body.len()
     );
     let send_at = std::time::Instant::now();
-    conn.write_frame(&Frame { code: GET_NIPOPOW_PROOF, body })
-        .await
-        .expect("write frame failed");
+    conn.write_frame(&Frame {
+        code: GET_NIPOPOW_PROOF,
+        body,
+    })
+    .await
+    .expect("write frame failed");
 
-    let proof_bytes = timeout(
-        Duration::from_secs(FULL_CHAIN_BUILD_TIMEOUT_SECS),
-        async {
-            loop {
-                let frame = conn
-                    .read_frame(&Blacklist::new())
-                    .await
-                    .expect("read frame failed");
-                eprintln!(
-                    "[full-chain] received frame code={} body_len={}",
-                    frame.code,
-                    frame.body.len()
-                );
-                if frame.code == NIPOPOW_PROOF {
-                    return parse_nipopow_proof(&frame.body)
-                        .expect("parse_nipopow_proof failed");
-                }
+    let proof_bytes = timeout(Duration::from_secs(FULL_CHAIN_BUILD_TIMEOUT_SECS), async {
+        loop {
+            let frame = conn
+                .read_frame(&Blacklist::new())
+                .await
+                .expect("read frame failed");
+            eprintln!(
+                "[full-chain] received frame code={} body_len={}",
+                frame.code,
+                frame.body.len()
+            );
+            if frame.code == NIPOPOW_PROOF {
+                return parse_nipopow_proof(&frame.body).expect("parse_nipopow_proof failed");
             }
-        },
-    )
+        }
+    })
     .await
     .expect("full-chain build timed out — perf regression?");
     let elapsed = send_at.elapsed();
@@ -353,13 +365,18 @@ async fn nipopow_serve_full_chain_round_trip() {
 #[ignore = "requires a running ergo-node-rust on NIPOPOW_TARGET (default 127.0.0.1:9030)"]
 async fn nipopow_serve_no_anchor_repro() {
     let target = env::var("NIPOPOW_TARGET").unwrap_or_else(|_| DEFAULT_TARGET.to_string());
-    let addr: SocketAddr = target.parse().expect("NIPOPOW_TARGET must be a valid SocketAddr");
+    let addr: SocketAddr = target
+        .parse()
+        .expect("NIPOPOW_TARGET must be a valid SocketAddr");
 
     eprintln!("[no-anchor] connecting to {addr}");
-    let stream = timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS), TcpStream::connect(addr))
-        .await
-        .expect("connect timed out")
-        .expect("tcp connect failed");
+    let stream = timeout(
+        Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        TcpStream::connect(addr),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("tcp connect failed");
 
     let hs_config = HandshakeConfig {
         agent_name: "ergo-rust-test-client".into(),
@@ -383,13 +400,19 @@ async fn nipopow_serve_no_anchor_repro() {
     body.push(0); // header_id_present = 0
     body.put_u16(0).expect("vec write"); // pad_len = 0
 
-    conn.write_frame(&Frame { code: GET_NIPOPOW_PROOF, body })
-        .await
-        .expect("write frame failed");
+    conn.write_frame(&Frame {
+        code: GET_NIPOPOW_PROOF,
+        body,
+    })
+    .await
+    .expect("write frame failed");
 
     let proof_bytes = timeout(Duration::from_secs(FULL_CHAIN_BUILD_TIMEOUT_SECS), async {
         loop {
-            let frame = conn.read_frame(&Blacklist::new()).await.expect("read frame failed");
+            let frame = conn
+                .read_frame(&Blacklist::new())
+                .await
+                .expect("read frame failed");
             if frame.code == NIPOPOW_PROOF {
                 return parse_nipopow_proof(&frame.body).expect("parse_nipopow_proof failed");
             }

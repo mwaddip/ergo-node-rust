@@ -108,11 +108,17 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
-    fn new(buf: &'a [u8]) -> Self { Self { buf, pos: 0 } }
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
         if self.pos + n > self.buf.len() {
-            return Err(format!("short read: want {} have {}", n, self.buf.len() - self.pos));
+            return Err(format!(
+                "short read: want {} have {}",
+                n,
+                self.buf.len() - self.pos
+            ));
         }
         let s = &self.buf[self.pos..self.pos + n];
         self.pos += n;
@@ -157,10 +163,7 @@ mod tests {
             agent_name: "ergoref".to_string(),
             node_name: "test-node".to_string(),
             version: (5, 0, 25),
-            features: vec![
-                (16, vec![0xaa, 0xbb]),
-                (3, vec![0x01, 0x00, 0x02, 0x04]),
-            ],
+            features: vec![(16, vec![0xaa, 0xbb]), (3, vec![0x01, 0x00, 0x02, 0x04])],
         }
     }
 

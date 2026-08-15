@@ -80,7 +80,10 @@ impl UndoRecord {
             let label = read_digest(&mut pos)?;
             let packed_len = read_u32(&mut pos)? as usize;
             if pos + packed_len > data.len() {
-                bail!("undo record truncated reading packed bytes at offset {}", pos);
+                bail!(
+                    "undo record truncated reading packed bytes at offset {}",
+                    pos
+                );
             }
             let packed = Bytes::copy_from_slice(&data[pos..pos + packed_len]);
             pos += packed_len;
@@ -99,7 +102,10 @@ impl UndoRecord {
         let prev_top_node_height = read_u32(&mut pos)?;
         let version_len = read_u32(&mut pos)? as usize;
         if pos + version_len > data.len() {
-            bail!("undo record truncated reading prev_version at offset {}", pos);
+            bail!(
+                "undo record truncated reading prev_version at offset {}",
+                pos
+            );
         }
         let prev_version = Bytes::copy_from_slice(&data[pos..pos + version_len]);
         pos += version_len;

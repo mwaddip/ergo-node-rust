@@ -1,12 +1,17 @@
 [package]
 name = "enr-store"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Persistent modifier storage for ergo-node-rust"
 
 [dependencies]
 parking_lot = "0.12"
-redb = "4"
+# cache_metrics is REQUIRED, not optional tuning: without it cache_stats()
+# returns zeros and /debug/memory would confidently report an empty cache for
+# the largest consumer during sync. Declared per-crate rather than only at the
+# workspace root so `cargo test -p <crate>` — which does not build the root
+# crate — still collects them.
+redb = { version = "4", features = ["cache_metrics"] }
 tracing = "0.1"
 
 [dev-dependencies]

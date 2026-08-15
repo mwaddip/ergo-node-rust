@@ -102,10 +102,18 @@ fn empty_proof_input_contributes_nothing() {
     // The emission tx's input spends the emission box with ProofBytes::Empty.
     let emission_box = mainnet_emission_box();
     let miner_pk = test_miner_pk();
-    let tx = build_emission_tx(&emission_box, 1, &miner_pk, 720, &ReemissionRules::mainnet())
-        .unwrap();
+    let tx = build_emission_tx(
+        &emission_box,
+        1,
+        &miner_pk,
+        720,
+        &ReemissionRules::mainnet(),
+    )
+    .unwrap();
     assert!(
-        tx.inputs.iter().all(|i| i.spending_proof.proof.as_ref().is_empty()),
+        tx.inputs
+            .iter()
+            .all(|i| i.spending_proof.proof.as_ref().is_empty()),
         "test premise: emission tx inputs carry empty proofs"
     );
 
@@ -131,10 +139,8 @@ fn empty_tx_list_is_an_error() {
 
 fn test_miner_pk() -> ProveDlog {
     let bytes =
-        hex::decode("039bb5fe52359a64c99a60fd944fc5e388cbdc4d37ff091cc841c3ee79060b8647")
-            .unwrap();
-    let point =
-        ergo_chain_types::EcPoint::sigma_parse_bytes(&bytes).unwrap();
+        hex::decode("039bb5fe52359a64c99a60fd944fc5e388cbdc4d37ff091cc841c3ee79060b8647").unwrap();
+    let point = ergo_chain_types::EcPoint::sigma_parse_bytes(&bytes).unwrap();
     ProveDlog::new(point)
 }
 

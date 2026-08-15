@@ -431,8 +431,7 @@ impl<'a> PopowHeaderReader for ChainPopowReader<'a> {
         // h >= 2: load real extension bytes, unpack canonical interlinks.
         let loader = self.chain.extension_loader()?;
         let ext_bytes = loader(height)?;
-        let (parsed_header_id, fields) =
-            crate::voting::parse_extension_bytes(&ext_bytes).ok()?;
+        let (parsed_header_id, fields) = crate::voting::parse_extension_bytes(&ext_bytes).ok()?;
         // The loader is not trusted to return matching data: an upstream
         // backward-walk recovery (e.g., enr-store papering over BEST_CHAIN
         // holes) can return extension bytes for a different block at the
@@ -508,9 +507,7 @@ pub fn build_nipopow_proof(
         return Err(ChainError::Nipopow("m and k must be >= 1".into()));
     }
     if m > MAX_M_K || k > MAX_M_K {
-        return Err(ChainError::Nipopow(format!(
-            "m and k must be <= {MAX_M_K}"
-        )));
+        return Err(ChainError::Nipopow(format!("m and k must be <= {MAX_M_K}")));
     }
 
     // The reader's h>=2 path delegates to the loader, so it must be wired.
@@ -590,9 +587,7 @@ pub fn popow_header_by_id(
     // here it's a real failure (missing extension, parse error, etc).
     let reader = ChainPopowReader { chain };
     let popow_header = reader.popow_header_by_id(id).ok_or_else(|| {
-        ChainError::Nipopow(format!(
-            "failed to construct PoPowHeader for {id:?}"
-        ))
+        ChainError::Nipopow(format!("failed to construct PoPowHeader for {id:?}"))
     })?;
 
     let bytes = popow_header
@@ -916,7 +911,10 @@ mod tests {
     /// whose loader returns `None` for h=1 — used to verify that
     /// `build_nipopow_proof` synthesizes the genesis `PoPowHeader` in-process
     /// rather than querying the loader.
-    fn build_chain_with_interlinks_opts(count: u32, include_genesis_in_loader: bool) -> HeaderChain {
+    fn build_chain_with_interlinks_opts(
+        count: u32,
+        include_genesis_in_loader: bool,
+    ) -> HeaderChain {
         let config = ChainConfig::testnet();
         let mut chain = HeaderChain::new(config.clone());
         let n_bits = config.initial_n_bits;
@@ -925,14 +923,12 @@ mod tests {
         // root and the next block's interlinks commit to prior header ids.
         let mut headers: Vec<Header> = Vec::with_capacity(count as usize);
         let mut interlinks: Vec<BlockId> = Vec::new();
-        let mut store: std::collections::HashMap<u32, Vec<u8>> =
-            std::collections::HashMap::new();
+        let mut store: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
         let mut prev_id = BlockId(Digest32::zero());
         for h in 1..=count {
             if let Some(previous_header) = headers.last() {
-                interlinks =
-                    NipopowAlgos::update_interlinks(previous_header.clone(), interlinks)
-                        .expect("update_interlinks");
+                interlinks = NipopowAlgos::update_interlinks(previous_header.clone(), interlinks)
+                    .expect("update_interlinks");
             }
 
             let mut fields = if h == 1 {
@@ -969,9 +965,7 @@ mod tests {
 
         // Wire loader.
         let store_arc = Arc::new(Mutex::new(store));
-        chain.set_extension_loader(move |height| {
-            store_arc.lock().unwrap().get(&height).cloned()
-        });
+        chain.set_extension_loader(move |height| store_arc.lock().unwrap().get(&height).cloned());
 
         chain
     }
@@ -1016,12 +1010,7 @@ mod tests {
         let n_bits = chain.config().initial_n_bits;
         let mut prev = BlockId(Digest32::zero());
         for h in 1..=10 {
-            let hdr = make_synthetic_header(
-                h,
-                prev,
-                1_000_000 + (h as u64 - 1) * 45_000,
-                n_bits,
-            );
+            let hdr = make_synthetic_header(h, prev, 1_000_000 + (h as u64 - 1) * 45_000, n_bits);
             prev = hdr.id;
             chain.try_append_no_pow(hdr).unwrap();
         }
@@ -1448,12 +1437,7 @@ mod tests {
         // Build a small chain.
         let mut prev = BlockId(Digest32::zero());
         for h in 1..=5u32 {
-            let hdr = make_synthetic_header(
-                h,
-                prev,
-                1_000_000 + (h as u64 - 1) * 45_000,
-                n_bits,
-            );
+            let hdr = make_synthetic_header(h, prev, 1_000_000 + (h as u64 - 1) * 45_000, n_bits);
             prev = hdr.id;
             chain.try_append_no_pow(hdr).expect("append");
         }
@@ -1473,13 +1457,10 @@ mod tests {
         let bogus_fields = NipopowAlgos::pack_interlinks(vec![bogus_id]);
         let bogus_bytes = pack_extension_bytes(&bogus_id, &bogus_fields);
 
-        let mut store: std::collections::HashMap<u32, Vec<u8>> =
-            std::collections::HashMap::new();
+        let mut store: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
         store.insert(3u32, bogus_bytes);
         let store_arc = Arc::new(Mutex::new(store));
-        chain.set_extension_loader(move |height| {
-            store_arc.lock().unwrap().get(&height).cloned()
-        });
+        chain.set_extension_loader(move |height| store_arc.lock().unwrap().get(&height).cloned());
 
         let reader = ChainPopowReader { chain: &chain };
         let result = reader.popow_header_at_height(3);
@@ -1521,12 +1502,8 @@ mod tests {
         let mut headers: Vec<Header> = Vec::with_capacity(count as usize);
         let mut prev_id = BlockId(Digest32::zero());
         for h in 1..=count {
-            let header = make_synthetic_header(
-                h,
-                prev_id,
-                1_000_000 + (h as u64 - 1) * 45_000,
-                n_bits,
-            );
+            let header =
+                make_synthetic_header(h, prev_id, 1_000_000 + (h as u64 - 1) * 45_000, n_bits);
             prev_id = header.id;
             headers.push(header);
         }
@@ -1551,8 +1528,7 @@ mod tests {
         // are well-formed and parse cleanly through `parse_extension_bytes`
         // — they just don't match the header at the queried height. This
         // models enr-store returning a stale entry for a missing modifier.
-        let mut store: std::collections::HashMap<u32, Vec<u8>> =
-            std::collections::HashMap::new();
+        let mut store: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
         for (idx, h) in headers.iter().enumerate() {
             let bytes = if h.height >= 16 && h.height <= 48 && idx >= 4 {
                 let src_idx = idx - 4;
@@ -1570,9 +1546,7 @@ mod tests {
         }
 
         let store_arc = Arc::new(Mutex::new(store));
-        chain.set_extension_loader(move |height| {
-            store_arc.lock().unwrap().get(&height).cloned()
-        });
+        chain.set_extension_loader(move |height| store_arc.lock().unwrap().get(&height).cloned());
 
         // Build with both anchor variants: `None` (uses last_headers) and
         // an explicit deep anchor (uses popow_header_by_id directly). The

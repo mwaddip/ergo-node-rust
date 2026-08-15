@@ -173,7 +173,11 @@ pub fn check_parameters_v6(
     // mainnet block 1,629,184 where the block's ID 124 (6 bytes, empty
     // statusUpdates) differs from the previous boundary's 18 bytes, yet
     // JVM v6.0.3 accepts the chain.
-    let _ = (block_version, expected_proposed_update, parsed_proposed_update);
+    let _ = (
+        block_version,
+        expected_proposed_update,
+        parsed_proposed_update,
+    );
 
     Ok(())
 }
@@ -236,9 +240,7 @@ pub fn pack_parameters(params: &Parameters) -> Vec<([u8; 2], Vec<u8>)> {
     let mut entries: Vec<(i8, i32)> = params
         .parameters_table
         .iter()
-        .filter_map(|(param, value)| {
-            parameter_to_signed_id(*param).map(|id| (id, *value))
-        })
+        .filter_map(|(param, value)| parameter_to_signed_id(*param).map(|id| (id, *value)))
         .collect();
 
     entries.sort_by_key(|(id, _)| *id);
@@ -373,11 +375,15 @@ mod tests {
         ]);
         let params = parse_parameters_from_extension(&ext).unwrap();
         assert_eq!(
-            params.parameters_table.get(&Parameter::SoftForkVotesCollected),
+            params
+                .parameters_table
+                .get(&Parameter::SoftForkVotesCollected),
             Some(&100)
         );
         assert_eq!(
-            params.parameters_table.get(&Parameter::SoftForkStartingHeight),
+            params
+                .parameters_table
+                .get(&Parameter::SoftForkStartingHeight),
             Some(&1024)
         );
     }
@@ -387,8 +393,12 @@ mod tests {
         let mut params = Parameters::default();
         params.parameters_table.clear();
         params.parameters_table.insert(Parameter::BlockVersion, 1);
-        params.parameters_table.insert(Parameter::StorageFeeFactor, 1_250_000);
-        params.parameters_table.insert(Parameter::MaxBlockSize, 524_288);
+        params
+            .parameters_table
+            .insert(Parameter::StorageFeeFactor, 1_250_000);
+        params
+            .parameters_table
+            .insert(Parameter::MaxBlockSize, 524_288);
 
         let fields = pack_parameters(&params);
         assert_eq!(fields.len(), 3);
@@ -402,7 +412,9 @@ mod tests {
     fn check_v6_exact_match() {
         let mut expected = Parameters::default();
         expected.parameters_table.clear();
-        expected.parameters_table.insert(Parameter::StorageFeeFactor, 1_250_000);
+        expected
+            .parameters_table
+            .insert(Parameter::StorageFeeFactor, 1_250_000);
         expected.parameters_table.insert(Parameter::BlockVersion, 4);
 
         let parsed = expected.clone();
@@ -415,11 +427,15 @@ mod tests {
         // v6 allows local to be smaller — newer protocol can introduce params.
         let mut expected = Parameters::default();
         expected.parameters_table.clear();
-        expected.parameters_table.insert(Parameter::StorageFeeFactor, 1_250_000);
+        expected
+            .parameters_table
+            .insert(Parameter::StorageFeeFactor, 1_250_000);
         expected.parameters_table.insert(Parameter::BlockVersion, 4);
 
         let mut parsed = expected.clone();
-        parsed.parameters_table.insert(Parameter::MaxBlockSize, 524_288);
+        parsed
+            .parameters_table
+            .insert(Parameter::MaxBlockSize, 524_288);
 
         assert!(check_parameters_v6(&expected, &parsed, 128, 1, &[], &[]).is_ok());
     }
@@ -430,13 +446,19 @@ mod tests {
         // parameter we expected — consensus failure.
         let mut expected = Parameters::default();
         expected.parameters_table.clear();
-        expected.parameters_table.insert(Parameter::StorageFeeFactor, 1_250_000);
+        expected
+            .parameters_table
+            .insert(Parameter::StorageFeeFactor, 1_250_000);
         expected.parameters_table.insert(Parameter::BlockVersion, 4);
-        expected.parameters_table.insert(Parameter::MaxBlockSize, 524_288);
+        expected
+            .parameters_table
+            .insert(Parameter::MaxBlockSize, 524_288);
 
         let mut parsed = Parameters::default();
         parsed.parameters_table.clear();
-        parsed.parameters_table.insert(Parameter::StorageFeeFactor, 1_250_000);
+        parsed
+            .parameters_table
+            .insert(Parameter::StorageFeeFactor, 1_250_000);
         parsed.parameters_table.insert(Parameter::BlockVersion, 4);
 
         let err = check_parameters_v6(&expected, &parsed, 128, 1, &[], &[]).unwrap_err();
@@ -467,7 +489,9 @@ mod tests {
 
         let mut parsed = Parameters::default();
         parsed.parameters_table.clear();
-        parsed.parameters_table.insert(Parameter::StorageFeeFactor, 1_250_000);
+        parsed
+            .parameters_table
+            .insert(Parameter::StorageFeeFactor, 1_250_000);
 
         let err = check_parameters_v6(&expected, &parsed, 128, 1, &[], &[]).unwrap_err();
         assert!(matches!(err, ValidationError::ParameterMismatch { .. }));
@@ -485,7 +509,12 @@ mod tests {
         params.parameters_table.clear();
         params.parameters_table.insert(Parameter::BlockVersion, 4);
         assert!(check_parameters_v6(
-            &params, &params, 1_629_184, 4, &[0x00, 0x00], &[0x02, 0xd7, 0x01],
+            &params,
+            &params,
+            1_629_184,
+            4,
+            &[0x00, 0x00],
+            &[0x02, 0xd7, 0x01],
         )
         .is_ok());
     }
@@ -498,7 +527,12 @@ mod tests {
         params.parameters_table.clear();
         params.parameters_table.insert(Parameter::BlockVersion, 3);
         assert!(check_parameters_v6(
-            &params, &params, 1024, 3, &[0x00, 0x00], &[0x02, 0xd7, 0x01],
+            &params,
+            &params,
+            1024,
+            3,
+            &[0x00, 0x00],
+            &[0x02, 0xd7, 0x01],
         )
         .is_ok());
     }
@@ -556,9 +590,15 @@ mod tests {
     fn round_trip_parse_pack() {
         let mut original = Parameters::default();
         original.parameters_table.clear();
-        original.parameters_table.insert(Parameter::StorageFeeFactor, 1_250_000);
-        original.parameters_table.insert(Parameter::MaxBlockSize, 524_288);
-        original.parameters_table.insert(Parameter::MaxBlockCost, 1_000_000);
+        original
+            .parameters_table
+            .insert(Parameter::StorageFeeFactor, 1_250_000);
+        original
+            .parameters_table
+            .insert(Parameter::MaxBlockSize, 524_288);
+        original
+            .parameters_table
+            .insert(Parameter::MaxBlockCost, 1_000_000);
         original.parameters_table.insert(Parameter::BlockVersion, 4);
 
         let packed = pack_parameters(&original);
@@ -569,7 +609,10 @@ mod tests {
         let ext = make_extension(fields);
         let parsed = parse_parameters_from_extension(&ext).unwrap();
 
-        assert_eq!(parsed.parameters_table.len(), original.parameters_table.len());
+        assert_eq!(
+            parsed.parameters_table.len(),
+            original.parameters_table.len()
+        );
         for (k, v) in original.parameters_table.iter() {
             assert_eq!(parsed.parameters_table.get(k), Some(v));
         }

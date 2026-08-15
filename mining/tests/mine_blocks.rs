@@ -9,15 +9,16 @@ use std::time::Duration;
 use ergo_chain_types::{
     ADDigest, AutolykosSolution, BlockId, Digest, Digest32, EcPoint, Header, Votes,
 };
-use tracing_test::traced_test;
 use ergo_lib::chain::emission::{EmissionRules, MonetarySettings};
 use ergo_lib::chain::genesis;
+use ergo_lib::chain::parameters::Parameters;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
 use ergo_mining::emission::{build_emission_tx, ReemissionRules};
 use ergo_mining::solution::validate_solution;
 use ergo_mining::types::*;
 use ergo_mining::{MiningError, ValidatorProofsResult};
+use tracing_test::traced_test;
 
 /// Initial difficulty for testnet/mainnet — decodes to 1.
 /// Target = order / 1 ≈ 2^256, so any nonce is valid.
@@ -113,8 +114,7 @@ fn cpu_mine(candidate: &CandidateBlock, max_attempts: u64) -> Result<Header, Str
 fn build_emission_tx_produces_valid_structure() {
     let settings = MonetarySettings::default();
     let pks = founder_pks();
-    let (emission_box, _, _) =
-        genesis::genesis_boxes(&settings, &pks, 2, PROOFS).unwrap();
+    let (emission_box, _, _) = genesis::genesis_boxes(&settings, &pks, 2, PROOFS).unwrap();
 
     let miner_pk = test_miner_pk();
     let reemission_rules = ReemissionRules::mainnet();
@@ -144,8 +144,7 @@ fn build_emission_tx_produces_valid_structure() {
 fn generate_candidate_and_mine_block() {
     let settings = MonetarySettings::default();
     let pks = founder_pks();
-    let (emission_box, _, _) =
-        genesis::genesis_boxes(&settings, &pks, 2, PROOFS).unwrap();
+    let (emission_box, _, _) = genesis::genesis_boxes(&settings, &pks, 2, PROOFS).unwrap();
 
     let miner_pk = test_miner_pk();
     let config = MinerConfig {
@@ -167,7 +166,7 @@ fn generate_candidate_and_mine_block() {
         };
 
     // Generate candidate for block 1
-    let (candidate, work) = ergo_mining::generate_candidate(
+    let generated = ergo_mining::generate_candidate(
         &config,
         &parent,
         INITIAL_N_BITS,
@@ -175,19 +174,48 @@ fn generate_candidate_and_mine_block() {
         &emission_box,
         None, // no boundary params (height 2 is not an epoch boundary)
         &[],  // no proposed-update payload
+        &[],  // empty mempool
+        &Parameters::default(),
+        &[], // no ancestors beyond the parent
+        &|_| None,
         &mock_proofs,
     )
     .expect("candidate generation failed");
+    let (candidate, work) = (generated.block, generated.work);
+    assert!(
+        generated.invalid_txs.is_empty(),
+        "no mempool transactions were offered, so none can be invalid"
+    );
 
     // Verify WorkMessage fields
     assert_eq!(work.h, 2, "block height should be 2 (genesis is 1)");
     assert!(!work.msg.is_empty(), "msg should be non-empty hex");
-    assert!(!work.b.is_empty(), "b (target) should be non-empty");
+    // `b` is the Autolykos TARGET (q / difficulty), never the difficulty. This
+    // was `!work.b.is_empty()` until v0.8.0, and it passed continuously while
+    // the serve path emitted "1" and no miner on earth could find a share. A
+    // correct b has a known minimum magnitude — the target only shrinks below
+    // 20 digits at a difficulty around 10^57, which no network has ever seen —
+    // so anything short here is the difficulty leaking through again, not a
+    // low-difficulty epoch. Exact values are pinned in
+    // `tests/work_message_wiring.rs` against a Scala-node vector.
+    assert!(
+        work.b.len() >= 20,
+        "b must be the target, not the difficulty: got {} digits ({})",
+        work.b.len(),
+        work.b
+    );
     assert!(!work.pk.is_empty(), "pk should be non-empty hex");
-    assert!(work.proof.is_none(), "basic candidate omits the proof (no nested msgPreimage)");
+    assert!(
+        work.proof.is_none(),
+        "basic candidate omits the proof (no nested msgPreimage)"
+    );
 
     // Verify candidate structure
-    assert_eq!(candidate.transactions.len(), 1, "should have 1 tx (emission only)");
+    assert_eq!(
+        candidate.transactions.len(),
+        1,
+        "should have 1 tx (emission only)"
+    );
     assert_eq!(candidate.version, 2);
     assert_eq!(candidate.n_bits, INITIAL_N_BITS);
     assert_eq!(candidate.votes, [0, 0, 0]);
@@ -208,8 +236,7 @@ fn generate_candidate_and_mine_block() {
 fn mine_three_consecutive_blocks() {
     let settings = MonetarySettings::default();
     let pks = founder_pks();
-    let (emission_box, _, _) =
-        genesis::genesis_boxes(&settings, &pks, 2, PROOFS).unwrap();
+    let (emission_box, _, _) = genesis::genesis_boxes(&settings, &pks, 2, PROOFS).unwrap();
 
     let miner_pk = test_miner_pk();
     let config = MinerConfig {
@@ -237,7 +264,7 @@ fn mine_three_consecutive_blocks() {
     for _ in 0..3u32 {
         let height = parent.height + 1;
 
-        let (candidate, _work) = ergo_mining::generate_candidate(
+        let candidate = ergo_mining::generate_candidate(
             &config,
             &parent,
             INITIAL_N_BITS,
@@ -245,9 +272,14 @@ fn mine_three_consecutive_blocks() {
             &current_emission_box,
             None, // no boundary params (heights 2-4 are not epoch boundaries)
             &[],  // no proposed-update payload
+            &[],  // empty mempool
+            &Parameters::default(),
+            &[], // no ancestors beyond the parent
+            &|_| None,
             &mock_proofs,
         )
-        .unwrap_or_else(|e| panic!("candidate at height {height} failed: {e}"));
+        .unwrap_or_else(|e| panic!("candidate at height {height} failed: {e}"))
+        .block;
 
         let header = cpu_mine(&candidate, 100)
             .unwrap_or_else(|e| panic!("mining block at height {height} failed: {e}"));
@@ -259,11 +291,8 @@ fn mine_three_consecutive_blocks() {
         );
 
         // Update interlinks for the next block
-        interlinks = ergo_nipopow::NipopowAlgos::update_interlinks(
-            parent.clone(),
-            interlinks,
-        )
-        .unwrap_or_else(|e| panic!("interlinks update at height {height} failed: {e}"));
+        interlinks = ergo_nipopow::NipopowAlgos::update_interlinks(parent.clone(), interlinks)
+            .unwrap_or_else(|e| panic!("interlinks update at height {height} failed: {e}"));
 
         // The emission tx is the first transaction in the candidate.
         // Its first output is the new emission box for the next block.
@@ -309,8 +338,7 @@ fn mine_three_consecutive_blocks() {
 fn mining_block_found_emits_contract_marker() {
     let settings = MonetarySettings::default();
     let pks = founder_pks();
-    let (emission_box, _, _) =
-        genesis::genesis_boxes(&settings, &pks, 2, PROOFS).unwrap();
+    let (emission_box, _, _) = genesis::genesis_boxes(&settings, &pks, 2, PROOFS).unwrap();
 
     let miner_pk = test_miner_pk();
     let config = MinerConfig {
@@ -328,7 +356,7 @@ fn mining_block_found_emits_contract_marker() {
             Some(Ok((vec![0u8; 64], ADDigest::from([0u8; 33]))))
         };
 
-    let (candidate, _work) = ergo_mining::generate_candidate(
+    let candidate = ergo_mining::generate_candidate(
         &config,
         &parent,
         INITIAL_N_BITS,
@@ -336,17 +364,18 @@ fn mining_block_found_emits_contract_marker() {
         &emission_box,
         None,
         &[],
+        &[],
+        &Parameters::default(),
+        &[],
+        &|_| None,
         &mock_proofs,
     )
-    .expect("candidate generation failed");
+    .expect("candidate generation failed")
+    .block;
 
-    let header =
-        cpu_mine(&candidate, 100).expect("mining should succeed with trivial difficulty");
+    let header = cpu_mine(&candidate, 100).expect("mining should succeed with trivial difficulty");
 
-    assert!(
-        logs_contain("mining: block found"),
-        "marker prefix missing"
-    );
+    assert!(logs_contain("mining: block found"), "marker prefix missing");
     assert!(
         logs_contain(&format!("height={}", header.height)),
         "height field missing"

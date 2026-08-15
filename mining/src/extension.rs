@@ -36,9 +36,7 @@ pub fn unpack_parent_interlinks(parent_extension_bytes: &[u8]) -> Vec<BlockId> {
     let ec = match ErgoExtensionCandidate::new(fields) {
         Ok(ec) => ec,
         Err(e) => {
-            tracing::warn!(
-                "mining: ExtensionCandidate::new failed: {e}; using empty interlinks"
-            );
+            tracing::warn!("mining: ExtensionCandidate::new failed: {e}; using empty interlinks");
             return vec![];
         }
     };

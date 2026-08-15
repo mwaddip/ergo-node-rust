@@ -64,9 +64,15 @@ pub fn validate_solution(
     };
     header.id = BlockId(Digest32::from(id_hash));
 
-    // Verify PoW using Header::check_pow() which computes:
-    //   target = order / decode_compact_bits(n_bits)
-    //   valid = pow_hit(header) < target
+    // Verify PoW using Header::check_pow() (upstream sigma-rust), which computes:
+    //   target = order / decode_compact_bits(n_bits)   [== enr_chain::pow_target]
+    //   valid  = pow_hit(header) < target
+    //
+    // That target must be the same number `build_work_message` serves as
+    // `WorkMessage.b`. It was not in v0.8.0 — the serve path sent the raw
+    // difficulty — so miners hunted a bound ~10^58 tighter than the one checked
+    // here and this branch never ran for anyone. `tests/work_message_wiring.rs`
+    // pins the two together; check_pow itself stays upstream's.
     let valid = header
         .check_pow()
         .map_err(|e| MiningError::InvalidSolution(format!("check_pow: {e}")))?;

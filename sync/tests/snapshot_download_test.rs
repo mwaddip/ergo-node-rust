@@ -18,12 +18,13 @@ fn store_and_retrieve_chunks() {
     let path = dir.path().join("test.redb");
     let manifest_id = [0x11; 32];
 
-    let store =
-        ChunkDownloadStore::create(&path, manifest_id, 100_000, b"manifest", 5).unwrap();
+    let store = ChunkDownloadStore::create(&path, manifest_id, 100_000, b"manifest", 5).unwrap();
 
     // Store three chunks.
     for i in 0..3u8 {
-        store.store_chunk(&make_chunk_id(i), &make_chunk_data(i)).unwrap();
+        store
+            .store_chunk(&make_chunk_id(i), &make_chunk_data(i))
+            .unwrap();
     }
 
     // Retrieve each and verify data.
@@ -53,8 +54,12 @@ fn crash_recovery_preserves_state() {
     {
         let store =
             ChunkDownloadStore::create(&path, manifest_id, height, manifest_bytes, total).unwrap();
-        store.store_chunk(&make_chunk_id(0), &make_chunk_data(0)).unwrap();
-        store.store_chunk(&make_chunk_id(1), &make_chunk_data(1)).unwrap();
+        store
+            .store_chunk(&make_chunk_id(0), &make_chunk_data(0))
+            .unwrap();
+        store
+            .store_chunk(&make_chunk_id(1), &make_chunk_data(1))
+            .unwrap();
         // store dropped here — simulates crash
     }
 
@@ -84,19 +89,36 @@ fn is_complete_detection() {
     let path = dir.path().join("complete.redb");
     let total = 3u32;
 
-    let store =
-        ChunkDownloadStore::create(&path, [0x33; 32], 300_000, b"m", total).unwrap();
+    let store = ChunkDownloadStore::create(&path, [0x33; 32], 300_000, b"m", total).unwrap();
 
-    assert!(!store.is_complete().unwrap(), "should not be complete with 0 chunks");
+    assert!(
+        !store.is_complete().unwrap(),
+        "should not be complete with 0 chunks"
+    );
 
-    store.store_chunk(&make_chunk_id(0), &make_chunk_data(0)).unwrap();
-    assert!(!store.is_complete().unwrap(), "should not be complete with 1/3 chunks");
+    store
+        .store_chunk(&make_chunk_id(0), &make_chunk_data(0))
+        .unwrap();
+    assert!(
+        !store.is_complete().unwrap(),
+        "should not be complete with 1/3 chunks"
+    );
 
-    store.store_chunk(&make_chunk_id(1), &make_chunk_data(1)).unwrap();
-    assert!(!store.is_complete().unwrap(), "should not be complete with 2/3 chunks");
+    store
+        .store_chunk(&make_chunk_id(1), &make_chunk_data(1))
+        .unwrap();
+    assert!(
+        !store.is_complete().unwrap(),
+        "should not be complete with 2/3 chunks"
+    );
 
-    store.store_chunk(&make_chunk_id(2), &make_chunk_data(2)).unwrap();
-    assert!(store.is_complete().unwrap(), "should be complete with 3/3 chunks");
+    store
+        .store_chunk(&make_chunk_id(2), &make_chunk_data(2))
+        .unwrap();
+    assert!(
+        store.is_complete().unwrap(),
+        "should be complete with 3/3 chunks"
+    );
 }
 
 /// stored_chunk_ids returns the correct set of IDs.
@@ -105,13 +127,14 @@ fn stored_chunk_ids_returns_correct_set() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ids.redb");
 
-    let store =
-        ChunkDownloadStore::create(&path, [0x44; 32], 400_000, b"m", 5).unwrap();
+    let store = ChunkDownloadStore::create(&path, [0x44; 32], 400_000, b"m", 5).unwrap();
 
     let expected: HashSet<[u8; 32]> = (0..3u8).map(make_chunk_id).collect();
 
     for i in 0..3u8 {
-        store.store_chunk(&make_chunk_id(i), &make_chunk_data(i)).unwrap();
+        store
+            .store_chunk(&make_chunk_id(i), &make_chunk_data(i))
+            .unwrap();
     }
 
     let ids: HashSet<[u8; 32]> = store.stored_chunk_ids().unwrap().into_iter().collect();
@@ -124,11 +147,12 @@ fn iter_chunks_returns_all() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("iter.redb");
 
-    let store =
-        ChunkDownloadStore::create(&path, [0x55; 32], 500_000, b"m", 4).unwrap();
+    let store = ChunkDownloadStore::create(&path, [0x55; 32], 500_000, b"m", 4).unwrap();
 
     for i in 0..4u8 {
-        store.store_chunk(&make_chunk_id(i), &make_chunk_data(i)).unwrap();
+        store
+            .store_chunk(&make_chunk_id(i), &make_chunk_data(i))
+            .unwrap();
     }
 
     let chunks = store.iter_chunks().unwrap();

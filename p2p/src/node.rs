@@ -1048,8 +1048,13 @@ mod tests {
     fn test_node() -> TestHarness {
         let blacklist = Arc::new(Blacklist::new());
         let peer_db = shared_peer_db(blacklist.clone());
-        let router_inner =
-            Router::with_peer_db(peer_db.clone(), blacklist.clone(), 64, Network::Mainnet, true);
+        let router_inner = Router::with_peer_db(
+            peer_db.clone(),
+            blacklist.clone(),
+            64,
+            Network::Mainnet,
+            true,
+        );
         let counters = router_inner.counters();
         let router = Arc::new(Mutex::new(router_inner));
         let peer_senders = Arc::new(Mutex::new(HashMap::new()));
@@ -1235,8 +1240,13 @@ mod tests {
     async fn subscriber_receives_events() {
         let blacklist = Arc::new(Blacklist::new());
         let peer_db = shared_peer_db(blacklist.clone());
-        let router_inner =
-            Router::with_peer_db(peer_db.clone(), blacklist.clone(), 64, Network::Mainnet, true);
+        let router_inner = Router::with_peer_db(
+            peer_db.clone(),
+            blacklist.clone(),
+            64,
+            Network::Mainnet,
+            true,
+        );
         let counters = router_inner.counters();
         let router = Arc::new(Mutex::new(router_inner));
         let peer_senders: Arc<Mutex<HashMap<PeerId, PeerSender>>> =
@@ -1324,8 +1334,13 @@ mod tests {
         // event loop with a synthetic Message event.
         let blacklist = Arc::new(Blacklist::new());
         let peer_db = shared_peer_db(blacklist.clone());
-        let router_inner =
-            Router::with_peer_db(peer_db.clone(), blacklist.clone(), 64, Network::Mainnet, true);
+        let router_inner = Router::with_peer_db(
+            peer_db.clone(),
+            blacklist.clone(),
+            64,
+            Network::Mainnet,
+            true,
+        );
         let counters = router_inner.counters();
         let router = Arc::new(Mutex::new(router_inner));
         let peer_senders: Arc<Mutex<HashMap<PeerId, PeerSender>>> =

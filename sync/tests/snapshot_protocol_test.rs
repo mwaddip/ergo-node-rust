@@ -128,11 +128,10 @@ fn reject_oversized_messages() {
 #[test]
 fn parse_real_jvm_snapshots_info() {
     let body: Vec<u8> = vec![
-        2, 254, 231, 32, 58, 66, 224, 79, 217, 75, 51, 233, 158, 23, 236, 50,
-        7, 157, 130, 232, 149, 102, 39, 253, 72, 215, 26, 124, 86, 25, 119, 45,
-        215, 94, 159, 154, 254, 233, 32, 207, 233, 138, 191, 11, 147, 60, 90, 220,
-        89, 176, 29, 171, 60, 132, 45, 179, 136, 137, 176, 241, 183, 140, 231, 224,
-        63, 174, 232, 234, 185, 200, 41,
+        2, 254, 231, 32, 58, 66, 224, 79, 217, 75, 51, 233, 158, 23, 236, 50, 7, 157, 130, 232,
+        149, 102, 39, 253, 72, 215, 26, 124, 86, 25, 119, 45, 215, 94, 159, 154, 254, 233, 32, 207,
+        233, 138, 191, 11, 147, 60, 90, 220, 89, 176, 29, 171, 60, 132, 45, 179, 136, 137, 176,
+        241, 183, 140, 231, 224, 63, 174, 232, 234, 185, 200, 41,
     ];
 
     let parsed = SnapshotMessage::parse(SNAPSHOTS_INFO, &body).unwrap();
@@ -169,12 +168,27 @@ fn parse_empty_snapshots_info() {
 /// Verify is_snapshot_code for codes 75-82.
 #[test]
 fn is_snapshot_code_range() {
-    assert!(!SnapshotMessage::is_snapshot_code(75), "75 should not be a snapshot code");
-    assert!(SnapshotMessage::is_snapshot_code(76), "76 = GetSnapshotsInfo");
+    assert!(
+        !SnapshotMessage::is_snapshot_code(75),
+        "75 should not be a snapshot code"
+    );
+    assert!(
+        SnapshotMessage::is_snapshot_code(76),
+        "76 = GetSnapshotsInfo"
+    );
     assert!(SnapshotMessage::is_snapshot_code(77), "77 = SnapshotsInfo");
     assert!(SnapshotMessage::is_snapshot_code(78), "78 = GetManifest");
     assert!(SnapshotMessage::is_snapshot_code(79), "79 = Manifest");
-    assert!(SnapshotMessage::is_snapshot_code(80), "80 = GetUtxoSnapshotChunk");
-    assert!(SnapshotMessage::is_snapshot_code(81), "81 = UtxoSnapshotChunk");
-    assert!(!SnapshotMessage::is_snapshot_code(82), "82 should not be a snapshot code");
+    assert!(
+        SnapshotMessage::is_snapshot_code(80),
+        "80 = GetUtxoSnapshotChunk"
+    );
+    assert!(
+        SnapshotMessage::is_snapshot_code(81),
+        "81 = UtxoSnapshotChunk"
+    );
+    assert!(
+        !SnapshotMessage::is_snapshot_code(82),
+        "82 should not be a snapshot code"
+    );
 }

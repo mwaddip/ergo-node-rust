@@ -436,15 +436,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam-channel"
-version = "0.5.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -640,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "enr-chain"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "ergo-chain-types",
  "ergo-lib",
@@ -656,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "enr-p2p"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "blake2",
  "if-addrs",
@@ -675,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "enr-state"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "blake2",
@@ -689,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "enr-store"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "parking_lot",
  "redb",
@@ -705,7 +696,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "ergo-api"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "axum",
  "blake2",
@@ -781,7 +772,7 @@ dependencies = [
 
 [[package]]
 name = "ergo-mempool"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "ergo-chain-types",
  "ergo-lib",
@@ -811,9 +802,10 @@ dependencies = [
 
 [[package]]
 name = "ergo-mining"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "blake2",
+ "enr-chain",
  "ergo-chain-types",
  "ergo-lib",
  "ergo-merkle-tree",
@@ -851,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "ergo-node-rust"
-version = "0.7.11"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -890,18 +882,16 @@ dependencies = [
 
 [[package]]
 name = "ergo-sync"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "blake2",
  "bytes",
- "crossbeam-channel",
  "enr-chain",
  "enr-p2p",
  "ergo-chain-types",
  "ergo-validation",
  "ergo_avltree_rust",
  "hex",
- "rayon",
  "redb",
  "tempfile",
  "thiserror",
@@ -912,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "ergo-validation"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "blake2",
  "bytes",
@@ -928,12 +918,13 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+ "tracing-test",
 ]
 
 [[package]]
 name = "ergo_avltree_rust"
 version = "0.1.1"
-source = "git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=568e7c3#568e7c31e6efeaeba1dbdd2ed5a52fb93e920d80"
+source = "git+https://github.com/mwaddip/ergo_avltree_rust.git?rev=b955790#b95579006eb5629d154293c449210053afbf49a4"
 dependencies = [
  "anyhow",
  "base16",
