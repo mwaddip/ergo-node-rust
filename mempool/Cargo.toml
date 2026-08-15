@@ -7,11 +7,11 @@ description = "In-memory transaction pool for the Ergo Rust node"
 
 [dependencies]
 ergo-validation = { path = "../validation" }
-ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "7d13d0d2fbfb9b65e96fe31c25ebfb022427814d" }
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 hex = "0.4"
 
 [dev-dependencies]
-ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "7d13d0d2fbfb9b65e96fe31c25ebfb022427814d" }
 tempfile = "3"

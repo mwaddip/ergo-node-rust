@@ -18,9 +18,10 @@ pub enum StateType {
     /// transitions using authenticated dictionary proofs (AD proofs) provided
     /// in each block. Requires downloading AD proofs from peers.
     Digest,
-    /// NiPoPoW light-client mode. Downloads NO block bodies. Bootstraps the
-    /// header chain from a verified NiPoPoW proof's suffix and follows the
-    /// tip thereafter. No transaction validation runs in this mode.
+    /// NiPoPoW light-client mode. Downloads NO block bodies and runs no
+    /// transaction validation. New legacy V1 bootstrap attempts fail closed;
+    /// a future authenticated format is required to establish the chain
+    /// origin before tip following can start.
     Light,
 }
 

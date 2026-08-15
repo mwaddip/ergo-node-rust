@@ -45,11 +45,18 @@ pub fn pow_target(n_bits: u32) -> BigInt {
 /// [`pow_target`] for the header's `n_bits`.
 ///
 /// Returns `Ok(())` if valid, `Err(ChainError::PowInvalid)` if the hit doesn't
-/// meet the target, or `Err(ChainError::PowCompute)` if the hit can't be computed.
+/// meet the target, `Err(ChainError::InvalidPowTarget)` if the compact target
+/// decodes to zero, or `Err(ChainError::PowCompute)` if the hit can't be computed.
 pub fn verify_pow(header: &Header) -> Result<(), ChainError> {
     let pow = pow_scheme();
     let hit = pow.pow_hit(header)?;
 
+    let decoded_n_bits = decode_compact_bits(header.n_bits);
+    if decoded_n_bits == 0.into() {
+        return Err(ChainError::InvalidPowTarget {
+            n_bits: header.n_bits,
+        });
+    }
     let target = pow_target(header.n_bits);
 
     let hit_bigint = hit.to_bigint().ok_or(ChainError::PowInvalid {

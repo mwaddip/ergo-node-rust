@@ -9,6 +9,11 @@ use crate::error::ChainError;
 /// Matches JVM `DifficultyAdjustment.PrecisionConstant`.
 const PRECISION: i64 = 1_000_000_000;
 
+/// Maximum number of prior epochs accepted for a difficulty recalculation.
+/// This bounds all vectors derived from configuration or persisted NiPoPoW
+/// context before allocation.
+pub(crate) const MAX_DIFFICULTY_EPOCHS: u32 = 256;
+
 /// Returns the expected nBits for the next header after `parent`.
 ///
 /// If `parent.height` is at an epoch boundary, recalculates difficulty
@@ -27,6 +32,7 @@ pub fn expected_difficulty(parent: &Header, chain: &HeaderChain) -> Result<u32, 
     }
 
     let epoch_length = config.epoch_length_at(parent.height + 1);
+    validate_recalculation_window(epoch_length, config.use_last_epochs)?;
 
     // Recalculation happens when the parent is the last block of an epoch
     if parent.height.is_multiple_of(epoch_length) && parent.height > 0 {
@@ -38,8 +44,22 @@ pub fn expected_difficulty(parent: &Header, chain: &HeaderChain) -> Result<u32, 
         // `chain.header_at` returns owned headers post-Phase-2; collect
         // first, then borrow into the ref-slice shape the inner helpers
         // still expect.
-        let owned_headers: Vec<Header> =
-            heights.iter().filter_map(|&h| chain.header_at(h)).collect();
+        // Height zero is the JVM pre-genesis sentinel and is intentionally
+        // absent. Every positive requested height must resolve; calculating
+        // from a silent subset would make local acceptance depend on cache or
+        // bootstrap gaps.
+        let owned_headers: Vec<Header> = heights
+            .iter()
+            .copied()
+            .filter(|height| *height > 0)
+            .map(|height| {
+                chain.difficulty_header_at(height).ok_or_else(|| {
+                    ChainError::DifficultyCalc(format!(
+                        "required difficulty header at height {height} is unavailable"
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
 
         if owned_headers.is_empty() {
             return Ok(config.initial_n_bits);
@@ -68,29 +88,89 @@ pub fn expected_difficulty(parent: &Header, chain: &HeaderChain) -> Result<u32, 
 }
 
 /// Heights of headers needed for difficulty recalculation at `height`.
+pub(crate) fn heights_for_next_recalculation(
+    height: u32,
+    epoch_length: u32,
+    use_last_epochs: u32,
+) -> Result<Vec<u32>, ChainError> {
+    validate_recalculation_window(epoch_length, use_last_epochs)?;
+
+    let height = u64::from(height);
+    let epoch_length_u64 = u64::from(epoch_length);
+    let next = if height % epoch_length_u64 == 0 {
+        height.checked_add(1)
+    } else {
+        height
+            .checked_div(epoch_length_u64)
+            .and_then(|epoch| epoch.checked_add(1))
+            .and_then(|epoch| epoch.checked_mul(epoch_length_u64))
+            .and_then(|boundary| boundary.checked_add(1))
+    }
+    .ok_or_else(|| ChainError::DifficultyCalc("next recalculation height overflow".into()))?;
+    let next = u32::try_from(next)
+        .map_err(|_| ChainError::DifficultyCalc("next recalculation height exceeds u32".into()))?;
+
+    Ok(previous_heights_for_recalculation(
+        next,
+        epoch_length,
+        use_last_epochs,
+    ))
+}
+
+fn validate_recalculation_window(
+    epoch_length: u32,
+    use_last_epochs: u32,
+) -> Result<(), ChainError> {
+    if epoch_length == 0 {
+        return Err(ChainError::DifficultyCalc(
+            "difficulty epoch length must be positive".into(),
+        ));
+    }
+    if use_last_epochs > MAX_DIFFICULTY_EPOCHS {
+        return Err(ChainError::DifficultyCalc(format!(
+            "difficulty use_last_epochs {use_last_epochs} exceeds maximum {MAX_DIFFICULTY_EPOCHS}"
+        )));
+    }
+    Ok(())
+}
+
 fn previous_heights_for_recalculation(
     height: u32,
     epoch_length: u32,
     use_last_epochs: u32,
 ) -> Vec<u32> {
-    if (height - 1).is_multiple_of(epoch_length) && epoch_length > 1 {
+    if height == 0 || epoch_length == 0 {
+        return Vec::new();
+    }
+    let previous_height = height - 1;
+    if previous_height.is_multiple_of(epoch_length) && epoch_length > 1 {
         // Branch 1: epoch boundary with epoch_length > 1. Filter out negative heights
         // (not enough history to fill all use_last_epochs slots).
         let mut heights: Vec<u32> = (0..=use_last_epochs)
-            .filter_map(|i| (height - 1).checked_sub(i * epoch_length))
+            .filter_map(|i| {
+                i.checked_mul(epoch_length)
+                    .and_then(|delta| previous_height.checked_sub(delta))
+            })
             .collect();
         heights.reverse();
         heights
-    } else if (height - 1).is_multiple_of(epoch_length) && height > epoch_length * use_last_epochs {
+    } else if previous_height.is_multiple_of(epoch_length)
+        && epoch_length
+            .checked_mul(use_last_epochs)
+            .is_some_and(|window| height > window)
+    {
         // Branch 2: epoch boundary with epoch_length <= 1 (i.e. epoch_length == 1)
         // and enough history. All heights are guaranteed non-negative by the guard.
         let mut heights: Vec<u32> = (0..=use_last_epochs)
-            .map(|i| (height - 1) - i * epoch_length)
+            .filter_map(|i| {
+                i.checked_mul(epoch_length)
+                    .and_then(|delta| previous_height.checked_sub(delta))
+            })
             .collect();
         heights.reverse();
         heights
     } else {
-        vec![height - 1]
+        vec![previous_height]
     }
 }
 
@@ -284,6 +364,36 @@ pub fn interpolate(data: &[(i64, BigInt)], epoch_length: i64) -> BigInt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_heights_for_next_recalculation_matches_jvm_vectors() {
+        assert_eq!(
+            heights_for_next_recalculation(926_976, 128, 4).unwrap(),
+            vec![926_464, 926_592, 926_720, 926_848, 926_976]
+        );
+        assert_eq!(
+            heights_for_next_recalculation(926_977, 128, 4).unwrap(),
+            vec![926_592, 926_720, 926_848, 926_976, 927_104]
+        );
+        assert_eq!(
+            heights_for_next_recalculation(926_950, 128, 4).unwrap(),
+            vec![926_464, 926_592, 926_720, 926_848, 926_976]
+        );
+        assert_eq!(
+            heights_for_next_recalculation(1, 128, 4).unwrap(),
+            vec![0, 128]
+        );
+        assert_eq!(
+            heights_for_next_recalculation(129, 128, 4).unwrap(),
+            vec![0, 128, 256]
+        );
+        assert!(heights_for_next_recalculation(10, 0, 4).is_err());
+    }
+
+    #[test]
+    fn test_heights_for_next_recalculation_rejects_pathological_epoch_count() {
+        assert!(heights_for_next_recalculation(10, 128, 257).is_err());
+    }
 
     #[test]
     fn test_previous_heights_basic() {

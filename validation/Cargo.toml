@@ -14,9 +14,9 @@ description = "Block validation for the Ergo Rust node"
 json = ["ergo-lib/json", "ergo-chain-types/json"]
 
 [dependencies]
-ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
-ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
-sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "7d13d0d2fbfb9b65e96fe31c25ebfb022427814d" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "7d13d0d2fbfb9b65e96fe31c25ebfb022427814d" }
+sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "7d13d0d2fbfb9b65e96fe31c25ebfb022427814d" }
 ergo_avltree_rust = "0.1.1"
 enr-state = { path = "../state" }
 rayon = "1"
@@ -27,8 +27,8 @@ tracing = "0.1"
 thiserror = "2"
 
 [dev-dependencies]
-ergotree-interpreter = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
-ergotree-ir = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
+ergotree-interpreter = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "7d13d0d2fbfb9b65e96fe31c25ebfb022427814d" }
+ergotree-ir = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "7d13d0d2fbfb9b65e96fe31c25ebfb022427814d" }
 tempfile = "3"
 # `no-env-filter` is required, not cosmetic: without it the default filter
 # drops the emits under test and a "and warns" assertion silently passes on

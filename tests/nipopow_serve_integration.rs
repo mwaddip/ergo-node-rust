@@ -2,7 +2,8 @@
 //!
 //! Connects to a running `ergo-node-rust` as an outbound peer, sends a
 //! `GetNipopowProof` (code 90), waits for the `NipopowProof` (code 91)
-//! response, parses it, and verifies it via `enr_chain::verify_nipopow_proof_bytes`.
+//! response, parses and inspects it, then confirms that legacy V1 cannot
+//! authorize bootstrap installation.
 //!
 //! Exercises the full path: codec → handler dispatch → build → serialize →
 //! framing → parse on receiver. The unit tests in `src/nipopow_serve.rs` cover
@@ -55,6 +56,37 @@ const FULL_CHAIN_BUILD_TIMEOUT_SECS: u64 = 10;
 // `chain too short` (must be >= m + k).
 const ANCHOR_HEIGHT: u32 = 200;
 const DEFAULT_TARGET: &str = "127.0.0.1:9030";
+/// Canonical testnet height-1 header ID from the reference node config.
+const TESTNET_GENESIS_ID: &str = "ab19bb59871e86507defb9a7769841b1130aad4d8c1ea8b0e01e0dee9e97a27e";
+
+fn testnet_verification_context(m: u32, k: u32) -> enr_chain::NipopowVerificationContext {
+    enr_chain::NipopowVerificationContext {
+        expected_m: m,
+        expected_k: k,
+        expected_genesis_id: TESTNET_GENESIS_ID
+            .parse()
+            .expect("canonical testnet genesis ID must parse"),
+        difficulty_epoch_length: 128,
+        use_last_epochs: 8,
+    }
+}
+
+fn inspect_v1_and_assert_bootstrap_disabled(
+    proof_bytes: &[u8],
+    context: &enr_chain::NipopowVerificationContext,
+) -> enr_chain::NipopowInspection {
+    let inspection = enr_chain::inspect_nipopow_proof_bytes(proof_bytes)
+        .expect("served V1 proof must remain inspectable");
+    let authorization = enr_chain::verify_nipopow_proof_bytes(proof_bytes, context);
+    assert!(
+        matches!(
+            authorization,
+            Err(enr_chain::ChainError::NipopowBootstrapDisabled)
+        ),
+        "legacy V1 must not authorize bootstrap: {authorization:?}"
+    );
+    inspection
+}
 
 #[tokio::test]
 #[ignore = "requires a running ergo-node-rust on NIPOPOW_TARGET (default 127.0.0.1:9030)"]
@@ -150,23 +182,23 @@ async fn nipopow_serve_round_trip_against_running_node() {
 
     eprintln!("got NipopowProof inner bytes: {} bytes", proof_bytes.len());
 
-    let meta = enr_chain::verify_nipopow_proof_bytes(&proof_bytes)
-        .expect("verify_nipopow_proof_bytes failed");
+    let context = testnet_verification_context(6, 6);
+    let inspection = inspect_v1_and_assert_bootstrap_disabled(&proof_bytes, &context);
 
     eprintln!(
-        "verified: suffix_tip_height={} total_headers={} continuous={}",
-        meta.suffix_tip_height, meta.total_headers, meta.continuous
+        "inspected V1 (bootstrap disabled): suffix_tip_height={} total_headers={} continuous={:?}",
+        inspection.suffix_tip_height, inspection.total_headers, inspection.continuous
     );
 
     // m=6 k=6 means at minimum the proof carries the k-suffix (6 headers).
     // The prefix can be empty on a short chain, so 6 is the floor we can rely on.
     assert!(
-        meta.total_headers >= 6,
+        inspection.total_headers >= 6,
         "expected at least k=6 headers in the proof, got {}",
-        meta.total_headers
+        inspection.total_headers
     );
     assert!(
-        meta.suffix_tip_height > 0,
+        inspection.suffix_tip_height > 0,
         "suffix tip height should be > 0"
     );
 }
@@ -284,23 +316,26 @@ async fn nipopow_serve_full_chain_round_trip() {
         elapsed.as_secs_f64()
     );
 
-    let meta = enr_chain::verify_nipopow_proof_bytes(&proof_bytes)
-        .expect("verify_nipopow_proof_bytes failed");
+    let context = testnet_verification_context(6, 6);
+    let inspection = inspect_v1_and_assert_bootstrap_disabled(&proof_bytes, &context);
 
     eprintln!(
-        "[full-chain] verified: suffix_tip_height={} total_headers={} continuous={} wall_time={:.3}s",
-        meta.suffix_tip_height, meta.total_headers, meta.continuous, elapsed.as_secs_f64()
+        "[full-chain] inspected V1 (bootstrap disabled): suffix_tip_height={} total_headers={} continuous={:?} wall_time={:.3}s",
+        inspection.suffix_tip_height,
+        inspection.total_headers,
+        inspection.continuous,
+        elapsed.as_secs_f64()
     );
 
     assert!(
-        meta.total_headers >= 6,
+        inspection.total_headers >= 6,
         "expected at least k=6 headers in the proof, got {}",
-        meta.total_headers
+        inspection.total_headers
     );
     assert!(
-        meta.suffix_tip_height > 200,
+        inspection.suffix_tip_height > 200,
         "full-chain suffix tip height should be much larger than the 200-anchor test, got {}",
-        meta.suffix_tip_height
+        inspection.suffix_tip_height
     );
 }
 
@@ -318,13 +353,14 @@ async fn nipopow_serve_full_chain_round_trip() {
 /// proofs with `Nipopow("invalid connections")`. The fix
 /// (`mwaddip/sigma-rust:fix/nipopow-prefix-connection-lookback`,
 /// integrated as `1e3fe28` on `ergo-node-integration`) ports JVM's
-/// `useLastEpochs + 2` lookback window so the verifier accepts proofs
+/// `useLastEpochs + 2` lookback window so bounded inspection accepts proofs
 /// where each entry connects to ANY of the up-to-10 immediately preceding
 /// entries.
 ///
-/// This test passes against any peer (JVM or Rust) that produces valid
-/// JVM-shape proofs. Pre-fix it failed; post-fix it passes. Keeping it
-/// as a permanent regression check for the connection-tolerance fix.
+/// This test passes against any peer (JVM or Rust) that produces structurally
+/// valid JVM-shape proofs, while separately asserting that V1 bootstrap
+/// authorization remains disabled. Keeping it as a permanent regression
+/// check for both properties.
 #[tokio::test]
 #[ignore = "requires a running ergo-node-rust on NIPOPOW_TARGET (default 127.0.0.1:9030)"]
 async fn nipopow_serve_no_anchor_repro() {
@@ -385,24 +421,24 @@ async fn nipopow_serve_no_anchor_repro() {
     .await
     .expect("timed out waiting for NipopowProof response");
 
-    let meta = enr_chain::verify_nipopow_proof_bytes(&proof_bytes)
-        .expect("verify_nipopow_proof_bytes failed (regression: tolerant lookback?)");
+    let context = testnet_verification_context(6, 10);
+    let inspection = inspect_v1_and_assert_bootstrap_disabled(&proof_bytes, &context);
 
     eprintln!(
-        "[no-anchor] verified OK: proof_bytes={} suffix_tip_height={} total_headers={}",
+        "[no-anchor] inspected V1; bootstrap disabled: proof_bytes={} suffix_tip_height={} total_headers={}",
         proof_bytes.len(),
-        meta.suffix_tip_height,
-        meta.total_headers,
+        inspection.suffix_tip_height,
+        inspection.total_headers,
     );
 
     assert!(
-        meta.total_headers >= 10,
+        inspection.total_headers >= 10,
         "expected at least k=10 headers in the proof, got {}",
-        meta.total_headers
+        inspection.total_headers
     );
     assert!(
-        meta.suffix_tip_height > 200,
+        inspection.suffix_tip_height > 200,
         "no-anchor request should resolve to a deep tip, got {}",
-        meta.suffix_tip_height
+        inspection.suffix_tip_height
     );
 }

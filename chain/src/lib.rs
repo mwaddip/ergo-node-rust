@@ -26,8 +26,11 @@ pub use ergo_chain_types::autolykos_pow_scheme::decode_compact_bits;
 pub use ergo_chain_types::{ADDigest, BlockId, Header};
 pub use error::{ChainError, RestoreError};
 pub use nipopow_proof::{
-    build_nipopow_proof, compare_nipopow_proof_bytes, popow_header_by_id,
-    verify_nipopow_proof_bytes, NipopowVerificationResult,
+    build_nipopow_proof, compare_nipopow_proof_bytes, inspect_nipopow_proof_bytes,
+    parse_nipopow_difficulty_context, popow_header_by_id, serialize_nipopow_difficulty_context,
+    verify_nipopow_proof_bytes, NipopowInspection, NipopowVerificationContext,
+    NipopowVerificationResult, PersistedNipopowDifficultyContext,
+    NIPOPOW_DIFFICULTY_CONTEXT_META_KEY,
 };
 pub use num_bigint::{BigInt, BigUint};
 pub use pow::{pow_target, verify_pow};

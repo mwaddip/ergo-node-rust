@@ -716,9 +716,10 @@ Critical findings from debugging sync against JVM 6.0.3 peers:
 
 When `config.state_type == StateType::Light` AND the chain is empty at startup,
 the sync machine runs a one-shot NiPoPoW bootstrap BEFORE entering the normal
-sync cycle. The bootstrap installs the proof's suffix as the chain origin via
-`HeaderChain::install_from_nipopow_proof`; subsequent tip-following uses the
-existing header sync loop without modification.
+sync cycle. Legacy V1 is currently non-authorizing: after the first solicited
+proof response, the chain verifier returns a typed capability error and sync
+terminates before comparison or installation. Build, serve, parser, and
+inspection behavior remain available.
 
 ### `run_light_bootstrap(transport, chain, config) -> Result<(), LightBootstrapError>`
 
@@ -729,48 +730,36 @@ returns immediately.
 
 State machine:
 
-1. **Wait for at least one outbound peer** with a delivery-eligible status
-   (handshake complete, not banned). Poll `transport.outbound_peers()` every
-   1s up to a 60s deadline. No peers → `LightBootstrapError::NoPeers`.
+1. **Wait for outbound peers** with completed handshakes. Poll
+   `transport.outbound_peers()` up to the peer-wait deadline. No peers yields
+   `LightBootstrapError::NoPeers`.
 
-2. **Send `GetNipopowProof`** to the first eligible peer with `m=6`, `k=10`,
-   `header_id = None` (no anchor — request a proof at the peer's current tip).
-   The wire envelope is built via `src/nipopow_serve::serialize_get_nipopow_proof`
-   (a new function — currently only the response serializer exists).
+2. **Broadcast `GetNipopowProof`** with `m=6`, `k=10`, and
+   `header_id = None` to every currently eligible outbound peer. If every
+   send fails, return `LightBootstrapError::AllPeersStalled`.
 
-3. **Wait for `NipopowProof` response** (P2P code 91) from that peer with a
-   30-second timeout. Other messages from other peers during this window are
-   processed normally by the rest of the sync machine; only `code == 91`
-   from the requested peer counts as the response. Timeout or wrong-peer
-   response → mark peer stalled, rotate to next eligible peer, retry up to
-   3 peers total. All 3 stalled → `LightBootstrapError::AllPeersStalled`.
+3. **Collect code-91 responses** from only the peers that received the
+   request, until they have all responded or the collection window expires.
+   Unsolicited peers and non-proof messages do not enter the candidate set.
 
-4. **Verify** the inner proof bytes via
-   `enr_chain::verify_nipopow_proof_bytes`. Verification failure → mark
-   peer hostile (NOT just stalled — sending an invalid proof is a protocol
-   violation), rotate, retry. Three hostile peers in a row →
-   `LightBootstrapError::AllPeersHostile`.
+4. **Ask the chain crate to authorize each response** through
+   `SyncChain::verify_nipopow_envelope`.
+   The bridge strips the envelope and calls context-bound
+   `enr_chain::verify_nipopow_proof_bytes` with the exact requested `m/k`,
+   configured genesis, and difficulty epoch context. The V1 entry point
+   validates the local context and returns
+   `ChainError::NipopowBootstrapDisabled` because the height-selected sparse
+   headers are not authenticated as branch members.
 
-5. **Install** the verified suffix into the local `HeaderChain`:
-   - The result's `headers: Vec<Header>` slice contains, in order:
-     `prefix`, then `suffix_head.header`, then `suffix_tail`. The light
-     client only installs the suffix portion (`suffix_head` + `suffix_tail`),
-     NOT the prefix headers — the prefix exists to prove cumulative work
-     and is discarded after verification.
-   - The split point inside `headers` is `headers.len() - k` (the last `k`
-     entries are the suffix; the rest is the prefix). With `k=10`, the
-     install passes `headers[headers.len()-10]` as `suffix_head` and the
-     remaining 9 as `suffix_tail`.
-   - On success, `chain.height()` returns the suffix tip's height. Set
-     the `validated_height` watermark to the same value (light mode treats
-     all installed headers as "validated" — the proof's PoW checks are
-     the validation).
+5. **Propagate the capability failure immediately.** Sync returns
+   `LightBootstrapError::BootstrapDisabled`. It does not classify the peer as
+   hostile, add a candidate, compare proofs, install headers, or write the
+   legacy difficulty-context record.
 
-6. **Transition to normal tip-following sync** via the existing
-   `sync_from_peer` loop. From here on out, light mode behaves like full
-   mode minus block bodies: the sync machine sends SyncInfo, receives
-   header Inv, requests headers, validates them via `try_append`, and
-   advances the tip.
+The retained comparison, exact-suffix install, persistence, and restart
+mechanics are exercised by isolated tests but are unreachable from legacy V1
+in production. A future proof format must first supply branch-authenticated
+difficulty-transition evidence.
 
 ### `LightBootstrapError`
 
@@ -779,6 +768,7 @@ pub enum LightBootstrapError {
     NoPeers,
     AllPeersStalled,
     AllPeersHostile,
+    BootstrapDisabled,
     InstallFailed(ChainError),
     StreamClosed,
 }
@@ -790,29 +780,24 @@ for first release, terminate.
 
 ### Bootstrap invariants
 
-- **Single peer per attempt**: bootstrap requests from ONE peer at a time.
-  Multi-peer best-arg comparison (KMZ17 §4.3, where the client compares
-  proofs from multiple peers and picks the one with highest cumulative work
-  via `bestArg`) is **out of scope for first release** and tracked as a
-  hardening follow-up. The first-release trust model is "trust the first
-  peer that returns a verifiable proof." This is documented as a known
-  limitation in the user-facing release notes.
-- **No restart-resume state**: bootstrap is one-shot and re-runs from
-  scratch on every restart where `chain.is_empty()`. Once the chain is
-  installed, subsequent restarts skip bootstrap entirely (chain is loaded
-  from store and is non-empty). There is no partial-bootstrap state that
-  needs persistence — the operation is atomic.
-- **Bootstrap NEVER mutates `store/`** beyond what `HeaderChain` itself
-  writes via its existing persistence path. The proof bytes are not
-  archived after install. If we want to re-verify the proof after a
-  reboot, we'd need to re-fetch it; this is not a first-release concern.
+- **V1 fails closed**: every V1 authorization attempt returns the typed
+  capability error before candidate comparison or chain installation.
+- **Capability failure is not peer hostility**: a conforming V1 response does
+  not count as an invalid-proof attack; sync terminates with
+  `BootstrapDisabled`.
+- **Inspection is non-authorizing**: successful bounded parsing, structural
+  validation, and per-header PoW checks cannot be converted into an install
+  result.
+- **Dormant install mechanics remain isolated**: exact prefix/suffix identity,
+  sparse-context bounds, suffix difficulty, and restart binding continue to
+  have regression coverage for a future authenticated format.
 
 ### Trust model
 
-Standard SPV: single-peer bootstrap trusts that peer's view of the
-chain. Failure mode is liveness, not safety — a hostile peer causes a
-recoverable DoS, not loss of funds. Multi-peer best-arg comparison
-(KMZ17 §4.3) is the standard hardening, tracked as a follow-up.
+Legacy V1 accepts no proof for bootstrap installation. A future V2 design must
+authenticate the difficulty-transition evidence as part of the selected
+branch before multi-peer comparison or installation can be re-enabled. V2 is
+not specified by this implementation.
 
 ## Block Section Download
 

@@ -24,7 +24,8 @@ use ergo_lib::chain::genesis;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
 use ergo_node_rust::{
-    P2pTransport, PeerStorageAdapter, SharedChain, SharedStore, ValidationPipeline,
+    restore_nipopow_difficulty_context_from_store, P2pTransport, PeerStorageAdapter, SharedChain,
+    SharedStore, ValidationPipeline,
 };
 use ergo_sync::{HeaderSync, SyncConfig, SyncStore};
 use ergo_validation::{
@@ -555,8 +556,8 @@ async fn penalize(
 /// Handle an incoming NiPoPoW message (code 90 GetNipopowProof or 91 NipopowProof).
 ///
 /// For code 90: parse the request, lock the chain, build the proof, and send the
-/// response via the P2P node. For code 91: parse the inner proof bytes and verify
-/// against the chain (logged but not applied — light-client mode is a future session).
+/// response via the P2P node. For code 91: validate only the bounded envelope;
+/// unsolicited V1 inspection is disabled and request-bound handling occurs in sync.
 ///
 /// Errors during parsing/building/verification are logged at warn level and dropped.
 /// We never send error responses — JVM doesn't expect them.
@@ -659,8 +660,8 @@ async fn handle_nipopow_event(
         }
 
         nipopow_serve::NIPOPOW_PROOF => {
-            let proof_bytes = match nipopow_serve::parse_nipopow_proof(body) {
-                Ok(b) => b,
+            let disposition = match nipopow_serve::classify_unsolicited_nipopow_proof(body) {
+                Ok(disposition) => disposition,
                 Err(e) => {
                     penalize(
                         p2p,
@@ -674,26 +675,17 @@ async fn handle_nipopow_event(
                 }
             };
 
-            // Verify is a pure function over the proof bytes — no chain access needed.
-            match enr_chain::verify_nipopow_proof_bytes(&proof_bytes) {
-                Ok(meta) => {
-                    tracing::info!(
+            // This unsolicited path has no request context. Keep only bounded
+            // envelope validation; request-bound handling continues in sync.
+            match disposition {
+                nipopow_serve::UnsolicitedNipopowDisposition::V1InspectionDisabled {
+                    proof_size,
+                } => {
+                    tracing::debug!(
                         peer = %peer_id,
-                        suffix_tip_height = meta.suffix_tip_height,
-                        total_headers = meta.total_headers,
-                        continuous = meta.continuous,
-                        "received and verified NiPoPoW proof (logged only — light-client mode pending)"
+                        proof_size,
+                        "received NiPoPoW proof; unsolicited V1 inspection disabled"
                     );
-                }
-                Err(e) => {
-                    penalize(
-                        p2p,
-                        peer_id,
-                        "permanent",
-                        &format!("NiPoPoW proof verification failed: {e}"),
-                        true,
-                    )
-                    .await;
                 }
             }
         }
@@ -2323,6 +2315,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let mut chain = HeaderChain::restore(chain_config, restore_entries)
         .map_err(|e| format!("header chain restore failed: {e:?}"))?;
+    restore_nipopow_difficulty_context_from_store(&mut chain, store.as_ref())
+        .map_err(|e| format!("NiPoPoW difficulty context restore failed: {e}"))?;
     match tip_id {
         Some(tip) => tracing::info!(
             headers = entry_count as u64,
@@ -3196,13 +3190,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         StateType::Light => {
-            // Light mode runs no validator. The chain is bootstrapped from a
-            // verified NiPoPoW proof (see sync's light bootstrap state) and
-            // tip-following uses HeaderChain::try_append, which the chain
-            // crate's light_client_mode flag teaches to skip the
-            // expected_difficulty recalc. Mining and transaction validation
-            // are not available.
-            tracing::info!("light-client mode: no block validator constructed");
+            // Light mode runs no block validator. Legacy NiPoPoW V1 bootstrap
+            // is fail-closed before comparison or installation because its
+            // sparse difficulty headers are not branch-authenticated. Mining
+            // and transaction validation are not available.
+            tracing::info!(
+                "light-client mode: no block validator; NiPoPoW V1 bootstrap is disabled"
+            );
             None
         }
     };

@@ -722,9 +722,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     /// through to [`Self::shutdown_flush`] via [`Self::run`].
     async fn run_inner(&mut self) {
         // Light-client bootstrap: if state_type is Light AND chain is empty,
-        // run a one-shot NiPoPoW bootstrap before entering the normal sync
-        // cycle. The bootstrap installs the proof's suffix as the chain
-        // origin; subsequent tip-following uses the existing loop unchanged.
+        // run a one-shot NiPoPoW bootstrap before entering normal sync.
+        // Legacy V1 returns BootstrapDisabled before comparison or install;
+        // the success branch is retained for a future authenticated format.
         // Idempotent: skipped on restart when the chain is non-empty.
         if self.config.state_type == StateType::Light && self.chain.chain_height().await == 0 {
             tracing::info!("light-client mode: running NiPoPoW bootstrap");
@@ -733,9 +733,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             {
                 Ok(()) => {
                     let height = self.chain.chain_height().await;
-                    // Light mode treats all installed headers as "validated"
-                    // — the proof's PoW checks ARE the validation. There's
-                    // no validator running and no block sections to download.
+                    // Reachable only after a future authorization path has
+                    // authenticated the installed origin. Legacy V1 cannot
+                    // reach this branch.
                     self.downloaded_height = height;
                     self.state_applied_height = height;
                     tracing::info!(
@@ -2794,7 +2794,7 @@ mod shutdown_flush_tests {
         async fn verify_nipopow_envelope(
             &self,
             _envelope_body: &[u8],
-        ) -> Result<Vec<Header>, ChainError> {
+        ) -> Result<enr_chain::NipopowVerificationResult, ChainError> {
             unreachable!("not called when state_type=Utxo")
         }
 
@@ -2804,6 +2804,7 @@ mod shutdown_flush_tests {
 
         async fn install_nipopow_suffix(
             &self,
+            _difficulty_headers: Vec<Header>,
             _suffix_head: Header,
             _suffix_tail: Vec<Header>,
         ) -> Result<(), ChainError> {
@@ -3205,7 +3206,7 @@ mod blocks_to_keep_tests {
         async fn verify_nipopow_envelope(
             &self,
             _envelope_body: &[u8],
-        ) -> Result<Vec<Header>, ChainError> {
+        ) -> Result<enr_chain::NipopowVerificationResult, ChainError> {
             unreachable!()
         }
 
@@ -3215,6 +3216,7 @@ mod blocks_to_keep_tests {
 
         async fn install_nipopow_suffix(
             &self,
+            _difficulty_headers: Vec<Header>,
             _suffix_head: Header,
             _suffix_tail: Vec<Header>,
         ) -> Result<(), ChainError> {
@@ -3834,7 +3836,7 @@ mod sweep_resume_tests {
         async fn verify_nipopow_envelope(
             &self,
             _envelope_body: &[u8],
-        ) -> Result<Vec<Header>, ChainError> {
+        ) -> Result<enr_chain::NipopowVerificationResult, ChainError> {
             unreachable!()
         }
         async fn is_better_nipopow(&self, _this: &[u8], _than: &[u8]) -> Result<bool, ChainError> {
@@ -3842,6 +3844,7 @@ mod sweep_resume_tests {
         }
         async fn install_nipopow_suffix(
             &self,
+            _difficulty_headers: Vec<Header>,
             _suffix_head: Header,
             _suffix_tail: Vec<Header>,
         ) -> Result<(), ChainError> {
@@ -4637,7 +4640,7 @@ mod serve_continuation_tests {
         async fn verify_nipopow_envelope(
             &self,
             _envelope_body: &[u8],
-        ) -> Result<Vec<Header>, ChainError> {
+        ) -> Result<enr_chain::NipopowVerificationResult, ChainError> {
             unreachable!("not called in serve tests")
         }
 
@@ -4647,6 +4650,7 @@ mod serve_continuation_tests {
 
         async fn install_nipopow_suffix(
             &self,
+            _difficulty_headers: Vec<Header>,
             _suffix_head: Header,
             _suffix_tail: Vec<Header>,
         ) -> Result<(), ChainError> {

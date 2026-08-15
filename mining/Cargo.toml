@@ -6,10 +6,10 @@ license = "MIT"
 description = "Block candidate assembly and PoW solution validation for external miners"
 
 [dependencies]
-ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
-ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
-ergo-nipopow = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
-ergo-merkle-tree = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "7d13d0d2fbfb9b65e96fe31c25ebfb022427814d" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "7d13d0d2fbfb9b65e96fe31c25ebfb022427814d" }
+ergo-nipopow = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "7d13d0d2fbfb9b65e96fe31c25ebfb022427814d" }
+ergo-merkle-tree = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "7d13d0d2fbfb9b65e96fe31c25ebfb022427814d" }
 # pow_target(n_bits) — the single sanctioned definition of the Autolykos
 # mining target served as WorkMessage.b. This crate re-derived it from
 # decode_compact_bits until v0.8.0 and stopped one division short, which is
@@ -17,7 +17,7 @@ ergo-merkle-tree = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f
 # dependencies. BigInt is re-exported from the crate root.
 enr-chain = { path = "../chain" }
 ergo-validation = { path = "../validation" }
-sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
+sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "7d13d0d2fbfb9b65e96fe31c25ebfb022427814d" }
 blake2 = "0.10"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }

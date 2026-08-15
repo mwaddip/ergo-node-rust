@@ -6,9 +6,10 @@
 //!   We build it from the local chain via `enr_chain::build_nipopow_proof`
 //!   and respond with a code 91 message.
 //!
-//! - **91 (`NipopowProof`)**: peer sends us a proof. We verify it via
-//!   `enr_chain::verify_nipopow_proof_bytes` and log the result. The proof
-//!   is NOT applied to chain state — light-client mode is a separate session.
+//! - **91 (`NipopowProof`)**: peer sends us an unsolicited proof. We validate
+//!   only its bounded envelope and return a typed V1-disabled disposition.
+//!   This path has no request context and cannot authorize bootstrap selection,
+//!   installation, or full proof inspection.
 //!
 //! Both codes use VLQ-encoded integer fields with a `putUShort(0)` pad-length
 //! footer for forward compatibility (the JVM convention for new message
@@ -174,6 +175,34 @@ pub fn parse_nipopow_proof(body: &[u8]) -> Result<Vec<u8>, NipopowError> {
     Ok(proof_bytes)
 }
 
+/// Result of classifying an unsolicited code-91 message.
+///
+/// Legacy V1 proofs have no request-bound authorization context, so this type
+/// deliberately exposes only the bounded envelope size and never parsed proof
+/// metadata or headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsolicitedNipopowDisposition {
+    /// The envelope is well formed, but unsolicited V1 inspection is disabled.
+    V1InspectionDisabled {
+        /// Size of the inner proof payload declared by the bounded envelope.
+        proof_size: usize,
+    },
+}
+
+/// Validate a code-91 envelope without inspecting its inner V1 proof.
+///
+/// The request-bound light-bootstrap state machine may consume the original
+/// message separately. This diagnostic path must not duplicate its structural,
+/// cryptographic, or proof-of-work validation.
+pub fn classify_unsolicited_nipopow_proof(
+    body: &[u8],
+) -> Result<UnsolicitedNipopowDisposition, NipopowError> {
+    let proof_bytes = parse_nipopow_proof(body)?;
+    Ok(UnsolicitedNipopowDisposition::V1InspectionDisabled {
+        proof_size: proof_bytes.len(),
+    })
+}
+
 /// Serialize the inner proof bytes into a `NipopowProof` (code 91) message body.
 ///
 /// Inverse of [`parse_nipopow_proof`].
@@ -282,6 +311,28 @@ mod tests {
     }
 
     #[test]
+    fn unsolicited_v1_proof_returns_disabled_without_inner_inspection() {
+        let body = serialize_nipopow_proof(&[0xff]);
+
+        assert_eq!(
+            classify_unsolicited_nipopow_proof(&body).unwrap(),
+            UnsolicitedNipopowDisposition::V1InspectionDisabled { proof_size: 1 }
+        );
+    }
+
+    #[test]
+    fn unsolicited_v1_proof_keeps_bounded_envelope_validation() {
+        let mut body = Vec::new();
+        body.put_u32(2).unwrap();
+        body.push(0xff);
+
+        assert!(matches!(
+            classify_unsolicited_nipopow_proof(&body),
+            Err(NipopowError::Truncated)
+        ));
+    }
+
+    #[test]
     fn serialize_get_nipopow_proof_no_anchor_round_trip() {
         let req = GetNipopowProofRequest {
             m: 6,
@@ -382,13 +433,13 @@ mod tests {
         let inner = parse_nipopow_proof(&envelope).unwrap();
         assert_eq!(inner, garbage_inner);
         // Now verify — scorex_parse_bytes should fail, not panic.
-        let result = enr_chain::verify_nipopow_proof_bytes(&inner);
+        let result = enr_chain::inspect_nipopow_proof_bytes(&inner);
         assert!(result.is_err());
     }
 
     #[test]
     fn verify_nipopow_empty_inner_bytes_returns_error() {
-        let result = enr_chain::verify_nipopow_proof_bytes(&[]);
+        let result = enr_chain::inspect_nipopow_proof_bytes(&[]);
         assert!(result.is_err());
     }
 
@@ -402,7 +453,7 @@ mod tests {
         inner.put_u32(10).unwrap(); // k
         inner.put_u32(0x7FFF_FFFF).unwrap(); // num_prefixes = 2 billion
 
-        let result = enr_chain::verify_nipopow_proof_bytes(&inner);
+        let result = enr_chain::inspect_nipopow_proof_bytes(&inner);
         assert!(result.is_err());
     }
 
@@ -419,7 +470,7 @@ mod tests {
         inner.put_u32(1).unwrap(); // suffix_head_size
         inner.push(0x00); // bogus header byte (will fail parse)
 
-        let result = enr_chain::verify_nipopow_proof_bytes(&inner);
+        let result = enr_chain::inspect_nipopow_proof_bytes(&inner);
         assert!(result.is_err());
     }
 
