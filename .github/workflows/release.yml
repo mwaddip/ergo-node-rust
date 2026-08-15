@@ -6,6 +6,12 @@ name: release
 
 on:
   # Two ways in, and they must stay equivalent.
+  #
+  # ⚠ They were not. The merge path ran for the first time at v0.8.0 — every
+  # earlier release came in by pushed tag — and failed at the final step
+  # because the release action was never told the tag name. Anything added
+  # here that reads github.ref must be checked against BOTH events: on a
+  # merged PR it is refs/pull/<n>/merge, not a tag and not a branch.
   push:
     tags:
       - 'v*'
@@ -170,6 +176,16 @@ jobs:
             ${{ steps.artifacts.outputs.fastsync_tar }}
             ${{ steps.artifacts.outputs.indexer_deb }}
             ${{ steps.artifacts.outputs.fastsync_deb }}
+          # REQUIRED on the merge path, and the reason it had never worked.
+          #
+          # On a tag push, github.ref IS the tag and the action infers it. On a
+          # merged PR, github.ref is refs/pull/<n>/merge — the tag this job
+          # created and pushed minutes earlier is invisible to the action, and
+          # it fails with "GitHub Releases requires a tag" AFTER tagging and
+          # building everything. `steps.tag` already publishes the name for
+          # exactly this, and the step above it says the release step "does not
+          # care which path it came from"; it did, because nothing passed it.
+          tag_name: ${{ steps.tag.outputs.name }}
           body: ${{ steps.tagbody.outputs.body }}
           generate_release_notes: true
           fail_on_unmatched_files: true
