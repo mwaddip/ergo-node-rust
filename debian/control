@@ -1,5 +1,5 @@
 Package: ergo-node-rust
-Version: 0.1.0
+Version: 0.8.0
 Section: net
 Priority: optional
 Architecture: amd64

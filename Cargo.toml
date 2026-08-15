@@ -2,9 +2,25 @@
 members = [".", "sync", "validation", "state", "mempool", "api", "mining", "p2p", "chain", "store"]
 exclude = ["addons/fastsync", "addons/indexer"]
 
+# THE version literal. Every workspace member inherits it via
+# `version.workspace = true`, so a release bump is this one line.
+#
+# The members used to carry their own `version = "0.1.0"`, set once when each
+# was absorbed from a submodule and never moved again through eight releases.
+# They are internal path dependencies, never published, and nothing pins a
+# version on them — so the number was pure decoration that disagreed with the
+# thing it looked like it described.
+#
+# ⚠ The `exclude`d addons do NOT inherit this and keep their own versions
+# (fastsync 0.1.8, indexer 0.2.8). They ship separately, on their own cadence,
+# with their own lockfiles. That is deliberate — do not "fix" it by pulling
+# them into the workspace.
+[workspace.package]
+version = "0.8.0"
+
 [package]
 name = "ergo-node-rust"
-version = "0.8.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "Full Ergo blockchain node in Rust"

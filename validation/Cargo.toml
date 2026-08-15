@@ -1,6 +1,6 @@
 [package]
 name = "ergo-validation"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "Block validation for the Ergo Rust node"
