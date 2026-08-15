@@ -321,6 +321,31 @@ struct SolvedLatch {
 }
 ```
 
+### Startup: the proof cache must be seeded
+
+`main` holds a `MiningProofData` cache — the parent header and emission box the
+mining task builds each candidate from. It is written by
+`Validator::update_mining_proofs`, which runs **only on the post-apply path**,
+and the mining task refuses to build when it is absent or its `tip_height`
+does not match the current validated height.
+
+⚠ **`main` MUST seed it at startup from the restored tip.** Otherwise a node
+restarted while already at the chain tip serves 503 from `/mining/candidate`
+until a peer delivers the next block — and for a node that is the only miner
+on its network, never: no candidate, so no block, so no application, so no
+candidate. Observed in the field as an hour of 503s after an at-tip restart,
+with three peers connected.
+
+The gap is invisible during sync, which is why it survived: a catching-up node
+applies a block within seconds and the cache fills itself. Only an at-tip
+restart exposes it.
+
+Seeding depends on `emission_box_id()` being valid on a freshly constructed
+validator — see `facts/validation.md` § "Recovering `emission_box_id` on
+resume". **Seeding the cache alone does not fix this**; without that recovery
+`update_mining_proofs` returns early at the emission-box check and the symptom
+is unchanged, which makes it look like the diagnosis was wrong.
+
 ### Lifecycle API
 
 ```rust

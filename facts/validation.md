@@ -201,13 +201,52 @@ pub trait MiningState {
     fn proofs_for_transactions(&self, txs: &[Transaction])
         -> Result<(Vec<u8>, ADDigest), ValidationError>;
 
-    /// Current emission box ID in the UTXO set, updated after each block.
+    /// Current emission box ID in the UTXO set.
     ///
     /// `None` means **all ERG has been emitted** — nothing else. It no
     /// longer doubles as the digest-mode signal.
+    ///
+    /// ⚠ **Valid immediately after construction, not only after the first
+    /// applied block.** See "Recovering emission_box_id on resume" below.
     fn emission_box_id(&self) -> Option<[u8; 32]>;
 }
 ```
+
+### Recovering `emission_box_id` on resume
+
+`emission_box_id` is **derived state**: it is discovered by scanning a block's
+insertions for an output whose `ErgoTree` matches the emission contract. That
+scan runs during `apply_state`, so a freshly constructed `UtxoValidator` has
+`None` until it applies a block.
+
+**That is a defect, and it must be recovered at construction.** `None` is not a
+neutral placeholder here — it is indistinguishable from "all ERG emitted", and
+the one consumer (`main`'s `update_mining_proofs`) returns early on it. A node
+restarted while already at the chain tip therefore serves **no mining
+candidate at all** until a peer delivers the next block. Where that node is
+the only miner, it is a hard deadlock rather than a delay: no candidate, so no
+block, so no application, so no candidate. Reported from the field after an
+at-tip restart sat at 503 for over an hour.
+
+**Recover it from the tip block, not from a UTXO-set scan.** The emission box
+is spent and recreated by the coinbase of every block that has one, so the
+insertions of the block at the resume height contain the current emission box.
+That is one block to parse. Scanning the UTXO set for a matching `ErgoTree`
+would be O(millions of boxes) and is not an acceptable startup cost.
+
+**Reuse the existing scan; do not write a second one.** The apply-time loop
+already does exactly this match. Extract it and call it from both paths — two
+implementations of "which box is the emission box" is precisely the divergence
+this contract exists to prevent.
+
+`None` after a successful recovery attempt remains correct and means what it
+says: the tip block created no emission output, i.e. emission has ended. A
+recovery that cannot read its input is a different case and must be logged
+rather than silently leaving `None`.
+
+⚠ **Do not "fix" this by persisting the ID alongside the state digest.** It is
+derivable from authoritative state, and a persisted copy is a second source of
+truth that can disagree with the tree it describes.
 
 ### Who implements what
 
@@ -956,6 +995,17 @@ Constraint: the store must have ADProofs for blocks above the validator's
 starting height. A store populated in UTXO mode lacks ADProofs for
 historical blocks — only blocks synced after switching to digest mode
 will have ADProofs available for validation.
+
+⚠ **Derived state must be reconstructed here, not left to the first applied
+block.** `emission_box_id` was, and the gap was invisible during sync — a
+catching-up node applies a block within seconds and the field fills in. It only
+manifests on a node restarted **at tip**, where the next application may be
+minutes away or, for a solo miner, never. See "Recovering `emission_box_id` on
+resume" above.
+
+The general rule: any field maintained incrementally by `apply_state` is
+suspect on resume. Ask what its value means before the first block, and
+whether that value is distinguishable from a legitimate one.
 
 ## Implementation Notes (Verified Against Testnet)
 
