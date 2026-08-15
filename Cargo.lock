@@ -804,6 +804,7 @@ name = "ergo-mining"
 version = "0.1.0"
 dependencies = [
  "blake2",
+ "enr-chain",
  "ergo-chain-types",
  "ergo-lib",
  "ergo-merkle-tree",
