@@ -1,5 +1,73 @@
 # Changelog
 
+## v0.8.1 — 2026-08-18
+
+### Release summary
+
+- Fixed: `CONTEXT.headers` exposed ten preceding headers where the reference node exposes nine, so a block every JVM node rejects could be accepted here.
+- Fixed: the mempool and mining-candidate contexts also exposed ten; all three paths now expose nine.
+- Fixed: a node that had spent its unknown-parent request budget could never ask for a missing parent again, leaving it stuck on an orphaned tip.
+
+### Fixed
+
+#### `CONTEXT.headers` exposes nine headers, not ten — consensus
+
+The JVM keeps two things under similar names. `lastHeaders` holds ten entries
+and **includes the block's own header at the head**
+(`newHeaders = header +: lastHeaders.take(LastHeadersInContext - 1)`).
+`sigmaLastHeaders` — what a script actually sees as `CONTEXT.headers` — is
+`lastHeaders.drop(1)`, so **nine**; the dropped entry is the block itself.
+`UpcomingStateContext` overrides that with the whole list, which is why
+candidate assembly and mempool prediction saw ten.
+
+Our window holds headers *strictly preceding* the block, because the block's
+own header goes in the preheader and is never in the slice. So the JVM's
+`drop(1)` never meant "drop something here" — it meant **take nine instead of
+ten**. We took ten, on all three paths. `headerChainBack(10, …)` was cited in
+the source as parity evidence; it gathers `lastHeaders`, not
+`sigmaLastHeaders`, and that citation is what made ten look correct.
+
+A script reading `CONTEXT.headers(9)` therefore evaluated fine here and threw
+`ArrayIndexOutOfBoundsException` on every JVM node. The divergence was
+accept-side — this node would follow a chain the network orphans, with nothing
+in its logs reporting a problem.
+
+Found when the same asymmetry took mainnet block production down on
+2026-08-18: on the JVM, candidate construction validated at ten and the
+completed block at nine, so a script reading `headers(9)` passed the first and
+failed the second, and the transaction was pushed back into the mempool and
+re-selected indefinitely. This node was self-consistent at ten across all three
+paths and so could not hit that failure mode, but its block validation was one
+header more permissive than consensus. All three paths are now nine, matching
+the agreed cross-client resolution.
+
+**No resync is required.** A canonical block cannot contain a script the
+reference node rejects, so nothing this node accepted depended on the tenth
+header. A script that merely read `CONTEXT.headers.size` would have produced a
+different state root and failed the existing state-root check loudly; that has
+not happened.
+
+#### Unknown-parent requests are an in-flight limit, not a lifetime budget
+
+When a header arrives whose parent is unknown, the validation pipeline buffers
+it and asks peers for the parent, bounded to three concurrent requests so a
+batch of orphans cannot fan out into a request storm. The set backing that
+bound was only ever inserted into — never cleared when a parent arrived, never
+expired when none ever did. Three was therefore a budget for the lifetime of
+the process, not a limit on requests in flight.
+
+Once spent, the node could no longer ask for a missing parent at all. It then
+recovered only if some peer volunteered the header unprompted, which is a
+matter of which peers it happens to be connected to.
+
+Observed on 2026-08-18: a node that woke from suspend holding an orphaned tip
+at height 1,853,471 sat at that height for 1h48m — receiving headers it could
+not attach and discarding them — until a peer finally announced the one header
+it was no longer able to request.
+
+Request slots are now released when the parent arrives, and expire after 60
+seconds when it never does.
+
 ## v0.8.0 — 2026-08-13
 
 <!--
