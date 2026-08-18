@@ -1248,8 +1248,16 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 }
             };
 
-            // Get preceding headers (up to 10) for ErgoStateContext
-            let preceding_start = height.saturating_sub(10).max(1);
+            // Preceding headers for the block's ErgoStateContext, newest
+            // first. Nine, not ten: `CONTEXT.headers` is `sigmaLastHeaders`
+            // (the JVM's `lastHeaders.drop(1)`), and our window holds headers
+            // strictly preceding the block because its own header goes in the
+            // preheader. Ten here would be trimmed to nine by
+            // `build_state_context` anyway — but a window that is only the
+            // right size because the callee trims it is how the ten-vs-nine
+            // divergence hid in the first place. See `../facts/validation.md`
+            // § "Window size: `CONTEXT.headers` is 9 for a block, never 10".
+            let preceding_start = height.saturating_sub(9).max(1);
             let mut preceding = Vec::new();
             for h in (preceding_start..height).rev() {
                 if let Some(hdr) = self.chain.header_at(h).await {
