@@ -83,9 +83,12 @@ pub struct GeneratedCandidate {
 ///   `max_block_size`. Not `boundary_params`: those are the parameters the
 ///   epoch boundary will *install*, and the JVM likewise bounds assembly with
 ///   `stateContext.currentParameters` (`CandidateGenerator.scala:591-598`)
-/// - `ancestor_headers` — headers before `parent`, newest first. `parent` is
-///   prepended internally to form the ≤10-header window the upcoming block's
-///   `ErgoStateContext` needs, so this may be empty near genesis
+/// - `ancestor_headers` — headers before `parent`, newest first, as
+///   `chain.headers_from(parent.height - 8, 9)` reversed minus the parent.
+///   `parent` is prepended internally to form the NINE-header
+///   `CONTEXT.headers` window the upcoming block's `ErgoStateContext` needs
+///   (see `context_window` for why nine and not ten), so at most eight of
+///   these are used and near genesis the slice may be short or empty
 /// - `utxo_lookup` — resolve a box id against the UTXO set
 ///
 /// `validator_proofs` is a closure that calls
@@ -134,9 +137,7 @@ pub fn generate_candidate(
         (vec![emission_tx], Vec::new())
     } else {
         let upcoming = upcoming_header(parent, version, n_bits, height, timestamp, config);
-        let mut window = Vec::with_capacity(1 + ancestor_headers.len().min(9));
-        window.push(parent.clone());
-        window.extend(ancestor_headers.iter().take(9).cloned());
+        let window = context_window(parent, ancestor_headers);
         let state_context = build_state_context(&upcoming, &window, parameters);
 
         select_and_collect_fees(
@@ -190,6 +191,45 @@ pub fn generate_candidate(
         work,
         invalid_txs,
     })
+}
+
+/// Headers a script sees as `CONTEXT.headers` — **nine**, the JVM's
+/// `sigmaLastHeaders`, not the ten-entry `lastHeaders` it is derived from
+/// (that list carries the block's own header at its head, and ours never
+/// does: the block's header goes in the preheader).
+///
+/// `facts/validation.md` § "Window size: `CONTEXT.headers` is 9 for a block,
+/// never 10" is the authority. Restated here rather than imported because
+/// nothing exports it yet; it belongs next to `build_state_context` once
+/// `ergo-validation` names it.
+const CONTEXT_HEADERS: usize = 9;
+
+/// The `CONTEXT.headers` window the candidate's transactions execute under:
+/// `parent` at the head, then up to eight of its ancestors, newest first —
+/// `CONTEXT_HEADERS` total.
+///
+/// Selection validates every candidate transaction against this window, so it
+/// must be the window block validation will judge with. A path that predicts
+/// with a wider one eventually packs a transaction into a block that cannot
+/// be accepted: the JVM shipped exactly that inconsistency and it took
+/// mainnet block production down on 2026-08-18 — a script reading
+/// `headers(9)` passed candidate construction at ten and threw on the
+/// completed block at nine.
+///
+/// The count is cut here rather than left to `build_state_context`'s own
+/// truncation. A window that is only the right size because someone else
+/// trims it is the next person's bug.
+///
+/// ⚠ Near genesis fewer than eight ancestors is legal chain state — the JVM's
+/// `headerChainBack` stops at genesis — so a short window is passed through
+/// unpadded. Padding by repeating the oldest header diverged from the
+/// reference node once already.
+fn context_window(parent: &Header, ancestor_headers: &[Header]) -> Vec<Header> {
+    let max_ancestors = CONTEXT_HEADERS - 1;
+    let mut window = Vec::with_capacity(1 + ancestor_headers.len().min(max_ancestors));
+    window.push(parent.clone());
+    window.extend(ancestor_headers.iter().take(max_ancestors).cloned());
+    window
 }
 
 /// The header the candidate's transactions will execute under.
@@ -617,5 +657,127 @@ impl CandidateGenerator {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ergo_chain_types::EcPoint;
+    use ergo_validation::build_state_context;
+
+    /// A syntactically complete header at `height`, distinguishable by `seed`.
+    /// Nothing here is chain-valid — the window is a slice operation and never
+    /// inspects linkage.
+    fn header_at(height: u32, seed: u8) -> Header {
+        Header {
+            version: 2,
+            id: BlockId(Digest::from([seed; 32])),
+            parent_id: BlockId(Digest::from([seed.wrapping_sub(1); 32])),
+            ad_proofs_root: Digest32::from([0u8; 32]),
+            state_root: ADDigest::from([0u8; 33]),
+            transaction_root: Digest32::from([0u8; 32]),
+            timestamp: 1_000 + u64::from(height),
+            n_bits: 16842752,
+            height,
+            extension_root: Digest32::from([0u8; 32]),
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce: vec![0u8; 8],
+                pow_distance: None,
+            },
+            votes: Votes([0, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        }
+    }
+
+    /// A parent at `parent_height` and the `count` headers below it, newest
+    /// first — the shape `generate_candidate`'s caller passes.
+    fn parent_and_ancestors(parent_height: u32, count: u32) -> (Header, Vec<Header>) {
+        let parent = header_at(parent_height, parent_height as u8);
+        let ancestors = (1..=count)
+            .map(|back| header_at(parent_height - back, (parent_height - back) as u8))
+            .collect();
+        (parent, ancestors)
+    }
+
+    /// `CONTEXT.headers` is NINE for a block, never ten
+    /// (`facts/validation.md`). Selection must predict with the window block
+    /// validation judges with, or it packs transactions into a block that
+    /// cannot be accepted.
+    ///
+    /// The count is asserted on the window this crate builds, not only on the
+    /// context that comes out of it: `build_state_context` truncates too, and
+    /// a window that is only the right size because someone else cut it is
+    /// the next person's bug.
+    #[test]
+    fn context_window_is_nine_headers_when_ancestors_are_plentiful() {
+        let (parent, ancestors) = parent_and_ancestors(100, 12);
+        let window = context_window(&parent, &ancestors);
+
+        assert_eq!(
+            window.len(),
+            9,
+            "window must be the parent plus EIGHT ancestors; got heights {:?}",
+            window.iter().map(|h| h.height).collect::<Vec<_>>()
+        );
+        assert_eq!(window[0].id, parent.id, "the parent heads the window");
+        assert_eq!(
+            window[1..].iter().map(|h| h.height).collect::<Vec<_>>(),
+            (92..=99).rev().collect::<Vec<_>>(),
+            "ancestors follow newest first, contiguous below the parent"
+        );
+        assert!(
+            !window.iter().any(|h| h.height == 91),
+            "the ninth ancestor is past the window and must be dropped here, \
+             not left for build_state_context to cut"
+        );
+
+        let upcoming = Header {
+            height: parent.height + 1,
+            parent_id: parent.id,
+            ..parent.clone()
+        };
+        let ctx = build_state_context(&upcoming, &window, &Parameters::default());
+        assert_eq!(
+            ctx.headers.len(),
+            9,
+            "CONTEXT.headers as a selected transaction sees it"
+        );
+    }
+
+    /// Near genesis fewer than eight ancestors is legal chain state — the
+    /// JVM's `headerChainBack` stops at genesis. Pass the short window
+    /// through unpadded; padding by repeating the oldest header diverged from
+    /// the reference node once already.
+    #[test]
+    fn context_window_near_genesis_is_short_and_unpadded() {
+        // Genesis is height 1 in Ergo: mining the block above it has no
+        // ancestors to offer at all.
+        let genesis = header_at(1, 1);
+        assert_eq!(
+            context_window(&genesis, &[]).len(),
+            1,
+            "at genesis the parent is the whole window"
+        );
+
+        // Height 4: three headers exist below the parent, not eight.
+        let (parent, ancestors) = parent_and_ancestors(4, 3);
+        let window = context_window(&parent, &ancestors);
+        assert_eq!(
+            window.len(),
+            4,
+            "parent plus the three ancestors that exist, not padded to nine"
+        );
+        assert_eq!(
+            window.iter().map(|h| h.height).collect::<Vec<_>>(),
+            vec![4, 3, 2, 1],
+            "the real chain, newest first, down to genesis"
+        );
+        let mut ids: Vec<_> = window.iter().map(|h| h.id).collect();
+        ids.sort_by_key(|id| id.0);
+        ids.dedup();
+        assert_eq!(ids.len(), 4, "no header is repeated to pad the window");
     }
 }

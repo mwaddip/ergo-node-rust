@@ -602,6 +602,81 @@ pub fn build_upcoming_state_context(
 ) -> ErgoStateContext;
 ```
 
+### Window size: `CONTEXT.headers` is 9 for a block, never 10
+
+**`build_state_context` must expose exactly 9 preceding headers.** This is a
+consensus rule, not a tuning choice.
+
+The JVM keeps two different things under similar names, and conflating them is
+what produced the 2026-08-18 divergence:
+
+| JVM name | Size | What it is |
+|---|---|---|
+| `lastHeaders` | 10 | internal list, **includes the block's own header at the head** |
+| `sigmaLastHeaders` | **9** | what a script sees as `CONTEXT.headers` |
+
+`ErgoStateContext.scala`:
+
+- L233 — `newHeaders = header +: lastHeaders.take(LastHeadersInContext - 1)`.
+  Appending block `B` yields `[B, h-1 … h-9]`: ten entries, `B` at the head.
+- L87 — base class: `sigmaLastHeaders = lastHeaders.drop(1)` → `[h-1 … h-9]`,
+  **nine**. The dropped entry is `B` itself.
+- L46 — `UpcomingStateContext` overrides `sigmaLastHeaders` with the whole
+  `lastHeaders`, **no drop** → ten. There is no block of its own to drop.
+
+Our builders take headers **strictly preceding** the block — the block's own
+header goes in the preheader, never in the window. So the JVM's `drop(1)` does
+not translate to dropping anything on our side; it translates to **taking nine
+instead of ten**. `headerChainBack(10, …)` gathers `lastHeaders`, not
+`sigmaLastHeaders`, and citing it as parity evidence for a 10-header window is
+the specific error to avoid.
+
+#### Caller obligations
+
+| Path | `CONTEXT.headers` | Consensus |
+|---|---|---|
+| block validation (`build_state_context`) | **9** | **yes** |
+| mining candidate assembly | 9 | no |
+| mempool / API (`build_upcoming_state_context`) | 9 | no |
+
+Only the first is consensus. The other two are set to 9 **deliberately**, so a
+transaction can never be admitted to the mempool or packed into a candidate and
+then rejected by the block validation that must follow it. A path that predicts
+with a wider window than the one that judges is the exact shape of the JVM
+incident below.
+
+⚠ **This is convergence with the JVM, not a divergence from it.** The agreed
+resolution is nine on every path — kushti, 2026-08-18: *"There must be 9 plus
+preheader everywhere."* The JVM is aligning `UpcomingStateContext` down to nine
+rather than widening full-block validation to ten, which would have needed
+coordinated protocol activation.
+
+Until that lands, a transaction reading `CONTEXT.headers(9)` is still accepted
+by a JVM mempool and refused by ours. Ours is the safe side of a transient gap:
+that transaction cannot be mined into a block any node will accept, so refusing
+it early costs nothing.
+
+#### Why this matters
+
+A script reading `CONTEXT.headers(9)` or branching on `CONTEXT.headers.size`
+sees a different chain depending on which client validates it. With a 10-header
+window we **accept a block every JVM node rejects** with
+`ArrayIndexOutOfBoundsException`, and follow a chain the network orphans. The
+divergence is accept-side, which is the dangerous direction: nothing in our logs
+reports a problem.
+
+Observed on mainnet 2026-08-18 (JVM block-production incident at ~1853471–4,
+reported by kushti): a script at `b44970ed…` reads `headers(9)`, so it passed
+JVM candidate construction at ten and threw on the completed block at nine. Our
+node was 10/10/10 — internally consistent, so it could not hit the JVM's
+candidate-vs-block failure, but its full-block validation was one header more
+permissive than consensus. It was spared only because it never obtained the
+block body in question.
+
+`sigma-rust` is **not** the constraint: `Headers = BoundedVec<Header, 1, 10>`
+permits one through ten and enforces nothing about which. The window size is
+entirely the caller's contract.
+
 ### Why two
 
 An unconfirmed transaction is not a member of the chain tip — it is a candidate

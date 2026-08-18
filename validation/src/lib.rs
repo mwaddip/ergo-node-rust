@@ -74,7 +74,10 @@ pub struct ScriptEvalInputs {
     pub proof_boxes: HashMap<[u8; 32], ErgoBox>,
     /// Block header.
     pub header: Header,
-    /// Up to 10 preceding headers (newest first).
+    /// Preceding headers, newest first. `build_state_context` exposes the
+    /// newest **9** of these as `CONTEXT.headers` — the JVM's
+    /// `sigmaLastHeaders`, not its ten-entry `lastHeaders`. Supplying more is
+    /// harmless; supplying fewer near genesis is legal chain state.
     pub preceding_headers: Vec<Header>,
     /// Active chain parameters.
     pub parameters: Parameters,

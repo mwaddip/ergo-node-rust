@@ -32,28 +32,52 @@ pub fn deserialize_box(bytes: &[u8]) -> Result<ErgoBox, ValidationError> {
     })
 }
 
-/// Build an ErgoStateContext from a header and its real ≤10 preceding headers
-/// (newest first), passed through unpadded.
+/// Build an ErgoStateContext from a header and its preceding headers (newest
+/// first). Exposes **exactly 9** of them as `CONTEXT.headers`; a shorter window
+/// passes through unpadded.
 ///
-/// The JVM gathers the same variable window — `headerChainBack(10, …)` stops
-/// at genesis (`FullBlockProcessor:71`), so fewer than 10 headers near genesis
-/// is legal chain state; padding to 10 by repeating the oldest (what this did
-/// before) diverged from the reference node for scripts reading
-/// `CONTEXT.headers`. ergo-lib derives `lastBlockUtxoRoot` from the newest
-/// preceding header's state_root — identical to the JVM's
-/// `previousStateDigest` (`ErgoStateContext.scala:92`) — with AvlTree flags
-/// verified against `ErgoContext.scala:17` / `ErgoInterpreter.scala:103-106`;
-/// nothing to override on our side.
+/// # Nine, never ten — this one is consensus
 ///
-/// Requires ≥ 1 preceding header — caller-guarded, and now also enforced by
-/// the `Headers` type.
+/// The JVM keeps two lists under similar names, and conflating them forks the
+/// chain (`ErgoStateContext.scala`):
+///
+/// - `lastHeaders` — ten, and **includes the block's own header at the head**:
+///   `newHeaders = header +: lastHeaders.take(LastHeadersInContext - 1)` (L233).
+/// - `sigmaLastHeaders` — what a script sees as `CONTEXT.headers`:
+///   `lastHeaders.drop(1)` (L87), so **nine**. The dropped entry is the block
+///   itself.
+///
+/// Our window holds headers *strictly preceding* the block — the block's own
+/// header goes in the preheader and is never in this slice — so the JVM's
+/// `drop(1)` does not mean "drop something here". It means **take nine instead
+/// of ten**. `headerChainBack(10, …)` (`FullBlockProcessor:71`) gathers
+/// `lastHeaders`, not `sigmaLastHeaders`; citing it as parity evidence for a
+/// ten-header window is the specific error that produced the divergence this
+/// replaces. At ten we accept a block every JVM node rejects with
+/// `ArrayIndexOutOfBoundsException` on `CONTEXT.headers(9)` and follow a chain
+/// the network orphans — accept-side, so nothing in our logs reports it.
+/// (Observed on mainnet 2026-08-18: script `b44970ed…` reads `headers(9)`.)
+///
+/// Fewer than nine near genesis is legal chain state — `headerChainBack` stops
+/// there — and passes through unpadded; padding by repeating the oldest (what
+/// this did before that) is its own divergence. `sigma-rust` enforces nothing
+/// here: `Headers = BoundedVec<Header, 1, 10>` permits any of one through ten.
+///
+/// ergo-lib derives `lastBlockUtxoRoot` from the newest preceding header's
+/// state_root — identical to the JVM's `previousStateDigest`
+/// (`ErgoStateContext.scala:92`) — with AvlTree flags verified against
+/// `ErgoContext.scala:17` / `ErgoInterpreter.scala:103-106`; nothing to
+/// override on our side.
+///
+/// Requires ≥ 1 preceding header — caller-guarded, and also enforced by the
+/// `Headers` type.
 pub fn build_state_context(
     header: &Header,
     preceding_headers: &[Header],
     parameters: &Parameters,
 ) -> ErgoStateContext {
     let pre_header = PreHeader::from(header.clone());
-    let headers = Headers::from_vec(preceding_headers.iter().take(10).cloned().collect())
+    let headers = Headers::from_vec(preceding_headers.iter().take(9).cloned().collect())
         .expect("build_state_context requires at least one preceding header (caller-guarded)");
     ErgoStateContext::new(pre_header, headers, parameters.clone())
 }
@@ -89,7 +113,8 @@ pub fn build_state_context(
 /// Unlike `build_state_context` there is no non-empty requirement:
 /// `preceding_headers` may be empty (height 1), since `last_header` alone
 /// already satisfies the `Headers` lower bound. The window is `last_header`
-/// plus up to 9 of them — 10 total, the JVM's `LastHeadersInContext`.
+/// plus up to 8 of them — **9 total, the same as block validation**, the tip
+/// having taken one of the nine slots.
 ///
 /// # JVM reference
 ///
@@ -97,11 +122,24 @@ pub fn build_state_context(
 /// composed with `PreHeader.apply` (`PreHeader.scala:49-63`) and
 /// `AutolykosPowScheme.derivedHeaderFields` (`AutolykosPowScheme.scala:455`).
 /// `UpcomingStateContext` overrides `sigmaLastHeaders` to the whole
-/// `lastHeaders` with no `drop(1)` (`ErgoStateContext.scala:46`) — that missing
-/// drop is precisely why the tip stays in the window here while block
-/// validation excludes its own header.
+/// `lastHeaders` with no `drop(1)` (`ErgoStateContext.scala:46`) — there is no
+/// block of its own to drop, which is why the tip stays *in* the window here
+/// while block validation keeps the block's own header out of it.
 ///
-/// Two deliberate divergences, both recorded in the contract:
+/// Three deliberate divergences, all recorded in the contract:
+/// - the window is **9, where the JVM currently has 10**. That same missing
+///   `drop(1)` leaves `UpcomingStateContext` one header wider than the block
+///   validation which must follow it — the exact shape of the 2026-08-18
+///   mainnet incident, where a script reading `headers(9)` passed JVM candidate
+///   construction at ten and threw on the completed block at nine. The agreed
+///   cross-client resolution is nine everywhere (kushti, 2026-08-18: "There
+///   must be 9 plus preheader everywhere"), with the JVM aligning `Upcoming`
+///   down rather than block validation widening to ten — widening is a
+///   consensus change and would need coordinated activation. Until that lands,
+///   a transaction reading `headers(9)` is accepted by a JVM mempool and
+///   refused here; that is the safe side of a transient gap, since no such
+///   transaction can be mined into a block any node accepts. **Do not "fix"
+///   this back to 10.**
 /// - `parameters` are the caller's, active for `last_header`. The JVM
 ///   recomputes them for `height + 1` inside `simplifiedUpcoming()`; the two
 ///   differ only on a block that crosses an epoch boundary.
@@ -146,9 +184,9 @@ pub fn build_upcoming_state_context(
         votes: Votes([0, 0, 0]),
     };
 
-    let mut window = Vec::with_capacity(1 + preceding_headers.len().min(9));
+    let mut window = Vec::with_capacity(1 + preceding_headers.len().min(8));
     window.push(last_header.clone());
-    window.extend(preceding_headers.iter().take(9).cloned());
+    window.extend(preceding_headers.iter().take(8).cloned());
     let headers =
         Headers::from_vec(window).expect("window always holds last_header, so it is never empty");
 
@@ -1101,17 +1139,29 @@ mod state_context_window_tests {
         assert_eq!(ctx.headers.last().height, 1);
     }
 
-    /// Steady state: a full 10-header window passes through as-is.
+    /// Steady state: `CONTEXT.headers` is **nine**, however many the caller
+    /// supplies.
+    ///
+    /// Nine is the JVM's `sigmaLastHeaders` (`ErgoStateContext.scala:87` —
+    /// `lastHeaders.drop(1)`), not the ten-entry `lastHeaders`. The dropped
+    /// entry is the block's own header, which lives in our preheader and was
+    /// never in this slice, so the `drop(1)` translates to taking nine here
+    /// rather than to dropping anything. Twelve are passed in so the nine is
+    /// proven to be a cap and not merely "all of them".
     #[test]
-    fn full_window_passes_through_identically() {
+    fn window_is_nine_not_ten() {
         let header = header_at(20);
-        // Heights 19 down to 10, newest first.
-        let preceding: Vec<Header> = (10..20).rev().map(header_at).collect();
+        // Heights 19 down to 8, newest first — more than the window holds.
+        let preceding: Vec<Header> = (8..20).rev().map(header_at).collect();
         let ctx = build_state_context(&header, &preceding, &Parameters::default());
 
-        assert_eq!(ctx.headers.len(), 10);
-        assert_eq!(ctx.headers.first().height, 19);
-        assert_eq!(ctx.headers.last().height, 10);
+        assert_eq!(
+            ctx.headers.len(),
+            9,
+            "a tenth header is one every JVM node throws on indexing"
+        );
+        assert_eq!(ctx.headers.first().height, 19, "the block's parent");
+        assert_eq!(ctx.headers.last().height, 11, "nine back, not ten");
     }
 }
 
@@ -1246,15 +1296,22 @@ mod upcoming_state_context_tests {
         );
     }
 
-    /// The tip occupies a slot in the window, so ten ancestors become nine.
-    /// Total stays at the JVM's `LastHeadersInContext`.
+    /// The tip occupies a slot in the nine, so only eight ancestors fit.
+    ///
+    /// Nine here is deliberate convergence rather than a copy of the JVM as it
+    /// stands: `UpcomingStateContext` overrides `sigmaLastHeaders` to the whole
+    /// ten-entry `lastHeaders` with no `drop(1)` (`ErgoStateContext.scala:46`),
+    /// and is being aligned *down* to nine rather than block validation being
+    /// widened to ten. A path that predicts against a wider window than the one
+    /// that judges is exactly the JVM's 2026-08-18 candidate-vs-block incident.
     #[test]
-    fn window_is_the_tip_plus_nine_ancestors() {
+    fn window_is_the_tip_plus_eight_ancestors() {
         let last = header_at(20);
-        let preceding: Vec<Header> = (10..20).rev().map(header_at).collect();
+        // Heights 19 down to 8 — more ancestors than the window holds.
+        let preceding: Vec<Header> = (8..20).rev().map(header_at).collect();
         let ctx = build_upcoming_state_context(&last, &preceding, &Parameters::default());
 
-        assert_eq!(ctx.headers.len(), 10);
+        assert_eq!(ctx.headers.len(), 9, "nine plus preheader, everywhere");
         assert_eq!(
             ctx.headers.first().height,
             20,
@@ -1262,8 +1319,8 @@ mod upcoming_state_context_tests {
         );
         assert_eq!(
             ctx.headers.last().height,
-            11,
-            "the tenth ancestor (height 10) drops out to make room for the tip"
+            12,
+            "the tip takes a slot, so the ninth ancestor drops out"
         );
     }
 
@@ -1300,7 +1357,7 @@ mod upcoming_state_context_tests {
 
         let upcoming = build_upcoming_state_context(&last, &ancestors, &Parameters::default());
 
-        // The block at 21, once mined, validates against the tip and its nine
+        // The block at 21, once mined, validates against the tip and its eight
         // ancestors — which is exactly what the mempool saw a moment earlier.
         let mut preceding_for_next = vec![last.clone()];
         preceding_for_next.extend(ancestors.iter().cloned());
@@ -1317,6 +1374,11 @@ mod upcoming_state_context_tests {
             at_next.headers.as_vec(),
             "same chain position, same window"
         );
+        // Equality alone is satisfied by two windows that are equally wrong —
+        // 10/10 was "internally consistent" too, and that is what let the
+        // divergence sit unseen. Pin the absolute size, not just the agreement.
+        assert_eq!(upcoming.headers.len(), 9);
+        assert_eq!(at_next.headers.len(), 9);
     }
 }
 

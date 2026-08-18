@@ -16,7 +16,7 @@ exclude = ["addons/fastsync", "addons/indexer"]
 # with their own lockfiles. That is deliberate — do not "fix" it by pulling
 # them into the workspace.
 [workspace.package]
-version = "0.8.0"
+version = "0.8.1"
 
 [package]
 name = "ergo-node-rust"

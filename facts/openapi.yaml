@@ -4,7 +4,7 @@ info:
   # Tracks the node version. Bump with the workspace version at release —
   # it sat at 0.6.5 through six releases because nothing tied the two
   # together. Moves with Cargo.toml, the addons, and their lockfiles.
-  version: 0.8.0
+  version: 0.8.1
   description: |
     REST surface exposed by the `api/` crate. Most endpoints aim for byte- or
     shape-compatibility with the JVM reference node (`ergoplatform/ergo`) so

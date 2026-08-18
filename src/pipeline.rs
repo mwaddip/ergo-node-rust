@@ -14,6 +14,48 @@ use tokio::sync::{mpsc, Mutex};
 /// LRU buffer capacity for out-of-order headers (JVM: `headersCache` = 8192).
 const BUFFER_CAPACITY: usize = 8_192;
 
+/// Maximum concurrent unknown-parent requests (flood guard).
+const MAX_PARENT_REQUESTS: usize = 3;
+
+/// How long an unanswered parent request holds its slot. A parent no peer
+/// will serve must not occupy the budget for the life of the process.
+const PARENT_REQUEST_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Unknown-parent header requests that are currently outstanding.
+///
+/// Bounded so a batch of orphan headers cannot fan out into a request storm:
+/// the fork chain links backward, so fetching the lowest missing parent is
+/// enough to drain the rest of the buffer once it arrives.
+#[derive(Default)]
+struct ParentRequests {
+    in_flight: std::collections::HashMap<[u8; 32], std::time::Instant>,
+}
+
+impl ParentRequests {
+    /// Decide whether to ask peers for `parent_id`, recording the request.
+    ///
+    /// Slots are released two ways — [`Self::resolved`] when the parent
+    /// arrives, and the TTL when no peer ever serves it. Release by neither
+    /// leaves the node unable to ask for a missing parent at all: it then
+    /// recovers only if some peer volunteers the header unprompted, which
+    /// is a matter of which peers it happens to be connected to.
+    fn should_request(&mut self, parent_id: [u8; 32], now: std::time::Instant) -> bool {
+        self.in_flight
+            .retain(|_, at| now.saturating_duration_since(*at) < PARENT_REQUEST_TTL);
+        if self.in_flight.contains_key(&parent_id) || self.in_flight.len() >= MAX_PARENT_REQUESTS {
+            return false;
+        }
+        self.in_flight.insert(parent_id, now);
+        true
+    }
+
+    /// Record that a previously requested parent has arrived and chained,
+    /// releasing its slot.
+    fn resolved(&mut self, id: &[u8; 32]) {
+        self.in_flight.remove(id);
+    }
+}
+
 /// A modifier-store row: `(type_id, modifier_id, height, body_bytes, optional_aux_bytes)`.
 /// Used wherever we accumulate entries for `ModifierStore::put_batch`.
 type StoreEntry = (u8, [u8; 32], u32, Vec<u8>, Option<Vec<u8>>);
@@ -39,8 +81,8 @@ pub struct ValidationPipeline {
     delivery_data_tx: mpsc::Sender<DeliveryData>,
     tracker: HeaderTracker,
     buffer: LruCache<BlockId, (Header, Vec<u8>)>,
-    /// Parent IDs we've already requested for fork resolution (avoid flooding).
-    reorg_requested: std::collections::HashSet<[u8; 32]>,
+    /// Unknown-parent requests currently outstanding (avoid flooding).
+    reorg_requested: ParentRequests,
     /// Channel for forwarding unconfirmed transactions to the mempool task.
     tx_sender: Option<mpsc::Sender<([u8; 32], Vec<u8>)>>,
 }
@@ -63,7 +105,7 @@ impl ValidationPipeline {
             delivery_data_tx,
             tracker: HeaderTracker::new(),
             buffer: LruCache::new(NonZeroUsize::new(BUFFER_CAPACITY).unwrap()),
-            reorg_requested: std::collections::HashSet::new(),
+            reorg_requested: ParentRequests::default(),
             tx_sender: None,
         }
     }
@@ -301,6 +343,10 @@ impl ValidationPipeline {
             match chain.try_append(header.clone()) {
                 Ok(AppendResult::Extended) => {
                     chained += 1;
+                    // If this header was an outstanding parent request, it has
+                    // now arrived — release its slot rather than waiting out
+                    // the TTL.
+                    self.reorg_requested.resolved(&header_id.0 .0);
                     let score_bytes = chain
                         .score_at(header_height)
                         .expect("score for just-appended header")
@@ -323,6 +369,7 @@ impl ValidationPipeline {
                         match chain.try_append(buf.clone()) {
                             Ok(AppendResult::Extended) => {
                                 chained += 1;
+                                self.reorg_requested.resolved(&bid.0 .0);
                                 let buf_score_bytes = chain
                                     .score_at(buf_height)
                                     .expect("score for just-appended buffered header")
@@ -342,6 +389,7 @@ impl ValidationPipeline {
                     }
                 }
                 Ok(AppendResult::Forked { fork_height }) => {
+                    self.reorg_requested.resolved(&header_id.0 .0);
                     // Header is valid but forks from the best chain.
                     // Compute its cumulative score and store immediately
                     // (later headers in this batch may extend this fork).
@@ -457,12 +505,13 @@ impl ValidationPipeline {
                             "ParentNotFound"
                         );
 
-                        // Request the missing parent — but only the FIRST one per
-                        // batch to avoid flooding. The fork chain links backward,
-                        // so fetching the lowest missing parent is sufficient: once
-                        // it arrives and chains, the rest drain from the buffer.
-                        if (self.reorg_requested.is_empty() || self.reorg_requested.len() < 3)
-                            && self.reorg_requested.insert(parent_id.0 .0)
+                        // Request the missing parent, bounded by the in-flight
+                        // budget. The fork chain links backward, so fetching the
+                        // lowest missing parent is sufficient: once it arrives and
+                        // chains, the rest drain from the buffer.
+                        if self
+                            .reorg_requested
+                            .should_request(parent_id.0 .0, std::time::Instant::now())
                         {
                             let _ = self
                                 .delivery_control_tx
@@ -862,5 +911,60 @@ mod tests {
         let header2 = Header::scorex_parse_bytes(&bytes).unwrap();
         let bytes2 = header2.scorex_serialize_bytes().unwrap();
         assert_eq!(bytes, bytes2, "round-trip must be byte-identical");
+    }
+
+    /// A parent request that has been answered must give its slot back.
+    ///
+    /// Regression: `reorg_requested` was only ever inserted into, so the
+    /// three-slot flood guard was a lifetime budget rather than an
+    /// in-flight limit. Once spent, a node could never again ask for a
+    /// missing parent — observed 2026-08-18, where a node that woke from
+    /// suspend on an orphaned tip sat at that height for 1h48m until a peer
+    /// happened to announce the header it could no longer request.
+    #[test]
+    fn resolved_parent_request_frees_its_slot() {
+        let (mut pipeline, _tx, _progress_rx, _ctrl_rx, _data_rx, _dir) = test_pipeline();
+        let now = std::time::Instant::now();
+
+        for i in 1..=3u8 {
+            assert!(
+                pipeline.reorg_requested.should_request([i; 32], now),
+                "parent {i} must be requested while the in-flight budget has room"
+            );
+        }
+        assert!(
+            !pipeline.reorg_requested.should_request([4; 32], now),
+            "a fourth concurrent request must be held back by the flood guard"
+        );
+
+        // The first parent arrives and chains — that request is done.
+        pipeline.reorg_requested.resolved(&[1; 32]);
+
+        assert!(
+            pipeline.reorg_requested.should_request([4; 32], now),
+            "a resolved request must free its slot for the next unknown parent"
+        );
+    }
+
+    /// A parent request nobody answers must not hold its slot forever.
+    ///
+    /// The companion leak to [`resolved_parent_request_frees_its_slot`]: a
+    /// parent no peer will serve is never resolved, so without expiry it
+    /// occupies the budget permanently.
+    #[test]
+    fn unanswered_parent_request_expires_its_slot() {
+        let (mut pipeline, _tx, _progress_rx, _ctrl_rx, _data_rx, _dir) = test_pipeline();
+        let now = std::time::Instant::now();
+
+        for i in 1..=3u8 {
+            assert!(pipeline.reorg_requested.should_request([i; 32], now));
+        }
+        assert!(!pipeline.reorg_requested.should_request([4; 32], now));
+
+        let later = now + PARENT_REQUEST_TTL;
+        assert!(
+            pipeline.reorg_requested.should_request([4; 32], later),
+            "a request left unanswered past the TTL must release its slot"
+        );
     }
 }
