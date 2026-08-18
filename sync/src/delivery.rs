@@ -231,10 +231,7 @@ impl DeliveryTracker {
     /// slot to `growth_left` when the probe sequence lets the slot be marked
     /// EMPTY rather than DELETED. That depends on `RandomState`'s per-process
     /// hash seed, so after a burst of deliveries the same table reports
-    /// anything from a fraction of its real size up to the true value — the
-    /// first draft of this method was caught by its own test halving between
-    /// runs. A figure built on it would be wrong by a factor that changes run
-    /// to run, and nothing downstream could tell.
+    /// anything from a fraction of its real size up to the true value.
     ///
     /// The uncounted slack is bounded and one-directional: hashbrown rounds to
     /// a power-of-two bucket count at a 7/8 load factor and adds one control

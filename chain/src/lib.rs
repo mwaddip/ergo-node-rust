@@ -1,8 +1,4 @@
-//! Header chain validation for the Ergo Rust node.
-//!
-//! Phase 1: Parse headers from wire bytes, track best known height.
-//! Phase 2: Verify proof of work before accepting headers.
-//! Phase 3: Validate headers form a correct chain (parent, timestamp, difficulty).
+//! Header chain validation for the Ergo Rust node (parse, PoW, chain linkage, difficulty adjustment).
 
 pub(crate) mod cache;
 mod chain;

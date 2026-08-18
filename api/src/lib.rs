@@ -114,35 +114,10 @@ pub struct ApiState {
 /// A byte figure **published** into shared state by the crate that owns the
 /// structure it measures, rather than read through an accessor.
 ///
-/// Every other `/debug/memory` component figure is pulled synchronously via a
-/// trait method. These cannot be: the AVL prover lives inside the UTXO
-/// validator, which `sync/` owns and deliberately does not wrap in an
-/// `Arc<Mutex>` (`facts/validation.md`), so there is nothing for an HTTP
-/// handler to call. The owning crate computes its estimate and stores it here
-/// after each applied block — the mechanism already used for `shared_height` —
-/// and this crate reads it. Do not "simplify" this into a direct accessor: a
-/// synchronous read needs either a lock on an HTTP path or the `Arc<Mutex>`
-/// that was rejected on its own merits.
-///
-/// The `Option` discipline of the pulled figures survives intact. A gauge
-/// nothing has published to reports `None`, and `/debug/memory` omits the key;
-/// a published `0` reports `Some(0)` and renders as `0`. A node that has
-/// applied no blocks must not claim an empty prover — that is the same class of
-/// falsehood as the removed `chainHeaderEstimateBytes`. The two states are kept
-/// apart by a sentinel, so a gauge cannot report zero before anything has
-/// measured it — provided its storage was minted by
-/// [`unset`](PublishedGauge::unset), which is what sets the sentinel.
-///
-/// **The gauge is a view over an `Arc<AtomicU64>`, not the owner of an
-/// atomic.** The producer lives in a crate that cannot name this type — `api/`
-/// and `sync/` do not depend on each other, and none of the crates they share
-/// is a sensible home for an observability primitive. So the storage is a plain
-/// `Arc<AtomicU64>` that the main crate allocates once and hands to both ends:
-/// the producer publishes into it, and a gauge
-/// [adopts](PublishedGauge::from_storage) the same `Arc` to read it. Two views,
-/// one allocation.
-///
-/// See `facts/api.md` § "Component memory attribution".
+/// Reads an `Arc<AtomicU64>` that the main crate allocates once and hands to
+/// both the producer (`sync/`) and this consumer. Sentinel-gated: a gauge
+/// nothing has published to reports `None`, not zero. See `facts/api.md`
+/// § "Component memory attribution".
 pub struct PublishedGauge(Arc<AtomicU64>);
 
 impl PublishedGauge {

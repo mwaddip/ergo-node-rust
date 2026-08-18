@@ -1,16 +1,9 @@
 //! Lazy header/score caching for [`crate::HeaderChain`].
 //!
-//! Backs the migration from in-memory `Vec<Header>` / `Vec<BigUint>`
-//! to an LRU cache + lazy load from persistent storage. At mainnet
-//! scale (1.76M headers) the Vec alternative was ~1.4 GB; the cache is
-//! bounded by [`DEFAULT_CACHE_CAPACITY`] regardless of chain length.
-//! The integrator (main crate) wires [`HeaderLoader`] and
-//! [`ScoreLoader`] against `enr-store`.
-//!
-//! Phase 1 role: cache and loaders are installed on
-//! [`crate::HeaderChain`] and kept coherent via write-through on
-//! push/pop/reorg. No reads are routed through the cache yet — that
-//! arrives in Phase 2.
+//! LRU cache + lazy load from persistent storage for headers and
+//! cumulative-difficulty scores, bounded by [`DEFAULT_CACHE_CAPACITY`]
+//! regardless of chain length. The integrator (main crate) wires
+//! [`HeaderLoader`] and [`ScoreLoader`] against `enr-store`.
 
 use std::mem::size_of;
 use std::num::NonZeroUsize;

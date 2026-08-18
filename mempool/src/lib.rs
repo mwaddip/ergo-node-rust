@@ -23,9 +23,7 @@ pub struct Mempool {
     invalidated: ExpiringCache<[u8; 32]>,
     stats: FeeStats,
     config: MempoolConfig,
-    /// The tree a fee output is guarded by, derived once from
-    /// `config.reward_delay`. Step 7a compares every output against this, so
-    /// deriving it per output would recompile a tree per output per tx.
+    /// Fee output guard tree, derived once from `config.reward_delay`.
     fee_proposition: ErgoTree,
     /// Validation cost since last block (rate limiting).
     interblock_cost: u64,
@@ -36,16 +34,8 @@ pub struct Mempool {
 impl Mempool {
     /// # Panics
     ///
-    /// If the fee proposition cannot be built from `config.reward_delay`.
-    ///
-    /// `fee_proposition()` is a pure function of that one integer and takes no
-    /// external input, so a failure means the predef builder itself is broken —
-    /// a build-integrity fault, not a runtime or configuration condition. There
-    /// is no recovery worth having: a mempool that cannot recognise a fee
-    /// output reads every fee as zero and silently declines every transaction
-    /// on the network, which is precisely the bug this step exists to fix.
-    /// Failing loudly at startup is the honest outcome, and `new` stays
-    /// infallible so its two call sites in `main.rs` and `api/` are unaffected.
+    /// Panics on startup if the fee proposition cannot be built — see
+    /// `facts/mempool.md` § fee proposition.
     pub fn new(config: MempoolConfig) -> Self {
         let capacity = config.capacity;
         let fee_proposition = ergo_tree_predef::fee_proposition(config.reward_delay)

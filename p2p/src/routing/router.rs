@@ -166,8 +166,8 @@ pub struct Router {
     counters: Arc<TrafficCounters>,
     /// Local-serve hook for ModifierRequests, consulted before any
     /// relay (see `facts/p2p-routing.md`). `None` (the construction
-    /// default) preserves pure-proxy relay behavior; the integrator
-    /// wires it to the modifier store via [`Router::set_local_serve`].
+    /// default) means no local store hook; the integrator wires it
+    /// via [`Router::set_local_serve`].
     local_serve: Option<LocalServeFn>,
 }
 
@@ -394,20 +394,6 @@ impl Router {
 
         match message {
             ProtocolMessage::Inv { ids, .. } => {
-                // Record which peer has which modifier so our own
-                // ModifierRequest routing can pick a source. This is the
-                // full-node use of an incoming Inv.
-                //
-                // We do NOT relay the Inv to other peers. Relaying was
-                // leftover from the transparent-proxy origin of this crate
-                // and is protocol-incorrect for a full node: every peer
-                // talks to every other peer directly, so a relay of their
-                // announcements both duplicates traffic and — critically —
-                // can exceed the Inv size cap (v1 sync: 400 modifiers) if
-                // an upstream peer sent us an oversized Inv, getting us
-                // banned by strict peers. A full node announces its own
-                // modifiers (handled by the main crate on validate /
-                // mempool-accept), it does not forward others'.
                 for id in &ids {
                     self.inv_table.record(*id, source);
                 }

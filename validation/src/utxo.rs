@@ -28,13 +28,9 @@ use crate::{
 /// from.
 ///
 /// [`UtxoValidator::new`] takes one of these by value, so a caller cannot
-/// build a validator without saying where the emission box comes from. That
-/// is the whole design: `emission_box_id` is derived state maintained by
-/// `apply_state`, so a validator that has applied nothing reports `None` —
-/// the value that means **all ERG has been emitted**. `main`'s
-/// `update_mining_proofs` returns early on it, so a node restarted at the
-/// chain tip served no mining candidate at all until a peer delivered the
-/// next block; for a solo miner that is a deadlock, not a delay
+/// build a validator without saying where the emission box comes from.
+/// `emission_box_id` is derived state maintained by `apply_state`;
+/// constructors must provide an initial value via this type
 /// (facts/validation.md, "Recovering `emission_box_id` on resume").
 ///
 /// The variants are deliberately not an `Option`. "No block exists yet"
@@ -110,14 +106,8 @@ impl UtxoValidator {
     /// always run. There is no mode to configure and no way for a caller to
     /// end up holding an evaluation this validator did not perform.
     ///
-    /// `emission_source` is required, not optional, because forgetting it is
-    /// the defect: `emission_box_id` used to start at `None` and only ever be
-    /// written from `apply_state`, so a validator constructed at the tip
-    /// reported "all ERG emitted" until a block arrived. See
-    /// [`EmissionSource`]. The returned validator's `emission_box_id()` is
-    /// valid immediately — there is no second call to remember, and no
-    /// defaulted method a wrapper can silently swallow the way the enum
-    /// wrapper in `src/main.rs` swallowed `resize_cache`.
+    /// `emission_source` is required, not optional — see [`EmissionSource`].
+    /// The returned validator's `emission_box_id()` is valid immediately.
     pub fn new(
         storage: RedbAVLStorage,
         prover: BatchAVLProver,
@@ -575,11 +565,7 @@ impl UtxoValidator {
         // 7. Persist state changes atomically with block_height.
         //    Must precede generate_proof(): update_internal builds its delete
         //    list from prover.removed_nodes(), and generate_proof() clears the
-        //    changed-node buffers that back it. With the proof first (the
-        //    v0.7.5 order, commit 2c0811f) removed_nodes() returned empty on
-        //    every block, so superseded nodes were never deleted from
-        //    NODES_TABLE — unbounded orphan growth (235 GB at height ~1.66M,
-        //    ~658 KB/block, zero deletions).
+        //    changed-node buffers that back it.
         self.storage
             .update_with_height(&mut self.prover, vec![], header.height)
             .map_err(|e| ValidationError::StateOperationFailed(format!("persist failed: {e}")))?;
@@ -589,47 +575,11 @@ impl UtxoValidator {
         //    PersistentBatchAVLProver.generateProofAndUpdateStorage
         //    (storage.update, then generateProof).
         //
-        //    Safe as of ergo_avltree_rust #18 (in pinned rev 2941396):
-        //    pack_tree now gates on was_modified() — an Rc::as_ptr scan of
-        //    modified_nodes — instead of the tree's visited flags, and
-        //    modified_nodes survives update_with_height's tree.reset().
-        //    Before #18 this order collapsed Lookup-bearing proofs to a
-        //    single root label (block 28474, isolated by SANTA); on the
-        //    pinned rev both orders yield byte-identical proof bytes.
+        //    pack_tree gates on was_modified(), so this order is safe.
         let proof = self.prover.generate_proof();
-
-        // TEMP: 28474 Lookup divergence investigation — remove after SANTA resolves
-        if header.height == 28474 {
-            let internal_digest: [u8; 32] = blake2b256_hash(proof.as_ref()).0;
-            let expected_digest: [u8; 32] = header.ad_proofs_root.into();
-            tracing::info!(
-                height = 28474,
-                proof_digest = %hex::encode(internal_digest),
-                ad_proofs_root = %hex::encode(expected_digest),
-                proof_bytes_hex = %hex::encode(proof.as_ref()),
-                "28474 diagnostics"
-            );
-            for (i, op) in operations.iter().enumerate() {
-                match op {
-                    Operation::Lookup(key) => {
-                        tracing::info!(height=28474, op_index=i, op_kind="Lookup", box_id=%hex::encode(key.as_ref()));
-                    }
-                    Operation::Remove(key) => {
-                        tracing::info!(height=28474, op_index=i, op_kind="Remove", box_id=%hex::encode(key.as_ref()));
-                    }
-                    Operation::Insert(kv) => {
-                        tracing::info!(height=28474, op_index=i, op_kind="Insert", box_id=%hex::encode(kv.key.as_ref()));
-                    }
-                    _ => {}
-                }
-            }
-        }
 
         // Consensus: the JVM checks that internally-generated proof bytes hash
         // to the header's declared ad_proofs_root, even for proofless blocks.
-        // Without this, a Rust-mined block whose AVL proof serialization differs
-        // from the JVM's gets accepted by Rust nodes but rejected by the JVM
-        // reference node (live testnet fork at height 431,367).
         let internal_proof_digest = blake2b256_hash(proof.as_ref()).0;
         let expected_proof_digest: [u8; 32] = header.ad_proofs_root.into();
         if internal_proof_digest != expected_proof_digest {
@@ -701,18 +651,9 @@ impl UtxoValidator {
 
         match self.storage.rollback(&avl_digest) {
             Ok((root, tree_height)) => {
-                // `restore_root` is the entire cleanup: it installs the
-                // on-disk root and drops the abandoned cycle's bookkeeping —
-                // the changed-node buffers, the directions, and
-                // `modified_nodes`, the address-keyed map `pack_tree` gates
-                // on. That last clear used to be a separate line here; it
-                // moved *into* `restore_root` in fork rev b955790, so it is
-                // upstream now rather than gone. Do not reinstate it.
-                //
-                // The `modified_nodes.is_empty()` assertions in this file's
-                // rejection tests are what makes that upstream guarantee
-                // observable — they fail first if the pin ever moves back
-                // below b955790.
+                // `restore_root` handles the entire cleanup: it installs the
+                // on-disk root and clears `modified_nodes`. Do not reinstate
+                // a manual `modified_nodes` clear.
                 self.prover.restore_root(root, tree_height);
             }
             Err(e) => {
@@ -747,13 +688,8 @@ impl UtxoValidator {
 /// `SnapshotReader` both hand out (facts/state.md). Mining holds the latter,
 /// which is the point: the validator is owned by `sync/` and is `!Sync`, so
 /// the mining task cannot reach it — but this path never needed it. It
-/// deliberately builds a **separate** prover from storage, because the old
-/// approach of calling `prover.generate_proof_for_operations()` on the live
-/// prover cloned the tree shallowly (`Rc<RefCell<Node>>`) and operations on
-/// the clone mutated shared nodes (visited flags + children pointers during
-/// restructuring), corrupting the main prover for the next block apply
-/// (state-root mismatch on the first attempt; self-healing retry after
-/// rollback). So the dependency was always storage access.
+/// builds a **separate** prover from storage because the live prover is
+/// `!Sync` and shared-`Rc` mutation would corrupt it. See facts/state.md.
 ///
 /// ⚠ **The resolver must hand out fresh node handles.** `state/` guarantees
 /// that structurally — no cache, a fresh read transaction per resolve — and

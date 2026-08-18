@@ -1,25 +1,11 @@
 //! Periodic heap/height record emitted while the node is catching up.
 //!
-//! What survives of `eval_backlog.rs`. That module reported the depth of the
-//! deferred script-eval queue against the 2026-08-12 field OOM — a 4-thread
-//! 1.8 GHz node killed mid-sweep at **anon-rss 10.62 GiB, file-rss 2.4 MB**,
-//! heap rather than page cache, after 26h of steady cadence. Four of its six
-//! fields (`evals_in_flight`, `eval_bytes_in_flight`, `script_verified_height`,
-//! `eval_lag`) described that queue. The queue is gone in v0.8.0 —
-//! `apply_state` evaluates before it persists — so those four describe nothing.
-//!
-//! The two that remain describe the sweep itself and are the pair an operator
-//! actually reads together: how far state has been applied, and what the
-//! allocator is holding while it gets there. Nothing else emits a heap reading
-//! on a fixed grid during catch-up; `block applied` fires per block and carries
-//! no heap, and the sweep summary fires twice per sweep.
+//! Two fields: how far state has been applied, and what the allocator is
+//! holding while it gets there.
 //!
 //! See `../facts/sync.md` § "Catch-up progress instrumentation".
 //!
 //! ## Policy
-//!
-//! Unchanged from the record this replaces, because none of it was about the
-//! queue:
 //!
 //! - **Time-based, not per-block.** Through the empty early chain the sweep
 //!   clears ~192 blocks/second; a per-block record is unreadable. The gate is

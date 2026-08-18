@@ -35,9 +35,8 @@ pub fn expected_difficulty(parent: &Header, chain: &HeaderChain) -> Result<u32, 
             epoch_length,
             config.use_last_epochs,
         );
-        // `chain.header_at` returns owned headers post-Phase-2; collect
-        // first, then borrow into the ref-slice shape the inner helpers
-        // still expect.
+        // Collect owned headers, then borrow into the ref-slice shape
+        // the inner helpers expect.
         let owned_headers: Vec<Header> =
             heights.iter().filter_map(|&h| chain.header_at(h)).collect();
 

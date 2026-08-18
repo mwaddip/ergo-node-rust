@@ -28,9 +28,6 @@ pub const MAX_M_K: u32 = 256;
 /// extracted header chain so the light-client install path can pass it to
 /// [`HeaderChain::install_from_nipopow_proof`] without re-parsing the bytes.
 ///
-/// Renamed from `NipopowProofMeta` (which only carried metadata) to reflect
-/// the new return shape. Existing serve-side consumers reference fields by
-/// name only, so the rename is type-name-only there.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct NipopowVerificationResult {
     /// Height of the suffix tip (highest header in the proof).

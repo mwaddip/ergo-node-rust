@@ -44,8 +44,7 @@ pub const ID_BLOCK_VERSION: i8 = 123;
 
 /// Param ID 124: variable-length soft-fork validation rules.
 ///
-/// Deferred for first release — testnet won't be voting on validation rule
-/// changes. Encoding is `ErgoValidationSettingsUpdate` bytes, not 4-byte BE
+/// Encoding is `ErgoValidationSettingsUpdate` bytes, not 4-byte BE
 /// i32 like the other IDs.
 pub const ID_SOFT_FORK_DISABLING_RULES: i8 = 124;
 
@@ -226,10 +225,10 @@ pub(crate) const SUBBLOCKS_PER_BLOCK_DEFAULT: i32 = 30;
 /// 2-byte key prefix `0x00` (parameter table prefix), parses the second key
 /// byte as the signed parameter ID, and decodes the 4-byte BE i32 value.
 ///
-/// **ID 124** (`SoftForkDisablingRules`) is deferred for first release —
-/// testnet doesn't vote on validation rules. The parser SKIPS ID 124 entries
-/// silently. The integration with `ErgoValidationSettingsUpdate` will be
-/// added in a follow-up when sigma-rust exposes its serializer.
+/// **ID 124** (`SoftForkDisablingRules`) uses variable-length
+/// `ErgoValidationSettingsUpdate` encoding, not a 4-byte i32. The parser
+/// skips ID 124 entries; they are extracted separately via
+/// [`extract_disabling_rules_from_kv`].
 ///
 /// Returns a map keyed by signed param ID. The map will include ordinary
 /// IDs 1-8 plus reserved IDs 121, 122, 123 when present.
@@ -243,8 +242,7 @@ pub fn parse_parameters_from_kv(
         }
         let id = key[1] as i8;
         if id == ID_SOFT_FORK_DISABLING_RULES {
-            // Variable-length encoding via ErgoValidationSettingsUpdate.
-            // Deferred — see function docs.
+            // Variable-length encoding — extracted separately.
             continue;
         }
         if value.len() != 4 {

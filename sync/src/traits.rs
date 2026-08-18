@@ -21,13 +21,6 @@ pub trait SyncStore {
         id: &[u8; 32],
     ) -> impl std::future::Future<Output = Option<Vec<u8>>> + Send;
 
-    // `script_verified_height()` / `set_script_verified_height()` were removed
-    // here in v0.8.0 along with deferred evaluation. `apply_state` evaluates
-    // before it persists, so a second watermark trailing the first could only
-    // ever disagree with it. The metadata key they wrote remains in
-    // `chain_meta` on existing nodes and is simply never read again — a few
-    // stale bytes, no migration. See `../facts/sync.md` § "SyncStore".
-
     /// Read the durably-recorded validated_height from
     /// `chain_meta[b"validated_height"]`. Returns None if absent.
     /// See ../facts/sync.md "Cross-DB Durability Handshake" for the

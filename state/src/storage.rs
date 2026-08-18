@@ -151,14 +151,9 @@ fn read_memtotal() -> Option<usize> {
 /// table on demand.  Misses log WARN with the digest hex and return a
 /// `LabelOnly` placeholder that preserves the requested label.
 ///
-/// **Every call allocates.**  `unpack` builds a fresh `NodeId`, and what the
-/// closure returns is a clone of that node, so no handle is ever shared with
-/// another tree.  Nothing here caches, and nothing here may start to: a
-/// prover restored onto nodes still keyed in *another* prover's address-keyed
-/// map emits a different proof for identical tree state — same digest,
-/// different bytes.  That is the hazard recorded under `rollback()` in
-/// `facts/state.md`, and a read-only prover is exactly where someone would
-/// later be tempted to add a shared node cache "for performance".
+/// **Every call allocates a fresh node — no caching.**  See
+/// `facts/state.md` § "rollback()" for why shared node caches are unsafe
+/// here.
 ///
 /// Single implementation behind both [`RedbAVLStorage::resolver`] and
 /// [`SnapshotReader::resolver`] — two copies would drift, and drift here is
@@ -615,10 +610,8 @@ impl SnapshotReader {
     /// [`RedbAVLStorage::cache_bytes_used`], because this reader shares the
     /// owning storage's `Arc<Database>`.
     ///
-    /// Exists because the API cannot see the storage: `RedbAVLStorage` is
-    /// moved into the validator at startup, and `ergo_api::UtxoAccess` only
-    /// ever holds a reader.  A reader that exists has a database, so this is
-    /// live even mid-swap.
+    /// Exists because the API holds only a reader, not the storage.  See
+    /// `facts/api.md` § "Component memory attribution".
     pub fn cache_bytes_used(&self) -> u64 {
         self.db.cache_stats().used_bytes() as u64
     }
@@ -628,11 +621,8 @@ impl SnapshotReader {
     /// everything needed to stand up a **read-only prover** over the
     /// committed tree.
     ///
-    /// Exists because mining must compute AD proofs for a candidate without
-    /// touching the live prover, and cannot reach the validator that already
-    /// knows how (owned by `sync/`, and `!Sync`).  A second `RedbAVLStorage`
-    /// on the same file is not an option either — redb holds an exclusive
-    /// file lock, which is why this reader type exists at all.
+    /// Exists because mining needs AD proofs without touching the live
+    /// prover.  See `facts/state.md` § read-only prover / snapshot.
     ///
     /// Read-only: the closure only ever opens read transactions.  Nodes it
     /// resolves are freshly allocated per call and shared with no other
@@ -1026,16 +1016,10 @@ impl RedbAVLStorage {
             }
 
             // 7. Delete removed nodes.  If a label appears in both
-            //    `removed_labels` and `changed_nodes` (a stale entry in the
-            //    prover's `changed_nodes_buffer*` whose digest matches a
-            //    freshly-written node), removing it here would silently
-            //    destroy the node we just wrote.  Subsequent traversals
-            //    would then panic in the prover with "Should never reach
-            //    this point" because a parent references a digest that's
-            //    missing from NODES_TABLE.  Skipping the delete leaves at
-            //    worst an orphan in storage (harmless: never re-referenced
-            //    if truly orphan) and protects against the v0.4.x at-tip
-            //    state corruption.
+            //    `removed_labels` and `changed_nodes`, removing it here
+            //    would destroy the node we just wrote.  Skipping the
+            //    delete leaves at worst an orphan in storage (harmless:
+            //    never re-referenced if truly orphan).
             let mut skipped_overlapping = 0u32;
             for label in &removed_labels {
                 if written_labels.contains(label) {
@@ -1082,12 +1066,8 @@ impl RedbAVLStorage {
         self.current_version = Some(new_digest);
         self.version_chain = new_chain;
 
-        // Reset the prover's dirty-node bookkeeping. In UTXO mode we never
-        // call generate_proof on the main prover, so without this the
-        // is_new/visited flags accumulate forever. collect_changed_nodes
-        // treats is_new|visited as "changed since last flush", so stale
-        // flags cause inserted_labels in every undo record to include the
-        // ENTIRE live tree — a single rollback then deletes everything.
+        // Reset is_new/visited flags after commit so undo records reflect
+        // only changes since the last flush.
         prover.base.tree.reset();
         prover.base.changed_nodes_buffer.clear();
         prover.base.changed_nodes_buffer_to_check.clear();
@@ -1152,14 +1132,11 @@ impl VersionedAVLStorage for RedbAVLStorage {
 
                 // Reverse: delete nodes that were inserted.
                 //
-                // SKIPPED — see contains() fix in ergo_avltree_rust commit
-                // 879545c for the symmetric forward-path fix. Deleting an
-                // inserted_label here is unsafe when that label is still
-                // referenced from either (a) the rolled-back-to state's
-                // tree, or (b) older versions still in the chain. Net
-                // effect of skipping: orphan nodes accumulate in
-                // NODES_TABLE; the tree on disk stays consistent. Periodic
-                // offline mark-and-sweep can reclaim space if needed.
+                // SKIPPED — deleting an inserted_label here is unsafe
+                // when that label is still referenced from the
+                // rolled-back-to state or older versions still in the
+                // chain.  Net effect: orphan nodes accumulate in
+                // NODES_TABLE; the tree stays consistent.
                 skipped_deletions += undo.inserted_labels.len();
 
                 // Reverse: re-insert nodes that were removed.
@@ -1562,10 +1539,9 @@ impl RedbAVLStorage {
     ///
     /// Two mechanisms leave unreachable rows behind: the rollback path skips
     /// deleting an undo record's inserted labels (they may still be
-    /// referenced), and node v0.7.5–v0.7.9 shipped a call-order bug that
-    /// leaked every superseded node.  Neither corrupts the tree — traversals
-    /// only ever follow labels from a root — so this reclaims space, it does
-    /// not repair anything.
+    /// referenced), and superseded-node leaks from prior call-order bugs.
+    /// Neither corrupts the tree — traversals only ever follow labels from
+    /// a root — so this reclaims space, it does not repair anything.
     ///
     /// A depth-first walk of the current root visits every live node exactly
     /// once (each has exactly one parent), so no visited set is needed and

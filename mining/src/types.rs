@@ -69,9 +69,8 @@ pub struct WorkMessage {
     /// `q / decode_compact_bits(n_bits)` for the secp256k1 group order `q`.
     /// A solution is valid when `pow_hit < b`.
     ///
-    /// ⚠ **Not `decode_compact_bits(n_bits)` — that is the difficulty**, and
-    /// serving it here is the v0.8.0 defect that made the node unmineable.
-    /// The two are never close: at testnet height 485,897 the difficulty was
+    /// ⚠ **Not `decode_compact_bits(n_bits)` — that is the difficulty.** The
+    /// two are never close: at testnet height 485,897 the difficulty was
     /// 10 digits and the target 68. Anything under ~20 digits landing in this
     /// field is a bug, not a low-difficulty epoch.
     ///
@@ -117,14 +116,6 @@ pub struct WorkMessage {
 /// RawValue construction never fails in practice — but we surface it as a
 /// serialization error rather than panic if that invariant is ever violated.
 ///
-/// This doc comment said `decode_compact_bits(..)` until the v0.8.0 fix, which
-/// is the serve bug written down as an invariant in the very function that
-/// emits the field. The escape hatch itself was never in question and is now
-/// **more** load-bearing, not less: a real target is ~68 digits and genuinely
-/// cannot survive serde's numeric model, whereas the difficulty we were
-/// accidentally serving fit in a `u64` and would have encoded fine naively.
-/// The b-as-number fix was solving a real problem — it was just guarding the
-/// wrong number.
 fn serialize_b_as_number<S>(b: &str, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -156,14 +147,8 @@ pub struct CachedCandidate {
 mod tests {
     use super::*;
 
-    /// A plausible `b` for the shape tests below: the target a Scala node
-    /// served at testnet height 485,897.
-    ///
-    /// These tests are about JSON *shape*, not semantics, so any decimal
-    /// string would exercise them — but this was `12237864960` until v0.8.0,
-    /// a difficulty-magnitude value that now reads as an example of the serve
-    /// bug rather than as a target. A real target is ~68 digits. The
-    /// arbitrary-precision test below keeps its own (larger) literal.
+    /// A realistic target value (~68 decimal digits) from testnet height
+    /// 485,897, used by the shape tests below.
     const OBSERVED_TARGET: &str =
         "29598898778389163379010897437604384363675568080188445020547283242588";
 

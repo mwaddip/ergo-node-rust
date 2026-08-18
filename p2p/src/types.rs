@@ -74,9 +74,9 @@ impl Network {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyMode {
-    /// Full proxy: forward all messages, advertise as full archival node.
+    /// Advertise as full archival node; route all message types.
     Full,
-    /// Light: gossip only, advertise as NiPoPoW-bootstrapped.
+    /// Advertise as NiPoPoW-bootstrapped; drop block-related requests.
     Light,
 }
 

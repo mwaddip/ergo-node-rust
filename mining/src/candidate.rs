@@ -120,12 +120,9 @@ pub fn build_work_message(
 
     // b = the Autolykos TARGET: q / decode_compact_bits(n_bits), where q is the
     // secp256k1 group order. It is NOT decode_compact_bits(n_bits) itself —
-    // that is the DIFFICULTY, and serving it is what made v0.8.0 unmineable:
-    // external miners were handed a bound tens of orders of magnitude too tight
-    // and submitted zero shares at any hashrate, while `check_pow` on the
-    // solution path — dividing correctly — stood ready to accept a block nobody
-    // could find. `enr_chain::pow_target` is the one definition of this value;
-    // do not re-derive the division here. See ../facts/chain.md § "Phase 2".
+    // that is the DIFFICULTY. `enr_chain::pow_target` is the one definition of
+    // this value; do not re-derive the division here. See ../facts/chain.md
+    // § "Phase 2".
     let target = enr_chain::pow_target(candidate.n_bits);
 
     // pk = compressed EcPoint hex

@@ -219,11 +219,6 @@ impl SharedStore {
     }
 }
 
-// SYNC_META_TYPE_ID (255) and SCRIPT_VERIFIED_HEIGHT_KEY ("svh") lived here to
-// persist the script-verification watermark. Both went with deferred evaluation
-// in v0.8.0 and had no other users. Nodes upgraded from an earlier version keep
-// the stale key in their store; nothing reads it, and there is no migration.
-
 impl SyncStore for SharedStore {
     async fn has_modifier(&self, type_id: u8, id: &[u8; 32]) -> bool {
         let store = self.store.clone();

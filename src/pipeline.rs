@@ -637,16 +637,6 @@ impl ValidationPipeline {
         // wrote a few lines up — last writer wins, and it would be the losing
         // branch.
         //
-        // This is what wedged mainnet on 2026-07-30. A single batch held the
-        // losing 1,840,209 header (Extended → deferred into store_entries),
-        // its winning sibling (Forked), and the winner's child (fork-extension
-        // → deep reorg). The reorg correctly wrote BEST_CHAIN[1840209] =
-        // winner; this flush then re-inserted the demoted loser over it. The
-        // in-memory chain stayed correct, so nothing surfaced until the next
-        // restart rebuilt `by_id` from the clobbered index — after which the
-        // validator applied the losing block body and the node wedged on an
-        // AVL missing-key (the emission box) at 1,840,210.
-        //
         // Demoted entries are still persisted, but through `put_header` with a
         // fork number: PRIMARY + HEADER_FORKS, and BEST_CHAIN only when the
         // slot is empty. Dropping them outright would discard the header

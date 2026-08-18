@@ -54,9 +54,6 @@ pub fn build_sync_info(chain: &HeaderChain) -> Vec<u8> {
         .map(|h| h.height)
         .unwrap_or(1);
 
-    // Collect headers at the specified offsets (tip-first).
-    // Post-Phase-2, `header_at` returns owned headers; iteration
-    // below borrows from this Vec.
     let mut selected: Vec<Header> = Vec::new();
     for &offset in SYNC_OFFSETS {
         let target = match tip_height.checked_sub(offset) {

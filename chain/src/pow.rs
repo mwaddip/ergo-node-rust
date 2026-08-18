@@ -25,16 +25,8 @@ fn pow_scheme() -> &'static AutolykosPowScheme {
 /// undivided. Only the PoW comparison takes the `q /` division, and only through
 /// this function.
 ///
-/// This exists because the division was missed once. `mining/` re-derived the
-/// target from `decode_compact_bits` for the `WorkMessage.b` field it serves to
-/// external miners and stopped one operation short, handing them a target tens of
-/// orders of magnitude too hard. A GPU miner ran nine minutes at 143 MH/s and
-/// submitted zero shares, while this crate's `verify_pow` — computing the target
-/// correctly — stood ready to accept a block nobody could find. Serve-side and
-/// verify-side now resolve to the same number by construction. **Do not inline
-/// `order_bigint() / decode_compact_bits(..)` at a new call site; call this.**
-///
-/// See `../facts/chain.md` § "Phase 2: PoW Verification" for the full account.
+/// **Do not inline `order_bigint() / decode_compact_bits(..)` at a new call
+/// site; call this.** See `../facts/chain.md` § "Phase 2: PoW Verification".
 pub fn pow_target(n_bits: u32) -> BigInt {
     order_bigint() / decode_compact_bits(n_bits)
 }

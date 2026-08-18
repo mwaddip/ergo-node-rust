@@ -141,11 +141,6 @@ fn reemission_rules_for(
 /// itself: the parent it was applied against, and the emission box — whose id
 /// comes from `MiningState`, i.e. from the validator, which the mining task
 /// cannot reach.
-///
-/// It no longer carries AD proofs or a pre-built emission transaction. Those
-/// were computed for an emission-ONLY block; with transaction selection the
-/// proofs must cover the assembled list, so `generate_candidate` computes them
-/// through `proofs_from_storage` against the reader.
 struct MiningProofData {
     parent: ergo_chain_types::Header,
     emission_box: ergo_validation::ErgoBox,
@@ -156,9 +151,6 @@ type MiningProofCache = Arc<std::sync::Mutex<Option<MiningProofData>>>;
 
 /// Context for mining proof pre-computation inside the validator callback.
 struct MiningCtx {
-    // No `config` here: the hook stopped building the emission transaction when
-    // assembly moved into `generate_candidate`, and the mining task reads the
-    // config off the generator it already holds.
     proof_cache: MiningProofCache,
     snapshot_reader: Arc<SnapshotReader>,
     /// Candidate lifecycle handle — the post-apply hook calls
@@ -299,9 +291,8 @@ impl Validator {
         };
 
         // Digest mode implements no MiningState — candidate assembly needs a
-        // live UTXO set. `self.mining` is already None there, so this arm is
-        // belt-and-braces; the point is that "wrong mode" and "all ERG
-        // emitted" are now two distinct returns instead of one shared None.
+        // live UTXO set. `self.mining` is already None there, so this is
+        // belt-and-braces.
         let mining_state = match self.mining_state() {
             Some(s) => s,
             None => return,
@@ -309,7 +300,7 @@ impl Validator {
 
         let emission_id = match mining_state.emission_box_id() {
             Some(id) => id,
-            None => return, // all ERG emitted — and now that is all it means
+            None => return, // all ERG emitted
         };
 
         let box_bytes = match mining.snapshot_reader.lookup_key(&emission_id) {
@@ -431,9 +422,8 @@ impl BlockValidator for Validator {
             // every well-formed transaction on the network with
             // "Creation height H+1 > preheader height".
             //
-            // The guard no longer protects the builder — `header` alone
-            // satisfies `Headers` — but a context published at height 0 has no
-            // meaningful UTXO root for its consumers, so it stays.
+            // A context published at height 0 has no meaningful UTXO root
+            // for its consumers, so skip it.
             if !preceding_headers.is_empty() {
                 let ctx = ergo_validation::build_upcoming_state_context(
                     header,
@@ -497,22 +487,12 @@ impl BlockValidator for Validator {
         result
     }
 
-    // The four forwards that used to live here — flush, resize_cache,
-    // proofs_for_transactions, emission_box_id — are gone. One of them was
-    // silently missing for the life of the feature; the narrative is kept in
-    // facts/validation.md § "Traits", where it documents why the split
-    // happened rather than sitting next to code that no longer exists.
-    //
-    // Storage and mining are reached through the two accessors below. There
-    // is no per-method forwarding left to forget.
-
     /// The active variant's storage lifecycle. `None` in digest mode, which
     /// owns no redb.
     ///
     /// `None` means "nothing to persist" — never "the flush failed". Callers
-    /// must keep those apart; collapsing them is the shape that produced the
-    /// `resize_cache` bug documented above. See facts/sync.md § "Flushing a
-    /// validator that owns no state".
+    /// must keep those apart. See facts/sync.md § "Flushing a validator that
+    /// owns no state".
     ///
     /// This one is a trait method rather than an inherent accessor because
     /// `sync/` is generic over `V: BlockValidator` and never names this type,
@@ -1052,12 +1032,9 @@ struct NodeConfig {
     /// If no peer reports a tip within this window, fastsync is skipped.
     #[serde(default = "default_fastsync_peer_wait_timeout_sec")]
     fastsync_peer_wait_timeout_sec: u64,
-    /// TOTAL redb page cache across BOTH databases, in megabytes (default: 512).
-    ///
-    /// Breaking change: this previously sized `state.redb` alone while
-    /// `modifiers.redb` silently took redb's built-in 1 GiB default, so a
-    /// config saying 1024 actually used 2048 MB.
-    /// Absent = derived from the memory budget (facts/memory.md).
+    /// TOTAL redb page cache across BOTH databases, in megabytes.
+    /// Split by `cache_store_pct`. Absent = derived from the memory budget
+    /// (facts/memory.md).
     cache_mb: Option<u64>,
     /// Total memory the node may use, MB. Absent = read the cgroup limit,
     /// else a conservative share of MemTotal.
@@ -1088,12 +1065,6 @@ struct NodeConfig {
     /// Lower bound on blocks between flushes. Prevents storm-flushing when
     /// heap growth is driven by something other than the redb write tx.
     flush_min_blocks: Option<u32>,
-
-    // ── Deferred-eval backpressure ───────────────────────────────────────
-    // Bounds the queue of script evaluations dispatched to rayon but not
-    // yet drained. Governs a pool of memory DISJOINT from the redb dirty
-    // pages that flush_heap_threshold_mb controls — flushing redb does not
-    // free a queued eval, so the two must not share a budget.
 
     // ── At-tip memory mirrors ────────────────────────────────────────────
     // These take effect once chain sync reaches tip. Until then the cold-
@@ -1179,9 +1150,6 @@ fn default_data_dir() -> String {
 fn default_state_type() -> String {
     "utxo".to_string()
 }
-/// Deferred until a slow box tells us what inline actually costs. Changing
-/// this default is a durability decision, not a tuning one — see
-/// facts/validation.md § "Script evaluation modes".
 fn default_verify_transactions() -> bool {
     true
 }
@@ -2243,9 +2211,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?);
     tracing::info!("modifier store opened");
 
-    // One-shot scores backfill migration. v0.4.x stored empty
-    // placeholder scores for main-chain headers; v0.5.0 needs real
-    // cumulative scores so the chain's ScoreLoader can serve them.
+    // One-shot scores backfill migration: ensures every main-chain
+    // header has a real cumulative score for the ScoreLoader.
     // Idempotent — re-runs safely if killed mid-walk. Batched into
     // 50_000-entry chunks per redb write tx so unclean-restart
     // recovery work stays bounded.
@@ -2407,8 +2374,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         // Wire the header loader so chain's LRU cache can fall through to
-        // storage on miss. Replaces the materialize-all-headers-in-memory
-        // behavior — at 1.76M mainnet headers that was 1.4 GB of live heap.
+        // storage on miss.
         let store_for_header_loader = store.clone();
         chain.set_header_loader(move |height: u32| -> Option<ergo_chain_types::Header> {
             let header_bytes = match store_for_header_loader.read_header_at(height) {
@@ -2779,12 +2745,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // evaluation entirely: at or below it, `apply_state` builds no
     // `ScriptEvalInputs` and runs nothing.
     //
-    // It used to have a second consumer — `sync` floored `script_verified_height`
-    // at this value, and the two had to be the same number or a checkpointed
-    // node left a permanent frontier hole. That watermark is gone with deferred
-    // evaluation, so the coupling is gone with it; the value now has exactly
-    // one meaning and one reader.
-    //
     // This is deliberately NOT `configured_checkpoint.unwrap_or(0)`. Digest
     // mode resuming from a stored tip defaults to `height - 100`, not 0 — so
     // that one expression would put the floor up to a whole chain below the
@@ -2855,15 +2815,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let sr = storage.snapshot_reader();
                 swap_reader.install(sr.clone());
 
-                // Load the persisted root BEFORE constructing the prover.
-                // BatchAVLProver::new snapshots tree.root into old_top_node
-                // (line 74). If the tree is empty at construction time, the
-                // sentinel infinity-leaf is snapshotted instead, and the first
-                // resumed block produces a proof against an empty-tree baseline
-                // → ProofDigestMismatch. Installing the real root first skips
-                // the constructor's is_none() branch and snapshots the correct
-                // root. Same fix as PersistentBatchAVLProver::rollback() line 66
-                // in avltree 042c830.
+                // Load the persisted root BEFORE constructing the prover:
+                // BatchAVLProver::new snapshots tree.root into old_top_node,
+                // and an empty tree at construction time snapshots the sentinel
+                // infinity-leaf → ProofDigestMismatch on the first resumed block.
+                // See facts/state.md § "Prover initialization".
                 let (root, tree_height) = storage
                     .rollback(&current_version)
                     .expect("failed to load current version root from storage");
@@ -2885,11 +2841,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // metadata. `block_height().is_some() == version().is_some()`
                 // per the state contract, so the None arm is unreachable here.
                 //
-                // The Some(0) + non-genesis-digest case is the one-shot legacy
-                // migration path: state.redb was written before META_BLOCK_HEIGHT
-                // existed; `RedbAVLStorage::open` stamped 0 to preserve the
-                // invariant. We resolve via a chain scan; the first subsequent
-                // apply_state writes the real height and makes this permanent.
+                // Some(0) + non-genesis-digest: state.redb predates
+                // META_BLOCK_HEIGHT; resolve via chain scan. The first
+                // subsequent apply_state writes the real height.
                 let height = match stored_height {
                     Some(h) if h > 0 => h,
                     Some(0) => {
@@ -3039,13 +2993,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .update_with_height(&mut prover, vec![], 0)
                     .expect("genesis state update failed");
 
-                // Commit the genesis batch — without this, the prover's internal
-                // batch state (old_top_node, directions) bleeds into block 1, so
-                // the proof generated at height 1 covers the genesis bootstrap
-                // inserts plus block 1's operations starting from an empty tree
-                // instead of just block 1's ops from the 3-box genesis tree.
-                // The resulting blake2b256(proof) != header.ad_proofs_root for
-                // block 1, triggering a false ProofDigestMismatch.
+                // Commit the genesis batch so old_top_node resets to the
+                // 3-box genesis tree. Without this, block 1's proof covers
+                // the genesis inserts too → ProofDigestMismatch.
                 prover.generate_proof();
 
                 let actual = prover.digest().expect("prover has no root after genesis");
@@ -3243,12 +3193,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         flush_heap_threshold_mb: memory_plan.flush_heap_threshold_mb,
         flush_max_blocks: memory_plan.flush_max_blocks,
         flush_min_blocks: memory_plan.flush_min_blocks,
-        // Derived from THE mode binding, never re-parsed from node_config —
-        // sync doing deferred bookkeeping while the validator evaluates
-        // inline freezes the frontier; the reverse advances it over blocks
-        // nothing verified. Omitting this line used to compile, because the
-        // literal ended in `..SyncConfig::default()` and this would have taken
-        // `false` in silence. It no longer does; see the note at the bottom.
         synced_flush_heap_threshold_mb: memory_plan.synced_flush_heap_threshold_mb,
         synced_flush_max_blocks: memory_plan.synced_flush_max_blocks,
         synced_flush_min_blocks: memory_plan.synced_flush_min_blocks,
@@ -3263,23 +3207,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             blocks_to_keep as i32
         },
 
-        // Pacing constants: deliberately not operator-tunable, not derived from
-        // config, and not consensus-, memory-, or durability-relevant.
-        //
-        // Named individually instead of riding `..SyncConfig::default()` so that
-        // a 25th field on SyncConfig is a COMPILE ERROR here rather than a
-        // silent default. That trap already came close once: `script_eval_inline`
-        // would have taken `false` through the fallthrough and left sync doing
-        // deferred bookkeeping while the validator evaluated inline — green
-        // build, wrong node.
-        //
-        // Values still come from the Default impl, so there is one source of
-        // truth for them. Only the *enumeration* is restated here, which is
-        // precisely the part we want the compiler to police.
-        //
-        // Note this works because struct literals without `..` are exhaustively
-        // checked — unlike a `match` on an enum, where `if let` and `matches!`
-        // let a new variant through in silence.
+        // Pacing constants: not operator-tunable, not consensus-relevant.
+        // Named individually (no `..SyncConfig::default()`) so adding a
+        // field to SyncConfig is a compile error here, not a silent default.
         sync_interval: sync_defaults.sync_interval,
         stall_timeout: sync_defaults.stall_timeout,
         synced_poll_interval: sync_defaults.synced_poll_interval,

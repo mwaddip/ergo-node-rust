@@ -178,9 +178,7 @@ pub struct JemallocMemory {
 /// behind an owner that holds no shared handle — but the ownership rule is the
 /// same either way: the crate that owns the structure produces the number.
 ///
-/// Headers themselves are NOT resident — they have been served lazily from
-/// storage since `chain/` retired the header `Vec` in Phase 3. Do not
-/// reintroduce a field claiming to size resident headers.
+/// Headers are not resident; they are served lazily from storage.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ComponentMemory {
@@ -197,9 +195,7 @@ pub struct ComponentMemory {
     /// Chain length. A count, not an estimate.
     pub chain_header_count: u32,
     /// `modifiers.redb` page cache occupancy, from redb's own `cache_stats()`.
-    /// Omitted — never zero — when unavailable; a zero would assert the cache
-    /// is empty. Historically the largest single consumer during cold sync and
-    /// entirely invisible here.
+    /// Omitted — never zero — when unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store_cache_bytes: Option<u64>,
     /// `state.redb` page cache occupancy. Omitted, never zero, when

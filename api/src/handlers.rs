@@ -291,11 +291,9 @@ pub async fn get_block_transactions(
         return api_error(StatusCode::NOT_FOUND, "transactions not found", None).into_response();
     };
 
-    // A fat block costs ~0.5s of CPU to render, ~75% of it sigma-rust's
-    // Transaction::sigma_parse. Running that on the async reactor starved block
-    // application under concurrent load (the 2026-05 reactor-starvation
-    // incident), so parse+serialize go on the blocking pool. Keep rendering via
-    // serde_json::Value so object keys stay byte-for-byte sorted as before.
+    // sigma-rust's Transaction::sigma_parse is CPU-heavy (~0.5s for a fat
+    // block); parse+serialize go on the blocking pool to avoid starving the
+    // async reactor under concurrent load.
     let rendered = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
         let parsed = ergo_validation::parse_block_transactions(&data)
             .map_err(|e| format!("failed to parse stored transactions: {e}"))?;
@@ -885,12 +883,9 @@ async fn nipopow_proof_response(
         )
     })?;
 
-    // sigma-rust's NipopowProof serde shape matches the JVM encoder for every
-    // field EXCEPT `continuous`, which the JVM emits but the Rust struct
-    // doesn't carry. We flatten the derived serialization and add the
-    // missing field. `continuous` is always `false` for this release — the
-    // chain-side proof builder never produces continuous-mode proofs (see
-    // `facts/nipopow.md`).
+    // JVM emits `continuous` but sigma-rust's NipopowProof struct lacks it.
+    // Flatten the derived serialization and inject the field; always `false`
+    // per `facts/nipopow.md`.
     #[derive(serde::Serialize)]
     struct JvmCompatProof<'a> {
         #[serde(flatten)]
@@ -1247,12 +1242,8 @@ pub async fn info_wait(
 /// Memory breakdown: kernel counters, allocator counters, and per-component
 /// figures reported by the crates that own the structures.
 ///
-/// The component figures are transported, not computed. This handler must
-/// never size another crate's structure from a constant of its own: the
-/// removed `chainHeaderEstimateBytes` multiplied the header count by a local
-/// 800-bytes-per-header constant describing a `Vec<Header>` that `chain/`
-/// retired in Phase 3, and reported 1.48 GB for a structure that did not exist.
-/// See `facts/api.md` § "Component memory attribution".
+/// Component figures are transported, not computed. See `facts/api.md`
+/// § "Component memory attribution".
 pub async fn get_debug_memory(State(state): State<ApiState>) -> Json<DebugMemory> {
     // Process memory from /proc/self/status. Fall back to zeros if any field
     // is missing — the endpoint is diagnostic, not mission-critical.
@@ -2302,9 +2293,7 @@ mod tests {
     }
 
     /// An accessor reporting `None` must produce JSON with NO such key — not
-    /// a zero, which would assert "the cache is empty". redb was the largest
-    /// single consumer during the 2026-08-11 genesis sync and a zero here
-    /// would have read as "not it", exactly the wrong answer.
+    /// a zero, which would assert "the cache is empty".
     #[test]
     fn debug_memory_omits_cache_fields_when_unavailable() {
         let c = debug_memory_components_of(test_state_with_cache(None, None, None));
@@ -2352,9 +2341,8 @@ mod tests {
         assert_eq!(c["mempoolTxCount"], serde_json::json!(0));
     }
 
-    /// Nothing has published: all three keys absent. This is every node's
-    /// state at startup, and the moment a zero here would read as "the prover
-    /// is empty, look elsewhere" — the answer that cost a day on 2026-08-11.
+    /// Nothing has published: all three keys absent. None → absent key,
+    /// not zero.
     #[test]
     fn debug_memory_omits_published_fields_until_written() {
         let c = debug_memory_components_of(test_state_with_published(None, None, None));

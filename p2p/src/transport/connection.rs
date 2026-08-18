@@ -155,16 +155,10 @@ impl Connection {
 /// Read a handshake by accumulating TCP segments via the BufReader.
 ///
 /// TCP may deliver the handshake across multiple segments, especially over
-/// the internet. BufReader::fill_buf() only returns cached data without
-/// re-reading if there's unconsumed data. We use read() into a local Vec
-/// to accumulate, then on success, we "unread" the excess bytes by putting
-/// them back into the BufReader's stream via a workaround: we DON'T use
-/// the accumulated bytes directly — instead we consume only the handshake
-/// portion from the BufReader and leave excess for frame reading.
-///
-/// Strategy: read byte-by-byte from the BufReader until parse succeeds.
-/// This is slow but handshakes are small (~200 bytes) and happen once per
-/// connection. The BufReader retains any excess bytes internally.
+/// the internet. Strategy: read byte-by-byte from the BufReader until
+/// parse succeeds. This is slow but handshakes are small (~200 bytes) and
+/// happen once per connection. The BufReader retains any excess bytes
+/// internally.
 ///
 /// Returns the parsed spec and the number of bytes consumed from the
 /// stream so callers can credit handshake traffic counters.

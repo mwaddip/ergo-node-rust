@@ -19,7 +19,7 @@ pub struct UnconfirmedTx {
     pub tx_bytes: Vec<u8>,
     /// Transaction fee in nanoERG.
     pub fee: u64,
-    /// Validation cost estimate (tx byte size as proxy until sigma-rust adds cost tracking).
+    /// Validation cost (script cost or tx byte size as fallback).
     pub cost: u32,
     /// When this transaction entered the pool.
     pub created: Instant,
@@ -78,12 +78,7 @@ pub struct MempoolConfig {
     pub cost_per_block: u64,
     /// Maximum validation cost budget per peer per block interval.
     pub cost_per_peer_per_block: u64,
-    /// Miner reward delay, the only input to the fee proposition tree.
-    ///
-    /// A monetary constant, not a mining setting: the node must extract fees
-    /// whether or not it mines, so this mirrors the JVM's
-    /// `chainSettings.monetary.minerRewardDelay` rather than `[mining]`.
-    /// Mainnet is 720, which is the default.
+    /// Monetary constant (mainnet: 720) — emission-maturity delay for fee output identification.
     pub reward_delay: i32,
 }
 

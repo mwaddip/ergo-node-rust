@@ -195,12 +195,8 @@ impl RedbModifierStore {
     /// explicitly sized page cache.
     ///
     /// `cache_bytes` is handed to `Builder::set_cache_size`, which splits
-    /// it 90/10 between the read and write caches. There is no default:
-    /// redb's own is 1 GiB per handle, which nobody chose, no config
-    /// controlled, and `/debug/memory` could not see — during the
-    /// 2026-08-11 genesis resync, heap profiling put 89.3% of header-phase
-    /// growth under `put_batch` → `BtreeMut::insert`. Every caller now has
-    /// to state a number.
+    /// it 90/10 between the read and write caches. The caller must
+    /// provide an explicit size — there is no sensible default.
     ///
     /// A plain byte count, deliberately not `state/`'s `CacheSize` enum:
     /// this crate does not depend on `state/` and must not acquire that
@@ -286,10 +282,8 @@ impl RedbModifierStore {
     /// For each non-header modifier type, performs a single backward
     /// range scan and reads only the last (= highest-height) entry —
     /// O(K log N) total, where K is the number of modifier types and
-    /// N is the total HEIGHT_INDEX row count. A naive full-table scan
-    /// dominated open time at full mainnet scale (~5.3M rows across
-    /// 3 section types → ~6m on the laptop after unclean shutdown),
-    /// hence the per-type seek.
+    /// N is the total HEIGHT_INDEX row count. Per-type seek avoids a
+    /// full-table scan at open.
     ///
     /// Type 101 (Header) is excluded by design: headers live in the
     /// fork-aware tables and their tip is loaded by
@@ -470,11 +464,8 @@ impl ModifierStore for RedbModifierStore {
                 primary.insert((*type_id, *id), data.as_slice())?;
 
                 if *type_id == 101 {
-                    // Header — fork-aware tables. HEIGHT_INDEX is the legacy
-                    // schema and is intentionally NOT written for type_id=101.
-                    // The score is now caller-provided real cumulative
-                    // difficulty (big-endian BigUint bytes), not an empty
-                    // placeholder; validated as Some(...) above.
+                    // Header — fork-aware tables. HEIGHT_INDEX is
+                    // intentionally NOT written for type_id=101.
                     let score_bytes = score
                         .as_ref()
                         .expect("score validated as Some for type=101")
@@ -535,8 +526,6 @@ impl ModifierStore for RedbModifierStore {
 
     fn get_id_at(&self, type_id: u8, height: u32) -> Result<Option<[u8; 32]>, Self::Error> {
         // Headers (type_id=101) are looked up via BEST_CHAIN, not HEIGHT_INDEX.
-        // HEIGHT_INDEX is the legacy schema for headers and is cleared by
-        // migration on first open.
         if type_id == 101 {
             return self.best_header_at(height);
         }
@@ -2516,7 +2505,7 @@ mod tests {
     }
 
     // --- Page cache sizing + occupancy reporting (facts/store.md
-    //     § "Page cache (added 2026-08-12)"). ---
+    //     § "Page cache"). ---
 
     /// Writes ~15.6 MiB of headers through `put_batch` and returns
     /// `(used_bytes, evictions)` for a store opened with `cache_bytes`.

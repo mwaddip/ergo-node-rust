@@ -282,10 +282,8 @@ impl BlockValidator for DigestValidator {
     /// no cache to resize, so there is no [`StatePersistence`] to hand out.
     ///
     /// ⚠ The absence of a [`StatePersistence`] impl is the mode signal. Do
-    /// not "helpfully" give `DigestValidator` a no-op one — a defaulted
-    /// `resize_cache` on `BlockValidator` is exactly what let the enum
-    /// wrapper in `src/main.rs` drop the at-tip cache resize for the life of
-    /// the feature while logging success.
+    /// not give `DigestValidator` a no-op one — see facts/validation.md
+    /// § "Traits".
     fn state_persistence(&self) -> Option<&dyn StatePersistence> {
         None
     }

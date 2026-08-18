@@ -145,7 +145,7 @@ pub fn decode(magic: &[u8; 4], data: &[u8]) -> io::Result<Frame> {
 /// - When `tap` is `Some`, the raw wire bytes of a successfully-parsed
 ///   frame are passed to it via `capture_inbound` before this function
 ///   returns. Frames rejected at the parse layer (bad magic / oversize /
-///   bad checksum) are NOT captured in v1.
+///   bad checksum) are NOT captured.
 pub async fn read_frame(
     reader: &mut (impl tokio::io::AsyncReadExt + Unpin),
     magic: &[u8; 4],

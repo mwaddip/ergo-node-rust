@@ -1,15 +1,7 @@
-//! Prover memory attribution — measured from the live AVL structures.
+//! Runtime estimation of the AVL prover's memory footprint from tree
+//! population and structure.
 //!
-//! `/debug/memory` could not name most of a catching-up node's heap: a v0.8.0
-//! node that applied ~27k blocks held 1356 MB of live heap (87%) that no crate
-//! claimed, while a node at the same tip that did not sync held 214 MB
-//! unattributed. The caches were not the difference — the catch-up node's were
-//! already down to 34 MB state / 18 MB store. Something that grows with block
-//! *application* and is never released is holding it, and the AVL prover was
-//! one of two suspects that report nothing (`facts/api.md`,
-//! `facts/validation.md`).
-//!
-//! ## Why the prover's tree is a candidate at all
+//! ## Why the prover's tree matters
 //!
 //! `AVLTree::resolve` replaces a `Node::LabelOnly` child **in place** with the
 //! node unpacked from storage (`batch_node.rs`), and nothing ever converts a
@@ -24,11 +16,9 @@
 //!
 //! ## Everything here is counted, never multiplied
 //!
-//! `AVG_HEADER_BYTES` reported 1.48 GB for a `Vec` that had been deleted four
-//! months earlier because it multiplied a count by a constant nobody rechecked
-//! (`facts/api.md`). Nothing here is a constant: the per-node figure is
-//! `size_of` of the real types, so it moves if the fork's `Node` changes, and
-//! every payload figure is the `len()` of the actual buffer.
+//! Nothing here is a constant: the per-node figure is `size_of` of the real
+//! types, so it moves if the fork's `Node` changes, and every payload figure
+//! is the `len()` of the actual buffer.
 
 use std::cell::RefCell;
 

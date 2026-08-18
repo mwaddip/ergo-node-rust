@@ -72,8 +72,7 @@ pub struct GeneratedCandidate {
 /// Performs contract steps 1–8: emission transaction, mempool selection, fee
 /// collection, state root, extension, assembly, work message. **This is the
 /// only supported way to produce a `CandidateBlock`** — assembling one
-/// field-by-field outside the crate is a contract violation, and it is what
-/// left selection and fee collection dead through v0.8.0 development.
+/// field-by-field outside the crate is a contract violation.
 ///
 /// The caller owns the mempool, the chain and the UTXO set; this crate owns
 /// the assembly. So the caller passes in:
@@ -210,20 +209,14 @@ const CONTEXT_HEADERS: usize = 9;
 ///
 /// Selection validates every candidate transaction against this window, so it
 /// must be the window block validation will judge with. A path that predicts
-/// with a wider one eventually packs a transaction into a block that cannot
-/// be accepted: the JVM shipped exactly that inconsistency and it took
-/// mainnet block production down on 2026-08-18 — a script reading
-/// `headers(9)` passed candidate construction at ten and threw on the
-/// completed block at nine.
+/// with a wider one packs a transaction into a block that cannot be accepted.
 ///
 /// The count is cut here rather than left to `build_state_context`'s own
-/// truncation. A window that is only the right size because someone else
-/// trims it is the next person's bug.
+/// truncation. See `facts/validation.md` § "Window size".
 ///
 /// ⚠ Near genesis fewer than eight ancestors is legal chain state — the JVM's
 /// `headerChainBack` stops at genesis — so a short window is passed through
-/// unpadded. Padding by repeating the oldest header diverged from the
-/// reference node once already.
+/// unpadded.
 fn context_window(parent: &Header, ancestor_headers: &[Header]) -> Vec<Header> {
     let max_ancestors = CONTEXT_HEADERS - 1;
     let mut window = Vec::with_capacity(1 + ancestor_headers.len().min(max_ancestors));
@@ -310,11 +303,7 @@ fn upcoming_header(
 /// and size go, and its fee box leaves the fee transaction — so the loop
 /// terminates, at worst at emission-only.
 ///
-/// The common case costs one fee-transaction build and validation. The
-/// alternative arrangement — the JVM's, rebuilding and revalidating the fee
-/// transaction after every accepted candidate — is exact at every step but
-/// pays that per accepted transaction, and candidate assembly now runs every
-/// 15 s (TTL regeneration) rather than once a block.
+/// The common case costs one fee-transaction build and validation.
 #[allow(clippy::too_many_arguments)]
 fn select_and_collect_fees(
     config: &MinerConfig,
@@ -336,8 +325,7 @@ fn select_and_collect_fees(
     // Reserve the emission transaction's share of both budgets.
     //
     // If its cost cannot be measured we cannot bound the block, so we add
-    // nothing to it: the candidate degrades to emission-only, which is
-    // exactly what the node produced before selection was wired in. Failing
+    // nothing to it: the candidate degrades to emission-only. Failing
     // outright would turn a measurement problem into "mining stops", a
     // failure mode this step must not introduce.
     let emission_cost = match validate_single_transaction(

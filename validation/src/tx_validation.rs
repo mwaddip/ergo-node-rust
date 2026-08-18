@@ -32,42 +32,9 @@ pub fn deserialize_box(bytes: &[u8]) -> Result<ErgoBox, ValidationError> {
     })
 }
 
-/// Build an ErgoStateContext from a header and its preceding headers (newest
-/// first). Exposes **exactly 9** of them as `CONTEXT.headers`; a shorter window
-/// passes through unpadded.
+/// Build a 9-header `ErgoStateContext`. See facts/validation.md § "Window size".
 ///
-/// # Nine, never ten — this one is consensus
-///
-/// The JVM keeps two lists under similar names, and conflating them forks the
-/// chain (`ErgoStateContext.scala`):
-///
-/// - `lastHeaders` — ten, and **includes the block's own header at the head**:
-///   `newHeaders = header +: lastHeaders.take(LastHeadersInContext - 1)` (L233).
-/// - `sigmaLastHeaders` — what a script sees as `CONTEXT.headers`:
-///   `lastHeaders.drop(1)` (L87), so **nine**. The dropped entry is the block
-///   itself.
-///
-/// Our window holds headers *strictly preceding* the block — the block's own
-/// header goes in the preheader and is never in this slice — so the JVM's
-/// `drop(1)` does not mean "drop something here". It means **take nine instead
-/// of ten**. `headerChainBack(10, …)` (`FullBlockProcessor:71`) gathers
-/// `lastHeaders`, not `sigmaLastHeaders`; citing it as parity evidence for a
-/// ten-header window is the specific error that produced the divergence this
-/// replaces. At ten we accept a block every JVM node rejects with
-/// `ArrayIndexOutOfBoundsException` on `CONTEXT.headers(9)` and follow a chain
-/// the network orphans — accept-side, so nothing in our logs reports it.
-/// (Observed on mainnet 2026-08-18: script `b44970ed…` reads `headers(9)`.)
-///
-/// Fewer than nine near genesis is legal chain state — `headerChainBack` stops
-/// there — and passes through unpadded; padding by repeating the oldest (what
-/// this did before that) is its own divergence. `sigma-rust` enforces nothing
-/// here: `Headers = BoundedVec<Header, 1, 10>` permits any of one through ten.
-///
-/// ergo-lib derives `lastBlockUtxoRoot` from the newest preceding header's
-/// state_root — identical to the JVM's `previousStateDigest`
-/// (`ErgoStateContext.scala:92`) — with AvlTree flags verified against
-/// `ErgoContext.scala:17` / `ErgoInterpreter.scala:103-106`; nothing to
-/// override on our side.
+/// Fewer than nine near genesis is legal chain state; do not pad.
 ///
 /// Requires ≥ 1 preceding header — caller-guarded, and also enforced by the
 /// `Headers` type.
@@ -126,20 +93,13 @@ pub fn build_state_context(
 /// block of its own to drop, which is why the tip stays *in* the window here
 /// while block validation keeps the block's own header out of it.
 ///
-/// Three deliberate divergences, all recorded in the contract:
-/// - the window is **9, where the JVM currently has 10**. That same missing
-///   `drop(1)` leaves `UpcomingStateContext` one header wider than the block
-///   validation which must follow it — the exact shape of the 2026-08-18
-///   mainnet incident, where a script reading `headers(9)` passed JVM candidate
-///   construction at ten and threw on the completed block at nine. The agreed
-///   cross-client resolution is nine everywhere (kushti, 2026-08-18: "There
-///   must be 9 plus preheader everywhere"), with the JVM aligning `Upcoming`
-///   down rather than block validation widening to ten — widening is a
-///   consensus change and would need coordinated activation. Until that lands,
-///   a transaction reading `headers(9)` is accepted by a JVM mempool and
-///   refused here; that is the safe side of a transient gap, since no such
-///   transaction can be mined into a block any node accepts. **Do not "fix"
-///   this back to 10.**
+/// Three deliberate divergences, all recorded in facts/validation.md:
+/// - the window is **9, where the JVM currently has 10**. The agreed
+///   cross-client resolution is nine everywhere, with the JVM aligning
+///   `Upcoming` down rather than block validation widening to ten — widening
+///   is a consensus change. Until that lands, a transaction reading
+///   `headers(9)` is accepted by a JVM mempool and refused here; that is the
+///   safe side of a transient gap. **Do not "fix" this back to 10.**
 /// - `parameters` are the caller's, active for `last_header`. The JVM
 ///   recomputes them for `height + 1` inside `simplifiedUpcoming()`; the two
 ///   differ only on a block that crosses an epoch boundary.

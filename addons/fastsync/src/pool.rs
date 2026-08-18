@@ -84,13 +84,8 @@ pub struct PeerPool {
     /// None when peers came from `--peer-url` (single-peer mode).
     node_url: Option<String>,
     last_refresh: Instant,
-    /// Client for the peer-discovery query, built once.
-    ///
-    /// Previously `maybe_refresh()` constructed a fresh `Client` on every
-    /// call. Each one owns a connection pool, and reqwest's documentation is
-    /// explicit that a single client should be reused — at one refresh per
-    /// 30 s that was ~480 pools created and dropped over a 4-hour header
-    /// phase.
+    /// Client for the peer-discovery query, built once and reused (reqwest
+    /// documents that a single client should be shared across calls).
     refresh_client: Client,
 }
 
@@ -527,17 +522,7 @@ impl PeerPool {
     ///
     /// Batches are distributed round-robin across healthy peers. Order
     /// doesn't matter for block sections — the node accepts them in any order.
-    /// Takes `header_ids` BY VALUE and moves the strings into the batch queue.
-    ///
-    /// It previously took a slice and cloned every id, so the caller's
-    /// `Vec<(u32, String)>` and the queue's copies were alive simultaneously
-    /// for the whole of phase 2 — at 1.82M headers that is ~167 MiB plus a
-    /// ~153 MiB duplicate. Consuming the vec moves each `String` instead
-    /// (pointer move, no heap copy) and frees the tuple array as the
-    /// iterator drains.
-    ///
-    /// Nothing needs the ids after this call; the caller's only other use is
-    /// a `len()` for a log line, which it now captures beforehand.
+    /// Takes `header_ids` by value to move the strings into the batch queue.
     pub async fn fetch_blocks(
         &mut self,
         header_ids: Vec<(u32, String)>,

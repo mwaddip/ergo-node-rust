@@ -4,14 +4,12 @@
 //! When the validator's applied tip (`validated_height()`) fails to
 //! advance across a full sweep, the block at the frontier is failing
 //! *deterministically* — a consensus divergence, a corrupt-but-on-disk
-//! block, or (the motivating case) a script the evaluator wrongly
-//! rejects. Left ungated, the sweep re-runs every couple of seconds: the
-//! tip stays pinned, the section ticker re-advances `downloaded_height`
-//! over the still-on-disk sections, and the sweep runs again. That pegs a
-//! core and floods the journal for as long as the condition holds — which,
-//! being deterministic, is until the binary, the data, or the chain
-//! changes. A testnet node spun this way ~every 10s for 13h on a
-//! since-fixed `tree_version` script bug.
+//! block, or a script the evaluator wrongly rejects. Left ungated, the
+//! sweep re-runs every couple of seconds: the tip stays pinned, the
+//! section ticker re-advances `downloaded_height` over the still-on-disk
+//! sections, and the sweep runs again. That pegs a core and floods the
+//! journal for as long as the condition holds — which, being
+//! deterministic, is until the binary, the data, or the chain changes.
 //!
 //! The gate derives entirely from authoritative state — the applied tip —
 //! not from a parallel failure counter. A sweep that does not move
@@ -37,14 +35,7 @@
 //!
 //! Because detection is mode-agnostic but the event names the mode, the
 //! caller — the sweep, which caught the failure — hands in a
-//! [`StallDetail`] (`error_kind`, optional `missing_key`). Before v1.3 a
-//! retired per-`apply_state` tracker owned this emission and the
-//! deferred-eval wedge bypassed it entirely (it never fired during the
-//! 13h stall above); folding it onto the mode-agnostic frontier count
-//! closed that gap. Deferred evaluation itself is gone as of v0.8.0 — a
-//! script rejection is an `apply_state` `Err` now — but the frontier-keyed
-//! detection is what makes this robust to the next mechanism too, which is
-//! why it is written that way rather than against a list of error kinds.
+//! [`StallDetail`] (`error_kind`, optional `missing_key`).
 //!
 //! Backoff state is in-memory and resets on restart; a restart is a
 //! legitimate reset (the operator may have swapped the binary or the data
@@ -59,7 +50,7 @@ const BASE_DELAY: Duration = Duration::from_secs(1);
 const MAX_DELAY: Duration = Duration::from_secs(300);
 
 /// Consecutive same-frontier stalls before `validation_stuck` is emitted.
-/// Pinned by the contract (the old `apply_state` tracker's threshold).
+/// Pinned by the contract (facts/sync.md).
 const STUCK_THRESHOLD: u32 = 5;
 
 /// Failure label the sweep attaches to a stall, used only to populate the
@@ -76,14 +67,7 @@ const STUCK_THRESHOLD: u32 = 5;
 pub(crate) struct StallDetail {
     /// `validation_stuck.error_kind`: an `apply_state` error kind
     /// (`"missing_key"` / `"transaction_invalid"` / `"other"`).
-    ///
-    /// The `"script_eval"` value went with deferred evaluation in v0.8.0 and
-    /// `"transaction_invalid"` is not a rename of it — the old value named
-    /// the deferred eval-failure path, the new one names
-    /// `ValidationError::TransactionInvalid`, which covers a failed script
-    /// and equally a failed ERG or token preservation check. Produced by
-    /// [`crate::apply_state_error::classify_apply_state_error`], which
-    /// matches on the error variant rather than on its Display string.
+    /// Produced by [`crate::apply_state_error::classify_apply_state_error`].
     pub error_kind: &'static str,
     /// `validation_stuck.missing_key` — present only for the `apply_state`
     /// `missing_key` case (a 32-byte AVL key, hex).

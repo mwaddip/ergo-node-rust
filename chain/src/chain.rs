@@ -86,21 +86,17 @@ pub struct HeaderChain {
     ///
     /// For full chains starting at genesis this is `Some(1)`; for
     /// chains installed from a NiPoPoW proof this is the suffix-head
-    /// height. Replaces the old `by_height[0].height` computation —
-    /// the `Vec<Header>` itself was retired in Phase 3, with headers
-    /// now served by [`LazyHeaderStore`] backed by the registered
-    /// [`HeaderLoader`].
+    /// height.
     base_height: Option<u32>,
     /// Map from header ID to height for O(1) containment / height
     /// lookup. Kept as an in-memory index because hitting storage on
     /// every `contains()` / `height_of()` check is not worth the save —
-    /// it costs ~75 MB at mainnet scale, an order of magnitude below
-    /// the retired header Vec's ~1.4 GB. That figure is derived, not
-    /// asserted: [`by_id_bytes`] computes it from this map's live
-    /// capacity, and it is the unbounded term in
-    /// [`HeaderChain::memory_estimate`]. Also the canonical source for
-    /// [`Self::height`] / [`Self::len`] — chain length is `by_id.len()`
-    /// and the tip height is `base_height + by_id.len() - 1`.
+    /// ~75 MB at mainnet scale. That figure is derived, not asserted:
+    /// [`by_id_bytes`] computes it from this map's live capacity, and
+    /// it is the unbounded term in [`HeaderChain::memory_estimate`].
+    /// Also the canonical source for [`Self::height`] / [`Self::len`] —
+    /// chain length is `by_id.len()` and the tip height is
+    /// `base_height + by_id.len() - 1`.
     by_id: HashMap<BlockId, u32>,
     /// Currently active blockchain parameters (Phase 6: Soft-Fork Voting).
     /// Updated only at epoch-boundary block validation via
@@ -147,14 +143,12 @@ pub struct HeaderChain {
     /// they don't have. PoW verification, parent linkage, and timestamp
     /// bounds remain in force. See `facts/chain.md` Phase 6 invariants.
     light_client_mode: bool,
-    /// Lazy header/score store. After v0.5.0 this is the sole source
-    /// of truth for both header and cumulative-score reads at heights
-    /// not currently in the LRU cache — the old `Vec<Header>` and
-    /// `Vec<BigUint>` safety nets are gone. Integrators MUST register
-    /// both a [`HeaderLoader`] and a [`ScoreLoader`] at startup; a
-    /// query that misses the cache and has no loader (or whose loader
-    /// returns `None`) is treated as "absent" exactly as the contract
-    /// specifies.
+    /// Lazy header/score store — sole source of truth for header and
+    /// cumulative-score reads at heights not in the LRU cache.
+    /// Integrators MUST register both a [`HeaderLoader`] and a
+    /// [`ScoreLoader`] at startup; a query that misses the cache and
+    /// has no loader (or whose loader returns `None`) is treated as
+    /// "absent" exactly as the contract specifies.
     lazy: LazyHeaderStore,
 }
 
@@ -374,11 +368,6 @@ impl HeaderChain {
     }
 
     /// Height of the best validated chain tip, or 0 if empty.
-    ///
-    /// Derived from [`Self::base_height`] and the `by_id` map size,
-    /// which remain in lockstep on every push/pop/reorg path. The
-    /// retired `scores: Vec<BigUint>` field used to play this role —
-    /// `by_id` carries the same information at no extra cost.
     pub fn height(&self) -> u32 {
         match self.base_height {
             Some(base) if !self.by_id.is_empty() => base + (self.by_id.len() as u32) - 1,
@@ -389,10 +378,8 @@ impl HeaderChain {
     /// The tip header of the best validated chain.
     ///
     /// Reads through [`LazyHeaderStore`]: cache first, loader on
-    /// miss. Post-Phase-3 there is no in-memory fallback — if the
-    /// loader is unwired (test fixture or misconfigured node) and
-    /// the cache has evicted the tip, this panics, which is the
-    /// honest signal that the chain is broken.
+    /// miss. If the loader is unwired and the cache has evicted the
+    /// tip, this panics.
     ///
     /// # Panics
     ///
@@ -504,15 +491,9 @@ impl HeaderChain {
     /// The values are formulas — see [`ChainMemoryEstimate`] for what
     /// that does and does not entitle a caller to conclude.
     ///
-    /// This lives here, beside the fields it models, deliberately. The
-    /// previous arrangement kept a constant (`AVG_HEADER_BYTES = 800`)
-    /// in the API crate sizing a `Vec<Header>` that this crate had
-    /// already retired; nothing connected the two, so the endpoint went
-    /// on reporting ~1.48 GB for a structure that no longer existed —
-    /// more than the whole process RSS — and that figure was taken as a
-    /// leading suspect during a real memory investigation. A refactor
-    /// that reshapes `by_id` or the caches is now editing the same
-    /// files as the estimate.
+    /// This lives here, beside the fields it models, so a refactor
+    /// that reshapes `by_id` or the caches is editing the same files
+    /// as the estimate.
     pub fn memory_estimate(&self) -> ChainMemoryEstimate {
         ChainMemoryEstimate {
             index_bytes: by_id_bytes(&self.by_id),
@@ -538,11 +519,10 @@ impl HeaderChain {
     /// Cumulative difficulty score at the given height, if it exists
     /// in the chain.
     ///
-    /// Cache first; on miss falls through to the [`ScoreLoader`]. The
-    /// retired in-memory `Vec<BigUint>` safety net is gone — a height
-    /// not in cache and not returned by the loader is treated as
-    /// absent (`None`). Integrators MUST wire `set_score_loader`
-    /// before any query that may miss the LRU window.
+    /// Cache first; on miss falls through to the [`ScoreLoader`]. A
+    /// height not in cache and not returned by the loader is absent
+    /// (`None`). Integrators MUST wire `set_score_loader` before any
+    /// query that may miss the LRU window.
     pub fn score_at(&self, height: u32) -> Option<BigUint> {
         let base = self.base_height?;
         if height < base || height > self.height() {
@@ -599,10 +579,6 @@ impl HeaderChain {
     /// persistent storage.
     ///
     /// Wired by the integrator (main crate) to bridge `enr-store`.
-    /// Phase 1: the loader is installed on the lazy store but not yet
-    /// consulted by any public read — `header_at`, `tip`, and
-    /// `headers_from` still read from the in-memory `Vec<Header>`.
-    /// Phases 2–3 migrate those reads onto the cache + loader.
     pub fn set_header_loader<F>(&mut self, loader: F)
     where
         F: Fn(u32) -> Option<Header> + Send + Sync + 'static,

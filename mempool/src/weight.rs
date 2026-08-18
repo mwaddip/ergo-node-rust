@@ -35,7 +35,7 @@ impl PartialOrd for TxWeight {
     }
 }
 
-/// Fake validation cost when real cost tracking is unavailable.
+/// Fallback cost when the real script cost is zero (division-by-zero guard).
 const FAKE_COST: u32 = 1000;
 
 impl TxWeight {

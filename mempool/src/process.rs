@@ -7,24 +7,8 @@ use crate::family::propagate_family_weight;
 use crate::types::*;
 use crate::weight::TxWeight;
 
-/// The transaction fee: the summed value of every output guarded by the fee
-/// proposition.
-///
-/// **Not `input_sum - output_sum`.** Ergo has no implicit remainder that
-/// becomes the fee — ergo-lib enforces exact ERG preservation
-/// (`ErgPreservationError` when `input_sum != output_sum`,
-/// `wallet/tx_context.rs:122`), so a difference-based fee is structurally zero
-/// for every transaction that survives validation, and the minimum-fee check
-/// then declines all of them. The fee is an explicit output instead.
-///
-/// Mirrors `ErgoMemPool.extractFee` (`ErgoMemPool.scala:304-309`), which
-/// filters outputs on `chainSettings.monetary.feeProposition`.
-///
-/// Compared by `ErgoTree` value rather than by serialized bytes: that is the
-/// JVM's own structural `==`, sigma-rust's `PartialEq` deliberately ignores
-/// `ParsedErgoTree`'s memoisation field, and it avoids serializing every
-/// output's script on a per-transaction path. An output whose script failed to
-/// parse is an `ErgoTree::Unparsed` and correctly matches nothing.
+/// Extracts the explicit fee output matching the fee proposition.
+/// See `facts/mempool.md` § step 7a.
 pub fn extract_fee(tx: &Transaction, fee_proposition: &ErgoTree) -> u64 {
     tx.outputs
         .iter()
@@ -66,13 +50,6 @@ pub fn input_box_id_raw(box_id: &ergo_lib::ergotree_ir::chain::ergo_box::BoxId) 
 /// built the transaction against a tip one block ahead of ours, and applying
 /// the next block makes it valid. Callers must decline such a transaction, not
 /// invalidate it — see the contract's step 6a.
-///
-/// The comparison is signed, mirroring `verify_output()` in ergo-lib's
-/// `wallet/tx_context.rs` byte for byte. A creation height with bit 31 set is
-/// "negative" under the V1 rules ergo-lib still honours, so it does *not* trip
-/// that check; it trips `NegativeHeight` instead, which is permanent. Widening
-/// this to an unsigned comparison would swallow those into the transient path
-/// and re-validate the same garbage on every rebroadcast, forever.
 pub fn output_above_preheader(tx: &Transaction, state_context: &ErgoStateContext) -> Option<u32> {
     let preheader_height = state_context.pre_header.height as i32;
     tx.outputs
@@ -176,12 +153,7 @@ impl super::Mempool {
             })
             .unwrap_or_default();
 
-        // 6a. Transient creation-height guard. A transaction built one block
-        // ahead of us is not invalid, it is early — the next applied block
-        // makes it valid. Letting it reach step 6 would cache it as invalid
-        // for `invalidation_ttl`, so every rebroadcast in the next half hour
-        // is dropped at step 1 without ever being re-validated. Same reasoning
-        // as the missing-input decline above.
+        // Step 6a: transient creation-height guard — see facts/mempool.md.
         if let Some(height) = output_above_preheader(&tx, state_context) {
             return ProcessingOutcome::Declined {
                 reason: format!(

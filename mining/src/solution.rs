@@ -69,10 +69,8 @@ pub fn validate_solution(
     //   valid  = pow_hit(header) < target
     //
     // That target must be the same number `build_work_message` serves as
-    // `WorkMessage.b`. It was not in v0.8.0 — the serve path sent the raw
-    // difficulty — so miners hunted a bound ~10^58 tighter than the one checked
-    // here and this branch never ran for anyone. `tests/work_message_wiring.rs`
-    // pins the two together; check_pow itself stays upstream's.
+    // `WorkMessage.b`. `tests/work_message_wiring.rs` pins the two together;
+    // check_pow itself stays upstream's.
     let valid = header
         .check_pow()
         .map_err(|e| MiningError::InvalidSolution(format!("check_pow: {e}")))?;

@@ -161,18 +161,13 @@ pub fn check_parameters_v6(
         }
     }
 
-    // NOTE: No byte-for-byte proposedUpdate comparison against a
-    // chain-tracked "expected" value. The earlier implementation was based
-    // on a misreading of JVM `matchParameters60`: JVM compares
+    // NOTE: No byte-for-byte proposedUpdate comparison. JVM compares
     // `parsedParams.proposedUpdate` to `calculatedParams.proposedUpdate`,
     // but `calculatedParams` is built via `Parameters.update(..., parsedParams.proposedUpdate, ...)`
     // which returns `Parameters(height, table3, proposedUpdate)` with
     // `proposedUpdate` = the block's parsed value (Parameters.scala:95).
-    // So both sides of JVM's `p1.proposedUpdate != p2.proposedUpdate` are
-    // the same object — the check is tautologically false. Verified against
-    // mainnet block 1,629,184 where the block's ID 124 (6 bytes, empty
-    // statusUpdates) differs from the previous boundary's 18 bytes, yet
-    // JVM v6.0.3 accepts the chain.
+    // Both sides of JVM's `p1.proposedUpdate != p2.proposedUpdate` are the
+    // same object — the check is tautologically false.
     let _ = (
         block_version,
         expected_proposed_update,

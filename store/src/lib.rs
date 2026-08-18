@@ -77,20 +77,15 @@ pub trait ModifierStore: Send + Sync {
     ///
     /// Returns the cumulative difficulty score as big-endian BigUint
     /// bytes. Populated for **every** header — main-chain and forks
-    /// alike — after the one-shot scores backfill migration runs at
-    /// store open. Returns `None` only when `id` was never written.
+    /// alike. Returns `None` only when `id` was never written.
     fn header_score(&self, id: &[u8; 32]) -> Result<Option<Vec<u8>>, Self::Error>;
 
     /// Update only the score for an existing header.
     ///
     /// Writes `header_scores[id] = score`. Does NOT touch PRIMARY,
-    /// HEADER_FORKS, or BEST_CHAIN. Used by the scores backfill
-    /// migration to upgrade empty-placeholder scores to real values
-    /// without rewriting the full header record.
+    /// HEADER_FORKS, or BEST_CHAIN.
     ///
-    /// Returns Err if `id` is not present in PRIMARY (would be a
-    /// caller bug — the migration walks BEST_CHAIN which is consistent
-    /// with PRIMARY).
+    /// Returns Err if `id` is not present in PRIMARY (caller bug).
     fn put_header_score(&self, id: &[u8; 32], score: &[u8]) -> Result<(), Self::Error>;
 
     /// Batch variant of [`put_header_score`] — writes many `(id, score)`
@@ -106,11 +101,8 @@ pub trait ModifierStore: Send + Sync {
     /// empty `entries` slice is a no-op that returns Ok without
     /// touching disk.
     ///
-    /// Used by the scores backfill migration to cut per-transaction
-    /// overhead by ~100×. With 1.78M individual single-write calls
-    /// the migration also leaves substantial redb recovery work for
-    /// the next unclean restart (~6 min open time observed) —
-    /// chunking into ~50_000-entry batches collapses that.
+    /// Batched write for scores — reduces per-transaction overhead
+    /// and bounds unclean-restart recovery work.
     fn put_header_score_batch(&self, entries: &[([u8; 32], Vec<u8>)]) -> Result<(), Self::Error>;
 
     /// Delete all modifier rows of the given `type_ids` at heights strictly

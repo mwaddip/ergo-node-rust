@@ -128,8 +128,7 @@ pub fn build_fee_tx(
     // Cap at what one box can hold, measured rather than counted — see
     // `fit_tokens`. The dropped tokens are burned: their fee boxes are still
     // spent as inputs and Ergo permits an output carrying fewer tokens than
-    // its inputs. The JVM's `take(MaxAssetsPerBox)` burns them too, just at
-    // the wrong limit.
+    // its inputs.
     let kept = fit_tokens(&aggregated, reward_value, &reward_script, height)?;
     if kept.len() < aggregated.len() {
         tracing::warn!(

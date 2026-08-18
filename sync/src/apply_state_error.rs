@@ -13,23 +13,8 @@
 //! only the `apply_state`-specific classification, so the backoff stays
 //! mode-agnostic.
 //!
-//! ## Classify on the variant, never on the Display string
-//!
-//! Until v0.8.0 this took a `&str` and grepped the whole rendered error
-//! for `"does not exist"`, while its caller held the typed
-//! [`ValidationError`] and stringified it one line earlier. **Nothing
-//! referenced the variant.** So when deferred evaluation was removed, the
-//! script-failure kind stopped being produced and nothing failed to
-//! compile — the same silent-drift shape as an `if let` that swallows a
-//! new variant. A string-keyed classifier cannot be broken by a change to
-//! the errors it classifies, which sounds like robustness and is the
-//! opposite: it means the compiler has nothing to tell you.
-//!
-//! The one string parse that remains is *inside* a matched variant, where
-//! the AVL key genuinely arrives as prose from the tree layer. That parse
-//! is scoped to the variant's own payload, not to the rendered whole, so
-//! it can no longer misfire on an unrelated variant whose `reason` text
-//! happens to contain the phrase.
+//! Classify on the variant, never on the Display string — the compiler
+//! can't break what it can't see.
 
 use ergo_validation::ValidationError;
 

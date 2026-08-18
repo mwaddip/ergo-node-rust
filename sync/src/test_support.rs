@@ -1,19 +1,8 @@
-//! Test-only tracing capture.
+//! Shared test scaffolding: tracing capture, mock stores, event assertions.
 //!
-//! Journal-event conformance tests (`../facts/journal-events.md`) assert on the
-//! *rendered* line, which means every one of them needs a subscriber writing
-//! into a buffer. Four near-identical copies of that scaffolding had grown
-//! across `state.rs`, `sweep_backoff.rs`, `eval_backlog.rs` (since deleted) and
-//! the integration test before this module existed.
-//!
-//! Duplication is not the only reason to have one copy. The max level lives
-//! here, and it is the thing that silently decides whether an event is
-//! capturable at all: `tracing_subscriber::fmt()` defaults to INFO, so an event
-//! emitted below that renders to nothing under a copy that took the default,
-//! and looks exactly like an event that was never emitted. That is not
-//! hypothetical — it is how `deferred_eval_gate_engaged` (DEBUG, removed in
-//! v0.8.0 with the queue it described) shipped unverified. Callers name the
-//! level explicitly.
+//! Callers name the tracing level explicitly — `tracing_subscriber::fmt()`
+//! defaults to INFO, so an event emitted below that renders to nothing and
+//! looks exactly like an event that was never emitted.
 
 use std::io;
 use std::sync::{Arc, Mutex};

@@ -62,8 +62,6 @@ pub struct ApplyStateOutcome {
 /// self-weighing, and no `Send` requirement, all of which existed only to
 /// feed a queue that no longer exists.
 ///
-/// **Renamed from `DeferredEval` in v0.8.0.** The old name described a
-/// deferral that does not happen.
 #[derive(Debug)]
 pub struct ScriptEvalInputs {
     /// Block height (for error reporting).
@@ -150,10 +148,8 @@ pub trait BlockValidator {
     /// reach [`StatePersistence`]. [`MiningState`] needs no such accessor
     /// because its only consumer is `main`, which does name the type.
     ///
-    /// This method answers a capability question; it does NOT perform work.
-    /// That is what separates it from the defaulted no-ops it replaces — a
-    /// `None` return is a truthful answer, whereas `Ok(())` from a defaulted
-    /// `flush` was a claim that work happened.
+    /// This method answers a capability question; it does not perform work.
+    /// `None` is a truthful answer.
     fn state_persistence(&self) -> Option<&dyn StatePersistence>;
 }
 
@@ -162,10 +158,7 @@ pub trait BlockValidator {
 /// case explicitly rather than being handed a successful no-op.
 ///
 /// ⚠ **The absence of an impl is the mode signal.** [`DigestValidator`] must
-/// never gain a no-op impl of this trait: a defaulted `resize_cache` on
-/// `BlockValidator` is exactly what let the enum wrapper in `src/main.rs`
-/// silently drop the at-tip cache resize for the life of the feature, while
-/// logging success (facts/validation.md).
+/// never gain a no-op impl of this trait — see facts/validation.md § "Traits".
 pub trait StatePersistence {
     /// Force a durable commit (fsync) of all outstanding storage writes.
     /// Called at sweep flush points (bounds crash data loss) and on graceful
@@ -191,10 +184,8 @@ pub trait StatePersistence {
     /// trait at all: digest mode therefore reports absent, which is correct —
     /// it has no prover.
     ///
-    /// REQUIRED — no default body, matching the cache accessors. A default
-    /// would let an implementor silently return a wrong value, which is
-    /// structurally how `AVG_HEADER_BYTES` survived four months of reporting
-    /// 1.48 GB for a `Vec` that no longer existed (`facts/api.md`).
+    /// REQUIRED — no default body. A default would let an implementor
+    /// silently return a wrong value.
     ///
     /// ⚠ **O(resident nodes).** The figure is walked, not multiplied, so the
     /// call costs a full traversal of the materialised tree — on a synced
@@ -221,8 +212,7 @@ pub trait MiningState {
 
     /// Current emission box ID in the UTXO set, updated after each block.
     ///
-    /// `None` means **all ERG has been emitted** — nothing else. It no longer
-    /// doubles as the digest-mode signal.
+    /// `None` means **all ERG has been emitted** — nothing else.
     ///
     /// ⚠ **Valid immediately after construction, not only after the first
     /// applied block.** [`UtxoValidator::new`] recovers it from a required

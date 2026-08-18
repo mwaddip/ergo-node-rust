@@ -5,8 +5,8 @@
 //! is the security boundary.
 //!
 //! The `api/` crate owns the cross-crate counter interface (`P2pCountersSource`).
-//! The `p2p/` crate implements it in a follow-up dispatch; until then, the
-//! `StubP2pCounters` impl in this module returns an all-zero snapshot.
+//! The `p2p/` crate provides the live implementation; `StubP2pCounters` in this
+//! module is a zero-counter fallback for builds or configurations without P2P.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -148,8 +148,7 @@ pub struct P2pCountersSnapshot {
     pub unknown: DirectionalCounter,
 }
 
-/// Zero-counter source anchored at process start. Used until the real
-/// `p2p/` implementation lands.
+/// Zero-counter fallback for builds or configurations without P2P.
 pub struct StubP2pCounters {
     process_start: u64,
 }

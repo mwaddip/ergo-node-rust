@@ -8,8 +8,7 @@
 //! Filter check is O(1) HashSet probe (~10 ns for typical lists). On a
 //! filter pass, the per-record cost is one Vec allocation for the
 //! record buffer, one memcpy into the mmap'd page, and the atomic head
-//! update inside the ring's mutex. v1.1 optimization to consider:
-//! ring-side `claim_slot(size) -> &mut [u8]` API to avoid the Vec.
+//! update inside the ring's mutex.
 
 use super::config::FilterMode;
 use super::pcap::{record_size, write_record, Direction};

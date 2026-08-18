@@ -44,8 +44,7 @@ impl UndoRecord {
         buf.extend_from_slice(&self.prev_top_node_height.to_be_bytes());
         buf.extend_from_slice(&(self.prev_version.len() as u32).to_be_bytes());
         buf.extend_from_slice(&self.prev_version);
-        // Appended in the block_height revision.  Pre-revision records
-        // stop here; deserialize treats absent trailing bytes as 0.
+        // Trailing field; absent in older records, deserialized as 0.
         buf.extend_from_slice(&self.prev_block_height.to_be_bytes());
 
         buf
@@ -110,9 +109,7 @@ impl UndoRecord {
         let prev_version = Bytes::copy_from_slice(&data[pos..pos + version_len]);
         pos += version_len;
 
-        // Trailing field — present only on records written after the
-        // block_height revision.  Absent ⇒ treat as 0 (pre-revision
-        // caller didn't track block height).
+        // Trailing field; absent in older records, treated as 0.
         let prev_block_height = if pos + 4 <= data.len() {
             read_u32(&mut pos)?
         } else {

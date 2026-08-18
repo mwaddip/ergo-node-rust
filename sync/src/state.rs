@@ -60,12 +60,9 @@ fn sync_info_anchor_ids(info: &SyncInfo) -> Vec<BlockId> {
 ///
 /// ⚠ `NothingToPersist` and `NoValidator` are NOT interchangeable, and folding
 /// the first into the second is a behaviour change, not a simplification.
-/// Digest mode has a validator and a real height; before the v0.8.0 trait split
-/// it reached `Flushed(M)` through `BlockValidator`'s defaulted `flush` —
-/// returning `Ok(())` for work it never did — so the `set_validated_height(M)`
-/// write and the prune both happened. They must keep happening. Light mode
-/// deliberately skips both. See `../facts/sync.md` § "Flushing a validator that
-/// owns no state".
+/// Digest mode has a validator and a real height — `set_validated_height(M)`
+/// and the prune must keep happening. Light mode deliberately skips both.
+/// See `../facts/sync.md` § "Flushing a validator that owns no state".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FlushOutcome {
     Flushed(u32),
@@ -278,17 +275,6 @@ pub struct SyncConfig {
     ///
     /// See ../facts/sync.md § "Block Body Retention".
     pub blocks_to_keep: i32,
-    // `eval_backlog_max_mb`, `eval_backlog_max_blocks`, `checkpoint_height`
-    // and `script_eval_inline` were removed in v0.8.0 with deferred
-    // evaluation. The first two bounded a queue that no longer exists; the
-    // last two existed only to tell sync where `script_verified_height` came
-    // from and how far down it had to be floored, and that watermark is gone.
-    //
-    // The checkpoint itself still matters — heights at or below it skip
-    // evaluation — but that is entirely `validation/`'s business now, fed
-    // straight from the node config to the validator. Sync never had an
-    // opinion about it beyond the floor. See `../facts/sync.md`
-    // § "Block Assembly (state_applied_height)".
 }
 
 impl Default for SyncConfig {
@@ -399,13 +385,7 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     /// Highest height where ALL required block sections are in the store.
     downloaded_height: u32,
     /// Highest height where apply_state() returned Ok (state advanced).
-    ///
-    /// Since v0.8.0 the only watermark the sweep keeps besides
-    /// `downloaded_height`. `apply_state` evaluates scripts before it persists,
-    /// so an `Ok` already means they passed and there is nothing left for a
-    /// second, trailing watermark to say. See `../facts/sync.md`
-    /// § "Block Assembly (state_applied_height)" for what the trailing one cost
-    /// before it was removed.
+    /// The sole sweep watermark besides `downloaded_height`.
     state_applied_height: u32,
     /// Interval gate for the periodic catch-up progress record. Diagnostic
     /// only. In-memory: a restart re-baselines. See
@@ -442,16 +422,13 @@ pub struct HeaderSync<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockVali
     /// existing storage handle (no reopen, no second mmap).
     synced_cache_bytes: Option<usize>,
     /// Exponential backoff gating the validation sweep when the applied
-    /// tip fails to advance — a deterministic `apply_state` failure, which
-    /// since v0.8.0 includes the script rejections that used to come back
-    /// asynchronously and roll the tip back from a drain. Derived purely from
-    /// the validator's applied tip, so its stall detection is blind to which
-    /// subsystem rejected the block. Also
-    /// the single emitter of the contract `validation_stuck` event, fired
-    /// once a frontier has stalled 5 sweeps in a row (the caller hands in
-    /// the `error_kind`/`missing_key` label). Resets on real progress or a
-    /// frontier change. In-memory — a restart is a legitimate reset. See
-    /// [`crate::sweep_backoff`].
+    /// tip fails to advance. Derived purely from the validator's applied
+    /// tip, so stall detection is blind to which subsystem rejected the
+    /// block. Also the single emitter of the contract `validation_stuck`
+    /// event, fired once a frontier has stalled 5 sweeps in a row (the
+    /// caller hands in the `error_kind`/`missing_key` label). Resets on
+    /// real progress or a frontier change. In-memory — a restart is a
+    /// legitimate reset. See [`crate::sweep_backoff`].
     sweep_backoff: crate::sweep_backoff::SweepBackoff,
     /// Explicit shutdown signal from the host. `run()` selects against
     /// this alongside `run_inner()`; the signal cancels the loop and
@@ -1439,8 +1416,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         // Drive the sweep backoff off the authoritative applied tip. If the
         // sweep moved the tip past where it started, that is real progress —
         // clear any backoff. If it did not, the frontier is failing
-        // deterministically on `apply_state` — which since v0.8.0 includes the
-        // script failures that used to come back asynchronously; arm/escalate
+        // deterministically on `apply_state`; arm/escalate
         // the exponential delay so the next retry is throttled, and — once the
         // frontier has stalled 5 sweeps in a row — emit the contract
         // `validation_stuck` event, labelled by `stall_detail`. This
@@ -1528,12 +1504,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                     "reorg: adjusting section queue and watermark"
                 );
 
-                // Nothing to drain. Since v0.8.0 a reorg cannot arrive between
-                // a block's application and its verification, because there is
-                // no gap between them — `apply_state` evaluates before it
-                // persists. The generation tagging, the reorder-buffer purge
-                // and the conditional invalidation this replaces all existed to
-                // decide which in-flight results a rollback had made wrong.
+                // No in-flight results to invalidate — evaluation is
+                // synchronous.
 
                 // Reset watermarks if they were above the fork point
                 if self.downloaded_height > fork_point {
@@ -1893,12 +1865,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
 
         // ── In-place cache resize (no reopen, no second mmap) ──
         if let Some(cache_bytes) = self.synced_cache_bytes.take() {
-            // Only a validator that owns storage has a cache to resize. Digest
-            // mode has none, and must NOT reach the success log below — before
-            // the v0.8.0 trait split the defaulted `resize_cache` returned
-            // `Ok(())` there and this logged "cache resized in-place" for a
-            // resize that never happened. That false success is the reason the
-            // split exists (facts/validation.md).
+            // Only a validator that owns storage has a cache to resize.
+            // Digest mode has none — see facts/validation.md § "Traits".
             match self.validator.as_ref().and_then(|v| v.state_persistence()) {
                 Some(persistence) => {
                     if let Err(e) = persistence.resize_cache(cache_bytes) {
@@ -1921,7 +1889,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             }
         }
 
-        // ── Storage reopen handshake (legacy, kept for digest-mode) ──
+        // ── Storage reopen handshake (digest-mode) ──
         if let (Some(req_tx), Some(val_rx)) = (
             self.at_tip_request_tx.take(),
             self.at_tip_validator_rx.take(),
@@ -2509,13 +2477,9 @@ mod cross_db_flush_tests {
             digest: ADDigest::zero(),
         };
 
-        // Digest mode: `state_persistence()` is None, so nothing is fsynced —
-        // but the validator has a real height and the store side of the pair
-        // runs exactly as after a successful flush. Before the v0.8.0 trait
-        // split this height reached the store via a defaulted `flush` that
-        // returned Ok(()) without doing anything; the write must survive the
-        // split. See ../facts/sync.md § "Flushing a validator that owns no
-        // state".
+        // Digest mode's flush writes validated_height even though no state
+        // is persisted. See ../facts/sync.md § "Flushing a validator that
+        // owns no state".
         let outcome = try_flush_validator(Some(&validator), 1_785_000);
         complete_store_flush_pair(outcome, &store).await;
 
@@ -3453,14 +3417,9 @@ mod blocks_to_keep_tests {
 
     #[tokio::test]
     async fn prune_still_runs_when_validator_owns_no_persistent_state() {
-        // Digest mode: state_persistence() is None → FlushOutcome::
-        // NothingToPersist(M) → prune at the same horizon a real flush would
-        // use. Before the v0.8.0 trait split this path went through the
-        // defaulted `flush` returning Ok(()) and reached Flushed(M), so
-        // pruning happened; folding the case into NoValidator would silently
-        // stop a digest node from pruning. The prune call sites use `if let`,
-        // which the compiler does not exhaustiveness-check — this test is the
-        // guard the compiler cannot be.
+        // NothingToPersist still triggers pruning. The prune call sites
+        // use `if let`, which the compiler does not exhaustiveness-check —
+        // this test is the guard the compiler cannot be.
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let (_progress_tx, progress_rx) = mpsc::channel(1);
         let (_dc_tx, delivery_control_rx) = mpsc::unbounded_channel::<DeliveryControl>();
@@ -3604,26 +3563,8 @@ mod blocks_to_keep_tests {
 
 #[cfg(test)]
 mod sweep_resume_tests {
-    //! Regression tests for the validation-sweep resume wedge.
-    //!
-    //! The bug: the sweep derived its start height from
-    //! `state_applied_height` (a cache) instead of the validator's true
-    //! applied tip (`validated_height()`). A rollback could leave the cache
-    //! ahead of the prover; every later sweep then fed `apply_state` a
-    //! non-consecutive block, which the validator's consecutiveness guard
-    //! correctly rejected (`expected N, got N+k`), looping forever even
-    //! though the skipped blocks were on disk.
-    //!
-    //! The rollback in question was a mid-sweep deferred-eval one when this
-    //! wedge was found. That path is gone as of v0.8.0, but the reorg
-    //! rollback reaches the same state and the anchoring is what prevents it
-    //! either way, so these tests outlive the mechanism that first exposed
-    //! them.
-    //!
-    //! The fix anchors both the sweep start AND the post-sweep cache on
-    //! `validated_height()`. These tests construct the desynced state
-    //! directly and assert the sweep resumes at `applied_tip + 1` and
-    //! applies the intervening on-disk blocks instead of wedging.
+    //! Ensure the sweep resumes from `validated_height()`, never the
+    //! stale `state_applied_height` cache.
     use super::*;
     use crate::test_support::capture_async;
     use enr_chain::{ChainError, SyncInfo};
@@ -3964,12 +3905,8 @@ mod sweep_resume_tests {
 
     #[tokio::test]
     async fn sweep_resumes_at_applied_tip_when_cache_ran_ahead() {
-        // The exact wedge shape: applied tip 2665, cache desynced two ahead
-        // at 2667, blocks 2666..=2670 all on disk. The OLD code computed
-        // `from = state_applied_height + 1 = 2668`, fed the validator a
-        // non-consecutive block, and looped forever on
-        // `expected 2666, got 2668`. The fix must resume at
-        // `validated_height() + 1 = 2666`.
+        // Applied tip 2665, cache desynced two ahead at 2667, blocks
+        // 2666..=2670 on disk. Must resume at validated_height() + 1 = 2666.
         let mut sync = build_sync(SweepValidator::at(2665));
         sync.state_applied_height = 2667; // cache ran ahead of the prover
         sync.downloaded_height = 2670; // 2666..=2670 are downloaded
@@ -4123,11 +4060,9 @@ mod sweep_resume_tests {
 
     #[tokio::test]
     async fn stalled_sweep_arms_backoff_and_gate_suppresses_retry() {
-        // Frontier 2665 is wedged: block 2666 fails apply_state every attempt
-        // (modelling a deterministic divergence — since v0.8.0 that includes a
-        // script rejection, which now comes back as an `apply_state` Err like
-        // any other). Blocks 2666..=2670 are all on disk, so without the gate
-        // the sweep would re-run at full tilt.
+        // Frontier 2665 is wedged: block 2666 fails apply_state every
+        // attempt (a deterministic divergence). Blocks 2666..=2670 are all
+        // on disk, so without the gate the sweep would re-run at full tilt.
         let mut sync = build_sync(SweepValidator::at(2665).failing_at(2666));
         sync.downloaded_height = 2670;
 
@@ -4252,11 +4187,7 @@ mod sweep_resume_tests {
 
     /// `validation_rollback_failed` — ERROR, `path="reorg"`.
     ///
-    /// ⚠ The contract lists `path` as `eval_failure|reorg`. The
-    /// `eval_failure` emit site went with deferred evaluation in v0.8.0 —
-    /// `handle_eval_failure` was the only producer of that value — so the
-    /// reorg path is now the event's sole emitter. `facts/journal-events.md`
-    /// still documents both values and needs the narrowing; flagged to main.
+    /// The reorg path is this event's sole emitter.
     #[tokio::test]
     async fn journal_validation_rollback_failed_conforms() {
         let mut sync = build_sync_with_chain(
@@ -4287,9 +4218,7 @@ mod sweep_resume_tests {
         assert_field(&output, "height", "2668");
         assert_field(&output, "path", "\"reorg\"");
         // `ValidationError`'s Display, not the bare message the validator
-        // constructed — the mirror this replaces asserted the bare string and
-        // passed, because it was matching its own `info!()` rather than the
-        // emit. The contract says "Display-formatted"; this is what that is.
+        // constructed. The contract says "Display-formatted".
         assert!(
             output.contains("error=UTXO state operation failed: rollback to height 2668 failed"),
             "missing the Display-formatted underlying error: {output}"
@@ -4316,8 +4245,7 @@ mod sweep_resume_tests {
             output.contains("VALIDATION SWEEP COMPLETE"),
             "missing complete marker: {output}"
         );
-        // The marker is the literal prefix. The emit shape was once
-        // "=== VALIDATION SWEEP STARTED ===", which prefix-matches nothing.
+        // The marker is the literal prefix, not a decorated banner.
         assert!(
             !output.contains("==="),
             "markers are plain text, not decorated: {output}"
