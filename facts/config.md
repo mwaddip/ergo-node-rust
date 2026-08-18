@@ -164,7 +164,7 @@ nodes to testnet on upgrade.** The migration is not tidiness; it is the thing
 that stops an upgrade from silently changing which chain a node follows.
 
 Old and new installs converge on the same shape, so the loader carries no
-permanent legacy branch.
+permanent branch for either.
 
 ## Testing
 

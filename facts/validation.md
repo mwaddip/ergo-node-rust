@@ -32,58 +32,34 @@ transaction validation: S9  P8 E6 C5 I8 A7 L8
 
 ## Traits: `BlockValidator`, `StatePersistence`, `MiningState`
 
-**Split in v0.8.0.** Until then this was one trait whose last four methods
-carried do-nothing default bodies, and that shape cost us a bug that ran
-undetected for the life of the feature.
+Three traits. `StatePersistence` and `MiningState` are implemented **only by
+`UtxoValidator`**; `BlockValidator` is implemented by both validators and by
+the `Validator` enum wrapper in `src/main.rs`, which is pure delegation.
 
-`impl BlockValidator for Validator` (the enum wrapper in `src/main.rs`) is pure
-delegation: every method had to forward to the active variant. When
-`resize_cache` was added, the wrapper was not updated. It compiled, because the
-trait supplied a default returning `Ok(())`. So the at-tip cache resize called
-into the wrapper, hit the default, did nothing, returned `Ok`, and **logged
-success** — `UtxoValidator::resize_cache` was correct throughout and simply
-unreachable. The resize never once reached `state.redb`. Found by @odiseusme on
-2026-08-12 by reading `main.rs` rather than trusting the metrics; confirmed
-independently before the fix. `flush` is the same shape and far worse: a
-forgotten forward there means state is never persisted while every caller is
-told it was.
+**No method on any of the three carries a default body.** The two narrow traits
+have one consumer each:
 
-The first fix considered was "declare every method, no defaults, let the
-compiler catch the next wrapper that forgets." That works, but it still relies
-on someone reading nine compiler errors correctly the next time a method is
-added, and it costs 24 explicit no-op bodies across the workspace — 20 of them
-in `sync/`'s test stubs.
+| Method | Trait | Consumer |
+|---|---|---|
+| `flush`, `resize_cache` | `StatePersistence` | `sync/` — sweep flush points and at-tip cache tuning |
+| `proofs_for_transactions`, `emission_box_id` | `MiningState` | `main` — `Validator::update_mining_proofs` |
 
-**The split removes the failure mode instead of detecting it.** The four
-methods had one consumer each and did not share it:
+A method added to either trait needs no wrapper change: there is no per-method
+forwarding in the wrapper to forget.
 
-| Method | Consumer |
-|---|---|
-| `flush`, `resize_cache` | `sync/` — sweep flush points and at-tip cache tuning |
-| `proofs_for_transactions`, `emission_box_id` | `main` — `Validator::update_mining_proofs` |
+`state_persistence()` is on `BlockValidator` and is **required, not defaulted**.
+`sync/` is generic over `V: BlockValidator` and cannot name main's `Validator`,
+so a trait method is the only route by which it can reach storage at all. It
+reports a capability rather than performing work. See "How callers reach the
+split traits" below.
 
-So they become two traits, each implemented **only by `UtxoValidator`**. There
-is no per-method forwarding left in the wrapper to forget: a method added to
-either trait needs no wrapper change at all.
+⚠ **The absence of an impl is the mode signal.** `DigestValidator` implements
+neither `StatePersistence` nor `MiningState`. A digest-mode validator must not
+return a harmless-looking value for either capability; the caller handles the
+absent capability explicitly.
 
-One accessor does survive on `BlockValidator` — `state_persistence()`, and it
-is **required, not defaulted**. `sync/` is generic over `V: BlockValidator` and
-cannot name main's `Validator`, so a trait method is the only route by which it
-can reach storage at all. That is a smaller surface than four defaulted methods
-and a different kind of thing: it reports a capability rather than performing
-work, so `None` is a truthful answer where `Ok(())` was a false claim. See
-"How callers reach the split traits" below.
-
-⚠ **The absence of an impl is the mode signal.** `DigestValidator` does not
-implement either new trait. Do not reintroduce "digest mode returns a harmless
-value" anywhere — that is precisely the shape that produced the bug above.
-
-**This split also disambiguates two overloaded `None`s.**
-`proofs_for_transactions` returned `Option<Result<..>>` where the outer `Option`
-meant "wrong mode"; that layer is gone. `emission_box_id` returned `None` for
-*either* "digest mode" *or* "all ERG emitted" — two unrelated facts wearing one
-value, which `update_mining_proofs` then early-returned on identically. It now
-means only **all ERG emitted**.
+`emission_box_id` returning `None` means **all ERG emitted**, and nothing else.
+`proofs_for_transactions` returns `Result<..>`, not `Option<Result<..>>`.
 
 ```rust
 pub trait BlockValidator {
@@ -114,8 +90,7 @@ pub trait BlockValidator {
     /// Postconditions on Err:
     ///   - State is unchanged: validated_height, current_digest, AND THE
     ///     PROVER are exactly as before the call. See "Err leaves the prover
-    ///     clean" below — this was aspirational until 2026-08-12 and the
-    ///     digest-mismatch path violated it.
+    ///     clean" below.
     ///   - The error describes which check failed.
     fn apply_state(
         &mut self,
@@ -145,7 +120,7 @@ pub trait BlockValidator {
     /// Postconditions on Ok:
     ///   - `self.validated_height()` == height
     ///   - `self.current_digest()` == digest
-    /// Postconditions on Err (changed 2026-06-12 — was a silent swallow):
+    /// Postconditions on Err:
     ///   - the underlying state rollback FAILED and the validator's
     ///     observable state is UNCHANGED: `validated_height()`,
     ///     `current_digest()`, and the prover are exactly as before the
@@ -165,15 +140,14 @@ pub trait BlockValidator {
     /// its only consumer is `main`, which does name the type.
     ///
     /// This method answers a capability question; it does NOT perform work.
-    /// That is what separates it from the defaulted no-ops it replaces — a
-    /// `None` return is a truthful answer, whereas `Ok(())` from a defaulted
-    /// `flush` was a claim that work happened.
+    /// A `None` return is a truthful answer about capability, never a claim
+    /// that work happened.
     fn state_persistence(&self) -> Option<&dyn StatePersistence>;
 }
 
 /// Storage lifecycle. Implemented by `UtxoValidator` only — a validator that
 /// owns no persistent state does not implement it, and the caller handles
-/// that case explicitly rather than being handed a successful no-op.
+/// that case explicitly.
 pub trait StatePersistence {
     /// Force a durable commit (fsync) of all outstanding storage writes.
     /// Called at sweep flush points (bounds crash data loss) and on
@@ -194,7 +168,7 @@ pub trait StatePersistence {
 
 /// Mining support. Implemented by `UtxoValidator` only — candidate assembly
 /// requires a live UTXO set, so digest mode does not implement it and
-/// `main` skips mining rather than receiving a `None` that means "wrong mode".
+/// `main` skips mining.
 pub trait MiningState {
     /// Compute AD proofs and the resulting state root for a set of
     /// transactions WITHOUT modifying persistent state.
@@ -203,8 +177,7 @@ pub trait MiningState {
 
     /// Current emission box ID in the UTXO set.
     ///
-    /// `None` means **all ERG has been emitted** — nothing else. It no
-    /// longer doubles as the digest-mode signal.
+    /// `None` means **all ERG has been emitted** — nothing else.
     ///
     /// ⚠ **Valid immediately after construction, not only after the first
     /// applied block.** See "Recovering emission_box_id on resume" below.
@@ -225,8 +198,7 @@ the one consumer (`main`'s `update_mining_proofs`) returns early on it. A node
 restarted while already at the chain tip therefore serves **no mining
 candidate at all** until a peer delivers the next block. Where that node is
 the only miner, it is a hard deadlock rather than a delay: no candidate, so no
-block, so no application, so no candidate. Reported from the field after an
-at-tip restart sat at 503 for over an hour.
+block, so no application, so no candidate.
 
 **Recover it from the tip block, not from a UTXO-set scan.** The emission box
 is spent and recreated by the coinbase of every block that has one, so the
@@ -258,7 +230,7 @@ truth that can disagree with the tree it describes.
 | `sync/` stubs exercising flush (4) | ✅ | `Some(self)` | ✅ | — |
 | `sync/` stubs that do not (2) | ✅ | `None` | — | — |
 
-### Prover memory attribution (added 2026-08-14)
+### Prover memory attribution
 
 `StatePersistence` gains one method — it belongs there because the prover is
 exactly the state the trait already governs:
@@ -281,9 +253,8 @@ pub struct ProverMemoryEstimate {
 }
 ```
 
-⚠ **The buffers are NOT cleared on flush** — an earlier revision of this
-contract said so and was wrong. `StatePersistence::flush` is a redb fsync and
-never touches the prover. The clear happens at the proof-cycle boundary inside
+⚠ **The buffers are NOT cleared on flush.** `StatePersistence::flush` is a redb
+fsync and never touches the prover. The clear happens at the proof-cycle boundary inside
 `apply_state`: `generate_proof` clears all three, `update_internal` the two
 Vecs. So `modified_nodes_bytes` sampled between blocks reads its idle floor **by
 construction** — it cannot show a leak, and a rising value there would mean
@@ -303,25 +274,19 @@ ceiling — whichever fires first. A block count alone is a sync-shaped rule: 51
 blocks is seconds during catch-up and roughly seventeen hours at tip, where a
 gauge that updates twice a day cannot show a growth curve on exactly the node an
 operator watches. The cost that motivates the block interval does not exist at
-tip, so the two triggers never compete. An earlier revision said "flush cadence", which is not
-implementable where the publish actually happens: `sync/` calls `flush()`
+tip, so the two triggers never compete.
+
+⚠ **The publish must not be hung off flush cadence.** `sync/` calls `flush()`
 through `state_persistence()`, so the main crate's `Validator` never observes a
-flush and has no hook to hang it on. Intercepting would mean `Validator` itself
-implementing `StatePersistence` to wrap the delegate — a structural change to
-the split traits for a diagnostic gauge, which is not a trade worth making.
+flush and has no hook to hang it on. Reaching one would mean `Validator` itself
+implementing `StatePersistence` to wrap the delegate.
 
 `old_top_node` is `pub(crate)` in the fork, so the previous cycle's baseline is
 not reachable and is excluded. Documented rather than estimated.
 
-Measured motivation: a v0.8.0 node that caught up ~27k blocks holds 1356 MB of
-live heap that no crate can name — 87% of the total — while a node at the same
-tip that did not sync holds 214 MB unattributed. The prover is the prime
-suspect and reports nothing today.
-
-**Compute from the real structures, do not derive from a constant.** A
-bytes-per-node multiplier is precisely how `AVG_HEADER_BYTES` reported 1.48 GB
-for a `Vec` that no longer existed (`facts/api.md`). If only a node count is
-obtainable, return the count and omit the byte fields rather than multiplying.
+**Compute from the real structures, do not derive from a constant.** If only a
+node count is obtainable, return the count and omit the byte fields rather than
+multiplying by a bytes-per-node estimate.
 
 `DigestValidator` does not implement `StatePersistence` at all, so digest mode
 reports absent — which is correct, it has no prover.
@@ -360,45 +325,25 @@ caller's guard — relevant because `UtxoValidator` holds `Rc`s through the AVL
 prover and the wrapper carries a hand-written `Send` assertion (`src/main.rs`,
 see its SAFETY comment). Check that reasoning rather than inheriting it.
 
-⚠ **`E0034` hazard, found in step A.** With both `BlockValidator` and
-`MiningState` in scope on a *concrete* `UtxoValidator`,
-`proofs_for_transactions` resolves ambiguously and the call must be qualified
-(`BlockValidator::proofs_for_transactions(&v, ..)`). Generic `V: BlockValidator`
-call sites are unaffected. The ambiguity disappears in step E with the shims.
+⚠ **`E0034` hazard.** With both `BlockValidator` and `MiningState` in scope on
+a *concrete* `UtxoValidator`, `proofs_for_transactions` resolves ambiguously and
+the call must be qualified (`BlockValidator::proofs_for_transactions(&v, ..)`).
+Generic `V: BlockValidator` call sites are unaffected.
 
-### No behavioural delta
+⚠ **`None` from `state_persistence()` is "nothing to persist", not a failure.**
+`sync/` models it as such (`FlushOutcome`, the no-validator case). A flush that
+cannot happen must not be reported as a flush that failed; nothing may be pruned
+or advanced on the strength of it either way.
 
-The split changes no runtime behaviour. Digest mode previously returned
-`Ok(())` from the defaulted `flush`/`resize_cache`; it now yields `None` from
-`state_persistence()`, and **the caller treats that as the existing
-"nothing to persist" arm, not as a failure** — `sync/` already models this
-(`FlushOutcome`, the no-validator case). A flush that cannot happen must not
-be reported as a flush that failed; nothing may be pruned or advanced on the
-strength of it either way.
-
-## Script evaluation (deferred mode removed in v0.8.0)
+## Script evaluation
 
 `apply_state` **always** evaluates the block's scripts itself, before
-persisting. `Ok` therefore means the scripts passed. There is no mode, no
-`ApplyStateOutcome::deferred_eval`, and no evaluation the caller still owes.
+persisting. `Ok` therefore means the scripts passed. There is no mode and no
+evaluation the caller still owes.
 
-⚠ **Deferred evaluation is gone and is not returning as an option.** It let
-`apply_state` return before the scripts ran — buying sync throughput at the
-price of a crash-consistency window and, worse, a second source of truth for
-*how far this chain is actually verified*. Every bug in that machinery came
-from the same root, that verification lagged application:
-
-- the frozen reorder-buffer watermark, which wedged a node for 190,000 blocks
-- `handle_eval_failure` zeroing `evals_in_flight` while its rayon tasks were
-  still running and still holding their heap — the undercount that opened the
-  dispatch gate early
-- the unbounded backlog that killed a 4-thread 1.8 GHz host at **anon-rss
-  10.62 GiB** mid-catch-up
-- the checkpoint frontier floor, needed only because heights at or below the
-  checkpoint never dispatched an eval and so could never advance a frontier
-
-Removing the lag removes the class. Anything that reintroduces "apply now,
-verify later" reintroduces all of it.
+⚠ **Script evaluation is synchronous with application and must stay that way.**
+There is no mode in which `apply_state` returns before the scripts have run, and
+there is no second source of truth for how far the chain is verified.
 
 **Evaluation happens before persistence, not before application.** The
 JVM validates scripts before touching its AVL tree, but it can afford to: it
@@ -409,9 +354,7 @@ literal copy would add a read per input for no gain.
 The boundary that actually matters is **persistence**, because persistence is
 what survives a crash. Everything from the first prover operation to just
 before `storage.update_with_height` is in-memory only. Evaluating in that
-window means no block whose **scripts** are unverified reaches `state.redb`,
-which closed the startup-gap hole at the source rather than repairing it
-afterwards — and then let `sync/` delete the repair machinery entirely.
+window means no block whose **scripts** are unverified reaches `state.redb`.
 
 Ordering: apply operations and capture boxes → verify digest → **evaluate
 scripts** → persist. The digest check stays first because it is cheap and
@@ -420,10 +363,11 @@ rejects malformed blocks before the expensive step.
 ⚠ **This closes the script gap only. It does not make `apply_state`
 crash-atomic.** The proof-digest consensus check still runs *after*
 `update_with_height`, so a post-persist `Err` remains reachable and a crash in
-that window can still leave a persisted block that failed a later check. Moving
-proof generation earlier does not fix it and has already been tried: reverted
-in `96a0186`, because `removed_nodes()` then returns empty and superseded nodes
-stop being deleted — the orphan-growth bug that reached 235 GB.
+that window can still leave a persisted block that failed a later check.
+
+⚠ **Proof generation must not be moved earlier to close it.** `removed_nodes()`
+then returns empty, superseded nodes stop being deleted, and `nodes` grows
+without bound (`facts/state.md` § "Offline Compaction").
 
 So the two windows are different sizes and only one of them closes. Anyone
 citing "nothing unverified is persisted" should say **scripts**, or they are
@@ -435,20 +379,12 @@ overstating it.
 as it was on entry. Script failure, digest mismatch, box deserialization, the
 persist, and the post-persist proof-digest check all have to satisfy it.
 
-**This already worked** and has since `2992645`. `apply_state` is a wrapper
-around `apply_state_internal` that calls `rollback_prover_to` on any `Err`;
-every bare `return`/`?` inside `_internal` undoes nothing on its own and does
-not need to. Inline evaluation is one more `Err` arm under the same wrapper.
+`apply_state` is a wrapper around `apply_state_internal` that calls
+`rollback_prover_to` on any `Err`; every bare `return`/`?` inside `_internal`
+undoes nothing on its own and does not need to. Script evaluation is one more
+`Err` arm under the same wrapper.
 
-*An earlier draft of this section asserted the opposite — that the
-digest-mismatch path returned `Err` with the prover dirty and needed fixing.
-That was wrong: it read `apply_state_internal`'s bare `return Err` and
-attributed it to the public entry point. Recorded because the mistake is
-repeatable — in a file with a `_internal` split, the enclosing function is part
-of what a line means, and a grep result does not carry it.*
-
-**Why the rollback is sound before persistence**, which is the part that is
-genuinely non-obvious: at the evaluation point the undo log does not run at
+**Why the rollback is sound before persistence:** at the evaluation point the undo log does not run at
 all. `RedbAVLStorage` sets `current_version` only after a successful commit
 (`state/src/storage.rs:1002`), so it still equals the pre-block digest, and
 `rollback()` takes its short-circuit branch (`storage.rs:1034-1044`) — re-read
@@ -462,16 +398,10 @@ operation. Both paths work, for different reasons; do not collapse them.
 Precondition: `storage.current_version` must be `Some`, which
 `UtxoValidator::new` already documents and guarantees.
 
-**`restore_root` clears `base.modified_nodes`** as of the fork rev this
-workspace pins — `b955790`, in the `[patch.crates-io]` table of the root
-`Cargo.toml`. Revs before it cleared the changed-node buffers and directions
-and rebased `old_top_node` but left the address-keyed map `pack_tree` gates on
-holding every node the failed block touched: not a correctness bug, since each
-entry owns an `Rc` and a live address cannot be recycled, but an unbounded
-retention that inline mode promotes from never-happens to once per hostile
-block. `rollback_prover_to` carried a local `modified_nodes.clear()` for that;
-it is redundant at this rev. Anyone reading an older tree should not conclude
-the clear is load-bearing.
+**`restore_root` clears `base.modified_nodes`** at the fork rev this workspace
+pins — `b955790`, in the `[patch.crates-io]` table of the root `Cargo.toml`.
+`rollback_prover_to` therefore needs no local `modified_nodes.clear()`; the one
+it does not carry is not a gap.
 
 ⚠ **The upstream fix carries a precondition on `state/`.** The same defect has
 a worse form that we are exempt from *by construction, not by luck*: two
@@ -487,22 +417,17 @@ here. **A node-level cache in `state/` returning live `Rc` handles from
 `rollback` would make a wrong proof reachable.** Caching the *bytes* is fine;
 caching the *handles* is a consensus bug.
 
-### Open: the block cost is discarded, and always was
+### Open: the block cost is discarded
 
 `evaluate_scripts` returns the block-accumulated transaction cost and
 `apply_state` drops it. Nothing is unenforced — the `maxBlockCost` gate runs
-inside `evaluate_scripts` regardless.
+inside `evaluate_scripts` regardless. No caller consumes the figure, and the
+only cost-shaped value in the API is `max_block_cost`, the parameter limit
+rather than what a block actually spent.
 
-*A previous draft of this section said the figure was "observable in deferred
-mode and invisible in inline". That was wrong: the deferred path discarded it
-too, at `sync/src/state.rs` — `evaluate_scripts(&eval).map(|_cost| ())`, with
-the binding name documenting the discard. No caller has ever consumed it in
-either mode, and the only cost-shaped value in the API is `max_block_cost`,
-which is the parameter limit rather than what a block actually spent.*
-
-So this is not a regression to repair but an observable to add, and it wants a
-consumer first — a `cost=` field on the sweep line, or a block-level API
-field. Adding it is a field on `ApplyStateOutcome` and one assignment.
+Surfacing it is an observable to add, and it wants a consumer first — a `cost=`
+field on the sweep line, or a block-level API field. Adding it is a field on
+`ApplyStateOutcome` and one assignment.
 
 ## New Types
 
@@ -524,14 +449,9 @@ pub struct ScriptEvalInputs {
 }
 ```
 
-**Renamed from `DeferredEval` in v0.8.0**, along with the removal of its
-`approx_heap_bytes` field and the `new()` that derived it. That weight existed
-so `sync/` could bound a queue by bytes in flight rather than item count —
-per-item weight varies by three orders of magnitude, since `proof_boxes` holds
-every input and data-input box of the block. There is no queue now. The struct
-is a plain input bundle that never leaves the stack frame that built it, so it
-no longer needs to be `Send`, no longer needs to weigh itself, and no longer
-carries a name describing a deferral that does not happen.
+`ScriptEvalInputs` is a plain input bundle that never leaves the stack frame
+that built it. It does not need to be `Send`, and it carries no self-weighing
+field: nothing queues it, so nothing needs to bound it by bytes in flight.
 
 ## Free Function: proofs without a validator
 
@@ -753,7 +673,7 @@ exactly like an idle network.
 pub fn evaluate_scripts(eval: &ScriptEvalInputs) -> Result<u64, ValidationError>;
 ```
 
-### Block cost semantics (added 2026-06-10)
+### Block cost semantics
 
 - The returned cost is **Σ of per-tx costs** as returned by ergo-lib
   `TransactionContext::validate` (each per-tx number already includes the
@@ -892,11 +812,9 @@ DigestValidator::new(
 - `IntraBlockDoubleSpend` — same box spent twice within one block
 - `TransactionInvalid(index, details)` — tx validation failed (Phase 4a+)
 - `BlockCostExceeded { cost, max_cost }` — Σ per-tx costs >
-  `parameters.max_block_cost()` (added 2026-06-10; previously unenforced —
-  each tx independently got the full block budget)
+  `parameters.max_block_cost()`. The budget is per block, not per transaction
 - `BlockVersionMismatch { expected, got }` — governing parameters'
-  `block_version()` != `header.version` (added 2026-06-10; JVM
-  `exBlockVersion`; previously unenforced)
+  `block_version()` != `header.version` (JVM `exBlockVersion`)
 - `MissingProof` — ad_proofs is None but validator requires proofs
 
 ## Section Parsing (internal)
@@ -931,10 +849,8 @@ DigestValidator::new(
 - `state_applied_height` — AVL state advanced to here. External consumers see this.
 - `downloaded_height` — all required section bytes are present in the store.
 
-`script_verified_height` was deleted in v0.8.0 along with deferred evaluation.
-It existed to track how far behind application verification had fallen; since
-`apply_state` now evaluates before persisting, application *is* verification
-and a second watermark can only disagree with the first.
+There is no third watermark. `apply_state` evaluates before persisting, so
+application *is* verification and `state_applied_height` carries both facts.
 
 ### Invariants
 
@@ -1004,9 +920,8 @@ instead of `BatchAVLVerifier`. Same validation core — different box source:
 - AD proofs not required (not downloaded in UTXO mode)
 - AD proofs generated as side effect (to serve digest-mode peers)
 - `reset_to()` uses `PersistentBatchAVLProver::rollback()`; a rollback
-  failure surfaces as Err with validator state unchanged (2026-06-12 —
-  previously logged-and-swallowed while the cache advanced onto
-  un-rolled state, the latent gap-wedge hole)
+  failure surfaces as Err with validator state unchanged. It must never be
+  logged and swallowed: the cache must not advance onto un-rolled state
 
 The `BlockValidator` trait is designed for both. `ad_proofs: Option<&[u8]>`
 is `Some` for digest, `None` for UTXO.

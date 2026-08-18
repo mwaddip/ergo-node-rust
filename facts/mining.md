@@ -78,8 +78,8 @@ current candidate is lost; miners just poll for a new one.
 - `serde_json` (feature `raw_value`) — ONLY for `WorkMessage.b`'s
   `serialize_with`: `b` ranges to ~2^256, which serde's numeric data model
   cannot represent, so it is emitted as a bare JSON number via
-  `serde_json::value::RawValue` wrapping the decimal digits (added
-  2026-06-12 with the b-as-number fix). The API crate still does the
+  `serde_json::value::RawValue` wrapping the decimal digits. The API crate
+  still does the
   HTTP-level `Json(work)` encoding; mining only owns this one
   number-shape escape hatch.
 
@@ -192,25 +192,21 @@ below). When present (a `candidateWithTxs`-style candidate), it is:
   "proof": { "msgPreimage": "hex (header without PoW)", "txProofs": [...] }
 ```
 
-**`b` is a bare JSON NUMBER, not a quoted string (corrected 2026-06-12 —
-JVM-compat serve bug).** JVM `ExternalCandidateBlock` encodes `b` as a
-`BigInt` via circe → an arbitrary-precision unquoted JSON number
+**`b` is a bare JSON NUMBER, not a quoted string.** JVM
+`ExternalCandidateBlock` encodes `b` as a `BigInt` via circe → an
+arbitrary-precision unquoted JSON number
 (`ergo-core .../examples/LiteClientExamples.scala:27`: `"b" :
 748014723576678314041035877227113663879264849498014394977645987`).
-Emitting it as a string (the prior contract + impl) breaks every
-JVM-compatible miner/pool: their jsmn-based parsers expect a numeric
-token and reject the candidate ("Jsmn failed to parse"). `b` ranges up
-to the secp256k1 group order (~2^256), so it does NOT fit u64 —
-serialize it as an arbitrary-precision JSON number (serde_json
-`raw_value`: a `serialize_with` that wraps the decimal digits in a
-`RawValue`, emitting them verbatim/unquoted; or the `arbitrary_precision`
-feature). This was invisible until the node was first driven by a real
-external miner (the "untested as a mining source" serve-direction gap —
-same class as the rust-peer serve bugs). `msg`/`pk` stay hex strings,
-`h` stays a number.
+Emitted as a string it breaks every JVM-compatible miner/pool: their
+jsmn-based parsers expect a numeric token and reject the candidate
+("Jsmn failed to parse"). `b` ranges up to the secp256k1 group order
+(~2^256), so it does NOT fit u64 — serialize it as an arbitrary-precision
+JSON number (serde_json `raw_value`: a `serialize_with` that wraps the
+decimal digits in a `RawValue`, emitting them verbatim/unquoted; or the
+`arbitrary_precision` feature). `msg`/`pk` stay hex strings, `h` stays a
+number.
 
-**`proof` is OPTIONAL and OMITTED when empty (corrected 2026-06-12 — the
-SECOND serve bug, same root cause).** JVM `WorkMessage` encoder
+**`proof` is OPTIONAL and OMITTED when empty.** JVM `WorkMessage` encoder
 (`ergo-core .../mining/WorkMessage.scala:27-39`) builds the object then
 `.collect { case (name, Some(value)) => ... }` — `proof` (and `h`) come
 from `Option`s and are **dropped from the JSON entirely** when `None`, NOT
@@ -342,9 +338,9 @@ restart exposes it.
 
 Seeding depends on `emission_box_id()` being valid on a freshly constructed
 validator — see `facts/validation.md` § "Recovering `emission_box_id` on
-resume". **Seeding the cache alone does not fix this**; without that recovery
+resume". **Seeding the cache alone does not satisfy this**; without that recovery
 `update_mining_proofs` returns early at the emission-box check and the symptom
-is unchanged, which makes it look like the diagnosis was wrong.
+is unchanged.
 
 ### Lifecycle API
 
@@ -452,21 +448,13 @@ supported path; constructing a `CandidateBlock` field-by-field outside this
 crate is a contract violation regardless of whether the result happens to be
 well-formed.
 
-⚠ **This was violated until v0.8.0, and the violation is what made steps 3 and
-4 dead code. Fixed in `3aecc7f`; the history stays because the failure was
-invisible for months.** `src/main.rs` built `CandidateBlock { .. }` inline — parent,
-n_bits, state root, AD proofs, its own copy of the
-`max(now, parent.timestamp + 1)` rule, `transactions: vec![emission_tx]` — and
-never called `generate_candidate`. So the crate's entry point had no production
-caller, and `select_transactions` and `build_fee_tx` had none either: the path
-that would have called them was not the path that ran. Mined blocks carried the
-emission transaction alone and miners collected no fees.
+⚠ **`src/main.rs` must not build a `CandidateBlock` inline.** Doing so bypasses
+`select_transactions` and `build_fee_tx` entirely: blocks carry the emission
+transaction alone and miners collect no fees, with nothing failing anywhere.
+The `max(now, parent.timestamp + 1)` timestamp rule in particular must exist
+only here.
 
-The lesson generalises past mining: **a crate function with no caller outside
-its own tests is not "not yet wired", it is a second implementation waiting to
-diverge.** Here the timestamp rule already existed twice.
-
-`generate_candidate` therefore needs everything steps 3–4 require, passed in
+`generate_candidate` needs everything steps 3–4 require, passed in
 rather than reached for — the caller owns the mempool and the UTXO set, the
 crate owns the assembly:
 
@@ -615,10 +603,9 @@ See "Ownership" above for why it spent v0.8.0 development with no caller.
       later cheaper transaction may still fit.
    e. Otherwise add to selected set and accumulate both cost and size.
 
-   ⚠ **The cost check cannot precede validation**, and an earlier draft of
-   this list had it first. A transaction's cost is produced *by*
-   `validate_single_transaction`; there is nothing to check against before
-   that call returns.
+   ⚠ **The cost check cannot precede validation.** A transaction's cost is
+   produced *by* `validate_single_transaction`; there is nothing to check
+   against before that call returns.
 
    ⚠ **The size bound is over the serialized SECTION, not the sum of
    transaction sizes.** Validators enforce `max_block_size` against the
@@ -698,9 +685,8 @@ validate, so a count cap only moves the failure from "box will not build" to
 ⚠ **Measure `out.bytes`, not the candidate.** `txBoxSize` applies to the
 serialized `ErgoBox`, which carries 32 bytes of transaction id plus the output
 index on top of the `ErgoBoxCandidate` body — 33 bytes that an
-estimate-from-the-candidate misses. Earlier drafts of this section said 122 and
-8476 for exactly that reason. Any implementation must grow the real box and
-measure it rather than assuming a per-token width.
+estimate-from-the-candidate misses. Any implementation must grow the real box
+and measure it rather than assuming a per-token width.
 
 The JVM caps by the same wrong constant — `flatMap(_.additionalTokens).take(MaxAssetsPerBox)`,
 unsorted — and loses the same fees. **We diverge deliberately.** Which fee
@@ -830,7 +816,7 @@ Convert the candidate into the data miners need.
    | 10 | votes | 3 bytes | raw bytes | `candidate.votes` |
    | 11 | unparsedBytes (only if version > 1) | 1 byte length + N bytes | raw `u8` length prefix + raw bytes | empty for first release |
 
-   **transactionsRoot computation (corrected 2026-06-10 — consensus bug):**
+   **transactionsRoot computation:**
    JVM `BlockTransactions.scala:59-63` makes the Merkle leaves
    version-dependent:
    - block version 1: leaves = the tx IDs (32 bytes each,
@@ -844,12 +830,10 @@ Convert the candidate into the data miners need.
      (`ErgoTransaction.scala:77-78`). Empty proofs (e.g. storage-rent
      spends) contribute zero bytes to the concatenation.
 
-   `transactions_root(txs)` previously implemented the v1 form
-   unconditionally — on v2+ networks (mainnet/testnet today) every
-   assembled candidate carried a transactionsRoot no JVM peer accepts;
-   mined blocks would have been orphaned network-wide. The signature is now
-   `transactions_root(txs, block_version)`. Surfaced 2026-06-10 by the
-   SANTA donner runner recomputing roots over real v4 testnet blocks.
+   ⚠ **The form is version-dependent and the signature must carry the
+   version: `transactions_root(txs, block_version)`.** Computing the v1 form
+   unconditionally puts a transactionsRoot on every candidate that no JVM peer
+   on a v2+ network accepts, and mined blocks are orphaned network-wide.
 
    **Consensus-critical.** This serialization must match JVM
    `HeaderSerializer.bytesWithoutPow` byte-for-byte. Any divergence means
@@ -865,9 +849,7 @@ Convert the candidate into the data miners need.
    **Note on `nBits`:** despite Scorex's general rule that integers are
    VLQ-encoded, `nBits` is the one exception in the header — it's written
    as 4 raw big-endian bytes via JVM `DifficultySerializer.serialize`, and
-   sigma-rust matches this with `n_bits.to_be_bytes()`. Earlier versions
-   of this contract incorrectly described `nBits` as VLQ; the code was
-   always correct.
+   sigma-rust matches this with `n_bits.to_be_bytes()`.
 
 2. **Serialize** the header without PoW fields.
 
@@ -878,24 +860,10 @@ Convert the candidate into the data miners need.
    ⚠ **Not `decode_compact_bits(candidate.n_bits)` — that is the difficulty.**
    The target is `q / difficulty` where `q` is the secp256k1 group order, and
    `pow_target` in `facts/chain.md` § "Phase 2" is the single definition of it.
-   This step said `decode_compact_bits` and the implementation faithfully
-   matched it, so the serve path advertised a target tens of orders of
-   magnitude harder than the one `check_pow` actually enforces. Zero shares
-   submitted, at any hashrate.
-
-   ⚠ **This is not a v0.8.0 regression. It dates to `5b65e49`, the commit that
-   completed this crate, and is present in every tagged release from `v0.1.0`
-   through `v0.7.11` — 42 of them.** External mining has never worked in a
-   released build of this node. It was caught on the `release/v0.8.0` branch,
-   before that tag existed, only because an operator pointed a real GPU at it.
-
-   Nothing that came before could have caught it. "Verified at runtime against
-   mainnet tip" meant candidate *assembly* was correct — well-formed, JVM-shaped,
-   byte-identical `msg`. Even the two earlier JVM-compat serve fixes (`b` as a
-   bare number, `proof` omitted when empty) were about making a real miner
-   **parse** the candidate; once it parsed, it mined against an impossible bound
-   and the only symptom was silence. **A miner that receives, parses and accepts
-   your candidate and then reports nothing is not idle — check `b`.**
+   Serving the difficulty advertises a bound tens of orders of magnitude harder
+   than the one `check_pow` enforces, and the only symptom is zero shares
+   submitted at any hashrate. **A miner that receives, parses and accepts your
+   candidate and then reports nothing is not idle — check `b`.**
 
    The two numbers are not close enough to be confused at a glance: at testnet
    height 485,897 the difficulty was `3912040448` (10 digits) and the target
@@ -976,9 +944,8 @@ The candidate is cached and served to multiple miner polls:
    - Verify `hit < target` where `target = enr_chain::pow_target(n_bits)`,
      i.e. `q / decode_compact_bits(n_bits)` — the same value served as
      `WorkMessage.b`. Serving one number and validating against another is
-     precisely the defect fixed in v0.8.0 (present since v0.1.0 — see
-     § "Candidate Assembly" step 4); these two must not be allowed to drift
-     apart again.
+     § "Candidate Assembly" step 4. Serving one number and validating against
+     another is the defect these two exist to prevent; they must not drift.
    - On failure (all candidates tried): return 400 "invalid PoW solution"
 
 6. **Assemble full block:**
@@ -1027,8 +994,8 @@ mining-specific behavior that the API handlers invoke.
 
 No request body. Returns `WorkMessage` JSON.
 
-**Height source — query by VALIDATED height, NOT header height (fixed
-2026-06-12 — bug #3).** The handler MUST query `cached_work` with
+**Height source — query by VALIDATED height, NOT header height.** The handler
+MUST query `cached_work` with
 `ApiState.validated_height` (the validator's last-fully-applied height —
 the SAME `Arc<AtomicU32>` the mining task uses to key the cache, wired in
 `main.rs`), NOT `chain.height()` (the HEADER-chain tip). The candidate is
@@ -1037,15 +1004,13 @@ height; querying by header height fails the `cached.tip_height ==
 current_tip_height` check whenever the header chain leads validation
 (`full < headers`) — which is the NORMAL transient state every time a new
 header arrives before its body is validated, and a persistent state when
-validation trails reception (e.g. a single slow peer). The original
-`chain.height()` query made the candidate `503` continuously in that
-window even though a valid candidate for the validated tip sat in the
-cache — the node was unservable as a mining source whenever it wasn't
-perfectly synced. Found driving a real external miner; the miner grinds on
-`validated_tip + 1`, racing the network for that height and switching when
-the node validates the next block (own or network). Regression: a
-candidate cached at validated height H must be served while header height
-is H+1.
+validation trails reception (e.g. a single slow peer). Querying by header
+height returns `503` continuously in that window even though a valid candidate
+for the validated tip sits in the cache, leaving the node unservable as a
+mining source whenever it is not perfectly synced. A miner grinds on `validated_tip + 1`, racing the
+network for that height and switching when the node validates the next block
+(own or network). **A candidate cached at validated height H must be served
+while header height is H+1.**
 
 Returns 503 if:
 - Mining not configured (no miner PK in config)
@@ -1285,12 +1250,11 @@ return 503 with `"reason": "mining not configured"`.
     matches, the header serialization is correct.
 
     ⚠ **`msg` matching proves header serialization and nothing else.** This
-    item claimed to be "the ultimate correctness test" and it is not: a
-    candidate can have a byte-perfect `msg` and still be unmineable, which is
-    exactly what shipped in every release from v0.1.0 to v0.7.11. Compare
-    **every** served field against the JVM's, `b` included.
+    item is not the ultimate correctness test: a candidate can have a
+    byte-perfect `msg` and still be unmineable. Compare **every** served field
+    against the JVM's, `b` included.
 
-13. **Target vector (regression):** Assert the served `b` against a fixed
+13. **Target vector:** Assert the served `b` against a fixed
     known-good pair captured from a Scala node, not against our own formula —
     a test that recomputes `pow_target` the way the implementation does will
     pass on any consistent-but-wrong definition.

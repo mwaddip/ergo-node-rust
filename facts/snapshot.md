@@ -47,9 +47,9 @@ handling happen in the sync machine (receiving) and main crate (serving).
 | 81 | `UtxoSnapshotChunk` | Response | `VLQ(len) + subtree_bytes` | 4,000,000 B |
 
 **All integer fields use Scorex serialization** (VLQ for unsigned, ZigZag+VLQ
-for signed). This was verified against real testnet wire captures — the initial
-assumption of BE u32/i32 was wrong. The JVM's `MessageSpecV1` uses `putUInt`
-(VLQ) and `putInt` (ZigZag+VLQ) for all integer serialization.
+for signed) — never BE u32/i32. The JVM's `MessageSpecV1` uses `putUInt` (VLQ)
+and `putInt` (ZigZag+VLQ) for all integer serialization. Verified against real
+testnet wire captures.
 
 ### Peer filtering
 

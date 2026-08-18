@@ -73,8 +73,8 @@ future_pad_length: u16 (VLQ — JVM putUShort)
 ```
 
 **Critical**: `m` and `k` use `putInt` (ZigZag VLQ), NOT plain VLQ or BE
-fixed-width. The lesson from snapshot sync (`facts/snapshot.md` line 49)
-applies: JVM Scorex serializers always use VLQ. Verified in `GetNipopowProofSpec.scala`.
+fixed-width. JVM Scorex serializers always use VLQ (`facts/snapshot.md`
+carries the same rule). Verified in `GetNipopowProofSpec.scala`.
 
 **Validation**:
 - Total body size MUST be ≤ 1000 bytes (reject before allocating).

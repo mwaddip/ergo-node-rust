@@ -305,7 +305,7 @@ the canonical height is `block_height()`.
 Returns an iterator over ADDigests that `rollback()` can restore to.
 Ordered newest-first. Length bounded by `keep_versions`.
 
-## Page cache observability (added 2026-08-12)
+## Page cache observability
 
 ### `RedbAVLStorage::cache_bytes_used(&self) -> u64`
 
@@ -437,53 +437,38 @@ impl RedbAVLStorage {
 
 ## Resolver Strategy
 
-### ⚠ The prover holds the ENTIRE UTXO tree in RAM (corrected 2026-08-15)
+### ⚠ The prover holds the ENTIRE UTXO tree in RAM
 
-**An earlier revision of this section said reads grow the resident tree
-permanently, and named that as the cause of a node's unattributed heap. That was
-wrong and is retracted.** The mechanism it described is real in the fork; it
-simply does not fire on the path that matters, and it was never the explanation
-for the memory.
-
-What is actually true: **the prover's tree is 100% resident, by construction.**
-A UTXO node starting from genesis (`src/main.rs`) builds an in-memory `AVLTree`
-and inserts the genesis boxes; every node since is created by insertion and
-stays reachable from `tree.root`. No `Node::LabelOnly` can enter that tree — the
-only constructors are `AVLTree::unpack`'s two children and the resolver's miss
-path, both reachable only from `AVLTree::resolve`, which is a no-op unless the
-child is *already* `LabelOnly`. The set starts empty and is closed under every
-operation, so it stays empty. Measured over a 689k-block genesis sync: zero
-resolver misses, zero rollbacks.
-
-So `resolve` having no inverse is true and irrelevant here. There is nothing to
-evict because nothing was ever resolved — the tree is in RAM because it was
-*put* there.
+**The prover's tree is 100% resident, by construction.** A UTXO node starting
+from genesis (`src/main.rs`) builds an in-memory `AVLTree` and inserts the
+genesis boxes; every node since is created by insertion and stays reachable from
+`tree.root`. No `Node::LabelOnly` can enter that tree — the only constructors
+are `AVLTree::unpack`'s two children and the resolver's miss path, both
+reachable only from `AVLTree::resolve`, which is a no-op unless the child is
+*already* `LabelOnly`. The set starts empty and is closed under every operation,
+so it stays empty. There is nothing to evict because nothing is ever resolved.
 
 **Both starting states converge on the same ceiling, the whole tree:**
 
 - *Genesis sync* — starts at the ceiling, 100% resident from block 1.
 - *Resumed or rolled-back node* — `restore_root` drops to three nodes, then
   resolution ratchets back up toward the same ceiling and never comes down.
+  **Every node that has ever been restarted is in this regime.**
 
-**`proverResidentNodesBytes` therefore measures the UTXO set, not a leak.**
-`node_count` is exactly `2 × boxes − 1`: always odd, and every delta even. It
-falls when the UTXO set contracts — confirmed against consensus data the node
-cannot influence, since the last byte of `stateRoot` is the AVL height, and that
-height fell 20 → 16 between h=205,440 and h=247,000, exactly where the gauge
-dropped 54.5 MB → 5.3 MB. An AVL height only falls on deletion, and height 16
-caps the tree at 65,536 leaves.
+**`proverResidentNodesBytes` measures the UTXO set, not a leak.** `node_count`
+is exactly `2 × boxes − 1`: always odd, and every delta even. It falls when the
+UTXO set contracts.
 
 Cost: roughly **500 B of RAM per UTXO box** carrying ~86 B of box data — 160 B
-per node (`RcBox` + `Node`), two nodes per box, plus keys. At h=688k that is
-2.26 M nodes / 568 MB, about 28% of live heap. It grows with the UTXO set, which
-grows with chain history. Bounded, and not reassuring.
+per node (`RcBox` + `Node`), two nodes per box, plus keys. It grows with the
+UTXO set, which grows with chain history. Bounded, and not reassuring.
 
 ⚠ **Do not "fix" this by releasing subtrees after `update_internal` commits.**
-That is not a leak fix; it is adding eviction that has never existed. The fork
-has no inverse of `resolve`, so it would have to be written, and every
-subsequent touch would pay a redb read plus `unpack` and re-materialise the same
-nodes. It is a throughput-for-memory design decision with a real cost, not a
-defect repair — and it must be measured, not assumed.
+That is not a leak fix; it is adding eviction that does not exist. The fork has
+no inverse of `resolve`, so it would have to be written, and every subsequent
+touch would pay a redb read plus `unpack` to re-materialise the same nodes. It
+is a throughput-for-memory trade with a real cost, and it must be measured
+rather than assumed.
 
 ### The problem
 
@@ -571,40 +556,32 @@ require re-syncing from scratch anyway.
 
 ## Offline Compaction
 
-### Why
+### What compaction reclaims
 
-Two mechanisms have historically left unreachable rows in `nodes`:
+Rows in `nodes` unreachable from any live root. The tree itself stays
+consistent — this is wasted space, not corruption. No consensus impact, and no
+resync is required for correctness.
 
-1. **Rollback skip** (`storage.rs`, rollback path). Deleting an undo record's
-   `inserted_labels` is unsafe while those labels may still be referenced by
-   the rolled-back-to tree or by older versions in the chain, so the deletion
-   is skipped. Fires only on reorg or a failed apply.
-2. **Call-order regression** (node v0.7.5–v0.7.9). `generate_proof()` cleared
-   the changed-node buffers before `update_internal` read them via
-   `removed_nodes()`, so the per-block delete list was empty and *every*
-   superseded node leaked. Fixed by restoring `update` → `generate_proof`.
-   Observed: 235 GB at height ~1.66M against a ~4–8 GB live tree.
+They accumulate through the **rollback skip** (`storage.rs`, rollback path):
+deleting an undo record's `inserted_labels` is unsafe while those labels may
+still be referenced by the rolled-back-to tree or by older versions in the
+chain, so the deletion is skipped. Fires only on reorg or a failed apply.
 
-Both produce the same artefact: rows in `nodes` unreachable from any live
-root. The tree itself stays consistent — this is wasted space, not corruption.
-No consensus impact, and no resync is required for correctness.
-
-Compaction reclaims that space offline.
+⚠ **Call order is load-bearing on the write path: `update` → `generate_proof`.**
+`generate_proof()` clears the changed-node buffers that `update_internal` reads
+via `removed_nodes()`. Inverted, the per-block delete list comes back empty and
+*every* superseded node is orphaned — a growth of two orders of magnitude over
+the live tree, with no error anywhere.
 
 ### Approach: rewrite, not sweep
 
 Compaction is a **rewrite of the reachable tree into a fresh database**, not a
 mark-and-sweep of the existing one.
 
-A sweep would have to mark every node reachable from all `keep_versions + 1`
-retained roots. Those roots share nearly all their nodes, so correctness
-demands a visited set spanning every reachable digest — at mainnet scale
-plausibly hundreds of millions of 32-byte labels, tens of GB of RAM. It is not
-guaranteed to run on operator hardware.
-
 A rewrite walks the single current root. Every live node in an AVL+ tree has
 exactly one parent, so a depth-first traversal visits each node exactly once
-with no visited set at all. Memory is O(tree depth) — around 30 frames.
+with no visited set at all. Memory is O(tree depth) — around 30 frames, which
+is what makes compaction runnable on operator hardware.
 
 Because the output database is built fresh containing only live nodes, it is
 minimal by construction. **`redb::Database::compact()` is not used and is not
@@ -707,8 +684,7 @@ verifies exactly one row. Unpacking a node yields `LabelOnly` children whose
 labels are read out of the *parent's* packed bytes, not out of the children's
 own stored rows — so re-hashing the root merely re-hashes bytes that were
 copied verbatim from source, and a missing, truncated, or altered node
-anywhere below the root goes undetected. An earlier revision of this contract
-asserted the shortcut was sufficient; it is not.
+anywhere below the root goes undetected.
 
 The recursive form is what makes the check cryptographic rather than a
 heuristic. Each label is a Blake2b256 over the node's contents including its
@@ -867,7 +843,7 @@ The primary design constraint. The node WILL be killed mid-operation.
   version, restoring the root node from storage. Subsequent operations lazy-load
   the rest of the tree via the resolver.
 
-### Open-time cost (v0.5.0+)
+### Open-time cost
 
 Every redb `WriteTransaction` opened by `RedbAVLStorage` MUST call
 `set_quick_repair(true)` before committing. Without quick-repair,
@@ -975,7 +951,7 @@ differ (prover vs verifier, persistent vs ephemeral).
 The generated AD proof from step 5 can optionally be served to digest-mode
 peers, but this is a future concern (Phase 6).
 
-## At-tip storage reopen contract (v0.4.x)
+## At-tip storage reopen contract
 
 Operators may reopen the storage with a smaller redb cache once chain
 sync reaches tip (drives RSS down by ~80% on mainnet at-tip). The

@@ -285,7 +285,7 @@ Two wire formats exist. V2 is used by all current nodes (>= 4.0.16).
 - The chain never contains two headers at the same height on the same fork.
 - All timestamps are treated as untrusted data. Timing logic uses block height.
 
-### Parent linkage (load-bearing — violated in production 2026-08-02)
+### Parent linkage (load-bearing)
 
 **A header may only enter the chain if its parent is already present.** For any
 accepted header `H` at height `N > 1`, `header_at(N-1)` on `H`'s branch must
@@ -312,11 +312,10 @@ already abandoned. The failure surfaces far away and much later, as an AVL
 `Key ... does not exist` during block application, which reads like state
 corruption rather than a header-acceptance bug.
 
-Observed instance: at mainnet height 1,840,209 the chain held the losing
-candidate `5fd5dac8…` while holding header `1e08e826…` at 1,840,210 whose
-`parentId` was the *winning* candidate `89f6ba6e…` — a header that was never
-stored. No fork was reported, `reset_to` was never called, and the node wedged
-retrying 1,840,210 against a state built on the losing branch.
+Concretely: a chain holding the losing candidate at height N while holding a
+header at N+1 whose `parentId` is the *winning* candidate reports no fork,
+never calls `reset_to`, and wedges retrying N+1 against a state built on the
+losing branch.
 
 Corollary for consumers: `header_at(N).id == header_at(N+1).parent_id` must be
 safe to rely on. Code that walks the chain by height is entitled to assume the
@@ -453,8 +452,8 @@ Chain owns the live instance; consumers query it via `active_parameters()`.
   mainnet activates rule 409 at the same boundary as the v6 bump). It is
   also the payload returned as `activated_update` at a voting-driven
   activation boundary.
-- **`block_proposed_update` normalization (added 2026-06-12 — JVM
-  `Parameters.parseExtension` swallow parity)**: the LIVE wrappers
+- **`block_proposed_update` normalization (JVM `Parameters.parseExtension`
+  swallow parity)**: the LIVE wrappers
   (`compute_expected_parameters`, `compute_expected_parameters_for_candidate`
   — i.e. the shared `compute_boundary_parameters_at`) MUST pre-normalize the
   block's raw 124 bytes through the strict parse
@@ -472,7 +471,6 @@ Chain owns the live instance; consumers query it via `active_parameters()`.
   the output is byte-identical. This is the consensus rule.
 
 ### `compute_expected_parameters_for_candidate(epoch_boundary_height: u32, block_proposed_update: &[u8], candidate_votes: [u8; 3]) -> Result<(Parameters, Vec<u8>), ChainError>`
-(added 2026-06-11)
 - **The candidate-aware sibling** of `compute_expected_parameters`: identical
   pipeline, but `boundary_fork_vote` derives from the SUPPLIED
   `candidate_votes` (id-120 membership) instead of `header_at(T)` — a mining
@@ -492,8 +490,7 @@ Chain owns the live instance; consumers query it via `active_parameters()`.
 ### `count_votes_in_epoch(epoch_end_height: u32) -> Result<Vec<(i8, u32)>>`
 - **Precondition**: All headers in `[epoch_end_height - voting_length + 1, epoch_end_height]`
   are present in the chain.
-- **Postcondition (corrected 2026-06-11 — SEEDED tally, JVM `VotingData`
-  parity)**: For a boundary at `T` the window is `[T − voting_length, T − 1]`
+- **Postcondition (SEEDED tally, JVM `VotingData` parity)**: For a boundary at `T` the window is `[T − voting_length, T − 1]`
   (`epoch_end_height = T − 1`). The window's FIRST header — the previous
   boundary — **seeds** the tally: each of its non-zero vote ids enters with
   count 1 (the seed header's own vote counts). Every subsequent window header
@@ -503,7 +500,7 @@ Chain owns the live instance; consumers query it via `active_parameters()`.
   If the window's first header is NOT the previous boundary (chain-start
   clamp: `T − voting_length < 1`, genesis is height 1), the seed is EMPTY and
   the tally is empty — every vote in the window drops.
-- **Order is consensus-relevant (corrected 2026-06-12)**: the tally is an
+- **Order is consensus-relevant**: the tally is an
   ORDERED sequence, not a map — JVM `VotingData.epochVotes` is
   `Array[(Byte, Int)]` seeded in the boundary header's vote-SLOT order
   (zero slots filtered, order preserved, duplicates NOT deduped —
@@ -526,7 +523,7 @@ Chain owns the live instance; consumers query it via `active_parameters()`.
 - **Helper for `compute_expected_parameters`**, exposed for testability.
   Delegates to the pure `tally_votes_seeded` (below).
 
-### Pure consensus seams (added 2026-06-11 — SANTA chain tier)
+### Pure consensus seams (SANTA chain tier)
 
 The SANTA chain tier grades these functions directly with settings handed
 per-entry. They MUST be pure: settings always arrive as arguments — never
@@ -535,10 +532,9 @@ testnet-128 votingLength bug class) and never from chain state.
 
 - `voting::tally_votes_seeded(window: &[(u32, [u8; 3])], boundary_height: u32,
   voting_length: u32) -> Vec<(i8, u32)>` — the seeded tally above, over
-  (height, votes) pairs. **Returns an ORDERED sequence** (signature
-  corrected 2026-06-12): entries in seed-slot order, duplicates preserved,
-  increments applied to every matching entry — see the order note under
-  `count_votes_in_epoch`. The legacy unseeded `tally_votes` is retired.
+  (height, votes) pairs. **Returns an ORDERED sequence**: entries in seed-slot
+  order, duplicates preserved, increments applied to every matching entry — see
+  the order note under `count_votes_in_epoch`. There is no unseeded variant.
 - `voting::compute_boundary_parameters(voting: &VotingSettings,
   boundary_height: u32, current: &Parameters, tally: &[(i8, u32)],
   boundary_fork_vote: bool, proposed_update: &[u8])
@@ -546,8 +542,7 @@ testnet-128 votingLength bug class) and never from chain state.
   pure extraction of `compute_expected_parameters` steps 1-4 (ordinary
   steps, soft-fork lifecycle, forced-v2, SubblocksPerBlock auto-insert),
   which stays tally + delegate (one implementation). Additionally returns
-  the **activated update AS A PARSED VALUE** (changed 2026-06-12, round 3
-  — was canonical bytes, before that verbatim bytes): JVM
+  the **activated update AS A PARSED VALUE**, never bytes: JVM
   `Parameters.update` returns the `ErgoValidationSettingsUpdate` OBJECT;
   the wire form is whatever a consumer gets from `serialize(value)`,
   NEVER the input slice. At a voting-driven activation boundary the value
@@ -560,8 +555,8 @@ testnet-128 votingLength bug class) and never from chain state.
   exact lifecycle wiring per JVM `Parameters.update` /
   `ErgoStateContext.process`; the SANTA chain contract
   (`~/projects/santa/docs/contract/runner-contract-chain.md` §2/§3/§4
-  "voting", incl. the REJECT arm) is the graded reference. **Strictness
-  (added 2026-06-12)**: the pure seam parse-validates `proposed_update`
+  "voting", incl. the REJECT arm) is the graded reference. **Strictness**: the
+  pure seam parse-validates `proposed_update`
   UP FRONT via `parse_validation_settings_update` (below) and errors on
   failure — JVM parity at the seam level is "these bytes must
   deserialize", because the JVM object handed to `Parameters.update`
@@ -571,7 +566,7 @@ testnet-128 votingLength bug class) and never from chain state.
   `epochVotes.find(_._1 == SoftFork)`), and `updateParams` folds in
   tally order.
 
-### `ValidationSettingsUpdate` value + canonical encoder (added 2026-06-12)
+### `ValidationSettingsUpdate` value + canonical encoder
 
 ```rust
 pub struct ValidationSettingsUpdate {
@@ -590,7 +585,7 @@ ids; statuses count + per-entry `putUShort(ruleId − FIRST_RULE_ID)` +
 ruleId < 1000 makes the offset negative and JVM's `putUShort`
 require-fails — notably `ReplacedRule(0)`, which is exactly what the
 unknown-statusCode forward-compat PARSE arm produces. The JVM can accept
-an update it cannot re-serialize (SANTA finding, 2026-06-12): a node
+an update it cannot re-serialize (SANTA finding): a node
 that ACTIVATES such an update throws only when something later
 serializes the value (e.g. a miner assembling a boundary extension) —
 `Parameters.update` itself succeeds. Mirror exactly: parse accepts,
@@ -606,7 +601,7 @@ activated value today (the proposed-bytes tracking for
   damping clamps are EIP-37-arm-only; classic `calculate` stays unclamped
   linear interpolation.
 
-### Soft-fork lifecycle — JVM-exactness pins (added 2026-06-12)
+### Soft-fork lifecycle — JVM-exactness pins
 
 Port of `Parameters.updateFork` (Parameters.scala:98-155). Sequential `if`s;
 every condition reads the PRE-update table (`current`); mutations accumulate
@@ -655,7 +650,7 @@ verbatim. Approval compares via signed widening (`votes as i64 > threshold`)
 SETTINGS is out of scope; vectors hand sane settings.)
 
 **HEIGHT/start arithmetic is i64-exact — a DELIBERATE divergence from JVM
-`Int`, out of scope (verified 2026-06-12).** JVM `Height = Int` and
+`Int`, out of scope.** JVM `Height = Int` and
 `votingLength`/`softForkEpochs`/`activationEpochs`/`version2ActivationHeight`
 are all `Int` (VotingSettings.scala:3-6, ErgoHistoryUtils Height = Int), so
 the JVM computes every checkpoint (`S + L·(ve+ae+1)` etc., and the
@@ -679,7 +674,7 @@ negative-`122` vector; absent that flag the board's green here means
 "agrees on all reachable input," NOT "byte-matches JVM Int wrap on
 adversarial heights."
 
-### `parse_validation_settings_update(bytes: &[u8]) -> Result<ValidationSettingsUpdate, ChainError>` (added 2026-06-12; returns the full value since round 3)
+### `parse_validation_settings_update(bytes: &[u8]) -> Result<ValidationSettingsUpdate, ChainError>`
 
 Strict deserialization of an `ErgoValidationSettingsUpdate` payload —
 port of `ErgoValidationSettingsUpdateSerializer.parse`
@@ -698,21 +693,18 @@ Ergo `rulesSpec` disableability (ValidationRules.scala:22-231, v6.0.3):
   200, 201, 203-211, 213, 214, 216, 300-305, 307, 403, 500, 501.
 - Not in spec (passes): everything else, incl. 110, 202, 414, ≥1000.
 
-`parse_disabled_rules` was REMOVED in round 3 (2026-06-12): the 409
-auto-insert gate reads the parsed value's `rules` directly and no other
-non-test caller remained. The strict seam is the only parse entry point.
-The encoder's Err variant is `ChainError::Voting` (pinned
-implementation-side, round 3).
+**The strict seam is the only parse entry point.** There is no
+`parse_disabled_rules`: the 409 auto-insert gate reads the parsed value's
+`rules` directly. The encoder's Err variant is `ChainError::Voting`.
 
-**Count-wrap parity (added 2026-06-12, implementation-derived)**: both
+**Count-wrap parity (implementation-derived)**: both
 section counts are read as JVM `r.getUInt().toInt` — plain `.toInt`, not
 `.toIntExact` — so a VLQ count in `[2^31, 2^32)` truncates NEGATIVE and
 `(0 until n)` reads ZERO entries (ErgoValidationSettingsUpdate.scala:43,
 51). A payload declaring a ≥2^31 rules count therefore parses as
 rules-empty instead of erroring. Mirrored exactly; pinned by test.
 
-**statusUpdates handling — STRICT (gap closed 2026-06-12, sigma pin
-`75be067f`).** After the rules section the strict parse reads the
+**statusUpdates handling — STRICT (sigma pin `75be067f`).** After the rules section the strict parse reads the
 `statusUpdates` COUNT (VLQ; JVM `getUInt().toInt` — the count-wrap note
 above applies here too; a payload truncated before the count — e.g. the
 1-byte `0x00` — errors, JVM `getUInt` underflow parity), then decodes
@@ -730,13 +722,12 @@ parity — `parseBytes` does not enforce full consumption). Mainnet
 h=1,628,160's payload (3× ReplacedRule: 1011→1016, 1007→1017,
 1008→1018) parses strict-clean — it is valid, not lenient-tolerated.
 The parsed statuses are RETAINED in the returned
-`ValidationSettingsUpdate` value (round 3 — previously discarded) so
-consumers can canonically re-encode; dynamic rule-status STATE remains
+`ValidationSettingsUpdate` value so consumers can canonically re-encode; dynamic rule-status STATE remains
 out of scope until a real on-chain update requires it
 (`active_proposed_update_bytes` keeps tracking the block's verbatim
 bytes, unaffected).
 
-### Fork-vote window gate — JVM `checkForkVote` (added 2026-06-12, NEW live-path rule)
+### Fork-vote window gate — JVM `checkForkVote`
 
 Port of `ErgoStateContext.checkForkVote` (ErgoStateContext.scala:156-168),
 fired from header processing for EVERY header whose votes contain 120
@@ -759,12 +750,11 @@ is lenient in the boundary computation at non-force heights and fatal
 here). Rule 407 is votable-disableable but active on both networks for
 all of history (launch default disables only 215/409) — implement as
 always-on; dynamic rule-status tracking is out of scope until a real
-on-chain update disables it. **Consensus note**: this gate was MISSING
-entirely (accept-what-JVM-rejects, fork direction) — dormant while no
-round is in progress, live the moment any 122 enters the table. Found
-during the 2026-06-12 JVM cross-read.
+on-chain update disables it. **Consensus note**: the gate is dormant while no
+round is in progress and live the moment any 122 enters the table. Omitting it
+is an accept-what-JVM-rejects divergence in the fork direction.
 
-**Pure seam (added 2026-06-12, SANTA chain tier kind `fork_vote_gate`)**:
+**Pure seam (SANTA chain tier kind `fork_vote_gate`)**:
 
 ```rust
 voting::check_fork_vote(
@@ -793,15 +783,14 @@ header on the live path (JVM-indistinguishable there: both surface as
 rule-407 invalid through `validateNoThrow`); the three-way split exists
 for the tier's grading granularity.
 
-### Header vote-field validity — JVM `validateVotes` (added 2026-06-12, NEW live-path rule)
+### Header vote-field validity — JVM `validateVotes`
 
 Port of `ErgoStateContext.validateVotes` (ErgoStateContext.scala:328-345),
 rules 212-214. **Was MISSING entirely** — chain/ read `header.votes` only
-for the tally and the fork gate and validated the field for nothing
+for the tally and the fork gate without validating the field
 (accept-what-JVM-rejects, fork direction; invisible on canonical history —
 no real header violates these — but an adversary who MINES a header with a
 malformed vote field gets it into our tree while the network rejects it).
-Found in the 2026-06-12 vote-rule cross-read.
 
 ```rust
 voting::check_header_votes(votes: [u8; 3]) -> Result<(), ChainError>
@@ -1314,7 +1303,7 @@ peer on demand. Tracked as a follow-up.
 - `reorg_floor()` is consulted before any reorg execution. Reorgs whose
   fork point falls below the floor are rejected.
 
-## Memory attribution (added 2026-08-11)
+## Memory attribution
 
 ### `HeaderChain::memory_estimate() -> ChainMemoryEstimate`
 

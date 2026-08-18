@@ -86,20 +86,25 @@ lives at `api/src/lib.rs::ApiState`. The roles, summarized:
 - Optional P2P-capture handle (`None` when `[debug.p2p_capture]` is off)
 - Mining state and block submitter (`None` outside UTXO mode with a miner PK)
 
-### Component memory attribution (added 2026-08-11)
+### Component memory attribution
 
-`ChainAccess` carries a `memory_estimate()` returning an api-local
-`ChainMemory { index_bytes, header_cache_bytes, score_cache_bytes }`, surfaced
-by `GET /debug/memory` as `chainIndexBytes` / `chainHeaderCacheBytes` /
-`chainScoreCacheBytes`.
+`GET /debug/memory` reports per-component figures alongside the process totals:
+
+- `chainIndexBytes` / `chainHeaderCacheBytes` / `chainScoreCacheBytes`, from
+  `ChainAccess::memory_estimate()` returning an api-local
+  `ChainMemory { index_bytes, header_cache_bytes, score_cache_bytes }`.
+- `storeCacheBytes`, `storeCacheEvictions` and `stateCacheBytes`, from
+  `redb::Database::cache_stats()` in `store/` and `state/`, reached through
+  `StoreAccess::cache_bytes_used`, `StoreAccess::cache_evictions` and
+  `UtxoAccess::cache_bytes_used`. redb is typically the single largest
+  consumer during a genesis sync.
+- `proverModifiedNodesBytes`, `proverResidentNodesBytes` and `syncWindowBytes`,
+  which are **published** rather than read — see below.
 
 **The API layer must not compute these numbers.** It reports what the owning
-crate tells it. The removed `chainHeaderEstimateBytes` was computed here from
-a local `AVG_HEADER_BYTES = 800` describing a `Vec<Header>` inside `chain/`;
-when `chain/` retired that Vec in Phase 3, this constant kept multiplying it
-by the header count and reported ~1.48 GB for a structure that did not exist —
-a figure exceeding total process RSS, which went unnoticed because nothing
-cross-checked the two crates.
+crate tells it. A figure derived here from a local constant describing a
+structure in another crate cannot notice when that structure changes shape, and
+nothing cross-checks the two.
 
 This crate deliberately does not depend on `enr-chain`; it reaches the chain
 only through `ChainAccess`. `ChainMemory` is therefore an api-local type, and
@@ -110,36 +115,10 @@ integration seam — it is not licence to reintroduce sizing arithmetic here.
 Any future per-component memory field follows the same rule: the crate that
 owns the structure computes the figure; this crate transports it.
 
-**Extended 2026-08-12** with `storeCacheBytes`, `stateCacheBytes` and
-`storeCacheEvictions`, sourced from `redb::Database::cache_stats()` in `store/`
-and `state/` respectively, reached through `StoreAccess::cache_bytes_used`,
-`StoreAccess::cache_evictions` and `UtxoAccess::cache_bytes_used`.
-
-redb was the single largest consumer during a genesis sync and was entirely
-invisible to this endpoint — 2701 MB of a 2859 MB process was unattributed,
-which is what made the 2026-08-11 investigation take a day.
-
-All three accessors return `Option<u64>` and the fields are omitted when the
-value is `None`. Reporting `0` would assert an empty cache, the same class of
-falsehood as the removed `chainHeaderEstimateBytes`. The traits declare these
-methods **without default bodies**: a default would let an implementor silently
-return a wrong value, which is structurally how `AVG_HEADER_BYTES` survived
-four months.
-
-**Extended 2026-08-14** with `proverModifiedNodesBytes`, `proverResidentNodesBytes`
-and `syncWindowBytes`.
-
-The 2026-08-12 extension attributed redb and left the rest. Measured on two
-v0.8.0 nodes at the same tip on the same machine: a node that had applied ~27k
-blocks to catch up held **2175 MB rssAnon with 1356 MB (87% of live heap)
-unattributed**, while a node already at tip held 430 MB with 214 MB
-unattributed. Same version, same height, and the catch-up node had the *shorter*
-uptime — so the growth follows block application and is not released when sync
-ends. The at-tip cache resize fires correctly and does not help, because the
-bulk was never cache: that node's caches were down to 34 MB state / 18 MB store.
-
-The suspects are the AVL prover's working set and `sync/`'s in-flight window,
-neither of which any crate reports today.
+**Every accessor returns `Option<u64>` and its field is omitted when the value
+is `None`.** Reporting `0` would assert an empty cache. The traits declare these
+methods **without default bodies**: a default lets an implementor silently
+return a wrong value.
 
 ⚠ **These three cannot be read synchronously, unlike every field above.** The
 prover lives inside the UTXO validator, which `sync/` owns and does not share
@@ -172,14 +151,14 @@ other reads against it.
 ⚠ **The two cadences differ, deliberately.** `syncWindowBytes` is cheap and
 publishes after each applied block. The prover figures walk the resident tree —
 O(resident nodes), the same order as applying a block at mainnet scale — so they
-publish at **flush cadence**. Per-block publication there is a measurable sync
-regression for no benefit: the structure grows monotonically, so a slow gauge
-loses nothing. Do not "make it consistent" by moving the prover onto the
-per-block path.
+publish on a bounded block interval with a wall-clock ceiling
+(`facts/validation.md` § "Prover memory attribution"). Per-block publication
+there is a measurable sync regression for no benefit: the structure grows
+monotonically, so a slow gauge loses nothing. Do not "make it consistent" by
+moving the prover onto the per-block path.
 
 Do not "simplify" this into a direct accessor. A synchronous read would need
-either a lock on the validator on an HTTP path or an `Arc<Mutex>` around it,
-and the second was rejected on its own merits.
+either a lock on the validator on an HTTP path or an `Arc<Mutex>` around it.
 
 ### State Context Lifecycle
 

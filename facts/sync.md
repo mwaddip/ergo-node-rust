@@ -57,7 +57,7 @@ few stale bytes, no migration.)*
 - Persist `validated_height` to `chain_meta` with `Durability::Immediate`.
 - **Precondition**: caller MUST have flushed the validator before invoking
   this — see the flush ordering rule under "Cross-DB Durability Handshake"
-  below. Since v0.8.0 that flush is reached through
+  below. That flush is reached through
   `validator.state_persistence()` — a required `BlockValidator` method, so it
   is callable from sync's generic `V: BlockValidator` bound — which returns
   `None` in digest mode; see
@@ -96,7 +96,7 @@ How the sync machine queries and updates chain state.
   download phase is a no-op without special-casing in the sync loop.
 - `store`: `SyncStore` for checking modifier existence
 - `validator`: `Option<BlockValidator>` for digest/UTXO-mode block validation.
-  Since v0.8.0 the storage-lifecycle methods live on a separate
+  The storage-lifecycle methods live on a separate
   `StatePersistence` trait reached through `state_persistence()`, so there are
   two independent "absent" signals and they are **not** interchangeable: no
   validator at all (light mode, below) bypasses the watermark scanner
@@ -210,8 +210,8 @@ is behind or forked from ours — the JVM does this in
   sent), so its transition to `synced()` depends entirely on receiving our
   SyncInfo back and seeing `our_tip <= its_height`. Misaddressing it to our
   sync peer strands the requester in the header loop forever — headers
-  complete, block download never engages. (Regression: a serving node at tip,
-  not syncing from the requester, still answers the requester.)
+  complete, block download never engages. A serving node at tip, not syncing
+  from the requester, still answers the requester.
 
 Continuation computation is a `SyncChain` trait method:
 
@@ -229,8 +229,8 @@ Implemented by the main crate's `SharedChain` bridge via
 
 **History (2026-06-08):** never implemented — only the consume side existed,
 because no peer had ever synced FROM this node (all prior peers were JVM
-archival nodes serving us). A from-genesis rust peer stalled forever at
-height 0 against a rust node. Discovered by the digest side-instance.
+archival nodes serving us). Without it a from-genesis peer stalls at height 0
+against another node of ours.
 
 ### Serving modifier requests (store-first)
 
@@ -272,8 +272,8 @@ The sync machine responds by clearing its section queue, resetting both
 watermarks (`downloaded_height` and `state_applied_height`) to the fork point,
 resetting the block validator's state root, re-queuing sections for the new
 branch, and re-scanning the download watermark. There are no in-flight eval
-results to drain — a reorg cannot arrive between a block's application and its
-verification, because there is no longer any gap between them.
+results to drain: a reorg cannot arrive between a block's application and its
+verification, because there is no gap between them.
 
 For incomplete fork chains (parent not in store), the pipeline sends
 `DeliveryControl::NeedModifier` to request the missing parent header. Once it
@@ -293,7 +293,7 @@ Periodic SyncInfo (30s) to detect new blocks. Reacts to Inv with ModifierRequest
 Receives pipeline progress for logging. The control channel is checked with
 `biased;` priority in the synced loop too — a `Reorg` while synced must not be missed.
 
-### At-tip Storage Reopen (v0.4.x)
+### At-tip Storage Reopen
 
 Operators can reduce steady-state RSS at chain tip by reopening the
 AVL state DB with a smaller redb cache once sync has caught up.
@@ -386,14 +386,13 @@ below. A crash between (2) and (3) is covered by (2)'s Immediate
 commit; only ancillary modifier writes get rolled back, which sync
 re-fetches naturally.
 
-### Flushing a validator that owns no state (added v0.8.0)
+### Flushing a validator that owns no state
 
 `state_persistence()` returns `None` in digest mode, because
 `DigestValidator` owns no redb and has nothing to fsync. That is **not** a
 flush failure and must not be treated as one.
 
-Three distinct cases, and the middle one is the new spelling of what used to
-be a defaulted `Ok(())`:
+Three distinct cases:
 
 | Case | Meaning | Effect on step (2)/(3) and pruning |
 |---|---|---|
@@ -403,25 +402,20 @@ be a defaulted `Ok(())`:
 
 ⚠ **`None` is NOT `FlushOutcome::NoValidator`.** That variant is light mode —
 no validator at all — and it deliberately skips `set_validated_height`. Digest
-mode has a validator and a real `validated_height()`, and today it reaches
-`FlushOutcome::Flushed(M)` by way of the defaulted `flush` returning `Ok(())`,
-so the store write happens. **It must keep happening**; reusing `NoValidator`
-would silently drop it and turn a refactor into a behaviour change.
+mode has a validator and a real `validated_height()`, so the store write
+happens and **must keep happening**; reusing `NoValidator` would silently drop
+it.
 
-A distinct outcome is therefore required — one that advances `last_flush` and
-completes the store pair, while not claiming an fsync occurred. Digest mode
-does not *resume* from this value (it rescans for the first complete block and
+`None` therefore has its own outcome — one that advances `last_flush` and
+completes the store pair while not claiming an fsync occurred. Digest mode does
+not *resume* from this value (it rescans for the first complete block and
 recovers state roots from headers — `src/main.rs`, the `StateType::Digest`
-branch), so the write is bookkeeping rather than load-bearing. It is preserved
-anyway, because the split is a refactor: dropping it is a separate decision
-that would need its own justification, not a side effect of moving a method
-between traits.
+branch), so the write is bookkeeping rather than load-bearing. Removing it is a
+separate decision with its own justification.
 
-⚠ The `None` and `Err` arms must not be collapsed. "Nothing to flush" and
-"the flush failed" differ by exactly the bug this split was made to prevent —
-a validator reporting success for work it never did. `sync/` already models
-the shape (`FlushOutcome`, and the no-validator case in `StateType::Light`);
-digest mode joins that arm rather than growing a new one.
+⚠ The `None` and `Err` arms must not be collapsed. "Nothing to flush" and "the
+flush failed" are different facts, and a validator must never report success
+for work it did not do.
 
 ### Startup reconciliation
 
@@ -444,12 +438,10 @@ match M.cmp(&V) {
         } else if let Some(header) = chain.header_at(V).await {
             // Suspicious gap. Roll state back to V via existing reset_to
             // (state.rollback + validator.validated_height = V).
-            // reset_to returns Result (2026-06-12): on Err the validator
-            // did NOT move — fall through to the forced-trust arm (state
-            // genuinely sits at M; set_validated_height(M) + loud warn).
-            // This codifies what the old swallow accidentally did in the
-            // 2026-06-09 sweep incident: state stayed at tip,
-            // self-corrected on next flush, no corruption.
+            // reset_to returns Result: on Err the validator did NOT move —
+            // fall through to the forced-trust arm (state genuinely sits at
+            // M; set_validated_height(M) + loud warn). State stays at tip and
+            // self-corrects on the next flush.
             match validator.reset_to(V, header.state_root) {
                 Ok(()) => { /* warn!(M, V, gap, "state rolled back to V") */ }
                 Err(_e) => {
@@ -670,15 +662,13 @@ go through method/field access on `self`). The compiling pattern moves
 receiver in its place whose paired sender is held alive for the
 duration of `run()` so the sentinel never resolves spuriously.
 
-**Why an explicit signal:** earlier drafts of this contract relied on
-event-stream-closure (sync's `next_event()` returning `None` after the
-host dropped its P2P reference) as the implicit shutdown signal. That
-design is broken: `P2pTransport` holds `Arc<P2pNode>` and the host
-clones that Arc into the mining, API, mempool, and other paths. The
-host's `drop(p2p)` only releases one of many references — the node
-stays alive, its event-emitting tasks stay alive, the channel never
-closes, and sync hangs in `next_event().await` until the runtime
-forcibly aborts it. The oneshot signal is the only deterministic exit.
+⚠ **Event-stream closure cannot serve as the shutdown signal.**
+`P2pTransport` holds `Arc<P2pNode>` and the host clones that Arc into the
+mining, API, mempool, and other paths. The host's `drop(p2p)` releases one
+of many references — the node stays alive, its event-emitting tasks stay
+alive, the channel never closes, and sync hangs in `next_event().await`
+until the runtime forcibly aborts it. The oneshot signal is the only
+deterministic exit.
 
 ### Host shutdown ordering
 
@@ -829,7 +819,7 @@ JVM has no light-mode analog at the section-id level (it gates the entire
 download phase via `nipopowBootstrap`); our chain crate folds the gating into
 `required_section_ids` returning empty, which keeps the sync loop unchanged.
 
-### Memory attribution (added 2026-08-14)
+### Memory attribution
 
 `HeaderSync` exposes a best-effort estimate of what its in-flight structures
 hold:
@@ -847,13 +837,8 @@ pub struct SyncWindowEstimate {
 }
 ```
 
-⚠ **An earlier revision of this contract named the first field
-`buffered_section_bytes` and described it as "section payloads received and
-awaiting application". No such thing exists in this crate** — that was my
-assumption, not the architecture, and it is corrected here.
-
-**The window is cleared as a suspect for the unattributed heap.** `sync/` holds
-**zero** section payload bytes and keeps no persistent download queue.
+⚠ **This crate buffers no section payloads.** `sync/` holds **zero** section
+payload bytes and keeps no persistent download queue.
 `ModifierResponse` is not a message this state machine handles: the P2P pipeline
 writes bytes into the modifier store and notifies sync with **ids only**. The
 sweep reads each block back out of the store, applies it, and drops it within a
@@ -1074,37 +1059,17 @@ The sync machine tracks two watermarks:
 - **`state_applied_height`** — highest height where `apply_state()` returned Ok.
   External consumers (API, mempool, mining) see this height.
 
-**`script_verified_height` was deleted in v0.8.0**, along with deferred
-evaluation itself. It tracked how far script verification trailed state
-application; `apply_state` now evaluates before persisting, so `Ok` already
-means the scripts passed, and a second watermark could only ever disagree with
-the first. Everything hanging off it went too: the reorder buffer and its
-`eval_generation` stamp, the dispatch gate and its byte/count bounds, the
-failure-rollback path, the startup gap repair, and the checkpoint frontier
-floor.
+**There is no third watermark for script verification.** `apply_state`
+evaluates before persisting, so `Ok` already means the scripts passed and a
+watermark trailing `state_applied_height` could only ever disagree with it.
+There is no reorder buffer, no dispatch gate, no eval-failure rollback path,
+and no checkpoint frontier floor.
 
-*The history is kept because it is the argument against reintroducing any of
-it.* The reorder buffer was drain-local until 2026-08-12, so any eval result
-that overtook its predecessor was found non-contiguous and discarded — and the
-channel never resends, so the frontier could never pass that hole for the life
-of the process. Block 3522 (3 txs, 17 inputs, the first non-coinbase-only block
-in its region) was overtaken by the trivial 3523 on a two-thread pool, and the
-watermark froze there for **190,000+ blocks** while `eval_lag` read **187,711**
-against `evals_in_flight` of **1** and flat memory. Scripts were still
-evaluated and failures still rolled back, so it was bookkeeping rather than a
-verification skip — but every consumer reading that watermark as "validated up
-to here" was lied to from the first overtake onwards, which on a low-thread
-host is almost immediate.
-
-That bug, the `handle_eval_failure` zeroing of `evals_in_flight` while its
-rayon tasks still ran and still held their heap, and the unbounded backlog that
-killed a 4-thread 1.8 GHz host at anon-rss 10.62 GiB, were three faces of one
-root: **verification lagging application**. Removing the lag removed the class,
-and it is the reason a "just make it async again for throughput" proposal
-should be treated as a request to reopen all three.
+⚠ **Do not reintroduce a verification stage that lags application**, for
+throughput or any other reason. See `docs/engineering-lessons.md`.
 
 Both watermarks initialize from `validator.validated_height()` on startup.
-Nothing script-related is persisted separately any more.
+Nothing script-related is persisted separately.
 
 ### Invariants
 
@@ -1124,13 +1089,8 @@ A periodic INFO record during catch-up:
 | `state_applied_height` | **the applied tip — `validator.validated_height()`**, NOT the struct field |
 | `jemalloc_allocated` | the existing probe; the field is **omitted** when no probe is wired |
 
-Reduced in v0.8.0 from six fields to two. `evals_in_flight`,
-`script_verified_height`, `eval_lag` and `eval_bytes_in_flight` all described a
-queue that no longer exists.
-
-⚠ **Anything quoting `eval_lag` from a pre-2026-08-12 run is quoting a frozen
-number** — see the watermark history above. Field reports and journals from
-that era should not be used to argue about backlog depth.
+Two fields, and no others. There is no eval queue to report depth, lag, or
+in-flight bytes for.
 
 ### Watermark scanner
 
