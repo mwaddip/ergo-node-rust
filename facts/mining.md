@@ -482,11 +482,16 @@ crate owns the assembly:
 transaction against a context built by `build_state_context(stub,
 preceding_headers, parameters)`. Built from the parent alone that context
 exposes a **one-header** `CONTEXT.headers` window, where block validation
-exposes up to ten. A script reading `headers[5]` would then fail *during
+exposes nine. A script reading `headers[5]` would then fail *during
 selection* and the transaction would be evicted from the mempool as invalid —
-a valid transaction destroyed by a selection-only artefact. Pass
-`chain.headers_from(parent.height - 9, 10)` reversed, minus the parent; the
-parent is prepended internally.
+a valid transaction destroyed by a selection-only artefact.
+
+⚠ **The window is nine, not ten** — see `facts/validation.md` § "Window size:
+`CONTEXT.headers` is 9 for a block, never 10". Selection must predict with the
+same window block validation judges with, or it packs transactions the block
+that carries them will be rejected for. Pass
+`chain.headers_from(parent.height - 8, 9)` reversed, minus the parent; the
+parent is prepended internally, giving nine total.
 
 `generate_candidate` returns `GeneratedCandidate { block, work, invalid_txs }`.
 ⚠ **`invalid_txs` MUST be routed to the mempool for eviction** or Step 3.6 is

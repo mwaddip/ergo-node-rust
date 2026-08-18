@@ -4045,14 +4045,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
 
                     // Ancestors for the upcoming-block context, newest first,
-                    // WITHOUT the parent — generate_candidate prepends it. A
-                    // one-header window here would fail any script reading
-                    // headers[5] and get a valid transaction evicted.
+                    // WITHOUT the parent — generate_candidate prepends it,
+                    // giving the 9 of `CONTEXT.headers`. A one-header window
+                    // here would fail any script reading headers[5] and get a
+                    // valid transaction evicted.
+                    //
+                    // 9 headers in, minus the parent, is the 8 ancestors
+                    // `context_window` keeps. Fetching 10 also works — mining
+                    // truncates — but supplying a window that is only the right
+                    // size because the callee trims it is how the 10-vs-9
+                    // divergence hid. See `facts/validation.md` § "Window size".
                     let (active_params, ancestor_headers) = {
                         let chain_guard = mining_chain.lock().await;
                         let params = chain_guard.active_parameters().clone();
-                        let mut hs = chain_guard
-                            .headers_from(proof_data.parent.height.saturating_sub(9), 10);
+                        let mut hs =
+                            chain_guard.headers_from(proof_data.parent.height.saturating_sub(8), 9);
                         hs.reverse();
                         hs.retain(|h| h.height != proof_data.parent.height);
                         (params, hs)
