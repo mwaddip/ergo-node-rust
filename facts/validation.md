@@ -86,6 +86,8 @@ pub trait BlockValidator {
     ///     `apply_state` means exactly that; there is nothing left owed.
     ///   - `ApplyStateOutcome.epoch_boundary_params` is Some if this was
     ///     an epoch-boundary block with verified parameters
+    ///   - `ApplyStateOutcome.block_cost` is Some(cost) if scripts were
+    ///     evaluated, None if the block was at or below checkpoint_height
     ///
     /// Postconditions on Err:
     ///   - State is unchanged: validated_height, current_digest, AND THE
@@ -417,17 +419,14 @@ here. **A node-level cache in `state/` returning live `Rc` handles from
 `rollback` would make a wrong proof reachable.** Caching the *bytes* is fine;
 caching the *handles* is a consensus bug.
 
-### Open: the block cost is discarded
+### Block cost
 
-`evaluate_scripts` returns the block-accumulated transaction cost and
-`apply_state` drops it. Nothing is unenforced — the `maxBlockCost` gate runs
-inside `evaluate_scripts` regardless. No caller consumes the figure, and the
-only cost-shaped value in the API is `max_block_cost`, the parameter limit
-rather than what a block actually spent.
-
-Surfacing it is an observable to add, and it wants a consumer first — a `cost=`
-field on the sweep line, or a block-level API field. Adding it is a field on
-`ApplyStateOutcome` and one assignment.
+`evaluate_scripts` returns the block-accumulated transaction cost (Σ per-tx
+costs, enforced ≤ `max_block_cost`). The `maxBlockCost` gate runs inside
+`evaluate_scripts` regardless — the field is an observable, not a check the
+caller must perform. `ApplyStateOutcome::block_cost` surfaces it as
+`Option<u64>`: `Some` when scripts were evaluated, `None` when the block was
+at or below `checkpoint_height` and evaluation was skipped.
 
 ## New Types
 
@@ -435,6 +434,13 @@ field on the sweep line, or a block-level API field. Adding it is a field on
 pub struct ApplyStateOutcome {
     /// Some if this was an epoch-boundary block with verified parameters.
     pub epoch_boundary_params: Option<Parameters>,
+    /// Raw `ErgoValidationSettingsUpdate` payload from extension key
+    /// `[0x00, 124]` at epoch boundaries (empty Vec if the field is absent),
+    /// or None for non-boundary blocks.
+    pub epoch_boundary_proposed_update: Option<Vec<u8>>,
+    /// Block-accumulated transaction cost from `evaluate_scripts`, or None
+    /// when evaluation was skipped (block at or below checkpoint_height).
+    pub block_cost: Option<u64>,
 }
 
 /// Everything needed to verify transaction spending proofs. Built inside

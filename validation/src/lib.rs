@@ -35,10 +35,6 @@ pub use ergo_lib::chain::transaction::Transaction;
 pub use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
 
 /// Outcome of a successful state application.
-///
-/// Carries nothing about script evaluation, because there is nothing to
-/// carry: `apply_state` evaluates the block's scripts itself and an `Ok`
-/// already means they passed (facts/validation.md, "Script evaluation").
 #[derive(Debug)]
 pub struct ApplyStateOutcome {
     /// `Some(parsed)` if this was an epoch-boundary block AND the parsed
@@ -52,6 +48,9 @@ pub struct ApplyStateOutcome {
     /// passes this to `chain.apply_epoch_boundary_parameters` alongside
     /// the parameters so both advance atomically.
     pub epoch_boundary_proposed_update: Option<Vec<u8>>,
+    /// Block-accumulated transaction cost from `evaluate_scripts`, or `None`
+    /// when evaluation was skipped (block at or below `checkpoint_height`).
+    pub block_cost: Option<u64>,
 }
 
 /// Everything needed to verify a block's transaction spending proofs.

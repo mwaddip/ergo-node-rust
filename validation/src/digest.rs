@@ -229,6 +229,7 @@ impl BlockValidator for DigestValidator {
         // validators cannot drift on a consensus path. Nothing to roll back
         // on the Err path: step 8 below is the only mutation in the whole
         // function, and it has not happened yet.
+        let mut block_cost = None;
         if validate_txs {
             let mut proof_boxes = HashMap::with_capacity(proof_box_bytes.len());
             for (id, bytes) in &proof_box_bytes {
@@ -244,9 +245,7 @@ impl BlockValidator for DigestValidator {
                 parameters: active_params.clone(),
             };
 
-            // Cost discarded, not unchecked — the maxBlockCost gate runs
-            // inside evaluate_scripts.
-            tx_validation::evaluate_scripts(&eval)?;
+            block_cost = Some(tx_validation::evaluate_scripts(&eval)?);
         }
 
         // 8. Advance state
@@ -258,6 +257,7 @@ impl BlockValidator for DigestValidator {
         Ok(ApplyStateOutcome {
             epoch_boundary_params,
             epoch_boundary_proposed_update,
+            block_cost,
         })
     }
 
