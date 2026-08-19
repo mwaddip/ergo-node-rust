@@ -542,6 +542,7 @@ impl UtxoValidator {
         //
         // The digest check stays ahead of it because it is cheap and rejects
         // malformed blocks before the expensive step.
+        let mut block_cost = None;
         if validate_txs {
             let mut proof_boxes = HashMap::with_capacity(proof_box_bytes.len());
             for (id, bytes) in &proof_box_bytes {
@@ -557,9 +558,7 @@ impl UtxoValidator {
                 parameters: active_params.clone(),
             };
 
-            // The cost is discarded, not unchecked: the maxBlockCost
-            // consensus gate runs inside evaluate_scripts.
-            tx_validation::evaluate_scripts(&eval)?;
+            block_cost = Some(tx_validation::evaluate_scripts(&eval)?);
         }
 
         // 7. Persist state changes atomically with block_height.
@@ -634,6 +633,7 @@ impl UtxoValidator {
         Ok(ApplyStateOutcome {
             epoch_boundary_params,
             epoch_boundary_proposed_update,
+            block_cost,
         })
     }
 
