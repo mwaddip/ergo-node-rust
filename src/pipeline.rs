@@ -274,23 +274,40 @@ impl ValidationPipeline {
                 }
             };
 
-            // Round-trip check: detect headers whose re-serialization produces
-            // different bytes. These would break SyncInfo (commonPoint fails).
-            if let Ok(reserialized) = header.scorex_serialize_bytes() {
-                if data != reserialized.as_slice() {
+            // Round-trip check: the header's id is recomputed from its parsed
+            // fields, but the bytes stored and served are the wire bytes. A
+            // header whose re-serialization differs (trailing bytes, a
+            // non-canonical encoding) would be stored and served under a
+            // label not recomputed from those bytes, and would break SyncInfo
+            // (commonPoint fails) — so it is rejected, the same rule the
+            // sections' `finish()` applies (`facts/receive-path.md`).
+            match header.scorex_serialize_bytes() {
+                Ok(reserialized) if data == reserialized.as_slice() => {}
+                Ok(reserialized) => {
                     let first_diff = data
                         .iter()
                         .zip(reserialized.iter())
                         .position(|(a, b)| a != b);
-                    tracing::error!(
-                        height = header.height,
-                        wire_len = data.len(),
-                        reser_len = reserialized.len(),
-                        first_diff_at = ?first_diff,
-                        wire_prefix = format!("{:02x?}", &data[..data.len().min(20)]),
-                        reser_prefix = format!("{:02x?}", &reserialized[..reserialized.len().min(20)]),
-                        "ROUND-TRIP MISMATCH"
-                    );
+                    if let Some(pid) = peer_id {
+                        tracing::warn!(
+                            peer_id = pid,
+                            height = header.height,
+                            wire_len = data.len(),
+                            reser_len = reserialized.len(),
+                            first_diff_at = ?first_diff,
+                            "PENALTY header bytes are not canonical (round-trip mismatch)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            height = header.height,
+                            "pipeline: rejecting header: round-trip mismatch"
+                        );
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(height = header.height, "pipeline: rejecting header: cannot re-serialize: {e}");
+                    continue;
                 }
             }
 
@@ -1275,5 +1292,25 @@ mod tests {
         let ext_id = enr_chain::section_ids(&header)[2].1;
         run(&mut pipeline, vec![(108, ext_id, ext.clone(), Some(7))]);
         assert_eq!(pipeline.store.get(108, &ext_id).unwrap().as_deref(), Some(ext.as_slice()));
+    }
+
+    /// A header whose wire bytes are not its canonical serialization
+    /// (here: canonical bytes plus trailing junk, which parses to the same
+    /// id) is rejected, not stored raw under the recomputed id.
+    #[test]
+    fn non_canonical_header_bytes_are_rejected() {
+        use sigma_ser::ScorexSerializable;
+        let (header, _ext, _ad) = block_2666();
+        let canonical = header.scorex_serialize_bytes().unwrap();
+        let mut trailing = canonical.clone();
+        trailing.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(enr_chain::parse_header(&trailing).unwrap().id, header.id, "same id");
+        let (mut pipeline, _tx, _progress_rx, _ctrl_rx, mut data_rx, _dir) = test_pipeline();
+        run(&mut pipeline, vec![(HEADER_TYPE_ID, header.id.0 .0, trailing, Some(7))]);
+        assert!(received(&mut data_rx).is_empty(), "non-canonical header must not be reported received");
+        assert_eq!(pipeline.buffer.len(), 0, "and must not be buffered");
+        // Control: the canonical bytes are accepted (parent unknown → buffered).
+        run(&mut pipeline, vec![(HEADER_TYPE_ID, header.id.0 .0, canonical, Some(7))]);
+        assert_eq!(received(&mut data_rx), vec![header.id.0 .0]);
     }
 }
