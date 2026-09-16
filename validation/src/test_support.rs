@@ -181,6 +181,14 @@ pub fn preceding_headers() -> Vec<Header> {
 }
 
 /// Raw section bytes for a block carrying `txs`.
+/// Make `header` commit to the given transactions and extension fields, the
+/// way a mined header does. Fixtures built with zero roots must call this
+/// once `apply_state` binds sections to their roots.
+pub fn bind_roots(header: &mut Header, txs: &[Transaction], fields: &[([u8; 2], Vec<u8>)]) {
+    header.transaction_root = Digest32::from(enr_chain::transactions_root(txs, header.version));
+    header.extension_root = Digest32::from(enr_chain::extension_root(fields));
+}
+
 pub fn sections(txs: &[Transaction]) -> (Vec<u8>, Vec<u8>) {
     (
         crate::sections::serialize_block_transactions(&HEADER_ID, 3, txs)

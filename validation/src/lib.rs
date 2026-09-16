@@ -235,6 +235,17 @@ pub enum ValidationError {
     #[error("AD proofs digest mismatch")]
     ProofDigestMismatch { expected: [u8; 32], got: [u8; 32] },
 
+    /// The transactions section does not hash to `header.transaction_root`
+    /// (JVM `bsCorrespondsToHeader`): substituted, reordered, or re-witnessed
+    /// bodies land here regardless of how they reached validation.
+    #[error("transactions root mismatch")]
+    TransactionsRootMismatch { expected: [u8; 32], got: [u8; 32] },
+
+    /// The extension section does not hash to `header.extension_root`
+    /// (JVM `bsCorrespondsToHeader`).
+    #[error("extension root mismatch")]
+    ExtensionRootMismatch { expected: [u8; 32], got: [u8; 32] },
+
     #[error("state root mismatch after AD proof verification")]
     StateRootMismatch { expected: Vec<u8>, got: Vec<u8> },
 

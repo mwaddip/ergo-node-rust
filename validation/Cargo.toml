@@ -19,6 +19,7 @@ ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "b
 sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "b438d520" }
 ergo_avltree_rust = "0.1.1"
 enr-state = { path = "../state" }
+enr-chain = { path = "../chain" }
 rayon = "1"
 blake2 = "0.10"
 bytes = "1"

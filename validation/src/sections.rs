@@ -428,3 +428,34 @@ mod tests {
         }
     }
 }
+
+
+/// Bind the parsed transactions and extension sections to the roots the
+/// header commits to (JVM `bsCorrespondsToHeader`). The receive path binds
+/// peer deliveries at the store write (`facts/receive-path.md`); this binds
+/// whatever reaches validation — sections stored before that binding
+/// existed, sections injected by any other writer, and the runner paths that
+/// bypass the store. The root computations are the workspace's single
+/// implementations in `enr_chain`.
+pub fn check_section_roots(
+    header: &ergo_chain_types::Header,
+    txs: &ParsedBlockTransactions,
+    ext: &ParsedExtension,
+) -> Result<(), ValidationError> {
+    // The root's shape (whether witness leaves are folded in) follows the
+    // header's version, not the version the body declares about itself: the
+    // header is the verified thing, the body is what is being checked.
+    let expected: [u8; 32] = header.transaction_root.into();
+    let got = enr_chain::transactions_root(&txs.transactions, header.version);
+    if got != expected {
+        return Err(ValidationError::TransactionsRootMismatch { expected, got });
+    }
+    let expected: [u8; 32] = header.extension_root.into();
+    let fields: Vec<([u8; 2], Vec<u8>)> =
+        ext.fields.iter().map(|f| (f.key, f.value.clone())).collect();
+    let got = enr_chain::extension_root(&fields);
+    if got != expected {
+        return Err(ValidationError::ExtensionRootMismatch { expected, got });
+    }
+    Ok(())
+}
