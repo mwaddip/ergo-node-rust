@@ -249,6 +249,8 @@ pub struct ExtensionCandidate {
 
 impl ExtensionCandidate {
     /// Merkle root digest of extension fields (for header.extension_root).
+    /// Delegates to `enr_chain::extension_root(&self.fields)` — the single
+    /// implementation of the leaf encoding (`facts/chain.md` § Section bodies).
     pub fn digest(&self) -> [u8; 32];
 }
 ```
@@ -834,6 +836,11 @@ Convert the candidate into the data miners need.
    version: `transactions_root(txs, block_version)`.** Computing the v1 form
    unconditionally puts a transactionsRoot on every candidate that no JVM peer
    on a v2+ network accepts, and mined blocks are orphaned network-wide.
+
+   The implementation is `enr_chain::transactions_root` with
+   `enr_chain::witness_id` (`facts/chain.md` § Section bodies) — the same
+   functions the receive path uses to bind delivered block bodies. Mining
+   carries no copy of either.
 
    **Consensus-critical.** This serialization must match JVM
    `HeaderSerializer.bytesWithoutPow` byte-for-byte. Any divergence means

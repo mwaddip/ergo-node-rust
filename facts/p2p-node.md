@@ -145,11 +145,14 @@ The outbound manager runs as a background task. Two distinct phases:
 ### Fill phase (new in v0.6.0+)
 - Once `connected_outbound >= min_peers` and `< max_peers`, the
   manager enters a slow-trickle mode:
-  - Every `outbound_fill_interval` (default **30s**), it queries
-    `PeerDb::recent(N, exclude=currently_connected_addrs)` where
-    `N = max_peers - connected_outbound`.
-  - If the result is non-empty, it dials the **first** entry
-    (most-recently-seen). One dial per tick, not N.
+  - Every `outbound_fill_interval` (default **30s**), it asks
+    `PeerDb::dial_candidate(exclude = currently_connected_addrs ∪ cooldown,
+    connected = currently_connected_addrs, eligible = not bogus when
+    `filter_bogus_addresses` is on)` for one address: a uniformly random
+    eligible entry, preferring an IP group not already connected
+    (`facts/p2p-peerdb.md`). Hearsay entries are eligible — dialing is how
+    hearsay becomes observation.
+  - If it returns an address, dial it. One dial per tick, not N.
   - If `connected_outbound >= max_peers`, the manager sleeps the tick.
   - If the PeerDb is empty or fully exhausted (every fresh candidate
     has been tried and failed within the last `fill_retry_cooldown`),

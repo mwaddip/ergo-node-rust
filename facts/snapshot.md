@@ -131,9 +131,33 @@ snapshot height. The header's `stateRoot` is 33 bytes: `[root_hash: 32B | tree_h
 ```
 verify(manifest, expected_state_root: [u8; 33]):
   let (expected_root, expected_height) = split_digest(expected_state_root)
-  assert manifest root label == expected_root
   assert manifest root_height == expected_height
+  walk the DFS stream, recomputing every node's label from its own fields:
+    assert the root's recomputed label == expected_root
+    for every internal node above manifest_depth: assert its stored
+      left_label / right_label == the recomputed labels of the two subtrees
+      that follow it in DFS order
+    boundary nodes (depth == manifest_depth) keep their stored labels as the
+      subtree ids; those links are checked when the chunks arrive
+  assert every byte was consumed: truncation, trailing bytes, a zero
+    manifest_depth, or an unknown node prefix rejects the manifest
 ```
+
+A node's label commits to that node's bytes only: an internal node hashes
+the child labels *it carries*, not its children. A root that verifies says
+nothing about the interior unless every parent-child link is checked, which
+is why `verify` walks the whole stream. The JVM checks the root alone
+(`ManifestSerializer.parse` reuses each node's stored child labels), so a
+peer in its quorum can serve a correct root over an arbitrary interior; this
+node does not accept that. Stricter than the reference, local to bootstrap,
+no consensus effect.
+
+`verify` runs three times, each on the bytes actually in hand: on every
+manifest response before any subtree id is extracted from it; on the stored
+manifest bytes when resuming an interrupted download; and on the assembled
+root before `load_snapshot` (§ State initialization). The manifest id agreed
+by quorum is the *expected* value — it is never a substitute for hashing the
+bytes that arrived (`facts/receive-path.md`).
 
 ### Subtree extraction
 
@@ -163,10 +187,14 @@ or `right_label` from the manifest's boundary nodes.
 
 ### Chunk verification
 
-Each chunk's root label must match the subtree ID that was requested. After
-deserialization, the tree structure is self-consistent (parent labels are
-Blake2b256 of their children). No additional verification needed per chunk —
-the manifest's verified root transitively authenticates all chunks.
+Each chunk's root label must match the subtree ID that was requested, and
+every parent-child link inside the chunk must hold: each internal node's
+stored `left_label` / `right_label` equal the recomputed labels of the two
+subtrees that follow it in DFS order, down to the leaves, with every byte
+consumed. The manifest's verified boundary links bind each chunk's root; the
+chunk's own links bind everything beneath it. A chunk that fails is not
+stored: it goes back to `pending_subtree_ids` for a different peer
+(§ Chunk download).
 
 ## Receiving: Sync State Machine
 
@@ -235,9 +263,16 @@ any newly connected peers. Do not spam the same peers.
 
 1. Pick a random peer from the quorum set for the selected manifest.
 2. Send `GetManifest` (code 78) with the `manifest_id`.
-3. On response (code 79):
+3. On response (code 79) **from the peer the request went to** — a code-79
+   message from any other peer is ignored (JVM `processManifest`:
+   `ri.peer == remote`):
    - Parse the manifest bytes (2-byte header + DFS node traversal)
-   - Verify against the header's `state_root` at the snapshot height
+   - `verify` against the header's `state_root` at the snapshot height: the
+     recomputed root label equals the quorum's `manifest_id`, and the
+     manifest's `root_height` equals the header's tree height
+   - On failure: log the peer, drop it from the quorum set for this
+     bootstrap, continue with the next peer. Nothing from a failed manifest
+     is retained — no subtree ids, no download store
    - Extract subtree IDs from boundary nodes
    - Transition to ChunkDownload
 4. On timeout: retry with a different peer from the quorum set.
@@ -259,7 +294,10 @@ Scheduler:
    - Send `GetUtxoSnapshotChunk` (code 80) for each
    - Move IDs to `in_flight`
 4. On chunk response (code 81):
-   - Verify the chunk was in `in_flight`
+   - Verify the chunk's recomputed root label is in `in_flight`
+   - Verify every link inside the chunk (§ Chunk verification); on failure,
+     log a `PENALTY` naming the peer, move the id back to
+     `pending_subtree_ids`, and prefer a different peer for it
    - Store the raw chunk bytes keyed by subtree ID
    - Remove from `in_flight`
    - If `pending_subtree_ids` is empty AND `in_flight` is empty: all done
@@ -288,7 +326,7 @@ better: flat memory usage, crash-safe, and enables resume on restart.
 | `"manifest_id"` | 32B — which manifest this download is for |
 | `"snapshot_height"` | u32 BE — block height of the snapshot |
 | `"manifest_bytes"` | raw manifest (to re-extract subtree IDs on resume) |
-| `"total_chunks"` | u32 BE — expected number of chunks |
+| `"total_chunks"` | u32 BE — informational; completeness is derived from the verified manifest's subtree ids, never from this counter |
 
 #### Lifecycle
 
@@ -300,9 +338,11 @@ better: flat memory usage, crash-safe, and enables resume on restart.
 #### Crash recovery
 
 On startup, if `snapshot_download.redb` exists:
-- Read metadata to recover `manifest_id` and `snapshot_height`.
-- Verify the manifest still matches the header chain's `state_root` at that height
-  (headers may have been reorganized while we were down).
+- Read metadata to recover `manifest_id`, `snapshot_height` and `manifest_bytes`.
+- `verify` the stored `manifest_bytes` against the header chain's `state_root`
+  at that height — hash the bytes, do not trust the recorded `manifest_id`.
+  Headers may have been reorganized while we were down, and the file is only
+  as trustworthy as whatever wrote it.
 - If valid: count stored chunks vs. `total_chunks`, rebuild `pending_subtree_ids`
   from the manifest for any missing chunks, resume download.
 - If invalid (reorg changed the state root): delete the file, restart discovery.
@@ -315,15 +355,25 @@ it left off. No chunk is ever re-downloaded unless the snapshot itself is invali
 After all chunks are downloaded:
 
 1. Parse the manifest into individual nodes: `Vec<(Digest32, Vec<u8>)>`
-   where each entry is `(node_label, packed_node_bytes)`.
-2. Parse each chunk into individual nodes: same format.
+   where each entry is `(node_label, packed_node_bytes)`. `root_hash` is the
+   first manifest node's recomputed label.
+2. Parse each chunk into individual nodes, verifying it again
+   (§ Chunk verification) against the subtree id it is stored under. A
+   failure invalidates the download the way a tampered stored manifest does:
+   cleanup and fresh discovery. The file is only as trustworthy as whatever
+   wrote it.
 3. Concatenate manifest nodes + all chunk nodes.
-4. Call `RedbAVLStorage::load_snapshot(nodes, root_hash, root_height, version_digest)`.
-5. Create `PersistentBatchAVLProver` from the populated storage.
-6. Set `validated_height = snapshot_height`.
-7. Set `downloaded_height = snapshot_height`.
-8. Discard downloaded chunk data (the nodes are now in `state.redb`).
-9. Transition to normal block section download from `snapshot_height + 1`.
+4. The main crate compares `(root_hash, root_height)` with
+   `split_state_root(header.state_root)` for the header at `snapshot_height`
+   in its own validated chain, read at this moment — not a value carried
+   over from discovery. Mismatch aborts the bootstrap: the download file is
+   deleted, the failure is logged, and `state.redb` is left untouched.
+5. Call `RedbAVLStorage::load_snapshot(nodes, root_hash, root_height, version_digest)`.
+6. Create `PersistentBatchAVLProver` from the populated storage.
+7. Set `validated_height = snapshot_height`.
+8. Set `downloaded_height = snapshot_height`.
+9. Discard downloaded chunk data (the nodes are now in `state.redb`).
+10. Transition to normal block section download from `snapshot_height + 1`.
 
 ### Integration with SyncTransport
 

@@ -64,6 +64,10 @@ type StoreEntry = (u8, [u8; 32], u32, Vec<u8>, Option<Vec<u8>>);
 /// Returned by `assemble_fork_branch` and held as pending state until a deep reorg fires.
 type ForkBranch = (u32, Vec<(Header, Vec<u8>)>);
 
+/// A block section as delivered: `(type_id, id it was delivered under, body, peer)`.
+/// `peer` is `None` for locally ingested bytes (`POST /ingest/modifiers`).
+type SectionDelivery<'a> = (u8, [u8; 32], &'a [u8], Option<u64>);
+
 /// Async validation pipeline for modifiers.
 ///
 /// Receives raw modifier data from the P2P layer via a channel, validates
@@ -200,62 +204,59 @@ impl ValidationPipeline {
     }
 
     /// Process a batch of raw modifiers.
+    ///
+    /// Headers first, so a section delivered in the same batch as its header
+    /// finds that header known; then sections, each bound to the id it was
+    /// delivered under before anything is stored (`facts/sync.md`
+    /// § Receive-path binding); then one `Received` notification carrying
+    /// only what was accepted.
     pub(crate) async fn process_batch(&mut self, batch: Vec<ergo_api::ModifierBatchItem>) {
-        // Single pass: collect IDs for delivery tracker, partition headers from sections
-        let mut received_ids = Vec::with_capacity(batch.len());
         let mut raw_headers: Vec<(&[u8], Option<u64>)> = Vec::new();
-        let mut section_entries: Vec<StoreEntry> = Vec::new();
-
-        {
-            let chain_guard = self.chain.lock().await;
-            for (type_id, id, data, peer_id) in &batch {
-                received_ids.push(*id);
-                if *type_id == HEADER_TYPE_ID {
-                    raw_headers.push((data.as_slice(), *peer_id));
-                } else if *type_id == TRANSACTION_TYPE_ID && !data.is_empty() {
-                    // Unconfirmed transaction — forward to mempool
-                    if let Some(ref tx_sender) = self.tx_sender {
-                        let _ = tx_sender.try_send((*id, data.clone()));
-                    }
-                } else if !data.is_empty() {
-                    // Block sections (102=BlockTransactions, 104=ADProofs, 108=Extension)
-                    // have the header ID in the first 32 bytes. Look up the header to
-                    // derive the height so the store can index by (type_id, height).
-                    let height = if data.len() >= 32 {
-                        let header_id: [u8; 32] = data[..32].try_into().unwrap();
-                        let block_id =
-                            ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(header_id));
-                        chain_guard.height_of(&block_id).unwrap_or(0)
-                    } else {
-                        0
-                    };
-                    section_entries.push((*type_id, *id, height, data.clone(), None));
+        let mut sections: Vec<SectionDelivery<'_>> = Vec::new();
+        for (type_id, id, data, peer_id) in &batch {
+            if *type_id == HEADER_TYPE_ID {
+                raw_headers.push((data.as_slice(), *peer_id));
+            } else if *type_id == TRANSACTION_TYPE_ID && !data.is_empty() {
+                // Unconfirmed transaction — forward to the mempool, which binds
+                // it by `Transaction::id()` over the bytes. The delivered id is
+                // used for nothing beyond that channel's log lines.
+                if let Some(ref tx_sender) = self.tx_sender {
+                    let _ = tx_sender.try_send((*id, data.clone()));
                 }
+            } else if !data.is_empty() {
+                sections.push((*type_id, *id, data.as_slice(), *peer_id));
             }
-        } // drop chain_guard
+        }
 
-        // Notify delivery tracker (data plane — ok to drop)
-        if !received_ids.is_empty()
+        let mut accepted = self.process_headers(raw_headers).await;
+
+        if !sections.is_empty() {
+            let chain = self.chain.lock().await;
+            accepted.extend(self.bind_and_store_sections(&chain, sections));
+        }
+
+        // Notify delivery tracker (data plane — ok to drop). Accepted ids
+        // only: a dropped delivery must leave its pending request alive.
+        if !accepted.is_empty()
             && self
                 .delivery_data_tx
-                .try_send(DeliveryData::Received(received_ids))
+                .try_send(DeliveryData::Received(accepted))
                 .is_err()
         {
             tracing::debug!("delivery data channel full, dropped Received notification");
         }
+    }
 
-        // Store non-header block sections directly (no validation)
-        if !section_entries.is_empty() {
-            let count = section_entries.len();
-            if let Err(e) = self.store.put_batch(&section_entries) {
-                tracing::error!(count, "store write failed for block sections: {e}");
-            } else {
-                tracing::debug!(count, "stored block sections");
-            }
-        }
-
+    /// Parse, PoW-verify, and chain a batch of raw headers.
+    ///
+    /// Returns the ids of the headers that parsed and passed PoW — chained
+    /// or buffered — which is what the delivery tracker may consider
+    /// received. The id a peer delivered under is never used; the header's
+    /// own id is.
+    async fn process_headers(&mut self, raw_headers: Vec<(&[u8], Option<u64>)>) -> Vec<[u8; 32]> {
+        let mut accepted: Vec<[u8; 32]> = Vec::with_capacity(raw_headers.len());
         if raw_headers.is_empty() {
-            return;
+            return accepted;
         }
 
         // Parse, round-trip check, and PoW-verify
@@ -308,11 +309,12 @@ impl ValidationPipeline {
                 }
                 continue;
             }
+            accepted.push(header.id.0 .0);
             valid_headers.push((header, data.to_vec()));
         }
 
         if valid_headers.is_empty() {
-            return;
+            return accepted;
         }
 
         // Sort by height — within a batch this eliminates most buffering
@@ -712,6 +714,93 @@ impl ValidationPipeline {
                 "pipeline: batch breakdown (all known)"
             );
         }
+
+        accepted
+    }
+
+    /// Bind each delivered block section to its id and store the ones that
+    /// bind for a header this node holds. Returns the ids actually stored.
+    ///
+    /// `facts/sync.md` § Receive-path binding: the id is recomputed from the
+    /// bytes (`enr_chain::section_id_from_body`) and must equal the id the
+    /// peer delivered under, and the body's header must be on the best chain
+    /// or be a fork header in the store. Anything else is dropped — no store
+    /// write, no `Received` — with a `PENALTY`-tagged warn naming the peer.
+    /// The store's precondition that a section's id is its recomputed id
+    /// (`facts/store.md`) is discharged here and nowhere else.
+    fn bind_and_store_sections(
+        &self,
+        chain: &HeaderChain,
+        sections: Vec<SectionDelivery<'_>>,
+    ) -> Vec<[u8; 32]> {
+        let mut entries: Vec<StoreEntry> = Vec::with_capacity(sections.len());
+        for (type_id, delivered_id, data, peer_id) in sections {
+            let identity = match enr_chain::section_id_from_body(type_id, data) {
+                Ok(identity) => identity,
+                Err(e) => {
+                    reject_section(peer_id, type_id, &format!("body does not parse: {e}"));
+                    continue;
+                }
+            };
+            if identity.id != delivered_id {
+                reject_section(
+                    peer_id,
+                    type_id,
+                    &format!(
+                        "id mismatch: delivered under {} but the bytes hash to {}",
+                        hex::encode(delivered_id),
+                        hex::encode(identity.id)
+                    ),
+                );
+                continue;
+            }
+            let header_id = BlockId(ergo_chain_types::Digest32::from(identity.header_id));
+            let height = match chain.height_of(&header_id) {
+                Some(height) => height,
+                None => match self.store.contains(HEADER_TYPE_ID, &identity.header_id) {
+                    // A fork header off the best chain: stored, not height-indexed.
+                    Ok(true) => 0,
+                    Ok(false) => {
+                        reject_section(
+                            peer_id,
+                            type_id,
+                            &format!("for unknown header {}", hex::encode(identity.header_id)),
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!(type_id, "store read failed while binding a section: {e}");
+                        continue;
+                    }
+                },
+            };
+            entries.push((type_id, delivered_id, height, data.to_vec(), None));
+        }
+
+        if entries.is_empty() {
+            return Vec::new();
+        }
+        let count = entries.len();
+        match self.store.put_batch(&entries) {
+            Ok(()) => {
+                tracing::debug!(count, "stored block sections");
+                entries.into_iter().map(|(_, id, _, _, _)| id).collect()
+            }
+            Err(e) => {
+                tracing::error!(count, "store write failed for block sections: {e}");
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// Log a dropped block section. Peer-delivered bytes get the `PENALTY` tag
+/// the routing layer's attribution keys on; locally ingested bytes (no peer)
+/// are a fastsync problem and are logged as such.
+fn reject_section(peer_id: Option<u64>, type_id: u8, reason: &str) {
+    match peer_id {
+        Some(pid) => tracing::warn!(peer_id = pid, type_id, "PENALTY section rejected: {reason}"),
+        None => tracing::warn!(type_id, "ingest: section rejected: {reason}"),
     }
 }
 
@@ -803,14 +892,185 @@ mod tests {
         assert_eq!(chain.height(), 0, "bad header should not be chained");
     }
 
-    #[test]
-    fn ignores_non_header_modifier_types() {
-        let (mut pipeline, _tx, _progress_rx, _ctrl_rx, _data_rx, _dir) = test_pipeline();
-        let batch = vec![(102, [0xaa; 32], vec![0xff; 100], None)];
+    const BLOCK_2666: &str = include_str!("../chain/tests/fixtures/block-2666.json");
+
+    fn vlq(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                return;
+            }
+            out.push(b | 0x80);
+        }
+    }
+
+    /// Real testnet block 2666: its header, and its extension and AD-proof
+    /// bodies rebuilt in wire format. Block transactions need a JSON
+    /// transaction decoder this crate does not enable; `chain/` covers that
+    /// type against the same fixture.
+    fn block_2666() -> (Header, Vec<u8>, Vec<u8>) {
+        let v: serde_json::Value = serde_json::from_str(BLOCK_2666).unwrap();
+        let header: Header = serde_json::from_value(v["header"].clone()).unwrap();
+        let header_id = header.id.0 .0;
+
+        let fields = v["extension"]["fields"].as_array().unwrap();
+        let mut ext = header_id.to_vec();
+        vlq(&mut ext, fields.len() as u64);
+        for f in fields {
+            let key = hex::decode(f[0].as_str().unwrap()).unwrap();
+            let value = hex::decode(f[1].as_str().unwrap()).unwrap();
+            ext.extend_from_slice(&key);
+            ext.push(value.len() as u8);
+            ext.extend_from_slice(&value);
+        }
+
+        let proof = hex::decode(v["adProofs"]["proofBytes"].as_str().unwrap()).unwrap();
+        let mut ad = header_id.to_vec();
+        vlq(&mut ad, proof.len() as u64);
+        ad.extend_from_slice(&proof);
+
+        (header, ext, ad)
+    }
+
+    /// Put block 2666's header into the store as a fork header — enough for
+    /// the request gate ("a header the node holds") without an ancestry
+    /// back to testnet genesis.
+    fn store_header_as_fork(pipeline: &ValidationPipeline, header: &Header) {
+        use sigma_ser::ScorexSerializable;
+        let raw = header.scorex_serialize_bytes().unwrap();
+        pipeline
+            .store
+            .put_header(&header.id.0 .0, header.height, 1, &[1u8], &raw)
+            .unwrap();
+    }
+
+    fn run(pipeline: &mut ValidationPipeline, batch: Vec<ergo_api::ModifierBatchItem>) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(pipeline.process_batch(batch));
-        let chain = rt.block_on(pipeline.chain.lock());
-        assert_eq!(chain.height(), 0, "non-header types should be skipped");
+    }
+
+    /// Every id reported as received so far, in delivery order.
+    fn received(rx: &mut mpsc::Receiver<DeliveryData>) -> Vec<[u8; 32]> {
+        let mut ids = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let DeliveryData::Received(batch) = msg {
+                ids.extend(batch);
+            }
+        }
+        ids
+    }
+
+    /// A body that does not hash to the id it was delivered under is never
+    /// stored — not under that id, not under any id — and is not reported
+    /// as received.
+    #[test]
+    fn section_that_does_not_bind_is_dropped() {
+        let (mut pipeline, _tx, _progress_rx, _ctrl_rx, mut data_rx, _dir) = test_pipeline();
+        run(
+            &mut pipeline,
+            vec![(102, [0xaa; 32], vec![0xff; 100], Some(7))],
+        );
+        assert_eq!(pipeline.store.get(102, &[0xaa; 32]).unwrap(), None);
+        assert!(received(&mut data_rx).is_empty());
+    }
+
+    /// Real bodies, delivered under their real ids, for a header the node
+    /// holds: stored under exactly those ids and reported as received.
+    #[test]
+    fn bound_sections_for_a_known_header_are_stored() {
+        let (mut pipeline, _tx, _progress_rx, _ctrl_rx, mut data_rx, _dir) = test_pipeline();
+        let (header, ext, ad) = block_2666();
+        store_header_as_fork(&pipeline, &header);
+        let ids = enr_chain::section_ids(&header);
+        let (ad_id, ext_id) = (ids[1].1, ids[2].1);
+
+        run(
+            &mut pipeline,
+            vec![
+                (108, ext_id, ext.clone(), Some(7)),
+                (104, ad_id, ad.clone(), Some(7)),
+            ],
+        );
+
+        assert_eq!(
+            pipeline.store.get(108, &ext_id).unwrap().as_deref(),
+            Some(ext.as_slice())
+        );
+        assert_eq!(
+            pipeline.store.get(104, &ad_id).unwrap().as_deref(),
+            Some(ad.as_slice())
+        );
+        // A fork header off the best chain owns no height slot (facts/store.md).
+        assert_eq!(pipeline.store.get_id_at(108, header.height).unwrap(), None);
+
+        let mut got = received(&mut data_rx);
+        got.sort();
+        let mut want = vec![ext_id, ad_id];
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    /// A body that binds — to some other id. Delivered under a foreign id it
+    /// is dropped, and it is not stored under its own id either: the peer
+    /// said where these bytes go, and the peer was wrong.
+    #[test]
+    fn bound_body_under_a_foreign_id_is_dropped() {
+        let (mut pipeline, _tx, _progress_rx, _ctrl_rx, mut data_rx, _dir) = test_pipeline();
+        let (header, ext, _ad) = block_2666();
+        store_header_as_fork(&pipeline, &header);
+        let ids = enr_chain::section_ids(&header);
+        let (ad_id, ext_id) = (ids[1].1, ids[2].1);
+
+        run(&mut pipeline, vec![(108, ad_id, ext, Some(7))]);
+
+        assert_eq!(pipeline.store.get(108, &ad_id).unwrap(), None);
+        assert_eq!(pipeline.store.get(108, &ext_id).unwrap(), None);
+        assert!(received(&mut data_rx).is_empty());
+    }
+
+    /// A body that binds but names a header the node does not hold: dropped.
+    #[test]
+    fn section_for_an_unknown_header_is_dropped() {
+        let (mut pipeline, _tx, _progress_rx, _ctrl_rx, mut data_rx, _dir) = test_pipeline();
+        let (header, ext, _ad) = block_2666();
+        let ext_id = enr_chain::section_ids(&header)[2].1;
+
+        run(&mut pipeline, vec![(108, ext_id, ext, Some(7))]);
+
+        assert_eq!(pipeline.store.get(108, &ext_id).unwrap(), None);
+        assert!(received(&mut data_rx).is_empty());
+    }
+
+    /// A poisoned body cannot displace an honest one, because it never
+    /// reaches the store — under any delivery order.
+    #[test]
+    fn poison_cannot_overwrite_an_honest_section() {
+        let (mut pipeline, _tx, _progress_rx, _ctrl_rx, _data_rx, _dir) = test_pipeline();
+        let (header, ext, _ad) = block_2666();
+        store_header_as_fork(&pipeline, &header);
+        let ext_id = enr_chain::section_ids(&header)[2].1;
+
+        run(&mut pipeline, vec![(108, ext_id, ext.clone(), Some(7))]);
+        run(&mut pipeline, vec![(108, ext_id, vec![0xff; 100], Some(8))]);
+
+        assert_eq!(
+            pipeline.store.get(108, &ext_id).unwrap().as_deref(),
+            Some(ext.as_slice())
+        );
+    }
+
+    /// Header ids reach the tracker only after parse and PoW: junk under a
+    /// pending-looking id clears nothing.
+    #[test]
+    fn rejected_header_is_not_reported_as_received() {
+        let (mut pipeline, _tx, _progress_rx, _ctrl_rx, mut data_rx, _dir) = test_pipeline();
+        run(
+            &mut pipeline,
+            vec![(HEADER_TYPE_ID, [0xaa; 32], vec![0xff, 0x00, 0x01], Some(7))],
+        );
+        assert!(received(&mut data_rx).is_empty());
     }
 
     #[test]
@@ -840,7 +1100,7 @@ mod tests {
         let header: Header = serde_json::from_str(json).unwrap();
         let bytes = header.scorex_serialize_bytes().unwrap();
 
-        let (mut pipeline, _tx, _progress_rx, _ctrl_rx, _data_rx, _dir) = test_pipeline();
+        let (mut pipeline, _tx, _progress_rx, _ctrl_rx, mut data_rx, _dir) = test_pipeline();
         let batch = vec![(HEADER_TYPE_ID, [0xaa; 32], bytes, None)];
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(pipeline.process_batch(batch));
@@ -851,6 +1111,8 @@ mod tests {
             1,
             "valid PoW header should be buffered"
         );
+        // The tracker hears the header's own id, not the label it came under.
+        assert_eq!(received(&mut data_rx), vec![header.id.0 .0]);
         let chain = rt.block_on(pipeline.chain.lock());
         assert_eq!(
             chain.height(),

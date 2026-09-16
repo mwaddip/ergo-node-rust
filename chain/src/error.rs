@@ -73,6 +73,13 @@ pub enum ChainError {
     #[error("extension parse error: {0}")]
     ExtensionParse(String),
 
+    /// A block section body (type 102 / 104 / 108) is not its wire format,
+    /// leaves bytes unconsumed, or `type_id` is not a block section type.
+    /// Reported by [`crate::section_id_from_body`]; the pipeline logs it
+    /// with the delivering peer and drops the bytes.
+    #[error("section type {type_id} body rejected: {reason}")]
+    Section { type_id: u8, reason: String },
+
     /// NiPoPoW proof error.
     #[error("nipopow error: {0}")]
     Nipopow(String),

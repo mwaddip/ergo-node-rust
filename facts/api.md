@@ -266,7 +266,12 @@ their security boundary, not on an API key:
 
 - `POST /ingest/modifiers` (on the main listener) — rejects any request from
   a non-loopback peer with 403, regardless of API-key state. This protects
-  the modifier-pipeline shortcut used by co-located fastsync tooling.
+  the modifier-pipeline shortcut used by co-located fastsync tooling. The
+  loopback check is an access control, not a trust grant: ingested bytes
+  enter the same pipeline as P2P deliveries and are bound the same way
+  (`facts/receive-path.md`, `facts/sync.md` § Receive-path binding). A
+  body whose id does not match is dropped there; `{"accepted": n}` counts
+  bodies queued, not bodies stored.
 - `GET /stats/p2p` (on a separate listener, default `127.0.0.1:9055`) —
   starts only when the operator config includes a `[stats]` section. A
   non-loopback bind logs a startup WARN; there is no auth.

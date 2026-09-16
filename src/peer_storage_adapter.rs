@@ -64,6 +64,9 @@ fn encode_record(r: &PeerRecord) -> Vec<u8> {
         buf.push(*id);
         encode_bytes(&mut buf, body);
     }
+    // Trailing field: absent in rows written before it existed, which decode
+    // as hearsay (`facts/p2p-peerdb.md` § Observed and hearsay).
+    buf.extend_from_slice(&r.last_handshake_ms.to_le_bytes());
     buf
 }
 
@@ -92,9 +95,17 @@ fn decode_record(address: SocketAddr, bytes: &[u8]) -> Result<PeerRecord, String
         let body = cur.read_bytes()?;
         features.push((id, body));
     }
+    // A row from before the field existed ends here; it is hearsay until
+    // the next handshake. A partial trailing field is corruption.
+    let last_handshake_ms = if cur.remaining() == 0 {
+        0
+    } else {
+        cur.read_u64()?
+    };
     Ok(PeerRecord {
         address,
         last_seen_ms,
+        last_handshake_ms,
         agent_name,
         node_name,
         version: (v0, v1, v2),
@@ -123,6 +134,10 @@ impl<'a> Cursor<'a> {
         let s = &self.buf[self.pos..self.pos + n];
         self.pos += n;
         Ok(s)
+    }
+
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
     }
 
     fn read_u8(&mut self) -> Result<u8, String> {
@@ -160,6 +175,7 @@ mod tests {
         PeerRecord {
             address: "1.2.3.4:9030".parse().unwrap(),
             last_seen_ms: 1_700_000_000_000,
+            last_handshake_ms: 1_699_000_000_000,
             agent_name: "ergoref".to_string(),
             node_name: "test-node".to_string(),
             version: (5, 0, 25),
@@ -173,6 +189,33 @@ mod tests {
         let bytes = encode_record(&r);
         let back = decode_record(r.address, &bytes).unwrap();
         assert_eq!(back, r);
+    }
+
+    /// A row written before `last_handshake_ms` existed carries no
+    /// trailing field and must load as hearsay, everything else intact.
+    #[test]
+    fn legacy_row_without_handshake_field_decodes_as_hearsay() {
+        let r = rec();
+        let mut bytes = encode_record(&r);
+        bytes.truncate(bytes.len() - 8);
+        let back = decode_record(r.address, &bytes).unwrap();
+        assert_eq!(back.last_handshake_ms, 0);
+        assert_eq!(
+            back,
+            PeerRecord {
+                last_handshake_ms: 0,
+                ..r
+            }
+        );
+    }
+
+    /// One to seven trailing bytes is neither format: corruption, not hearsay.
+    #[test]
+    fn partial_handshake_field_errors() {
+        let r = rec();
+        let mut bytes = encode_record(&r);
+        bytes.truncate(bytes.len() - 3);
+        assert!(decode_record(r.address, &bytes).is_err());
     }
 
     #[test]

@@ -2,7 +2,6 @@
 
 use ergo_chain_types::{BlockId, ExtensionCandidate as ErgoExtensionCandidate, Header};
 use ergo_lib::chain::parameters::Parameters;
-use ergo_merkle_tree::{MerkleNode, MerkleTree};
 use ergo_nipopow::NipopowAlgos;
 
 use crate::types::ExtensionCandidate;
@@ -99,29 +98,8 @@ pub fn build_extension(
 
 /// Compute the Merkle root digest of extension fields.
 ///
-/// Uses the same leaf format as the JVM: `[2u8] ++ key ++ value`
-/// where 2 is the key length prefix. Must match JVM `Extension.rootHash`
-/// byte-for-byte.
-pub fn extension_digest(extension: &ExtensionCandidate) -> Result<[u8; 32], MiningError> {
-    if extension.fields.is_empty() {
-        // Empty extension uses special hash (genesis case)
-        let tree = MerkleTree::new(Vec::<MerkleNode>::new());
-        return Ok(tree.root_hash_special().into());
-    }
-
-    // Each extension field becomes a Merkle leaf: [key_length=2] ++ key ++ value
-    let nodes: Vec<MerkleNode> = extension
-        .fields
-        .iter()
-        .map(|(key, value)| {
-            let mut leaf_data = Vec::with_capacity(1 + 2 + value.len());
-            leaf_data.push(2u8); // key length prefix
-            leaf_data.extend_from_slice(key);
-            leaf_data.extend_from_slice(value);
-            MerkleNode::from_bytes(leaf_data)
-        })
-        .collect();
-
-    let tree = MerkleTree::new(nodes);
-    Ok(tree.root_hash().into())
+/// Delegates to `enr_chain::extension_root` — the single implementation of
+/// the leaf encoding (`facts/chain.md` § Section bodies).
+pub fn extension_digest(extension: &ExtensionCandidate) -> [u8; 32] {
+    enr_chain::extension_root(&extension.fields)
 }

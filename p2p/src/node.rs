@@ -894,10 +894,7 @@ async fn outbound_manager(
             floor_backoff = FLOOR_BACKOFF_INITIAL;
             if current_outbound < max_peers {
                 // ---- Fill phase: one PeerDb candidate per tick. ----
-                if let Some(candidate) =
-                    pick_fill_candidate(&ctx, max_peers.saturating_sub(current_outbound), &cooldown)
-                        .await
-                {
+                if let Some(candidate) = pick_fill_candidate(&ctx, &cooldown).await {
                     tracing::info!(addr = %candidate, "Outbound fill: dialing PeerDb candidate");
                     spawn_outbound_connect(candidate, &hs_config, mode, ctx.clone()).await;
                     cooldown.insert(candidate, Instant::now() + OUTBOUND_REDIAL_COOLDOWN);
@@ -935,17 +932,16 @@ fn prune_cooldown(cooldown: &mut HashMap<SocketAddr, Instant>) {
     cooldown.retain(|_, until| *until > now);
 }
 
-/// Returns the most-recently-seen PeerDb candidate that is not
-/// currently connected, blacklisted, or in cooldown.
+/// One PeerDb candidate for the fill phase: a uniformly random entry,
+/// hearsay included, that is not currently connected, blacklisted, in
+/// cooldown, or (when filtering is on) bogus, preferring an address group
+/// no connected peer occupies. See `facts/p2p-node.md` § Fill phase and
+/// `PeerDb::dial_candidate`.
 async fn pick_fill_candidate(
     ctx: &BackgroundCtx,
-    fill_slots: usize,
     cooldown: &HashMap<SocketAddr, Instant>,
 ) -> Option<SocketAddr> {
-    if fill_slots == 0 {
-        return None;
-    }
-    let connected: HashSet<SocketAddr> = ctx
+    let connected: Vec<SocketAddr> = ctx
         .router
         .lock()
         .await
@@ -953,15 +949,17 @@ async fn pick_fill_candidate(
         .into_iter()
         .map(|(a, _)| a)
         .collect();
-    let mut exclude = connected;
-    exclude.extend(cooldown.keys().copied());
+    let exclude: HashSet<SocketAddr> = connected
+        .iter()
+        .copied()
+        .chain(cooldown.keys().copied())
+        .collect();
 
     let db = ctx.peer_db.lock().expect("peer_db poisoned");
-    db.recent(fill_slots, &exclude)
-        .into_iter()
-        .filter(|r| !(ctx.filter_bogus_addresses && is_bogus_address(r.address, ctx.network)))
-        .map(|r| r.address)
-        .next()
+    db.dial_candidate(&exclude, &connected, |r| {
+        !(ctx.filter_bogus_addresses && is_bogus_address(r.address, ctx.network))
+    })
+    .map(|r| r.address)
 }
 
 async fn spawn_outbound_connect(
@@ -1513,6 +1511,7 @@ mod tests {
     #[tokio::test]
     async fn all_peers_lists_connected_with_connection_type() {
         let TestHarness { node, router, .. } = test_node();
+        let before = now_ms();
 
         router.lock().await.register_peer(
             PeerId(1),
@@ -1542,7 +1541,22 @@ mod tests {
             outbound.connection_type,
             Some(crate::types::ConnectionType::Outgoing)
         ));
-        assert!(outbound.last_seen_ms.is_some());
+        // The outbound registration is a completed handshake with the
+        // address we dialed: stamped with the registration time and held
+        // by the PeerDb as observed.
+        let seen = outbound
+            .last_seen_ms
+            .expect("outbound entry carries last_seen");
+        assert!(before <= seen && seen <= now_ms());
+        let rec = node
+            .peer_db
+            .lock()
+            .unwrap()
+            .get(pub_addr("203.0.113.40:9030"))
+            .cloned()
+            .expect("outbound address in PeerDb");
+        assert!(rec.is_observed());
+        assert_eq!(rec.last_seen_ms, seen);
 
         let inbound = peers
             .iter()
@@ -1553,11 +1567,24 @@ mod tests {
             inbound.connection_type,
             Some(crate::types::ConnectionType::Incoming)
         ));
+        // The inbound socket is a connection-overlay entry only: its
+        // last_seen is "now" and nothing was written to the PeerDb.
+        let seen = inbound
+            .last_seen_ms
+            .expect("overlay entry carries last_seen");
+        assert!(before <= seen && seen <= now_ms());
+        assert!(node
+            .peer_db
+            .lock()
+            .unwrap()
+            .get(pub_addr("203.0.113.41:9030"))
+            .is_none());
     }
 
     #[tokio::test]
     async fn all_peers_lists_disconnected_with_no_connection_type() {
         let TestHarness { node, router, .. } = test_node();
+        let before = now_ms();
 
         let addr = pub_addr("203.0.113.50:9030");
         router.lock().await.register_peer(
@@ -1583,8 +1610,20 @@ mod tests {
         let entry = &peers[0];
         assert_eq!(entry.address, addr);
         assert!(entry.connection_type.is_none());
-        assert!(entry.last_seen_ms.is_some());
         assert_eq!(entry.agent_name.as_deref(), Some("ergoref"));
+        // Disconnecting does not demote the entry: it keeps the handshake
+        // stamp from registration and stays observed for GetPeers.
+        let seen = entry.last_seen_ms.expect("PeerDb entry carries last_seen");
+        assert!(before <= seen && seen <= now_ms());
+        let rec = node
+            .peer_db
+            .lock()
+            .unwrap()
+            .get(addr)
+            .cloned()
+            .expect("entry survives disconnect");
+        assert!(rec.is_observed());
+        assert_eq!(rec.last_seen_ms, seen);
     }
 
     #[tokio::test]

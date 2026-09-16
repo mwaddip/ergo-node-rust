@@ -20,6 +20,7 @@ pub use chain::{AppendResult, ChainMemoryEstimate, HeaderChain, InstalledHeader}
 pub use config::{ChainConfig, Network};
 pub use ergo_chain_types::autolykos_pow_scheme::decode_compact_bits;
 pub use ergo_chain_types::{ADDigest, BlockId, Header};
+pub use ergo_lib::chain::transaction::Transaction;
 pub use error::{ChainError, RestoreError};
 pub use nipopow_proof::{
     build_nipopow_proof, compare_nipopow_proof_bytes, popow_header_by_id,
@@ -28,8 +29,9 @@ pub use nipopow_proof::{
 pub use num_bigint::{BigInt, BigUint};
 pub use pow::{pow_target, verify_pow};
 pub use section::{
-    required_section_ids, section_ids, AD_PROOFS_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID,
-    EXTENSION_TYPE_ID, HEADER_TYPE_ID, TRANSACTION_TYPE_ID,
+    ad_proofs_digest, extension_root, required_section_ids, section_id, section_id_from_body,
+    section_ids, transactions_root, witness_id, SectionIdentity, AD_PROOFS_TYPE_ID,
+    BLOCK_TRANSACTIONS_TYPE_ID, EXTENSION_TYPE_ID, HEADER_TYPE_ID, TRANSACTION_TYPE_ID,
 };
 pub use state_type::StateType;
 pub use sync_info::{build_sync_info, parse_sync_info, SyncInfo};

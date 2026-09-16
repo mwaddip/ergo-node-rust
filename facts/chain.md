@@ -375,6 +375,93 @@ variant carries the distinction at the type level instead.
   rather than `stateType`); returning empty here lets sync's section-queue
   construction handle Light without a special case at the call site.
 
+### Section bodies
+
+The receive path binds every non-header section to its id before the bytes
+reach the store (`facts/receive-path.md`). The computation lives here because
+it is the body-side twin of `section_ids`: the same
+`Blake2b256(type_id || header_id || digest)`, with the digest recomputed from
+the delivered bytes instead of read from the header.
+
+#### `section_id(type_id: u8, header_id: &[u8; 32], digest: &[u8; 32]) -> [u8; 32]`
+- `Blake2b256(type_id || header_id || digest)` — JVM
+  `NonHeaderBlockSection.computeIdBytes` / `Algos.hash.prefixedHash`.
+- `section_ids(header)` is this function applied to the header's three roots.
+
+#### `transactions_root(txs: &[Transaction], block_version: u8) -> [u8; 32]`
+- Merkle root over the leaves JVM `BlockTransactions.transactionsRoot` uses:
+  - `block_version == 1`: the tx ids (`Transaction::id()`, 32 bytes each).
+  - `block_version >= 2`: all tx ids followed by all witness ids — two
+    concatenated lists, never interleaved.
+- An empty `txs` yields the JVM empty-tree root,
+  `Algos.emptyMerkleTreeRoot = Blake2b256(no bytes)` (`Algos.scala:19`;
+  sigma-rust `MerkleTree::root_hash_special`). No special-casing beyond
+  that: a header never carries that root, so an empty body is rejected by
+  the id comparison, not by this function.
+- **Single implementation in the workspace.** Mining builds candidate
+  headers with it (`facts/mining.md`) and carries no copy of its own.
+
+#### `witness_id(tx: &Transaction) -> [u8; 31]`
+- `Blake2b256(concat(inputs[*].spending_proof.proof))` with the first byte
+  dropped (JVM `ErgoTransaction.witnessSerializedId`). Empty proofs
+  contribute no bytes.
+
+#### `extension_root(fields: &[([u8; 2], Vec<u8>)]) -> [u8; 32]`
+- Merkle root over leaves `len(key) as u8 || key || value` (JVM
+  `Extension.kvToLeaf`), in field order. Empty `fields` → the same
+  empty-tree root as above (JVM `Algos.merkleTreeRoot`).
+- Single implementation; mining's `ExtensionCandidate::digest` delegates here.
+
+#### `ad_proofs_digest(proof_bytes: &[u8]) -> [u8; 32]`
+- `Blake2b256(proof_bytes)` (JVM `ADProofs.proofDigest`).
+
+#### `section_id_from_body(type_id: u8, body: &[u8]) -> Result<SectionIdentity, ChainError>`
+
+```rust
+pub struct SectionIdentity {
+    /// The header this body claims to belong to: its first 32 bytes.
+    pub header_id: [u8; 32],
+    /// `section_id(type_id, header_id, digest)` with `digest` recomputed from `body`.
+    pub id: [u8; 32],
+}
+```
+
+- **Precondition**: `type_id ∈ {102, 104, 108}`. Any other value is
+  `Err(ChainError::Section { .. })`; the caller never passes header or
+  transaction bytes here.
+- **Postcondition**: `Ok(identity)` iff `body` parses completely as the
+  section's wire format — every byte consumed, no trailing bytes — and
+  `identity.id` is the id the JVM computes for the same bytes. JVM rule
+  `bsCorrespondsToHeader` compares exactly this value against
+  `header.sectionIds`; our pipeline compares it against the delivered id.
+- Wire formats (integers VLQ unless stated):
+  - **102 BlockTransactions**: `header_id[32] || ver_or_count: u32 || [count: u32] || txs`.
+    If `ver_or_count > 10_000_000`, then `block_version = ver_or_count - 10_000_000`
+    and a separate `count` follows; otherwise `block_version = 1` and
+    `ver_or_count` is the count. `block_version` must fit `u8`
+    (`Header.version`); larger is `Err`. A count of zero is `Err` — the
+    JVM's `BlockTransactions` requires at least one transaction, so an
+    empty body does not parse there either. Each tx is parsed with
+    `Transaction::sigma_parse`. `digest = transactions_root(txs, block_version)`.
+  - **104 ADProofs**: `header_id[32] || size: u32 || proof_bytes[size]`.
+    `digest = ad_proofs_digest(proof_bytes)`.
+  - **108 Extension**: `header_id[32] || count: u16 || (key[2] || len: u8 || value[len]) × count`.
+    `digest = extension_root(fields)`.
+- **Pure computation**: parses and hashes, touches no chain state. It does
+  not know whether `header_id` names a real header — that is the request
+  gate, applied by the caller against the header chain and the store.
+- **Bounds**: a body is at most one P2P message (`facts/p2p-protocol.md`);
+  `count` values bound loop trips, never allocations.
+- `Err` on any parse failure, trailing bytes, or unsupported `type_id`. The
+  error carries the type id and a reason; the pipeline logs it with the
+  delivering peer and drops the bytes.
+
+**Two parsers, one wire format.** `ergo-validation` keeps its own
+`parse_block_transactions` / `parse_extension` / `parse_ad_proofs` because
+it needs the typed transactions for application, not just the digest. Both
+read the formats above; a divergence between them is a bug in whichever side
+disagrees with the JVM serializer.
+
 ## Phase 6: Soft-Fork Voting
 
 Track and apply blockchain parameter changes voted on by miners. The vote

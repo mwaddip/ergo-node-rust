@@ -39,7 +39,7 @@ use ergo_lib::chain::emission::MonetarySettings;
 use ergo_lib::chain::genesis;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
-use ergo_mining::candidate::{build_work_message, transactions_root};
+use ergo_mining::candidate::build_work_message;
 use ergo_mining::emission::{build_emission_tx, ReemissionRules};
 use ergo_mining::extension::extension_digest;
 use ergo_mining::solution::validate_solution;
@@ -169,8 +169,8 @@ fn build_work_message_wiring_matches_independent_serialization() {
     //         — every field assignment is right here, in the test, where
     //         a swap would be visible to the reader. ----
     let expected_ad_proofs_root: [u8; 32] = blake2b256_bytes(&known_ad_proof_bytes);
-    let expected_tx_root = transactions_root(&transactions, parent.version).unwrap();
-    let expected_extension_root = extension_digest(&extension).unwrap();
+    let expected_tx_root = enr_chain::transactions_root(&transactions, parent.version);
+    let expected_extension_root = extension_digest(&extension);
 
     let independent_header = Header {
         version: parent.version,
@@ -178,7 +178,7 @@ fn build_work_message_wiring_matches_independent_serialization() {
         parent_id: parent.id,
         ad_proofs_root: Digest32::from(expected_ad_proofs_root),
         state_root: known_state_root,
-        transaction_root: expected_tx_root,
+        transaction_root: Digest32::from(expected_tx_root),
         timestamp: known_timestamp,
         n_bits: TRIVIAL_N_BITS,
         height,
@@ -367,11 +367,14 @@ fn header_for_nonce(candidate: &CandidateBlock, nonce: u64) -> Header {
         parent_id: candidate.parent.id,
         ad_proofs_root: Digest32::from(blake2b256_bytes(&candidate.ad_proof_bytes)),
         state_root: candidate.state_root,
-        transaction_root: transactions_root(&candidate.transactions, candidate.version).unwrap(),
+        transaction_root: Digest32::from(enr_chain::transactions_root(
+            &candidate.transactions,
+            candidate.version,
+        )),
         timestamp: candidate.timestamp,
         n_bits: candidate.n_bits,
         height: candidate.parent.height + 1,
-        extension_root: Digest32::from(extension_digest(&candidate.extension).unwrap()),
+        extension_root: Digest32::from(extension_digest(&candidate.extension)),
         autolykos_solution: solution_with_nonce(nonce),
         votes: Votes(candidate.votes),
         unparsed_bytes: Box::new([]),

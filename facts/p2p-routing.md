@@ -41,15 +41,18 @@
 - **Postcondition**: Actions target only registered peers.
 - Mode filtering: Light mode drops SyncInfo and block-related ModifierRequests.
 - GetPeers: parsed (body must be empty), then PeerDb is queried for
-  up to 8 recently-seen non-blacklisted peers, excluding the requester's
-  own address. The selection is serialized as a `Peers` message and
+  up to 8 *observed* non-blacklisted peers (`PeerDb::observed` — peers
+  we have completed a handshake with; hearsay is never gossiped onward),
+  excluding the requester's own address. The selection is serialized as a `Peers` message and
   sent back to the source. An empty selection produces a `Peers` body
   with VLQ count = 0 (one byte: `0x00`).
 - Peers: body parsed per `p2p-protocol.md::Peers wire format`. For
   each entry, if the entry's declared address is present and not
   blacklisted — and, when bogus-address filtering is enabled (see
   `[network].filter_bogus_addresses` below), not bogus — it is
-  recorded into PeerDb with `last_seen_ms = now`.
+  recorded into PeerDb as hearsay: `last_seen_ms = now`,
+  `last_handshake_ms` untouched (`facts/p2p-peerdb.md` § Observed and
+  hearsay).
   Malformed Peers (cap exceeded, truncated body, invalid shortString)
   triggers a permanent ban of the source via the blacklist module —
   a genuine protocol violation, mirroring JVM
@@ -66,7 +69,8 @@
   are dropped from `Peers` intake and from GetPeers response
   selection — JVM 6.0.3 parity. When `false`, no address-sanity
   filtering is applied: every syntactically-valid address is ingested,
-  may be selected for outbound fill, and is gossiped onward. The flag
+  may be selected for outbound fill, and — once we have handshaked with
+  it — is gossiped onward. The flag
   does not affect the malformed-Peers ban (unconditional) or the
   self-address filter (separate; the node never records or dials its
   own declared addresses).
@@ -107,7 +111,11 @@ The router builds the classifier from `std::net::Ipv4Addr` /
 reserved 240/4, IPv6 link-local / ULA / mapped / documentation) with
 bit-mask checks. The unstable `is_global` family is NOT used.
 - PeerConnected: when a peer transitions to Active, its handshake
-  `PeerSpec` is recorded into PeerDb if it has a declared address.
+  `PeerSpec` is recorded into PeerDb per `facts/p2p-peerdb.md`
+  § Observed and hearsay: outbound — the dialed address is observed, the
+  declared address observed if on the same IP and hearsay otherwise;
+  inbound — the declared address is observed if on the remote IP and
+  hearsay otherwise, and nothing is recorded without a declared address.
 - Inv: not forwarded — recorded into the inv table for routing only.
 - ModifierRequest: **local serve hook first** — the router is constructed
   with an optional store-blind callback

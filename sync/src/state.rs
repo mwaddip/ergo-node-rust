@@ -3686,6 +3686,7 @@ mod sweep_resume_tests {
             Ok(ApplyStateOutcome {
                 epoch_boundary_params: None,
                 epoch_boundary_proposed_update: None,
+                block_cost: None,
             })
         }
 

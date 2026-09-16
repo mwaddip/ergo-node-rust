@@ -80,9 +80,25 @@ impl ParsedNode {
             ParsedNode::Leaf { packed_bytes, .. } => packed_bytes,
         }
     }
+
+    /// Take the node apart into what storage keeps: its label and its packed bytes.
+    pub fn into_parts(self) -> ([u8; 32], Vec<u8>) {
+        match self {
+            ParsedNode::Internal {
+                label,
+                packed_bytes,
+                ..
+            } => (label, packed_bytes),
+            ParsedNode::Leaf {
+                label,
+                packed_bytes,
+                ..
+            } => (label, packed_bytes),
+        }
+    }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ParseError {
     #[error("unexpected end of data")]
     UnexpectedEof,

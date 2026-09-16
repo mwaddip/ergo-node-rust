@@ -1,7 +1,11 @@
-use ergo_sync::snapshot::manifest::{extract_subtree_ids, parse_manifest_header};
-use ergo_sync::snapshot::parser::{
-    compute_internal_label, compute_leaf_label, PACKED_INTERNAL_PREFIX, PACKED_LEAF_PREFIX,
+use ergo_sync::snapshot::manifest::{
+    extract_subtree_ids, parse_manifest_header, verify_manifest, ManifestError,
 };
+use ergo_sync::snapshot::parser::{
+    compute_internal_label, compute_leaf_label, ParseError, PACKED_INTERNAL_PREFIX,
+    PACKED_LEAF_PREFIX,
+};
+use ergo_sync::snapshot::tree::{Side, TreeError};
 
 /// Helper: serialize an internal node into packed bytes.
 fn pack_internal(
@@ -172,4 +176,214 @@ fn depth_3_full_tree_extracts_8_ids() {
     for (i, id) in ids.iter().enumerate() {
         assert_eq!(*id, st[i], "subtree ID mismatch at index {i}");
     }
+}
+
+// ── Byte accounting and verification ────────────────────────────────────────
+
+/// The depth-2 manifest from `depth_2_boundary_extracts_4_ids`, with the
+/// 33-byte state root a header would carry for it.
+fn depth_2_manifest() -> (Vec<u8>, [u8; 33], Vec<[u8; 32]>) {
+    let root_height = 5u8;
+    let subtrees = [[0xA0u8; 32], [0xB0; 32], [0xC0; 32], [0xD0; 32]];
+    let child_l = compute_internal_label(0, &subtrees[0], &subtrees[1]);
+    let child_r = compute_internal_label(0, &subtrees[2], &subtrees[3]);
+    let root = compute_internal_label(0, &child_l, &child_r);
+
+    let mut manifest = vec![root_height, 2];
+    manifest.extend_from_slice(&pack_internal(0, &[0x10; 32], &child_l, &child_r));
+    manifest.extend_from_slice(&pack_internal(0, &[0x10; 32], &subtrees[0], &subtrees[1]));
+    manifest.extend_from_slice(&pack_internal(0, &[0x20; 32], &subtrees[2], &subtrees[3]));
+
+    let mut state_root = [0u8; 33];
+    state_root[..32].copy_from_slice(&root);
+    state_root[32] = root_height;
+    (manifest, state_root, subtrees.to_vec())
+}
+
+#[test]
+fn verify_binds_root_label_and_height_to_the_state_root() {
+    let (manifest, state_root, subtrees) = depth_2_manifest();
+    let verified = verify_manifest(manifest.clone(), &state_root).unwrap();
+    assert_eq!(&verified.root_hash()[..], &state_root[..32]);
+    assert_eq!(verified.root_height(), 5);
+    assert_eq!(verified.subtree_ids(), subtrees.as_slice());
+    assert_eq!(verified.bytes(), manifest.as_slice());
+    assert_eq!(verified.node_bytes(), &manifest[2..]);
+}
+
+#[test]
+fn verify_accepts_a_single_leaf_manifest() {
+    let key = [1u8; 32];
+    let value = b"box";
+    let next = [2u8; 32];
+    let label = compute_leaf_label(&key, value, &next);
+    let mut manifest = vec![1u8, 14];
+    manifest.extend_from_slice(&pack_leaf(&key, value, &next));
+    let mut state_root = [0u8; 33];
+    state_root[..32].copy_from_slice(&label);
+    state_root[32] = 1;
+
+    let verified = verify_manifest(manifest, &state_root).unwrap();
+    assert_eq!(verified.root_hash(), label);
+    assert!(verified.subtree_ids().is_empty());
+}
+
+#[test]
+fn verify_rejects_a_root_label_that_is_not_the_headers() {
+    let (mut manifest, state_root, _) = depth_2_manifest();
+    // Flip the root node's balance byte: its label changes, the rest of the
+    // manifest stays well-formed.
+    manifest[3] ^= 0x01;
+    assert_eq!(
+        verify_manifest(manifest, &state_root).unwrap_err(),
+        ManifestError::Tree(TreeError::RootMismatch)
+    );
+}
+
+#[test]
+fn verify_rejects_a_root_height_that_is_not_the_headers() {
+    let (mut manifest, state_root, _) = depth_2_manifest();
+    manifest[0] = 6;
+    assert_eq!(
+        verify_manifest(manifest, &state_root).unwrap_err(),
+        ManifestError::RootHeightMismatch {
+            expected: 5,
+            got: 6
+        }
+    );
+}
+
+#[test]
+fn walk_rejects_a_manifest_cut_at_a_node_boundary() {
+    let (mut manifest, state_root, _) = depth_2_manifest();
+    // Drop the last boundary node whole: every remaining node parses, and a
+    // walk that stopped at end-of-bytes would report two subtree ids of four.
+    manifest.truncate(manifest.len() - 98);
+    assert_eq!(
+        extract_subtree_ids(&manifest, 32).unwrap_err(),
+        ManifestError::Tree(TreeError::Truncated)
+    );
+    assert_eq!(
+        verify_manifest(manifest, &state_root).unwrap_err(),
+        ManifestError::Tree(TreeError::Truncated)
+    );
+}
+
+#[test]
+fn walk_rejects_a_manifest_cut_inside_a_node() {
+    let (mut manifest, _, _) = depth_2_manifest();
+    manifest.truncate(manifest.len() - 10);
+    assert_eq!(
+        extract_subtree_ids(&manifest, 32).unwrap_err(),
+        ManifestError::Tree(TreeError::Parse(ParseError::UnexpectedEof))
+    );
+}
+
+#[test]
+fn walk_rejects_trailing_bytes_after_the_tree() {
+    let (mut manifest, state_root, _) = depth_2_manifest();
+    manifest.extend_from_slice(&[0u8; 3]);
+    assert_eq!(
+        extract_subtree_ids(&manifest, 32).unwrap_err(),
+        ManifestError::Tree(TreeError::TrailingBytes(3))
+    );
+    assert_eq!(
+        verify_manifest(manifest, &state_root).unwrap_err(),
+        ManifestError::Tree(TreeError::TrailingBytes(3))
+    );
+}
+
+#[test]
+fn walk_rejects_a_zero_manifest_depth() {
+    let (mut manifest, _, _) = depth_2_manifest();
+    manifest[1] = 0;
+    assert_eq!(
+        extract_subtree_ids(&manifest, 32).unwrap_err(),
+        ManifestError::ZeroDepth
+    );
+}
+
+#[test]
+fn walk_rejects_an_unknown_node_prefix() {
+    let (mut manifest, _, _) = depth_2_manifest();
+    // The prefix byte of the second node.
+    manifest[2 + 98] = 0x07;
+    assert_eq!(
+        extract_subtree_ids(&manifest, 32).unwrap_err(),
+        ManifestError::Tree(TreeError::Parse(ParseError::InvalidPrefix(0x07)))
+    );
+}
+
+// ── Parent-child link verification ──────────────────────────────────────────
+
+/// Build a depth-2 manifest where the root is correct (its label commits to
+/// the real left/right labels) but the left boundary node is replaced by a
+/// *different* internal node. The root's stored left_label no longer matches
+/// the recomputed label of the node that follows it.
+#[test]
+fn verify_rejects_an_interior_child_replaced_by_a_different_node() {
+    // Real children:
+    let subtrees = [[0xA0u8; 32], [0xB0; 32], [0xC0; 32], [0xD0; 32]];
+    let child_l = compute_internal_label(0, &subtrees[0], &subtrees[1]);
+    let child_r = compute_internal_label(0, &subtrees[2], &subtrees[3]);
+    let root = compute_internal_label(0, &child_l, &child_r);
+
+    // A replacement with different content → different recomputed label.
+    let rogue_l = compute_internal_label(0, &[0xEE; 32], &[0xFF; 32]);
+
+    let root_height = 5u8;
+    let mut manifest = vec![root_height, 2];
+    manifest.extend_from_slice(&pack_internal(0, &[0x10; 32], &child_l, &child_r));
+    // Slot in the replacement: root's stored left_label stays child_l, but the
+    // node hashes to rogue_l.
+    manifest.extend_from_slice(&pack_internal(0, &[0x10; 32], &[0xEE; 32], &[0xFF; 32]));
+    manifest.extend_from_slice(&pack_internal(0, &[0x20; 32], &subtrees[2], &subtrees[3]));
+
+    let mut state_root = [0u8; 33];
+    state_root[..32].copy_from_slice(&root);
+    state_root[32] = root_height;
+
+    // The root node's left_label ≠ the rogue node's recomputed label.
+    assert_ne!(child_l, rogue_l, "test setup: the labels should differ");
+
+    let err = verify_manifest(manifest, &state_root).unwrap_err();
+    assert_eq!(
+        err,
+        ManifestError::Tree(TreeError::BrokenLink {
+            parent: 0,
+            side: Side::Left,
+        })
+    );
+}
+
+/// Same idea, but the two children are swapped: left node where right should
+/// be and vice versa. Each child is well-formed, but the root's stored labels
+/// don't match what is at each position.
+#[test]
+fn verify_rejects_two_children_swapped() {
+    let subtrees = [[0xA0u8; 32], [0xB0; 32], [0xC0; 32], [0xD0; 32]];
+    let child_l = compute_internal_label(0, &subtrees[0], &subtrees[1]);
+    let child_r = compute_internal_label(0, &subtrees[2], &subtrees[3]);
+    let root = compute_internal_label(0, &child_l, &child_r);
+
+    let root_height = 5u8;
+    let mut manifest = vec![root_height, 2];
+    manifest.extend_from_slice(&pack_internal(0, &[0x10; 32], &child_l, &child_r));
+    // DFS: left position should carry child_l, but we put child_r there.
+    manifest.extend_from_slice(&pack_internal(0, &[0x20; 32], &subtrees[2], &subtrees[3]));
+    manifest.extend_from_slice(&pack_internal(0, &[0x10; 32], &subtrees[0], &subtrees[1]));
+
+    let mut state_root = [0u8; 33];
+    state_root[..32].copy_from_slice(&root);
+    state_root[32] = root_height;
+
+    let err = verify_manifest(manifest, &state_root).unwrap_err();
+    // The walk sees the first child (child_r) where it expected child_l.
+    assert_eq!(
+        err,
+        ManifestError::Tree(TreeError::BrokenLink {
+            parent: 0,
+            side: Side::Left,
+        })
+    );
 }
