@@ -107,10 +107,11 @@ pub fn parse_block_transactions(data: &[u8]) -> Result<ParsedBlockTransactions, 
 
     // Parse individual transactions from the remaining byte stream.
     // Transaction::sigma_parse reads from a SigmaByteReader and advances the position.
+    // The wire count bounds the loop trip count only — never a preallocation.
     let pos = 32 + cursor.position() as usize;
     let tx_cursor = Cursor::new(&data[pos..]);
     let mut reader = SigmaByteReader::new(tx_cursor, ConstantStore::empty());
-    let mut transactions = Vec::with_capacity(tx_count);
+    let mut transactions = Vec::new();
 
     for i in 0..tx_count {
         let tx = Transaction::sigma_parse(&mut reader)
@@ -127,7 +128,11 @@ pub fn parse_block_transactions(data: &[u8]) -> Result<ParsedBlockTransactions, 
 
 /// Parse an Extension section (type 108) from raw modifier bytes.
 ///
-/// Wire format: `[header_id: 32B] [field_count: VLQ] [fields: {key: 2B, val_len: 1B, val}...]`
+/// Wire format: `[header_id: 32B] [field_count: VLQ u16] [fields: {key: 2B, val_len: 1B, val}...]`
+///
+/// The count is a VLQ ushort (JVM `ExtensionSerializer` writes/reads it via
+/// `putUShort`/`getUShort`, range-checked 0..=65535); any larger value is a
+/// parse error, matching the JVM and `chain::section_id_from_body`.
 pub fn parse_extension(data: &[u8]) -> Result<ParsedExtension, ValidationError> {
     const TYPE_ID: u8 = 108;
     if data.len() < 33 {
@@ -137,12 +142,13 @@ pub fn parse_extension(data: &[u8]) -> Result<ParsedExtension, ValidationError> 
     let mut cursor = Cursor::new(&data[32..]);
 
     let field_count = cursor
-        .get_u32()
+        .get_u16()
         .map_err(|e| section_parse_err(TYPE_ID, format!("field_count VLQ: {e}")))?
         as usize;
 
     let mut pos = 32 + cursor.position() as usize;
-    let mut fields = Vec::with_capacity(field_count);
+    // The wire count bounds the loop trip count only — never a preallocation.
+    let mut fields = Vec::new();
 
     for i in 0..field_count {
         if pos + 3 > data.len() {
@@ -358,5 +364,67 @@ mod tests {
         data.push(10); // claim 10 bytes
         data.extend_from_slice(&[0u8; 3]); // only 3 bytes
         assert!(parse_extension(&data).is_err());
+    }
+
+    /// JVM `ExtensionSerializer` writes the field count with `putUShort` and
+    /// reads it with `getUShort`, range-checked 0..=65535. A count of 65_536
+    /// is not a legal extension body on the wire; our parser must Err rather
+    /// than silently accept it as it would with `get_u32`.
+    #[test]
+    fn parse_extension_field_count_above_u16_max_is_err() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0u8; 32]); // header_id
+        // VLQ-encode 65_536 (out of range for u16). put_u32 produces the
+        // same VLQ bytes as any encoder for this value; the type only
+        // decides the range check on read.
+        let mut count_buf = Vec::new();
+        WriteSigmaVlqExt::put_u32(&mut count_buf, 65_536).unwrap();
+        data.extend_from_slice(&count_buf);
+        match parse_extension(&data) {
+            Err(ValidationError::SectionParse {
+                section_type,
+                reason,
+            }) => {
+                assert_eq!(section_type, 108);
+                assert!(
+                    reason.contains("field_count"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            Err(other) => panic!("expected SectionParse, got {other:?}"),
+            Ok(_) => panic!("count 65536 must not parse"),
+        }
+    }
+
+    /// A hostile BlockTransactions body declares `u32::MAX` transactions and
+    /// carries none. The old `Vec::with_capacity(tx_count)` would attempt a
+    /// ~34 GB allocation on 64-bit before the loop; the fixed parser must
+    /// Err from the first `Transaction::sigma_parse` on the empty tail.
+    ///
+    /// We cannot easily prove "did not allocate 4 billion Transactions"
+    /// without a counting allocator in the test harness — none is wired up
+    /// here — so this test asserts the observable outcome (Err), and the
+    /// no-preallocation guarantee is code-inspected on the change to
+    /// `Vec::new()` in `parse_block_transactions`.
+    #[test]
+    fn parse_block_transactions_hostile_count_is_err_without_allocating() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0u8; 32]); // header_id
+        // version sentinel for BlockVersion == 2
+        let mut sentinel_buf = Vec::new();
+        WriteSigmaVlqExt::put_u32(&mut sentinel_buf, BLOCK_VERSION_SENTINEL + 2).unwrap();
+        data.extend_from_slice(&sentinel_buf);
+        // hostile tx_count == u32::MAX
+        let mut count_buf = Vec::new();
+        WriteSigmaVlqExt::put_u32(&mut count_buf, u32::MAX).unwrap();
+        data.extend_from_slice(&count_buf);
+        // no transaction bytes follow
+        match parse_block_transactions(&data) {
+            Err(ValidationError::SectionParse { section_type, .. }) => {
+                assert_eq!(section_type, 102);
+            }
+            Err(other) => panic!("expected SectionParse, got {other:?}"),
+            Ok(_) => panic!("u32::MAX transactions with none supplied must Err"),
+        }
     }
 }
