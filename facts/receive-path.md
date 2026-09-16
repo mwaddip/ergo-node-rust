@@ -35,8 +35,8 @@ Whether a drop also penalizes the sender is a routing decision
 
 | Bytes | Label | Binding computation | Request gate | Enforced by |
 |---|---|---|---|---|
-| Header (101) | modifier id | id recomputed by `parse_header` from the header's own fields; PoW verified | none — headers self-authenticate | pipeline; `facts/chain.md` `parse_header` / `verify_pow` |
-| Block section (102 / 104 / 108) | modifier id | `enr_chain::section_id_from_body` | the body's `header_id` is a header the node holds (best chain or store) | pipeline (`facts/sync.md` § Receive-path binding); computation in `facts/chain.md` § Section bodies; precondition in `facts/store.md` |
+| Header (101) | modifier id | id recomputed by `parse_header` from the header's own fields; the wire bytes must equal the re-serialization (else the stored/served bytes would not be the bytes the label was computed over); PoW verified | none — headers self-authenticate | pipeline; `facts/chain.md` `parse_header` / `verify_pow` |
+| Block section (102 / 104 / 108) | modifier id | `enr_chain::section_id_from_body` | the body's `header_id` is a header the node holds (best chain or store) **and** the delivered id is one of `section_ids(header)` — the header's roots, not the body's own hash, decide whether the block has that section | pipeline (`facts/sync.md` § Receive-path binding); computation in `facts/chain.md` § Section bodies; precondition in `facts/store.md` |
 | Unconfirmed transaction (2) | tx id | `Transaction::id()` over the parsed bytes | none today — the JVM drops unrequested transactions; we validate every tx on entry against state under one shared rate-limit budget (`facts/mempool.md`) | mempool |
 | Snapshot manifest (79) | manifest id | root node label recomputed from the node's fields | id chosen by quorum; response accepted only from the peer asked | sync, `facts/snapshot.md` § Manifest download |
 | Snapshot chunk (81) | subtree id | root node label recomputed from the node's fields | id is in flight | sync, `facts/snapshot.md` § Chunk download |

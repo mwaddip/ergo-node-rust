@@ -274,23 +274,40 @@ impl ValidationPipeline {
                 }
             };
 
-            // Round-trip check: detect headers whose re-serialization produces
-            // different bytes. These would break SyncInfo (commonPoint fails).
-            if let Ok(reserialized) = header.scorex_serialize_bytes() {
-                if data != reserialized.as_slice() {
+            // Round-trip check: the header's id is recomputed from its parsed
+            // fields, but the bytes stored and served are the wire bytes. A
+            // header whose re-serialization differs (trailing bytes, a
+            // non-canonical encoding) would be stored and served under a
+            // label not recomputed from those bytes, and would break SyncInfo
+            // (commonPoint fails) — so it is rejected, the same rule the
+            // sections' `finish()` applies (`facts/receive-path.md`).
+            match header.scorex_serialize_bytes() {
+                Ok(reserialized) if data == reserialized.as_slice() => {}
+                Ok(reserialized) => {
                     let first_diff = data
                         .iter()
                         .zip(reserialized.iter())
                         .position(|(a, b)| a != b);
-                    tracing::error!(
-                        height = header.height,
-                        wire_len = data.len(),
-                        reser_len = reserialized.len(),
-                        first_diff_at = ?first_diff,
-                        wire_prefix = format!("{:02x?}", &data[..data.len().min(20)]),
-                        reser_prefix = format!("{:02x?}", &reserialized[..reserialized.len().min(20)]),
-                        "ROUND-TRIP MISMATCH"
-                    );
+                    if let Some(pid) = peer_id {
+                        tracing::warn!(
+                            peer_id = pid,
+                            height = header.height,
+                            wire_len = data.len(),
+                            reser_len = reserialized.len(),
+                            first_diff_at = ?first_diff,
+                            "PENALTY header bytes are not canonical (round-trip mismatch)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            height = header.height,
+                            "pipeline: rejecting header: round-trip mismatch"
+                        );
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(height = header.height, "pipeline: rejecting header: cannot re-serialize: {e}");
+                    continue;
                 }
             }
 
@@ -755,12 +772,30 @@ impl ValidationPipeline {
                 continue;
             }
             let header_id = BlockId(ergo_chain_types::Digest32::from(identity.header_id));
-            let height = match chain.height_of(&header_id) {
-                Some(height) => height,
-                None => match self.store.contains(HEADER_TYPE_ID, &identity.header_id) {
+            // Request gate: the header must be one the node holds, and the
+            // delivered id must be one of the section ids THAT HEADER
+            // declares (JVM `bsCorrespondsToHeader`: `header.sectionIds
+            // .exists(_._2 == m.id)`). Binding to the bytes alone (above)
+            // proves the body hashes to its own label; only the header's
+            // roots say whether that label is a section the block has.
+            let (height, header) = match chain.height_of(&header_id) {
+                Some(height) => match chain.header_at(height) {
+                    Some(header) => (height, header),
+                    None => {
+                        tracing::error!(type_id, height, "header indexed but not loadable while binding a section");
+                        continue;
+                    }
+                },
+                None => match self.store.get(HEADER_TYPE_ID, &identity.header_id) {
                     // A fork header off the best chain: stored, not height-indexed.
-                    Ok(true) => 0,
-                    Ok(false) => {
+                    Ok(Some(raw)) => match enr_chain::parse_header(&raw) {
+                        Ok(header) => (0, header),
+                        Err(e) => {
+                            tracing::error!(type_id, "stored fork header does not parse while binding a section: {e}");
+                            continue;
+                        }
+                    },
+                    Ok(None) => {
                         reject_section(
                             peer_id,
                             type_id,
@@ -774,6 +809,21 @@ impl ValidationPipeline {
                     }
                 },
             };
+            if !enr_chain::section_ids(&header)
+                .iter()
+                .any(|(t, id)| *t == type_id && *id == delivered_id)
+            {
+                reject_section(
+                    peer_id,
+                    type_id,
+                    &format!(
+                        "id {} is not a section header {} declares",
+                        hex::encode(delivered_id),
+                        hex::encode(identity.header_id)
+                    ),
+                );
+                continue;
+            }
             entries.push((type_id, delivered_id, height, data.to_vec(), None));
         }
 
@@ -1218,5 +1268,49 @@ mod tests {
             pipeline.reorg_requested.should_request([4; 32], later),
             "a request left unanswered past the TTL must release its slot"
         );
+    }
+
+    /// A body that binds to ITS OWN id, for a header the node holds, but whose
+    /// id is not one of that header's declared section ids: dropped. Binding
+    /// to the bytes proves the label; only the header's roots say whether the
+    /// block has such a section (JVM `bsCorrespondsToHeader`).
+    #[test]
+    fn body_under_its_own_id_for_a_known_header_is_dropped_unless_declared() {
+        let (mut pipeline, _tx, _progress_rx, _ctrl_rx, mut data_rx, _dir) = test_pipeline();
+        let (header, ext, _ad) = block_2666();
+        store_header_as_fork(&pipeline, &header);
+        let mut foreign = header.id.0 .0.to_vec();
+        foreign.push(1);
+        foreign.extend_from_slice(&[0x01, 0x00, 9]);
+        foreign.extend_from_slice(b"interlink");
+        let own_id = enr_chain::section_id_from_body(108, &foreign).unwrap().id;
+        assert_ne!(own_id, enr_chain::section_ids(&header)[2].1);
+        run(&mut pipeline, vec![(108, own_id, foreign, Some(7))]);
+        assert_eq!(pipeline.store.get(108, &own_id).unwrap(), None);
+        assert!(received(&mut data_rx).is_empty());
+        // The declared section still stores.
+        let ext_id = enr_chain::section_ids(&header)[2].1;
+        run(&mut pipeline, vec![(108, ext_id, ext.clone(), Some(7))]);
+        assert_eq!(pipeline.store.get(108, &ext_id).unwrap().as_deref(), Some(ext.as_slice()));
+    }
+
+    /// A header whose wire bytes are not its canonical serialization
+    /// (here: canonical bytes plus trailing junk, which parses to the same
+    /// id) is rejected, not stored raw under the recomputed id.
+    #[test]
+    fn non_canonical_header_bytes_are_rejected() {
+        use sigma_ser::ScorexSerializable;
+        let (header, _ext, _ad) = block_2666();
+        let canonical = header.scorex_serialize_bytes().unwrap();
+        let mut trailing = canonical.clone();
+        trailing.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(enr_chain::parse_header(&trailing).unwrap().id, header.id, "same id");
+        let (mut pipeline, _tx, _progress_rx, _ctrl_rx, mut data_rx, _dir) = test_pipeline();
+        run(&mut pipeline, vec![(HEADER_TYPE_ID, header.id.0 .0, trailing, Some(7))]);
+        assert!(received(&mut data_rx).is_empty(), "non-canonical header must not be reported received");
+        assert_eq!(pipeline.buffer.len(), 0, "and must not be buffered");
+        // Control: the canonical bytes are accepted (parent unknown → buffered).
+        run(&mut pipeline, vec![(HEADER_TYPE_ID, header.id.0 .0, canonical, Some(7))]);
+        assert_eq!(received(&mut data_rx), vec![header.id.0 .0]);
     }
 }

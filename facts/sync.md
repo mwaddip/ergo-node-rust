@@ -836,8 +836,10 @@ peer-delivered block sections, and it writes nothing it has not bound
      `Ok(identity)` with `identity.id == id`. Otherwise drop: no store
      write, no `Received`, a `PENALTY`-tagged warn naming the peer.
   2. Request gate: `identity.header_id` must be a header the node holds —
-     on the best chain, or a fork header in the store. Otherwise drop the
-     same way. The pipeline does not consult the delivery tracker: a
+     on the best chain, or a fork header in the store — and `id` must be one
+     of `enr_chain::section_ids(header)` (JVM `bsCorrespondsToHeader`
+     membership: a body bound to its own label is still dropped when the
+     header declares no such section). Otherwise drop the same way. The pipeline does not consult the delivery tracker: a
      section for a known header is one sync wants or already has, and the
      store write is idempotent for identical bytes.
   3. `put_batch`, with the height of `identity.header_id` (0 for a fork
