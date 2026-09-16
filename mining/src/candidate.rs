@@ -2,57 +2,11 @@
 
 use blake2::Digest as Blake2Digest;
 use ergo_chain_types::{AutolykosSolution, BlockId, Digest, Digest32, EcPoint, Header, Votes};
-use ergo_lib::chain::transaction::Transaction;
-use ergo_merkle_tree::{MerkleNode, MerkleTree};
 
-use crate::extension::extension_digest;
 use crate::types::*;
 use crate::MiningError;
 
 type Blake2b256 = blake2::Blake2b<blake2::digest::typenum::U32>;
-
-/// Compute the version-dependent Merkle root for the header's transaction_root.
-///
-/// JVM `BlockTransactions.scala:59-63`: for block version 1 the leaves are
-/// the tx IDs; for version >= 2 the leaves are all tx IDs followed by all
-/// witness IDs (`txIds ++ witnessIds` — two concatenated lists, not
-/// interleaved). Mainnet and testnet are both version >= 2 today, so a
-/// tx-IDs-only root is rejected by every JVM peer.
-pub fn transactions_root(txs: &[Transaction], block_version: u8) -> Result<Digest32, MiningError> {
-    if txs.is_empty() {
-        return Err(MiningError::AssemblyFailed("no transactions".into()));
-    }
-
-    let mut nodes: Vec<MerkleNode> = txs
-        .iter()
-        .map(|tx| {
-            let tx_id = tx.id();
-            MerkleNode::from_bytes(tx_id.as_ref().to_vec())
-        })
-        .collect();
-
-    if block_version >= 2 {
-        nodes.extend(txs.iter().map(|tx| MerkleNode::from_bytes(witness_id(tx))));
-    }
-
-    let tree = MerkleTree::new(nodes);
-    Ok(tree.root_hash())
-}
-
-/// Witness ID of a transaction: blake2b256 over the concatenation of every
-/// input's raw spending-proof bytes, with the first byte dropped — 31 bytes
-/// (JVM `ErgoTransaction.scala:77-78`). The truncation to 248 bits is
-/// deliberate: it distinguishes witness leaves from 32-byte tx-ID leaves in
-/// the Merkle tree. Empty proofs (e.g. storage-rent spends) contribute no
-/// bytes to the concatenation.
-fn witness_id(tx: &Transaction) -> Vec<u8> {
-    let mut hasher = Blake2b256::new();
-    for input in tx.inputs.iter() {
-        hasher.update(input.spending_proof.proof.as_ref());
-    }
-    let hash: [u8; 32] = hasher.finalize().into();
-    hash[1..].to_vec()
-}
 
 /// Build the candidate header (without PoW) and derive the WorkMessage.
 ///
@@ -68,20 +22,17 @@ pub fn build_work_message(
 ) -> Result<(Vec<u8>, WorkMessage), MiningError> {
     let height = candidate.parent.height + 1;
 
-    // AD proofs root = Blake2b256(ad_proof_bytes)
-    let ad_proofs_root = {
-        let mut hasher = Blake2b256::new();
-        hasher.update(&candidate.ad_proof_bytes);
-        let hash: [u8; 32] = hasher.finalize().into();
-        Digest32::from(hash)
-    };
+    let ad_proofs_root = Digest32::from(enr_chain::ad_proofs_digest(&candidate.ad_proof_bytes));
 
-    // Transaction root = version-dependent Merkle root (tx IDs, plus
-    // witness IDs for block version >= 2)
-    let tx_root = transactions_root(&candidate.transactions, candidate.version)?;
+    if candidate.transactions.is_empty() {
+        return Err(MiningError::AssemblyFailed("no transactions".into()));
+    }
+    let tx_root = Digest32::from(enr_chain::transactions_root(
+        &candidate.transactions,
+        candidate.version,
+    ));
 
-    // Extension root
-    let ext_root_bytes = extension_digest(&candidate.extension)?;
+    let ext_root_bytes = enr_chain::extension_root(&candidate.extension.fields);
 
     // Build header with placeholder solution (excluded from serialization)
     let header = Header {

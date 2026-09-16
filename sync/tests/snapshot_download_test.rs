@@ -82,43 +82,44 @@ fn crash_recovery_preserves_state() {
     );
 }
 
-/// is_complete returns false until chunk_count >= total_chunks.
+/// is_complete derives from the subtree ids, not from total_chunks.
 #[test]
-fn is_complete_detection() {
+fn is_complete_follows_subtree_ids() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("complete.redb");
-    let total = 3u32;
+    let ids: Vec<[u8; 32]> = (0..3u8).map(make_chunk_id).collect();
 
-    let store = ChunkDownloadStore::create(&path, [0x33; 32], 300_000, b"m", total).unwrap();
+    let store = ChunkDownloadStore::create(&path, [0x33; 32], 300_000, b"m", 3).unwrap();
 
     assert!(
-        !store.is_complete().unwrap(),
+        !store.is_complete(&ids).unwrap(),
         "should not be complete with 0 chunks"
     );
 
-    store
-        .store_chunk(&make_chunk_id(0), &make_chunk_data(0))
-        .unwrap();
+    store.store_chunk(&ids[0], &make_chunk_data(0)).unwrap();
     assert!(
-        !store.is_complete().unwrap(),
+        !store.is_complete(&ids).unwrap(),
         "should not be complete with 1/3 chunks"
     );
 
-    store
-        .store_chunk(&make_chunk_id(1), &make_chunk_data(1))
-        .unwrap();
+    store.store_chunk(&ids[1], &make_chunk_data(1)).unwrap();
     assert!(
-        !store.is_complete().unwrap(),
+        !store.is_complete(&ids).unwrap(),
         "should not be complete with 2/3 chunks"
     );
 
-    store
-        .store_chunk(&make_chunk_id(2), &make_chunk_data(2))
-        .unwrap();
+    store.store_chunk(&ids[2], &make_chunk_data(2)).unwrap();
     assert!(
-        store.is_complete().unwrap(),
+        store.is_complete(&ids).unwrap(),
         "should be complete with 3/3 chunks"
     );
+
+    // An empty id slice is trivially complete — not an error.
+    assert!(store.is_complete(&[]).unwrap());
+
+    // An id not in the store makes it incomplete even with chunks stored.
+    let extra = [0xFF; 32];
+    assert!(!store.is_complete(&[ids[0], extra]).unwrap());
 }
 
 /// stored_chunk_ids returns the correct set of IDs.

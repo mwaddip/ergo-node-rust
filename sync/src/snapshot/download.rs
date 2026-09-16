@@ -129,7 +129,9 @@ impl ChunkDownloadStore {
         Ok(table.len()? as u32)
     }
 
-    /// Total chunks expected for this snapshot.
+    /// The `total_chunks` counter recorded at creation. Informational only:
+    /// completeness is [`Self::is_complete`], derived from the verified
+    /// manifest's subtree ids (`facts/snapshot.md` § Metadata keys).
     pub fn total_chunks(&self) -> u32 {
         self.total_chunks
     }
@@ -154,9 +156,26 @@ impl ChunkDownloadStore {
         Ok(guard.value().to_vec())
     }
 
-    /// Whether all expected chunks have been downloaded.
-    pub fn is_complete(&self) -> Result<bool> {
-        Ok(self.chunk_count()? >= self.total_chunks)
+    /// The ids among `subtree_ids` that have no stored chunk yet, in the
+    /// order given.
+    pub fn missing_chunks(&self, subtree_ids: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(CHUNKS)?;
+        let mut missing = Vec::new();
+        for id in subtree_ids {
+            if table.get(id.as_slice())?.is_none() {
+                missing.push(*id);
+            }
+        }
+        Ok(missing)
+    }
+
+    /// Whether every one of `subtree_ids` has a stored chunk.
+    ///
+    /// Completeness is a property of the verified manifest's ids, never of
+    /// the recorded `total_chunks` counter.
+    pub fn is_complete(&self, subtree_ids: &[[u8; 32]]) -> Result<bool> {
+        Ok(self.missing_chunks(subtree_ids)?.is_empty())
     }
 
     /// Return the subtree IDs of all stored chunks.
@@ -235,6 +254,7 @@ mod tests {
         assert_eq!(store.total_chunks(), 10);
         assert_eq!(store.manifest_bytes().unwrap(), manifest_bytes);
         assert_eq!(store.chunk_count().unwrap(), 0);
-        assert!(!store.is_complete().unwrap());
+        assert!(!store.is_complete(&[[0xAB; 32]]).unwrap());
+        assert!(store.is_complete(&[]).unwrap());
     }
 }

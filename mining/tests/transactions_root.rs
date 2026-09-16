@@ -13,12 +13,12 @@
 //! v2+ network carried a transactionsRoot no JVM peer accepts.
 
 use blake2::Digest as Blake2Digest;
+use ergo_chain_types::Digest32;
 use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
 use ergo_merkle_tree::{MerkleNode, MerkleTree};
-use ergo_mining::candidate::transactions_root;
 use ergo_mining::emission::{build_emission_tx, ReemissionRules};
 
 type Blake2b256 = blake2::Blake2b<blake2::digest::typenum::U32>;
@@ -60,17 +60,17 @@ fn v2_root_matches_real_testnet_block_2666() {
         );
     }
 
-    let root = transactions_root(&txs, block_version).unwrap();
+    let root = enr_chain::transactions_root(&txs, block_version);
     assert_eq!(
-        hex::encode(root.0),
+        hex::encode(root),
         expected_root,
         "v2+ transactionsRoot must match the real block 2666 header"
     );
 
     // The pre-fix rule (tx IDs only) must NOT reproduce the on-chain root.
-    let v1_style_root = transactions_root(&txs, 1).unwrap();
+    let v1_style_root = enr_chain::transactions_root(&txs, 1);
     assert_ne!(
-        hex::encode(v1_style_root.0),
+        hex::encode(v1_style_root),
         expected_root,
         "tx-IDs-only root unexpectedly matches — the witness leaves would be \
          dead code and the original bug report wrong"
@@ -83,15 +83,15 @@ fn v2_root_matches_real_testnet_block_2666() {
 fn v1_root_is_tx_ids_only() {
     let (_, _, txs) = load_fixture();
 
-    let expected = MerkleTree::new(
+    let expected: Digest32 = MerkleTree::new(
         txs.iter()
             .map(|tx| MerkleNode::from_bytes(tx.id().as_ref().to_vec()))
             .collect::<Vec<_>>(),
     )
     .root_hash();
 
-    let root = transactions_root(&txs, 1).unwrap();
-    assert_eq!(root, expected);
+    let root = enr_chain::transactions_root(&txs, 1);
+    assert_eq!(root, <[u8; 32]>::from(expected));
 }
 
 /// An input with an empty spending proof (emission/storage-rent style)
@@ -121,20 +121,30 @@ fn empty_proof_input_contributes_nothing() {
         let hash: [u8; 32] = Blake2b256::new().finalize().into();
         hash[1..].to_vec()
     };
-    let expected = MerkleTree::new(vec![
+    let expected: Digest32 = MerkleTree::new(vec![
         MerkleNode::from_bytes(tx.id().as_ref().to_vec()),
         MerkleNode::from_bytes(empty_witness),
     ])
     .root_hash();
 
-    let root = transactions_root(&[tx], 2).unwrap();
-    assert_eq!(root, expected);
+    let root = enr_chain::transactions_root(&[tx], 2);
+    assert_eq!(root, <[u8; 32]>::from(expected));
 }
 
+/// Chain's `transactions_root` yields the empty-tree root for an empty list
+/// (JVM `Algos.emptyMerkleTreeRoot`). Mining's "no transactions" guard
+/// lives at the call site, not in the root function.
 #[test]
-fn empty_tx_list_is_an_error() {
-    assert!(transactions_root(&[], 1).is_err());
-    assert!(transactions_root(&[], 2).is_err());
+fn empty_tx_list_yields_empty_tree_root() {
+    let expected: Digest32 = MerkleTree::new(Vec::<MerkleNode>::new()).root_hash_special();
+    assert_eq!(
+        enr_chain::transactions_root(&[], 1),
+        <[u8; 32]>::from(expected)
+    );
+    assert_eq!(
+        enr_chain::transactions_root(&[], 2),
+        <[u8; 32]>::from(expected)
+    );
 }
 
 fn test_miner_pk() -> ProveDlog {

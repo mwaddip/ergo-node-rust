@@ -128,7 +128,12 @@ bytes of data.
 
 - fastsync never writes to the node's databases directly. All state changes go
   through `POST /ingest/modifiers` and are subject to the node's normal
-  validation pipeline.
+  validation pipeline, including section-to-header binding
+  (`facts/receive-path.md`): the node recomputes each section's id from the
+  bytes and drops any body that does not match the id fastsync sent.
+  fastsync derives its ids from the headers (`wire.rs` `prefixed_hash`), so
+  an honest run never trips this; a dropped body shows up as a section the
+  node re-requests over P2P, not as an ingest error.
 - fastsync is advisory and always optional. A node with `fastsync = false`, or
   with the binary absent from `PATH`, syncs correctly over P2P — only slower.
 - Phase 1 must complete before phase 2 begins; block fetching is keyed on the

@@ -635,8 +635,10 @@ version = "0.8.1"
 dependencies = [
  "ergo-chain-types",
  "ergo-lib",
+ "ergo-merkle-tree",
  "ergo-nipopow",
  "hashbrown 0.16.1",
+ "hex",
  "lru",
  "num-bigint",
  "serde_json",
@@ -653,6 +655,7 @@ dependencies = [
  "igd-next",
  "memmap2",
  "nix",
+ "rand 0.10.0",
  "serde",
  "tempfile",
  "thiserror",

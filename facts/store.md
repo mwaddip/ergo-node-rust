@@ -262,10 +262,14 @@ pub trait ModifierStore: Send + Sync {
     /// Key is the encoded `SocketAddr` (see "Tables" / `peer_db`). Value
     /// is the serialized record body: `(last_seen_ms u64 LE,
     /// agent_name shortString, node_name shortString, version 3B,
-    /// features_blob)`. Overwrites any prior value at the same address.
+    /// features_blob, last_handshake_ms u64 LE)` — the trailing field
+    /// is absent in rows written before it existed and reads as 0
+    /// (`facts/p2p-peerdb.md`). Overwrites any prior value at the same
+    /// address.
     ///
-    /// The store treats record bytes as opaque — encoding is owned by
-    /// the p2p crate. Only the key encoding (`SocketAddr → bytes`) is
+    /// The store treats record bytes as opaque — the `PeerRecord`
+    /// schema is the p2p crate's and the encoding is the main crate's
+    /// `PeerStorageAdapter`. Only the key encoding (`SocketAddr → bytes`) is
     /// the store's concern, because it determines lookup and iteration
     /// behaviour.
     fn put_peer(
@@ -415,11 +419,16 @@ crate treats values as opaque byte strings.
 
 ## Preconditions
 
-- **`put`**: `data` is non-empty. `id` is the canonical modifier ID
-  (Blake2b256 of the serialized bytes for headers). `height` is the block height
-  this modifier belongs to, or `0` for "height unknown" (skips height indexing).
-  The caller has already validated the modifier. `type_id != 101` —
-  main-chain headers must use `put_batch`.
+- **`put`**: `data` is non-empty. `id` is the canonical modifier ID: for
+  headers, Blake2b256 of the serialized bytes; for block sections
+  (102 / 104 / 108), `enr_chain::section_id_from_body(type_id, data).id`.
+  The caller has already performed that binding and dropped anything that
+  failed it (`facts/receive-path.md`). The store cannot check this — it has
+  no chain dependency — and does not try; it is a precondition, not a
+  postcondition. `height` is the block height this modifier belongs to, or
+  `0` for "height unknown" (skips height indexing). The caller has already
+  validated the modifier. `type_id != 101` — main-chain headers must use
+  `put_batch`.
 - **`put_batch`**: Each entry satisfies the per-entry `put` preconditions.
   Additionally, for entries with `type_id == 101`: `score` is `Some(bytes)`
   where `bytes` is the cumulative difficulty as big-endian BigUint bytes,

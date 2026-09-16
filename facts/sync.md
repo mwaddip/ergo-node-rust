@@ -723,23 +723,27 @@ State machine:
    (handshake complete, not banned). Poll `transport.outbound_peers()` every
    1s up to a 60s deadline. No peers → `LightBootstrapError::NoPeers`.
 
-2. **Send `GetNipopowProof`** to the first eligible peer with `m=6`, `k=10`,
-   `header_id = None` (no anchor — request a proof at the peer's current tip).
-   The wire envelope is built via `src/nipopow_serve::serialize_get_nipopow_proof`
-   (a new function — currently only the response serializer exists).
+2. **Broadcast `GetNipopowProof`** to every outbound peer with `m=6`, `k=10`,
+   `header_id = None` (no anchor — request a proof at the peer's current
+   tip). The peers the send succeeded for are the *polled set*. Empty
+   polled set → `LightBootstrapError::AllPeersStalled`.
 
-3. **Wait for `NipopowProof` response** (P2P code 91) from that peer with a
-   30-second timeout. Other messages from other peers during this window are
-   processed normally by the rest of the sync machine; only `code == 91`
-   from the requested peer counts as the response. Timeout or wrong-peer
-   response → mark peer stalled, rotate to next eligible peer, retry up to
-   3 peers total. All 3 stalled → `LightBootstrapError::AllPeersStalled`.
+3. **Collect `NipopowProof` responses** (P2P code 91) for a 30-second
+   window. A response counts only from a peer in the polled set — a code-91
+   message from any other peer is ignored — and **only the first code-91
+   message from each polled peer is that peer's response**: later messages
+   from the same peer are ignored, neither verified nor counted nor
+   compared (`facts/receive-path.md`). The window closes early once every
+   polled peer has responded; one peer cannot close it by sending several
+   messages. Peers still silent at the deadline are stalled.
 
-4. **Verify** the inner proof bytes via
-   `enr_chain::verify_nipopow_proof_bytes`. Verification failure → mark
-   peer hostile (NOT just stalled — sending an invalid proof is a protocol
-   violation), rotate, retry. Three hostile peers in a row →
-   `LightBootstrapError::AllPeersHostile`.
+4. **Verify** each counted response via `SyncChain::verify_nipopow_envelope`
+   as it arrives. A failure marks that peer hostile (not stalled — an
+   invalid proof is a protocol violation). If the window closes with no
+   valid proof: any hostile peer → `LightBootstrapError::AllPeersHostile`,
+   otherwise `AllPeersStalled`. With more than one valid proof, pick the
+   best by KMZ17 §4.3 (`SyncChain::is_better_nipopow`, each challenger
+   against the incumbent; a comparison error keeps the incumbent).
 
 5. **Install** the verified suffix into the local `HeaderChain`:
    - The result's `headers: Vec<Header>` slice contains, in order:
@@ -780,13 +784,11 @@ for first release, terminate.
 
 ### Bootstrap invariants
 
-- **Single peer per attempt**: bootstrap requests from ONE peer at a time.
-  Multi-peer best-arg comparison (KMZ17 §4.3, where the client compares
-  proofs from multiple peers and picks the one with highest cumulative work
-  via `bestArg`) is **out of scope for first release** and tracked as a
-  hardening follow-up. The first-release trust model is "trust the first
-  peer that returns a verifiable proof." This is documented as a known
-  limitation in the user-facing release notes.
+- **One response per polled peer**: every outbound peer is polled once,
+  each contributes at most one proof to the comparison, and no single peer
+  can close the collection window. The installed suffix is the KMZ17 §4.3
+  best among all valid responses, so a hostile peer has to out-work the
+  honest ones, not out-race them.
 - **No restart-resume state**: bootstrap is one-shot and re-runs from
   scratch on every restart where `chain.is_empty()`. Once the chain is
   installed, subsequent restarts skip bootstrap entirely (chain is loaded
@@ -799,10 +801,11 @@ for first release, terminate.
 
 ### Trust model
 
-Standard SPV: single-peer bootstrap trusts that peer's view of the
-chain. Failure mode is liveness, not safety — a hostile peer causes a
-recoverable DoS, not loss of funds. Multi-peer best-arg comparison
-(KMZ17 §4.3) is the standard hardening, tracked as a follow-up.
+Standard SPV with multi-peer best-arg comparison (KMZ17 §4.3): the
+installed suffix is the best valid proof among all polled peers. A hostile
+peer can stall bootstrap (liveness) or lose the comparison; it cannot win
+without more cumulative work than the honest proofs, and it cannot narrow
+the comparison to its own proofs (§ Bootstrap invariants).
 
 ## Block Section Download
 
@@ -818,6 +821,40 @@ This mirrors the JVM's `ToDownloadProcessor.requiredModifiersForHeader`, which c
 JVM has no light-mode analog at the section-id level (it gates the entire
 download phase via `nipopowBootstrap`); our chain crate folds the gating into
 `required_section_ids` returning empty, which keeps the sync loop unchanged.
+
+### Receive-path binding
+
+The P2P pipeline (main crate, `src/pipeline.rs`) is the only writer of
+peer-delivered block sections, and it writes nothing it has not bound
+(`facts/receive-path.md`). Per delivered `(type_id, id, bytes, peer)`:
+
+- **Header (101)**: parse, verify PoW, chain. The delivered `id` is never
+  used; the header's own id is. `Received` is reported for headers that
+  parsed and passed PoW — chained or buffered — never for rejects.
+- **Block section (102 / 104 / 108)**:
+  1. `enr_chain::section_id_from_body(type_id, bytes)` must return
+     `Ok(identity)` with `identity.id == id`. Otherwise drop: no store
+     write, no `Received`, a `PENALTY`-tagged warn naming the peer.
+  2. Request gate: `identity.header_id` must be a header the node holds —
+     on the best chain, or a fork header in the store. Otherwise drop the
+     same way. The pipeline does not consult the delivery tracker: a
+     section for a known header is one sync wants or already has, and the
+     store write is idempotent for identical bytes.
+  3. `put_batch`, with the height of `identity.header_id` (0 for a fork
+     header off the best chain, per `facts/store.md`). The height index is
+     keyed off the bound `header_id`, never off unverified bytes.
+  4. `Received` carries `id` only after the write succeeds.
+- **Unconfirmed transaction (2)**: forwarded to the mempool, which binds by
+  `Transaction::id()` over the parsed bytes; the delivered id is used for
+  nothing beyond log lines.
+
+The store stays last-writer-wins for sections (`facts/store.md`). With
+binding in place, two writers can only ever put identical bytes under an
+id, so order is irrelevant — and a first-writer-wins store would have made
+any pre-binding poison permanent.
+
+`POST /ingest/modifiers` enters the same channel with `peer = None` and is
+treated identically (`facts/api.md`).
 
 ### Memory attribution
 
@@ -893,7 +930,10 @@ Block section requests follow the same pattern as header requests:
 - Send `ModifierRequest` with the section type and IDs
 - Track delivery via the `DeliveryTracker`
 - On timeout: re-request from a different peer
-- On receive: the pipeline stores the bytes (no validation)
+- On receive: the pipeline binds the bytes to the delivered id and stores
+  them only if they bind (§ Receive-path binding). A body that does not
+  bind is dropped and never reported as received, so its request keeps
+  its timeout and is re-requested from another peer
 
 ### Inv handling
 

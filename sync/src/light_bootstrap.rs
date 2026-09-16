@@ -9,6 +9,8 @@
 //! JVM reference: `ErgoNodeViewSynchronizer.scala:1032` (outbound request),
 //! `PopowProcessor.applyPopowProof` (install side).
 
+use std::collections::HashSet;
+
 use enr_chain::{BlockId, Header};
 use enr_p2p::protocol::messages::ProtocolMessage;
 use enr_p2p::protocol::peer::ProtocolEvent;
@@ -88,7 +90,8 @@ fn build_get_nipopow_proof_body(m: i32, k: i32, header_id: Option<&BlockId>) -> 
 /// Top-level state machine (KMZ17 §4.3 multi-peer comparison):
 /// 1. Wait for at least one outbound peer (60s deadline).
 /// 2. Broadcast `GetNipopowProof(m=6, k=10)` to ALL outbound peers.
-/// 3. Collect valid proofs within a 30s window. Verify each on arrival.
+/// 3. Collect proofs within a 30s window, one per polled peer. Verify each
+///    on arrival.
 /// 4. If multiple valid proofs, compare pairwise via `is_better_than`
 ///    and pick the best. If one valid proof, use it.
 /// 5. Split the best proof's headers into (suffix_head, suffix_tail)
@@ -145,15 +148,19 @@ pub async fn run_light_bootstrap<T: SyncTransport, C: SyncChain>(
         return Err(LightBootstrapError::AllPeersStalled(peers.len()));
     }
 
-    // Step 3: collect valid proofs within the window.
+    // Step 3: collect valid proofs within the window. One response per
+    // polled peer: the first code-91 message from a peer is its answer, and
+    // anything it sends after that is ignored — not verified, not counted,
+    // not compared — so no single peer can close the window early or stack
+    // the comparison (JVM `processNipopowProof`: `nipopowProviders`).
     let mut valid_proofs: Vec<ValidProof> = Vec::new();
     let mut hostile = 0usize;
-    let mut responded = 0usize;
+    let mut responded: HashSet<PeerId> = HashSet::new();
     let deadline = Instant::now() + COLLECTION_WINDOW;
 
     loop {
-        // All peers responded or window expired — stop collecting.
-        if responded >= sent_to.len() {
+        // Every polled peer responded or window expired — stop collecting.
+        if responded.len() >= sent_to.len() {
             break;
         }
         let remaining = match deadline.checked_duration_since(Instant::now()) {
@@ -180,8 +187,13 @@ pub async fn run_light_bootstrap<T: SyncTransport, C: SyncChain>(
         if code != NIPOPOW_PROOF {
             continue;
         }
-
-        responded += 1;
+        if !responded.insert(peer_id) {
+            tracing::debug!(
+                peer = ?peer_id,
+                "light bootstrap: ignoring a further proof from a peer that already answered"
+            );
+            continue;
+        }
 
         match chain.verify_nipopow_envelope(&body).await {
             Ok(headers) => {
@@ -344,6 +356,12 @@ mod tests {
         (1..=count as u32).map(fake_header).collect()
     }
 
+    /// `count` headers starting at height `first`, so two proofs' suffixes
+    /// are told apart by the height they install.
+    fn fake_headers_from(first: u32, count: usize) -> Vec<Header> {
+        (first..first + count as u32).map(fake_header).collect()
+    }
+
     /// Mock transport that delivers scripted events.
     struct MockTransport {
         outbound: Vec<PeerId>,
@@ -387,13 +405,10 @@ mod tests {
         Err(String),
     }
 
-    /// Compare outcome for is_better_nipopow. `Worse` is the matching
-    /// counterpart to `Better` — the mock can script a "this is worse
-    /// than that" comparison even if no test currently does.
+    /// Compare outcome for is_better_nipopow.
     #[derive(Clone)]
     enum CompareResult {
         Better,
-        #[allow(dead_code)]
         Worse,
         Err(String),
     }
@@ -405,6 +420,8 @@ mod tests {
     struct MockChain {
         /// Map envelope body → verification result.
         verify_results: Mutex<Vec<(Vec<u8>, VerifyResult)>>,
+        /// Every envelope body `verify_nipopow_envelope` was asked about, in order.
+        verified: Mutex<Vec<Vec<u8>>>,
         /// Pairwise comparison results: (this, that) → result.
         compare_results: Mutex<Vec<ScriptedComparison>>,
         installed: Mutex<Option<(Header, Vec<Header>)>>,
@@ -414,9 +431,14 @@ mod tests {
         fn new() -> Self {
             Self {
                 verify_results: Mutex::new(Vec::new()),
+                verified: Mutex::new(Vec::new()),
                 compare_results: Mutex::new(Vec::new()),
                 installed: Mutex::new(None),
             }
+        }
+
+        fn verified(&self) -> Vec<Vec<u8>> {
+            self.verified.lock().unwrap().clone()
         }
 
         fn add_verify(&self, body: Vec<u8>, result: VerifyResult) {
@@ -486,6 +508,7 @@ mod tests {
             &self,
             envelope_body: &[u8],
         ) -> Result<Vec<Header>, ChainError> {
+            self.verified.lock().unwrap().push(envelope_body.to_vec());
             let results = self.verify_results.lock().unwrap();
             for (body, result) in results.iter() {
                 if body == envelope_body {
@@ -862,5 +885,71 @@ mod tests {
                 _ => panic!("expected Unknown message"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_one_peer_cannot_close_the_window_by_answering_thrice() {
+        // A hostile peer sends three valid-but-weak proofs before the honest
+        // peer answers. Counted per message, the window would close after the
+        // second and the honest proof would never be compared.
+        let hostile = PeerId(1);
+        let honest = PeerId(2);
+        let weak = [vec![0xa1], vec![0xa2], vec![0xa3]];
+        let strong = vec![0xbb];
+        let chain = MockChain::new();
+        for body in &weak {
+            chain.add_verify(body.clone(), VerifyResult::Ok(fake_headers(15)));
+        }
+        chain.add_verify(strong.clone(), VerifyResult::Ok(fake_headers_from(101, 15)));
+        chain.add_compare(strong.clone(), weak[0].clone(), CompareResult::Better);
+
+        let mut transport = MockTransport::new(
+            vec![hostile, honest],
+            vec![
+                proof_event(hostile, weak[0].clone()),
+                proof_event(hostile, weak[1].clone()),
+                proof_event(hostile, weak[2].clone()),
+                proof_event(honest, strong.clone()),
+            ],
+        );
+
+        run_light_bootstrap(&mut transport, &chain).await.unwrap();
+
+        let (head, _) = chain.installed().expect("the honest proof is installed");
+        assert_eq!(
+            head.height, 106,
+            "suffix head of the honest proof (101..115)"
+        );
+        // Only the first message from each peer was verified.
+        assert_eq!(chain.verified(), vec![weak[0].clone(), strong]);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_second_message_from_a_counted_peer_is_neither_verified_nor_kept() {
+        let peer_a = PeerId(1);
+        let peer_b = PeerId(2);
+        let first = vec![0xa1];
+        let again = vec![0xa2];
+        let other = vec![0xbb];
+        let chain = MockChain::new();
+        chain.add_verify(first.clone(), VerifyResult::Ok(fake_headers(15)));
+        chain.add_verify(other.clone(), VerifyResult::Ok(fake_headers(15)));
+        // No verify script for `again`, and no comparison involving it: had
+        // it been verified or pushed, the mock would have surfaced it.
+        chain.add_compare(other.clone(), first.clone(), CompareResult::Worse);
+
+        let mut transport = MockTransport::new(
+            vec![peer_a, peer_b],
+            vec![
+                proof_event(peer_a, first.clone()),
+                proof_event(peer_a, again),
+                proof_event(peer_b, other.clone()),
+            ],
+        );
+
+        run_light_bootstrap(&mut transport, &chain).await.unwrap();
+
+        assert_eq!(chain.verified(), vec![first, other]);
+        assert!(chain.installed().is_some());
     }
 }

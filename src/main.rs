@@ -3426,6 +3426,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "loading snapshot into state"
                     );
 
+                    // Last gate before state.redb is written: the assembled
+                    // root and tree height must be the state_root of the
+                    // header at the snapshot height, read from the chain as
+                    // it is now (facts/snapshot.md § State initialization,
+                    // step 4). Sync verified the manifest against the same
+                    // header; this is the check that does not trust sync.
+                    {
+                        let expected: Option<[u8; 33]> = snapshot_chain
+                            .lock()
+                            .await
+                            .header_at(snapshot_data.snapshot_height)
+                            .map(|h| h.state_root.into());
+                        let matches = expected.is_some_and(|root| {
+                            root[..32] == snapshot_data.root_hash
+                                && root[32] == snapshot_data.tree_height
+                        });
+                        if !matches {
+                            tracing::error!(
+                                height = snapshot_data.snapshot_height,
+                                snapshot_root = hex::encode(snapshot_data.root_hash),
+                                snapshot_tree_height = snapshot_data.tree_height,
+                                header_state_root = ?expected.map(hex::encode),
+                                "snapshot root does not match the header at its height; \
+                                 refusing to load it — state.redb untouched, restart to bootstrap again"
+                            );
+                            return;
+                        }
+                    }
+
                     let params = AVLTreeParams {
                         key_length: 32,
                         value_length: None,

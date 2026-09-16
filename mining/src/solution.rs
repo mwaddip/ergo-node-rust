@@ -4,7 +4,6 @@ use blake2::Digest as Blake2Digest;
 use ergo_chain_types::{AutolykosSolution, BlockId, Digest, Digest32, Header, Votes};
 use sigma_ser::ScorexSerializable;
 
-use crate::candidate::transactions_root;
 use crate::types::CandidateBlock;
 use crate::MiningError;
 
@@ -22,15 +21,16 @@ pub fn validate_solution(
     let height = candidate.parent.height + 1;
 
     // Recompute header fields (must match build_work_message exactly)
-    let ad_proofs_root = {
-        let mut hasher = Blake2b256::new();
-        hasher.update(&candidate.ad_proof_bytes);
-        let hash: [u8; 32] = hasher.finalize().into();
-        Digest32::from(hash)
-    };
+    let ad_proofs_root = Digest32::from(enr_chain::ad_proofs_digest(&candidate.ad_proof_bytes));
 
-    let tx_root = transactions_root(&candidate.transactions, candidate.version)?;
-    let ext_root_bytes = crate::extension::extension_digest(&candidate.extension)?;
+    if candidate.transactions.is_empty() {
+        return Err(MiningError::AssemblyFailed("no transactions".into()));
+    }
+    let tx_root = Digest32::from(enr_chain::transactions_root(
+        &candidate.transactions,
+        candidate.version,
+    ));
+    let ext_root_bytes = enr_chain::extension_root(&candidate.extension.fields);
 
     // Build the full header with the submitted solution.
     // The id field is initially zero — we compute the proper hash after assembly.

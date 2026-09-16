@@ -9,7 +9,6 @@ description = "Block candidate assembly and PoW solution validation for external
 ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
 ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
 ergo-nipopow = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
-ergo-merkle-tree = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
 # pow_target(n_bits) — the single sanctioned definition of the Autolykos
 # mining target served as WorkMessage.b. This crate re-derived it from
 # decode_compact_bits until v0.8.0 and stopped one division short, which is
@@ -30,6 +29,7 @@ thiserror = "2"
 tracing = "0.1"
 
 [dev-dependencies]
+ergo-merkle-tree = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "f76db922" }
 num-bigint = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing-test = { version = "0.2", features = ["no-env-filter"] }

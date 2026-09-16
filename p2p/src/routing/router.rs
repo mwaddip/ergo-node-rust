@@ -276,21 +276,25 @@ impl Router {
                 agent_name: agent_name.clone(),
             },
         );
-        // Best-effort seed of PeerDb for outbound peers so the
-        // register-only test path (no event-loop) gets an entry without
-        // also driving the PeerConnected event. Production overwrites
-        // this stub via PeerConnected's full handshake spec (merge-max
-        // on last_seen).
+        // Seed the PeerDb for outbound peers. `addr` is the address we
+        // dialed and the handshake has completed, so this is an
+        // observation in its own right (`facts/p2p-peerdb.md` § Observed
+        // and hearsay). It also gives the register-only test path (no
+        // event loop) an entry without driving the PeerConnected event;
+        // production fills in the full handshake spec via PeerConnected,
+        // both timestamps merging by max.
         //
         // Inbound peers are excluded: their observed socket is the
         // peer's ephemeral outgoing port, not a listening address worth
         // gossiping. Their listening address (declared in the
         // handshake) is recorded by PeerConnected.
         if direction == Direction::Outbound && !self.blacklist.contains(addr) {
+            let now = now_ms();
             let mut db = self.peer_db.lock().expect("peer_db poisoned");
             db.record(PeerRecord {
                 address: addr,
-                last_seen_ms: now_ms(),
+                last_seen_ms: now,
+                last_handshake_ms: now,
                 agent_name: agent_name.unwrap_or_default(),
                 node_name: String::new(),
                 version: (0, 0, 0),
@@ -340,8 +344,13 @@ impl Router {
 
     pub fn handle_event(&mut self, event: ProtocolEvent) -> Vec<Action> {
         match event {
-            ProtocolEvent::PeerConnected { spec, addr, .. } => {
-                self.record_peer_connected(&spec, addr);
+            ProtocolEvent::PeerConnected {
+                spec,
+                direction,
+                addr,
+                ..
+            } => {
+                self.record_peer_connected(&spec, direction, addr);
                 vec![]
             }
 
@@ -358,27 +367,63 @@ impl Router {
         }
     }
 
-    fn record_peer_connected(&self, spec: &PeerSpec, observed_addr: SocketAddr) {
-        // Prefer the peer's declared address; fall back to the observed
-        // socket so that NAT'd peers without a declared address are
-        // still tracked.
-        let key_addr = spec.address.unwrap_or(observed_addr);
-        if self.blacklist.contains(key_addr) {
+    /// Record what a completed handshake proves (`facts/p2p-peerdb.md`
+    /// § Observed and hearsay). `remote_addr` is the connection's remote
+    /// socket: the address we dialed for an outbound peer, an ephemeral
+    /// port for an inbound one.
+    ///
+    /// Outbound: the dialed address listens, so it is observed, always.
+    /// The declared address is a port claim on that same host (observed)
+    /// or a claim about another host (hearsay). Inbound: the connection
+    /// proves only its remote IP, so the declared address is observed on
+    /// that IP and hearsay on any other; with no declared address there
+    /// is nothing to record, since the remote socket is not a listening
+    /// address.
+    fn record_peer_connected(
+        &self,
+        spec: &PeerSpec,
+        direction: Direction,
+        remote_addr: SocketAddr,
+    ) {
+        let same_host = |declared: SocketAddr| declared.ip() == remote_addr.ip();
+        // (address, observed)
+        let mut to_record: Vec<(SocketAddr, bool)> = Vec::with_capacity(2);
+        match direction {
+            Direction::Outbound => {
+                to_record.push((remote_addr, true));
+                if let Some(declared) = spec.address.filter(|d| *d != remote_addr) {
+                    to_record.push((declared, same_host(declared)));
+                }
+            }
+            Direction::Inbound => {
+                if let Some(declared) = spec.address {
+                    to_record.push((declared, same_host(declared)));
+                }
+            }
+        }
+        if to_record.is_empty() {
             return;
         }
+        let now = now_ms();
         let mut db = self.peer_db.lock().expect("peer_db poisoned");
-        db.record(PeerRecord {
-            address: key_addr,
-            last_seen_ms: now_ms(),
-            agent_name: spec.agent.clone(),
-            node_name: spec.name.clone(),
-            version: (spec.version.major, spec.version.minor, spec.version.patch),
-            features: spec
-                .features
-                .iter()
-                .map(|f| (f.id, f.body.clone()))
-                .collect(),
-        });
+        for (address, observed) in to_record {
+            if self.blacklist.contains(address) {
+                continue;
+            }
+            db.record(PeerRecord {
+                address,
+                last_seen_ms: now,
+                last_handshake_ms: if observed { now } else { 0 },
+                agent_name: spec.agent.clone(),
+                node_name: spec.name.clone(),
+                version: (spec.version.major, spec.version.minor, spec.version.patch),
+                features: spec
+                    .features
+                    .iter()
+                    .map(|f| (f.id, f.body.clone()))
+                    .collect(),
+            });
+        }
     }
 
     fn route_message(&mut self, source: PeerId, message: ProtocolMessage) -> Vec<Action> {
@@ -546,9 +591,12 @@ impl Router {
                     self.peers.values().map(|p| p.addr).collect();
                 exclude.insert(source_addr);
 
+                // Observed peers only: an address we have merely heard of
+                // is never vouched for to a third party
+                // (`facts/p2p-peerdb.md` § Observed and hearsay).
                 let specs: Vec<PeerSpec> = {
                     let db = self.peer_db.lock().expect("peer_db poisoned");
-                    db.recent(limit, &exclude)
+                    db.observed(limit, &exclude)
                         .into_iter()
                         .filter(|r| {
                             !(self.filter_bogus_addresses
@@ -584,9 +632,14 @@ impl Router {
                             if self.blacklist.contains(addr) {
                                 continue;
                             }
+                            // Hearsay: a third party's claim that this
+                            // address exists. `last_seen_ms` stamps the
+                            // mention; the handshake stamp is left as it
+                            // was (0 for a new entry).
                             db.record(PeerRecord {
                                 address: addr,
                                 last_seen_ms: now_ms(),
+                                last_handshake_ms: 0,
                                 agent_name: spec.agent.clone(),
                                 node_name: spec.name.clone(),
                                 version: (
@@ -739,9 +792,9 @@ mod tests {
     }
 
     #[test]
-    fn get_peers_returns_recent_excluding_source() {
+    fn get_peers_returns_observed_excluding_source() {
         let mut router = Router::new(Network::Mainnet);
-        // Five known peers in the PeerDb but none currently connected.
+        // Five peers we handshaked with earlier, none currently connected.
         // Use a public-looking range — 203.0.113/24 was documentation
         // (now filtered by the bogus-address sanity layer).
         {
@@ -750,6 +803,7 @@ mod tests {
                 db.record(PeerRecord {
                     address: pub_addr(&format!("78.46.10.{i}:9030")),
                     last_seen_ms: 1000 + i as u64 * 100,
+                    last_handshake_ms: 1000 + i as u64 * 100,
                     agent_name: "ergoref".into(),
                     node_name: "node".into(),
                     version: (5, 0, 25),
@@ -785,12 +839,12 @@ mod tests {
             _ => panic!("expected Peers reply"),
         };
         let specs = parse_peers_body(&body, 64).unwrap();
-        // Source addr is excluded.
+        // Source addr is excluded; the other four observed peers are all
+        // served (peers_to_send = 64/8 = 8 > 4).
         for s in &specs {
             assert_ne!(s.address.unwrap(), source_addr);
         }
-        // At most peers_to_send (= 64/8 = 8) entries.
-        assert!(specs.len() <= 8);
+        assert_eq!(specs.len(), 4);
     }
 
     #[test]
@@ -893,9 +947,9 @@ mod tests {
     }
 
     #[test]
-    fn peer_connected_records_with_declared_address() {
+    fn peer_connected_outbound_declared_other_host_is_hearsay() {
         let mut router = Router::new(Network::Mainnet);
-        let observed = pub_addr("198.51.100.20:9030");
+        let dialed = pub_addr("198.51.100.20:9030");
         let declared = pub_addr("203.0.113.20:9030");
         let event = ProtocolEvent::PeerConnected {
             peer_id: PeerId(1),
@@ -910,21 +964,32 @@ mod tests {
                 }],
             },
             direction: Direction::Outbound,
-            addr: observed,
+            addr: dialed,
         };
         router.handle_event(event);
         let db = router.peer_db.lock().unwrap();
-        let rec = db.get(declared).expect("declared address recorded");
+        assert_eq!(db.count(), 2);
+        // The dialed address is what the handshake proved: observed, with
+        // the full spec.
+        let rec = db.get(dialed).expect("dialed address recorded");
+        assert!(rec.is_observed());
         assert_eq!(rec.agent_name, "ergoref");
         assert_eq!(rec.node_name, "node20");
         assert_eq!(rec.version, (5, 0, 25));
         assert_eq!(rec.features.len(), 1);
+        // The declared address names another host: a claim, kept as
+        // hearsay with the same spec.
+        let rec = db.get(declared).expect("declared address recorded");
+        assert!(!rec.is_observed());
+        assert!(rec.last_seen_ms > 0);
+        assert_eq!(rec.node_name, "node20");
+        assert_eq!(db.observed(8, &HashSet::new()).len(), 1);
     }
 
     #[test]
-    fn peer_connected_falls_back_to_observed_when_no_declared() {
+    fn peer_connected_outbound_no_declared_records_dialed() {
         let mut router = Router::new(Network::Mainnet);
-        let observed = pub_addr("198.51.100.21:9030");
+        let dialed = pub_addr("198.51.100.21:9030");
         let event = ProtocolEvent::PeerConnected {
             peer_id: PeerId(1),
             spec: PeerSpec {
@@ -935,11 +1000,14 @@ mod tests {
                 features: vec![],
             },
             direction: Direction::Outbound,
-            addr: observed,
+            addr: dialed,
         };
         router.handle_event(event);
         let db = router.peer_db.lock().unwrap();
-        assert!(db.get(observed).is_some());
+        assert_eq!(db.count(), 1);
+        let rec = db.get(dialed).expect("dialed address recorded");
+        assert!(rec.is_observed(), "we dialed it and it answered");
+        assert_eq!(rec.node_name, "node21");
     }
 
     #[test]
@@ -1095,6 +1163,7 @@ mod tests {
             db.record(PeerRecord {
                 address: bogus,
                 last_seen_ms: 3000,
+                last_handshake_ms: 3000,
                 agent_name: "ergoref".into(),
                 node_name: "".into(),
                 version: (5, 0, 25),
@@ -1172,8 +1241,8 @@ mod tests {
             None,
         );
 
-        // Preload PeerDb with one bogus + one good entry (bypass the
-        // Peers-arm filter so we exercise the defensive egress path).
+        // Preload PeerDb with one bogus + one good observed entry (bypass
+        // the Peers-arm filter so we exercise the defensive egress path).
         let good = pub_addr("78.46.3.10:9030");
         let bogus = pub_addr("192.168.1.42:9030"); // RFC 1918
         {
@@ -1181,6 +1250,7 @@ mod tests {
             db.record(PeerRecord {
                 address: good,
                 last_seen_ms: 2000,
+                last_handshake_ms: 2000,
                 agent_name: "ergoref".into(),
                 node_name: "".into(),
                 version: (5, 0, 25),
@@ -1188,7 +1258,8 @@ mod tests {
             });
             db.record(PeerRecord {
                 address: bogus,
-                last_seen_ms: 3000, // more recent than `good`
+                last_seen_ms: 3000,
+                last_handshake_ms: 3000, // more recent than `good`
                 agent_name: "ergoref".into(),
                 node_name: "".into(),
                 version: (5, 0, 25),
@@ -1242,13 +1313,14 @@ mod tests {
             None,
             None,
         );
-        // A non-connected gossiped entry.
-        let gossiped = pub_addr("78.46.30.42:9030");
+        // A peer we handshaked with earlier and are no longer connected to.
+        let disconnected = pub_addr("78.46.30.42:9030");
         {
             let mut db = router.peer_db.lock().unwrap();
             db.record(PeerRecord {
-                address: gossiped,
+                address: disconnected,
                 last_seen_ms: 5000,
+                last_handshake_ms: 5000,
                 agent_name: "ergoref".into(),
                 node_name: "".into(),
                 version: (5, 0, 25),
@@ -1274,8 +1346,8 @@ mod tests {
             assert_ne!(a, source_addr);
             assert_ne!(a, other_addr);
         }
-        // The gossiped entry should be present.
-        assert!(specs.iter().any(|s| s.address == Some(gossiped)));
+        // The disconnected observed peer is present.
+        assert!(specs.iter().any(|s| s.address == Some(disconnected)));
     }
 
     /// On testnet, the network-conditional classes (RFC 1918, CGN, ULA,
@@ -1317,6 +1389,259 @@ mod tests {
             !router.blacklist.contains(source_addr),
             "testnet source not banned for gossiping private addresses"
         );
+    }
+
+    // ---- observed vs hearsay (facts/p2p-peerdb.md § Observed and hearsay) ----
+
+    fn observed_record(address: SocketAddr, stamp: u64) -> PeerRecord {
+        PeerRecord {
+            address,
+            last_seen_ms: stamp,
+            last_handshake_ms: stamp,
+            agent_name: "ergoref".into(),
+            node_name: "".into(),
+            version: (5, 0, 25),
+            features: vec![],
+        }
+    }
+
+    fn connected_event(
+        declared: Option<SocketAddr>,
+        direction: Direction,
+        socket: SocketAddr,
+    ) -> ProtocolEvent {
+        ProtocolEvent::PeerConnected {
+            peer_id: PeerId(1),
+            spec: PeerSpec {
+                agent: "ergoref".into(),
+                version: Version::new(5, 0, 25),
+                name: "node".into(),
+                address: declared,
+                features: vec![],
+            },
+            direction,
+            addr: socket,
+        }
+    }
+
+    #[test]
+    fn register_peer_seeds_outbound_as_observed() {
+        let mut router = Router::new(Network::Mainnet);
+        let dialed = pub_addr("78.46.70.1:9030");
+        router.register_peer(
+            PeerId(1),
+            Direction::Outbound,
+            ProxyMode::Full,
+            dialed,
+            None,
+            Some("ergoref".into()),
+        );
+        // An inbound registration carries the peer's ephemeral socket; it
+        // is not a listening address and register_peer does not record it.
+        let inbound_socket = pub_addr("78.46.70.2:51234");
+        router.register_peer(
+            PeerId(2),
+            Direction::Inbound,
+            ProxyMode::Full,
+            inbound_socket,
+            None,
+            Some("ergoref".into()),
+        );
+        let db = router.peer_db.lock().unwrap();
+        let rec = db.get(dialed).expect("dialed address recorded");
+        assert!(
+            rec.is_observed(),
+            "a completed outbound handshake is an observation"
+        );
+        assert_eq!(rec.last_seen_ms, rec.last_handshake_ms);
+        assert!(db.get(inbound_socket).is_none());
+    }
+
+    #[test]
+    fn peers_intake_records_hearsay() {
+        let mut router = Router::new(Network::Mainnet);
+        let source = PeerId(1);
+        router.register_peer(
+            source,
+            Direction::Outbound,
+            ProxyMode::Full,
+            pub_addr("78.46.20.1:9030"),
+            None,
+            None,
+        );
+        // One address we handshaked with before, one we have never seen.
+        let known = pub_addr("78.46.20.10:9030");
+        let fresh = pub_addr("78.46.20.11:9030");
+        router
+            .peer_db
+            .lock()
+            .unwrap()
+            .record(observed_record(known, 5000));
+
+        let body = build_peers_body(&[spec_for("ergoref", known), spec_for("ergoref", fresh)]);
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::Peers { body },
+        });
+        assert!(actions.is_empty());
+
+        let db = router.peer_db.lock().unwrap();
+        let fresh_rec = db.get(fresh).expect("gossiped address recorded");
+        assert_eq!(fresh_rec.last_handshake_ms, 0, "gossip is hearsay");
+        assert!(
+            fresh_rec.last_seen_ms > 5000,
+            "the mention is stamped with the receipt time"
+        );
+        let known_rec = db.get(known).expect("still present");
+        assert_eq!(
+            known_rec.last_handshake_ms, 5000,
+            "gossip cannot raise a handshake stamp"
+        );
+        assert!(
+            known_rec.last_seen_ms > 5000,
+            "but it does refresh last_seen"
+        );
+    }
+
+    #[test]
+    fn get_peers_serves_observed_only() {
+        let mut router = Router::new(Network::Mainnet);
+        let source = PeerId(1);
+        router.register_peer(
+            source,
+            Direction::Outbound,
+            ProxyMode::Full,
+            pub_addr("78.46.40.1:9030"),
+            None,
+            None,
+        );
+        let observed = pub_addr("78.46.40.10:9030");
+        let hearsay = pub_addr("78.46.40.11:9030");
+        {
+            let mut db = router.peer_db.lock().unwrap();
+            db.record(observed_record(observed, 1000));
+            // Hearsay mentioned far more recently than the handshake:
+            // recency does not make it gossip-worthy.
+            db.record(PeerRecord {
+                last_handshake_ms: 0,
+                ..observed_record(hearsay, 9_000_000)
+            });
+        }
+
+        let actions = router.handle_event(ProtocolEvent::Message {
+            peer_id: source,
+            message: ProtocolMessage::GetPeers,
+        });
+        let body = match &actions[0] {
+            Action::Send {
+                message: ProtocolMessage::Peers { body },
+                ..
+            } => body.clone(),
+            _ => panic!("expected Peers reply"),
+        };
+        let specs = parse_peers_body(&body, 64).unwrap();
+        let addrs: Vec<SocketAddr> = specs.iter().filter_map(|s| s.address).collect();
+        assert_eq!(addrs, vec![observed]);
+    }
+
+    #[test]
+    fn peer_connected_outbound_is_observed() {
+        let mut router = Router::new(Network::Mainnet);
+        let dialed = pub_addr("78.46.50.20:9030");
+        router.handle_event(connected_event(Some(dialed), Direction::Outbound, dialed));
+        let db = router.peer_db.lock().unwrap();
+        let rec = db.get(dialed).expect("recorded");
+        assert!(rec.is_observed());
+        assert_eq!(rec.last_seen_ms, rec.last_handshake_ms);
+        assert_eq!(db.count(), 1, "declared == dialed is one entry");
+        assert_eq!(db.observed(8, &HashSet::new()).len(), 1);
+    }
+
+    #[test]
+    fn peer_connected_outbound_declared_other_port_same_host_both_observed() {
+        let mut router = Router::new(Network::Mainnet);
+        let dialed = pub_addr("78.46.50.20:9030");
+        let declared = pub_addr("78.46.50.20:9031");
+        router.handle_event(connected_event(Some(declared), Direction::Outbound, dialed));
+        let db = router.peer_db.lock().unwrap();
+        assert_eq!(db.count(), 2);
+        assert!(db.get(dialed).expect("dialed recorded").is_observed());
+        assert!(
+            db.get(declared).expect("declared recorded").is_observed(),
+            "a port claim on the host we just talked to"
+        );
+    }
+
+    #[test]
+    fn peer_connected_inbound_declared_same_host_is_observed() {
+        let mut router = Router::new(Network::Mainnet);
+        let socket = pub_addr("78.46.60.5:51234");
+        let declared = pub_addr("78.46.60.5:9030");
+        router.handle_event(connected_event(Some(declared), Direction::Inbound, socket));
+        let db = router.peer_db.lock().unwrap();
+        let rec = db.get(declared).expect("declared address recorded");
+        assert!(
+            rec.is_observed(),
+            "a declared port on the connection's own IP is observed"
+        );
+        assert!(
+            db.get(socket).is_none(),
+            "the ephemeral socket is not recorded"
+        );
+    }
+
+    #[test]
+    fn peer_connected_inbound_declared_other_host_is_hearsay() {
+        let mut router = Router::new(Network::Mainnet);
+        let socket = pub_addr("78.46.60.5:51234");
+        let declared = pub_addr("91.10.1.1:9030");
+        router.handle_event(connected_event(Some(declared), Direction::Inbound, socket));
+        let db = router.peer_db.lock().unwrap();
+        let rec = db.get(declared).expect("declared address recorded");
+        assert_eq!(
+            rec.last_handshake_ms, 0,
+            "the connection proves nothing about another host"
+        );
+        assert!(rec.last_seen_ms > 0);
+        assert!(
+            db.observed(8, &HashSet::new()).is_empty(),
+            "hearsay is never served by GetPeers"
+        );
+    }
+
+    #[test]
+    fn peer_connected_inbound_no_declared_records_nothing() {
+        let mut router = Router::new(Network::Mainnet);
+        let socket = pub_addr("78.46.60.5:51234");
+        let before = router.peer_db.lock().unwrap().count();
+        router.handle_event(connected_event(None, Direction::Inbound, socket));
+        let db = router.peer_db.lock().unwrap();
+        assert_eq!(
+            db.count(),
+            before,
+            "an ephemeral socket is not a listening address"
+        );
+        assert!(db.get(socket).is_none());
+    }
+
+    #[test]
+    fn peer_connected_inbound_hearsay_does_not_demote_observed() {
+        // An address we dialed before, now declared by an inbound peer on
+        // another host: the earlier observation stands.
+        let mut router = Router::new(Network::Mainnet);
+        let declared = pub_addr("91.10.1.1:9030");
+        router
+            .peer_db
+            .lock()
+            .unwrap()
+            .record(observed_record(declared, 5000));
+        router.handle_event(connected_event(
+            Some(declared),
+            Direction::Inbound,
+            pub_addr("78.46.60.5:51234"),
+        ));
+        let db = router.peer_db.lock().unwrap();
+        assert_eq!(db.get(declared).unwrap().last_handshake_ms, 5000);
     }
 
     // ---- local-serve hook (facts/p2p-routing.md ModifierRequest arm) ----
