@@ -98,6 +98,10 @@ impl BlockValidator for DigestValidator {
         let parsed_txs = parse_block_transactions(block_txs)?;
         let parsed_ext = parse_extension(extension)?;
 
+        // 1b. Section-to-header binding (JVM `bsCorrespondsToHeader`): the
+        // bodies must hash to the roots the header commits to.
+        crate::sections::check_section_roots(header, &parsed_txs, &parsed_ext)?;
+
         // 1a. Epoch-boundary parameter check (consensus-critical).
         // Uses JVM v6 matchParameters60 semantics: local can have fewer
         // entries than received, every entry in local must match received.
@@ -341,7 +345,11 @@ mod tests {
         let (txs, extension) = sections(transactions);
         Fixture {
             pre_digest,
-            header: make_header(BLOCK_HEIGHT, post_digest, blake2b256_hash(proof.as_ref())),
+            header: {
+                let mut h = make_header(BLOCK_HEIGHT, post_digest, blake2b256_hash(proof.as_ref()));
+                bind_roots(&mut h, transactions, &[]);
+                h
+            },
             txs,
             proofs: crate::sections::serialize_ad_proofs(&HEADER_ID, proof.as_ref()),
             extension,

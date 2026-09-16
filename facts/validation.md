@@ -1050,3 +1050,15 @@ index (u16). NOT just the candidate (without ref). Matches JVM's
 height byte is the LAST byte. `ergo_chain_types::ADDigest` = `Digest<33>`.
 `ergo_avltree_rust::ADDigest` = `bytes::Bytes`. Convert between them via
 `[u8; 33]` intermediate.
+
+
+## Section-to-header binding at apply
+
+`apply_state` (both validators) binds the parsed transactions and extension
+sections to `header.transaction_root` and `header.extension_root` before any
+other check (`sections::check_section_roots`, JVM `bsCorrespondsToHeader`).
+The receive path already binds peer deliveries at the store write
+(`facts/receive-path.md`); this is the validation seam's own guarantee, so it
+holds for sections that reached the store before that binding existed, for
+any other writer, and for callers that bypass the store. Mismatch →
+`TransactionsRootMismatch` / `ExtensionRootMismatch`, clean rejections.

@@ -438,6 +438,10 @@ impl UtxoValidator {
         let parsed_txs = parse_block_transactions(block_txs)?;
         let parsed_ext = parse_extension(extension)?;
 
+        // 1b. Section-to-header binding (JVM `bsCorrespondsToHeader`): the
+        // bodies must hash to the roots the header commits to.
+        crate::sections::check_section_roots(header, &parsed_txs, &parsed_ext)?;
+
         // 1a. Epoch-boundary parameter check (consensus-critical).
         // Uses JVM v6 matchParameters60 semantics: local can have fewer
         // entries than received, every entry in local must match received.
@@ -890,8 +894,10 @@ mod tests {
     impl Block {
         fn new(transactions: &[Transaction], state_root: ADDigest, ad_root: Digest32) -> Self {
             let (txs, extension) = sections(transactions);
+            let mut header = make_header(BLOCK_HEIGHT, state_root, ad_root);
+            bind_roots(&mut header, transactions, &[]);
             Self {
-                header: make_header(BLOCK_HEIGHT, state_root, ad_root),
+                header,
                 txs,
                 extension,
                 preceding: preceding_headers(),
@@ -1513,5 +1519,50 @@ mod tests {
             "the genesis emission box was not recognised — `emission_box_prop` \
              and the genesis bootstrap have diverged"
         );
+    }
+
+    /// `apply_state` binds the sections it validates to the header's roots
+    /// (JVM `bsCorrespondsToHeader`), independently of the store-side binding
+    /// on the receive path.
+    mod section_root_binding {
+        use super::*;
+        use crate::sections::{serialize_block_transactions, serialize_extension};
+
+        fn two_tx_fixture() -> (ErgoBox, ErgoBox, Transaction, Transaction, ADDigest, Digest32) {
+            let b1 = make_box(true, 1);
+            let b2 = make_box(true, 2);
+            let a = spend_tx(std::slice::from_ref(&b1));
+            let b = spend_tx(std::slice::from_ref(&b2));
+            let ops = block_operations(&[a.clone(), b.clone()]);
+            let (sr, ar) = oracle(&[b1.clone(), b2.clone()], &ops);
+            (b1, b2, a, b, sr, ar)
+        }
+
+        #[test]
+        fn honest_body_still_applies() {
+            let (b1, b2, a, b, sr, ar) = two_tx_fixture();
+            let (mut v, _d) = seeded_validator(&[b1, b2]);
+            assert!(Block::new(&[a, b], sr, ar).apply(&mut v).is_ok());
+        }
+
+        #[test]
+        fn reordered_transactions_are_rejected() {
+            let (b1, b2, a, b, sr, ar) = two_tx_fixture();
+            let (mut v, _d) = seeded_validator(&[b1, b2]);
+            let mut blk = Block::new(&[a.clone(), b.clone()], sr, ar);
+            blk.txs = serialize_block_transactions(&HEADER_ID, 3, &[b, a]).unwrap();
+            let err = blk.apply(&mut v).unwrap_err();
+            assert!(matches!(err, ValidationError::TransactionsRootMismatch { .. }), "got {err:?}");
+        }
+
+        #[test]
+        fn tampered_extension_is_rejected() {
+            let (b1, b2, a, b, sr, ar) = two_tx_fixture();
+            let (mut v, _d) = seeded_validator(&[b1, b2]);
+            let mut blk = Block::new(&[a, b], sr, ar);
+            blk.extension = serialize_extension(&HEADER_ID, &[([0x02, 0x00], vec![0x00])]).unwrap();
+            let err = blk.apply(&mut v).unwrap_err();
+            assert!(matches!(err, ValidationError::ExtensionRootMismatch { .. }), "got {err:?}");
+        }
     }
 }

@@ -909,6 +909,7 @@ version = "0.8.2"
 dependencies = [
  "blake2",
  "bytes",
+ "enr-chain",
  "enr-state",
  "ergo-chain-types",
  "ergo-lib",
