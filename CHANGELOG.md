@@ -1,5 +1,76 @@
 # Changelog
 
+## v0.8.2 — 2026-09-16
+
+### Release summary
+
+Security fix: block sections from peers are now bound to their recomputed
+ids before storage. A variant sweep found and closed the same class in
+snapshot sync, peer gossip, and NiPoPoW light bootstrap. Reported privately
+via GHSA-6jxq-45v3-53m4.
+
+### Fixed
+
+#### Block sections bound to their ids before storage
+
+Non-header block sections (BlockTransactions, ADProofs, Extension) were
+stored under the id the sending peer declared, without the node ever
+recomputing that id from the delivered bytes. Any peer that completed a
+handshake could write arbitrary bytes under any section id, overwriting
+honest deliveries, and the poison persisted across restarts. State (the
+UTXO set) was not corrupted — AVL transitions are bound by `state_root` —
+but the node would store and serve bodies every other node rejects.
+
+The pipeline now recomputes each section's id from its bytes via
+`enr_chain::section_id_from_body` and stores only bodies whose id matches
+and whose header the node holds.
+
+#### Snapshot manifest verified against its id
+
+The snapshot discovery phase correctly binds the manifest id to the
+header's `state_root`, but the manifest download accepted the first
+response from any peer without comparing the manifest's recomputed root to
+that id. A quorum peer could serve an arbitrary manifest, controlling every
+subtree id, and the assembled state would pass the root check.
+
+The manifest is now verified on every response (root label and tree height
+against the header), on crash-recovery resume, and before `load_snapshot`.
+Responses are accepted only from the peer that was asked. Every
+parent-child link inside the manifest and inside every downloaded chunk is
+verified on receipt and again at assembly.
+
+#### Peer database distinguishes observed from hearsay
+
+Peer addresses learned from gossip were stamped `last_seen_ms = now` and
+ranked identically to peers the node had handshaked with, for both outbound
+dial selection and what the node tells other peers about. A single inbound
+peer could steer outbound connections and evict genuinely observed peers.
+
+The peer database now tracks `last_handshake_ms` separately. Only observed
+peers (those the node has completed a handshake with) are propagated to
+others. Outbound candidates are chosen at random with IP-group diversity.
+Gossip entries can fill the table but never evict a handshaked peer; when
+only observed entries remain, the most crowded address group pays first.
+
+#### One NiPoPoW response per polled peer
+
+The light-bootstrap collection loop counted every code-91 message from a
+polled peer as a separate response. One peer sending multiple messages
+could close the collection window before honest peers answered and stack
+its proofs into the KMZ17 comparison.
+
+Each polled peer now contributes at most one response. The window closes
+early only when every polled peer has responded once.
+
+### Internal
+
+- `enr_chain` gains `section_id_from_body`, `transactions_root`,
+  `witness_id`, `extension_root`, and `ad_proofs_digest` as the single
+  workspace implementations of the section-root computations. `ergo-mining`
+  delegates to them.
+- `facts/receive-path.md` states the binding invariant once and maps every
+  inbound sink to the contract that enforces it.
+
 ## v0.8.1 — 2026-08-18
 
 ### Release summary
