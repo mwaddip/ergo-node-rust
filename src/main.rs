@@ -2267,6 +2267,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("scores migration: sentinel written");
     }
 
+    // One-shot: re-bind sections stored before v0.8.2's receive-path binding.
+    // A body written by an earlier version under an id it does not hash to
+    // is otherwise read back by derived id and applied (facts/store.md).
+    if store.chain_meta_get(b"sections_rebound_v1")?.is_none() {
+        let (kept, dropped) = store.rebind_sections(&[102, 104, 108], |type_id, id, bytes| {
+            enr_chain::section_id_from_body(type_id, bytes)
+                .map(|identity| identity.id == *id)
+                .unwrap_or(false)
+        })?;
+        tracing::info!(kept, dropped, "sections rebind: one-time verification of stored sections done");
+        store.chain_meta_put(b"sections_rebound_v1", &[1u8])?;
+        store.flush()?;
+    }
+
     // Restore chain state from BEST_CHAIN. Single sequential scan;
     // ~25 MB ID material for a 1.76M-height chain, restored in
     // milliseconds. No header parsing, no PoW recheck, no
