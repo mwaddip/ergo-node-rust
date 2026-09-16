@@ -417,6 +417,17 @@ to the store — callers pass `SocketAddr` and never see the bytes.
 Future keys are added at the discretion of the integrator. The store
 crate treats values as opaque byte strings.
 
+## One-shot rebind of stored sections
+
+`RedbModifierStore::rebind_sections(type_ids, bound)` walks PRIMARY for the
+given non-header types, deletes every row whose bytes fail `bound`, and
+removes the HEIGHT_INDEX rows that pointed at deleted ids. The main crate
+runs it once on first start after the receive-path binding shipped
+(`chain_meta` key `sections_rebound_v1`), with
+`enr_chain::section_id_from_body(t, bytes).id == id` as the predicate: the
+store's write precondition, discharged retroactively for rows written
+before the precondition existed.
+
 ## Preconditions
 
 - **`put`**: `data` is non-empty. `id` is the canonical modifier ID: for

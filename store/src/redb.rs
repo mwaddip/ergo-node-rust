@@ -401,6 +401,73 @@ impl RedbModifierStore {
     }
 }
 
+impl RedbModifierStore {
+    /// One-shot re-verification of stored non-header sections against a
+    /// binding predicate. Rows for which `bound(type_id, id, bytes)` is false
+    /// are deleted from PRIMARY together with any HEIGHT_INDEX row pointing
+    /// at them. Returns `(kept, dropped)`.
+    ///
+    /// Exists because the receive-path binding (v0.8.2) applies to writes
+    /// only: a store populated before it can hold bodies under ids they do
+    /// not hash to, and nothing on the read path recomputes them. The main
+    /// crate runs this once on first start after upgrade (`chain_meta`
+    /// key `sections_rebound_v1`).
+    pub fn rebind_sections<F>(&self, type_ids: &[u8], bound: F) -> Result<(usize, usize), StoreError>
+    where
+        F: Fn(u8, &[u8; 32], &[u8]) -> bool,
+    {
+        let mut to_delete: Vec<(u8, [u8; 32])> = Vec::new();
+        let mut kept = 0usize;
+        {
+            let read_txn = self.db.begin_read()?;
+            let primary = match read_txn.open_table(PRIMARY) {
+                Ok(t) => t,
+                Err(::redb::TableError::TableDoesNotExist(_)) => return Ok((0, 0)),
+                Err(e) => return Err(StoreError::Table(e)),
+            };
+            for &t in type_ids {
+                for entry in primary.range((t, [0u8; 32])..=(t, [0xffu8; 32]))? {
+                    let (key_guard, value_guard) = entry?;
+                    let (_t, id) = key_guard.value();
+                    if bound(t, &id, value_guard.value()) {
+                        kept += 1;
+                    } else {
+                        to_delete.push((t, id));
+                    }
+                }
+            }
+        }
+        if to_delete.is_empty() {
+            return Ok((kept, 0));
+        }
+        let mut write_txn = self.db.begin_write()?;
+        write_txn.set_quick_repair(true);
+        {
+            let mut primary = write_txn.open_table(PRIMARY)?;
+            let mut height_idx = write_txn.open_table(HEIGHT_INDEX)?;
+            let mut index_rows: Vec<(u8, u32)> = Vec::new();
+            for &t in type_ids {
+                for entry in height_idx.range((t, 0u32)..=(t, u32::MAX))? {
+                    let (key_guard, value_guard) = entry?;
+                    let (_t, h) = key_guard.value();
+                    let id = value_guard.value();
+                    if to_delete.iter().any(|(dt, did)| *dt == t && *did == id) {
+                        index_rows.push((t, h));
+                    }
+                }
+            }
+            for (t, id) in &to_delete {
+                primary.remove((*t, *id))?;
+            }
+            for (t, h) in &index_rows {
+                height_idx.remove((*t, *h))?;
+            }
+        }
+        write_txn.commit()?;
+        Ok((kept, to_delete.len()))
+    }
+}
+
 impl ModifierStore for RedbModifierStore {
     type Error = StoreError;
 
@@ -2564,5 +2631,29 @@ mod tests {
             "control load now evicts at 1 GiB too — the 8 MiB assertion \
              no longer discriminates and this test needs re-tuning"
         );
+    }
+
+    /// `rebind_sections` drops rows whose bytes fail the predicate, keeps the
+    /// rest, and removes the height-index rows that pointed at dropped ids.
+    #[test]
+    fn rebind_sections_drops_unbound_rows_and_their_index_entries() {
+        let dir = TempDir::new().unwrap();
+        let store = RedbModifierStore::new(&dir.path().join("m.redb"), TEST_CACHE_BYTES).unwrap();
+        let good = [0x11u8; 32];
+        let bad = [0x22u8; 32];
+        store.put(108, &good, 5, b"good-bytes").unwrap();
+        store.put(108, &bad, 6, b"bad-bytes").unwrap();
+        store.put(102, &bad, 7, b"bad-tx-bytes").unwrap();
+        let (kept, dropped) = store
+            .rebind_sections(&[102, 104, 108], |_t, _id, bytes| bytes.starts_with(b"good"))
+            .unwrap();
+        assert_eq!((kept, dropped), (1, 2));
+        assert_eq!(store.get(108, &good).unwrap(), Some(b"good-bytes".to_vec()));
+        assert_eq!(store.get(108, &bad).unwrap(), None);
+        assert_eq!(store.get(102, &bad).unwrap(), None);
+        assert_eq!(store.get_id_at(108, 6).unwrap(), None, "index row of a dropped body is gone");
+        assert_eq!(store.get_id_at(108, 5).unwrap(), Some(good), "index row of a kept body stays");
+        // Idempotent: a second pass drops nothing.
+        assert_eq!(store.rebind_sections(&[102, 104, 108], |_, _, b| b.starts_with(b"good")).unwrap(), (1, 0));
     }
 }
