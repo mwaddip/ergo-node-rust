@@ -755,12 +755,30 @@ impl ValidationPipeline {
                 continue;
             }
             let header_id = BlockId(ergo_chain_types::Digest32::from(identity.header_id));
-            let height = match chain.height_of(&header_id) {
-                Some(height) => height,
-                None => match self.store.contains(HEADER_TYPE_ID, &identity.header_id) {
+            // Request gate: the header must be one the node holds, and the
+            // delivered id must be one of the section ids THAT HEADER
+            // declares (JVM `bsCorrespondsToHeader`: `header.sectionIds
+            // .exists(_._2 == m.id)`). Binding to the bytes alone (above)
+            // proves the body hashes to its own label; only the header's
+            // roots say whether that label is a section the block has.
+            let (height, header) = match chain.height_of(&header_id) {
+                Some(height) => match chain.header_at(height) {
+                    Some(header) => (height, header),
+                    None => {
+                        tracing::error!(type_id, height, "header indexed but not loadable while binding a section");
+                        continue;
+                    }
+                },
+                None => match self.store.get(HEADER_TYPE_ID, &identity.header_id) {
                     // A fork header off the best chain: stored, not height-indexed.
-                    Ok(true) => 0,
-                    Ok(false) => {
+                    Ok(Some(raw)) => match enr_chain::parse_header(&raw) {
+                        Ok(header) => (0, header),
+                        Err(e) => {
+                            tracing::error!(type_id, "stored fork header does not parse while binding a section: {e}");
+                            continue;
+                        }
+                    },
+                    Ok(None) => {
                         reject_section(
                             peer_id,
                             type_id,
@@ -774,6 +792,21 @@ impl ValidationPipeline {
                     }
                 },
             };
+            if !enr_chain::section_ids(&header)
+                .iter()
+                .any(|(t, id)| *t == type_id && *id == delivered_id)
+            {
+                reject_section(
+                    peer_id,
+                    type_id,
+                    &format!(
+                        "id {} is not a section header {} declares",
+                        hex::encode(delivered_id),
+                        hex::encode(identity.header_id)
+                    ),
+                );
+                continue;
+            }
             entries.push((type_id, delivered_id, height, data.to_vec(), None));
         }
 
@@ -1218,5 +1251,29 @@ mod tests {
             pipeline.reorg_requested.should_request([4; 32], later),
             "a request left unanswered past the TTL must release its slot"
         );
+    }
+
+    /// A body that binds to ITS OWN id, for a header the node holds, but whose
+    /// id is not one of that header's declared section ids: dropped. Binding
+    /// to the bytes proves the label; only the header's roots say whether the
+    /// block has such a section (JVM `bsCorrespondsToHeader`).
+    #[test]
+    fn body_under_its_own_id_for_a_known_header_is_dropped_unless_declared() {
+        let (mut pipeline, _tx, _progress_rx, _ctrl_rx, mut data_rx, _dir) = test_pipeline();
+        let (header, ext, _ad) = block_2666();
+        store_header_as_fork(&pipeline, &header);
+        let mut foreign = header.id.0 .0.to_vec();
+        foreign.push(1);
+        foreign.extend_from_slice(&[0x01, 0x00, 9]);
+        foreign.extend_from_slice(b"interlink");
+        let own_id = enr_chain::section_id_from_body(108, &foreign).unwrap().id;
+        assert_ne!(own_id, enr_chain::section_ids(&header)[2].1);
+        run(&mut pipeline, vec![(108, own_id, foreign, Some(7))]);
+        assert_eq!(pipeline.store.get(108, &own_id).unwrap(), None);
+        assert!(received(&mut data_rx).is_empty());
+        // The declared section still stores.
+        let ext_id = enr_chain::section_ids(&header)[2].1;
+        run(&mut pipeline, vec![(108, ext_id, ext.clone(), Some(7))]);
+        assert_eq!(pipeline.store.get(108, &ext_id).unwrap().as_deref(), Some(ext.as_slice()));
     }
 }
