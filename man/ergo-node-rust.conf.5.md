@@ -74,6 +74,11 @@ applicable.
     test chain (protocol v4 from genesis, difficulty 1, no public seeds;
     give it your own **seed_peers**).
 
+**magic** = *[b0, b1, b2, b3]*
+:   Devnet only: replace the wire magic so several private networks can
+    coexist. Rejected for mainnet and testnet, and a public network's
+    magic is rejected as a value.
+
 # [listen.ipv6] / [listen.ipv4]
 
 At least one listener must be configured. IPv6 is preferred — Ergo

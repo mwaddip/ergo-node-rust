@@ -4,7 +4,10 @@
 
 ### `from_toml_str(toml: &str) -> Result<Config>`
 
-`[proxy] network` is `mainnet`, `testnet` or `devnet`.
+`[proxy] network` is `mainnet`, `testnet` or `devnet`. `[proxy] magic` (optional, four bytes) replaces the
+wire magic and is accepted only when the network is `devnet`; a public network's magic is rejected as a value.
+`ProxyConfig::magic()` returns the magic in force, and it is what the handshake session feature, the peer
+check and the frame codec use.
 
 Parse a `Config` from TOML **already in memory**.
 

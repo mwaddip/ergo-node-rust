@@ -25,6 +25,10 @@
 # it your own `seed_peers`). Switching requires reconfiguring `seed_peers`
 # below to peers on the same network.
 network = "testnet"
+# Devnet only: override the wire magic (four bytes) so several private
+# networks can coexist, or to join another private network's magic.
+# Rejected for mainnet and testnet.
+# magic = [7, 7, 7, 7]
 
 # ── Listeners ───────────────────────────────────────────────────────────
 #
