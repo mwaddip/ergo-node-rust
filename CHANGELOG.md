@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `[proxy] network = "devnet"`: a private test network (magic `[7,7,7,7]`,
+  protocol v4 from genesis, testnet genesis boxes, difficulty pinned at 1 by
+  an unreachable epoch, 20 s block interval, no re-emission), matching the
+  mixed Scala/Rust devnet recipe of arkadianet/ergo so nodes of both
+  implementations and a Scala `devnet60` node can share one isolated wire.
+  Mainnet and testnet are unchanged.
+
 ## v0.8.2 — 2026-09-16
 
 ### Release summary

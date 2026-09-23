@@ -68,9 +68,11 @@ applicable.
 
 # [proxy]
 
-**network** = *"mainnet" | "testnet"*
+**network** = *"mainnet" | "testnet" | "devnet"*
 :   Network to join. Determines magic bytes, genesis block, peer
-    discovery, and default API port. Required.
+    discovery, and default API port. Required. *"devnet"* is a private
+    test chain (protocol v4 from genesis, difficulty 1, no public seeds;
+    give it your own **seed_peers**).
 
 # [listen.ipv6] / [listen.ipv4]
 

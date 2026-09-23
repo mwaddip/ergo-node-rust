@@ -70,6 +70,7 @@ pub async fn run(
     };
     let network = match info.network.as_str() {
         "mainnet" => NetworkPrefix::Mainnet,
+        // testnet and devnet share the testnet prefix
         _ => NetworkPrefix::Testnet,
     };
     tracing::info!(
