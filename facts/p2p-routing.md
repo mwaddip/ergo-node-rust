@@ -82,7 +82,7 @@
 ### Bogus address classification
 
 Classification is **network-conditional**. The router is constructed
-with a `Network` (mainnet or testnet), and the public
+with a `Network` (mainnet, testnet or devnet), and the public
 `is_bogus_address(addr, network)` entry point combines two
 sub-predicates:
 

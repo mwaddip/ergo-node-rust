@@ -108,8 +108,9 @@ pub struct MinerConfig {
     /// EIP-27 re-emission rules. Carried in config (not derived inside
     /// `generate_candidate`) so the network-policy decision lives at the
     /// configuration boundary. Construct from the chain's network type at
-    /// config-load time. Currently hardcoded to mainnet at the call sites
-    /// in `src/main.rs` until testnet/devnet network detection is wired in.
+    /// config-load time: `reemission_rules_for(network)` in `src/main.rs`
+    /// (mainnet's rules for mainnet; testnet's, which never activate, for
+    /// testnet and devnet).
     pub reemission_rules: ReemissionRules,
 }
 ```

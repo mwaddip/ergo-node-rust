@@ -980,7 +980,8 @@ pub async fn get_mining_reward_address(
         )
     })?;
     let prefix = match state.node_info.network.as_str() {
-        "testnet" => NetworkPrefix::Testnet,
+        // devnet shares testnet's address prefix (Scala `addressPrefix = 16`)
+        "testnet" | "devnet" => NetworkPrefix::Testnet,
         _ => NetworkPrefix::Mainnet,
     };
     let address_str = AddressEncoder::new(prefix).address_to_str(&Address::P2S(tree_bytes));

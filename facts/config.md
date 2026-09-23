@@ -13,7 +13,7 @@ already drifted:
 
 | Source | State |
 |---|---|
-| `src/main.rs` | Correct. mainnet→9053, testnet→9052. |
+| `src/main.rs` | Correct. mainnet→0.0.0.0:9053, testnet→0.0.0.0:9052, devnet→127.0.0.1:9052 (a private chain's API stays local unless configured). |
 | `ergo.toml.example` | Correct. |
 | `install.sh` | **Inverted.** mainnet→9052, testnet→9053 — the pre-v0.6.10 values. |
 | `deploy/ergo.toml` | **testnet**, testnet seeds, `max_peers = 10`. |

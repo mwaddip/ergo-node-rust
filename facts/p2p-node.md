@@ -4,6 +4,8 @@
 
 ### `from_toml_str(toml: &str) -> Result<Config>`
 
+`[proxy] network` is `mainnet`, `testnet` or `devnet`.
+
 Parse a `Config` from TOML **already in memory**.
 
 - **Precondition**: none. The caller owns where the text came from.
