@@ -41,7 +41,7 @@ impl Connection {
         config: &HandshakeConfig,
         counters: &Arc<TrafficCounters>,
     ) -> io::Result<Self> {
-        let magic = config.network.magic();
+        let magic = config.magic;
         let peer_addr = stream.peer_addr()?;
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
@@ -58,7 +58,7 @@ impl Connection {
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Handshake timeout"))??;
         counters.record_handshake_in(bytes_read as u64);
 
-        handshake::validate_peer(&peer_spec, &config.network)
+        handshake::validate_peer_magic(&peer_spec, config.magic)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         Ok(Self {
@@ -76,7 +76,7 @@ impl Connection {
         config: &HandshakeConfig,
         counters: &Arc<TrafficCounters>,
     ) -> io::Result<Self> {
-        let magic = config.network.magic();
+        let magic = config.magic;
         let peer_addr = stream.peer_addr()?;
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
@@ -87,7 +87,7 @@ impl Connection {
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Handshake timeout"))??;
         counters.record_handshake_in(bytes_read as u64);
 
-        handshake::validate_peer(&peer_spec, &config.network)
+        handshake::validate_peer_magic(&peer_spec, config.magic)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // Send our handshake

@@ -20,9 +20,15 @@
 # applicable. Commented-out values show the built-in default.
 
 [proxy]
-# Network: "testnet" or "mainnet". Switching requires reconfiguring
-# `seed_peers` below to peers on the same network.
+# Network: "testnet", "mainnet", or "devnet" (a private test chain: magic
+# [7,7,7,7], protocol v4 from genesis, difficulty 1, no public seeds; give
+# it your own `seed_peers`). Switching requires reconfiguring `seed_peers`
+# below to peers on the same network.
 network = "testnet"
+# Devnet only: override the wire magic (four bytes) so several private
+# networks can coexist, or to join another private network's magic.
+# Rejected for mainnet and testnet.
+# magic = [7, 7, 7, 7]
 
 # ── Listeners ───────────────────────────────────────────────────────────
 #
@@ -122,7 +128,8 @@ protocol_version = "6.0.3"
 # Minimum fee in nanoERG to enter the mempool (1,000,000 = 0.001 ERG).
 # min_fee = 1000000
 
-# REST API bind address. Defaults depend on network:
+# REST API bind address. Defaults depend on network (devnet: 127.0.0.1:9052,
+# a private chain's API stays local unless configured):
 #   mainnet → 0.0.0.0:9053
 #   testnet → 0.0.0.0:9052
 # api_address = "0.0.0.0:9053"

@@ -156,6 +156,7 @@ impl P2pNode {
         let (ver_major, ver_minor, ver_patch) = config.version_bytes()?;
         let version = Version::new(ver_major, ver_minor, ver_patch);
         let network = config.proxy.network;
+        let magic = config.proxy.magic();
         let network_settings = config.network_settings();
         let max_peer_spec_objects = network_settings.max_peer_spec_objects as usize;
 
@@ -243,6 +244,7 @@ impl P2pNode {
                 &config.identity,
                 version,
                 network,
+                magic,
                 listener_cfg.mode,
                 mode_config,
                 ipv6_declared,
@@ -263,6 +265,7 @@ impl P2pNode {
                 &config.identity,
                 version,
                 network,
+                magic,
                 listener_cfg.mode,
                 mode_config,
                 ipv4_declared,
@@ -283,6 +286,7 @@ impl P2pNode {
                 &config.identity,
                 version,
                 network,
+                magic,
                 ProxyMode::Full,
                 mode_config,
                 outbound_declared,
@@ -767,6 +771,7 @@ fn make_handshake_config(
     identity: &crate::config::IdentityConfig,
     version: Version,
     network: crate::types::Network,
+    magic: [u8; 4],
     mode: ProxyMode,
     mode_config: handshake::ModeConfig,
     declared_address: Option<SocketAddr>,
@@ -776,6 +781,7 @@ fn make_handshake_config(
         peer_name: identity.peer_name.clone(),
         version,
         network,
+        magic,
         mode,
         declared_address,
         mode_config,
@@ -811,6 +817,7 @@ async fn accept_loop(
                     peer_name: hs_config.peer_name.clone(),
                     version: hs_config.version,
                     network: hs_config.network,
+                    magic: hs_config.magic,
                     mode: hs_config.mode,
                     declared_address: hs_config.declared_address,
                     mode_config: hs_config.mode_config,
@@ -983,6 +990,7 @@ async fn spawn_outbound_connect(
                 peer_name: hs_config.peer_name.clone(),
                 version: hs_config.version,
                 network: hs_config.network,
+                magic: hs_config.magic,
                 mode: hs_config.mode,
                 declared_address: hs_config.declared_address,
                 mode_config: hs_config.mode_config,

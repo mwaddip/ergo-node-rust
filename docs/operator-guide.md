@@ -122,7 +122,7 @@ installs find it next to the binary.
 
 | Setting | Default | Notes |
 |---|---|---|
-| `[proxy].network` | `"testnet"` | Switch to `"mainnet"` requires updating `seed_peers` to mainnet peers (see the example config). |
+| `[proxy].network` | `"testnet"` | Switch to `"mainnet"` requires updating `seed_peers` to mainnet peers (see the example config). `"devnet"` is a private test chain with no public seeds. |
 | `[node].data_dir` | `./ergo-node-data` | `.deb` installs override this to `/var/lib/ergo-node/data`. |
 | `[node].state_type` | `"utxo"` | `"utxo"` = full state, can mine. `"digest"` = state root only, smaller footprint, can't mine. `"light"` = NiPoPoW-bootstrapped, headers + sliding window. |
 | `[node].blocks_to_keep` | `-1` | `-1` = full archive. `0` = at-tip only (pruned). `N` = retain last N blocks. |

@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `[proxy] network = "devnet"`: a private test network (magic `[7,7,7,7]`,
+  protocol v4 from genesis, testnet genesis boxes, difficulty pinned at 1 by
+  an unreachable epoch, 20 s block interval, no re-emission), matching the
+  mixed Scala/Rust devnet recipe of arkadianet/ergo so nodes of both
+  implementations and a Scala `devnet60` node can share one isolated wire.
+  `[proxy] magic = [..]` overrides the wire magic on devnet only (rejected
+  for the public networks, and a public network's magic is rejected as a
+  value). Mainnet and testnet are unchanged. Crate API: `HandshakeConfig`
+  gains a required `magic` field (the magic in force).
+
 ## v0.8.2 — 2026-09-16
 
 ### Release summary

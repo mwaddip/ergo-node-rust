@@ -123,6 +123,19 @@ impl Default for NetworkConfig {
 #[derive(Debug, Deserialize)]
 pub struct ProxyConfig {
     pub network: Network,
+    /// Optional wire magic, accepted only for `network = "devnet"`: several
+    /// private test networks can then run side by side without sharing a
+    /// magic, and a devnet can be given the magic of another private
+    /// network it must join. Public networks always use their own magic.
+    #[serde(default)]
+    pub magic: Option<[u8; 4]>,
+}
+
+impl ProxyConfig {
+    /// The wire magic in force: the override when set, else the network's own.
+    pub fn magic(&self) -> [u8; 4] {
+        self.magic.unwrap_or_else(|| self.network.magic())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,6 +190,14 @@ impl Config {
 
         if config.outbound.seed_peers.is_empty() {
             return Err("At least one seed peer must be configured".into());
+        }
+        if let Some(magic) = config.proxy.magic {
+            if config.proxy.network != Network::Devnet {
+                return Err("[proxy] magic can only be set for network = \"devnet\"".into());
+            }
+            if magic == Network::Mainnet.magic() || magic == Network::Testnet.magic() {
+                return Err("[proxy] magic must not be a public network's magic".into());
+            }
         }
 
         if config.outbound.min_peers > config.outbound.max_peers {
@@ -391,5 +412,53 @@ discover_timeout_secs = 7
         assert!(Config::from_toml_str("hello = \"world\"").is_err());
         // Empty input.
         assert!(Config::from_toml_str("").is_err());
+    }
+}
+
+#[cfg(test)]
+mod devnet_magic_tests {
+    use super::{Config, Network};
+
+    const BASE: &str = r#"
+[listen.ipv4]
+address = "127.0.0.1:9030"
+mode = "full"
+max_inbound = 4
+[outbound]
+min_peers = 1
+max_peers = 1
+seed_peers = ["127.0.0.1:9031"]
+[identity]
+agent_name = "a"
+peer_name = "p"
+protocol_version = "6.0.3"
+"#;
+
+    #[test]
+    fn magic_override_only_on_devnet() {
+        let dev = format!("[proxy]\nnetwork = \"devnet\"\nmagic = [102, 111, 114, 107]\n{BASE}");
+        let c = Config::from_toml_str(&dev).expect("devnet with magic parses");
+        assert_eq!(c.proxy.network, Network::Devnet);
+        assert_eq!(c.proxy.magic(), [102, 111, 114, 107]);
+
+        let plain = format!("[proxy]\nnetwork = \"devnet\"\n{BASE}");
+        let c = Config::from_toml_str(&plain).expect("devnet without magic parses");
+        assert_eq!(c.proxy.magic(), Network::Devnet.magic());
+
+        for public in ["[1, 0, 2, 4]", "[2, 3, 2, 3]"] {
+            let bad = format!("[proxy]\nnetwork = \"devnet\"\nmagic = {public}\n{BASE}");
+            let err = Config::from_toml_str(&bad)
+                .expect_err("a public network's magic is rejected on devnet");
+            assert!(err.to_string().contains("public network"), "{err}");
+        }
+        for net in ["mainnet", "testnet"] {
+            let bad = format!("[proxy]\nnetwork = \"{net}\"\nmagic = [7, 7, 7, 7]\n{BASE}");
+            let err =
+                Config::from_toml_str(&bad).expect_err("public network rejects a magic override");
+            assert!(err.to_string().contains("devnet"), "{err}");
+            let plain = format!("[proxy]\nnetwork = \"{net}\"\n{BASE}");
+            let c = Config::from_toml_str(&plain).expect("public network parses");
+            assert_eq!(c.proxy.magic(), c.proxy.network.magic());
+        }
     }
 }

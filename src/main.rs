@@ -87,7 +87,12 @@ fn build_genesis_boxes(network: enr_p2p::types::Network) -> Vec<([u8; 32], Vec<u
     let settings = MonetarySettings::default();
 
     let proof_strings = match network {
-        enr_p2p::types::Network::Testnet => TESTNET_NO_PREMINE_PROOFS,
+        // devnet reuses the testnet genesis boxes: the Scala devnet.conf pins
+        // the testnet genesisStateDigestHex (so does arkadianet/ergo's
+        // scripts/devnet-mixed/genesis.conf)
+        enr_p2p::types::Network::Testnet | enr_p2p::types::Network::Devnet => {
+            TESTNET_NO_PREMINE_PROOFS
+        }
         enr_p2p::types::Network::Mainnet => MAINNET_NO_PREMINE_PROOFS,
     };
 
@@ -130,7 +135,11 @@ fn reemission_rules_for(
 ) -> ergo_mining::emission::ReemissionRules {
     match network {
         enr_p2p::types::Network::Mainnet => ergo_mining::emission::ReemissionRules::mainnet(),
-        enr_p2p::types::Network::Testnet => ergo_mining::emission::ReemissionRules::testnet(),
+        // devnet: re-emission never activates (Scala devnet overrides
+        // `reemission.activationHeight = 100000001`, as testnet does)
+        enr_p2p::types::Network::Testnet | enr_p2p::types::Network::Devnet => {
+            ergo_mining::emission::ReemissionRules::testnet()
+        }
     }
 }
 
@@ -2073,6 +2082,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chain_config = match network {
         enr_p2p::types::Network::Testnet => ChainConfig::testnet(),
         enr_p2p::types::Network::Mainnet => ChainConfig::mainnet(),
+        enr_p2p::types::Network::Devnet => ChainConfig::devnet(),
     };
 
     // Wall-clock start, surfaced as `launchTime` on GET /info (see
@@ -2088,6 +2098,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         network = match network {
             enr_p2p::types::Network::Testnet => "testnet",
             enr_p2p::types::Network::Mainnet => "mainnet",
+            enr_p2p::types::Network::Devnet => "devnet",
         },
         "Ergo node starting"
     );
@@ -2674,7 +2685,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Genesis state root — needed for fresh start or revalidation
     let genesis_digest_hex = match network {
-        enr_p2p::types::Network::Testnet => TESTNET_GENESIS_DIGEST,
+        enr_p2p::types::Network::Testnet | enr_p2p::types::Network::Devnet => {
+            TESTNET_GENESIS_DIGEST
+        }
         enr_p2p::types::Network::Mainnet => MAINNET_GENESIS_DIGEST,
     };
     let genesis_bytes = hex::decode(genesis_digest_hex).expect("invalid genesis digest hex");
@@ -3846,6 +3859,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(match network {
                 enr_p2p::types::Network::Testnet => "0.0.0.0:9052",
                 enr_p2p::types::Network::Mainnet => "0.0.0.0:9053",
+                // a private network's API stays local unless configured
+                enr_p2p::types::Network::Devnet => "127.0.0.1:9052",
             })
             .parse()
             .expect("invalid api_address");
@@ -4222,6 +4237,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 network: match network {
                     enr_p2p::types::Network::Testnet => "testnet".to_string(),
                     enr_p2p::types::Network::Mainnet => "mainnet".to_string(),
+                    enr_p2p::types::Network::Devnet => "devnet".to_string(),
                 },
                 state_type: match state_type {
                     StateType::Utxo => "utxo".to_string(),
@@ -5014,6 +5030,46 @@ mod tests {
             hex::encode(&digest),
             expected_hex,
             "genesis state digest mismatch"
+        );
+    }
+
+    #[test]
+    fn devnet_genesis_boxes_produce_testnet_digest() {
+        // devnet shares testnet's genesis boxes: the Scala devnet.conf pins
+        // the testnet genesisStateDigestHex, so the digest the node asserts
+        // on at first start is the testnet one.
+        let boxes = build_genesis_boxes(enr_p2p::types::Network::Devnet);
+        let testnet = build_genesis_boxes(enr_p2p::types::Network::Testnet);
+        assert_eq!(boxes, testnet, "devnet genesis boxes differ from testnet's");
+        let resolver: ergo_avltree_rust::batch_node::Resolver =
+            Arc::new(|digest: &[u8; 32]| Node::LabelOnly(NodeHeader::new(Some(*digest), None)));
+        let tree = AVLTree::with_resolver(resolver, 32, None);
+        let mut prover = BatchAVLProver::new(tree, false);
+        for (id, value) in &boxes {
+            prover
+                .perform_one_operation(&Operation::Insert(KeyValue {
+                    key: Bytes::copy_from_slice(id),
+                    value: Bytes::copy_from_slice(value),
+                }))
+                .expect("genesis box insert failed");
+        }
+        let digest = prover.digest().expect("prover has no digest");
+        assert_eq!(
+            hex::encode(&digest),
+            TESTNET_GENESIS_DIGEST,
+            "devnet genesis state digest mismatch"
+        );
+    }
+
+    #[test]
+    fn devnet_reemission_never_activates_like_testnet() {
+        let d = reemission_rules_for(enr_p2p::types::Network::Devnet);
+        let t = reemission_rules_for(enr_p2p::types::Network::Testnet);
+        assert_eq!(d.activation_height, t.activation_height);
+        assert_eq!(d.activation_height, 100_000_001);
+        assert_ne!(
+            d.activation_height,
+            reemission_rules_for(enr_p2p::types::Network::Mainnet).activation_height
         );
     }
 

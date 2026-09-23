@@ -13,6 +13,9 @@ pub enum Network {
     Mainnet,
     /// Testnet (the post-6.0 incarnation, starts at protocol v4).
     Testnet,
+    /// Private development network (starts at protocol v4, difficulty 1,
+    /// epoch boundaries out of reach). See `ChainConfig::devnet`.
+    Devnet,
 }
 
 /// Network parameters that affect header chain validation.
@@ -67,6 +70,25 @@ impl ChainConfig {
         }
     }
 
+    /// Devnet configuration: the testnet chain with difficulty pinned at 1
+    /// by an unreachable difficulty epoch (`1 << 25` blocks) and a 20 s
+    /// block interval; the forced v2 activation stays testnet's (never
+    /// reached). The Scala side is `networkType = "devnet60"` with
+    /// `epochLength = 33554432`, `blockInterval = 20s`,
+    /// `initialDifficultyHex = "01"`; the mixed Scala/Rust devnet of
+    /// arkadianet/ergo (`scripts/devnet-mixed/genesis.conf`) uses this
+    /// profile.
+    pub fn devnet() -> Self {
+        Self {
+            network: Network::Devnet,
+            epoch_length: 1 << 25,
+            block_interval_ms: 20_000,
+            max_time_drift_ms: 10 * 20_000,
+            voting: VotingConfig::devnet(),
+            ..Self::testnet()
+        }
+    }
+
     /// Mainnet configuration.
     pub fn mainnet() -> Self {
         Self {
@@ -99,5 +121,28 @@ impl ChainConfig {
     /// Whether EIP-37 difficulty adjustment is active at the given height.
     pub fn eip37_active(&self, height: u32) -> bool {
         self.eip37_activation_height.is_some_and(|h| height >= h)
+    }
+}
+
+#[cfg(test)]
+mod devnet_tests {
+    use super::*;
+
+    #[test]
+    fn devnet_is_testnet_with_difficulty_pinned() {
+        // Scala devnet-mixed genesis.conf: epochLength 33554432, blockInterval 20s,
+        // initialDifficultyHex "01", version2ActivationHeight unreachable.
+        let d = ChainConfig::devnet();
+        let t = ChainConfig::testnet();
+        assert_eq!(d.network, Network::Devnet);
+        assert_eq!(d.epoch_length, 1 << 25);
+        assert_eq!(d.block_interval_ms, 20_000);
+        assert_eq!(d.max_time_drift_ms, 10 * 20_000);
+        assert_eq!(d.initial_n_bits, t.initial_n_bits); // difficulty 1
+        assert_eq!(d.use_last_epochs, t.use_last_epochs);
+        assert_eq!(d.version2_activation_n_bits, None);
+        assert_eq!(d.genesis_id, None);
+        assert_eq!(d.eip37_activation_height, None);
+        assert_eq!(d.voting.voting_length, 1 << 25);
     }
 }

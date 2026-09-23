@@ -51,6 +51,9 @@ pub struct HandshakeConfig {
     pub peer_name: String,
     pub version: Version,
     pub network: Network,
+    /// Wire magic sent in the session feature and expected from peers
+    /// (`network.magic()` unless the config overrides it on devnet).
+    pub magic: [u8; 4],
     pub mode: ProxyMode,
     pub declared_address: Option<SocketAddr>,
     /// Mode feature advertisement — what capabilities to claim in the handshake.
@@ -133,7 +136,7 @@ fn write_peer_entry_from_config(config: &HandshakeConfig, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&mode_body);
 
     buf.push(FEATURE_SESSION);
-    let session_body = build_session_body(config.network);
+    let session_body = build_session_body(config.magic);
     vlq::write_vlq(buf, session_body.len() as u64);
     buf.extend_from_slice(&session_body);
 }
@@ -180,9 +183,9 @@ fn build_mode_body(config: &HandshakeConfig) -> Vec<u8> {
     body
 }
 
-fn build_session_body(network: Network) -> Vec<u8> {
+fn build_session_body(magic: [u8; 4]) -> Vec<u8> {
     let mut body = Vec::with_capacity(16);
-    body.extend_from_slice(&network.magic());
+    body.extend_from_slice(&magic);
     // Session ID is putLong = ZigZag encode then VLQ
     let session_id = rand_u64() as i64;
     let zigzag = vlq::zigzag_encode_i64(session_id);
@@ -335,6 +338,12 @@ fn parse_features<R: Read>(reader: &mut R) -> io::Result<Vec<Feature>> {
 /// - **Precondition**: `spec` was produced by `parse`.
 /// - **Postcondition**: returns Ok(()) if version >= 4.0.100 and session magic matches, Err otherwise.
 pub fn validate_peer(spec: &PeerSpec, network: &Network) -> Result<(), String> {
+    validate_peer_magic(spec, network.magic())
+}
+
+/// `validate_peer` against an explicit expected magic (the configured
+/// override on devnet, else the network's own).
+pub fn validate_peer_magic(spec: &PeerSpec, expected: [u8; 4]) -> Result<(), String> {
     if spec.version < Version::EIP37_MIN {
         return Err(format!(
             "Peer version {} is below minimum {} (EIP-37)",
@@ -346,7 +355,6 @@ pub fn validate_peer(spec: &PeerSpec, network: &Network) -> Result<(), String> {
     if let Some(session) = spec.features.iter().find(|f| f.id == FEATURE_SESSION) {
         if session.body.len() >= 4 {
             let peer_magic = &session.body[0..4];
-            let expected = network.magic();
             if peer_magic != expected {
                 return Err(format!(
                     "Session magic mismatch: {:?} (expected {:?})",
@@ -473,5 +481,35 @@ mod tests {
             body: vec![0],
         }]);
         assert_eq!(spec.rest_api_url(), None);
+    }
+}
+
+#[cfg(test)]
+mod devnet_magic_tests {
+    use super::*;
+
+    #[test]
+    fn session_feature_carries_the_configured_magic() {
+        let cfg = HandshakeConfig {
+            agent_name: "a".into(),
+            peer_name: "p".into(),
+            version: Version::new(6, 0, 3),
+            network: Network::Devnet,
+            magic: [102, 111, 114, 107],
+            mode: ProxyMode::Full,
+            declared_address: None,
+            mode_config: ModeConfig::default(),
+        };
+        let bytes = build(&cfg);
+        let spec = parse(&bytes).expect("own handshake parses");
+        let session = spec
+            .features
+            .iter()
+            .find(|f| f.id == FEATURE_SESSION)
+            .expect("session feature present");
+        assert_eq!(&session.body[0..4], &[102, 111, 114, 107]);
+        assert!(validate_peer_magic(&spec, [102, 111, 114, 107]).is_ok());
+        assert!(validate_peer_magic(&spec, Network::Devnet.magic()).is_err());
+        assert!(validate_peer(&spec, &Network::Devnet).is_err());
     }
 }

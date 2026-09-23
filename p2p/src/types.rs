@@ -59,6 +59,13 @@ pub enum Direction {
 pub enum Network {
     Mainnet,
     Testnet,
+    /// Private development network: an isolated chain for multi-node tests
+    /// (protocol v4 from genesis, difficulty 1, no public seeds). The
+    /// profile is a Scala `networkType = "devnet60"` node with a fixed
+    /// difficulty and a 20 s interval, the one the mixed Scala/Rust devnet
+    /// of arkadianet/ergo also runs, so nodes of either implementation and
+    /// such a Scala node share one wire.
+    Devnet,
 }
 
 impl Network {
@@ -66,6 +73,8 @@ impl Network {
         match self {
             Network::Mainnet => [1, 0, 2, 4],
             Network::Testnet => [2, 3, 2, 3],
+            // No public network uses this magic.
+            Network::Devnet => [7, 7, 7, 7],
         }
     }
 }
@@ -123,4 +132,23 @@ pub struct PeerEntry {
 pub struct NetworkStatus {
     pub last_incoming_message_ms: Option<u64>,
     pub current_network_time_ms: u64,
+}
+
+#[cfg(test)]
+mod devnet_tests {
+    use super::Network;
+
+    #[test]
+    fn devnet_magic_is_private_and_selectable_by_name() {
+        // no public network's magic, and reachable from `[proxy] network = "devnet"`
+        assert_eq!(Network::Devnet.magic(), [7, 7, 7, 7]);
+        assert_ne!(Network::Devnet.magic(), Network::Mainnet.magic());
+        assert_ne!(Network::Devnet.magic(), Network::Testnet.magic());
+        #[derive(serde::Deserialize)]
+        struct Proxy {
+            network: Network,
+        }
+        let p: Proxy = toml::from_str("network = \"devnet\"").expect("parses");
+        assert_eq!(p.network, Network::Devnet);
+    }
 }

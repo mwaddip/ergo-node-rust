@@ -93,6 +93,17 @@ impl VotingConfig {
         }
     }
 
+    /// Devnet voting parameters: the testnet thresholds with a voting epoch
+    /// of `1 << 25` blocks, so no parameter or soft-fork vote can be tallied
+    /// within a test chain's lifetime (Scala `votingLength = 33554432`,
+    /// `softForkEpochs = 32`, `activationEpochs = 32`).
+    pub fn devnet() -> Self {
+        Self {
+            voting_length: 1 << 25,
+            ..Self::testnet()
+        }
+    }
+
     /// `true` iff the given vote count meets the soft-fork supermajority.
     ///
     /// JVM `softForkApproved`: `votes > votingLength * softForkEpochs * 9 / 10`
@@ -193,7 +204,7 @@ fn ordinary_param(id: i8) -> Option<Parameter> {
 pub fn default_parameters(network: crate::Network) -> Parameters {
     let block_version = match network {
         crate::Network::Mainnet => 1,
-        crate::Network::Testnet => 4,
+        crate::Network::Testnet | crate::Network::Devnet => 4,
     };
     let mut params = Parameters::new(
         block_version,
@@ -206,7 +217,7 @@ pub fn default_parameters(network: crate::Network) -> Parameters {
         100,       // DataInputCost
         100,       // OutputCost
     );
-    if matches!(network, crate::Network::Testnet) {
+    if matches!(network, crate::Network::Testnet | crate::Network::Devnet) {
         params
             .parameters_table
             .insert(Parameter::SubblocksPerBlock, SUBBLOCKS_PER_BLOCK_DEFAULT);
@@ -1373,6 +1384,21 @@ mod tests {
     fn default_parameters_mainnet_starts_at_v1() {
         let p = default_parameters(crate::Network::Mainnet);
         assert_eq!(p.block_version(), 1);
+    }
+
+    #[test]
+    fn default_parameters_devnet_matches_testnet_launch() {
+        // devnet launches like testnet: protocol v4 with the sub-blocks
+        // parameter present (Scala Devnet60LaunchParameters).
+        let d = default_parameters(crate::Network::Devnet);
+        let t = default_parameters(crate::Network::Testnet);
+        assert_eq!(d.block_version(), 4);
+        assert_eq!(d.parameters_table, t.parameters_table);
+        let v = VotingConfig::devnet();
+        assert_eq!(v.voting_length, 1 << 25);
+        assert_eq!(v.soft_fork_epochs, 32);
+        assert_eq!(v.activation_epochs, 32);
+        assert_eq!(v.version2_activation_height, 0);
     }
 
     #[test]

@@ -161,6 +161,7 @@ Rejection results in a permanent ban (~3600 days) in the JVM reference node.
 ```
 Mainnet:  [0x01, 0x00, 0x02, 0x04]
 Testnet:  [0x02, 0x03, 0x02, 0x03]    (changed Feb 2026 testnet reset)
+Devnet:   [0x07, 0x07, 0x07, 0x07]    (private test chain; no public network)
 ```
 
 The magic bytes appear in:

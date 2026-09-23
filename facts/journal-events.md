@@ -151,7 +151,7 @@ ships.
 #### `node_starting`
 - **Level:** INFO
 - **Marker:** `"Ergo node starting"`
-- **Fields:** `version` (string), `network` (string: `mainnet`|`testnet`)
+- **Fields:** `version` (string), `network` (string: `mainnet`|`testnet`|`devnet`)
 - **Since:** 1.0
 - **Stability:** stable
 - **Emitted at:** very first line after subscriber init, before any I/O.
