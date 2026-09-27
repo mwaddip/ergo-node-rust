@@ -424,8 +424,14 @@ caching the *handles* is a consensus bug.
 Transaction validity below the block level — scripts, spending proofs, ERG and
 token preservation, per-transaction cost — is ergo-lib's
 `TransactionContext::validate` in the pinned sigma-rust fork. The node does not
-re-implement it. Two of its rules are stated here because they are easy to get
+re-implement it. The rules below are stated here because they are easy to get
 subtly wrong, and a wrong answer is a fork.
+
+**Box creation height.** A box's creation height is read the way the JVM's
+`getUIntExact` reads it (sigmastate `ErgoBoxCandidate.scala:195`): a value above
+`Int.MaxValue` (2³¹ − 1) rejects the box **at parse**. The rejection carries to
+everything that contains the box — a transaction output, or a Box-typed
+constant in a context-extension variable or a register.
 
 **Context-extension bounds.** A spending proof's `ContextExtension` is rejected
 **at parse** when its entry count is ≥ 128 or any variable id is ≥ 0x80. Both are
@@ -447,8 +453,9 @@ On that path:
 - The arithmetic is the JVM's 32-bit `Int`:
   - storage fee = `storageFeeFactor × boxBytes`, wrapping at 32 bits
   - age = `height − creationHeight`, signed
-- The input costs `StorageContractCost` = 50 block-cost units
-  (`Constants.scala:35`) instead of a script-evaluation cost.
+- The input costs `StorageContractCost` = 50 block-cost units instead of a
+  script-evaluation cost. The constants are those of the `Constants` object
+  `ErgoInterpreter` imports: ergo-wallet `wallet/protocol/Constants.scala:19-23`.
 
 ### Block cost
 
