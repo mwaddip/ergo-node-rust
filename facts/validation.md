@@ -456,6 +456,14 @@ On that path:
 - The input costs `StorageContractCost` = 50 block-cost units instead of a
   script-evaluation cost. The constants are those of the `Constants` object
   `ErgoInterpreter` imports: ergo-wallet `wallet/protocol/Constants.scala:19-23`.
+- The recreation check compares every register except R0 and R3, as
+  `box.get(rId) == output.get(rId)`. R4–R9 are compared as the stored register
+  values, so a Tuple expression never equals a Constant.
+- **Known gap:** R1 (the script) is compared by its *re-serialized* bytes, where
+  the JVM compares the retained `propositionBytes`. A non-canonical script
+  encoding (for example, an overlong VLQ constants count) makes the two differ,
+  and we accept a recreation the JVM rejects. Closing it needs `ErgoTree` to
+  retain its wire bytes.
 
 ### Block cost
 
