@@ -419,6 +419,52 @@ here. **A node-level cache in `state/` returning live `Rc` handles from
 `rollback` would make a wrong proof reachable.** Caching the *bytes* is fine;
 caching the *handles* is a consensus bug.
 
+### Transaction rules taken from ergo-lib
+
+Transaction validity below the block level — scripts, spending proofs, ERG and
+token preservation, per-transaction cost — is ergo-lib's
+`TransactionContext::validate` in the pinned sigma-rust fork. The node does not
+re-implement it. The rules below are stated here because they are easy to get
+subtly wrong, and a wrong answer is a fork.
+
+**Box creation height.** A box's creation height is read the way the JVM's
+`getUIntExact` reads it (sigmastate `ErgoBoxCandidate.scala:195`): a value above
+`Int.MaxValue` (2³¹ − 1) rejects the box **at parse**. The rejection carries to
+everything that contains the box — a transaction output, or a Box-typed
+constant in a context-extension variable or a register.
+
+**Context-extension bounds.** A spending proof's `ContextExtension` is rejected
+**at parse** when its entry count is ≥ 128 or any variable id is ≥ 0x80. Both are
+read as signed bytes, as sigmastate ≥ 6.0.5 `ContextExtension.serializer.parse`
+does (`data/shared/src/main/scala/sigma/interpreter/ContextExtension.scala:52-66`).
+The rule is not version-gated and applies to every input, storage-rent spends
+included. JSON input enforces the same id range (0..=127). A serializer holding
+more than 127 entries errors rather than truncating the count.
+
+**Storage-rent spends.** An input takes the storage-rent path when all three
+hold: its box is at least `StoragePeriod` = 1,051,200 blocks old, its proof is
+empty, and its extension holds variable 127 (`ErgoInterpreter.scala:72-77`).
+On that path:
+- If variable 127 is not a `Short`, or does not index an output, the input falls
+  back to ordinary script verification (the JVM's `recoverWith`).
+- Otherwise the recreation check (`checkExpiredBox`, `ErgoInterpreter.scala:42-55`)
+  decides, and **its verdict is final**: a failed check rejects the input and
+  never falls back to the script.
+- The arithmetic is the JVM's 32-bit `Int`:
+  - storage fee = `storageFeeFactor × boxBytes`, wrapping at 32 bits
+  - age = `height − creationHeight`, signed
+- The input costs `StorageContractCost` = 50 block-cost units instead of a
+  script-evaluation cost. The constants are those of the `Constants` object
+  `ErgoInterpreter` imports: ergo-wallet `wallet/protocol/Constants.scala:19-23`.
+- The recreation check compares every register except R0 and R3, as
+  `box.get(rId) == output.get(rId)`. R4–R9 are compared as the stored register
+  values, so a Tuple expression never equals a Constant.
+- **Known gap:** R1 (the script) is compared by its *re-serialized* bytes, where
+  the JVM compares the retained `propositionBytes`. A non-canonical script
+  encoding (for example, an overlong VLQ constants count) makes the two differ,
+  and we accept a recreation the JVM rejects. Closing it needs `ErgoTree` to
+  retain its wire bytes.
+
 ### Block cost
 
 `evaluate_scripts` returns the block-accumulated transaction cost (Σ per-tx
@@ -685,6 +731,9 @@ pub fn evaluate_scripts(eval: &ScriptEvalInputs) -> Result<u64, ValidationError>
   `TransactionContext::validate` (each per-tx number already includes the
   JVM-equivalent `initialCost` components — input/data-input/output static
   costs — plus script evaluation cost; this is the tx-tier-anchored number).
+- A storage-rent input contributes `StorageContractCost` = 50 to its
+  transaction's cost in place of a script-evaluation cost (§ Transaction rules
+  taken from ergo-lib).
 - **JVM mapping:** `ErgoState.execTransactions` (`ErgoState.scala:106`) folds
   `validateStateful` from `Valid(0L)`, threading the accumulated cost through
   each tx; the running total is checked against `maxBlockCost` at each tx's
