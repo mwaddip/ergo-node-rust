@@ -1,5 +1,69 @@
 # Changelog
 
+## v0.8.3 — 2026-09-27
+
+### Release summary
+
+This release fixes consensus-parity gaps in transaction validation, found while
+reviewing the JVM reference node's v6.0.3–v6.0.6 releases. In three places,
+sigma-rust (the node's transaction-validation library) accepted what the JVM
+rejects:
+- context-extension bounds
+- storage-rent spends
+- box creation heights
+
+All three are now closed. The sigma-rust fork is pinned at `bf4d6943`, and the
+fixes are upstream as ergoplatform/sigma-rust #923, #924 and #925. The release
+also ships the Extension field-count fix below.
+
+### Fixed
+
+#### Context-extension bounds rejected at parse
+
+A spending proof's context extension is now rejected when the transaction is
+parsed if it has 128 or more entries, or if any variable id is 0x80 or above.
+This is what sigmastate ≥ 6.0.5 does, and it isn't version-gated.
+
+Previously the node read both values as unsigned bytes:
+- an id of 0x80 or above got through on storage-rent spends
+- a count of 128 or more got through on any input
+
+The JVM refuses to parse such transactions and penalizes peers that relay them.
+JSON input now enforces the same id range.
+
+#### Storage-rent spends match the JVM
+
+The storage-rent path is now a port of the JVM's `ErgoInterpreter.verify` and
+`checkExpiredBox`.
+- **A failed recreation check rejects the input.** Previously it fell through to
+  script evaluation, so an old box whose script is satisfiable with an empty proof
+  was accepted.
+- **The storage fee uses the JVM's 32-bit `Int` arithmetic.** At the current fee
+  factor it wraps for boxes of 1718 bytes or more. The box's age is computed signed.
+- **A storage-rent input costs `StorageContractCost` = 50**, as on the JVM. It was
+  previously 0.
+- **Registers R4–R9 are compared as stored values**, as `ErgoBox.get` does.
+
+#### Box creation height bounded at parse
+
+A box whose creation height is above `Int.MaxValue` is now rejected when parsed,
+as the JVM's `getUIntExact` does. This also covers boxes nested in Box-typed
+constants (context-extension variables, registers), which the later
+negative-height check doesn't reach.
+
+#### Extension field count read as `u16`
+
+- The Extension section's field count is read as the JVM's unsigned short
+  (0..=65535), not as a `u32`.
+- Block-section parsers no longer reserve memory from a wire-declared count before
+  parsing. A hostile count could previously have requested about 34 GB.
+
+### Known limitation
+
+The storage-rent recreation check still compares a box's script (R1) using
+re-serialized bytes, where the JVM compares the original bytes. A non-canonical
+script encoding can make the two differ. This is tracked for a follow-up.
+
 ## v0.8.2 — 2026-09-16
 
 ### Release summary
