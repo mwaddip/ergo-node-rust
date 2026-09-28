@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "enr-chain"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "ergo-chain-types",
  "ergo-lib",
@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "enr-p2p"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "blake2",
  "if-addrs",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "enr-state"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "anyhow",
  "blake2",
@@ -682,7 +682,7 @@ dependencies = [
 
 [[package]]
 name = "enr-store"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "parking_lot",
  "redb",
@@ -698,7 +698,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "ergo-api"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "axum",
  "blake2",
@@ -774,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "ergo-mempool"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "ergo-chain-types",
  "ergo-lib",
@@ -804,7 +804,7 @@ dependencies = [
 
 [[package]]
 name = "ergo-mining"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "blake2",
  "enr-chain",
@@ -846,7 +846,7 @@ dependencies = [
 
 [[package]]
 name = "ergo-node-rust"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "anyhow",
  "bytes",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "ergo-sync"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "blake2",
  "bytes",
@@ -905,7 +905,7 @@ dependencies = [
 
 [[package]]
 name = "ergo-validation"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "blake2",
  "bytes",
