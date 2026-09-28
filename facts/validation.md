@@ -441,6 +441,47 @@ The rule is not version-gated and applies to every input, storage-rent spends
 included. JSON input enforces the same id range (0..=127). A serializer holding
 more than 127 entries errors rather than truncating the count.
 
+**Nesting depth.** Values are parsed against sigmastate's reader nesting level
+(`CoreByteReader.level`, `MaxTreeDepth` = 110, `CoreByteReader.scala:127-129`).
+- **What takes a level:** each of these takes one level while it parses:
+  - a value or expression node (`ValueSerializer.deserialize`)
+  - a data value: a collection element, a tuple item, an option's content, or a Box
+    or Header (`CoreDataSerializer`, `DataSerializer`)
+  - a SigmaBoolean node
+- **Over the limit:** a parse that would go above 110 rejects the transaction. Inside
+  a size-flagged tree it rejects rather than degrading the tree.
+- **Release:** a level is released only when its parse succeeds, as in the JVM. So a
+  size-flagged tree that degrades to unparsed leaves its levels in place for the rest
+  of that transaction.
+- **Per transaction:** each transaction starts on a fresh reader state: level 0, and
+  empty constant and `ValDef` type stores. That is what ergo's
+  `ErgoTransactionSerializer.parse` gives it (`ErgoTransaction.scala:497-503`), and it
+  holds for a block's transactions too, which the node parses from one reader.
+
+**Type nesting (known divergence).** sigmastate's `TypeSerializer` passes a nesting
+depth down its recursion but never checks it (`TypeSerializer.scala:130-243`). Its only
+limit is the thread stack.
+- The pinned fork rejects a type nested deeper than 110, counted the same way. An
+  unbounded recursive parse aborts the process on an input of a few kilobytes.
+- The JVM parses some types the node rejects. An empty collection spends no value level
+  on its element type, so an element type nested 111 or more deep is valid to the JVM
+  there.
+- The bound is temporary. The Ergo team's rule replaces it.
+
+**ErgoTree framing.** These follow sigmastate's `ErgoTreeSerializer.deserializeErgoTree`:
+- **Read window:** a tree reads within its own window of `MaxPropositionSize` = 4096
+  bytes from its first byte. That window replaces the box's until the tree ends. A read
+  that starts past it trips rule 1014: a size-flagged tree degrades to unparsed, and an
+  unsized one rejects.
+- **Declared size:** a size-flagged tree's body is parsed on the box's reader and ends
+  where the body ends. The declared size only frames the raw bytes of a tree that
+  degrades.
+- **Root type:** a root that isn't a `SigmaProp` degrades a size-flagged tree and
+  rejects an unsized one (rule 1001).
+- **Type code 112:** before ErgoTree v3, type code 112 (a function type) is an unknown
+  type code. A size-flagged tree that carries it degrades. In an unsized tree, a
+  register or a context-extension value, it rejects.
+
 **Storage-rent spends.** An input takes the storage-rent path when all three
 hold: its box is at least `StoragePeriod` = 1,051,200 blocks old, its proof is
 empty, and its extension holds variable 127 (`ErgoInterpreter.scala:72-77`).
