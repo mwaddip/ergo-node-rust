@@ -374,6 +374,7 @@ mod tests {
     fn parse_extension_field_count_above_u16_max_is_err() {
         let mut data = Vec::new();
         data.extend_from_slice(&[0u8; 32]); // header_id
+
         // VLQ-encode 65_536 (out of range for u16). put_u32 produces the
         // same VLQ bytes as any encoder for this value; the type only
         // decides the range check on read.
@@ -410,6 +411,7 @@ mod tests {
     fn parse_block_transactions_hostile_count_is_err_without_allocating() {
         let mut data = Vec::new();
         data.extend_from_slice(&[0u8; 32]); // header_id
+
         // version sentinel for BlockVersion == 2
         let mut sentinel_buf = Vec::new();
         WriteSigmaVlqExt::put_u32(&mut sentinel_buf, BLOCK_VERSION_SENTINEL + 2).unwrap();
