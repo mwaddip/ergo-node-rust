@@ -1,5 +1,94 @@
 # Changelog
 
+## v0.8.4 — 2026-09-28
+
+### Release summary
+
+Security fix: a transaction of about 2 KB, from any peer, could abort the
+node. sigma-rust (the node's transaction-parsing library) parsed nested values
+and types recursively with no depth limit, so deep nesting overflowed the
+parsing thread's stack. Nesting is now bounded:
+- at the JVM's `MaxTreeDepth` for values
+- at the same number for types, where the JVM defines no limit
+
+The release also brings script parsing in line with the JVM, and ships a second
+crash fix (below). The sigma-rust fork is pinned at `0bd7199f`. Everything
+except the type bound is upstream as ergoplatform/sigma-rust #927.
+
+### Fixed
+
+#### Deeply nested values no longer crash the node
+
+Values are parsed against the JVM's nesting limit (`MaxTreeDepth` = 110). Each
+of these takes one level:
+- a value or expression node
+- a data value (a collection element, a tuple item, an option's content, a Box or
+  a Header)
+- a SigmaBoolean node
+
+A transaction that nests deeper is rejected at parse, as sigmastate does.
+
+Previously there was no limit. A context-extension value nested about 1,000
+levels deep overflowed the stack and aborted the process. It could arrive:
+- from any peer, as a relayed transaction or inside a delivered block section
+- through `POST /transactions`
+
+#### Each transaction parses on a fresh reader state
+
+The node parses a block's transactions from one reader. Each transaction now
+starts with the state the JVM's `ErgoTransactionSerializer` gives it: nesting
+level 0, and empty constant and `ValDef` stores. Before, state leaked from one
+transaction into the next:
+- a script that degraded to unparsed could make the following transaction fail
+- a `ValDef` in one transaction could satisfy a `ValUse` in the next
+
+#### Type nesting bounded
+
+A type nested deeper than 110 is rejected at parse. Without a bound, a type
+nested about 2,500 deep aborted the process, on its own or inside a deeply
+nested value. See the known limitation below.
+
+#### Type code 112 before ErgoTree v3 no longer panics
+
+Before ErgoTree v3, type code 112 (a function type) is now an unknown type code,
+as in the JVM:
+- a size-flagged script carrying it degrades to unparsed
+- anywhere else, the transaction is rejected
+
+Previously it panicked the parser.
+
+#### Script framing matches the JVM
+
+- A size-flagged script is parsed up to where its body actually ends. The declared
+  size only frames the bytes of a script that degrades to unparsed.
+- A script is read within its own 4096-byte window (`MaxPropositionSize`). A read
+  past it degrades a size-flagged script and rejects an unsized one.
+- An unsized script whose root isn't a `SigmaProp` is rejected at parse, as the
+  JVM does. Previously an output carrying one could be created.
+
+#### Indexer service reaches a mainnet node
+
+The indexer's systemd unit passed `--node-url http://127.0.0.1:9052`, the
+testnet API port. That flag overrode both `/etc/ergo-node/indexer.toml` and the
+built-in mainnet default, so on a mainnet node the indexer couldn't reach the
+node. The flag is gone, and the config file or the default (9053) applies.
+
+### Addons
+
+ergo-indexer 0.2.9 and ergo-fastsync 0.1.9 are pinned to the same sigma-rust as
+the node. The indexer parses every output script to derive its address. On the
+old pin that parse panicked on a script the node now accepts, a degraded
+script carrying type code 112.
+
+### Known limitations
+
+- **The type-nesting bound is a temporary divergence from the JVM.** The JVM has no
+  such bound, so it accepts some types the node rejects: an empty collection whose
+  element type nests 111 or more deep. The bound will follow the Ergo team's rule
+  once one exists.
+- **The v0.8.3 limitation still applies.** The storage-rent check compares a box's
+  script by re-serialized bytes.
+
 ## v0.8.3 — 2026-09-27
 
 ### Release summary
