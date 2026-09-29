@@ -164,13 +164,13 @@ impl super::Mempool {
         }
 
         // 6. Validate (returns script evaluation cost in block cost units)
-        let cost = match validate_single_transaction(
+        let validation_cost = match validate_single_transaction(
             &tx,
             input_boxes.clone(),
             data_boxes,
             state_context,
         ) {
-            Ok(script_cost) => script_cost.max(tx_bytes.len() as u64) as u32,
+            Ok(script_cost) => script_cost,
             Err(e) => {
                 self.invalidated.insert(tx_id);
                 return ProcessingOutcome::Invalidated {
@@ -178,6 +178,9 @@ impl super::Mempool {
                 };
             }
         };
+        // The weighting cost floors it at the serialized size; the entry keeps
+        // both.
+        let cost = validation_cost.max(tx_bytes.len() as u64) as u32;
 
         // Track validation cost for rate limiting
         if let Some(peer) = source {
@@ -249,6 +252,7 @@ impl super::Mempool {
             tx_bytes: tx_bytes.into(),
             fee,
             cost,
+            validation_cost: Some(validation_cost),
             created: now,
             last_checked: now,
             source,

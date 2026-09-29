@@ -87,6 +87,18 @@ impl OrderedPool {
         self.ordered.get(weight)
     }
 
+    /// Get a transaction and its weight by ID.
+    pub(crate) fn get_weighted(&self, tx_id: &[u8; 32]) -> Option<(&TxWeight, &UnconfirmedTx)> {
+        self.ordered.get_key_value(self.by_id.get(tx_id)?)
+    }
+
+    /// Get a transaction by ID, mutably. For its bookkeeping fields only: the
+    /// indexes hold copies of `tx`'s inputs and outputs and of `tx_bytes`.
+    pub(crate) fn get_mut(&mut self, tx_id: &[u8; 32]) -> Option<&mut UnconfirmedTx> {
+        let weight = self.by_id.get(tx_id)?;
+        self.ordered.get_mut(weight)
+    }
+
     /// Check if tx ID is in pool.
     pub fn contains(&self, tx_id: &[u8; 32]) -> bool {
         self.by_id.contains_key(tx_id)

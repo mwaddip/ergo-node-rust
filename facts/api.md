@@ -226,6 +226,8 @@ All errors on the main listener return a JSON body matching the JVM format:
 - `403` — authentication required but missing or invalid
 - `404` — resource not found (unknown header ID, box ID, tx ID)
 - `410` — resource was pruned (e.g., `/blocks/{id}/validation-fragments` after `blocks_to_keep` clipped the section)
+- `413` — request body too large
+- `415` — a JSON endpoint's body not sent as `application/json`
 - `429` — rate limited (if HTTP-level rate limiting is added at a reverse proxy)
 - `500` — internal error (component failure, should not happen)
 - `503` — node is syncing or a required subsystem (mining, modifier pipeline, state context) is not yet available
@@ -235,7 +237,12 @@ internal information (stack traces, component errors) and should be omitted
 in production or restricted to authenticated requests.
 
 All endpoints, including Rust-only ones, return errors via the standard
-`ApiError` shape above. Endpoints that need to expose a programmatic
+`ApiError` shape above. That includes a request refused before any handler
+logic runs: a malformed query string or path segment, or a body that isn't
+valid JSON for the endpoint. It also includes a request no route matches
+(404), a known path asked with a method it doesn't serve (405), and a
+response that fails to serialize (500). HEAD answers keep an empty body.
+Endpoints that need to expose a programmatic
 dispatch key (the cross-validator harness keying off
 `/blocks/{id}/validation-fragments`, the capture endpoints' on/off probe)
 carry a short code string in `reason` and any context in `detail`. See
@@ -296,7 +303,7 @@ bind_address = "127.0.0.1:9055"   # Loopback-only by default
 
 - **Paths** use kebab-case multi-word segments (`validation-fragments`,
   `api-urls`) and lowerCamelCase for JVM-aligned segments (`lastHeaders`,
-  `byTransactionId`, `getSnapshotsInfo`, `popowHeader`). JVM-aligned segments
+  `byTransactionId`, `getSnapshotsInfo`, `popowHeaderById`). JVM-aligned segments
   keep the JVM spelling exactly so existing tooling works; new Rust-only
   paths use kebab-case.
 - **JSON keys** use camelCase. The `serde(rename_all = "camelCase")`
@@ -322,6 +329,17 @@ hit the cap must check the returned length against the requested limit.
 - Block listings: descending by height (newest first).
 - Mempool listings: descending by priority (highest fee weight first).
 - Peer listings: insertion / observation order; not stable across restarts.
+
+### Transaction JSON
+
+Every response that renders a transaction lists each input's
+context-extension entries in the order the transaction serializes them: the
+order its id is computed over. A client that re-serializes the JSON, taking
+the entries in the order given, must get the transaction's id back. JSON
+object keys are otherwise unordered, but this map's order is part of the
+transaction. The rendering must not re-sort it: a `serde_json::Value` object
+built without `preserve_order` sorts its keys as strings, so `"8"` would come
+after `"4"`, and `"10"` before `"2"`.
 
 ### Synced-state semantics
 
@@ -367,6 +385,10 @@ uptime as `currentTime - launchTime`.
 - The API crate never mutates chain, state, or store. It has read-only access.
 - The API crate mutates mempool only through `mempool.process()`. No direct
   pool manipulation.
+- A handler that reads the pool holds the mempool lock only to copy out
+  what it needs. The P2P transaction intake waits on the same lock, so
+  UTXO-set reads and serialization happen after the handler releases it.
+  `process()` is the exception: it validates under the lock by design.
 - All box IDs and transaction IDs in responses are hex-encoded (matching JVM).
 - All header IDs in responses are hex-encoded (matching JVM).
 - All ERG amounts are in nanoERG (1 ERG = 10^9 nanoERG).

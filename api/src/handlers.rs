@@ -1,13 +1,18 @@
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::Json;
 use serde::Deserialize;
 
 use std::sync::Arc;
 
+use ergo_lib::chain::transaction::{DataInput, Input};
+use ergo_lib::ergotree_ir::chain::ergo_box::{BoxId, ErgoBox};
+use ergo_lib::ergotree_ir::chain::tx_id::TxId;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+use ergo_mempool::Mempool;
 use sigma_ser::ScorexSerializable;
 
+use crate::extract::{ApiBytes, ApiJson, ApiPath, ApiQuery};
+use crate::response::{json_body, Json};
 use crate::types::*;
 use crate::ApiState;
 
@@ -24,7 +29,7 @@ fn err<T>(status: StatusCode, reason: impl Into<String>) -> ApiResult<T> {
 /// Build an `(StatusCode, Json<ApiError>)` tuple ready for `Err(...)`, `ok_or_else`,
 /// or `map_err`. The `error` field mirrors the HTTP status code, matching the JVM
 /// node's `ApiError` shape.
-fn api_error(
+pub(crate) fn api_error(
     status: StatusCode,
     reason: impl Into<String>,
     detail: Option<String>,
@@ -162,6 +167,32 @@ fn subtle_constant_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Requests no route serves: the router's fallbacks
+// ---------------------------------------------------------------------------
+
+/// A path no route matches.
+pub async fn unknown_path(uri: axum::http::Uri) -> (StatusCode, Json<ApiError>) {
+    api_error(
+        StatusCode::NOT_FOUND,
+        "unknown endpoint",
+        Some(format!("path={}", uri.path())),
+    )
+}
+
+/// A path a route matches, asked with a method it doesn't serve. axum adds
+/// the `Allow` header.
+pub async fn method_not_allowed(
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+) -> (StatusCode, Json<ApiError>) {
+    api_error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method not allowed",
+        Some(format!("{method} {}", uri.path())),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // GET /info
 // ---------------------------------------------------------------------------
 
@@ -237,7 +268,7 @@ pub async fn get_info(State(state): State<ApiState>) -> Json<NodeInfo> {
 
 pub async fn get_block_ids_at_height(
     State(state): State<ApiState>,
-    Path(height): Path<u32>,
+    ApiPath(height): ApiPath<u32>,
 ) -> ApiResult<Vec<String>> {
     match state.chain.header_at(height) {
         Some(header) => Ok(Json(vec![hex::encode(header.id.0.as_ref())])),
@@ -251,7 +282,7 @@ pub async fn get_block_ids_at_height(
 
 pub async fn get_block_header(
     State(state): State<ApiState>,
-    Path(header_id): Path<String>,
+    ApiPath(header_id): ApiPath<String>,
 ) -> ApiResult<ergo_chain_types::Header> {
     let id = hex_to_id(&header_id)?;
     match state.chain.header_by_id(&id) {
@@ -267,9 +298,24 @@ pub async fn get_block_header(
 /// Block transactions section type ID (Ergo modifier type 102).
 const BLOCK_TRANSACTIONS_TYPE: u8 = 102;
 
+/// The block transactions section stored as `data`, as the JVM renders its
+/// `BlockTransactions` (v6.0.6): the one object `/blocks/{id}/transactions`,
+/// `/blocks/{id}` as `blockTransactions`, and `/blocks/modifier/{id}` answer.
+/// `size` is the stored section's length in bytes.
+fn block_transactions_section(data: &[u8]) -> Result<BlockTransactionsSection, String> {
+    let parsed = ergo_validation::parse_block_transactions(data)
+        .map_err(|e| format!("failed to parse stored transactions: {e}"))?;
+    Ok(BlockTransactionsSection {
+        header_id: hex::encode(parsed.header_id),
+        transactions: parsed.transactions,
+        block_version: parsed.block_version,
+        size: data.len(),
+    })
+}
+
 pub async fn get_block_transactions(
     State(state): State<ApiState>,
-    Path(header_id): Path<String>,
+    ApiPath(header_id): ApiPath<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -295,23 +341,13 @@ pub async fn get_block_transactions(
     // block); parse+serialize go on the blocking pool to avoid starving the
     // async reactor under concurrent load.
     let rendered = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        let parsed = ergo_validation::parse_block_transactions(&data)
-            .map_err(|e| format!("failed to parse stored transactions: {e}"))?;
-        let value = serde_json::json!({
-            "headerId": header_id,
-            "transactions": parsed.transactions,
-        });
-        serde_json::to_vec(&value).map_err(|e| format!("failed to serialize transactions: {e}"))
+        let section = block_transactions_section(&data)?;
+        serde_json::to_vec(&section).map_err(|e| format!("failed to serialize transactions: {e}"))
     })
     .await;
 
     match rendered {
-        Ok(Ok(bytes)) => (
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            bytes,
-        )
-            .into_response(),
+        Ok(Ok(bytes)) => json_body(bytes),
         Ok(Err(reason)) => {
             api_error(StatusCode::INTERNAL_SERVER_ERROR, reason, None).into_response()
         }
@@ -330,7 +366,7 @@ pub async fn get_block_transactions(
 
 pub async fn get_last_headers(
     State(state): State<ApiState>,
-    Path(count): Path<u32>,
+    ApiPath(count): ApiPath<u32>,
 ) -> Json<Vec<ergo_chain_types::Header>> {
     let count = count.min(100);
     let height = state.chain.height();
@@ -349,7 +385,7 @@ pub async fn get_last_headers(
 
 pub async fn post_transaction(
     State(state): State<ApiState>,
-    Json(tx): Json<ergo_validation::Transaction>,
+    ApiJson(tx): ApiJson<ergo_validation::Transaction>,
 ) -> ApiResult<String> {
     process_transaction(state, tx, true).await
 }
@@ -360,7 +396,7 @@ pub async fn post_transaction(
 
 pub async fn check_transaction(
     State(state): State<ApiState>,
-    Json(tx): Json<ergo_validation::Transaction>,
+    ApiJson(tx): ApiJson<ergo_validation::Transaction>,
 ) -> ApiResult<String> {
     process_transaction(state, tx, false).await
 }
@@ -370,17 +406,6 @@ async fn process_transaction(
     tx: ergo_validation::Transaction,
     add_to_pool: bool,
 ) -> ApiResult<String> {
-    let ctx_guard = state.state_context.read().await;
-    let ctx = match ctx_guard.as_ref() {
-        Some(c) => c,
-        None => {
-            return err(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "node is syncing, cannot validate transactions yet",
-            )
-        }
-    };
-
     // Compute tx_id hex string
     let tx_id_hex = String::from(tx.id());
 
@@ -391,6 +416,31 @@ async fn process_transaction(
             return err(
                 StatusCode::BAD_REQUEST,
                 format!("transaction serialization failed: {e}"),
+            )
+        }
+    };
+
+    // The JVM refuses a transaction over `maxTransactionSize` before it
+    // verifies anything, so while the node is syncing too (facts/api.md
+    // § Transaction Submission Flow, step 2a).
+    if tx_bytes.len() > ergo_mempool::MAX_TRANSACTION_SIZE {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "transaction is {} bytes, over the {} byte limit",
+                tx_bytes.len(),
+                ergo_mempool::MAX_TRANSACTION_SIZE
+            ),
+        );
+    }
+
+    let ctx_guard = state.state_context.read().await;
+    let ctx = match ctx_guard.as_ref() {
+        Some(c) => c,
+        None => {
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "node is syncing, cannot validate transactions yet",
             )
         }
     };
@@ -496,6 +546,10 @@ impl ergo_mempool::types::UtxoReader for UtxoReaderAdapter<'_> {
 
 // ---------------------------------------------------------------------------
 // GET /transactions/unconfirmed
+// GET /transactions/unconfirmed/byTransactionId/{tx_id}
+//
+// Each transaction rendered as the JVM's `UnconfirmedTransaction`, inputs
+// resolved to the boxes they spend.
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -510,27 +564,138 @@ fn default_limit() -> usize {
     50
 }
 
+/// Whether this node resolves an unconfirmed input to the box it spends.
+/// Only a node holding the UTXO set does: the JVM's digest node resolves
+/// none, and neither does a `digest` or `light` node here.
+fn resolves_inputs(node: &crate::NodeMeta) -> bool {
+    node.state_type == "utxo"
+}
+
+/// The 32 bytes a box lookup is keyed by.
+fn box_id_bytes(id: BoxId) -> [u8; 32] {
+    ergo_chain_types::Digest32::from(id).0
+}
+
+/// A pool entry as `/transactions/unconfirmed*` renders it, copied out under
+/// the mempool lock. The P2P intake waits on that lock, so the UTXO set is
+/// read after it is released, and the pool's part of each input's
+/// resolution is taken here: the output of another pool transaction that
+/// the input spends.
+struct PoolEntry {
+    id: TxId,
+    /// Each input, with the pool output it spends, if any. Always `None` on
+    /// a node that doesn't resolve inputs.
+    inputs: Vec<(Input, Option<ErgoBox>)>,
+    data_inputs: Vec<DataInput>,
+    outputs: Vec<ErgoBox>,
+    size: usize,
+    cost: Option<u64>,
+}
+
+impl PoolEntry {
+    fn take(utx: &ergo_mempool::types::UnconfirmedTx, pool: &Mempool, resolve: bool) -> Self {
+        let tx = &utx.tx;
+        let inputs = tx
+            .inputs
+            .iter()
+            .map(|input| {
+                let pool_output = if resolve {
+                    pool.unconfirmed_box(&box_id_bytes(input.box_id)).cloned()
+                } else {
+                    None
+                };
+                (input.clone(), pool_output)
+            })
+            .collect();
+        PoolEntry {
+            id: tx.id(),
+            inputs,
+            data_inputs: tx
+                .data_inputs
+                .as_ref()
+                .map(|d| d.as_vec().clone())
+                .unwrap_or_default(),
+            outputs: tx.outputs.as_vec().clone(),
+            size: utx.tx_bytes.len(),
+            cost: utx.validation_cost,
+        }
+    }
+
+    /// Resolve each input against the UTXO set, then against the pool
+    /// output taken with the entry: the order `/utxo/withPool` looks a box
+    /// up in. `utxo` is `None` on a node that doesn't resolve inputs.
+    fn render(self, utxo: Option<&dyn crate::UtxoAccess>) -> UnconfirmedTransaction {
+        let inputs = self
+            .inputs
+            .into_iter()
+            .map(|(input, pool_output)| {
+                let spent = utxo
+                    .and_then(|utxo| utxo.box_by_id(&box_id_bytes(input.box_id)))
+                    .or(pool_output);
+                match spent {
+                    Some(spent) => UnconfirmedInput::Resolved {
+                        spent: Box::new(spent),
+                        spending_proof: input.spending_proof,
+                    },
+                    None => UnconfirmedInput::Unresolved(input),
+                }
+            })
+            .collect();
+        UnconfirmedTransaction {
+            id: self.id,
+            inputs,
+            data_inputs: self.data_inputs,
+            outputs: self.outputs,
+            size: self.size,
+            cost: self.cost,
+        }
+    }
+}
+
+/// Run `render` off the async runtime: resolving reads the UTXO set once
+/// per input, and a page can hold thousands of inputs. `render` gets the
+/// UTXO reader on a node that resolves inputs, `None` on one that doesn't.
+async fn render_unconfirmed<T: Send + 'static>(
+    state: &ApiState,
+    resolve: bool,
+    render: impl FnOnce(Option<&dyn crate::UtxoAccess>) -> T + Send + 'static,
+) -> Result<T, (StatusCode, Json<ApiError>)> {
+    let utxo = resolve.then(|| Arc::clone(&state.utxo_reader));
+    tokio::task::spawn_blocking(move || render(utxo.as_deref()))
+        .await
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unconfirmed rendering task failed: {e}"),
+                None,
+            )
+        })
+}
+
 pub async fn get_unconfirmed(
     State(state): State<ApiState>,
-    Query(params): Query<PaginationParams>,
-) -> Json<Vec<serde_json::Value>> {
+    ApiQuery(params): ApiQuery<PaginationParams>,
+) -> ApiResult<Vec<UnconfirmedTransaction>> {
     let limit = params.limit.min(100);
     let offset = params.offset.min(100_000);
-    let pool = state.mempool.lock().await;
-    let txs: Vec<_> = pool
-        .all_prioritized()
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .filter_map(|utx| match serde_json::to_value(&utx.tx) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                tracing::warn!(error = %e, tx_id = %hex::encode(utx.tx.id().0.0), "unconfirmed_transactions: serde failed; tx omitted");
-                None
-            }
-        })
-        .collect();
-    Json(txs)
+    let resolve = resolves_inputs(&state.node_info);
+    let entries: Vec<PoolEntry> = {
+        let pool = state.mempool.lock().await;
+        pool.all_prioritized()
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|utx| PoolEntry::take(utx, &pool, resolve))
+            .collect()
+    };
+    render_unconfirmed(&state, resolve, move |utxo| {
+        entries
+            .into_iter()
+            .map(|entry| entry.render(utxo))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map(Json)
 }
 
 // ---------------------------------------------------------------------------
@@ -538,9 +703,8 @@ pub async fn get_unconfirmed(
 // ---------------------------------------------------------------------------
 
 pub async fn get_unconfirmed_ids(State(state): State<ApiState>) -> Json<Vec<String>> {
-    let pool = state.mempool.lock().await;
-    let ids: Vec<String> = pool.tx_ids().into_iter().map(hex::encode).collect();
-    Json(ids)
+    let ids = state.mempool.lock().await.tx_ids();
+    Json(ids.into_iter().map(hex::encode).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -549,81 +713,143 @@ pub async fn get_unconfirmed_ids(State(state): State<ApiState>) -> Json<Vec<Stri
 
 pub async fn get_unconfirmed_by_id(
     State(state): State<ApiState>,
-    Path(tx_id): Path<String>,
-) -> ApiResult<serde_json::Value> {
+    ApiPath(tx_id): ApiPath<String>,
+) -> ApiResult<UnconfirmedTransaction> {
     let id = hex_to_id(&tx_id)?;
-    let pool = state.mempool.lock().await;
-    match pool.get(&id) {
-        Some(utx) => match serde_json::to_value(&utx.tx) {
-            Ok(v) => Ok(Json(v)),
-            Err(e) => err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("serialization failed: {e}"),
-            ),
-        },
-        None => err(StatusCode::NOT_FOUND, "transaction not in mempool"),
-    }
+    let resolve = resolves_inputs(&state.node_info);
+    let entry = {
+        let pool = state.mempool.lock().await;
+        match pool.get(&id) {
+            Some(utx) => PoolEntry::take(utx, &pool, resolve),
+            None => return err(StatusCode::NOT_FOUND, "transaction not in mempool"),
+        }
+    };
+    render_unconfirmed(&state, resolve, move |utxo| entry.render(utxo))
+        .await
+        .map(Json)
 }
 
 // ---------------------------------------------------------------------------
 // GET /transactions/getFee
+// GET /transactions/waitTime
+// GET /transactions/poolHistogram
+//
+// The JVM's parameters, defaults and bare JSON answers
+// (`TransactionsApiRoute`, v6.0.6). The arithmetic is the mempool's
+// (facts/mempool.md § Fee queries); these handlers refuse what its
+// preconditions exclude.
 // ---------------------------------------------------------------------------
+
+/// `value` as the unsigned type the mempool takes, or 400 when it is
+/// negative. `name` is the parameter's spelling in the query string.
+fn non_negative<T, U: TryFrom<T>>(value: T, name: &str) -> Result<U, (StatusCode, Json<ApiError>)> {
+    U::try_from(value).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            format!("{name} must not be negative"),
+            None,
+        )
+    })
+}
+
+fn default_tx_size() -> i32 {
+    100
+}
 
 #[derive(Deserialize)]
 pub struct FeeParams {
-    #[serde(default = "default_wait_time")]
-    #[serde(rename = "waitTime")]
-    wait_time: u64,
-    #[serde(default = "default_tx_size")]
-    #[serde(rename = "txSize")]
-    tx_size: usize,
+    /// Minutes.
+    #[serde(rename = "waitTime", default = "default_wait_minutes")]
+    wait_time: i32,
+    /// Bytes.
+    #[serde(rename = "txSize", default = "default_tx_size")]
+    tx_size: i32,
 }
 
-fn default_wait_time() -> u64 {
+fn default_wait_minutes() -> i32 {
     1
-}
-fn default_tx_size() -> usize {
-    100
 }
 
 pub async fn get_recommended_fee(
     State(state): State<ApiState>,
-    Query(params): Query<FeeParams>,
-) -> ApiResult<FeeResponse> {
-    let pool = state.mempool.lock().await;
-    // Convert wait_time from blocks to approximate milliseconds
-    // (Ergo target block time ~2 minutes = 120_000ms)
-    let wait_time = params.wait_time.min(100);
-    let tx_size = params.tx_size.min(1_000_000);
-    let wait_ms = wait_time.saturating_mul(120_000);
-    match pool.recommended_fee(wait_ms, tx_size) {
-        Some(fee) => Ok(Json(FeeResponse { fee })),
-        None => err(StatusCode::BAD_REQUEST, "insufficient fee history"),
-    }
+    ApiQuery(params): ApiQuery<FeeParams>,
+) -> ApiResult<u64> {
+    let wait_minutes = non_negative(params.wait_time, "waitTime")?;
+    let tx_size = non_negative(params.tx_size, "txSize")?;
+    let fee = state
+        .mempool
+        .lock()
+        .await
+        .recommended_fee(wait_minutes, tx_size);
+    Ok(Json(fee))
 }
 
-// ---------------------------------------------------------------------------
-// GET /transactions/poolHistogram
-// ---------------------------------------------------------------------------
+#[derive(Deserialize)]
+pub struct WaitTimeParams {
+    /// NanoERG.
+    #[serde(default = "default_wait_fee")]
+    fee: i64,
+    /// Bytes.
+    #[serde(rename = "txSize", default = "default_tx_size")]
+    tx_size: i32,
+}
+
+fn default_wait_fee() -> i64 {
+    1000
+}
+
+pub async fn get_wait_time(
+    State(state): State<ApiState>,
+    ApiQuery(params): ApiQuery<WaitTimeParams>,
+) -> ApiResult<u64> {
+    let fee = non_negative(params.fee, "fee")?;
+    let tx_size = match u32::try_from(params.tx_size) {
+        Ok(size) if size > 0 => size,
+        _ => return err(StatusCode::BAD_REQUEST, "txSize must be positive"),
+    };
+    let wait_ms = state.mempool.lock().await.expected_wait_ms(fee, tx_size);
+    Ok(Json(wait_ms))
+}
+
+/// Most bins `poolHistogram` answers. The JVM has no bound.
+const MAX_HISTOGRAM_BINS: u32 = 1000;
 
 #[derive(Deserialize)]
 pub struct HistogramParams {
     #[serde(default = "default_bins")]
-    bins: usize,
+    bins: i32,
+    /// Milliseconds.
+    #[serde(default = "default_max_wait_ms")]
+    maxtime: i64,
 }
 
-fn default_bins() -> usize {
+fn default_bins() -> i32 {
     10
+}
+
+fn default_max_wait_ms() -> i64 {
+    60_000
 }
 
 pub async fn get_pool_histogram(
     State(state): State<ApiState>,
-    Query(params): Query<HistogramParams>,
-) -> Json<serde_json::Value> {
-    let bins = params.bins.min(50);
-    let pool = state.mempool.lock().await;
-    let histogram = pool.fee_histogram(bins);
-    Json(serde_json::to_value(histogram).unwrap_or(serde_json::Value::Array(vec![])))
+    ApiQuery(params): ApiQuery<HistogramParams>,
+) -> ApiResult<Vec<ergo_mempool::stats::FeeHistogramBin>> {
+    let bins = match u32::try_from(params.bins) {
+        Ok(bins) if (1..=MAX_HISTOGRAM_BINS).contains(&bins) => bins,
+        _ => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("bins must be between 1 and {MAX_HISTOGRAM_BINS}"),
+            )
+        }
+    };
+    let max_wait_ms = match u64::try_from(params.maxtime) {
+        Ok(ms) if ms >= u64::from(bins) => ms,
+        _ => return err(StatusCode::BAD_REQUEST, "maxtime must be at least bins"),
+    };
+    let histogram = state.mempool.lock().await.pool_histogram(bins, max_wait_ms);
+    Ok(Json(histogram))
 }
 
 // ---------------------------------------------------------------------------
@@ -632,7 +858,7 @@ pub async fn get_pool_histogram(
 
 pub async fn get_utxo_by_id(
     State(state): State<ApiState>,
-    Path(box_id): Path<String>,
+    ApiPath(box_id): ApiPath<String>,
 ) -> ApiResult<ergo_validation::ErgoBox> {
     let id = hex_to_id(&box_id)?;
     match state.utxo_reader.box_by_id(&id) {
@@ -647,7 +873,7 @@ pub async fn get_utxo_by_id(
 
 pub async fn get_utxo_with_pool(
     State(state): State<ApiState>,
-    Path(box_id): Path<String>,
+    ApiPath(box_id): ApiPath<String>,
 ) -> ApiResult<ergo_validation::ErgoBox> {
     let id = hex_to_id(&box_id)?;
     // Check confirmed UTXO set first
@@ -732,7 +958,7 @@ fn url_host_matches_addr(url: &str, addr: &std::net::SocketAddr) -> bool {
 pub async fn post_ingest_modifiers(
     axum::extract::ConnectInfo(remote): axum::extract::ConnectInfo<std::net::SocketAddr>,
     State(state): State<ApiState>,
-    body: axum::body::Bytes,
+    ApiBytes(body): ApiBytes,
 ) -> ApiResult<serde_json::Value> {
     // Localhost-only: reject requests from non-loopback addresses
     if !remote.ip().is_loopback() {
@@ -796,7 +1022,7 @@ pub async fn post_ingest_modifiers(
 /// unbounded iteration (the loop is O(height)).
 const MAX_EMISSION_HEIGHT: u32 = 2_100_000;
 
-pub async fn get_emission_at(Path(height): Path<u32>) -> ApiResult<EmissionInfo> {
+pub async fn get_emission_at(ApiPath(height): ApiPath<u32>) -> ApiResult<EmissionInfo> {
     use ergo_lib::chain::emission::{EmissionRules, MonetarySettings};
 
     if height > MAX_EMISSION_HEIGHT {
@@ -831,14 +1057,14 @@ pub async fn get_emission_at(Path(height): Path<u32>) -> ApiResult<EmissionInfo>
 
 pub async fn get_nipopow_proof(
     State(state): State<ApiState>,
-    Path((m, k)): Path<(u32, u32)>,
+    ApiPath((m, k)): ApiPath<(u32, u32)>,
 ) -> ApiResult<serde_json::Value> {
     nipopow_proof_response(Arc::clone(&state.chain), m, k, None).await
 }
 
 pub async fn get_nipopow_proof_by_header(
     State(state): State<ApiState>,
-    Path((m, k, header_id)): Path<(u32, u32, String)>,
+    ApiPath((m, k, header_id)): ApiPath<(u32, u32, String)>,
 ) -> ApiResult<serde_json::Value> {
     let id = hex_to_id(&header_id)?;
     // Surface "unknown header_id" as 404 before kicking off the (potentially
@@ -1004,7 +1230,7 @@ pub struct SolutionSubmission {
 
 pub async fn post_mining_solution(
     State(state): State<ApiState>,
-    Json(submission): Json<SolutionSubmission>,
+    ApiJson(submission): ApiJson<SolutionSubmission>,
 ) -> ApiResult<serde_json::Value> {
     let mining = state.mining.as_ref().ok_or_else(mining_err)?;
 
@@ -1206,7 +1432,7 @@ pub struct WaitQuery {
 
 pub async fn info_wait(
     State(state): State<ApiState>,
-    Query(params): Query<WaitQuery>,
+    ApiQuery(params): ApiQuery<WaitQuery>,
 ) -> Result<Json<crate::types::NodeInfo>, StatusCode> {
     let current = state
         .validated_height
@@ -1338,7 +1564,7 @@ pub struct CaptureDumpQuery {
 /// subsystem to be on, in contrast to `/info`'s probe-friendly 200.
 pub async fn get_capture_dump(
     State(state): State<ApiState>,
-    Query(query): Query<CaptureDumpQuery>,
+    ApiQuery(query): ApiQuery<CaptureDumpQuery>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -1529,7 +1755,7 @@ fn read_proc_memory() -> ProcessMemory {
 
 pub async fn get_blocks(
     State(state): State<ApiState>,
-    Query(params): Query<PaginationParams>,
+    ApiQuery(params): ApiQuery<PaginationParams>,
 ) -> Json<Vec<String>> {
     let limit = params.limit.min(100) as u32;
     let offset = params.offset.min(u32::MAX as usize) as u32;
@@ -1548,8 +1774,8 @@ const HEADER_TYPE: u8 = 101;
 
 pub async fn get_full_block(
     State(state): State<ApiState>,
-    Path(header_id): Path<String>,
-) -> ApiResult<serde_json::Value> {
+    ApiPath(header_id): ApiPath<String>,
+) -> ApiResult<FullBlock> {
     let id = hex_to_id(&header_id)?;
     let header = match state.chain.header_by_id(&id) {
         Some(h) => h,
@@ -1563,48 +1789,32 @@ pub async fn get_full_block(
         &id,
         header.transaction_root.0.as_ref(),
     );
-    let txs_value = match state.store.get(BLOCK_TRANSACTIONS_TYPE, &txs_modifier_id) {
-        Some(data) => {
-            let parsed = ergo_validation::parse_block_transactions(&data).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError {
-                        error: 500,
-                        reason: format!("failed to parse stored transactions: {e}"),
-                        detail: None,
-                    }),
-                )
-            })?;
-            serde_json::json!({
-                "headerId": header_id_hex,
-                "transactions": parsed.transactions,
-                "blockVersion": parsed.block_version,
-                "size": data.len(),
-            })
-        }
+    let block_transactions = match state.store.get(BLOCK_TRANSACTIONS_TYPE, &txs_modifier_id) {
+        Some(data) => block_transactions_section(&data)
+            .map_err(|reason| api_error(StatusCode::INTERNAL_SERVER_ERROR, reason, None))?,
         None => return err(StatusCode::NOT_FOUND, "transactions not found"),
     };
 
     // AD proofs (optional in JVM): keyed by blake2b256(104 || header_id || ad_proofs_root).
     // Stored format: [header_id: 32B] [proof_size: VLQ u32] [proof_bytes: proof_size B].
     let ad_modifier_id = section_modifier_id(AD_PROOFS_TYPE, &id, header.ad_proofs_root.0.as_ref());
-    let ad_proofs_value = state
+    let ad_proofs = state
         .store
         .get(AD_PROOFS_TYPE, &ad_modifier_id)
         .and_then(|data| {
             let proof_bytes = inline_ad_proof_bytes(&data)?;
-            Some(serde_json::json!({
-                "headerId": header_id_hex,
-                "proofBytes": hex::encode(proof_bytes),
-                "digest": hex::encode(header.ad_proofs_root.0.as_ref()),
-                "size": data.len(),
-            }))
+            Some(AdProofsSection {
+                header_id: header_id_hex.clone(),
+                proof_bytes: hex::encode(proof_bytes),
+                digest: Some(hex::encode(header.ad_proofs_root.0.as_ref())),
+                size: data.len(),
+            })
         });
 
     // Extension: keyed by blake2b256(108 || header_id || extension_root).
     let ext_modifier_id =
         section_modifier_id(EXTENSION_TYPE, &id, header.extension_root.0.as_ref());
-    let extension_value = match state.store.get(EXTENSION_TYPE, &ext_modifier_id) {
+    let extension = match state.store.get(EXTENSION_TYPE, &ext_modifier_id) {
         Some(data) => {
             let parsed = ergo_validation::parse_extension(&data).map_err(|e| {
                 (
@@ -1621,36 +1831,21 @@ pub async fn get_full_block(
                 .iter()
                 .map(|f| [hex::encode(f.key), hex::encode(&f.value)])
                 .collect();
-            serde_json::json!({
-                "headerId": header_id_hex,
-                "digest": hex::encode(header.extension_root.0.as_ref()),
-                "fields": fields,
-            })
+            ExtensionSection {
+                header_id: header_id_hex,
+                digest: Some(hex::encode(header.extension_root.0.as_ref())),
+                fields,
+            }
         }
         None => return err(StatusCode::NOT_FOUND, "extension not found"),
     };
 
-    let mut full = serde_json::Map::new();
-    full.insert(
-        "header".into(),
-        serde_json::to_value(&header).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: 500,
-                    reason: format!("header serialization failed: {e}"),
-                    detail: None,
-                }),
-            )
-        })?,
-    );
-    full.insert("blockTransactions".into(), txs_value);
-    full.insert("extension".into(), extension_value);
-    full.insert(
-        "adProofs".into(),
-        ad_proofs_value.unwrap_or(serde_json::Value::Null),
-    );
-    Ok(Json(serde_json::Value::Object(full)))
+    Ok(Json(FullBlock {
+        header,
+        block_transactions,
+        extension,
+        ad_proofs,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1659,8 +1854,8 @@ pub async fn get_full_block(
 
 pub async fn get_block_modifier(
     State(state): State<ApiState>,
-    Path(modifier_id): Path<String>,
-) -> ApiResult<serde_json::Value> {
+    ApiPath(modifier_id): ApiPath<String>,
+) -> ApiResult<BlockModifier> {
     let id = hex_to_id(&modifier_id)?;
     for &type_id in &[
         HEADER_TYPE,
@@ -1671,44 +1866,22 @@ pub async fn get_block_modifier(
         let Some(data) = state.store.get(type_id, &id) else {
             continue;
         };
-        let id_hex = hex::encode(id);
-        let value = match type_id {
+        let modifier = match type_id {
             HEADER_TYPE => {
                 // Headers stored by header ID, so id IS the header ID.
                 match state.chain.header_by_id(&id) {
-                    Some(h) => serde_json::to_value(&h).map_err(|e| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ApiError {
-                                error: 500,
-                                reason: format!("header serialization failed: {e}"),
-                                detail: None,
-                            }),
-                        )
-                    })?,
-                    None => {
-                        serde_json::json!({ "type": "header", "id": id_hex, "size": data.len() })
-                    }
+                    Some(h) => BlockModifier::Header(Box::new(h)),
+                    None => BlockModifier::StoredHeader {
+                        kind: "header",
+                        id: hex::encode(id),
+                        size: data.len(),
+                    },
                 }
             }
-            BLOCK_TRANSACTIONS_TYPE => {
-                let parsed = ergo_validation::parse_block_transactions(&data).map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiError {
-                            error: 500,
-                            reason: format!("parse failed: {e}"),
-                            detail: None,
-                        }),
-                    )
-                })?;
-                serde_json::json!({
-                    "headerId": hex::encode(parsed.header_id),
-                    "transactions": parsed.transactions,
-                    "blockVersion": parsed.block_version,
-                    "size": data.len(),
-                })
-            }
+            BLOCK_TRANSACTIONS_TYPE => BlockModifier::BlockTransactions(
+                block_transactions_section(&data)
+                    .map_err(|reason| api_error(StatusCode::INTERNAL_SERVER_ERROR, reason, None))?,
+            ),
             AD_PROOFS_TYPE => {
                 // Stored: [header_id: 32B] [proof_size: VLQ] [proof_bytes].
                 if data.len() < 32 {
@@ -1719,10 +1892,11 @@ pub async fn get_block_modifier(
                     Some(b) => b,
                     None => return err(StatusCode::INTERNAL_SERVER_ERROR, "malformed ad_proofs"),
                 };
-                serde_json::json!({
-                    "headerId": inner_header_id,
-                    "proofBytes": hex::encode(proof_bytes),
-                    "size": data.len(),
+                BlockModifier::AdProofs(AdProofsSection {
+                    header_id: inner_header_id,
+                    proof_bytes: hex::encode(proof_bytes),
+                    digest: None,
+                    size: data.len(),
                 })
             }
             EXTENSION_TYPE => {
@@ -1741,14 +1915,15 @@ pub async fn get_block_modifier(
                     .iter()
                     .map(|f| [hex::encode(f.key), hex::encode(&f.value)])
                     .collect();
-                serde_json::json!({
-                    "headerId": hex::encode(parsed.header_id),
-                    "fields": fields,
+                BlockModifier::Extension(ExtensionSection {
+                    header_id: hex::encode(parsed.header_id),
+                    digest: None,
+                    fields,
                 })
             }
             _ => unreachable!(),
         };
-        return Ok(Json(value));
+        return Ok(Json(modifier));
     }
     err(StatusCode::NOT_FOUND, "modifier not found")
 }
@@ -1780,71 +1955,40 @@ fn hex_to_id_status(hex_str: &str) -> Result<[u8; 32], ()> {
 }
 
 // ---------------------------------------------------------------------------
-// GET /transactions/waitTime?fee=...&txSize=...
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-pub struct WaitTimeParams {
-    fee: u64,
-    #[serde(rename = "txSize", default = "default_tx_size")]
-    tx_size: usize,
-}
-
-#[derive(serde::Serialize)]
-pub struct WaitTimeResponse {
-    #[serde(rename = "waitTime")]
-    wait_time: u64,
-}
-
-pub async fn get_wait_time(
-    State(state): State<ApiState>,
-    Query(params): Query<WaitTimeParams>,
-) -> ApiResult<WaitTimeResponse> {
-    let tx_size = params.tx_size.min(1_000_000);
-    let pool = state.mempool.lock().await;
-    match pool.expected_wait_time(params.fee, tx_size) {
-        Some(wait_ms) => {
-            // Convert milliseconds back to blocks (target block time ~2 min).
-            // recommended_fee/expected_wait_time work in ms; the endpoint
-            // returns blocks per the JVM contract.
-            let blocks = wait_ms / 120_000;
-            Ok(Json(WaitTimeResponse { wait_time: blocks }))
-        }
-        None => err(StatusCode::BAD_REQUEST, "insufficient fee history"),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // POST /utxo/withPool/byIds  — batch lookup, max 100, positional null for missing
 // ---------------------------------------------------------------------------
 
 pub async fn post_utxo_with_pool_by_ids(
     State(state): State<ApiState>,
-    Json(ids): Json<Vec<String>>,
+    ApiJson(ids): ApiJson<Vec<String>>,
 ) -> ApiResult<Vec<Option<ergo_validation::ErgoBox>>> {
     if ids.len() > 100 {
         return err(StatusCode::BAD_REQUEST, "max 100 box IDs per request");
     }
-    // Parse and lookup. Malformed IDs are treated as "not found" (return null),
-    // not as a 400 — the contract is positional, and rejecting the whole batch
-    // for one bad ID would be operationally hostile.
-    let mut results: Vec<Option<ergo_validation::ErgoBox>> = Vec::with_capacity(ids.len());
-    let pool = state.mempool.lock().await;
-    for hex_id in &ids {
-        let parsed = hex::decode(hex_id)
-            .ok()
-            .and_then(|b| <[u8; 32]>::try_from(b).ok());
-        match parsed {
-            Some(id) => {
-                let found = state
-                    .utxo_reader
-                    .box_by_id(&id)
-                    .or_else(|| pool.unconfirmed_box(&id).cloned());
-                results.push(found);
-            }
-            None => results.push(None),
-        }
-    }
+    // Malformed IDs are treated as "not found" (return null), not as a 400 —
+    // the contract is positional, and rejecting the whole batch for one bad
+    // ID would be operationally hostile.
+    let ids: Vec<Option<[u8; 32]>> = ids
+        .iter()
+        .map(|hex_id| hex::decode(hex_id).ok().and_then(|b| b.try_into().ok()))
+        .collect();
+    // The P2P intake waits on the mempool lock, so the pool's outputs among
+    // the ids are copied out under it and the UTXO set is read after.
+    let pool_outputs: Vec<Option<ergo_validation::ErgoBox>> = {
+        let pool = state.mempool.lock().await;
+        ids.iter()
+            .map(|id| id.and_then(|id| pool.unconfirmed_box(&id).cloned()))
+            .collect()
+    };
+    // The UTXO set first, then the pool, as `/utxo/withPool/byId` looks.
+    let results = ids
+        .iter()
+        .zip(pool_outputs)
+        .map(|(id, pool_output)| {
+            id.and_then(|id| state.utxo_reader.box_by_id(&id))
+                .or(pool_output)
+        })
+        .collect();
     Ok(Json(results))
 }
 
@@ -1914,9 +2058,12 @@ pub async fn get_blacklisted_peers(State(state): State<ApiState>) -> Json<PeersB
 pub async fn post_peers_connect(
     State(state): State<ApiState>,
     headers: axum::http::HeaderMap,
-    body: String,
+    ApiBytes(body): ApiBytes,
 ) -> ApiResult<serde_json::Value> {
     check_api_key(&state, &headers)?;
+    let Ok(body) = std::str::from_utf8(&body) else {
+        return err(StatusCode::BAD_REQUEST, "request body is not UTF-8");
+    };
     // Body is a JSON string like "1.2.3.4:9030". Strip surrounding quotes.
     let trimmed = body.trim();
     let addr_str = trimmed
@@ -1940,26 +2087,28 @@ pub async fn post_peers_connect(
 }
 
 // ---------------------------------------------------------------------------
-// GET /nipopow/popowHeader/{header_id}
-// GET /nipopow/popowHeader/last
+// GET /nipopow/popowHeaderById/{header_id}
+// GET /nipopow/popowHeaderByHeight/{height}
 // ---------------------------------------------------------------------------
 
 pub async fn get_popow_header_by_id(
     State(state): State<ApiState>,
-    Path(header_id): Path<String>,
+    ApiPath(header_id): ApiPath<String>,
 ) -> ApiResult<serde_json::Value> {
     let id = hex_to_id(&header_id)?;
     popow_header_response(&state, id).await
 }
 
-pub async fn get_popow_header_last(State(state): State<ApiState>) -> ApiResult<serde_json::Value> {
-    let tip = match state.chain.tip() {
-        Some(t) => t,
-        None => return err(StatusCode::NOT_FOUND, "chain is empty"),
+/// The best chain's header at `height`, answered as `popowHeaderById`
+/// answers for its id.
+pub async fn get_popow_header_by_height(
+    State(state): State<ApiState>,
+    ApiPath(height): ApiPath<u32>,
+) -> ApiResult<serde_json::Value> {
+    let Some(header) = state.chain.header_at(height) else {
+        return err(StatusCode::NOT_FOUND, "no header at this height");
     };
-    let mut tip_id = [0u8; 32];
-    tip_id.copy_from_slice(tip.id.0.as_ref());
-    popow_header_response(&state, tip_id).await
+    popow_header_response(&state, header.id.0 .0).await
 }
 
 async fn popow_header_response(
@@ -2012,7 +2161,7 @@ async fn popow_header_response(
 
 pub async fn get_block_validation_fragments(
     State(state): State<ApiState>,
-    Path(header_id): Path<String>,
+    ApiPath(header_id): ApiPath<String>,
 ) -> ApiResult<ValidationFragments> {
     // Echo whatever the client sent (preserving case) when surfacing it in
     // the `detail` field — clients dispatch on `reason`, not on the echo.
@@ -2985,7 +3134,7 @@ mod tests {
         let rt = build_runtime();
         let Json(result) = rt.block_on(get_blocks(
             State(state),
-            Query(PaginationParams {
+            ApiQuery(PaginationParams {
                 offset: 0,
                 limit: 2,
             }),
@@ -3003,7 +3152,7 @@ mod tests {
         let Json(result) = rt.block_on(get_blocks(
             State(state),
             // Request 500, hard cap is 100.
-            Query(PaginationParams {
+            ApiQuery(PaginationParams {
                 offset: 0,
                 limit: 500,
             }),
@@ -3039,31 +3188,6 @@ mod tests {
     }
 
     #[test]
-    fn get_wait_time_no_history_returns_400() {
-        let chain = Arc::new(MockChain {
-            known_header_id: None,
-            header_for_known_id: None,
-            proof_result: Err("unused".into()),
-        });
-        let state = test_state(chain);
-        let rt = build_runtime();
-        let result = rt.block_on(get_wait_time(
-            State(state),
-            Query(WaitTimeParams {
-                fee: 1_000_000,
-                tx_size: 100,
-            }),
-        ));
-        match result {
-            Err((status, body)) => {
-                assert_eq!(status, StatusCode::BAD_REQUEST);
-                assert!(body.reason.contains("fee history"));
-            }
-            Ok(_) => panic!("expected 400 with empty mempool, got 200"),
-        }
-    }
-
-    #[test]
     fn post_utxo_with_pool_by_ids_caps_at_100() {
         let chain = Arc::new(MockChain {
             known_header_id: None,
@@ -3073,7 +3197,7 @@ mod tests {
         let state = test_state(chain);
         let rt = build_runtime();
         let ids: Vec<String> = (0..101).map(|_| "00".repeat(32)).collect();
-        let result = rt.block_on(post_utxo_with_pool_by_ids(State(state), Json(ids)));
+        let result = rt.block_on(post_utxo_with_pool_by_ids(State(state), ApiJson(ids)));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::BAD_REQUEST),
             Ok(_) => panic!("expected 400 for >100 IDs"),
@@ -3090,10 +3214,11 @@ mod tests {
         let state = test_state(chain);
         let rt = build_runtime();
         let ids = vec!["00".repeat(32), "zz".repeat(32), "11".repeat(32)];
-        let Json(results) = match rt.block_on(post_utxo_with_pool_by_ids(State(state), Json(ids))) {
-            Ok(v) => v,
-            Err((status, body)) => panic!("expected 200, got {status} / {}", body.reason),
-        };
+        let Json(results) =
+            match rt.block_on(post_utxo_with_pool_by_ids(State(state), ApiJson(ids))) {
+                Ok(v) => v,
+                Err((status, body)) => panic!("expected 200, got {status} / {}", body.reason),
+            };
         // All three positions present, all null (empty UTXO + empty mempool + bad hex).
         assert_eq!(results.len(), 3);
         assert!(results.iter().all(Option::is_none));
@@ -3183,7 +3308,7 @@ mod tests {
         let result = rt.block_on(post_peers_connect(
             State(state),
             axum::http::HeaderMap::new(),
-            "\"not-an-address\"".into(),
+            ApiBytes("\"not-an-address\"".into()),
         ));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::BAD_REQUEST),
@@ -3209,7 +3334,7 @@ mod tests {
         let result = rt.block_on(post_peers_connect(
             State(state),
             axum::http::HeaderMap::new(),
-            "\"1.2.3.4:9030\"".into(),
+            ApiBytes("\"1.2.3.4:9030\"".into()),
         ));
         assert!(result.is_ok());
         let received = called.lock().unwrap().unwrap();
@@ -3229,7 +3354,7 @@ mod tests {
         let result = rt.block_on(post_peers_connect(
             State(state),
             axum::http::HeaderMap::new(),
-            "\"1.2.3.4:9030\"".into(),
+            ApiBytes("\"1.2.3.4:9030\"".into()),
         ));
         match result {
             Err((status, body)) => {
@@ -3254,7 +3379,7 @@ mod tests {
         let result = rt.block_on(post_peers_connect(
             State(state),
             axum::http::HeaderMap::new(),
-            "\"1.2.3.4:9030\"".into(),
+            ApiBytes("\"1.2.3.4:9030\"".into()),
         ));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::FORBIDDEN),
@@ -3277,7 +3402,7 @@ mod tests {
         let result = rt.block_on(post_peers_connect(
             State(state),
             headers,
-            "\"1.2.3.4:9030\"".into(),
+            ApiBytes("\"1.2.3.4:9030\"".into()),
         ));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::FORBIDDEN),
@@ -3308,7 +3433,7 @@ mod tests {
         let result = rt.block_on(post_peers_connect(
             State(state),
             headers,
-            "\"1.2.3.4:9030\"".into(),
+            ApiBytes("\"1.2.3.4:9030\"".into()),
         ));
         assert!(result.is_ok());
     }
@@ -3322,7 +3447,7 @@ mod tests {
         });
         let state = test_state(chain);
         let rt = build_runtime();
-        let result = rt.block_on(get_block_modifier(State(state), Path("aa".repeat(32))));
+        let result = rt.block_on(get_block_modifier(State(state), ApiPath("aa".repeat(32))));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::NOT_FOUND),
             Ok(_) => panic!("expected 404"),
@@ -3338,7 +3463,7 @@ mod tests {
         });
         let state = test_state(chain);
         let rt = build_runtime();
-        let result = rt.block_on(get_block_modifier(State(state), Path("zzz".into())));
+        let result = rt.block_on(get_block_modifier(State(state), ApiPath("zzz".into())));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::BAD_REQUEST),
             Ok(_) => panic!("expected 400"),
@@ -3354,23 +3479,10 @@ mod tests {
         });
         let state = test_state(chain);
         let rt = build_runtime();
-        let result = rt.block_on(get_popow_header_by_id(State(state), Path("aa".repeat(32))));
-        match result {
-            Err((status, _)) => assert_eq!(status, StatusCode::NOT_FOUND),
-            Ok(_) => panic!("expected 404"),
-        }
-    }
-
-    #[test]
-    fn popow_header_last_empty_chain_returns_404() {
-        let chain = Arc::new(MockChain {
-            known_header_id: None,
-            header_for_known_id: None,
-            proof_result: Err("unused".into()),
-        });
-        let state = test_state(chain);
-        let rt = build_runtime();
-        let result = rt.block_on(get_popow_header_last(State(state)));
+        let result = rt.block_on(get_popow_header_by_id(
+            State(state),
+            ApiPath("aa".repeat(32)),
+        ));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::NOT_FOUND),
             Ok(_) => panic!("expected 404"),
@@ -3386,7 +3498,7 @@ mod tests {
         });
         let state = test_state(chain);
         let rt = build_runtime();
-        let result = rt.block_on(get_full_block(State(state), Path("aa".repeat(32))));
+        let result = rt.block_on(get_full_block(State(state), ApiPath("aa".repeat(32))));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::NOT_FOUND),
             Ok(_) => panic!("expected 404"),
@@ -3616,7 +3728,7 @@ mod tests {
         let rt = build_runtime();
         let result = rt.block_on(get_block_validation_fragments(
             State(state),
-            Path(target_id_hex.clone()),
+            ApiPath(target_id_hex.clone()),
         ));
         let Json(body) = match result {
             Ok(v) => v,
@@ -3651,7 +3763,7 @@ mod tests {
         let rt = build_runtime();
         let result = rt.block_on(get_block_validation_fragments(
             State(state),
-            Path("aa".repeat(32)),
+            ApiPath("aa".repeat(32)),
         ));
         match result {
             Err((status, Json(body))) => {
@@ -3698,7 +3810,7 @@ mod tests {
         let rt = build_runtime();
         let result = rt.block_on(get_block_validation_fragments(
             State(state),
-            Path(target_id_hex),
+            ApiPath(target_id_hex),
         ));
         let Json(body) = result.expect("200");
         assert_eq!(
@@ -3746,46 +3858,171 @@ mod tests {
     // GET /blocks/{id}/transactions
     // -----------------------------------------------------------------------
 
-    /// Guards the byte-shape of the response. The handler renders through
-    /// `serde_json::Value`, so every object's keys come out alphabetically
-    /// sorted. Re-canonicalizing the body must therefore be a no-op. A future
-    /// "optimization" to a typed/`derive(Serialize)` struct would emit fields in
-    /// impl order (e.g. `id` before `dataInputs`) and silently change the bytes
-    /// every external consumer sees — this test fails loudly if that happens.
     #[test]
-    fn block_transactions_response_is_canonical_sorted_json() {
+    fn block_transactions_answers_the_stored_section() {
         let (state, target_id_hex, expected_tx_count) = build_vf_fixture();
-        let rt = build_runtime();
-        let (status, content_type, body_bytes) = rt.block_on(async {
-            let resp = get_block_transactions(State(state), Path(target_id_hex.clone())).await;
-            let status = resp.status();
-            let content_type = resp
-                .headers()
-                .get(axum::http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            (status, content_type, bytes)
-        });
+        let uri = format!("/blocks/{target_id_hex}/transactions");
+        let served = get(state, &uri);
+        assert_json_ok(&served, &uri);
 
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(content_type.as_deref(), Some("application/json"));
-
-        let value: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        // The JVM's `BlockTransactions`: the block version, and the stored
+        // section's length. 118 bytes: the 32-byte header id; the version
+        // marker 10,000,000 + 2, a 4-byte VLQ; a 1-byte count; and the
+        // 81-byte transaction.
+        let value: serde_json::Value = serde_json::from_str(&served.body).unwrap();
         assert_eq!(value["headerId"], serde_json::Value::String(target_id_hex));
         assert_eq!(
             value["transactions"].as_array().map(Vec::len),
             Some(expected_tx_count)
         );
+        assert_eq!(value["blockVersion"], serde_json::json!(2));
+        assert_eq!(value["size"], serde_json::json!(118));
+    }
 
-        let recanonical = serde_json::to_vec(&value).unwrap();
+    /// `/blocks/{id}/transactions` answers the object `/blocks/{id}` carries
+    /// as `blockTransactions`.
+    #[test]
+    fn block_transactions_answer_what_the_full_block_carries() {
+        let (state, tx, header_id, _) = extension_order_fixture();
+        let uri = format!("/blocks/{header_id}/transactions");
+        let served = get(state.clone(), &uri);
+        assert_json_ok(&served, &uri);
+        let section: serde_json::Value = serde_json::from_str(&served.body).unwrap();
+        assert_eq!(section["headerId"], serde_json::json!(header_id));
+        assert_eq!(section["blockVersion"], serde_json::json!(2));
+        // 32 + 4 + 1 as above, and an 87-byte transaction: the 81 of
+        // `make_vf_p2pk_tx` with two extension entries of 3 bytes each.
+        assert_eq!(section["size"], serde_json::json!(124));
         assert_eq!(
-            body_bytes.as_ref(),
-            recanonical.as_slice(),
-            "response must already be canonical sorted-key JSON; a direct serializer would reorder keys"
+            section["transactions"][0]["id"],
+            serde_json::json!(hex::encode(tx.id().0 .0))
         );
+
+        let uri = format!("/blocks/{header_id}");
+        let block = get(state, &uri);
+        assert_json_ok(&block, &uri);
+        let block: serde_json::Value = serde_json::from_str(&block.body).unwrap();
+        assert_eq!(block["blockTransactions"], section);
+    }
+
+    // -----------------------------------------------------------------------
+    // Transaction JSON keeps context-extension order (facts/api.md
+    // § Transaction JSON)
+    // -----------------------------------------------------------------------
+
+    /// An input extension holding variable 8 and then variable 4: the
+    /// `Int` constants 1 and 2, `0402` and `0404` serialized.
+    const EXTENSION_8_THEN_4: &str = r#""extension":{"8":"0402","4":"0404"}"#;
+
+    /// A transaction whose one input carries [`EXTENSION_8_THEN_4`], stored
+    /// as the only transaction of a block and held in the pool. Returns
+    /// `(state, tx, header id hex, block transactions modifier id hex)`.
+    fn extension_order_fixture() -> (ApiState, ergo_validation::Transaction, String, String) {
+        use ergo_lib::ergotree_ir::mir::constant::Constant;
+
+        let mut extension = ContextExtension::empty();
+        extension.values.insert(8, Constant::from(1i32));
+        extension.values.insert(4, Constant::from(2i32));
+        let tx = spend(&[make_vf_p2pk_box(1_000_000).box_id()], &extension);
+
+        let header = make_vf_header(685, BlockId(Digest32::zero()));
+        let header_id = header.id.0 .0;
+        let txs_modifier_id = section_modifier_id(
+            BLOCK_TRANSACTIONS_TYPE,
+            &header_id,
+            header.transaction_root.0.as_ref(),
+        );
+        let ext_modifier_id =
+            section_modifier_id(EXTENSION_TYPE, &header_id, header.extension_root.0.as_ref());
+        let mut sections = HashMap::new();
+        sections.insert(
+            (BLOCK_TRANSACTIONS_TYPE, txs_modifier_id),
+            ergo_validation::serialize_block_transactions(&header_id, 2, std::slice::from_ref(&tx))
+                .unwrap(),
+        );
+        sections.insert(
+            (EXTENSION_TYPE, ext_modifier_id),
+            ergo_validation::serialize_extension(&header_id, &[([0, 1], vec![0xAB])]).unwrap(),
+        );
+
+        let mut state = test_state(Arc::new(MultiHeaderChain {
+            by_id: HashMap::from([(header_id, header)]),
+        }));
+        state.store = Arc::new(KeyedStore { by_key: sections });
+        add_to_pool(
+            &state,
+            vec![pool_entry(&tx, 2_000_000, None, Instant::now())],
+        );
+        (
+            state,
+            tx,
+            hex::encode(header_id),
+            hex::encode(txs_modifier_id),
+        )
+    }
+
+    /// Every response that renders a transaction lists the extension as the
+    /// transaction holds it, 8 before 4, and a client that parses the JSON
+    /// in that order gets the transaction back, id and all. ergo-lib's
+    /// parser recomputes the id from what it read and refuses the JSON when
+    /// that differs from the `id` it carries.
+    #[test]
+    fn every_transaction_rendering_keeps_context_extension_order() {
+        #[derive(serde::Deserialize)]
+        struct Transactions {
+            transactions: Vec<ergo_validation::Transaction>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Block {
+            block_transactions: Transactions,
+        }
+
+        let (state, tx, header_id, txs_modifier_id) = extension_order_fixture();
+        let tx_id = hex::encode(tx.id().0 .0);
+        type Parse = fn(&str) -> serde_json::Result<Vec<ergo_validation::Transaction>>;
+        let endpoints: [(String, Parse); 5] = [
+            (format!("/blocks/{header_id}/transactions"), |body| {
+                serde_json::from_str::<Transactions>(body).map(|t| t.transactions)
+            }),
+            (format!("/blocks/{header_id}"), |body| {
+                serde_json::from_str::<Block>(body).map(|b| b.block_transactions.transactions)
+            }),
+            (format!("/blocks/modifier/{txs_modifier_id}"), |body| {
+                serde_json::from_str::<Transactions>(body).map(|t| t.transactions)
+            }),
+            ("/transactions/unconfirmed".to_string(), |body| {
+                serde_json::from_str(body)
+            }),
+            (
+                format!("/transactions/unconfirmed/byTransactionId/{tx_id}"),
+                |body| serde_json::from_str(body).map(|t| vec![t]),
+            ),
+        ];
+
+        for (uri, parse) in endpoints {
+            let served = get(state.clone(), &uri);
+            assert_json_ok(&served, &uri);
+            assert!(
+                served.body.contains(EXTENSION_8_THEN_4),
+                "{uri}: extension out of order\n{}",
+                served.body
+            );
+
+            let reparsed = parse(&served.body).unwrap_or_else(|e| panic!("{uri}: {e}"));
+            assert_eq!(reparsed.len(), 1, "{uri}");
+            assert_eq!(reparsed[0].id(), tx.id(), "{uri}");
+            let keys: Vec<u8> = reparsed[0]
+                .inputs
+                .first()
+                .spending_proof
+                .extension
+                .values
+                .keys()
+                .copied()
+                .collect();
+            assert_eq!(keys, [8, 4], "{uri}");
+        }
     }
 
     #[test]
@@ -3796,7 +4033,7 @@ mod tests {
         let state = test_state(chain);
         let rt = build_runtime();
         let status = rt.block_on(async {
-            get_block_transactions(State(state), Path("aa".repeat(32)))
+            get_block_transactions(State(state), ApiPath("aa".repeat(32)))
                 .await
                 .status()
         });
@@ -3933,7 +4170,7 @@ mod tests {
         let rt = build_runtime();
         let response = rt.block_on(get_capture_dump(
             State(state),
-            Query(CaptureDumpQuery::default()),
+            ApiQuery(CaptureDumpQuery::default()),
         ));
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
@@ -3946,7 +4183,7 @@ mod tests {
         let rt = build_runtime();
         let response = rt.block_on(get_capture_dump(
             State(state),
-            Query(CaptureDumpQuery::default()),
+            ApiQuery(CaptureDumpQuery::default()),
         ));
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -3978,7 +4215,7 @@ mod tests {
         let rt = build_runtime();
         let response = rt.block_on(get_capture_dump(
             State(state),
-            Query(CaptureDumpQuery {
+            ApiQuery(CaptureDumpQuery {
                 peer: Some("10.0.0.7".to_string()),
                 since_secs: Some(120),
                 direction: Some("outbound".to_string()),
@@ -4004,7 +4241,7 @@ mod tests {
         let rt = build_runtime();
         let response = rt.block_on(get_capture_dump(
             State(state),
-            Query(CaptureDumpQuery {
+            ApiQuery(CaptureDumpQuery {
                 peer: None,
                 since_secs: None,
                 direction: Some("sideways".to_string()),
@@ -4020,7 +4257,7 @@ mod tests {
         let rt = build_runtime();
         let response = rt.block_on(get_capture_dump(
             State(state),
-            Query(CaptureDumpQuery {
+            ApiQuery(CaptureDumpQuery {
                 peer: Some("not-an-ip".to_string()),
                 since_secs: None,
                 direction: None,
@@ -4206,7 +4443,7 @@ mod tests {
         let rt = build_runtime();
         let result = rt.block_on(post_mining_solution(
             State(state),
-            Json(SolutionSubmission {
+            ApiJson(SolutionSubmission {
                 n: "0000000000000001".into(),
             }),
         ));
@@ -4236,7 +4473,7 @@ mod tests {
         let rt = build_runtime();
         let result = rt.block_on(post_mining_solution(
             State(state),
-            Json(SolutionSubmission {
+            ApiJson(SolutionSubmission {
                 n: "0000000000000001".into(),
             }),
         ));
@@ -4271,7 +4508,7 @@ mod tests {
         let rt = build_runtime();
         let result = rt.block_on(post_mining_solution(
             State(state),
-            Json(SolutionSubmission { n: nonce_hex }),
+            ApiJson(SolutionSubmission { n: nonce_hex }),
         ));
         match result {
             Ok(Json(v)) => assert_eq!(v["status"], "accepted"),
@@ -4288,7 +4525,7 @@ mod tests {
         let state2 = mining_state(make_minimal_header(4), generator2);
         let result2 = rt.block_on(post_mining_solution(
             State(state2),
-            Json(SolutionSubmission {
+            ApiJson(SolutionSubmission {
                 n: "0000000000000001".into(),
             }),
         ));
@@ -4380,7 +4617,7 @@ mod tests {
         let rt = build_runtime();
         let result = rt.block_on(post_mining_solution(
             State(state),
-            Json(SolutionSubmission { n: nonce_hex }),
+            ApiJson(SolutionSubmission { n: nonce_hex }),
         ));
         match result {
             Err((status, body)) => {
@@ -4423,7 +4660,7 @@ mod tests {
         for attempt in 0..2 {
             let result = rt.block_on(post_mining_solution(
                 State(state.clone()),
-                Json(SolutionSubmission {
+                ApiJson(SolutionSubmission {
                     n: nonce_hex.clone(),
                 }),
             ));
@@ -4467,7 +4704,7 @@ mod tests {
         let rt = build_runtime();
         let result = rt.block_on(post_mining_solution(
             State(state),
-            Json(SolutionSubmission { n: nonce_hex }),
+            ApiJson(SolutionSubmission { n: nonce_hex }),
         ));
         match result {
             Err((status, body)) => {
@@ -4526,5 +4763,879 @@ mod tests {
                 body.reason
             ),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Through the router: status, content type and body as a client reads them
+    // -----------------------------------------------------------------------
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use std::time::{Duration, Instant};
+
+    /// A response as a client reads it.
+    struct Served {
+        status: StatusCode,
+        content_type: Option<String>,
+        /// The `Allow` header, which a 405 carries.
+        allow: Option<String>,
+        body: String,
+    }
+
+    /// Serve one request through `service`: the whole router, routing and
+    /// extractors included. Bounded by axum's own `ServiceExt`, whose
+    /// `Service` supertrait the router implements; naming that trait itself
+    /// would take a `tower` dependency for nothing else.
+    async fn serve_one<S>(mut service: S, request: Request<Body>) -> axum::response::Response
+    where
+        S: axum::ServiceExt<
+            Request<Body>,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        >,
+    {
+        let Ok(()) = std::future::poll_fn(|cx| service.poll_ready(cx)).await;
+        let Ok(response) = service.call(request).await;
+        response
+    }
+
+    fn serve(state: ApiState, request: Request<Body>) -> Served {
+        build_runtime().block_on(async {
+            let response = serve_one(crate::router(state), request).await;
+            let status = response.status();
+            let header = |name| {
+                response
+                    .headers()
+                    .get(name)
+                    .map(|v: &axum::http::HeaderValue| {
+                        v.to_str().expect("ASCII header").to_string()
+                    })
+            };
+            let content_type = header(axum::http::header::CONTENT_TYPE);
+            let allow = header(axum::http::header::ALLOW);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("in-memory body");
+            Served {
+                status,
+                content_type,
+                allow,
+                body: String::from_utf8(body.to_vec()).expect("UTF-8 body"),
+            }
+        })
+    }
+
+    fn get(state: ApiState, uri: &str) -> Served {
+        serve(state, Request::get(uri).body(Body::empty()).unwrap())
+    }
+
+    /// `served` is a 200 with a JSON body.
+    fn assert_json_ok(served: &Served, uri: &str) {
+        assert_eq!(served.status, StatusCode::OK, "{uri}: {}", served.body);
+        assert_eq!(
+            served.content_type.as_deref(),
+            Some("application/json"),
+            "{uri}"
+        );
+    }
+
+    /// `served` is the `ApiError` JSON for `status`.
+    fn assert_api_error(served: &Served, status: StatusCode, uri: &str) {
+        assert_eq!(served.status, status, "{uri}: {}", served.body);
+        assert_eq!(
+            served.content_type.as_deref(),
+            Some("application/json"),
+            "{uri}: {}",
+            served.body
+        );
+        let error: serde_json::Value =
+            serde_json::from_str(&served.body).expect("ApiError body is JSON");
+        assert_eq!(error["error"], serde_json::json!(status.as_u16()), "{uri}");
+        assert!(error["reason"].is_string(), "{uri}: {}", served.body);
+    }
+
+    /// `tx` as a pool entry that entered at `created`, the way a rollback
+    /// hands one back: `return_to_pool` inserts it as given, unvalidated.
+    fn pool_entry(
+        tx: &ergo_validation::Transaction,
+        fee: u64,
+        validation_cost: Option<u64>,
+        created: Instant,
+    ) -> ergo_mempool::types::UnconfirmedTx {
+        let tx_bytes = tx.sigma_serialize_bytes().expect("tx serializes");
+        ergo_mempool::types::UnconfirmedTx {
+            cost: tx_bytes.len() as u32,
+            tx: tx.clone(),
+            tx_bytes: tx_bytes.into(),
+            fee,
+            validation_cost,
+            created,
+            last_checked: created,
+            source: None,
+        }
+    }
+
+    fn add_to_pool(state: &ApiState, entries: Vec<ergo_mempool::types::UnconfirmedTx>) {
+        state
+            .mempool
+            .try_lock()
+            .expect("uncontended")
+            .return_to_pool(entries);
+    }
+
+    /// `seconds` ago.
+    fn ago(seconds: u64) -> Instant {
+        Instant::now()
+            .checked_sub(Duration::from_secs(seconds))
+            .expect("monotonic clock runs past the offset")
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /transactions/getFee, /waitTime, /poolHistogram
+    // -----------------------------------------------------------------------
+
+    /// `MempoolConfig::default().min_fee`, which `test_state`'s pool runs with.
+    const MIN_FEE: &str = "1000000";
+
+    /// Serialized length of `make_vf_p2pk_tx(&make_vf_p2pk_box(1_000_000))`.
+    const VF_TX_LEN: usize = 81;
+
+    #[test]
+    fn get_fee_answers_min_fee_as_a_bare_integer_without_statistics() {
+        for uri in [
+            "/transactions/getFee",
+            "/transactions/getFee?waitTime=0&txSize=0",
+            "/transactions/getFee?waitTime=600&txSize=98304",
+        ] {
+            let served = get(empty_state(), uri);
+            assert_json_ok(&served, uri);
+            assert_eq!(served.body, MIN_FEE, "{uri}");
+        }
+    }
+
+    /// A pool transaction confirmed within its first minute fills the first
+    /// statistics bin, and `getFee` answers from it: fee per factor ×
+    /// `txSize` / 1024, above `min_fee`.
+    #[test]
+    fn get_fee_answers_from_confirmed_pool_transactions() {
+        let state = empty_state();
+        let tx = make_vf_p2pk_tx(&make_vf_p2pk_box(1_000_000));
+        let entry = pool_entry(&tx, 40_500_000, None, Instant::now());
+        assert_eq!(entry.tx_bytes.len(), VF_TX_LEN);
+        add_to_pool(&state, vec![entry]);
+        state
+            .mempool
+            .try_lock()
+            .expect("uncontended")
+            .apply_block(std::slice::from_ref(&tx));
+
+        // Fee per factor 40,500,000 × 1024 / 81 = 512,000,000.
+        let uri = "/transactions/getFee?waitTime=1&txSize=1024";
+        let served = get(state.clone(), uri);
+        assert_json_ok(&served, uri);
+        assert_eq!(served.body, "512000000");
+
+        // 512,000,000 × 1 / 1024 = 500,000: below min_fee, which it answers.
+        let uri = "/transactions/getFee?waitTime=1&txSize=1";
+        assert_eq!(get(state, uri).body, MIN_FEE, "{uri}");
+    }
+
+    #[test]
+    fn get_fee_refuses_negative_parameters() {
+        for uri in [
+            "/transactions/getFee?waitTime=-1",
+            "/transactions/getFee?txSize=-1",
+        ] {
+            assert_api_error(&get(empty_state(), uri), StatusCode::BAD_REQUEST, uri);
+        }
+    }
+
+    /// No block has confirmed a pool transaction, so the throughput window
+    /// is empty and the wait 0. `fee` is optional, as on the JVM.
+    #[test]
+    fn wait_time_answers_a_bare_integer() {
+        for uri in [
+            "/transactions/waitTime",
+            "/transactions/waitTime?fee=1000000&txSize=1",
+        ] {
+            let served = get(empty_state(), uri);
+            assert_json_ok(&served, uri);
+            assert_eq!(served.body, "0", "{uri}");
+        }
+    }
+
+    #[test]
+    fn wait_time_refuses_negative_parameters_and_zero_size() {
+        for uri in [
+            "/transactions/waitTime?fee=-1",
+            "/transactions/waitTime?txSize=-1",
+            "/transactions/waitTime?txSize=0",
+        ] {
+            assert_api_error(&get(empty_state(), uri), StatusCode::BAD_REQUEST, uri);
+        }
+    }
+
+    /// `bins + 1` empty bins, rendered as the JVM's `FeeHistogramBin`.
+    fn empty_histogram(bins: usize) -> String {
+        format!(
+            "[{}]",
+            vec![r#"{"nTxns":0,"totalFee":0}"#; bins + 1].join(",")
+        )
+    }
+
+    #[test]
+    fn pool_histogram_answers_bins_plus_one() {
+        for (uri, bins) in [
+            ("/transactions/poolHistogram", 10),
+            ("/transactions/poolHistogram?bins=1&maxtime=1", 1),
+            ("/transactions/poolHistogram?bins=1000&maxtime=1000", 1000),
+        ] {
+            let served = get(empty_state(), uri);
+            assert_json_ok(&served, uri);
+            assert_eq!(served.body, empty_histogram(bins), "{uri}");
+        }
+    }
+
+    /// Ten bins of 6,000 ms by default: a transaction 33 s into its wait
+    /// counts in bin 5, one past `maxtime` in the last, with its fee per
+    /// factor (fee × 1024 / 81 bytes).
+    #[test]
+    fn pool_histogram_bins_the_pool_by_wait() {
+        let state = empty_state();
+        let waiting = make_vf_p2pk_tx(&make_vf_p2pk_box(1_000_000));
+        let overdue = make_vf_p2pk_tx(&make_vf_p2pk_box(2_000_000));
+        add_to_pool(
+            &state,
+            vec![
+                pool_entry(&waiting, 810_000, None, ago(33)),
+                pool_entry(&overdue, 1_620_000, None, ago(61)),
+            ],
+        );
+
+        let served = get(state, "/transactions/poolHistogram");
+        let mut bins = [r#"{"nTxns":0,"totalFee":0}"#; 11];
+        bins[5] = r#"{"nTxns":1,"totalFee":10240000}"#;
+        bins[10] = r#"{"nTxns":1,"totalFee":20480000}"#;
+        assert_eq!(served.body, format!("[{}]", bins.join(",")));
+    }
+
+    #[test]
+    fn pool_histogram_refuses_bins_out_of_range_and_maxtime_below_bins() {
+        for uri in [
+            "/transactions/poolHistogram?bins=0",
+            "/transactions/poolHistogram?bins=-1",
+            "/transactions/poolHistogram?bins=1001",
+            "/transactions/poolHistogram?bins=10&maxtime=9",
+            "/transactions/poolHistogram?maxtime=-1",
+        ] {
+            assert_api_error(&get(empty_state(), uri), StatusCode::BAD_REQUEST, uri);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /transactions/unconfirmed, .../byTransactionId/{tx_id}
+    // -----------------------------------------------------------------------
+
+    use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
+
+    /// A UTXO set holding exactly `boxes`.
+    struct BoxUtxo(HashMap<[u8; 32], ergo_validation::ErgoBox>);
+
+    impl BoxUtxo {
+        fn holding(boxes: &[ergo_validation::ErgoBox]) -> Self {
+            Self(
+                boxes
+                    .iter()
+                    .map(|b| (box_id_bytes(b.box_id()), b.clone()))
+                    .collect(),
+            )
+        }
+    }
+
+    impl UtxoAccess for BoxUtxo {
+        fn box_by_id(&self, id: &[u8; 32]) -> Option<ergo_validation::ErgoBox> {
+            self.0.get(id).cloned()
+        }
+        fn cache_bytes_used(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    /// A transaction spending `inputs` with empty proofs, every input
+    /// carrying `extension`, into one P2PK output of 900,000 nanoERG.
+    fn spend(inputs: &[BoxId], extension: &ContextExtension) -> ergo_validation::Transaction {
+        use ergo_lib::chain::transaction::input::prover_result::ProverResult;
+        use ergo_lib::ergotree_interpreter::sigma_protocol::prover::ProofBytes;
+        use ergo_lib::ergotree_ir::chain::ergo_box::{
+            box_value::BoxValue, ErgoBoxCandidate, NonMandatoryRegisters,
+        };
+        use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
+
+        let inputs = inputs
+            .iter()
+            .map(|id| {
+                Input::new(
+                    *id,
+                    ProverResult {
+                        proof: ProofBytes::Empty,
+                        extension: extension.clone(),
+                    },
+                )
+            })
+            .collect();
+        let output = ErgoBoxCandidate {
+            value: BoxValue::try_from(900_000u64).unwrap(),
+            ergo_tree: ErgoTree::sigma_parse_bytes(&hex::decode(VF_P2PK_TREE_HEX).unwrap())
+                .unwrap(),
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height: 685,
+        };
+        ergo_validation::Transaction::new_from_vec(inputs, vec![], vec![output]).unwrap()
+    }
+
+    /// Serialized length of `spend` over three inputs with empty extensions.
+    const CHILD_TX_LEN: usize = 149;
+
+    /// A pool whose `child` spends three boxes: `confirmed`, in the UTXO set;
+    /// an output of `parent`, another pool transaction; and a box neither
+    /// holds. Returns `(state, parent, child)`.
+    fn unconfirmed_fixture() -> (
+        ApiState,
+        ergo_validation::Transaction,
+        ergo_validation::Transaction,
+    ) {
+        let confirmed = make_vf_p2pk_box(1_000_000);
+        let parent = make_vf_p2pk_tx(&make_vf_p2pk_box(2_000_000));
+        let unknown = BoxId::from(Digest32::from([0xEE; 32]));
+        let child = spend(
+            &[confirmed.box_id(), parent.outputs.first().box_id(), unknown],
+            &ContextExtension::empty(),
+        );
+
+        let mut state = empty_state();
+        state.utxo_reader = Arc::new(BoxUtxo::holding(&[confirmed]));
+        add_to_pool(
+            &state,
+            vec![
+                pool_entry(&parent, 1_000_000, None, Instant::now()),
+                pool_entry(&child, 5_000_000, Some(12_345), Instant::now()),
+            ],
+        );
+        (state, parent, child)
+    }
+
+    fn digest_mode(mut state: ApiState) -> ApiState {
+        state.node_info = Arc::new(NodeMeta {
+            state_type: "digest".into(),
+            ..(*state.node_info).clone()
+        });
+        state
+    }
+
+    fn unconfirmed_by_id(state: ApiState, tx: &ergo_validation::Transaction) -> Served {
+        let uri = format!(
+            "/transactions/unconfirmed/byTransactionId/{}",
+            hex::encode(tx.id().0 .0)
+        );
+        let served = get(state, &uri);
+        assert_json_ok(&served, &uri);
+        served
+    }
+
+    /// An input rendered as the transaction carries it, and nothing more.
+    fn assert_unresolved(input: &serde_json::Value, box_id: BoxId) {
+        assert_eq!(
+            *input,
+            serde_json::json!({
+                "boxId": hex::encode(box_id_bytes(box_id)),
+                "spendingProof": { "proofBytes": "", "extension": {} },
+            })
+        );
+    }
+
+    #[test]
+    fn unconfirmed_resolves_inputs_from_the_utxo_set_then_the_pool() {
+        let (state, parent, child) = unconfirmed_fixture();
+        let served = unconfirmed_by_id(state, &child);
+        let tx: serde_json::Value = serde_json::from_str(&served.body).unwrap();
+
+        assert_eq!(tx["id"], serde_json::json!(hex::encode(child.id().0 .0)));
+        assert_eq!(tx["size"], serde_json::json!(CHILD_TX_LEN));
+        assert_eq!(tx["cost"], serde_json::json!(12_345));
+        assert_eq!(tx["dataInputs"], serde_json::json!([]));
+        assert_eq!(tx["outputs"].as_array().map(Vec::len), Some(1));
+
+        // From the UTXO set: `make_vf_p2pk_box(1_000_000)`, whole.
+        assert_eq!(
+            tx["inputs"][0],
+            serde_json::json!({
+                "boxId": hex::encode(box_id_bytes(child.inputs.first().box_id)),
+                "value": 1_000_000,
+                "ergoTree": VF_P2PK_TREE_HEX,
+                "assets": [],
+                "additionalRegisters": {},
+                "creationHeight": 684,
+                "transactionId": VF_SRC_TX_HEX,
+                "index": 0,
+                "spendingProof": { "proofBytes": "", "extension": {} },
+            })
+        );
+        // From the pool: `parent`'s output.
+        assert_eq!(
+            tx["inputs"][1],
+            serde_json::json!({
+                "boxId": hex::encode(box_id_bytes(parent.outputs.first().box_id())),
+                "value": 900_000,
+                "ergoTree": VF_P2PK_TREE_HEX,
+                "assets": [],
+                "additionalRegisters": {},
+                "creationHeight": 685,
+                "transactionId": hex::encode(parent.id().0 .0),
+                "index": 0,
+                "spendingProof": { "proofBytes": "", "extension": {} },
+            })
+        );
+        // Neither holds it.
+        assert_unresolved(&tx["inputs"][2], child.inputs.as_vec()[2].box_id);
+
+        // A `Value` keeps the last of a repeated key, so count them in the
+        // text: one per input and one per output.
+        assert_eq!(served.body.matches("\"boxId\"").count(), 4);
+    }
+
+    #[test]
+    fn unconfirmed_lists_the_pool_by_weight_with_size_and_cost() {
+        let (state, parent, child) = unconfirmed_fixture();
+        let uri = "/transactions/unconfirmed";
+        let served = get(state, uri);
+        assert_json_ok(&served, uri);
+        let txs: serde_json::Value = serde_json::from_str(&served.body).unwrap();
+
+        // `child` pays the higher fee per byte, so it comes first.
+        assert_eq!(txs.as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            txs[0]["id"],
+            serde_json::json!(hex::encode(child.id().0 .0))
+        );
+        assert_eq!(txs[0]["size"], serde_json::json!(CHILD_TX_LEN));
+        assert_eq!(txs[0]["cost"], serde_json::json!(12_345));
+        assert_eq!(txs[0]["inputs"][0]["value"], serde_json::json!(1_000_000));
+        assert_eq!(txs[0]["inputs"][1]["value"], serde_json::json!(900_000));
+        assert!(txs[0]["inputs"][2].get("value").is_none());
+
+        // Returned by a rollback and not validated since: `cost` is null.
+        assert_eq!(
+            txs[1]["id"],
+            serde_json::json!(hex::encode(parent.id().0 .0))
+        );
+        assert_eq!(txs[1]["size"], serde_json::json!(VF_TX_LEN));
+        assert_eq!(txs[1]["cost"], serde_json::Value::Null);
+        // `parent`'s own input is in neither the UTXO set nor the pool.
+        assert_unresolved(&txs[1]["inputs"][0], parent.inputs.first().box_id);
+
+        assert_eq!(served.body.matches("\"boxId\"").count(), 6);
+    }
+
+    /// The JVM's digest node resolves no input, and neither does this one:
+    /// not from the UTXO set, not from the pool.
+    #[test]
+    fn unconfirmed_resolves_nothing_in_digest_mode() {
+        let (state, _parent, child) = unconfirmed_fixture();
+        let served = unconfirmed_by_id(digest_mode(state), &child);
+        let tx: serde_json::Value = serde_json::from_str(&served.body).unwrap();
+        for (i, input) in child.inputs.iter().enumerate() {
+            assert_unresolved(&tx["inputs"][i], input.box_id);
+        }
+        assert_eq!(tx["cost"], serde_json::json!(12_345));
+    }
+
+    #[test]
+    fn unconfirmed_by_id_answers_404_for_a_transaction_outside_the_pool() {
+        let uri = format!(
+            "/transactions/unconfirmed/byTransactionId/{}",
+            "ab".repeat(32)
+        );
+        assert_api_error(&get(empty_state(), &uri), StatusCode::NOT_FOUND, &uri);
+    }
+
+    // -----------------------------------------------------------------------
+    // Refused requests answer the ApiError body (facts/api.md § Error Model)
+    // -----------------------------------------------------------------------
+
+    fn get_request(uri: &str) -> Request<Body> {
+        Request::get(uri).body(Body::empty()).unwrap()
+    }
+
+    fn post_json(uri: &str, body: impl Into<Body>) -> Request<Body> {
+        Request::post(uri)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(body.into())
+            .unwrap()
+    }
+
+    #[test]
+    fn refused_requests_answer_the_api_error_body() {
+        let bad = StatusCode::BAD_REQUEST;
+        let cases = [
+            // Malformed query strings.
+            (get_request("/transactions/getFee?waitTime=abc"), bad),
+            (get_request("/transactions/waitTime?fee=1.5"), bad),
+            (get_request("/transactions/poolHistogram?bins=ten"), bad),
+            (get_request("/transactions/unconfirmed?limit=-1"), bad),
+            (get_request("/blocks?offset=first"), bad),
+            (get_request("/info/wait"), bad),
+            (get_request("/debug/p2p-capture/dump?since_secs=soon"), bad),
+            // Malformed path segments.
+            (get_request("/blocks/at/abc"), bad),
+            (get_request("/blocks/lastHeaders/-1"), bad),
+            (get_request("/emission/at/x"), bad),
+            (get_request("/nipopow/proof/x/1"), bad),
+            (get_request("/nipopow/proof/1/1/zz"), bad),
+            (
+                get_request("/transactions/unconfirmed/byTransactionId/zz"),
+                bad,
+            ),
+            (get_request("/utxo/byId/zz"), bad),
+            (get_request("/blocks/zz"), bad),
+            // Bodies that aren't valid JSON for the endpoint: malformed, and
+            // well-formed but not the shape the endpoint takes.
+            (post_json("/transactions", r#"{"inputs": ["#), bad),
+            (post_json("/transactions/check", "{}"), bad),
+            (post_json("/utxo/withPool/byIds", "[1, 2]"), bad),
+            (post_json("/mining/solution", r#""n""#), bad),
+            (
+                Request::post("/peers/connect")
+                    .body(Body::from(vec![0xFF, 0xFE]))
+                    .unwrap(),
+                bad,
+            ),
+            // The two refusals HTTP names more precisely.
+            (
+                Request::post("/transactions")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                post_json("/transactions", vec![b' '; 2 * 1024 * 1024 + 1]),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ];
+        for (request, status) in cases {
+            let uri = request.uri().to_string();
+            assert_api_error(&serve(empty_state(), request), status, &uri);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /nipopow/popowHeaderById/{header_id}, /popowHeaderByHeight/{height}
+    // -----------------------------------------------------------------------
+
+    /// A chain of one header, at [`PopowChain::HEIGHT`], that builds the
+    /// header's PoPowHeader with one interlink, the all-zero id.
+    struct PopowChain {
+        header: Header,
+    }
+
+    impl PopowChain {
+        const HEIGHT: u32 = 7;
+
+        fn new() -> Self {
+            Self {
+                header: make_minimal_header(Self::HEIGHT),
+            }
+        }
+
+        fn id_hex(&self) -> String {
+            hex::encode(self.header.id.0 .0)
+        }
+    }
+
+    impl ChainAccess for PopowChain {
+        fn height(&self) -> u32 {
+            Self::HEIGHT
+        }
+        fn header_at(&self, height: u32) -> Option<Header> {
+            (height == Self::HEIGHT).then(|| self.header.clone())
+        }
+        fn header_by_id(&self, id: &[u8; 32]) -> Option<Header> {
+            (*id == self.header.id.0 .0).then(|| self.header.clone())
+        }
+        fn tip(&self) -> Option<Header> {
+            Some(self.header.clone())
+        }
+        fn build_nipopow_proof(
+            &self,
+            _m: u32,
+            _k: u32,
+            _id: Option<[u8; 32]>,
+        ) -> Result<Vec<u8>, String> {
+            Err("unused".into())
+        }
+        fn header_ids(&self, _offset: u32, _limit: u32) -> Vec<[u8; 32]> {
+            vec![]
+        }
+        fn popow_header_by_id(&self, id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
+            if *id != self.header.id.0 .0 {
+                return Ok(None);
+            }
+            let popow = PoPowHeader {
+                header: self.header.clone(),
+                interlinks: vec![BlockId(Digest32::zero())],
+                interlinks_proof: BatchMerkleProof::new(vec![], vec![]),
+            };
+            Ok(Some(popow.scorex_serialize_bytes().unwrap()))
+        }
+        fn memory_estimate(&self) -> ChainMemory {
+            unreported_memory()
+        }
+    }
+
+    fn popow_state() -> ApiState {
+        test_state(Arc::new(PopowChain::new()))
+    }
+
+    #[test]
+    fn popow_header_by_id_and_by_height_answer_the_header() {
+        let id = PopowChain::new().id_hex();
+        let by_id_uri = format!("/nipopow/popowHeaderById/{id}");
+        let by_id = get(popow_state(), &by_id_uri);
+        assert_json_ok(&by_id, &by_id_uri);
+        let popow: serde_json::Value = serde_json::from_str(&by_id.body).unwrap();
+        assert_eq!(popow["header"]["id"], serde_json::json!(id));
+        assert_eq!(popow["header"]["height"], serde_json::json!(7));
+        assert_eq!(popow["interlinks"], serde_json::json!(["00".repeat(32)]));
+        assert!(popow["interlinksProof"].is_object(), "{}", by_id.body);
+
+        let by_height_uri = "/nipopow/popowHeaderByHeight/7";
+        let by_height = get(popow_state(), by_height_uri);
+        assert_json_ok(&by_height, by_height_uri);
+        assert_eq!(by_height.body, by_id.body);
+    }
+
+    #[test]
+    fn popow_header_routes_answer_404_without_a_header() {
+        for uri in [
+            format!("/nipopow/popowHeaderById/{}", "ab".repeat(32)),
+            "/nipopow/popowHeaderByHeight/0".to_string(),
+            "/nipopow/popowHeaderByHeight/8".to_string(),
+        ] {
+            assert_api_error(&get(popow_state(), &uri), StatusCode::NOT_FOUND, &uri);
+        }
+    }
+
+    #[test]
+    fn popow_header_routes_answer_400_for_a_malformed_parameter() {
+        for uri in [
+            "/nipopow/popowHeaderById/zz",
+            "/nipopow/popowHeaderByHeight/seven",
+            "/nipopow/popowHeaderByHeight/-1",
+        ] {
+            assert_api_error(&get(popow_state(), uri), StatusCode::BAD_REQUEST, uri);
+        }
+    }
+
+    /// Neither exists on the JVM, and they are gone here too.
+    #[test]
+    fn old_popow_header_routes_are_gone() {
+        let id = PopowChain::new().id_hex();
+        for uri in [
+            "/nipopow/popowHeader/last".to_string(),
+            format!("/nipopow/popowHeader/{id}"),
+        ] {
+            assert_api_error(&get(popow_state(), &uri), StatusCode::NOT_FOUND, &uri);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // POST /transactions, /transactions/check: the size limit
+    // -----------------------------------------------------------------------
+
+    /// A transaction that serializes to exactly `size` bytes, most of them
+    /// in its two inputs' proofs. Proof lengths from 16,384 to 65,535 take
+    /// three VLQ bytes, so one more proof byte is one more transaction byte.
+    fn transaction_of_size(size: usize) -> ergo_validation::Transaction {
+        use ergo_lib::chain::transaction::input::prover_result::ProverResult;
+        use ergo_lib::ergotree_interpreter::sigma_protocol::prover::ProofBytes;
+
+        let spent = [
+            make_vf_p2pk_box(1_000_000).box_id(),
+            make_vf_p2pk_box(2_000_000).box_id(),
+        ];
+        let outputs = spend(&spent, &ContextExtension::empty())
+            .output_candidates
+            .as_vec()
+            .clone();
+        let proof = |len: usize| ProverResult {
+            proof: ProofBytes::Some(vec![0xAB; len]),
+            extension: ContextExtension::empty(),
+        };
+        let with_second_proof = |len: usize| {
+            let inputs = vec![
+                Input::new(spent[0], proof(40_000)),
+                Input::new(spent[1], proof(len)),
+            ];
+            ergo_validation::Transaction::new_from_vec(inputs, vec![], outputs.clone()).unwrap()
+        };
+        let base = with_second_proof(20_000)
+            .sigma_serialize_bytes()
+            .unwrap()
+            .len();
+        let tx = with_second_proof(20_000 + size - base);
+        assert_eq!(tx.sigma_serialize_bytes().unwrap().len(), size);
+        tx
+    }
+
+    /// With no state context, a transaction the size check lets through is
+    /// refused next with 503; one it refuses answers 400.
+    #[test]
+    fn transactions_over_the_size_limit_are_refused_while_syncing() {
+        for uri in ["/transactions", "/transactions/check"] {
+            for (size, status) in [
+                (98_305, StatusCode::BAD_REQUEST),
+                (98_304, StatusCode::SERVICE_UNAVAILABLE),
+            ] {
+                let body = serde_json::to_string(&transaction_of_size(size)).unwrap();
+                let served = serve(empty_state(), post_json(uri, body));
+                assert_api_error(&served, status, &format!("{uri}, {size} bytes"));
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Requests no route serves: 404 and 405 with the ApiError body
+    // -----------------------------------------------------------------------
+
+    fn request(method: &str, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn a_path_no_route_matches_answers_404_with_the_api_error_body() {
+        for (method, uri) in [
+            ("GET", "/nope"),
+            ("POST", "/nope"),
+            ("GET", "/blocks/at/1/extra"),
+            ("GET", "/utxo/byId"),
+        ] {
+            let served = serve(empty_state(), request(method, uri));
+            assert_api_error(&served, StatusCode::NOT_FOUND, &format!("{method} {uri}"));
+        }
+    }
+
+    #[test]
+    fn a_method_a_path_does_not_serve_answers_405_with_the_api_error_body() {
+        let unknown_tx = format!("/transactions/unconfirmed/{}", "ab".repeat(32));
+        for (method, uri, allow) in [
+            ("POST", "/info", "GET,HEAD"),
+            ("DELETE", "/blocks", "GET,HEAD"),
+            ("GET", "/transactions", "POST"),
+            ("GET", unknown_tx.as_str(), "HEAD"),
+        ] {
+            let served = serve(empty_state(), request(method, uri));
+            assert_api_error(
+                &served,
+                StatusCode::METHOD_NOT_ALLOWED,
+                &format!("{method} {uri}"),
+            );
+            assert_eq!(served.allow.as_deref(), Some(allow), "{method} {uri}");
+        }
+    }
+
+    /// A HEAD answer has no body, whoever answers it: a route of its own, a
+    /// GET route, or either fallback.
+    #[test]
+    fn head_answers_keep_an_empty_body() {
+        let unknown_tx = format!("/transactions/unconfirmed/{}", "ab".repeat(32));
+        for (uri, status) in [
+            (unknown_tx.as_str(), StatusCode::NOT_FOUND),
+            ("/info", StatusCode::OK),
+            ("/nope", StatusCode::NOT_FOUND),
+            ("/transactions", StatusCode::METHOD_NOT_ALLOWED),
+        ] {
+            let served = serve(empty_state(), request("HEAD", uri));
+            assert_eq!(served.status, status, "HEAD {uri}");
+            assert_eq!(served.body, "", "HEAD {uri}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // POST /utxo/withPool/byIds: the mempool lock (facts/api.md § Invariants)
+    // -----------------------------------------------------------------------
+
+    /// A UTXO set of `boxes`, keyed as given, that records at each read
+    /// whether the mempool lock was free.
+    struct LockProbeUtxo {
+        mempool: Arc<tokio::sync::Mutex<Mempool>>,
+        boxes: HashMap<[u8; 32], ergo_validation::ErgoBox>,
+        lock_free_at_read: std::sync::Mutex<Vec<bool>>,
+    }
+
+    impl UtxoAccess for LockProbeUtxo {
+        fn box_by_id(&self, id: &[u8; 32]) -> Option<ergo_validation::ErgoBox> {
+            let free = self.mempool.try_lock().is_ok();
+            self.lock_free_at_read.lock().unwrap().push(free);
+            self.boxes.get(id).cloned()
+        }
+        fn cache_bytes_used(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    #[test]
+    fn utxo_with_pool_by_ids_reads_the_utxo_set_after_releasing_the_pool() {
+        let confirmed = make_vf_p2pk_box(1_000_000);
+        let parent = make_vf_p2pk_tx(&make_vf_p2pk_box(2_000_000));
+        let shadowed = make_vf_p2pk_tx(&make_vf_p2pk_box(3_000_000));
+        let pool_output = parent.outputs.first().box_id();
+        let shadowed_output = shadowed.outputs.first().box_id();
+
+        let mut state = empty_state();
+        add_to_pool(
+            &state,
+            vec![
+                pool_entry(&parent, 1_000_000, None, Instant::now()),
+                pool_entry(&shadowed, 1_000_000, None, Instant::now()),
+            ],
+        );
+        // Under `shadowed`'s output id the UTXO set holds `confirmed`, whose
+        // 1,000,000 against the pool's 900,000 shows which one answered.
+        let probe = Arc::new(LockProbeUtxo {
+            mempool: Arc::clone(&state.mempool),
+            boxes: HashMap::from([
+                (box_id_bytes(confirmed.box_id()), confirmed.clone()),
+                (box_id_bytes(shadowed_output), confirmed.clone()),
+            ]),
+            lock_free_at_read: Default::default(),
+        });
+        state.utxo_reader = probe.clone();
+
+        let ids = [
+            hex::encode(box_id_bytes(confirmed.box_id())),
+            hex::encode(box_id_bytes(pool_output)),
+            hex::encode(box_id_bytes(shadowed_output)),
+            "ee".repeat(32),
+            "zz".to_string(),
+        ];
+        let uri = "/utxo/withPool/byIds";
+        let served = serve(state, post_json(uri, serde_json::to_string(&ids).unwrap()));
+        assert_json_ok(&served, uri);
+        let boxes: serde_json::Value = serde_json::from_str(&served.body).unwrap();
+        assert_eq!(boxes.as_array().map(Vec::len), Some(5));
+        assert_eq!(boxes[0]["boxId"], serde_json::json!(ids[0]));
+        assert_eq!(boxes[0]["value"], serde_json::json!(1_000_000));
+        assert_eq!(boxes[1]["boxId"], serde_json::json!(ids[1]));
+        assert_eq!(boxes[1]["value"], serde_json::json!(900_000));
+        assert_eq!(boxes[2]["value"], serde_json::json!(1_000_000));
+        assert_eq!(boxes[3], serde_json::Value::Null);
+        assert_eq!(boxes[4], serde_json::Value::Null);
+
+        // One read per well-formed id, each with the lock free.
+        assert_eq!(*probe.lock_free_at_read.lock().unwrap(), [true; 4]);
     }
 }

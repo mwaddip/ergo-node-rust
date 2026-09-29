@@ -392,6 +392,7 @@ mod tests {
         let now = std::time::Instant::now();
         let utx = ergo_mempool::types::UnconfirmedTx {
             cost: tx_bytes.len() as u32,
+            validation_cost: None,
             tx_bytes: tx_bytes.into(),
             tx,
             fee: 1_000_000,

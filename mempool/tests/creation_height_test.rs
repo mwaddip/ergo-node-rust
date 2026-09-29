@@ -247,6 +247,7 @@ fn revalidate_still_invalidates_genuine_failures() {
     let now = Instant::now();
     mempool.return_to_pool(vec![UnconfirmedTx {
         cost: tx_bytes.len() as u32,
+        validation_cost: None,
         tx,
         tx_bytes: tx_bytes.into(),
         fee: 0,

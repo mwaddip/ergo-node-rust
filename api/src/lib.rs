@@ -1,4 +1,6 @@
+mod extract;
 mod handlers;
+mod response;
 pub mod stats;
 pub mod types;
 
@@ -477,12 +479,12 @@ pub fn router(state: ApiState) -> Router {
             get(handlers::get_nipopow_proof_by_header),
         )
         .route(
-            "/nipopow/popowHeader/last",
-            get(handlers::get_popow_header_last),
+            "/nipopow/popowHeaderById/{header_id}",
+            get(handlers::get_popow_header_by_id),
         )
         .route(
-            "/nipopow/popowHeader/{header_id}",
-            get(handlers::get_popow_header_by_id),
+            "/nipopow/popowHeaderByHeight/{height}",
+            get(handlers::get_popow_header_by_height),
         )
         // Mining
         .route("/mining/candidate", get(handlers::get_mining_candidate))
@@ -499,6 +501,10 @@ pub fn router(state: ApiState) -> Router {
             "/debug/p2p-capture/reset",
             post(handlers::post_capture_reset),
         )
+        // Requests no route serves. Last: the 405 fallback applies only to
+        // routes already added.
+        .fallback(handlers::unknown_path)
+        .method_not_allowed_fallback(handlers::method_not_allowed)
         .with_state(state)
 }
 

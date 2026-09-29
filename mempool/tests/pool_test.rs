@@ -110,6 +110,7 @@ fn make_utx(tx: Transaction, fee: u64) -> UnconfirmedTx {
         tx_bytes: tx_bytes.into(),
         fee,
         cost,
+        validation_cost: None,
         created: now,
         last_checked: now,
         source: None,

@@ -131,7 +131,7 @@ pub struct Mempool {
     /// `invalidation_ttl` are removed on access. Bounded to prevent
     /// unbounded growth.
     invalidated: ExpiringCache<[u8; 32]>,
-    /// Fee statistics for histogram/recommendation queries.
+    /// Statistics over confirmed pool transactions, for the fee queries.
     stats: FeeStats,
     /// Configuration.
     config: MempoolConfig,
@@ -143,7 +143,7 @@ pub struct Mempool {
 ```rust
 /// Ordering key for mempool transactions.
 /// Sorted by weight descending, then tx_id for deterministic tiebreak.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct TxWeight {
     /// Effective weight — starts as fee_per_factor, increased by family weighting.
     pub weight: u64,
@@ -151,8 +151,6 @@ pub struct TxWeight {
     pub fee_per_factor: u64,
     /// Transaction ID — tiebreaker for deterministic ordering.
     pub tx_id: [u8; 32],
-    /// Insertion timestamp (for statistics and cleanup ordering).
-    pub created: Instant,
 }
 
 impl Ord for TxWeight {
@@ -163,6 +161,10 @@ impl Ord for TxWeight {
     }
 }
 ```
+
+Equality is the ordering's: two weights are equal exactly when `cmp` says
+`Equal`, on `weight` and `tx_id`, as `Ord` requires. A transaction's times
+live on its `UnconfirmedTx` (`created`, `last_checked`), not here.
 
 ### `UnconfirmedTx`
 
@@ -177,11 +179,19 @@ pub struct UnconfirmedTx {
     pub tx_bytes: Arc<[u8]>,
     /// Transaction fee in nanoERG.
     pub fee: u64,
-    /// Validation cost from ErgoScript evaluation.
+    /// Weighting cost: the entry validation's cost, floored at the serialized
+    /// size. `FeePerCycle` divides by it and the rate limits sum it.
     pub cost: u32,
+    /// The cost the transaction's most recent successful validation measured,
+    /// at entry or at revalidation. `None` until one has run: a transaction
+    /// handed to `return_to_pool` carries `None`. The JVM's
+    /// `UnconfirmedTransaction.lastCost`; `GET /transactions/unconfirmed*`
+    /// reports it as `cost`.
+    pub validation_cost: Option<u64>,
     /// When this transaction entered the pool.
     pub created: Instant,
-    /// When this transaction was last revalidated.
+    /// When this transaction was last validated: at entry, then at each
+    /// successful revalidation.
     pub last_checked: Instant,
     /// Peer that sent this transaction (None if locally submitted via API).
     pub source: Option<PeerId>,
@@ -194,7 +204,7 @@ pub struct UnconfirmedTx {
 pub enum FeeStrategy {
     /// fee * 1024 / tx_byte_size
     FeePerByte,
-    /// fee * 1024 / validation_cost
+    /// fee * 1024 / cost (the weighting `cost`, not `validation_cost`)
     FeePerCycle,
 }
 ```
@@ -273,31 +283,72 @@ impl<K: Eq + Hash> ExpiringCache<K> {
 
 ### `FeeStats`
 
-Tracks fee information for histogram and recommendation queries.
+Statistics over the pool transactions that blocks confirmed: the JVM's
+`MemPoolStatistics` (v6.0.6). `recommended_fee` and `expected_wait_ms` read
+them (§ Fee queries); nothing else does.
 
 ```rust
+/// Bins in the wait histogram: one per whole minute, 0 through 59.
+pub const HISTOGRAM_BINS: usize = 60;
+/// How often the throughput window may move (the JVM's `measurementIntervalMsec`).
+pub const MEASUREMENT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// A count of transactions and the sum of their `fee_per_factor`.
+/// JSON `{"nTxns": …, "totalFee": …}`, the JVM's `FeeHistogramBin`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeeHistogramBin {
+    pub n_txns: u64,
+    /// Saturating.
+    pub total_fee: u64,
+}
+
 pub struct FeeStats {
-    /// Recent transaction wait times: (fee_per_factor, wait_duration_ms).
-    /// Populated when a confirmed tx is removed from the pool.
-    history: VecDeque<(u64, u64)>,
-    /// Maximum history entries.
-    max_history: usize,
+    /// Bin `m`: confirmed transactions that spent at least `m` and less than
+    /// `m + 1` whole minutes in the pool.
+    histogram: [FeeHistogramBin; HISTOGRAM_BINS],
+    /// Throughput window: `taken` pool transactions confirmed since `window_start`.
+    window_start: Instant,
+    taken: u64,
+    /// When the window last moved or declined to, and `taken` at that moment.
+    snap_time: Instant,
+    snap_taken: u64,
 }
 
 impl FeeStats {
-    /// Record that a transaction with given fee was confirmed after `wait_ms`.
-    pub fn record_confirmation(&mut self, fee_per_factor: u64, wait_ms: u64);
+    /// Empty histogram, `taken` and `snap_taken` 0, both instants `now`.
+    pub fn new(now: Instant) -> Self;
 
-    /// Fee histogram: bucket count, total fee, avg fee per bucket.
-    pub fn histogram(&self, bucket_count: usize) -> Vec<FeeBucket>;
-
-    /// Estimated wait time for a transaction with given fee and size.
-    pub fn expected_wait(&self, fee: u64, size: usize) -> Option<u64>;
-
-    /// Recommended fee to achieve target wait time.
-    pub fn recommended_fee(&self, target_wait_ms: u64, size: usize) -> Option<u64>;
+    /// A pool transaction that entered the pool at `created`, with base
+    /// weight `fee_per_factor`, was confirmed by a block at `now`.
+    pub fn record_confirmation(&mut self, now: Instant, created: Instant, fee_per_factor: u64);
 }
 ```
+
+`record_confirmation` does, in order:
+1. `taken += 1`.
+2. If `now − snap_time > MEASUREMENT_INTERVAL`: when `snap_taken ≠ 0`,
+   subtract `snap_taken` from `taken` and move `window_start` to `snap_time`.
+   Either way, set `snap_taken = taken` and `snap_time = now`.
+3. `m` = `now − created` in whole minutes. If `m < 60`, add 1 to
+   `histogram[m].n_txns` and `fee_per_factor` to `histogram[m].total_fee`. A
+   longer wait is left out of the histogram but was counted in step 1.
+
+While blocks keep confirming pool transactions, the window holds one to two
+intervals of them. The histogram is never pruned: it covers every
+confirmation since the node started.
+
+Where this departs from the JVM's code, it follows the JVM's own description
+of that code (the doc comment on `MemPoolStatistics.add`):
+- **Only confirmations are recorded,** by `apply_block`, for each confirmed
+  transaction the pool held. A transaction removed as a double-spend of a
+  confirmed one, or by revalidation, is not recorded, and nothing resets the
+  statistics. The JVM's code records those removals too, and resets its
+  statistics whenever a newly received transaction fails validation
+  (`ErgoMemPool.scala` :109-113, :303).
+- **Step 2 sets `snap_taken` after the subtraction.** The JVM sets it before
+  (`MemPoolStatistics.scala` :32), so its count sinks to zero or below within
+  a few windows, and its wait estimate then answers 0.
 
 ## Public API
 
@@ -376,15 +427,51 @@ impl Mempool {
     /// Iterator over all input box IDs spent by pool transactions.
     pub fn spent_inputs(&self) -> impl Iterator<Item = &[u8; 32]>;
 
-    /// Fee histogram for the current pool.
-    pub fn fee_histogram(&self, buckets: usize) -> Vec<FeeBucket>;
+    /// Fee in nanoERG for a transaction of `tx_size` bytes to be confirmed
+    /// within `wait_minutes`: `GET /transactions/getFee`. Never below `min_fee`.
+    pub fn recommended_fee(&self, wait_minutes: u32, tx_size: u32) -> u64;
 
-    /// Estimated wait time for a transaction with given fee and size.
-    pub fn expected_wait_time(&self, fee: u64, tx_size: usize) -> Option<u64>;
+    /// Expected wait in milliseconds for a transaction of `tx_size` bytes
+    /// paying `fee` nanoERG: `GET /transactions/waitTime`.
+    /// Precondition: `tx_size > 0`.
+    pub fn expected_wait_ms(&self, fee: u64, tx_size: u32) -> u64;
 
-    /// Recommended fee to achieve target wait time.
-    pub fn recommended_fee(&self, target_wait_ms: u64, tx_size: usize) -> Option<u64>;
+    /// The pool binned by how long each transaction has waited so far:
+    /// `GET /transactions/poolHistogram`. Returns `bins + 1` bins.
+    /// Preconditions: `bins >= 1`, `max_wait_ms >= bins`.
+    pub fn pool_histogram(&self, bins: u32, max_wait_ms: u64) -> Vec<FeeHistogramBin>;
 ```
+
+### Fee queries
+
+`expected_wait_ms` and `pool_histogram` read the clock once, as `now`;
+`recommended_fee` depends on no time and reads none. Each clock-reading
+method, these two and `apply_block` and `revalidate`, has an
+`_at(now: Instant)` form that takes `now` instead. The tests drive those;
+everything else calls the plain form. The arithmetic is integer, every
+division truncates, and nothing overflows: a product that could exceed `u64`
+is computed wider, and a result that doesn't fit saturates.
+
+- **`recommended_fee`** (JVM `ErgoMemPool.getRecommendedFee`, v6.0.6
+  :350-360): take the first bin from `histogram[0]` through
+  `histogram[min(wait_minutes, 59)]` whose `n_txns` is non-zero, and compute
+  `(total_fee / n_txns) * tx_size / 1024`, in that order. The answer is that
+  value or `min_fee`, whichever is larger, and `min_fee` when every bin in
+  the range is empty. There are no bins past 59, so a longer wait answers as
+  59 does.
+- **`expected_wait_ms`** (JVM `getExpectedWaitTime`, :371-387): with
+  `fee_per_kb = fee * 1024 / tx_size`, the position is the number of pool
+  transactions whose `weight` exceeds `fee_per_kb`. With `elapsed` =
+  `now − window_start`, capped at `MEASUREMENT_INTERVAL`, in milliseconds,
+  the answer is `elapsed * position / taken`, or 0 while `taken` is 0.
+- **`pool_histogram`** (JVM `HistogramStats.getFeeHistogram`): start from
+  `bins + 1` empty bins, with `interval = max_wait_ms / bins`. For each pool
+  transaction, `wait` = `now − created` in milliseconds; it adds 1 and its
+  `fee_per_factor` to bin `min(wait / interval, bins)` when `wait <
+  max_wait_ms`, and to bin `bins` otherwise. (When `max_wait_ms` isn't a
+  multiple of `bins`, `wait / interval` can pass `bins`. The JVM then
+  indexes past its array and fails, and here the transaction lands in the
+  last bin.)
 
 ### Serving reader
 
@@ -429,13 +516,15 @@ transactions from a published mempool reader, not from the live pool
 ```rust
     /// Remove confirmed transactions from an applied block.
     /// Also removes any pool transactions that double-spend confirmed inputs.
-    /// Records confirmation timing into fee statistics.
+    /// Records each confirmed transaction the pool held in `FeeStats`
+    /// (`record_confirmation`); the double-spends it removes are not recorded.
     /// Returns IDs of all removed transactions.
     pub fn apply_block(&mut self, confirmed_txs: &[Transaction]) -> Vec<[u8; 32]>;
 
     /// Return rolled-back transactions to the pool after a reorg.
     /// Transactions from removed blocks that aren't in the new chain go back.
-    /// These skip validation (they were valid in the previous chain state).
+    /// These skip validation (they were valid in the previous chain state),
+    /// so each carries `validation_cost: None` until a revalidation measures it.
     pub fn return_to_pool(
         &mut self,
         txs: Vec<UnconfirmedTx>,
@@ -450,15 +539,28 @@ transactions from a published mempool reader, not from the live pool
 ```rust
     /// Revalidate pool transactions against current state.
     ///
-    /// Iterates transactions in priority order. For each:
-    /// - Skip if `last_checked` is within `cleanup_interval`
-    /// - Resolve inputs from `utxo_reader`
+    /// Iterates transactions in priority order, highest weight first, so a
+    /// parent comes before its children. For each:
+    /// - Skip if no more than `cleanup_interval` has passed since `last_checked`
+    /// - Stop the pass if its accumulated cost has reached `CLEANUP_COST_LIMIT`
+    /// - Skip, unvalidated, a transaction with an output above the preheader
+    ///   height: step 6a's transient guard, since a reorg can move the
+    ///   preheader back. The JVM has no such guard, and invalidates it
+    /// - Resolve inputs from `utxo_reader`, then from the pool as the pass
+    ///   has left it. A child of a transaction removed earlier in the same
+    ///   pass is removed as inputs-missing; the JVM resolves against the
+    ///   pool as of the pass's start, so there the child survives until
+    ///   its next pass
     /// - Re-run `validate_single_transaction()`
+    /// - If valid: set `validation_cost` to the measured cost and
+    ///   `last_checked` to now (the JVM's `UnconfirmedTransaction.withCost`),
+    ///   and add the measured cost to the pass's
     /// - If invalid: remove and invalidate
     /// - If inputs missing: remove (declined, not invalidated — may reappear)
+    /// - Either removal adds the transaction's previous `validation_cost`
+    ///   to the pass's cost, 0 when it has none
     ///
-    /// Stops when cumulative validation cost exceeds `cost_per_block` or
-    /// all transactions have been checked. Returns IDs of removed transactions.
+    /// A skipped transaction adds nothing. Returns IDs of removed transactions.
     pub fn revalidate(
         &mut self,
         utxo_reader: &dyn UtxoReader,
@@ -473,6 +575,15 @@ transactions from a published mempool reader, not from the live pool
         utxo_reader: &dyn UtxoReader,
     ) -> Vec<&UnconfirmedTx>;
 }
+```
+
+The pass's budget is a crate-level constant:
+
+```rust
+/// Validation cost one revalidation pass may spend: the JVM's
+/// `CleanupWorker.CostLimit` (v6.0.6 :27). Separate from `cost_per_block`,
+/// which limits what remote peers' transactions may cost between blocks.
+pub const CLEANUP_COST_LIMIT: u64 = 7_000_000;
 ```
 
 ## Processing a Transaction: Detailed Flow
@@ -496,7 +607,8 @@ code. Nothing may reorder them ahead of step 5.
    blackout for that transaction. Same reasoning as step 5's missing input.
 7. **Validate**: Call `validate_single_transaction(tx, inputs, data_inputs, state_context)`.
    On failure: return `Invalidated` (add to expiring cache).
-   On success: receive `cost`.
+   On success: receive `cost`. The entry's `validation_cost` is `Some(cost)`,
+   and its weighting `cost` is `cost` floored at `tx_bytes.len()`.
 7a. **Compute fee**: sum the values of outputs whose `ergo_tree` equals the fee
    proposition. **Not `input_sum - output_sum`.** ergo-lib enforces exact ERG
    preservation (`ErgPreservationError` when `input_sum != output_sum`,
@@ -511,7 +623,8 @@ code. Nothing may reorder them ahead of step 5.
    raised by a replacement; this is not an invalidation).
 8. **Compute weight**: `fee_per_factor = fee * 1024 / fee_factor` where `fee_factor`
    is `tx_bytes.len()` (FeePerByte) or `cost` (FeePerCycle, with `FakeCost = 1000`
-   fallback if cost is 0).
+   fallback if cost is 0). The product is computed wider than `u64`, and a
+   quotient that doesn't fit saturates at `u64::MAX`.
 9. **Check double-spends**: For each input box ID, check `by_input`:
    - Collect all conflicting transactions.
    - Compute `avg_conflict_weight = sum(weights) / count`.
@@ -547,10 +660,11 @@ so they sort first in the priority order and are evicted last.
 When a new block arrives:
 
 1. For each confirmed transaction:
-   - If in pool: remove from `pool`, `by_id`, `by_input`, `by_output`.
-   - Record confirmation timing in `FeeStats` (fee_per_factor, wait duration).
+   - If in pool: record it in `FeeStats` (`record_confirmation` with its
+     `created` and base `fee_per_factor`), then remove it from `pool`,
+     `by_id`, `by_input`, `by_output`.
    - For each input of the confirmed tx: if a DIFFERENT pool tx also spends
-     that input (double-spend), remove the pool tx too.
+     that input (double-spend), remove the pool tx too. It is not recorded.
 2. Prune the `invalidated` cache (remove expired entries).
 
 On reorg (block removed):
@@ -703,6 +817,13 @@ rebroadcast_count = 3          # txs rebroadcast per cleanup cycle
     Verify next tx from that peer is declined. Verify local tx still accepted.
 12. **Reorg return**: Apply block removing tx A from chain. Return A to pool.
     Verify it's back in the pool without re-validation.
-13. **Fee statistics**: Add txs, confirm them, verify histogram reflects
-    recorded wait times.
+13. **Fee statistics**, against a driven clock rather than wall time, with
+    expected values written out by hand rather than recomputed by the code
+    under test: the histogram bin a confirmation lands in (59 minutes in,
+    60 out); the window moving across intervals, including the case where
+    the JVM's count would sink to zero; `recommended_fee` at the `min_fee`
+    floor, from an empty histogram, and from the first non-empty bin;
+    `expected_wait_ms` with `taken` 0 and with a known position; and
+    `pool_histogram`'s last bin, including a `max_wait_ms` that isn't a
+    multiple of `bins`.
 14. **Capacity at zero**: Empty pool, verify all queries return empty/zero.

@@ -92,6 +92,7 @@ fn unconfirmed(tx: &Transaction, bytes: &Arc<[u8]>) -> UnconfirmedTx {
         tx_bytes: Arc::clone(bytes),
         fee: FEE,
         cost: bytes.len() as u32,
+        validation_cost: None,
         created: now,
         last_checked: now,
         source: None,
