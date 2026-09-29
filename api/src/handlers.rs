@@ -2069,8 +2069,8 @@ pub async fn post_peers_connect(
 }
 
 // ---------------------------------------------------------------------------
-// GET /nipopow/popowHeader/{header_id}
-// GET /nipopow/popowHeader/last
+// GET /nipopow/popowHeaderById/{header_id}
+// GET /nipopow/popowHeaderByHeight/{height}
 // ---------------------------------------------------------------------------
 
 pub async fn get_popow_header_by_id(
@@ -2081,14 +2081,16 @@ pub async fn get_popow_header_by_id(
     popow_header_response(&state, id).await
 }
 
-pub async fn get_popow_header_last(State(state): State<ApiState>) -> ApiResult<serde_json::Value> {
-    let tip = match state.chain.tip() {
-        Some(t) => t,
-        None => return err(StatusCode::NOT_FOUND, "chain is empty"),
+/// The best chain's header at `height`, answered as `popowHeaderById`
+/// answers for its id.
+pub async fn get_popow_header_by_height(
+    State(state): State<ApiState>,
+    ApiPath(height): ApiPath<u32>,
+) -> ApiResult<serde_json::Value> {
+    let Some(header) = state.chain.header_at(height) else {
+        return err(StatusCode::NOT_FOUND, "no header at this height");
     };
-    let mut tip_id = [0u8; 32];
-    tip_id.copy_from_slice(tip.id.0.as_ref());
-    popow_header_response(&state, tip_id).await
+    popow_header_response(&state, header.id.0 .0).await
 }
 
 async fn popow_header_response(
@@ -3463,22 +3465,6 @@ mod tests {
             State(state),
             ApiPath("aa".repeat(32)),
         ));
-        match result {
-            Err((status, _)) => assert_eq!(status, StatusCode::NOT_FOUND),
-            Ok(_) => panic!("expected 404"),
-        }
-    }
-
-    #[test]
-    fn popow_header_last_empty_chain_returns_404() {
-        let chain = Arc::new(MockChain {
-            known_header_id: None,
-            header_for_known_id: None,
-            proof_result: Err("unused".into()),
-        });
-        let state = test_state(chain);
-        let rt = build_runtime();
-        let result = rt.block_on(get_popow_header_last(State(state)));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::NOT_FOUND),
             Ok(_) => panic!("expected 404"),
@@ -5280,6 +5266,130 @@ mod tests {
         for (request, status) in cases {
             let uri = request.uri().to_string();
             assert_api_error(&serve(empty_state(), request), status, &uri);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /nipopow/popowHeaderById/{header_id}, /popowHeaderByHeight/{height}
+    // -----------------------------------------------------------------------
+
+    /// A chain of one header, at [`PopowChain::HEIGHT`], that builds the
+    /// header's PoPowHeader with one interlink, the all-zero id.
+    struct PopowChain {
+        header: Header,
+    }
+
+    impl PopowChain {
+        const HEIGHT: u32 = 7;
+
+        fn new() -> Self {
+            Self {
+                header: make_minimal_header(Self::HEIGHT),
+            }
+        }
+
+        fn id_hex(&self) -> String {
+            hex::encode(self.header.id.0 .0)
+        }
+    }
+
+    impl ChainAccess for PopowChain {
+        fn height(&self) -> u32 {
+            Self::HEIGHT
+        }
+        fn header_at(&self, height: u32) -> Option<Header> {
+            (height == Self::HEIGHT).then(|| self.header.clone())
+        }
+        fn header_by_id(&self, id: &[u8; 32]) -> Option<Header> {
+            (*id == self.header.id.0 .0).then(|| self.header.clone())
+        }
+        fn tip(&self) -> Option<Header> {
+            Some(self.header.clone())
+        }
+        fn build_nipopow_proof(
+            &self,
+            _m: u32,
+            _k: u32,
+            _id: Option<[u8; 32]>,
+        ) -> Result<Vec<u8>, String> {
+            Err("unused".into())
+        }
+        fn header_ids(&self, _offset: u32, _limit: u32) -> Vec<[u8; 32]> {
+            vec![]
+        }
+        fn popow_header_by_id(&self, id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
+            if *id != self.header.id.0 .0 {
+                return Ok(None);
+            }
+            let popow = PoPowHeader {
+                header: self.header.clone(),
+                interlinks: vec![BlockId(Digest32::zero())],
+                interlinks_proof: BatchMerkleProof::new(vec![], vec![]),
+            };
+            Ok(Some(popow.scorex_serialize_bytes().unwrap()))
+        }
+        fn memory_estimate(&self) -> ChainMemory {
+            unreported_memory()
+        }
+    }
+
+    fn popow_state() -> ApiState {
+        test_state(Arc::new(PopowChain::new()))
+    }
+
+    #[test]
+    fn popow_header_by_id_and_by_height_answer_the_header() {
+        let id = PopowChain::new().id_hex();
+        let by_id_uri = format!("/nipopow/popowHeaderById/{id}");
+        let by_id = get(popow_state(), &by_id_uri);
+        assert_json_ok(&by_id, &by_id_uri);
+        let popow: serde_json::Value = serde_json::from_str(&by_id.body).unwrap();
+        assert_eq!(popow["header"]["id"], serde_json::json!(id));
+        assert_eq!(popow["header"]["height"], serde_json::json!(7));
+        assert_eq!(popow["interlinks"], serde_json::json!(["00".repeat(32)]));
+        assert!(popow["interlinksProof"].is_object(), "{}", by_id.body);
+
+        let by_height_uri = "/nipopow/popowHeaderByHeight/7";
+        let by_height = get(popow_state(), by_height_uri);
+        assert_json_ok(&by_height, by_height_uri);
+        assert_eq!(by_height.body, by_id.body);
+    }
+
+    #[test]
+    fn popow_header_routes_answer_404_without_a_header() {
+        for uri in [
+            format!("/nipopow/popowHeaderById/{}", "ab".repeat(32)),
+            "/nipopow/popowHeaderByHeight/0".to_string(),
+            "/nipopow/popowHeaderByHeight/8".to_string(),
+        ] {
+            assert_api_error(&get(popow_state(), &uri), StatusCode::NOT_FOUND, &uri);
+        }
+    }
+
+    #[test]
+    fn popow_header_routes_answer_400_for_a_malformed_parameter() {
+        for uri in [
+            "/nipopow/popowHeaderById/zz",
+            "/nipopow/popowHeaderByHeight/seven",
+            "/nipopow/popowHeaderByHeight/-1",
+        ] {
+            assert_api_error(&get(popow_state(), uri), StatusCode::BAD_REQUEST, uri);
+        }
+    }
+
+    /// Neither exists on the JVM, and they are gone here too.
+    #[test]
+    fn old_popow_header_routes_are_gone() {
+        let id = PopowChain::new().id_hex();
+        for uri in [
+            "/nipopow/popowHeader/last".to_string(),
+            format!("/nipopow/popowHeader/{id}"),
+        ] {
+            assert_eq!(
+                get(popow_state(), &uri).status,
+                StatusCode::NOT_FOUND,
+                "{uri}"
+            );
         }
     }
 }
