@@ -1,5 +1,6 @@
+use ergo_chain_types::Header;
 use ergo_lib::chain::transaction::input::prover_result::ProverResult;
-use ergo_lib::chain::transaction::{DataInput, Input};
+use ergo_lib::chain::transaction::{DataInput, Input, Transaction};
 use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
 use ergo_lib::ergotree_ir::chain::tx_id::TxId;
 use serde::Serialize;
@@ -57,11 +58,88 @@ pub struct EmissionInfo {
     pub total_remain_coins: u64,
 }
 
+// Every response that renders a transaction is typed down to ergo-lib's own
+// serializers, which write each input's context extension in the order the
+// transaction holds it (`facts/api.md` § Transaction JSON). A
+// `serde_json::Value` on the way would sort those keys as strings.
+
+/// `GET /blocks/{headerId}/transactions` response.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockTransactions {
+    /// As the request spelled it.
+    pub header_id: String,
+    pub transactions: Vec<Transaction>,
+}
+
+/// A block's transactions section: `blockTransactions` in
+/// `GET /blocks/{headerId}`, and `GET /blocks/modifier/{id}` for one.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockTransactionsSection {
+    pub header_id: String,
+    pub transactions: Vec<Transaction>,
+    pub block_version: u32,
+    /// Length of the stored section, in bytes.
+    pub size: usize,
+}
+
+/// A block's AD proofs section.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdProofsSection {
+    pub header_id: String,
+    pub proof_bytes: String,
+    /// The header's `adProofsRoot`, where the handler has the header.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// Length of the stored section, in bytes.
+    pub size: usize,
+}
+
+/// A block's extension section.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionSection {
+    pub header_id: String,
+    /// The header's `extensionRoot`, where the handler has the header.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// Each field as `[keyHex, valueHex]`.
+    pub fields: Vec<[String; 2]>,
+}
+
+/// `GET /blocks/{headerId}` response: the JVM's `ErgoFullBlock` shape.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FullBlock {
+    pub header: Header,
+    pub block_transactions: BlockTransactionsSection,
+    pub extension: ExtensionSection,
+    /// `null` when the store doesn't hold the section.
+    pub ad_proofs: Option<AdProofsSection>,
+}
+
+/// `GET /blocks/modifier/{id}` response: the section the id names.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum BlockModifier {
+    Header(Box<Header>),
+    /// A stored header the chain doesn't know.
+    StoredHeader {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        id: String,
+        size: usize,
+    },
+    BlockTransactions(BlockTransactionsSection),
+    AdProofs(AdProofsSection),
+    Extension(ExtensionSection),
+}
+
 /// A pool transaction as `GET /transactions/unconfirmed*` renders it: the
 /// JVM's `TransactionsApiRoute.createTransactionWithResolvedInputs`
-/// (v6.0.6). Serialized field by field from ergo-lib's own types, so each
-/// input's context extension keeps its order (`facts/api.md` § Transaction
-/// JSON).
+/// (v6.0.6).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UnconfirmedTransaction {
@@ -301,8 +379,7 @@ pub struct ValidationFragmentsTx {
     /// `Transaction::sigma_serialize_bytes()`, hex-encoded — each input as
     /// boxId + spending proof + ContextExtension, then data-inputs, then
     /// outputs. The on-chain ContextExtension wire order is preserved
-    /// byte-for-byte (NOT sorted), unlike the JSON endpoints which normalize
-    /// extension keys ascending. The tx id is `blake2b256(signingMessage)`
+    /// byte-for-byte (NOT sorted). The tx id is `blake2b256(signingMessage)`
     /// (proofs stripped, ContextExtensions kept in wire order), NOT
     /// `blake2b256(bytes)`.
     pub bytes: String,

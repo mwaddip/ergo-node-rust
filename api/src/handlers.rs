@@ -301,11 +301,11 @@ pub async fn get_block_transactions(
     let rendered = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
         let parsed = ergo_validation::parse_block_transactions(&data)
             .map_err(|e| format!("failed to parse stored transactions: {e}"))?;
-        let value = serde_json::json!({
-            "headerId": header_id,
-            "transactions": parsed.transactions,
-        });
-        serde_json::to_vec(&value).map_err(|e| format!("failed to serialize transactions: {e}"))
+        let body = BlockTransactions {
+            header_id,
+            transactions: parsed.transactions,
+        };
+        serde_json::to_vec(&body).map_err(|e| format!("failed to serialize transactions: {e}"))
     })
     .await;
 
@@ -1730,7 +1730,7 @@ const HEADER_TYPE: u8 = 101;
 pub async fn get_full_block(
     State(state): State<ApiState>,
     Path(header_id): Path<String>,
-) -> ApiResult<serde_json::Value> {
+) -> ApiResult<FullBlock> {
     let id = hex_to_id(&header_id)?;
     let header = match state.chain.header_by_id(&id) {
         Some(h) => h,
@@ -1744,7 +1744,7 @@ pub async fn get_full_block(
         &id,
         header.transaction_root.0.as_ref(),
     );
-    let txs_value = match state.store.get(BLOCK_TRANSACTIONS_TYPE, &txs_modifier_id) {
+    let block_transactions = match state.store.get(BLOCK_TRANSACTIONS_TYPE, &txs_modifier_id) {
         Some(data) => {
             let parsed = ergo_validation::parse_block_transactions(&data).map_err(|e| {
                 (
@@ -1756,12 +1756,12 @@ pub async fn get_full_block(
                     }),
                 )
             })?;
-            serde_json::json!({
-                "headerId": header_id_hex,
-                "transactions": parsed.transactions,
-                "blockVersion": parsed.block_version,
-                "size": data.len(),
-            })
+            BlockTransactionsSection {
+                header_id: header_id_hex.clone(),
+                transactions: parsed.transactions,
+                block_version: parsed.block_version,
+                size: data.len(),
+            }
         }
         None => return err(StatusCode::NOT_FOUND, "transactions not found"),
     };
@@ -1769,23 +1769,23 @@ pub async fn get_full_block(
     // AD proofs (optional in JVM): keyed by blake2b256(104 || header_id || ad_proofs_root).
     // Stored format: [header_id: 32B] [proof_size: VLQ u32] [proof_bytes: proof_size B].
     let ad_modifier_id = section_modifier_id(AD_PROOFS_TYPE, &id, header.ad_proofs_root.0.as_ref());
-    let ad_proofs_value = state
+    let ad_proofs = state
         .store
         .get(AD_PROOFS_TYPE, &ad_modifier_id)
         .and_then(|data| {
             let proof_bytes = inline_ad_proof_bytes(&data)?;
-            Some(serde_json::json!({
-                "headerId": header_id_hex,
-                "proofBytes": hex::encode(proof_bytes),
-                "digest": hex::encode(header.ad_proofs_root.0.as_ref()),
-                "size": data.len(),
-            }))
+            Some(AdProofsSection {
+                header_id: header_id_hex.clone(),
+                proof_bytes: hex::encode(proof_bytes),
+                digest: Some(hex::encode(header.ad_proofs_root.0.as_ref())),
+                size: data.len(),
+            })
         });
 
     // Extension: keyed by blake2b256(108 || header_id || extension_root).
     let ext_modifier_id =
         section_modifier_id(EXTENSION_TYPE, &id, header.extension_root.0.as_ref());
-    let extension_value = match state.store.get(EXTENSION_TYPE, &ext_modifier_id) {
+    let extension = match state.store.get(EXTENSION_TYPE, &ext_modifier_id) {
         Some(data) => {
             let parsed = ergo_validation::parse_extension(&data).map_err(|e| {
                 (
@@ -1802,36 +1802,21 @@ pub async fn get_full_block(
                 .iter()
                 .map(|f| [hex::encode(f.key), hex::encode(&f.value)])
                 .collect();
-            serde_json::json!({
-                "headerId": header_id_hex,
-                "digest": hex::encode(header.extension_root.0.as_ref()),
-                "fields": fields,
-            })
+            ExtensionSection {
+                header_id: header_id_hex,
+                digest: Some(hex::encode(header.extension_root.0.as_ref())),
+                fields,
+            }
         }
         None => return err(StatusCode::NOT_FOUND, "extension not found"),
     };
 
-    let mut full = serde_json::Map::new();
-    full.insert(
-        "header".into(),
-        serde_json::to_value(&header).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: 500,
-                    reason: format!("header serialization failed: {e}"),
-                    detail: None,
-                }),
-            )
-        })?,
-    );
-    full.insert("blockTransactions".into(), txs_value);
-    full.insert("extension".into(), extension_value);
-    full.insert(
-        "adProofs".into(),
-        ad_proofs_value.unwrap_or(serde_json::Value::Null),
-    );
-    Ok(Json(serde_json::Value::Object(full)))
+    Ok(Json(FullBlock {
+        header,
+        block_transactions,
+        extension,
+        ad_proofs,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1841,7 +1826,7 @@ pub async fn get_full_block(
 pub async fn get_block_modifier(
     State(state): State<ApiState>,
     Path(modifier_id): Path<String>,
-) -> ApiResult<serde_json::Value> {
+) -> ApiResult<BlockModifier> {
     let id = hex_to_id(&modifier_id)?;
     for &type_id in &[
         HEADER_TYPE,
@@ -1852,24 +1837,16 @@ pub async fn get_block_modifier(
         let Some(data) = state.store.get(type_id, &id) else {
             continue;
         };
-        let id_hex = hex::encode(id);
-        let value = match type_id {
+        let modifier = match type_id {
             HEADER_TYPE => {
                 // Headers stored by header ID, so id IS the header ID.
                 match state.chain.header_by_id(&id) {
-                    Some(h) => serde_json::to_value(&h).map_err(|e| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ApiError {
-                                error: 500,
-                                reason: format!("header serialization failed: {e}"),
-                                detail: None,
-                            }),
-                        )
-                    })?,
-                    None => {
-                        serde_json::json!({ "type": "header", "id": id_hex, "size": data.len() })
-                    }
+                    Some(h) => BlockModifier::Header(Box::new(h)),
+                    None => BlockModifier::StoredHeader {
+                        kind: "header",
+                        id: hex::encode(id),
+                        size: data.len(),
+                    },
                 }
             }
             BLOCK_TRANSACTIONS_TYPE => {
@@ -1883,11 +1860,11 @@ pub async fn get_block_modifier(
                         }),
                     )
                 })?;
-                serde_json::json!({
-                    "headerId": hex::encode(parsed.header_id),
-                    "transactions": parsed.transactions,
-                    "blockVersion": parsed.block_version,
-                    "size": data.len(),
+                BlockModifier::BlockTransactions(BlockTransactionsSection {
+                    header_id: hex::encode(parsed.header_id),
+                    transactions: parsed.transactions,
+                    block_version: parsed.block_version,
+                    size: data.len(),
                 })
             }
             AD_PROOFS_TYPE => {
@@ -1900,10 +1877,11 @@ pub async fn get_block_modifier(
                     Some(b) => b,
                     None => return err(StatusCode::INTERNAL_SERVER_ERROR, "malformed ad_proofs"),
                 };
-                serde_json::json!({
-                    "headerId": inner_header_id,
-                    "proofBytes": hex::encode(proof_bytes),
-                    "size": data.len(),
+                BlockModifier::AdProofs(AdProofsSection {
+                    header_id: inner_header_id,
+                    proof_bytes: hex::encode(proof_bytes),
+                    digest: None,
+                    size: data.len(),
                 })
             }
             EXTENSION_TYPE => {
@@ -1922,14 +1900,15 @@ pub async fn get_block_modifier(
                     .iter()
                     .map(|f| [hex::encode(f.key), hex::encode(&f.value)])
                     .collect();
-                serde_json::json!({
-                    "headerId": hex::encode(parsed.header_id),
-                    "fields": fields,
+                BlockModifier::Extension(ExtensionSection {
+                    header_id: hex::encode(parsed.header_id),
+                    digest: None,
+                    fields,
                 })
             }
             _ => unreachable!(),
         };
-        return Ok(Json(value));
+        return Ok(Json(modifier));
     }
     err(StatusCode::NOT_FOUND, "modifier not found")
 }
@@ -3867,46 +3846,139 @@ mod tests {
     // GET /blocks/{id}/transactions
     // -----------------------------------------------------------------------
 
-    /// Guards the byte-shape of the response. The handler renders through
-    /// `serde_json::Value`, so every object's keys come out alphabetically
-    /// sorted. Re-canonicalizing the body must therefore be a no-op. A future
-    /// "optimization" to a typed/`derive(Serialize)` struct would emit fields in
-    /// impl order (e.g. `id` before `dataInputs`) and silently change the bytes
-    /// every external consumer sees — this test fails loudly if that happens.
     #[test]
-    fn block_transactions_response_is_canonical_sorted_json() {
+    fn block_transactions_answers_the_stored_section() {
         let (state, target_id_hex, expected_tx_count) = build_vf_fixture();
-        let rt = build_runtime();
-        let (status, content_type, body_bytes) = rt.block_on(async {
-            let resp = get_block_transactions(State(state), Path(target_id_hex.clone())).await;
-            let status = resp.status();
-            let content_type = resp
-                .headers()
-                .get(axum::http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            (status, content_type, bytes)
-        });
+        let uri = format!("/blocks/{target_id_hex}/transactions");
+        let served = get(state, &uri);
+        assert_json_ok(&served, &uri);
 
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(content_type.as_deref(), Some("application/json"));
-
-        let value: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&served.body).unwrap();
         assert_eq!(value["headerId"], serde_json::Value::String(target_id_hex));
         assert_eq!(
             value["transactions"].as_array().map(Vec::len),
             Some(expected_tx_count)
         );
+    }
 
-        let recanonical = serde_json::to_vec(&value).unwrap();
-        assert_eq!(
-            body_bytes.as_ref(),
-            recanonical.as_slice(),
-            "response must already be canonical sorted-key JSON; a direct serializer would reorder keys"
+    // -----------------------------------------------------------------------
+    // Transaction JSON keeps context-extension order (facts/api.md
+    // § Transaction JSON)
+    // -----------------------------------------------------------------------
+
+    /// An input extension holding variable 8 and then variable 4: the
+    /// `Int` constants 1 and 2, `0402` and `0404` serialized.
+    const EXTENSION_8_THEN_4: &str = r#""extension":{"8":"0402","4":"0404"}"#;
+
+    /// A transaction whose one input carries [`EXTENSION_8_THEN_4`], stored
+    /// as the only transaction of a block and held in the pool. Returns
+    /// `(state, tx, header id hex, block transactions modifier id hex)`.
+    fn extension_order_fixture() -> (ApiState, ergo_validation::Transaction, String, String) {
+        use ergo_lib::ergotree_ir::mir::constant::Constant;
+
+        let mut extension = ContextExtension::empty();
+        extension.values.insert(8, Constant::from(1i32));
+        extension.values.insert(4, Constant::from(2i32));
+        let tx = spend(&[make_vf_p2pk_box(1_000_000).box_id()], &extension);
+
+        let header = make_vf_header(685, BlockId(Digest32::zero()));
+        let header_id = header.id.0 .0;
+        let txs_modifier_id = section_modifier_id(
+            BLOCK_TRANSACTIONS_TYPE,
+            &header_id,
+            header.transaction_root.0.as_ref(),
         );
+        let ext_modifier_id =
+            section_modifier_id(EXTENSION_TYPE, &header_id, header.extension_root.0.as_ref());
+        let mut sections = HashMap::new();
+        sections.insert(
+            (BLOCK_TRANSACTIONS_TYPE, txs_modifier_id),
+            ergo_validation::serialize_block_transactions(&header_id, 2, std::slice::from_ref(&tx))
+                .unwrap(),
+        );
+        sections.insert(
+            (EXTENSION_TYPE, ext_modifier_id),
+            ergo_validation::serialize_extension(&header_id, &[([0, 1], vec![0xAB])]).unwrap(),
+        );
+
+        let mut state = test_state(Arc::new(MultiHeaderChain {
+            by_id: HashMap::from([(header_id, header)]),
+        }));
+        state.store = Arc::new(KeyedStore { by_key: sections });
+        add_to_pool(
+            &state,
+            vec![pool_entry(&tx, 2_000_000, None, Instant::now())],
+        );
+        (
+            state,
+            tx,
+            hex::encode(header_id),
+            hex::encode(txs_modifier_id),
+        )
+    }
+
+    /// Every response that renders a transaction lists the extension as the
+    /// transaction holds it, 8 before 4, and a client that parses the JSON
+    /// in that order gets the transaction back, id and all. ergo-lib's
+    /// parser recomputes the id from what it read and refuses the JSON when
+    /// that differs from the `id` it carries.
+    #[test]
+    fn every_transaction_rendering_keeps_context_extension_order() {
+        #[derive(serde::Deserialize)]
+        struct Transactions {
+            transactions: Vec<ergo_validation::Transaction>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Block {
+            block_transactions: Transactions,
+        }
+
+        let (state, tx, header_id, txs_modifier_id) = extension_order_fixture();
+        let tx_id = hex::encode(tx.id().0 .0);
+        type Parse = fn(&str) -> serde_json::Result<Vec<ergo_validation::Transaction>>;
+        let endpoints: [(String, Parse); 5] = [
+            (format!("/blocks/{header_id}/transactions"), |body| {
+                serde_json::from_str::<Transactions>(body).map(|t| t.transactions)
+            }),
+            (format!("/blocks/{header_id}"), |body| {
+                serde_json::from_str::<Block>(body).map(|b| b.block_transactions.transactions)
+            }),
+            (format!("/blocks/modifier/{txs_modifier_id}"), |body| {
+                serde_json::from_str::<Transactions>(body).map(|t| t.transactions)
+            }),
+            ("/transactions/unconfirmed".to_string(), |body| {
+                serde_json::from_str(body)
+            }),
+            (
+                format!("/transactions/unconfirmed/byTransactionId/{tx_id}"),
+                |body| serde_json::from_str(body).map(|t| vec![t]),
+            ),
+        ];
+
+        for (uri, parse) in endpoints {
+            let served = get(state.clone(), &uri);
+            assert_json_ok(&served, &uri);
+            assert!(
+                served.body.contains(EXTENSION_8_THEN_4),
+                "{uri}: extension out of order\n{}",
+                served.body
+            );
+
+            let reparsed = parse(&served.body).unwrap_or_else(|e| panic!("{uri}: {e}"));
+            assert_eq!(reparsed.len(), 1, "{uri}");
+            assert_eq!(reparsed[0].id(), tx.id(), "{uri}");
+            let keys: Vec<u8> = reparsed[0]
+                .inputs
+                .first()
+                .spending_proof
+                .extension
+                .values
+                .keys()
+                .copied()
+                .collect();
+            assert_eq!(keys, [8, 4], "{uri}");
+        }
     }
 
     #[test]
