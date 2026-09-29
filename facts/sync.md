@@ -946,11 +946,30 @@ for block sections that need downloading. The queue is populated from two source
 Block section requests follow the same pattern as header requests:
 - Send `ModifierRequest` with the section type and IDs
 - Track delivery via the `DeliveryTracker`
-- On timeout: re-request from a different peer
+- On timeout: re-request from a different peer (§ Delivery timeouts)
 - On receive: the pipeline binds the bytes to the delivered id and stores
   them only if they bind (§ Receive-path binding). A body that does not
   bind is dropped and never reported as received, so its request keeps
   its timeout and is re-requested from another peer
+
+### Delivery timeouts
+
+The delivery check (every 5 seconds) finds requests that timed out. What
+happens next depends on the modifier type, as in the JVM's `CheckDelivery`
+(`ErgoNodeViewSynchronizer` v6.0.6 :1260-1300):
+
+- **A transaction is forgotten, not re-requested.** Its pending entry is
+  cleared and no peer is penalized, because the peer may have dropped it from
+  its mempool (JVM :1262-1265). A later `Inv` can request it again.
+- **A header or block section is re-requested from another peer**, up to the
+  maximum delivery attempts. The re-requests of one check are **batched**: one
+  `ModifierRequest` per (target peer, modifier type), up to 400 ids each (the
+  JVM's per-message cap), never one message per id.
+
+Batching is not an optimization. A peer's write queue holds 64 frames, and a
+full queue aborts the peer (`facts/p2p-node.md` § Peer write queues). A check
+that sends sixty ids as sixty messages fills a healthy peer's queue before its
+writer runs, and the abort moves the next check's burst to the next peer.
 
 ### Inv handling
 
