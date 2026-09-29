@@ -1907,9 +1907,9 @@ components:
             `Transaction::sigma_serialize_bytes()`: each input as
             boxId + spending proof + ContextExtension, then data-inputs, then
             outputs. The on-chain ContextExtension wire order is preserved
-            byte-for-byte (sigma stores it order-faithfully as an `IndexMap`);
-            unlike the JSON endpoints, which normalize extension keys
-            ascending, this is byte-exact. NOTE: the tx id is
+            byte-for-byte (sigma stores it order-faithfully as an `IndexMap`),
+            as the JSON endpoints preserve it too (`facts/api.md` §
+            Transaction JSON). NOTE: the tx id is
             `blake2b256(signingMessage)` (proofs stripped, ContextExtensions
             kept in wire order), NOT `blake2b256(bytes)`; to confirm `bytes`
             belongs to

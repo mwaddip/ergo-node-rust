@@ -226,6 +226,8 @@ All errors on the main listener return a JSON body matching the JVM format:
 - `403` — authentication required but missing or invalid
 - `404` — resource not found (unknown header ID, box ID, tx ID)
 - `410` — resource was pruned (e.g., `/blocks/{id}/validation-fragments` after `blocks_to_keep` clipped the section)
+- `413` — request body too large
+- `415` — a JSON endpoint's body not sent as `application/json`
 - `429` — rate limited (if HTTP-level rate limiting is added at a reverse proxy)
 - `500` — internal error (component failure, should not happen)
 - `503` — node is syncing or a required subsystem (mining, modifier pipeline, state context) is not yet available
