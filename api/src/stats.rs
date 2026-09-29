@@ -14,9 +14,10 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::Router;
 use serde::Serialize;
 
+use crate::response::Json;
 use crate::STATS_VERSION;
 
 // ---------------------------------------------------------------------------

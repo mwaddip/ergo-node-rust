@@ -1,6 +1,5 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::Json;
 use serde::Deserialize;
 
 use std::sync::Arc;
@@ -13,6 +12,7 @@ use ergo_mempool::Mempool;
 use sigma_ser::ScorexSerializable;
 
 use crate::extract::{ApiBytes, ApiJson, ApiPath, ApiQuery};
+use crate::response::{json_body, Json};
 use crate::types::*;
 use crate::ApiState;
 
@@ -311,12 +311,7 @@ pub async fn get_block_transactions(
     .await;
 
     match rendered {
-        Ok(Ok(bytes)) => (
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            bytes,
-        )
-            .into_response(),
+        Ok(Ok(bytes)) => json_body(bytes),
         Ok(Err(reason)) => {
             api_error(StatusCode::INTERNAL_SERVER_ERROR, reason, None).into_response()
         }

@@ -13,10 +13,10 @@ use axum::body::Bytes;
 use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request};
 use axum::http::request::Parts;
 use axum::http::StatusCode;
-use axum::Json;
 use serde::de::DeserializeOwned;
 
 use crate::handlers::api_error;
+use crate::response::Json;
 use crate::types::ApiError;
 
 type Refusal = (StatusCode, Json<ApiError>);
@@ -70,7 +70,7 @@ where
     }
 }
 
-/// [`Json`], refusing with the `ApiError` body.
+/// [`axum::Json`], refusing with the `ApiError` body.
 pub struct ApiJson<T>(pub T);
 
 impl<T, S> FromRequest<S> for ApiJson<T>
@@ -81,8 +81,8 @@ where
     type Rejection = Refusal;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Refusal> {
-        match Json::from_request(req, state).await {
-            Ok(Json(value)) => Ok(Self(value)),
+        match axum::Json::from_request(req, state).await {
+            Ok(axum::Json(value)) => Ok(Self(value)),
             Err(r) => Err(refusal(r.status(), "malformed JSON body", r.body_text())),
         }
     }
