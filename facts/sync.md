@@ -241,6 +241,26 @@ in the **p2p router**, through a store-blind local-serve callback injected by
 the main crate (`facts/p2p-routing.md` § `ModifierRequest`), not in the sync
 loop.
 
+### Announcing blocks (main crate responsibility)
+
+The node announces new blocks the way the JVM does (`ErgoNodeViewSynchronizer`
+v6.0.6 :1429-1467). An announcement is one `Inv` per id, broadcast to every
+connected peer (`facts/p2p-node.md` § `broadcast`): the header (type 101),
+then the block's sections in the JVM's `Header.sectionIds` order, ADProofs
+(104), BlockTransactions (102), Extension (108). The ADProofs id is announced
+even when the node holds no ADProofs for the block, as the JVM does.
+
+| Event | Announced | JVM |
+|---|---|---|
+| `POST /mining/solution` accepts a block this node mined | At once, before the block is validated or applied | `NewBlockMined` |
+| A block this node mined is applied | No: it was announced on acceptance | `LocalBlockApplied` |
+| A block from a peer is applied | Only if its header timestamp is less than 2 hours before the local clock | `RemoteBlockApplied`, `header.isNew(2.hours)` |
+
+- The 2-hour window is a relay heuristic, not a consensus rule. It keeps a
+  syncing node from announcing history.
+- Announcing never holds up block application. The post-apply hook hands the
+  header to an announcer task and returns.
+
 ### Peer rotation
 
 `stalled_peers: HashSet<PeerId>` tracks peers that failed to produce progress.
