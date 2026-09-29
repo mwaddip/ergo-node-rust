@@ -44,15 +44,15 @@ pub trait P2pCountersSource: Send + Sync {
 /// returned by [`Self::key`] — stable across versions per `facts/stats.md`.
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub enum ModifierTypeKey {
-    /// modifier byte 1 — renders as `"header"`
+    /// modifier byte 101 — renders as `"header"`
     Header,
     /// modifier byte 2 — renders as `"transaction"`
     Transaction,
-    /// modifier byte 3 — renders as `"block_transactions"`
+    /// modifier byte 102 — renders as `"block_transactions"`
     BlockTransactions,
-    /// modifier byte 4 — renders as `"ad_proofs"`
+    /// modifier byte 104 — renders as `"ad_proofs"`
     AdProofs,
-    /// modifier byte 5 — renders as `"extension"`
+    /// modifier byte 108 — renders as `"extension"`
     Extension,
 }
 
