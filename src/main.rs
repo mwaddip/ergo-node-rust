@@ -950,6 +950,25 @@ fn header_id_bytes(header: &ergo_chain_types::Header) -> [u8; 32] {
     id
 }
 
+/// Parse a transaction a peer delivered at the script version activated at
+/// `block_version`, as the JVM's `parseAndProcessTransaction` does. The
+/// version decides what parses and what the id is (facts/mempool.md § P2P
+/// Transaction Intake).
+fn parse_pool_transaction(
+    tx_bytes: &[u8],
+    block_version: u8,
+) -> Result<ergo_validation::Transaction, ergo_lib::ergotree_ir::serialization::SigmaParsingError> {
+    use ergo_lib::ergotree_ir::serialization::constant_store::ConstantStore;
+    use ergo_lib::ergotree_ir::serialization::sigma_byte_reader::{SigmaByteRead, SigmaByteReader};
+    use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+
+    let mut reader = SigmaByteReader::new(std::io::Cursor::new(tx_bytes), ConstantStore::empty());
+    reader.with_tree_version(
+        enr_chain::activated_tree_version(block_version),
+        ergo_validation::Transaction::sigma_parse,
+    )
+}
+
 /// Decides which blocks the announcer broadcasts. It keeps the ids of the
 /// blocks this node mined, so that their `Applied` is skipped.
 #[derive(Default)]
@@ -3845,11 +3864,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     // P2P transaction — deserialize, validate, add to pool
                     Some((tx_id, tx_bytes)) = tx_rx.recv() => {
-                        use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
-                        use std::io::Cursor;
-                        use ergo_lib::ergotree_ir::serialization::constant_store::ConstantStore;
-                        use ergo_lib::ergotree_ir::serialization::sigma_byte_reader::SigmaByteReader;
-
                         // Need state context to validate — skip if not yet available
                         // (still syncing, no blocks validated yet)
                         let ctx_guard = state_context.read().await;
@@ -3861,9 +3875,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         };
 
-                        let cursor = Cursor::new(&tx_bytes);
-                        let mut reader = SigmaByteReader::new(cursor, ConstantStore::empty());
-                        let tx = match ergo_validation::Transaction::sigma_parse(&mut reader) {
+                        let Ok(block_version) = u8::try_from(ctx.parameters.block_version()) else {
+                            tracing::error!(
+                                block_version = ctx.parameters.block_version(),
+                                "mempool: block version outside u8, skipping tx"
+                            );
+                            continue;
+                        };
+                        let tx = match parse_pool_transaction(&tx_bytes, block_version) {
                             Ok(tx) => tx,
                             Err(e) => {
                                 tracing::debug!(
@@ -4564,6 +4583,87 @@ mod tests {
     use ergo_avltree_rust::batch_node::{AVLTree, Node, NodeHeader};
     use ergo_avltree_rust::operation::{KeyValue, Operation};
     use std::sync::Arc;
+
+    // ── P2P transaction intake (facts/mempool.md) ────────────────────────
+
+    /// SANTA X15, `Tuple(1, Upcast(1, Long))`, as context variable 0 of a
+    /// one-input, one-output transaction, written at tree version 3 (the
+    /// `Upcast` kept). The same fixture as `chain/tests/section_binding.rs`
+    /// § 6, whose ids that file pins: read at 3 and at 0, these bytes are two
+    /// transactions.
+    fn upcast_tx_bytes() -> Vec<u8> {
+        use ergo_lib::chain::transaction::input::prover_result::ProverResult;
+        use ergo_lib::chain::transaction::Input;
+        use ergo_lib::ergotree_interpreter::sigma_protocol::prover::ProofBytes;
+        use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
+        use ergo_lib::ergotree_ir::chain::ergo_box::box_value::BoxValue;
+        use ergo_lib::ergotree_ir::chain::ergo_box::{
+            BoxId, ErgoBoxCandidate, NonMandatoryRegisters,
+        };
+        use ergo_lib::ergotree_ir::chain::evaluated_value::{EvaluatedExpr, EvaluatedValue};
+        use ergo_lib::ergotree_ir::ergo_tree::{ErgoTree, ErgoTreeVersion};
+        use ergo_lib::ergotree_ir::mir::constant::Constant;
+        use ergo_lib::ergotree_ir::mir::expr::Expr;
+        use ergo_lib::ergotree_ir::mir::upcast::Upcast;
+        use ergo_lib::ergotree_ir::serialization::sigma_byte_writer::{
+            SigmaByteWrite, SigmaByteWriter,
+        };
+        use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+        use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::{SigmaBoolean, SigmaProp};
+        use ergo_lib::ergotree_ir::types::stype::SType;
+
+        let one = || Expr::Const(1i32.into());
+        let x15 = EvaluatedValue::Expr(EvaluatedExpr::Tuple(vec![
+            one(),
+            Expr::Upcast(Upcast::new(one(), SType::SLong).unwrap()),
+        ]));
+        let mut extension = ContextExtension::empty();
+        extension.values.insert(0, x15);
+        let input = Input::new(
+            BoxId::zero(),
+            ProverResult {
+                proof: ProofBytes::Empty,
+                extension,
+            },
+        );
+        let always = SigmaProp::new(SigmaBoolean::TrivialProp(true));
+        let output = ErgoBoxCandidate {
+            value: BoxValue::new(1_000_000_000).unwrap(),
+            ergo_tree: ErgoTree::try_from(Expr::Const(Constant::from(always))).unwrap(),
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height: 1,
+        };
+        let tx =
+            ergo_validation::Transaction::new_from_vec(vec![input], vec![], vec![output]).unwrap();
+        let mut out = Vec::new();
+        let mut w = SigmaByteWriter::new(&mut out, None);
+        w.with_tree_version(ErgoTreeVersion::V3, |w| tx.sigma_serialize(w))
+            .unwrap();
+        out
+    }
+
+    /// The pool reads a peer's transaction at the activated script version:
+    /// 3 at block version 4, 0 at block version 1. The ids are the ones
+    /// `chain/tests/section_binding.rs` observed for the same bytes.
+    #[test]
+    fn a_pool_transaction_is_read_at_the_activated_version() {
+        let bytes = upcast_tx_bytes();
+
+        let at_v4 = parse_pool_transaction(&bytes, 4).unwrap();
+        assert_eq!(
+            hex::encode(at_v4.id().as_ref()),
+            "6b11fd0ea5f1e84782c15044f03cf10df48022ba7dcb8e6c0e48233b1cf9b0a1",
+            "block version 4 activates script version 3: the Upcast stays in the id"
+        );
+
+        let at_v1 = parse_pool_transaction(&bytes, 1).unwrap();
+        assert_eq!(
+            hex::encode(at_v1.id().as_ref()),
+            "b006736746ec23927fecfbaeb5a27bda4df791e5440eaba24e8aadb3072b3deb",
+            "block version 1 activates script version 0: the Upcast is written as 1"
+        );
+    }
 
     // ── Layered config loading (facts/config.md) ─────────────────────────
 
