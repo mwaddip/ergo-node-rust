@@ -422,12 +422,33 @@ Response: 200 "txId" or 400 { error, reason }
 
 Step 2 writes the transaction at the activated script version: the
 `ErgoTreeVersion` equal to `block_version() − 1` of the parameters in effect,
-which is 3 since 6.0 (`enr_chain::activated_tree_version`). That is the
-version a peer reads the relayed bytes at
+which is 3 since 6.0. That is the version a peer reads the relayed bytes at
 (`facts/mempool.md` § P2P Transaction Intake). Written at any other version,
 the bytes can hash to an id other than the one the node announces.
 `Transaction::sigma_serialize_bytes()` writes at the fork's highest version,
 which is not the same thing once the two differ.
+
+**The handler gets the version from `ChainAccess`, not from the state
+context.** The parameters in effect belong to the chain, which has them from
+startup. The state context exists only after the first applied block. So steps
+2 and 2a need no state context, and an oversized transaction gets 400 while
+the node is syncing too.
+
+```rust
+// on ChainAccess:
+/// The script version activated by the parameters in effect after the last
+/// applied block: `enr_chain::activated_tree_version` of their block
+/// version. `None` only if that block version doesn't fit `u8`, which voting
+/// can't produce. The handler answers 500.
+fn activated_tree_version(&self) -> Option<ErgoTreeVersion>;
+```
+
+The main crate's adapter implements it from the chain's active parameters.
+This crate still doesn't depend on `enr-chain`, and any chain rule it needs
+comes through `ChainAccess` like this one.
+`GET /blocks/{header_id}/validation-fragments` writes each transaction with
+`ergo_validation::serialize_block_transaction` (`facts/validation.md` §
+Section Parsing), not with a version of its own.
 
 Step 2a is the JVM's size check (`TransactionsApiRoute.validateTransactionAndProcess`,
 v6.0.6 :165-168): a transaction over `maxTransactionSize` is refused before it

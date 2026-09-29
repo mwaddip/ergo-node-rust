@@ -958,6 +958,13 @@ DigestValidator::new(
     own; follow it.
   - `Transaction::sigma_serialize_bytes()` is not this rule: it writes at the
     fork's highest version, 3, for every block.
+- **One transaction, as its block writes it:**
+  `serialize_block_transaction(tx: &Transaction, block_version: u8) ->
+  Result<Vec<u8>, ValidationError>`. It writes the transaction at
+  `block_transactions_write_version(block_version)`.
+  `serialize_block_transactions` writes each transaction through it. The API's
+  `validation-fragments` endpoint calls it directly, because the api crate
+  keeps off `enr-chain` (`facts/api.md` § Transaction Submission Flow).
 
 ### ADProofs (type 104)
 ```
