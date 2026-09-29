@@ -232,17 +232,14 @@ because no peer had ever synced FROM this node (all prior peers were JVM
 archival nodes serving us). Without it a from-genesis peer stalls at height 0
 against another node of ours.
 
-### Serving modifier requests (store-first)
+### Serving modifier requests
 
-Incoming `ModifierRequest` is served from the node's OWN store when the
-modifier is present; only ids absent locally fall through to the legacy
-relay-to-other-peers path (proxy heritage). Implementation note: serving
-lives in the **p2p router** via a store-blind local-serve callback injected
-by the main crate (see `facts/p2p-routing.md`, "Local serve hook") — NOT in
-the sync loop, so serve and relay can never double-respond for one request.
-Same discovery history as the continuation-Inv gap: relay-only behavior
-meant a node with an 11 GB block store answered requests by asking someone
-else.
+Incoming `ModifierRequest` is answered from what the node has: block sections
+from its own store, transactions from its mempool. Ids it doesn't have get no
+answer, as in the JVM, and are never passed on to another peer. Serving lives
+in the **p2p router**, through a store-blind local-serve callback injected by
+the main crate (`facts/p2p-routing.md` § `ModifierRequest`), not in the sync
+loop.
 
 ### Peer rotation
 

@@ -43,7 +43,7 @@ The handle to a running P2P layer. Created by `P2pNode::start()`. The P2P layer 
 - **Postcondition**: Listeners, outbound connections, keepalive,
   outbound-fill dialer, and event loop are spawned as background tasks.
   Returns immediately.
-- If `modifier_sink` is `Some`, every modifier from a `ModifierResponse` is sent to the channel as `(modifier_type, id, data, peer_id)` via the `Action::Validate` mechanism. `peer_id` is `Option<u64>` — `Some(id)` for peer-delivered modifiers, `None` for locally-ingested ones. The P2P layer never blocks on validation.
+- `modifier_sink` is required: a node that drops the modifiers it receives cannot sync. Every modifier from a `ModifierResponse` is sent to the channel as `(modifier_type, id, data, peer_id)` via the `Action::Validate` mechanism. `peer_id` is `Option<u64>` — `Some(id)` for peer-delivered modifiers, `None` for locally-ingested ones. The P2P layer never blocks on validation.
 - `peer_storage: Box<dyn PeerStorage>` provides persistent backing
   for the in-memory PeerDb. `start` calls `peer_storage.load_all()`
   to repopulate the table, then constructs the PeerDb and hands it
@@ -66,9 +66,6 @@ The handle to a running P2P layer. Created by `P2pNode::start()`. The P2P layer 
 ### `inbound_peers() -> Vec<PeerId>`
 - Returns IDs of currently connected inbound peers.
 
-### `latency_stats() -> Option<LatencyStats>`
-- Returns latency statistics for modifier responses, if any data collected.
-
 ### `send_to(peer, message) -> Result<()>`
 - **Precondition**: `peer` is a currently connected peer.
 - **Postcondition**: Message is serialized and queued for delivery, or the
@@ -78,9 +75,10 @@ The handle to a running P2P layer. Created by `P2pNode::start()`. The P2P layer 
   full. A full queue aborts the connection before the error is returned.
 - Does not guarantee delivery — the peer may disconnect before the message is sent.
 
-### `broadcast_outbound(message)`
+### `broadcast(message)`
 - **Postcondition**: Message is queued for delivery to every currently
-  connected outbound peer whose queue has room.
+  connected peer, inbound and outbound, whose queue has room. This is the
+  JVM's `SendToNetwork(msg, Broadcast)`.
 - A peer whose queue is full is aborted, exactly as for `send_to`. The
   broadcast continues with the remaining peers.
 
@@ -140,9 +138,9 @@ The handle to a running P2P layer. Created by `P2pNode::start()`. The P2P layer 
 
 ## Router: Action::Validate
 
-The router emits `Action::Validate { modifier_type, id, data, peer_id }` for each modifier in a `ModifierResponse`. `peer_id` identifies which peer sent the modifier, enabling penalty attribution when validation fails downstream. The event loop dispatches these to the `modifier_sink` channel as `(modifier_type, id, data, Some(peer_id.0))` via `try_send` (non-blocking). If no sink is provided, validate actions are dropped (pure proxy mode).
+The router emits `Action::Validate { modifier_type, id, data, peer_id }` for each modifier in a `ModifierResponse`. `peer_id` identifies which peer sent the modifier, enabling penalty attribution when validation fails downstream. The event loop dispatches these to the `modifier_sink` channel as `(modifier_type, id, data, Some(peer_id.0))` via `try_send` (non-blocking).
 
-The router does NOT validate modifiers. It routes them, emits them for external validation, and forwards to requesters. Validation is the pipeline's job.
+The router does not validate modifiers and never forwards them: it emits them for validation, which is the pipeline's job.
 
 ## Outbound Manager
 
@@ -201,7 +199,7 @@ constants :290-294). The byte bound is one maximum-size frame: the largest
 legal frame always fits, and a backlog beyond it means the peer is not reading.
 
 - **Enqueueing never waits.** Every path that puts a frame on a peer's queue —
-  the event loop's `Action::Send`, `send_to`, `broadcast_outbound`, the
+  the event loop's `Action::Send`, `send_to`, `broadcast`, the
   keepalive — either enqueues at once or finds the queue full.
 - **A full queue aborts the connection.** An enqueue that would exceed either
   bound aborts that peer (next section). This is what the JVM does since
@@ -210,7 +208,7 @@ legal frame always fits, and a backlog beyond it means the peer is not reading.
   e.g. after a write error, so the peer can never be written to again.
 - **No lock is held across an await on a peer.** A peer that stops reading
   must not be able to stall the event loop, the keepalive, or any caller of
-  `send_to` / `broadcast_outbound`.
+  `send_to` / `broadcast`.
 - Reader tasks may wait on the shared event channel (256). That backpressures
   the one peer's socket, not the event loop, and no protocol message is
   dropped to avoid it.
@@ -262,7 +260,7 @@ slot; confirmation transfers it to connections."
 ## Invariants
 
 - Background tasks live until the tokio runtime shuts down.
-- `send_to` and `broadcast_outbound` never block on delivery — they enqueue or abort, and return.
+- `send_to` and `broadcast` never block on delivery — they enqueue or abort, and return.
 - The event loop never blocks on a peer. Every enqueue is non-blocking ("Peer write queues").
 - The event subscriber is a read-only tap. It does not affect routing behavior.
 - Messages sent via `send_to` bypass the router — they go directly to the peer's write channel. The router does not see them and does not track them.

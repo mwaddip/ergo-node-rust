@@ -1,45 +1,32 @@
 # Routing Layer Contract
 
-## Module: `routing::inv_table`
+The router decides what the node does with each message a peer sends. It
+answers peer gossip and locally served modifier requests itself, and emits
+received modifiers for validation. Everything else reaches its consumer —
+sync, the mempool task, the snapshot and NiPoPoW handlers — through the event
+subscriber (`facts/p2p-node.md` § `subscribe()`), which sees every event
+before the router does.
 
-### `record(modifier_id, peer)`
-- **Postcondition**: `lookup(modifier_id) == Some(peer)`.
-
-### `lookup(modifier_id) -> Option<PeerId>`
-- Returns the peer that most recently announced this modifier.
-
-### `purge_peer(peer)`
-- **Postcondition**: No entry maps to `peer`.
-- **Invariant**: The Inv table never contains entries for disconnected peers.
-
-## Module: `routing::tracker`
-
-### RequestTracker
-
-#### `record(modifier_id, requester)`
-- **Postcondition**: `lookup(modifier_id) == Some(requester)`.
-
-#### `fulfill(modifier_id) -> Option<PeerId>`
-- **Postcondition**: Entry is removed. Returns the requester.
-
-#### `purge_peer(peer)`
-- **Postcondition**: No entry maps to `peer`.
-
-### SyncTracker
-
-#### `pair(inbound, outbound)`
-- **Postcondition**: `outbound_for(inbound) == Some(outbound)` AND `inbound_for(outbound) == Some(inbound)`.
-- **Invariant**: Pairings are bidirectionally consistent.
-
-#### `purge_peer(peer)`
-- **Postcondition**: No pairing references `peer` on either side.
+**The router never forwards a message from one peer to another.** Every
+`Action::Send` it emits answers the peer whose message triggered it. The node
+is not a proxy.
 
 ## Module: `routing::router`
 
 ### `handle_event(event) -> Vec<Action>`
 - **Precondition**: Peer IDs in events are registered (or being disconnected).
-- **Postcondition**: Actions target only registered peers.
-- Mode filtering: Light mode drops SyncInfo and block-related ModifierRequests.
+- **Postcondition**: Actions target only registered peers, and every
+  `Action::Send` targets the source of the message being handled.
+
+| Message | Router's action |
+|---|---|
+| `GetPeers` | Reply `Peers` to the source |
+| `Peers` | Record the entries into PeerDb as hearsay |
+| `ModifierRequest` | Answer what the local-serve hook has; nothing for the rest |
+| `ModifierResponse` | `Action::Validate` for each modifier, carrying the source's peer id |
+| `Inv`, `SyncInfo` | None: sync and the mempool task read them from the subscriber |
+| Any other code | None: dropped, not penalized |
+
 - GetPeers: parsed (body must be empty), then PeerDb is queried for
   up to 8 *observed* non-blacklisted peers (`PeerDb::observed` — peers
   we have completed a handshake with; hearsay is never gossiped onward),
@@ -79,6 +66,37 @@
   enabled — we never gossip a bogus address that ended up in PeerDb
   (legacy rows, or addresses ingested while the filter was off).
 
+- ModifierRequest: a peer connected through a **light** listener gets
+  nothing for a block-related type (101, 102, 104, 108): light listeners are
+  gossip-only. Otherwise every requested id goes to the local-serve hook, a
+  store-blind callback
+  `local_serve: Option<Arc<dyn Fn(u8, &[u8; 32]) -> Option<Vec<u8>> + Send + Sync>>`
+  that the integrator injects. The main crate answers block sections from the
+  modifier store and transactions from the mempool. Hits go back to the source
+  in `ModifierResponse` messages, one per request unless the encoded body
+  would exceed the serve batch cap. A miss gets no answer, as in the JVM,
+  which serves what it has and ignores the rest
+  (`ErgoNodeViewSynchronizer.modifiersReq`); the requester asks another peer.
+  The parse-layer object cap bounds the hook's cost: at most 400 lookups per
+  request.
+- ModifierResponse: each modifier becomes an `Action::Validate` with the
+  source's peer id (`facts/p2p-node.md` § Router: Action::Validate). Nothing
+  is sent back or onward.
+- Unknown code: dropped. It is neither forwarded nor penalized, because a
+  newer protocol version may send codes we don't know (the input-block
+  messages of the JVM's 6.5.0 line, for one). The JVM's `MessageSerializer`
+  throws on an unknown code, which stalls that connection for good; dropping
+  the frame keeps it. Codes the node handles outside the typed codec — UTXO
+  snapshot 76–81, NiPoPoW 90–91 — reach their handlers through the
+  subscriber, like every other event.
+- PeerConnected: when a peer transitions to Active, its handshake
+  `PeerSpec` is recorded into PeerDb per `facts/p2p-peerdb.md`
+  § Observed and hearsay: outbound — the dialed address is observed, the
+  declared address observed if on the same IP and hearsay otherwise;
+  inbound — the declared address is observed if on the remote IP and
+  hearsay otherwise, and nothing is recorded without a declared address.
+- PeerDisconnected: the peer's registry entry is removed.
+
 ### Bogus address classification
 
 Classification is **network-conditional**. The router is constructed
@@ -110,34 +128,9 @@ The router builds the classifier from `std::net::Ipv4Addr` /
 `is_private`) and hand-rolls the rest (CGN, documentation, benchmark,
 reserved 240/4, IPv6 link-local / ULA / mapped / documentation) with
 bit-mask checks. The unstable `is_global` family is NOT used.
-- PeerConnected: when a peer transitions to Active, its handshake
-  `PeerSpec` is recorded into PeerDb per `facts/p2p-peerdb.md`
-  § Observed and hearsay: outbound — the dialed address is observed, the
-  declared address observed if on the same IP and hearsay otherwise;
-  inbound — the declared address is observed if on the remote IP and
-  hearsay otherwise, and nothing is recorded without a declared address.
-- Inv: not forwarded — recorded into the inv table for routing only.
-- ModifierRequest: **local serve hook first** — the router is constructed
-  with an optional store-blind callback
-  `local_serve: Option<Arc<dyn Fn(u8, &[u8; 32]) -> Option<Vec<u8>> + Send + Sync>>`
-  injected by the integrator (main crate wires it to the modifier store).
-  For each requested id: callback `Some(bytes)` → emit
-  `Action::Send { target: source, ModifierResponse(type, [(id, bytes)]) }`
-  directly and do NOT relay that id. Callback `None` (or no callback
-  configured, e.g. pure-proxy deployments) → legacy relay: routed via Inv
-  table to the announcing peer if known, else forwarded to any available
-  outbound peer as fallback (enables chain sync, where modifier IDs come
-  from SyncInfo rather than Inv). Serve and relay are per-id exclusive —
-  one request id never produces both a local response and a relayed
-  request. Batching: locally-served ids within one incoming request MAY be
-  grouped into a single ModifierResponse.
-  History (2026-06-08): before the hook, a node with a complete block
-  store relayed every request to other peers — rust-to-rust sync
-  impossible (no JVM peer in the middle = no data). Discovered by the
-  digest side-instance syncing against the live node.
-- ModifierResponse: routed via request tracker to the requester.
-- SyncInfo: routed via sync tracker (inbound↔outbound pairing).
-- Unknown: forwarded to all peers of opposite direction.
 
 ## Invariant
-Inv table, request tracker, and sync tracker are consistent with the peer registry. No references to unregistered peers. PeerDb may contain addresses that are not currently registered — that is its purpose.
+
+The router's only per-peer state is the peer registry, and the registry holds
+exactly the registered peers. PeerDb may contain addresses that are not
+currently registered — that is its purpose.
