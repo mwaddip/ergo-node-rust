@@ -18,10 +18,6 @@ use enr_chain::{
 use crate::traits::{SyncChain, SyncStore, SyncTransport};
 use ergo_validation::BlockValidator;
 
-/// Number of block section requests to send per batch (per type).
-/// The JVM's Akka layer can silently drop large ModifierResponse bodies via
-/// backpressure, so this is capped below the JVM's `desiredInvObjects` (400).
-/// 64 per type × 2 types = 128 sections per cycle = 64 blocks/cycle.
 fn is_block_section_type(type_id: u8) -> bool {
     matches!(
         type_id,
@@ -994,7 +990,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 _ = tokio::time::sleep(until_delivery) => {
                     last_delivery_check = Instant::now();
                     let result = self.tracker.check_timeouts();
-                    self.handle_delivery_check(result, peer).await;
+                    self.handle_delivery_check(result).await;
                     self.advance_downloaded_height().await;
                 }
 
@@ -1728,11 +1724,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     }
 
     /// Handle delivery check results: re-request timed-out and evicted modifiers.
-    async fn handle_delivery_check(
-        &mut self,
-        result: crate::delivery::CheckResult,
-        _current_peer: PeerId,
-    ) {
+    async fn handle_delivery_check(&mut self, result: crate::delivery::CheckResult) {
         // Re-request timed-out modifiers from a different peer
         if !result.retries.is_empty()
             && self
@@ -1993,9 +1985,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
 
                 // Delivery timeout: expire stale requests, free pending slots
                 _ = delivery_ticker.tick() => {
-                    let peer = self.sync_peer.unwrap_or(PeerId(0));
                     let result = self.tracker.check_timeouts();
-                    self.handle_delivery_check(result, peer).await;
+                    self.handle_delivery_check(result).await;
                 }
 
                 // Sliding window section download — recompute and request every 2s.
