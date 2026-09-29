@@ -244,7 +244,9 @@ impl super::Mempool {
         let outputs = output_boxes(&tx);
         let utx = UnconfirmedTx {
             tx,
-            tx_bytes,
+            // Converted once, here: the pool entry and the serving index share
+            // this allocation.
+            tx_bytes: tx_bytes.into(),
             fee,
             cost,
             created: now,

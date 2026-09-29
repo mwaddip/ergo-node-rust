@@ -983,12 +983,14 @@ The candidate is cached and served to multiple miner polls:
    If the submitter is unavailable (503), `clear_solved()` first — the
    block never left the node.
 
-10. **Broadcast to P2P:** Send the full block to connected peers as
-    separate modifier messages:
-    - Header (type 101)
-    - BlockTransactions (type 102)
-    - ADProofs (type 104)
-    - Extension (type 108)
+10. **Announce:** at the hand-off in step 8, before the block is validated,
+    the main crate announces it: one `Inv` each for the header and its
+    three sections, to every connected peer (`facts/sync.md` § Announcing
+    blocks; JVM `NewBlockMined`). Peers request what they lack, and the
+    local-serve hook answers from the store, where the submitter put the
+    sections. The sections are never pushed unrequested: the JVM penalizes
+    unrequested modifiers as spam (`ErgoNodeViewSynchronizer.scala`
+    v6.0.6 :855-862).
 
 11. **Return 200** on success.
 

@@ -188,6 +188,9 @@ struct Validator {
     block_applied_tx: tokio::sync::mpsc::Sender<Vec<ergo_validation::Transaction>>,
     /// Notifies the /info/wait long-poll endpoint when a new block is validated.
     height_watch_tx: tokio::sync::watch::Sender<u32>,
+    /// The announcer task's queue: fresh applied blocks go to every peer
+    /// (facts/sync.md § Announcing blocks).
+    announce_tx: tokio::sync::mpsc::Sender<BlockAnnouncement>,
     /// Mining proof pre-computation (None if mining not configured or digest mode).
     mining: Option<MiningCtx>,
     /// AVL prover memory gauges, published every
@@ -200,6 +203,19 @@ struct Validator {
     blocks_since_prover_gauge: u32,
     /// When the gauges were last written, for the at-tip fallback.
     last_prover_gauge: std::time::Instant,
+}
+
+/// Where a `Validator` publishes each applied block. The node builds one set
+/// and clones it into every validator it constructs.
+#[derive(Clone)]
+struct ValidatorSinks {
+    shared_height: Arc<std::sync::atomic::AtomicU32>,
+    shared_state_context: Arc<tokio::sync::RwLock<Option<ergo_validation::ErgoStateContext>>>,
+    block_applied_tx: tokio::sync::mpsc::Sender<Vec<ergo_validation::Transaction>>,
+    height_watch_tx: tokio::sync::watch::Sender<u32>,
+    announce_tx: tokio::sync::mpsc::Sender<BlockAnnouncement>,
+    prover_modified_nodes_bytes: Arc<std::sync::atomic::AtomicU64>,
+    prover_resident_nodes_bytes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// How often the prover memory gauges are recomputed, in applied blocks.
@@ -235,16 +251,16 @@ enum ValidatorInner {
 }
 
 impl Validator {
-    fn new(
-        inner: ValidatorInner,
-        shared_height: Arc<std::sync::atomic::AtomicU32>,
-        shared_state_context: Arc<tokio::sync::RwLock<Option<ergo_validation::ErgoStateContext>>>,
-        block_applied_tx: tokio::sync::mpsc::Sender<Vec<ergo_validation::Transaction>>,
-        height_watch_tx: tokio::sync::watch::Sender<u32>,
-        mining: Option<MiningCtx>,
-        prover_modified_nodes_bytes: Arc<std::sync::atomic::AtomicU64>,
-        prover_resident_nodes_bytes: Arc<std::sync::atomic::AtomicU64>,
-    ) -> Self {
+    fn new(inner: ValidatorInner, sinks: ValidatorSinks, mining: Option<MiningCtx>) -> Self {
+        let ValidatorSinks {
+            shared_height,
+            shared_state_context,
+            block_applied_tx,
+            height_watch_tx,
+            announce_tx,
+            prover_modified_nodes_bytes,
+            prover_resident_nodes_bytes,
+        } = sinks;
         let h = match &inner {
             ValidatorInner::Digest(v) => v.validated_height(),
             ValidatorInner::Utxo(v) => v.validated_height(),
@@ -257,6 +273,7 @@ impl Validator {
             shared_state_context,
             block_applied_tx,
             height_watch_tx,
+            announce_tx,
             mining,
             prover_modified_nodes_bytes,
             prover_resident_nodes_bytes,
@@ -441,6 +458,16 @@ impl BlockValidator for Validator {
             // Send confirmed transactions to the mempool task for apply_block().
             if let Ok(parsed) = ergo_validation::parse_block_transactions(block_txs) {
                 let _ = self.block_applied_tx.try_send(parsed.transactions);
+            }
+
+            // Announce a fresh block to every peer (facts/sync.md § Announcing
+            // blocks). Checked here so a syncing node queues nothing; the
+            // announcer skips blocks this node mined. Best-effort, never
+            // waits: a full queue drops the announcement.
+            if is_fresh(header.timestamp, now_ms()) {
+                let _ = self
+                    .announce_tx
+                    .try_send(BlockAnnouncement::Applied(header.clone()));
             }
 
             // Candidate lifecycle: drop candidates that no longer build on
@@ -858,6 +885,104 @@ impl ergo_api::UtxoAccess for ApiUtxoReader {
     }
 }
 
+/// How recent an applied peer block's header must be for the node to announce
+/// it: the JVM's `header.isNew(2.hours)` in `RemoteBlockApplied`
+/// (facts/sync.md § Announcing blocks). A relay heuristic, not consensus: it
+/// keeps a syncing node from announcing history.
+const ANNOUNCE_FRESHNESS_MS: u64 = 2 * 60 * 60 * 1000;
+
+/// How many of its own mined block ids the announcer remembers, so it does not
+/// announce them again when they are applied. The solved latch keeps one mined
+/// block in flight at a time; the rest is room for blocks that never apply.
+const MINED_IDS_REMEMBERED: usize = 16;
+
+/// A block for the announcer task (facts/sync.md § Announcing blocks).
+enum BlockAnnouncement {
+    /// Accepted by `POST /mining/solution`: announced at once, before it is
+    /// validated (JVM `NewBlockMined`).
+    Mined(ergo_chain_types::Header),
+    /// Applied by the validator, its header fresh: announced unless this node
+    /// mined it (JVM `RemoteBlockApplied`, and `LocalBlockApplied`'s skip).
+    Applied(ergo_chain_types::Header),
+}
+
+/// Whether an applied block's header is recent enough to announce. A header
+/// stamped ahead of the local clock counts as fresh, as in the JVM, whose
+/// `now - timestamp` is then negative.
+fn is_fresh(header_timestamp_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(header_timestamp_ms) < ANNOUNCE_FRESHNESS_MS
+}
+
+/// Wall-clock epoch milliseconds, the unit of a header's timestamp.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// The ids announced for a block, one `Inv` each: the header, then its
+/// sections in the JVM's `Header.sectionIds` order, ADProofs,
+/// BlockTransactions, Extension.
+fn announced_ids(header: &ergo_chain_types::Header) -> [(u8, [u8; 32]); 4] {
+    let [(txs_type, txs_id), (proofs_type, proofs_id), (ext_type, ext_id)] =
+        enr_chain::section_ids(header);
+    debug_assert_eq!(
+        (txs_type, proofs_type, ext_type),
+        (
+            enr_chain::BLOCK_TRANSACTIONS_TYPE_ID,
+            enr_chain::AD_PROOFS_TYPE_ID,
+            enr_chain::EXTENSION_TYPE_ID
+        ),
+        "section_ids order"
+    );
+    [
+        (HEADER_TYPE_ID, header_id_bytes(header)),
+        (proofs_type, proofs_id),
+        (txs_type, txs_id),
+        (ext_type, ext_id),
+    ]
+}
+
+fn header_id_bytes(header: &ergo_chain_types::Header) -> [u8; 32] {
+    let mut id = [0u8; 32];
+    id.copy_from_slice(header.id.0.as_ref());
+    id
+}
+
+/// Decides which blocks the announcer broadcasts. It keeps the ids of the
+/// blocks this node mined, so that their `Applied` is skipped.
+#[derive(Default)]
+struct Announcer {
+    mined: std::collections::VecDeque<[u8; 32]>,
+}
+
+impl Announcer {
+    /// The header to announce for `event`, or `None`. Freshness is the
+    /// sender's check (`is_fresh`), made before an `Applied` is queued.
+    fn decide(&mut self, event: BlockAnnouncement) -> Option<ergo_chain_types::Header> {
+        match event {
+            BlockAnnouncement::Mined(header) => {
+                if self.mined.len() == MINED_IDS_REMEMBERED {
+                    self.mined.pop_front();
+                }
+                self.mined.push_back(header_id_bytes(&header));
+                Some(header)
+            }
+            BlockAnnouncement::Applied(header) => {
+                let id = header_id_bytes(&header);
+                match self.mined.iter().position(|mined| *mined == id) {
+                    Some(pos) => {
+                        self.mined.remove(pos);
+                        None
+                    }
+                    None => Some(header),
+                }
+            }
+        }
+    }
+}
+
 /// BlockSubmitter implementation for the mining solution endpoint.
 ///
 /// Stores the mined block sections directly in the modifier store, then
@@ -868,6 +993,8 @@ impl ergo_api::UtxoAccess for ApiUtxoReader {
 struct MinedBlockSubmitter {
     store: Arc<RedbModifierStore>,
     modifier_tx: tokio::sync::mpsc::Sender<ergo_api::ModifierBatchItem>,
+    /// The announcer task's queue (facts/sync.md § Announcing blocks).
+    announce_tx: tokio::sync::mpsc::Sender<BlockAnnouncement>,
 }
 
 impl ergo_api::BlockSubmitter for MinedBlockSubmitter {
@@ -936,6 +1063,11 @@ impl ergo_api::BlockSubmitter for MinedBlockSubmitter {
         self.modifier_tx
             .try_send((HEADER_TYPE_ID, header_id, header_bytes, None))
             .map_err(|e| format!("pipeline injection: {e}"))?;
+
+        // Announce at once, before the block is validated (facts/mining.md
+        // step 10; JVM `NewBlockMined`). Best-effort: a full queue drops the
+        // announcement, and the block still reaches peers through sync.
+        let _ = self.announce_tx.try_send(BlockAnnouncement::Mined(header));
 
         Ok(())
     }
@@ -1624,11 +1756,11 @@ fn conv_modifier_map(
     let mut out = std::collections::BTreeMap::new();
     for (&k, &v) in m {
         let key = match k {
-            1 => K::Header,
-            2 => K::Transaction,
-            3 => K::BlockTransactions,
-            4 => K::AdProofs,
-            5 => K::Extension,
+            enr_chain::HEADER_TYPE_ID => K::Header,
+            enr_chain::TRANSACTION_TYPE_ID => K::Transaction,
+            enr_chain::BLOCK_TRANSACTIONS_TYPE_ID => K::BlockTransactions,
+            enr_chain::AD_PROOFS_TYPE_ID => K::AdProofs,
+            enr_chain::EXTENSION_TYPE_ID => K::Extension,
             _ => continue,
         };
         out.insert(key, conv_p2p_counter(v));
@@ -2506,39 +2638,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // capture_tap from [debug.p2p_capture] in ergo.toml — None when the
     // section is absent or `enabled = false`. See facts/p2p-capture.md.
     let p2p = Arc::new(
-        enr_p2p::node::P2pNode::start(
-            config,
-            Some(modifier_tx),
-            mode_config,
-            peer_storage,
-            capture_tap,
-        )
-        .await?,
+        enr_p2p::node::P2pNode::start(config, modifier_tx, mode_config, peer_storage, capture_tap)
+            .await?,
     );
 
-    // Register message codes consumed by the main crate's event stream so
-    // the router doesn't blindly forward them to all peers.
-    for code in [76u8, 78, 80, 90, 91] {
-        p2p.register_consumed_code(code).await;
-    }
+    // Mempool — in-memory transaction pool. Built here, before the serve
+    // hook, so the hook can answer transaction requests from it.
+    let mempool = Arc::new(Mutex::new(ergo_mempool::Mempool::new(
+        ergo_mempool::types::MempoolConfig {
+            capacity: node_config.mempool_capacity,
+            min_fee: node_config.min_fee,
+            ..Default::default()
+        },
+    )));
 
-    // Local-serve hook: answer ModifierRequest from our own store before the
-    // router's relay fallback (facts/p2p-routing.md § Local serve hook).
-    // Store-blind router, store-aware closure. redb reads are sync + cheap.
+    // Local-serve hook: the router answers ModifierRequest with what this
+    // closure returns, and a miss gets no answer (facts/p2p-routing.md
+    // § ModifierRequest). Store-blind router, store-aware closure: block
+    // sections from the store (redb reads are sync + cheap), transactions
+    // from the mempool's serving reader, which never takes the mempool lock
+    // (facts/mempool.md § Serving reader).
     {
         let serve_store = store.clone();
+        let serve_mempool = mempool.lock().await.reader();
         p2p.set_local_serve(std::sync::Arc::new(
             move |modifier_type: u8, id: &[u8; 32]| {
-                serve_store.get(modifier_type, id).ok().flatten()
+                if modifier_type == enr_chain::TRANSACTION_TYPE_ID {
+                    serve_mempool.tx_bytes(id).map(|bytes| bytes.to_vec())
+                } else {
+                    serve_store.get(modifier_type, id).ok().flatten()
+                }
             },
         ))
         .await;
     }
 
+    // Block announcer (facts/sync.md § Announcing blocks): mined blocks from
+    // the solution endpoint, fresh applied blocks from the validator, each
+    // announced to every peer with one Inv per id.
+    let (announce_tx, mut announce_rx) = tokio::sync::mpsc::channel::<BlockAnnouncement>(64);
+    {
+        let p2p = p2p.clone();
+        tokio::spawn(async move {
+            let mut announcer = Announcer::default();
+            while let Some(event) = announce_rx.recv().await {
+                if let Some(header) = announcer.decide(event) {
+                    for (modifier_type, id) in announced_ids(&header) {
+                        p2p.broadcast(enr_p2p::protocol::messages::ProtocolMessage::Inv {
+                            modifier_type,
+                            ids: vec![id],
+                        })
+                        .await;
+                    }
+                    tracing::debug!(height = header.height, "block announced to all peers");
+                }
+            }
+        });
+    }
+
     // Validation pipeline — progress channel feeds sync, delivery channel feeds tracker
     let pipeline_chain = chain.clone();
     let api_store = store.clone(); // for REST API block queries
-    let sync_store = SharedStore::new(store.clone());
+    let sync_store = SharedStore::new(store.clone(), mempool.lock().await.reader());
     let revalidate_store = store.clone(); // for section scan during revalidation
     let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(4);
     // Control channel: unbounded — Reorg/NeedModifier must never be dropped
@@ -2758,6 +2919,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         checkpoint
     };
 
+    // Where every validator below publishes its applied blocks.
+    let validator_sinks = ValidatorSinks {
+        shared_height: shared_validated_height.clone(),
+        shared_state_context: shared_state_context.clone(),
+        block_applied_tx: block_applied_tx.clone(),
+        height_watch_tx: height_watch_tx.clone(),
+        announce_tx: announce_tx.clone(),
+        prover_modified_nodes_bytes: prover_modified_nodes_bytes.clone(),
+        prover_resident_nodes_bytes: prover_resident_nodes_bytes.clone(),
+    };
+
     let mut validator: Option<Validator> = match state_type {
         StateType::Utxo => {
             let state_path = data_dir.join("state.redb");
@@ -2949,13 +3121,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         checkpoint,
                         emission_source,
                     )),
-                    shared_validated_height.clone(),
-                    shared_state_context.clone(),
-                    block_applied_tx.clone(),
-                    height_watch_tx.clone(),
+                    validator_sinks.clone(),
                     mining_ctx,
-                    prover_modified_nodes_bytes.clone(),
-                    prover_resident_nodes_bytes.clone(),
                 ))
             } else if utxo_bootstrap {
                 // Snapshot bootstrap — validator will be created after snapshot download
@@ -3049,13 +3216,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         uv
                     }),
-                    shared_validated_height.clone(),
-                    shared_state_context.clone(),
-                    block_applied_tx.clone(),
-                    height_watch_tx.clone(),
+                    validator_sinks.clone(),
                     mining_ctx,
-                    prover_modified_nodes_bytes.clone(),
-                    prover_resident_nodes_bytes.clone(),
                 ))
             }
         }
@@ -3135,13 +3297,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             Some(Validator::new(
                 ValidatorInner::Digest(validator),
-                shared_validated_height.clone(),
-                shared_state_context.clone(),
-                block_applied_tx.clone(),
-                height_watch_tx.clone(),
+                validator_sinks.clone(),
                 None, // mining requires UTXO mode
-                prover_modified_nodes_bytes.clone(),
-                prover_resident_nodes_bytes.clone(),
             ))
         }
 
@@ -3410,13 +3567,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ever gains a different default the way digest-resume has, the floor
         // and the eval-skip boundary diverge and `sync` must be told directly.
         let checkpoint = configured_checkpoint.unwrap_or(0);
-        let shared_validated_height = shared_validated_height.clone();
-        let shared_state_context = shared_state_context.clone();
-        let block_applied_tx = block_applied_tx.clone();
+        let validator_sinks = validator_sinks.clone();
         let snapshot_swap_reader = swap_reader.clone();
         let snapshot_chain = chain.clone();
-        let prover_modified_nodes_bytes = prover_modified_nodes_bytes.clone();
-        let prover_resident_nodes_bytes = prover_resident_nodes_bytes.clone();
         tokio::spawn(async move {
             match snapshot_rx.await {
                 Ok(snapshot_data) => {
@@ -3542,13 +3695,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "utxo snapshot bootstrap — the block at the snapshot height was never downloaded",
                             ),
                         )),
-                        shared_validated_height.clone(),
-                        shared_state_context.clone(),
-                        block_applied_tx.clone(),
-                        height_watch_tx.clone(),
+                        validator_sinks.clone(),
                         None, // TODO: mining ctx for snapshot bootstrap
-                        prover_modified_nodes_bytes.clone(),
-                        prover_resident_nodes_bytes.clone(),
                     );
 
                     // Publish the bootstrap snapshot height to the
@@ -3558,7 +3706,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // has been 0 the entire time sync was downloading
                     // the snapshot; this is the first opportunity to
                     // update it.
-                    shared_validated_height.store(height, std::sync::atomic::Ordering::Relaxed);
+                    validator_sinks
+                        .shared_height
+                        .store(height, std::sync::atomic::Ordering::Relaxed);
                     let _ = validator_tx.send(validator);
                     tracing::info!(height, "validator sent to sync machine");
                 }
@@ -3664,15 +3814,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Mempool — in-memory transaction pool with P2P transaction receiver
-    let mempool = Arc::new(Mutex::new(ergo_mempool::Mempool::new(
-        ergo_mempool::types::MempoolConfig {
-            capacity: node_config.mempool_capacity,
-            min_fee: node_config.min_fee,
-            ..Default::default()
-        },
-    )));
-
     // Mempool task: validates incoming transactions, applies confirmed blocks,
     // and runs periodic cleanup/revalidation.
     {
@@ -3758,7 +3899,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     modifier_type: 2,
                                     ids: vec![*tx_id],
                                 };
-                                p2p_for_mempool.broadcast_outbound(inv).await;
+                                p2p_for_mempool.broadcast(inv).await;
                             }
                             ergo_mempool::types::ProcessingOutcome::Replaced { tx_id, removed } => {
                                 tracing::info!(
@@ -3770,7 +3911,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     modifier_type: 2,
                                     ids: vec![*tx_id],
                                 };
-                                p2p_for_mempool.broadcast_outbound(inv).await;
+                                p2p_for_mempool.broadcast(inv).await;
                             }
                             ergo_mempool::types::ProcessingOutcome::Invalidated { reason } => {
                                 tracing::debug!(
@@ -3827,7 +3968,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     modifier_type: 2,
                                     ids,
                                 };
-                                p2p_for_mempool.broadcast_outbound(inv).await;
+                                p2p_for_mempool.broadcast(inv).await;
                             }
                         }
                     }
@@ -4110,6 +4251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Arc::new(MinedBlockSubmitter {
                     store: store.clone(),
                     modifier_tx: modifier_tx_for_mining.clone(),
+                    announce_tx: announce_tx.clone(),
                 }) as Arc<dyn ergo_api::BlockSubmitter>
             }),
             validated_height: shared_validated_height.clone(),
@@ -4768,19 +4910,144 @@ mod tests {
         }
     }
 
+    /// facts/stats.md § Modifier-type keys: the JVM's `NetworkObjectTypeId`
+    /// bytes, pinned as literals. The keys once mapped from 1, 3, 4 and 5, so
+    /// header and section traffic (101, 102, 104, 108) was never counted.
+    #[test]
+    fn stats_modifier_keys_use_the_jvm_type_bytes() {
+        use ergo_api::stats::ModifierTypeKey as K;
+        let counted = |out_count| enr_p2p::protocol::counters::DirectionalCounter {
+            out_count,
+            ..Default::default()
+        };
+        let raw: std::collections::BTreeMap<u8, _> = [
+            (101u8, counted(1)),
+            (2, counted(2)),
+            (102, counted(3)),
+            (104, counted(4)),
+            (108, counted(5)),
+            (1, counted(90)),
+            (3, counted(91)),
+        ]
+        .into_iter()
+        .collect();
+        let keyed = conv_modifier_map(&raw);
+        let out = |k| keyed.get(&k).map(|c| c.out_count);
+        assert_eq!(out(K::Header), Some(1));
+        assert_eq!(out(K::Transaction), Some(2));
+        assert_eq!(out(K::BlockTransactions), Some(3));
+        assert_eq!(out(K::AdProofs), Some(4));
+        assert_eq!(out(K::Extension), Some(5));
+        assert_eq!(keyed.len(), 5, "bytes 1 and 3 are not modifier types");
+    }
+
+    fn announce_test_header(id_byte: u8, timestamp: u64) -> ergo_chain_types::Header {
+        use ergo_chain_types::*;
+        let mut id = [0u8; 32];
+        id[0] = id_byte;
+        Header {
+            version: 2,
+            id: BlockId(Digest32::from(id)),
+            parent_id: BlockId(Digest32::zero()),
+            ad_proofs_root: Digest32::from([1u8; 32]),
+            state_root: ADDigest::zero(),
+            transaction_root: Digest32::from([2u8; 32]),
+            timestamp,
+            n_bits: 100_000,
+            height: 1_000,
+            extension_root: Digest32::from([3u8; 32]),
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce: vec![0; 8],
+                pow_distance: None,
+            },
+            votes: Votes([0, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        }
+    }
+
+    /// The JVM's `NewBlockMined` / `RemoteBlockApplied` announce the header,
+    /// then `Header.sectionIds`: ADProofs, BlockTransactions, Extension.
+    #[test]
+    fn announced_ids_follow_the_jvm_section_order() {
+        let header = announce_test_header(7, 0);
+        let ids = announced_ids(&header);
+        let types: Vec<u8> = ids.iter().map(|(t, _)| *t).collect();
+        assert_eq!(types, [101, 104, 102, 108]);
+        assert_eq!(ids[0].1, header_id_bytes(&header));
+        for (type_id, id) in enr_chain::section_ids(&header) {
+            assert!(
+                ids.contains(&(type_id, id)),
+                "section {type_id} announced under its own id"
+            );
+        }
+    }
+
+    /// `header.isNew(2.hours)`: strictly under two hours old, and a header
+    /// stamped ahead of the local clock counts as fresh.
+    #[test]
+    fn a_header_is_fresh_for_under_two_hours() {
+        let now = 1_900_000_000_000u64;
+        assert!(is_fresh(now - 7_199_999, now));
+        assert!(!is_fresh(now - 7_200_000, now));
+        assert!(!is_fresh(0, now));
+        assert!(is_fresh(now + 60_000, now));
+    }
+
+    #[test]
+    fn a_mined_block_is_not_announced_again_when_applied() {
+        let mut announcer = Announcer::default();
+        let mined = announce_test_header(1, 0);
+        assert!(announcer
+            .decide(BlockAnnouncement::Mined(mined.clone()))
+            .is_some());
+        assert!(announcer
+            .decide(BlockAnnouncement::Applied(mined.clone()))
+            .is_none());
+        // Remembered for one skip only.
+        assert!(announcer
+            .decide(BlockAnnouncement::Applied(mined))
+            .is_some());
+        // A peer's block is announced.
+        assert!(announcer
+            .decide(BlockAnnouncement::Applied(announce_test_header(2, 0)))
+            .is_some());
+    }
+
+    #[test]
+    fn the_announcer_remembers_a_bounded_number_of_mined_blocks() {
+        let mut announcer = Announcer::default();
+        for id_byte in 0..=MINED_IDS_REMEMBERED as u8 {
+            announcer.decide(BlockAnnouncement::Mined(announce_test_header(id_byte, 0)));
+        }
+        assert_eq!(announcer.mined.len(), MINED_IDS_REMEMBERED);
+        // The oldest was dropped, so its apply is announced like a peer's.
+        assert!(announcer
+            .decide(BlockAnnouncement::Applied(announce_test_header(0, 0)))
+            .is_some());
+        assert!(announcer
+            .decide(BlockAnnouncement::Applied(announce_test_header(1, 0)))
+            .is_none());
+    }
+
     /// Build a `Validator` around either variant, with throwaway channels.
     fn wrap(inner: ValidatorInner) -> Validator {
         let (block_tx, _rx) = tokio::sync::mpsc::channel(1);
         let (height_tx, _hrx) = tokio::sync::watch::channel(0u32);
+        let (announce_tx, _arx) = tokio::sync::mpsc::channel(1);
         Validator::new(
             inner,
-            Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            Arc::new(tokio::sync::RwLock::new(None)),
-            block_tx,
-            height_tx,
+            ValidatorSinks {
+                shared_height: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                shared_state_context: Arc::new(tokio::sync::RwLock::new(None)),
+                block_applied_tx: block_tx,
+                height_watch_tx: height_tx,
+                announce_tx,
+                prover_modified_nodes_bytes: ergo_api::PublishedGauge::unset().storage(),
+                prover_resident_nodes_bytes: ergo_api::PublishedGauge::unset().storage(),
+            },
             None,
-            ergo_api::PublishedGauge::unset().storage(),
-            ergo_api::PublishedGauge::unset().storage(),
         )
     }
 

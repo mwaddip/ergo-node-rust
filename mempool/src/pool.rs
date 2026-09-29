@@ -1,6 +1,8 @@
 use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
+use crate::reader::{MempoolReader, TxBytesIndex};
 use crate::types::UnconfirmedTx;
 use crate::weight::TxWeight;
 
@@ -14,6 +16,9 @@ pub struct OrderedPool {
     pub(crate) by_input: HashMap<[u8; 32], TxWeight>,
     /// output_box_id → (TxWeight, ErgoBox) (for chained tx resolution)
     pub(crate) by_output: HashMap<[u8; 32], (TxWeight, ErgoBox)>,
+    /// tx_id → tx_bytes, shared with every `MempoolReader`. Holds exactly
+    /// `by_id`'s keys: `insert` and `remove` change both.
+    index: TxBytesIndex,
     /// Maximum capacity
     capacity: usize,
 }
@@ -25,6 +30,7 @@ impl OrderedPool {
             by_id: HashMap::new(),
             by_input: HashMap::new(),
             by_output: HashMap::new(),
+            index: TxBytesIndex::default(),
             capacity,
         }
     }
@@ -51,6 +57,7 @@ impl OrderedPool {
     ) {
         let tx_id = weight.tx_id;
         self.by_id.insert(tx_id, weight.clone());
+        self.index.insert(tx_id, Arc::clone(&utx.tx_bytes));
         for id in input_ids {
             self.by_input.insert(*id, weight.clone());
         }
@@ -63,6 +70,7 @@ impl OrderedPool {
     /// Remove a transaction by ID. Returns the removed tx if found.
     pub fn remove(&mut self, tx_id: &[u8; 32]) -> Option<UnconfirmedTx> {
         let weight = self.by_id.remove(tx_id)?;
+        self.index.remove(tx_id);
         let utx = self.ordered.remove(&weight)?;
 
         // Clean input index
@@ -82,6 +90,11 @@ impl OrderedPool {
     /// Check if tx ID is in pool.
     pub fn contains(&self, tx_id: &[u8; 32]) -> bool {
         self.by_id.contains_key(tx_id)
+    }
+
+    /// A serving reader over this pool's index.
+    pub(crate) fn reader(&self) -> MempoolReader {
+        MempoolReader::new(self.index.clone())
     }
 
     /// Find which pool tx spends a given input box (for double-spend check).

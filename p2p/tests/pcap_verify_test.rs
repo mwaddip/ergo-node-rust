@@ -104,10 +104,10 @@ fn jvm_first_message_has_correct_magic() {
     );
 }
 
-// --- Our proxy handshake structure verification ---
+// --- Our handshake structure verification ---
 
 #[test]
-fn proxy_handshake_roundtrips() {
+fn our_handshake_roundtrips() {
     let config = HandshakeConfig {
         agent_name: "ergo-proxy".to_string(),
         peer_name: "ergo-proxy-node".to_string(),
@@ -128,7 +128,7 @@ fn proxy_handshake_roundtrips() {
 }
 
 #[test]
-fn proxy_handshake_feature_body_lengths_are_u16_be() {
+fn our_handshake_carries_mode_and_session_features() {
     let config = HandshakeConfig {
         agent_name: "test".to_string(),
         peer_name: "test".to_string(),
@@ -139,12 +139,9 @@ fn proxy_handshake_feature_body_lengths_are_u16_be() {
         mode_config: handshake::ModeConfig::default(),
     };
     let bytes = handshake::build(&config);
-
-    // Find feature section: skip past timestamp, agent, version, peer, address
-    // Parse up to the feature count to find where features start
     let spec = handshake::parse(&bytes).unwrap();
 
-    // Verify features are parseable (which means body lengths are correct)
+    // The features parse back, so their VLQ body lengths agree with the parser.
     assert_eq!(
         spec.features.len(),
         2,
@@ -167,7 +164,7 @@ fn proxy_handshake_feature_body_lengths_are_u16_be() {
 }
 
 #[test]
-fn proxy_handshake_matches_jvm_structure() {
+fn our_handshake_matches_jvm_structure() {
     // Build a handshake with similar params to the JVM node
     let config = HandshakeConfig {
         agent_name: "ergoref".to_string(),
@@ -178,38 +175,38 @@ fn proxy_handshake_matches_jvm_structure() {
         declared_address: None,
         mode_config: handshake::ModeConfig::default(),
     };
-    let proxy_bytes = handshake::build(&config);
-    let proxy_spec = handshake::parse(&proxy_bytes).unwrap();
+    let our_bytes = handshake::build(&config);
+    let our_spec = handshake::parse(&our_bytes).unwrap();
 
     // Parse the JVM handshake
     let jvm_spec = handshake::parse(&JVM_HANDSHAKE).unwrap();
 
     // Structural comparison (skip timestamps and session IDs which differ)
-    assert_eq!(proxy_spec.agent, jvm_spec.agent);
-    assert_eq!(proxy_spec.version, jvm_spec.version);
-    assert_eq!(proxy_spec.name, jvm_spec.name);
+    assert_eq!(our_spec.agent, jvm_spec.agent);
+    assert_eq!(our_spec.version, jvm_spec.version);
+    assert_eq!(our_spec.name, jvm_spec.name);
 
     // Both should have Mode feature with same encoding
-    let proxy_mode = proxy_spec.features.iter().find(|f| f.id == 16);
+    let our_mode = our_spec.features.iter().find(|f| f.id == 16);
     let jvm_mode = jvm_spec.features.iter().find(|f| f.id == 16);
     assert_eq!(
-        proxy_mode.map(|f| &f.body),
+        our_mode.map(|f| &f.body),
         jvm_mode.map(|f| &f.body),
         "Mode feature body should match"
     );
 
     // Both should have Session feature with testnet magic
-    let proxy_session = proxy_spec.features.iter().find(|f| f.id == 3).unwrap();
+    let our_session = our_spec.features.iter().find(|f| f.id == 3).unwrap();
     let jvm_session = jvm_spec.features.iter().find(|f| f.id == 3).unwrap();
     assert_eq!(
-        &proxy_session.body[0..4],
+        &our_session.body[0..4],
         &jvm_session.body[0..4],
         "Session magic should match"
     );
 }
 
 #[test]
-fn proxy_frame_roundtrips_with_testnet_magic() {
+fn get_peers_frame_roundtrips_with_testnet_magic() {
     let magic = Network::Testnet.magic();
 
     // Build a GetPeers frame (same as JVM node sends)

@@ -1,8 +1,8 @@
 # enr-p2p
 
-P2P networking layer for the Ergo Rust node. Handles peer connections, handshake, message framing, and message routing. The network boundary — every byte from a peer is untrusted.
+P2P networking layer for the Ergo Rust node. Handles peer connections, handshake, message framing, and what the node does with each message a peer sends. The network boundary — every byte from a peer is untrusted.
 
-Started as a message-forwarding proxy. Gradually gaining awareness of what it forwards as validation components (`enr-chain`, etc.) come online. The proxy behavior is the fallback: if we can't validate it, forward it and let someone else decide.
+The node is a peer, not a proxy. The router answers the peer that sent a message, from what the node has, or does nothing: it never passes a message from one peer to another. Received modifiers go to the validation pipeline through the modifier sink. Every other event reaches its consumer (sync, the mempool task, the snapshot and NiPoPoW handlers) through the event subscriber.
 
 ## OVERRIDES (LOAD FIRST)
 
@@ -23,7 +23,10 @@ Key stats: **P10** (untrusted peers send arbitrary bytes), **L9** (adversarial t
 Interface contracts are in `facts/`:
 - `facts/p2p-transport.md` — frame encoding/decoding, handshake, connection lifecycle
 - `facts/p2p-protocol.md` — message parsing, peer state machine, event guarantees
-- `facts/p2p-routing.md` — inv table, request tracker, sync tracker, router behavior
+- `facts/p2p-routing.md` — what the router does with each message: replies, the local-serve hook, validation hand-off, bogus-address filtering
+- `facts/p2p-node.md` — the `P2pNode` API (`start`, `send_to`, `broadcast`, `subscribe`), peer write queues, aborts, inbound admission
+- `facts/p2p-peerdb.md` — the peer database: observed and hearsay addresses, outbound dial candidates
+- `facts/p2p-capture.md` — wire-traffic capture (`[debug.p2p_capture]`)
 
 Read the relevant contract before modifying any public API. If a contract needs changing, update it first, then implement.
 
@@ -33,8 +36,9 @@ This crate owns:
 - TCP connection management (inbound + outbound, IPv4 + IPv6)
 - Ergo P2P handshake (Scorex VLQ serialization, session features, version checks)
 - Message framing (magic bytes, blake2b checksums, body length)
-- Message routing (inv table, request tracking, sync pairing, peer registry)
-- Peer management (connect, disconnect, penalty tracking, keepalive)
+- Message routing (answering GetPeers and served modifier requests, recording gossiped peers, handing received modifiers to validation, peer registry)
+- Peer management (connect, disconnect, bounded write queues, penalty tracking, keepalive, PeerDb)
+- Broadcast to every connected peer, inbound and outbound
 
 This crate does NOT own:
 - Header validation or chain state — that's `chain/`
@@ -42,20 +46,29 @@ This crate does NOT own:
 - Persistent storage — that's `store/`
 - UTXO state — that's `state/`
 - What to sync or when — that's `ergo-sync`
+- What the node has to serve — the main crate's local-serve hook answers from the store and the mempool
 
 ## Architecture
 
 ```
-Inbound peers ──▶ ┌──────────────┐
-                  │  Transport   │  frame encode/decode, handshake
-                  ├──────────────┤
-                  │  Protocol    │  message parsing, peer state machine
-                  ├──────────────┤
-                  │  Router      │  message routing, inv/request tracking
-Outbound peers ◀──┘──────────────┘
+     peers (inbound + outbound)
+          │                ▲
+          │ frames         │ replies, to the sender only
+          ▼                │
+  ┌────────────────────────────┐
+  │  Transport                 │  frame encode/decode, handshake
+  ├────────────────────────────┤
+  │  Protocol                  │  message parsing, peer state machine
+  ├────────────────────────────┤
+  │  Router                    │  replies to the sender, peer registry
+  └────────────────────────────┘
+          │                │
+          ▼                ▼
+     subscriber       modifier sink
+   (every event)    (Action::Validate)
 ```
 
-The transport layer never interprets message content. The protocol layer parses messages into typed variants. The router decides where messages go. Validation hooks (like PoW checks on headers) are called by the router but implemented externally.
+The transport layer never interprets message content. The protocol layer parses messages into typed variants. The router decides what the node does with each message: it answers `GetPeers` from the PeerDb and `ModifierRequest`s through the local-serve hook, records gossiped `Peers`, emits each received modifier as `Action::Validate`, and does nothing with the rest (`Inv`, `SyncInfo`, unknown codes). Every `Action::Send` it emits targets the peer whose message it is handling, which a `debug_assert!` enforces. A light listener's peers get nothing for block-related requests (101, 102, 104, 108). The local-serve hook and the validation pipeline live outside the crate: the main crate injects the hook and owns the sink's receiver.
 
 ## Key Protocol Facts
 

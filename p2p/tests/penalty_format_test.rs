@@ -120,14 +120,15 @@ fn penalty_emit_with_detail_includes_reason() {
     );
 }
 
-/// The deploy/fail2ban/ergo-proxy.conf regex is the load-bearing
-/// integration with the operator's ban path. Drift between this regex
-/// and the actual emission shape means fail2ban silently stops banning.
+/// The main repo's deploy/fail2ban/ergo-node.conf regex is the
+/// load-bearing integration with the operator's ban path. Drift between
+/// this regex and the actual emission shape means fail2ban silently stops
+/// banning.
 #[test]
 fn fail2ban_regex_matches_permanent_kinds() {
     // Mirror of the production failregex — fail2ban's `<HOST>` macro
     // is approximated by `(\S+)` for the purpose of this test.
-    let regex_pattern = r#"PENALTY peer=(\S+) kind="(?:bad_magic|oversized_frame|bad_checksum|handshake_failed|address_sanity|malformed_peers)""#;
+    let regex_pattern = r#"PENALTY peer=(\S+) kind="(?:bad_magic|oversized_frame|bad_checksum|handshake_failed|malformed_peers)""#;
 
     let addr: std::net::IpAddr = "192.0.2.99".parse().unwrap();
     for kind in [
@@ -135,7 +136,6 @@ fn fail2ban_regex_matches_permanent_kinds() {
         "oversized_frame",
         "bad_checksum",
         "handshake_failed",
-        "address_sanity",
         "malformed_peers",
     ] {
         let line = capture(|| {
@@ -160,7 +160,6 @@ fn fail2ban_regex_matches_permanent_kinds() {
             "oversized_frame",
             "bad_checksum",
             "handshake_failed",
-            "address_sanity",
             "malformed_peers",
         ] {
             let needle = format!("kind=\"{permanent}\"");

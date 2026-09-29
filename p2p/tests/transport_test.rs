@@ -200,23 +200,6 @@ fn handshake_build_parse_roundtrip() {
 }
 
 #[test]
-fn handshake_self_built_is_not_proxy() {
-    // We no longer advertise FEATURE_PROXY — verify our own handshake
-    let config = HandshakeConfig {
-        agent_name: "ergo-proxy".to_string(),
-        peer_name: "test-node".to_string(),
-        version: Version::new(6, 0, 3),
-        network: Network::Testnet,
-        mode: ProxyMode::Full,
-        declared_address: None,
-        mode_config: handshake::ModeConfig::default(),
-    };
-    let bytes = handshake::build(&config);
-    let spec = handshake::parse(&bytes).unwrap();
-    assert!(!handshake::is_proxy(&spec));
-}
-
-#[test]
 fn handshake_full_mode_feature() {
     let config = HandshakeConfig {
         agent_name: "test".to_string(),

@@ -383,6 +383,7 @@ Client
 API handler
   │ 1. Deserialize JSON → Transaction
   │ 2. Serialize → tx_bytes (sigma format, for P2P)
+  │ 2a. tx_bytes longer than ergo_mempool::MAX_TRANSACTION_SIZE → 400
   │ 3. Acquire state_context read lock
   │ 4. Build MempoolUtxoReader (UTXO state + mempool unconfirmed outputs)
   │ 5. Acquire mempool lock
@@ -397,8 +398,15 @@ ProcessingOutcome
 Response: 200 "txId" or 400 { error, reason }
 ```
 
+Step 2a is the JVM's size check (`TransactionsApiRoute.validateTransactionAndProcess`,
+v6.0.6 :165-168): a transaction over `maxTransactionSize` is refused before it
+is verified. `POST /transactions/check` takes the same step. The check comes
+after the JSON parse, as the JVM's does, so it bounds what enters the mempool,
+not what the parser reads; the request body limit (`max_body_bytes`) bounds
+that.
+
 P2P broadcast happens separately in the mempool task (main crate), which
-broadcasts Inv type 2 to outbound peers for every accepted transaction.
+broadcasts Inv type 2 to all connected peers for every accepted transaction.
 The API handler returns immediately after `process()` — it does not wait
 for broadcast. This is the same path used by P2P transaction relay, with
 `source: None` instead of a peer ID.

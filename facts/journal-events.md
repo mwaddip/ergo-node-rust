@@ -475,9 +475,19 @@ facts/sync.md § "Block Assembly".*
 #### `peer_disconnected`
 - **Level:** INFO
 - **Marker:** `"Peer removed"`
-- **Fields:** `peer` (string), `reason` (string)
+- **Fields:** `peer` (string), `reason` (string, one of the values below)
 - **Since:** 1.0
 - **Stability:** stable
+- **`reason` values:**
+
+  | Value | Meaning |
+  |---|---|
+  | `connection_closed` | The peer closed the connection, or a read failed |
+  | `write_failed` | A write to the socket failed |
+  | `outbound_queue_full` | The peer's write queue hit a bound: it stopped reading (`facts/p2p-node.md` § "Peer write queues") |
+  | `disconnected` | The node aborted the connection itself (`disconnect_peer`, e.g. after a penalty) |
+
+  Parsers MUST tolerate an unknown value: this set may grow in a minor.
 
 #### `peer_penalised`
 - **Level:** WARN
@@ -485,6 +495,12 @@ facts/sync.md § "Block Assembly".*
 - **Fields:** `peer` (string), `kind` (string: short identifier such
   as `header_parse_failed`, `invalid_pow`, `malformed_peers`), `detail`
   (string, optional)
+- **Logged-only kinds** (misbehavior, never actioned by the shipped fail2ban
+  filter): `message_parse_failed`, `connection_limit_exceeded`, and
+  `oversized_transaction`, a peer's transaction over `MAX_TRANSACTION_SIZE`,
+  dropped unparsed (`facts/mempool.md` § P2P Transaction Intake). The last is
+  emitted by the main crate's pipeline, which knows the peer by its connection
+  id, so it carries `peer_id` rather than `peer`.
 - **Since:** 1.0
 - **Stability:** stable
 - **Note:** existing emissions in v0.5.x use marker prefix `"PENALTY"`

@@ -31,8 +31,18 @@ How the sync machine sends messages and observes the network.
 How the sync machine queries persistent storage.
 
 #### `has_modifier(type_id, id) -> bool`
-- Returns true if the modifier exists in the store.
-- Used to determine which block sections need downloading.
+- Returns true if the node already has the modifier. For a header or block
+  section that means the modifier store. For a transaction (type 2) it means
+  the mempool, which the main crate's adapter asks through the mempool's
+  serving reader (`facts/mempool.md` § Serving reader); the store holds no
+  transactions.
+- Used to decide what to request: block sections that need downloading, and
+  announced transactions the node does not hold yet. The JVM likewise asks
+  its mempool before requesting an announced transaction (`processInv`,
+  `ErgoNodeViewSynchronizer` v6.0.6 :1127-1145). It also skips invalidated,
+  recently applied and recently declined transactions, and caps a batch by
+  cost; the reader answers only pool membership, so those filters are not
+  applied here.
 - Must not block the async runtime (the bridge impl handles this).
 
 #### `get_modifier(type_id, id) -> Option<Vec<u8>>`
@@ -232,17 +242,34 @@ because no peer had ever synced FROM this node (all prior peers were JVM
 archival nodes serving us). Without it a from-genesis peer stalls at height 0
 against another node of ours.
 
-### Serving modifier requests (store-first)
+### Serving modifier requests
 
-Incoming `ModifierRequest` is served from the node's OWN store when the
-modifier is present; only ids absent locally fall through to the legacy
-relay-to-other-peers path (proxy heritage). Implementation note: serving
-lives in the **p2p router** via a store-blind local-serve callback injected
-by the main crate (see `facts/p2p-routing.md`, "Local serve hook") — NOT in
-the sync loop, so serve and relay can never double-respond for one request.
-Same discovery history as the continuation-Inv gap: relay-only behavior
-meant a node with an 11 GB block store answered requests by asking someone
-else.
+Incoming `ModifierRequest` is answered from what the node has: block sections
+from its own store, transactions from its mempool. Ids it doesn't have get no
+answer, as in the JVM, and are never passed on to another peer. Serving lives
+in the **p2p router**, through a store-blind local-serve callback injected by
+the main crate (`facts/p2p-routing.md` § `ModifierRequest`), not in the sync
+loop.
+
+### Announcing blocks (main crate responsibility)
+
+The node announces new blocks the way the JVM does (`ErgoNodeViewSynchronizer`
+v6.0.6 :1429-1467). An announcement is one `Inv` per id, broadcast to every
+connected peer (`facts/p2p-node.md` § `broadcast`): the header (type 101),
+then the block's sections in the JVM's `Header.sectionIds` order, ADProofs
+(104), BlockTransactions (102), Extension (108). The ADProofs id is announced
+even when the node holds no ADProofs for the block, as the JVM does.
+
+| Event | Announced | JVM |
+|---|---|---|
+| `POST /mining/solution` accepts a block this node mined | At once, before the block is validated or applied | `NewBlockMined` |
+| A block this node mined is applied | No: it was announced on acceptance | `LocalBlockApplied` |
+| A block from a peer is applied | Only if its header timestamp is less than 2 hours before the local clock | `RemoteBlockApplied`, `header.isNew(2.hours)` |
+
+- The 2-hour window is a relay heuristic, not a consensus rule. It keeps a
+  syncing node from announcing history.
+- Announcing never holds up block application. The post-apply hook hands the
+  header to an announcer task and returns.
 
 ### Peer rotation
 
@@ -929,11 +956,37 @@ for block sections that need downloading. The queue is populated from two source
 Block section requests follow the same pattern as header requests:
 - Send `ModifierRequest` with the section type and IDs
 - Track delivery via the `DeliveryTracker`
-- On timeout: re-request from a different peer
+- One download window's section requests go to **one** peer, the first
+  outbound peer, as one `ModifierRequest` per section type (up to 400 ids
+  each). The JVM spreads them across peers (`requestDownload`); we don't yet,
+  and a loop that sends the same ids to every peer is not a spread, because
+  the first request marks them pending and the rest skip them.
+- On timeout: re-request from a different peer (§ Delivery timeouts)
 - On receive: the pipeline binds the bytes to the delivered id and stores
   them only if they bind (§ Receive-path binding). A body that does not
   bind is dropped and never reported as received, so its request keeps
   its timeout and is re-requested from another peer
+
+### Delivery timeouts
+
+The delivery check (every 5 seconds) finds requests that timed out. What
+happens next depends on the modifier type, as in the JVM's `CheckDelivery`
+(`ErgoNodeViewSynchronizer` v6.0.6 :1260-1300):
+
+- **A transaction is forgotten, not re-requested.** Its pending entry is
+  cleared and no peer is penalized, because the peer may have dropped it from
+  its mempool (JVM :1262-1265). A later `Inv` can request it again. The same
+  holds whatever ends the request: a transaction request orphaned by its
+  peer's disconnect is forgotten too, never re-sent to another peer.
+- **A header or block section is re-requested from another peer**, up to the
+  maximum delivery attempts. The re-requests of one check are **batched**: one
+  `ModifierRequest` per (target peer, modifier type), up to 400 ids each (the
+  JVM's per-message cap), never one message per id.
+
+Batching is not an optimization. A peer's write queue holds 64 frames, and a
+full queue aborts the peer (`facts/p2p-node.md` § Peer write queues). A check
+that sends sixty ids as sixty messages fills a healthy peer's queue before its
+writer runs, and the abort moves the next check's burst to the next peer.
 
 ### Inv handling
 

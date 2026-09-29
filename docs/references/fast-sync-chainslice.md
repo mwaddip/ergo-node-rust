@@ -128,7 +128,6 @@ in `PeerSpec.features` right now, ignored but intact, with the URL sitting in
 // p2p/src/transport/handshake.rs, current state
 const FEATURE_MODE:    u8 = 16;
 const FEATURE_SESSION: u8 = 3;
-pub const FEATURE_PROXY: u8 = 64;
 // feature id 4 (RestApiUrl) is parsed into Feature{id:4, body:…} and passed through.
 ```
 

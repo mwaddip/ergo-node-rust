@@ -192,7 +192,7 @@ When body_length == 0 (e.g., GetPeers):
 
 **Note:** The frame header uses fixed-width big-endian for `body_length`, unlike everything in the handshake which uses VLQ. This is because framing is implemented directly in the network layer, not through the Scorex serialization framework.
 
-Maximum body size: 2 MB (JVM `ModifiersSpec.maxMessageSize = 2048576`). ModifierResponse messages containing block sections routinely reach 200KB-1MB. A 256KB limit silently drops section responses at the frame layer.
+Maximum body size: 16,388,608 bytes, the JVM's `MessageConstants.MaxMessageSize` (`ModifiersSpec.maxMsgSizeWithReserve * 2`, since v6.0.3; before that the cap was `ModifiersSpec.maxMessageSize`, 2,048,576). ModifierResponse messages containing block sections routinely reach 200KB-1MB, and UTXO snapshot chunks up to about 4 MB. A smaller limit silently drops those responses at the frame layer.
 
 ### Checksum
 

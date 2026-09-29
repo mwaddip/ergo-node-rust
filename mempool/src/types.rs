@@ -1,5 +1,6 @@
 use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Read-only access to the UTXO set for transaction validation.
@@ -15,8 +16,10 @@ pub trait UtxoReader {
 pub struct UnconfirmedTx {
     /// The transaction.
     pub tx: Transaction,
-    /// Serialized transaction bytes (cached for P2P propagation).
-    pub tx_bytes: Vec<u8>,
+    /// Serialized transaction bytes: what a peer sent, or the node's own
+    /// serialization for an API submission. One allocation, shared with the
+    /// serving reader.
+    pub tx_bytes: Arc<[u8]>,
     /// Transaction fee in nanoERG.
     pub fee: u64,
     /// Validation cost (script cost or tx byte size as fallback).

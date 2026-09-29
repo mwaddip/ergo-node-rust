@@ -70,11 +70,14 @@ impl Network {
     }
 }
 
-/// Proxy mode for a listener — controls handshake advertising and routing behavior.
+/// A listener's mode: what its handshake advertises, and which modifier
+/// requests from its peers are answered. The name is left over from when
+/// this crate was a proxy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyMode {
-    /// Advertise as full archival node; route all message types.
+    /// Advertise as full archival node; every request goes to the
+    /// local-serve hook.
     Full,
     /// Advertise as NiPoPoW-bootstrapped; drop block-related requests.
     Light,

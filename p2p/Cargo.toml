@@ -4,7 +4,7 @@ version.workspace = true
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.50", features = ["full"] }
 blake2 = { version = "0.10", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

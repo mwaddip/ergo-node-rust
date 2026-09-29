@@ -43,7 +43,7 @@ The handle to a running P2P layer. Created by `P2pNode::start()`. The P2P layer 
 - **Postcondition**: Listeners, outbound connections, keepalive,
   outbound-fill dialer, and event loop are spawned as background tasks.
   Returns immediately.
-- If `modifier_sink` is `Some`, every modifier from a `ModifierResponse` is sent to the channel as `(modifier_type, id, data, peer_id)` via the `Action::Validate` mechanism. `peer_id` is `Option<u64>` — `Some(id)` for peer-delivered modifiers, `None` for locally-ingested ones. The P2P layer never blocks on validation.
+- `modifier_sink` is required: a node that drops the modifiers it receives cannot sync. Every modifier from a `ModifierResponse` is sent to the channel as `(modifier_type, id, data, peer_id)` via the `Action::Validate` mechanism. `peer_id` is `Option<u64>` — `Some(id)` for peer-delivered modifiers, `None` for locally-ingested ones. The P2P layer never blocks on validation.
 - `peer_storage: Box<dyn PeerStorage>` provides persistent backing
   for the in-memory PeerDb. `start` calls `peer_storage.load_all()`
   to repopulate the table, then constructs the PeerDb and hands it
@@ -66,18 +66,27 @@ The handle to a running P2P layer. Created by `P2pNode::start()`. The P2P layer 
 ### `inbound_peers() -> Vec<PeerId>`
 - Returns IDs of currently connected inbound peers.
 
-### `latency_stats() -> Option<LatencyStats>`
-- Returns latency statistics for modifier responses, if any data collected.
-
 ### `send_to(peer, message) -> Result<()>`
 - **Precondition**: `peer` is a currently connected peer.
-- **Postcondition**: Message is serialized and queued for delivery.
-- Returns error if peer is unknown or disconnected.
+- **Postcondition**: Message is serialized and queued for delivery, or the
+  peer's connection is aborted (see "Peer write queues").
+- Never waits for queue space.
+- Returns error if the peer is unknown, already disconnected, or its queue is
+  full. A full queue aborts the connection before the error is returned.
 - Does not guarantee delivery — the peer may disconnect before the message is sent.
 
-### `broadcast_outbound(message)`
-- **Postcondition**: Message is queued for delivery to all currently connected outbound peers.
-- Best-effort: silently skips peers whose send channels are full or disconnected.
+### `broadcast(message)`
+- **Postcondition**: Message is queued for delivery to every currently
+  connected peer, inbound and outbound, whose queue has room. This is the
+  JVM's `SendToNetwork(msg, Broadcast)`.
+- A peer whose queue is full is aborted, exactly as for `send_to`. The
+  broadcast continues with the remaining peers.
+
+### `disconnect_peer(peer)`
+- **Postcondition**: the connection is aborted (see "Aborting a connection").
+- Unknown or already-disconnected peer: no-op.
+- Returns once the abort has been initiated. `PeerDisconnected` follows
+  asynchronously, from the peer's own task.
 
 ### `subscribe() -> Receiver<ProtocolEvent>`
 - Returns a channel receiver that receives a copy of every protocol event (incoming messages, peer connect/disconnect) before the router processes it.
@@ -129,9 +138,9 @@ The handle to a running P2P layer. Created by `P2pNode::start()`. The P2P layer 
 
 ## Router: Action::Validate
 
-The router emits `Action::Validate { modifier_type, id, data, peer_id }` for each modifier in a `ModifierResponse`. `peer_id` identifies which peer sent the modifier, enabling penalty attribution when validation fails downstream. The event loop dispatches these to the `modifier_sink` channel as `(modifier_type, id, data, Some(peer_id.0))` via `try_send` (non-blocking). If no sink is provided, validate actions are dropped (pure proxy mode).
+The router emits `Action::Validate { modifier_type, id, data, peer_id }` for each modifier in a `ModifierResponse`. `peer_id` identifies which peer sent the modifier, enabling penalty attribution when validation fails downstream. The event loop dispatches these to the `modifier_sink` channel as `(modifier_type, id, data, Some(peer_id.0))` via `try_send` (non-blocking).
 
-The router does NOT validate modifiers. It routes them, emits them for external validation, and forwards to requesters. Validation is the pipeline's job.
+The router does not validate modifiers and never forwards them: it emits them for validation, which is the pipeline's job.
 
 ## Outbound Manager
 
@@ -170,10 +179,89 @@ The outbound manager runs as a background task. Two distinct phases:
 - A `PermanentPenalty` from the blacklist removes the entry from
   PeerDb via `forget`.
 
+## Peer write queues
+
+Every connected peer has one outbound queue, drained by that peer's writer
+task. Two bounds apply to the frames that are queued and not yet taken by the
+writer:
+
+| Bound | Value | JVM v6.0.6 `PeerConnectionHandler` |
+|---|---|---|
+| Frames | 64 | `MaxBufferedOutboundMessages = 64` |
+| Bytes, at wire size | 16,388,621 | `MaxBufferedOutboundBytes = MaxMessageSize + HeaderLength + ChecksumLength` |
+
+A frame's wire size is its serialized length, as the JVM's `msg.length`: the
+9-byte header, plus the 4-byte checksum and the body when the body is
+non-empty. An empty-body frame counts 9.
+
+The JVM applies them in `buffer()` (`PeerConnectionHandler.scala` :239-256,
+constants :290-294). The byte bound is one maximum-size frame: the largest
+legal frame always fits, and a backlog beyond it means the peer is not reading.
+
+- **Enqueueing never waits.** Every path that puts a frame on a peer's queue —
+  the event loop's `Action::Send`, `send_to`, `broadcast`, the
+  keepalive — either enqueues at once or finds the queue full.
+- **A full queue aborts the connection.** An enqueue that would exceed either
+  bound aborts that peer (next section). This is what the JVM does since
+  6.0.5. It is not a penalty: no ban, no PeerDb change.
+- **A closed queue aborts the connection too.** The writer task has exited,
+  e.g. after a write error, so the peer can never be written to again.
+- **No lock is held across an await on a peer.** A peer that stops reading
+  must not be able to stall the event loop, the keepalive, or any caller of
+  `send_to` / `broadcast`.
+- Reader tasks may wait on the shared event channel (256). That backpressures
+  the one peer's socket, not the event loop, and no protocol message is
+  dropped to avoid it.
+- **A peer's queue is in place before it is announced.** It exists before the
+  peer is registered with the router or announced by `PeerConnected`, and it
+  is removed at the start of the teardown, before `PeerDisconnected`. So
+  `send_to` can return `UnknownPeer` for a peer being torn down, but never for
+  one whose teardown has not begun.
+
+## Aborting a connection
+
+An abort — from a full or closed queue, or from `disconnect_peer` — ends the
+connection at once:
+
+1. Queued frames are discarded, not flushed.
+2. The socket is closed in both directions without waiting on the peer. The
+   JVM sends `Abort`, a TCP reset. A peer advertising a zero receive window
+   must not be able to hold the socket, or the writer task, open.
+3. The reader stops. No further frame is read from the peer.
+4. The peer is unregistered from the router, and `PeerDisconnected` is
+   emitted exactly once, carrying the reason (`facts/journal-events.md`
+   § `peer_disconnected`).
+
+Dropping the queue's sender alone is not an abort. It shuts down the write
+side only after the writer drains, and a writer blocked on a peer that is not
+reading never gets there, while the reader keeps the peer registered.
+
+## Inbound admission
+
+`max_inbound` bounds inbound connections from the moment they are accepted,
+not from the moment the handshake completes.
+
+- At accept, the connection is admitted only if
+  `registered inbound peers + inbound handshakes in flight < max_inbound`.
+  Otherwise it is closed at once, and the existing
+  `connection_limit_exceeded` PENALTY line is logged.
+- Admission reserves a slot. On a successful handshake the slot transfers to
+  the registered peer. It is never released and re-taken, so an admitted
+  connection is counted at every instant from accept to disconnect.
+- A failed or timed-out handshake releases the slot. So does the registered
+  peer's disconnect.
+- The count spans both listeners and is compared against the accepting
+  listener's `max_inbound`, as it is today.
+
+JVM v6.0.6 `NetworkController.scala` :183-197 compares established plus
+pending incoming connections against `incomingLimit`: "Admission reserves a
+slot; confirmation transfers it to connections."
+
 ## Invariants
 
 - Background tasks live until the tokio runtime shuts down.
-- `send_to` and `broadcast_outbound` never block on delivery — they queue and return.
+- `send_to` and `broadcast` never block on delivery — they enqueue or abort, and return.
+- The event loop never blocks on a peer. Every enqueue is non-blocking ("Peer write queues").
 - The event subscriber is a read-only tap. It does not affect routing behavior.
 - Messages sent via `send_to` bypass the router — they go directly to the peer's write channel. The router does not see them and does not track them.
 - The event loop never blocks on validation — `Action::Validate` dispatch is non-blocking.

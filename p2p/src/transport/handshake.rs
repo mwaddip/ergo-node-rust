@@ -17,9 +17,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const FEATURE_MODE: u8 = 16;
 const FEATURE_SESSION: u8 = 3;
-/// Custom feature flag advertised in the handshake; kept for wire
-/// compatibility. JVM nodes ignore unknown features.
-pub const FEATURE_PROXY: u8 = 64;
 
 /// What to advertise in the Mode feature (ID 16) during handshake.
 ///
@@ -379,11 +376,6 @@ impl PeerSpec {
                 .map(String::from)
         })
     }
-}
-
-/// Check if a peer's handshake indicates it is a proxy.
-pub fn is_proxy(spec: &PeerSpec) -> bool {
-    spec.features.iter().any(|f| f.id == FEATURE_PROXY)
 }
 
 /// Measure the exact byte size of a handshake by parsing it with a cursor.
