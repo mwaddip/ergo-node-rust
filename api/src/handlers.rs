@@ -567,63 +567,125 @@ pub async fn get_unconfirmed_by_id(
 
 // ---------------------------------------------------------------------------
 // GET /transactions/getFee
+// GET /transactions/waitTime
+// GET /transactions/poolHistogram
+//
+// The JVM's parameters, defaults and bare JSON answers
+// (`TransactionsApiRoute`, v6.0.6). The arithmetic is the mempool's
+// (facts/mempool.md § Fee queries); these handlers refuse what its
+// preconditions exclude.
 // ---------------------------------------------------------------------------
+
+/// `value` as the unsigned type the mempool takes, or 400 when it is
+/// negative. `name` is the parameter's spelling in the query string.
+fn non_negative<T, U: TryFrom<T>>(value: T, name: &str) -> Result<U, (StatusCode, Json<ApiError>)> {
+    U::try_from(value).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            format!("{name} must not be negative"),
+            None,
+        )
+    })
+}
+
+fn default_tx_size() -> i32 {
+    100
+}
 
 #[derive(Deserialize)]
 pub struct FeeParams {
-    #[serde(default = "default_wait_time")]
-    #[serde(rename = "waitTime")]
-    wait_time: u64,
-    #[serde(default = "default_tx_size")]
-    #[serde(rename = "txSize")]
-    tx_size: usize,
+    /// Minutes.
+    #[serde(rename = "waitTime", default = "default_wait_minutes")]
+    wait_time: i32,
+    /// Bytes.
+    #[serde(rename = "txSize", default = "default_tx_size")]
+    tx_size: i32,
 }
 
-fn default_wait_time() -> u64 {
+fn default_wait_minutes() -> i32 {
     1
-}
-fn default_tx_size() -> usize {
-    100
 }
 
 pub async fn get_recommended_fee(
     State(state): State<ApiState>,
     Query(params): Query<FeeParams>,
-) -> ApiResult<FeeResponse> {
-    let pool = state.mempool.lock().await;
-    // Convert wait_time from blocks to approximate milliseconds
-    // (Ergo target block time ~2 minutes = 120_000ms)
-    let wait_time = params.wait_time.min(100);
-    let tx_size = params.tx_size.min(1_000_000);
-    let wait_ms = wait_time.saturating_mul(120_000);
-    match pool.recommended_fee(wait_ms, tx_size) {
-        Some(fee) => Ok(Json(FeeResponse { fee })),
-        None => err(StatusCode::BAD_REQUEST, "insufficient fee history"),
-    }
+) -> ApiResult<u64> {
+    let wait_minutes = non_negative(params.wait_time, "waitTime")?;
+    let tx_size = non_negative(params.tx_size, "txSize")?;
+    let fee = state
+        .mempool
+        .lock()
+        .await
+        .recommended_fee(wait_minutes, tx_size);
+    Ok(Json(fee))
 }
 
-// ---------------------------------------------------------------------------
-// GET /transactions/poolHistogram
-// ---------------------------------------------------------------------------
+#[derive(Deserialize)]
+pub struct WaitTimeParams {
+    /// NanoERG.
+    #[serde(default = "default_wait_fee")]
+    fee: i64,
+    /// Bytes.
+    #[serde(rename = "txSize", default = "default_tx_size")]
+    tx_size: i32,
+}
+
+fn default_wait_fee() -> i64 {
+    1000
+}
+
+pub async fn get_wait_time(
+    State(state): State<ApiState>,
+    Query(params): Query<WaitTimeParams>,
+) -> ApiResult<u64> {
+    let fee = non_negative(params.fee, "fee")?;
+    let tx_size = match u32::try_from(params.tx_size) {
+        Ok(size) if size > 0 => size,
+        _ => return err(StatusCode::BAD_REQUEST, "txSize must be positive"),
+    };
+    let wait_ms = state.mempool.lock().await.expected_wait_ms(fee, tx_size);
+    Ok(Json(wait_ms))
+}
+
+/// Most bins `poolHistogram` answers. The JVM has no bound.
+const MAX_HISTOGRAM_BINS: u32 = 1000;
 
 #[derive(Deserialize)]
 pub struct HistogramParams {
     #[serde(default = "default_bins")]
-    bins: usize,
+    bins: i32,
+    /// Milliseconds.
+    #[serde(default = "default_max_wait_ms")]
+    maxtime: i64,
 }
 
-fn default_bins() -> usize {
+fn default_bins() -> i32 {
     10
+}
+
+fn default_max_wait_ms() -> i64 {
+    60_000
 }
 
 pub async fn get_pool_histogram(
     State(state): State<ApiState>,
     Query(params): Query<HistogramParams>,
-) -> Json<serde_json::Value> {
-    let bins = params.bins.min(50);
-    let pool = state.mempool.lock().await;
-    let histogram = pool.fee_histogram(bins);
-    Json(serde_json::to_value(histogram).unwrap_or(serde_json::Value::Array(vec![])))
+) -> ApiResult<Vec<ergo_mempool::stats::FeeHistogramBin>> {
+    let bins = match u32::try_from(params.bins) {
+        Ok(bins) if (1..=MAX_HISTOGRAM_BINS).contains(&bins) => bins,
+        _ => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("bins must be between 1 and {MAX_HISTOGRAM_BINS}"),
+            )
+        }
+    };
+    let max_wait_ms = match u64::try_from(params.maxtime) {
+        Ok(ms) if ms >= u64::from(bins) => ms,
+        _ => return err(StatusCode::BAD_REQUEST, "maxtime must be at least bins"),
+    };
+    let histogram = state.mempool.lock().await.pool_histogram(bins, max_wait_ms);
+    Ok(Json(histogram))
 }
 
 // ---------------------------------------------------------------------------
@@ -1777,41 +1839,6 @@ pub async fn head_unconfirmed(
 fn hex_to_id_status(hex_str: &str) -> Result<[u8; 32], ()> {
     let bytes = hex::decode(hex_str).map_err(|_| ())?;
     bytes.try_into().map_err(|_| ())
-}
-
-// ---------------------------------------------------------------------------
-// GET /transactions/waitTime?fee=...&txSize=...
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-pub struct WaitTimeParams {
-    fee: u64,
-    #[serde(rename = "txSize", default = "default_tx_size")]
-    tx_size: usize,
-}
-
-#[derive(serde::Serialize)]
-pub struct WaitTimeResponse {
-    #[serde(rename = "waitTime")]
-    wait_time: u64,
-}
-
-pub async fn get_wait_time(
-    State(state): State<ApiState>,
-    Query(params): Query<WaitTimeParams>,
-) -> ApiResult<WaitTimeResponse> {
-    let tx_size = params.tx_size.min(1_000_000);
-    let pool = state.mempool.lock().await;
-    match pool.expected_wait_time(params.fee, tx_size) {
-        Some(wait_ms) => {
-            // Convert milliseconds back to blocks (target block time ~2 min).
-            // recommended_fee/expected_wait_time work in ms; the endpoint
-            // returns blocks per the JVM contract.
-            let blocks = wait_ms / 120_000;
-            Ok(Json(WaitTimeResponse { wait_time: blocks }))
-        }
-        None => err(StatusCode::BAD_REQUEST, "insufficient fee history"),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3036,31 +3063,6 @@ mod tests {
         let status = rt.block_on(head_unconfirmed(State(state), Path("zzz".into())));
         // Malformed id → can't possibly be in mempool → 404, not 400.
         assert_eq!(status, StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn get_wait_time_no_history_returns_400() {
-        let chain = Arc::new(MockChain {
-            known_header_id: None,
-            header_for_known_id: None,
-            proof_result: Err("unused".into()),
-        });
-        let state = test_state(chain);
-        let rt = build_runtime();
-        let result = rt.block_on(get_wait_time(
-            State(state),
-            Query(WaitTimeParams {
-                fee: 1_000_000,
-                tx_size: 100,
-            }),
-        ));
-        match result {
-            Err((status, body)) => {
-                assert_eq!(status, StatusCode::BAD_REQUEST);
-                assert!(body.reason.contains("fee history"));
-            }
-            Ok(_) => panic!("expected 400 with empty mempool, got 200"),
-        }
     }
 
     #[test]
@@ -4525,6 +4527,264 @@ mod tests {
                 "expected 200 with the cached candidate, got {status} / {}",
                 body.reason
             ),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Through the router: status, content type and body as a client reads them
+    // -----------------------------------------------------------------------
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use std::time::{Duration, Instant};
+
+    /// A response as a client reads it.
+    struct Served {
+        status: StatusCode,
+        content_type: Option<String>,
+        body: String,
+    }
+
+    /// Serve one request through `service`: the whole router, routing and
+    /// extractors included. Bounded by axum's own `ServiceExt`, whose
+    /// `Service` supertrait the router implements; naming that trait itself
+    /// would take a `tower` dependency for nothing else.
+    async fn serve_one<S>(mut service: S, request: Request<Body>) -> axum::response::Response
+    where
+        S: axum::ServiceExt<
+            Request<Body>,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        >,
+    {
+        let Ok(()) = std::future::poll_fn(|cx| service.poll_ready(cx)).await;
+        let Ok(response) = service.call(request).await;
+        response
+    }
+
+    fn serve(state: ApiState, request: Request<Body>) -> Served {
+        build_runtime().block_on(async {
+            let response = serve_one(crate::router(state), request).await;
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .map(|v| v.to_str().expect("ASCII content type").to_string());
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("in-memory body");
+            Served {
+                status,
+                content_type,
+                body: String::from_utf8(body.to_vec()).expect("UTF-8 body"),
+            }
+        })
+    }
+
+    fn get(state: ApiState, uri: &str) -> Served {
+        serve(state, Request::get(uri).body(Body::empty()).unwrap())
+    }
+
+    /// `served` is a 200 with a JSON body.
+    fn assert_json_ok(served: &Served, uri: &str) {
+        assert_eq!(served.status, StatusCode::OK, "{uri}: {}", served.body);
+        assert_eq!(
+            served.content_type.as_deref(),
+            Some("application/json"),
+            "{uri}"
+        );
+    }
+
+    /// `served` is the `ApiError` JSON for `status`.
+    fn assert_api_error(served: &Served, status: StatusCode, uri: &str) {
+        assert_eq!(served.status, status, "{uri}: {}", served.body);
+        assert_eq!(
+            served.content_type.as_deref(),
+            Some("application/json"),
+            "{uri}: {}",
+            served.body
+        );
+        let error: serde_json::Value =
+            serde_json::from_str(&served.body).expect("ApiError body is JSON");
+        assert_eq!(error["error"], serde_json::json!(status.as_u16()), "{uri}");
+        assert!(error["reason"].is_string(), "{uri}: {}", served.body);
+    }
+
+    /// `tx` as a pool entry that entered at `created`, the way a rollback
+    /// hands one back: `return_to_pool` inserts it as given, unvalidated.
+    fn pool_entry(
+        tx: &ergo_validation::Transaction,
+        fee: u64,
+        validation_cost: Option<u64>,
+        created: Instant,
+    ) -> ergo_mempool::types::UnconfirmedTx {
+        let tx_bytes = tx.sigma_serialize_bytes().expect("tx serializes");
+        ergo_mempool::types::UnconfirmedTx {
+            cost: tx_bytes.len() as u32,
+            tx: tx.clone(),
+            tx_bytes: tx_bytes.into(),
+            fee,
+            validation_cost,
+            created,
+            last_checked: created,
+            source: None,
+        }
+    }
+
+    fn add_to_pool(state: &ApiState, entries: Vec<ergo_mempool::types::UnconfirmedTx>) {
+        state
+            .mempool
+            .try_lock()
+            .expect("uncontended")
+            .return_to_pool(entries);
+    }
+
+    /// `seconds` ago.
+    fn ago(seconds: u64) -> Instant {
+        Instant::now()
+            .checked_sub(Duration::from_secs(seconds))
+            .expect("monotonic clock runs past the offset")
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /transactions/getFee, /waitTime, /poolHistogram
+    // -----------------------------------------------------------------------
+
+    /// `MempoolConfig::default().min_fee`, which `test_state`'s pool runs with.
+    const MIN_FEE: &str = "1000000";
+
+    /// Serialized length of `make_vf_p2pk_tx(&make_vf_p2pk_box(1_000_000))`.
+    const VF_TX_LEN: usize = 81;
+
+    #[test]
+    fn get_fee_answers_min_fee_as_a_bare_integer_without_statistics() {
+        for uri in [
+            "/transactions/getFee",
+            "/transactions/getFee?waitTime=0&txSize=0",
+            "/transactions/getFee?waitTime=600&txSize=98304",
+        ] {
+            let served = get(empty_state(), uri);
+            assert_json_ok(&served, uri);
+            assert_eq!(served.body, MIN_FEE, "{uri}");
+        }
+    }
+
+    /// A pool transaction confirmed within its first minute fills the first
+    /// statistics bin, and `getFee` answers from it: fee per factor ×
+    /// `txSize` / 1024, above `min_fee`.
+    #[test]
+    fn get_fee_answers_from_confirmed_pool_transactions() {
+        let state = empty_state();
+        let tx = make_vf_p2pk_tx(&make_vf_p2pk_box(1_000_000));
+        let entry = pool_entry(&tx, 40_500_000, None, Instant::now());
+        assert_eq!(entry.tx_bytes.len(), VF_TX_LEN);
+        add_to_pool(&state, vec![entry]);
+        state
+            .mempool
+            .try_lock()
+            .expect("uncontended")
+            .apply_block(std::slice::from_ref(&tx));
+
+        // Fee per factor 40,500,000 × 1024 / 81 = 512,000,000.
+        let uri = "/transactions/getFee?waitTime=1&txSize=1024";
+        let served = get(state.clone(), uri);
+        assert_json_ok(&served, uri);
+        assert_eq!(served.body, "512000000");
+
+        // 512,000,000 × 1 / 1024 = 500,000: below min_fee, which it answers.
+        let uri = "/transactions/getFee?waitTime=1&txSize=1";
+        assert_eq!(get(state, uri).body, MIN_FEE, "{uri}");
+    }
+
+    #[test]
+    fn get_fee_refuses_negative_parameters() {
+        for uri in [
+            "/transactions/getFee?waitTime=-1",
+            "/transactions/getFee?txSize=-1",
+        ] {
+            assert_api_error(&get(empty_state(), uri), StatusCode::BAD_REQUEST, uri);
+        }
+    }
+
+    /// No block has confirmed a pool transaction, so the throughput window
+    /// is empty and the wait 0. `fee` is optional, as on the JVM.
+    #[test]
+    fn wait_time_answers_a_bare_integer() {
+        for uri in [
+            "/transactions/waitTime",
+            "/transactions/waitTime?fee=1000000&txSize=1",
+        ] {
+            let served = get(empty_state(), uri);
+            assert_json_ok(&served, uri);
+            assert_eq!(served.body, "0", "{uri}");
+        }
+    }
+
+    #[test]
+    fn wait_time_refuses_negative_parameters_and_zero_size() {
+        for uri in [
+            "/transactions/waitTime?fee=-1",
+            "/transactions/waitTime?txSize=-1",
+            "/transactions/waitTime?txSize=0",
+        ] {
+            assert_api_error(&get(empty_state(), uri), StatusCode::BAD_REQUEST, uri);
+        }
+    }
+
+    /// `bins + 1` empty bins, rendered as the JVM's `FeeHistogramBin`.
+    fn empty_histogram(bins: usize) -> String {
+        format!(
+            "[{}]",
+            vec![r#"{"nTxns":0,"totalFee":0}"#; bins + 1].join(",")
+        )
+    }
+
+    #[test]
+    fn pool_histogram_answers_bins_plus_one() {
+        for (uri, bins) in [
+            ("/transactions/poolHistogram", 10),
+            ("/transactions/poolHistogram?bins=1&maxtime=1", 1),
+            ("/transactions/poolHistogram?bins=1000&maxtime=1000", 1000),
+        ] {
+            let served = get(empty_state(), uri);
+            assert_json_ok(&served, uri);
+            assert_eq!(served.body, empty_histogram(bins), "{uri}");
+        }
+    }
+
+    /// Ten bins of 6,000 ms by default: a transaction 33 s into its wait
+    /// counts in bin 5, one past `maxtime` in the last, with its fee per
+    /// factor (fee × 1024 / 81 bytes).
+    #[test]
+    fn pool_histogram_bins_the_pool_by_wait() {
+        let state = empty_state();
+        let waiting = make_vf_p2pk_tx(&make_vf_p2pk_box(1_000_000));
+        let overdue = make_vf_p2pk_tx(&make_vf_p2pk_box(2_000_000));
+        add_to_pool(
+            &state,
+            vec![
+                pool_entry(&waiting, 810_000, None, ago(33)),
+                pool_entry(&overdue, 1_620_000, None, ago(61)),
+            ],
+        );
+
+        let served = get(state, "/transactions/poolHistogram");
+        let mut bins = [r#"{"nTxns":0,"totalFee":0}"#; 11];
+        bins[5] = r#"{"nTxns":1,"totalFee":10240000}"#;
+        bins[10] = r#"{"nTxns":1,"totalFee":20480000}"#;
+        assert_eq!(served.body, format!("[{}]", bins.join(",")));
+    }
+
+    #[test]
+    fn pool_histogram_refuses_bins_out_of_range_and_maxtime_below_bins() {
+        for uri in [
+            "/transactions/poolHistogram?bins=0",
+            "/transactions/poolHistogram?bins=-1",
+            "/transactions/poolHistogram?bins=1001",
+            "/transactions/poolHistogram?bins=10&maxtime=9",
+            "/transactions/poolHistogram?maxtime=-1",
+        ] {
+            assert_api_error(&get(empty_state(), uri), StatusCode::BAD_REQUEST, uri);
         }
     }
 }

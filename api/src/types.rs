@@ -53,12 +53,6 @@ pub struct EmissionInfo {
     pub total_remain_coins: u64,
 }
 
-/// Fee recommendation response.
-#[derive(Serialize)]
-pub struct FeeResponse {
-    pub fee: u64,
-}
-
 /// GET /peers/api-urls response entry.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
