@@ -1263,10 +1263,6 @@ async fn spawn_outbound_connect(
             tokio::spawn(async move {
                 match Connection::outbound(stream, &hs, &ctx.counters).await {
                     Ok(conn) => {
-                        if handshake::is_proxy(conn.peer_spec()) {
-                            tracing::info!(peer = %peer_id, addr = %addr, "Outbound peer is a proxy, skipping");
-                            return;
-                        }
                         tracing::info!(peer = %peer_id, "Outbound handshake OK");
                         run_peer(peer_id, conn, Direction::Outbound, mode, addr, ctx, None).await;
                     }
@@ -2517,6 +2513,53 @@ mod tests {
         node.send_to(peer, blob(half)).await.unwrap();
         let link = peer_senders.lock().unwrap()[&peer].link.clone();
         assert!(!link.is_aborted());
+    }
+
+    #[tokio::test]
+    async fn an_outbound_peer_advertising_an_unknown_feature_connects() {
+        let TestHarness {
+            router,
+            ctx,
+            mut event_rx,
+            ..
+        } = test_node();
+        // A valid remote handshake plus feature 64, which this node does not
+        // know. The feature is kept, not interpreted (`facts/p2p-transport.md`
+        // § `parse`).
+        let unknown = handshake::Feature {
+            id: 64,
+            body: vec![],
+        };
+        let mut spec = handshake::parse(&remote_handshake()).unwrap();
+        spec.features.push(unknown.clone());
+        let mut remote_bytes = Vec::new();
+        crate::transport::vlq::write_vlq(&mut remote_bytes, now_ms());
+        handshake::serialize_peer_entry(&spec, &mut remote_bytes);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let remote = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(&remote_bytes).await.unwrap();
+            stream
+        });
+        spawn_outbound_connect(target, &local_handshake(), ProxyMode::Full, ctx.clone()).await;
+        // Held open until the end, so the connection stays up.
+        let _remote = remote.await.unwrap();
+
+        match next_event(&mut event_rx).await {
+            ProtocolEvent::PeerConnected {
+                peer_id,
+                spec,
+                direction,
+                ..
+            } => {
+                assert_eq!(direction, Direction::Outbound);
+                assert!(spec.features.contains(&unknown), "{:?}", spec.features);
+                assert_eq!(router.lock().await.outbound_peers(), vec![peer_id]);
+            }
+            other => panic!("expected PeerConnected, got {other:?}"),
+        }
     }
 
     #[tokio::test]
