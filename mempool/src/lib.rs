@@ -8,6 +8,14 @@ pub mod stats;
 pub mod types;
 pub mod weight;
 
+// The unit tests share the integration tests' fixtures, which name this
+// crate `ergo_mempool` as a dependent would.
+#[cfg(test)]
+extern crate self as ergo_mempool;
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_common;
+
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -24,6 +32,11 @@ use weight::TxWeight;
 /// Largest serialized transaction the node accepts from a peer or the API.
 /// The JVM's `maxTransactionSize` default (`application.conf`).
 pub const MAX_TRANSACTION_SIZE: usize = 98_304;
+
+/// Validation cost one revalidation pass may spend: the JVM's
+/// `CleanupWorker.CostLimit` (v6.0.6 :27). Separate from `cost_per_block`,
+/// which limits what remote peers' transactions may cost between blocks.
+pub const CLEANUP_COST_LIMIT: u64 = 7_000_000;
 
 pub struct Mempool {
     pool: OrderedPool,

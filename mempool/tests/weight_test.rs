@@ -86,22 +86,66 @@ fn tiebreak_by_tx_id() {
     assert_ne!(w_a, w_b, "different tx_ids should not be equal");
 }
 
+/// Equality is the ordering's, on `weight` and `tx_id`: `Ord` requires
+/// `a == b` exactly when `a.cmp(&b)` is `Equal`. `fee_per_factor` takes no
+/// part.
 #[test]
-fn ord_consistent_for_same_weight_and_id() {
-    // TxWeight derives Eq over all fields including `created: Instant`,
-    // so two separate `new()` calls are never structurally equal.
-    // But Ord only considers weight and tx_id, so they compare as Equal
-    // in ordering terms.
+fn equality_agrees_with_the_ordering() {
     use std::cmp::Ordering;
-    let id = make_tx_id(1);
-    let w1 = TxWeight::new(id, 1_000_000, 500, 0, FeeStrategy::FeePerByte);
-    let w2 = TxWeight::new(id, 1_000_000, 500, 0, FeeStrategy::FeePerByte);
-    assert_eq!(
-        w1.cmp(&w2),
-        Ordering::Equal,
-        "same weight+id should be Ordering::Equal"
+    let weight = |weight, fee_per_factor, seed| TxWeight {
+        weight,
+        fee_per_factor,
+        tx_id: make_tx_id(seed),
+    };
+    let base = weight(5_000, 1_000, 1);
+    let cases = [
+        (weight(5_000, 1_000, 1), true),
+        (weight(5_000, 4_000, 1), true),
+        (weight(6_000, 1_000, 1), false),
+        (weight(5_000, 1_000, 2), false),
+    ];
+    for (other, equal) in cases {
+        assert_eq!(base == other, equal, "== against {other:?}");
+        assert_eq!(
+            base.cmp(&other) == Ordering::Equal,
+            equal,
+            "cmp against {other:?}"
+        );
+    }
+}
+
+/// `fee * 1024` is computed wider than `u64`. 2 × 10^16 nanoERG for 1000
+/// bytes: the product, 2.048 × 10^19, passes `u64::MAX` (about 1.8 × 10^19),
+/// but the quotient, 2.048 × 10^16, fits and comes out exact.
+#[test]
+fn a_fee_past_u64_times_1024_is_weighed_exactly() {
+    let w = TxWeight::new(
+        make_tx_id(1),
+        20_000_000_000_000_000,
+        1000,
+        0,
+        FeeStrategy::FeePerByte,
     );
-    assert_eq!(w1.weight, w2.weight);
-    assert_eq!(w1.fee_per_factor, w2.fee_per_factor);
-    assert_eq!(w1.tx_id, w2.tx_id);
+    assert_eq!(w.fee_per_factor, 20_480_000_000_000_000);
+}
+
+/// A quotient that doesn't fit saturates, where the old `u64` product
+/// panicked in a debug build. `u64::MAX` for one byte is `u64::MAX × 1024`;
+/// under `FeePerCycle` with no cost it is `u64::MAX × 1024 / 1000`. For 2048
+/// bytes it fits: `u64::MAX / 2`, 9,223,372,036,854,775,807.
+#[test]
+fn a_fee_near_u64_max_saturates_instead_of_overflowing() {
+    let id = make_tx_id(1);
+
+    let per_byte = TxWeight::new(id, u64::MAX, 1, 0, FeeStrategy::FeePerByte);
+    assert_eq!(
+        (per_byte.fee_per_factor, per_byte.weight),
+        (u64::MAX, u64::MAX)
+    );
+
+    let per_cycle = TxWeight::new(id, u64::MAX, 1, 0, FeeStrategy::FeePerCycle);
+    assert_eq!(per_cycle.fee_per_factor, u64::MAX);
+
+    let halved = TxWeight::new(id, u64::MAX, 2048, 0, FeeStrategy::FeePerByte);
+    assert_eq!(halved.fee_per_factor, 9_223_372_036_854_775_807);
 }

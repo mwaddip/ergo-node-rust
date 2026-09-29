@@ -121,24 +121,39 @@ fn return_to_pool_carries_no_cost() {
 }
 
 /// A successful revalidation records the cost it measured and the time it
-/// ran, the JVM's `withCost`. The time decides the next pass: before this,
-/// nothing refreshed `last_checked` after entry, so every pass re-validated
-/// every transaction older than `cleanup_interval`.
+/// ran, the JVM's `withCost`, and that time decides the next pass. A pass
+/// checks a transaction only once more than `cleanup_interval` has passed
+/// since its `last_checked`: exactly the interval is too soon, as for the JVM,
+/// which re-checks past its `TimeLimit`.
 #[test]
 fn revalidation_records_cost_and_time_so_the_next_pass_skips() {
     let config = MempoolConfig::default();
     let interval = config.cleanup_interval;
+    let millisecond = Duration::from_millis(1);
     let mut mempool = Mempool::new(config);
     let context = state_context_at(TIP_HEIGHT);
 
     let input = make_box(true, 3, TIP_HEIGHT - 1);
+    let utxo = StaticUtxo::new(std::slice::from_ref(&input));
     let tx = spend_tx(std::slice::from_ref(&input), TIP_HEIGHT);
     let tx_id = tx_id_bytes(&tx);
     let t0 = Instant::now();
     mempool.return_to_pool(vec![returned(&tx, None, t0)]);
 
-    let checked = t0 + interval;
-    let removed = mempool.revalidate_at(checked, &StaticUtxo::new(&[input]), &context);
+    // Exactly the interval after entry: too soon.
+    assert!(mempool
+        .revalidate_at(t0 + interval, &utxo, &context)
+        .is_empty());
+    let utx = mempool.get(&tx_id).expect("still pooled");
+    assert_eq!(
+        (utx.validation_cost, utx.last_checked),
+        (None, t0),
+        "skipped"
+    );
+
+    // A millisecond more: checked.
+    let checked = t0 + interval + millisecond;
+    let removed = mempool.revalidate_at(checked, &utxo, &context);
     assert!(removed.is_empty(), "setup: the transaction is valid");
     let utx = mempool.get(&tx_id).expect("still pooled");
     // One input, one output: 10,000 + 2,000 + 100 + 1.
@@ -147,18 +162,14 @@ fn revalidation_records_cost_and_time_so_the_next_pass_skips() {
     assert_eq!(utx.created, t0, "entering the pool happened once");
 
     // With its input gone, any pass that checks the transaction removes it.
-    // Until `cleanup_interval` has passed since the last check, none does.
+    // Through exactly `cleanup_interval` after the last check, none does.
     let gone = StaticUtxo::new(&[]);
     assert!(mempool.revalidate_at(checked, &gone, &context).is_empty());
     assert!(mempool
-        .revalidate_at(
-            checked + interval - Duration::from_millis(1),
-            &gone,
-            &context
-        )
+        .revalidate_at(checked + interval, &gone, &context)
         .is_empty());
     assert_eq!(
-        mempool.revalidate_at(checked + interval, &gone, &context),
+        mempool.revalidate_at(checked + interval + millisecond, &gone, &context),
         vec![tx_id]
     );
 }
