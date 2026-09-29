@@ -1,3 +1,7 @@
+use ergo_lib::chain::transaction::input::prover_result::ProverResult;
+use ergo_lib::chain::transaction::{DataInput, Input};
+use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
+use ergo_lib::ergotree_ir::chain::tx_id::TxId;
 use serde::Serialize;
 
 /// Standard error response matching the JVM node's format.
@@ -51,6 +55,42 @@ pub struct EmissionInfo {
     pub miner_reward: u64,
     pub total_coins_issued: u64,
     pub total_remain_coins: u64,
+}
+
+/// A pool transaction as `GET /transactions/unconfirmed*` renders it: the
+/// JVM's `TransactionsApiRoute.createTransactionWithResolvedInputs`
+/// (v6.0.6). Serialized field by field from ergo-lib's own types, so each
+/// input's context extension keeps its order (`facts/api.md` § Transaction
+/// JSON).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnconfirmedTransaction {
+    pub id: TxId,
+    pub inputs: Vec<UnconfirmedInput>,
+    pub data_inputs: Vec<DataInput>,
+    pub outputs: Vec<ErgoBox>,
+    /// Length of the serialized transaction the pool holds, in bytes.
+    pub size: usize,
+    /// The cost the transaction's most recent validation measured. `null`
+    /// when none has run since a rollback returned it to the pool.
+    pub cost: Option<u64>,
+}
+
+/// An unconfirmed transaction's input, with the box it spends merged in
+/// when the node resolved that box.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum UnconfirmedInput {
+    /// Every field of the spent box, whose `boxId` is the input's, beside
+    /// the input's proof. One `boxId`, as the JVM's merge leaves one.
+    Resolved {
+        #[serde(flatten)]
+        spent: Box<ErgoBox>,
+        #[serde(rename = "spendingProof")]
+        spending_proof: ProverResult,
+    },
+    /// The input as the transaction carries it: `boxId` and `spendingProof`.
+    Unresolved(Input),
 }
 
 /// GET /peers/api-urls response entry.

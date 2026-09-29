@@ -5,7 +5,11 @@ use serde::Deserialize;
 
 use std::sync::Arc;
 
+use ergo_lib::chain::transaction::{DataInput, Input};
+use ergo_lib::ergotree_ir::chain::ergo_box::{BoxId, ErgoBox};
+use ergo_lib::ergotree_ir::chain::tx_id::TxId;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+use ergo_mempool::Mempool;
 use sigma_ser::ScorexSerializable;
 
 use crate::types::*;
@@ -496,6 +500,10 @@ impl ergo_mempool::types::UtxoReader for UtxoReaderAdapter<'_> {
 
 // ---------------------------------------------------------------------------
 // GET /transactions/unconfirmed
+// GET /transactions/unconfirmed/byTransactionId/{tx_id}
+//
+// Each transaction rendered as the JVM's `UnconfirmedTransaction`, inputs
+// resolved to the boxes they spend.
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -510,27 +518,138 @@ fn default_limit() -> usize {
     50
 }
 
+/// Whether this node resolves an unconfirmed input to the box it spends.
+/// Only a node holding the UTXO set does: the JVM's digest node resolves
+/// none, and neither does a `digest` or `light` node here.
+fn resolves_inputs(node: &crate::NodeMeta) -> bool {
+    node.state_type == "utxo"
+}
+
+/// The 32 bytes a box lookup is keyed by.
+fn box_id_bytes(id: BoxId) -> [u8; 32] {
+    ergo_chain_types::Digest32::from(id).0
+}
+
+/// A pool entry as `/transactions/unconfirmed*` renders it, copied out under
+/// the mempool lock. The P2P intake waits on that lock, so the UTXO set is
+/// read after it is released, and the pool's part of each input's
+/// resolution is taken here: the output of another pool transaction that
+/// the input spends.
+struct PoolEntry {
+    id: TxId,
+    /// Each input, with the pool output it spends, if any. Always `None` on
+    /// a node that doesn't resolve inputs.
+    inputs: Vec<(Input, Option<ErgoBox>)>,
+    data_inputs: Vec<DataInput>,
+    outputs: Vec<ErgoBox>,
+    size: usize,
+    cost: Option<u64>,
+}
+
+impl PoolEntry {
+    fn take(utx: &ergo_mempool::types::UnconfirmedTx, pool: &Mempool, resolve: bool) -> Self {
+        let tx = &utx.tx;
+        let inputs = tx
+            .inputs
+            .iter()
+            .map(|input| {
+                let pool_output = if resolve {
+                    pool.unconfirmed_box(&box_id_bytes(input.box_id)).cloned()
+                } else {
+                    None
+                };
+                (input.clone(), pool_output)
+            })
+            .collect();
+        PoolEntry {
+            id: tx.id(),
+            inputs,
+            data_inputs: tx
+                .data_inputs
+                .as_ref()
+                .map(|d| d.as_vec().clone())
+                .unwrap_or_default(),
+            outputs: tx.outputs.as_vec().clone(),
+            size: utx.tx_bytes.len(),
+            cost: utx.validation_cost,
+        }
+    }
+
+    /// Resolve each input against the UTXO set, then against the pool
+    /// output taken with the entry: the order `/utxo/withPool` looks a box
+    /// up in. `utxo` is `None` on a node that doesn't resolve inputs.
+    fn render(self, utxo: Option<&dyn crate::UtxoAccess>) -> UnconfirmedTransaction {
+        let inputs = self
+            .inputs
+            .into_iter()
+            .map(|(input, pool_output)| {
+                let spent = utxo
+                    .and_then(|utxo| utxo.box_by_id(&box_id_bytes(input.box_id)))
+                    .or(pool_output);
+                match spent {
+                    Some(spent) => UnconfirmedInput::Resolved {
+                        spent: Box::new(spent),
+                        spending_proof: input.spending_proof,
+                    },
+                    None => UnconfirmedInput::Unresolved(input),
+                }
+            })
+            .collect();
+        UnconfirmedTransaction {
+            id: self.id,
+            inputs,
+            data_inputs: self.data_inputs,
+            outputs: self.outputs,
+            size: self.size,
+            cost: self.cost,
+        }
+    }
+}
+
+/// Run `render` off the async runtime: resolving reads the UTXO set once
+/// per input, and a page can hold thousands of inputs. `render` gets the
+/// UTXO reader on a node that resolves inputs, `None` on one that doesn't.
+async fn render_unconfirmed<T: Send + 'static>(
+    state: &ApiState,
+    resolve: bool,
+    render: impl FnOnce(Option<&dyn crate::UtxoAccess>) -> T + Send + 'static,
+) -> Result<T, (StatusCode, Json<ApiError>)> {
+    let utxo = resolve.then(|| Arc::clone(&state.utxo_reader));
+    tokio::task::spawn_blocking(move || render(utxo.as_deref()))
+        .await
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unconfirmed rendering task failed: {e}"),
+                None,
+            )
+        })
+}
+
 pub async fn get_unconfirmed(
     State(state): State<ApiState>,
     Query(params): Query<PaginationParams>,
-) -> Json<Vec<serde_json::Value>> {
+) -> ApiResult<Vec<UnconfirmedTransaction>> {
     let limit = params.limit.min(100);
     let offset = params.offset.min(100_000);
-    let pool = state.mempool.lock().await;
-    let txs: Vec<_> = pool
-        .all_prioritized()
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .filter_map(|utx| match serde_json::to_value(&utx.tx) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                tracing::warn!(error = %e, tx_id = %hex::encode(utx.tx.id().0.0), "unconfirmed_transactions: serde failed; tx omitted");
-                None
-            }
-        })
-        .collect();
-    Json(txs)
+    let resolve = resolves_inputs(&state.node_info);
+    let entries: Vec<PoolEntry> = {
+        let pool = state.mempool.lock().await;
+        pool.all_prioritized()
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|utx| PoolEntry::take(utx, &pool, resolve))
+            .collect()
+    };
+    render_unconfirmed(&state, resolve, move |utxo| {
+        entries
+            .into_iter()
+            .map(|entry| entry.render(utxo))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map(Json)
 }
 
 // ---------------------------------------------------------------------------
@@ -550,19 +669,19 @@ pub async fn get_unconfirmed_ids(State(state): State<ApiState>) -> Json<Vec<Stri
 pub async fn get_unconfirmed_by_id(
     State(state): State<ApiState>,
     Path(tx_id): Path<String>,
-) -> ApiResult<serde_json::Value> {
+) -> ApiResult<UnconfirmedTransaction> {
     let id = hex_to_id(&tx_id)?;
-    let pool = state.mempool.lock().await;
-    match pool.get(&id) {
-        Some(utx) => match serde_json::to_value(&utx.tx) {
-            Ok(v) => Ok(Json(v)),
-            Err(e) => err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("serialization failed: {e}"),
-            ),
-        },
-        None => err(StatusCode::NOT_FOUND, "transaction not in mempool"),
-    }
+    let resolve = resolves_inputs(&state.node_info);
+    let entry = {
+        let pool = state.mempool.lock().await;
+        match pool.get(&id) {
+            Some(utx) => PoolEntry::take(utx, &pool, resolve),
+            None => return err(StatusCode::NOT_FOUND, "transaction not in mempool"),
+        }
+    };
+    render_unconfirmed(&state, resolve, move |utxo| entry.render(utxo))
+        .await
+        .map(Json)
 }
 
 // ---------------------------------------------------------------------------
@@ -4786,5 +4905,232 @@ mod tests {
         ] {
             assert_api_error(&get(empty_state(), uri), StatusCode::BAD_REQUEST, uri);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /transactions/unconfirmed, .../byTransactionId/{tx_id}
+    // -----------------------------------------------------------------------
+
+    use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
+
+    /// A UTXO set holding exactly `boxes`.
+    struct BoxUtxo(HashMap<[u8; 32], ergo_validation::ErgoBox>);
+
+    impl BoxUtxo {
+        fn holding(boxes: &[ergo_validation::ErgoBox]) -> Self {
+            Self(
+                boxes
+                    .iter()
+                    .map(|b| (box_id_bytes(b.box_id()), b.clone()))
+                    .collect(),
+            )
+        }
+    }
+
+    impl UtxoAccess for BoxUtxo {
+        fn box_by_id(&self, id: &[u8; 32]) -> Option<ergo_validation::ErgoBox> {
+            self.0.get(id).cloned()
+        }
+        fn cache_bytes_used(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    /// A transaction spending `inputs` with empty proofs, every input
+    /// carrying `extension`, into one P2PK output of 900,000 nanoERG.
+    fn spend(inputs: &[BoxId], extension: &ContextExtension) -> ergo_validation::Transaction {
+        use ergo_lib::chain::transaction::input::prover_result::ProverResult;
+        use ergo_lib::ergotree_interpreter::sigma_protocol::prover::ProofBytes;
+        use ergo_lib::ergotree_ir::chain::ergo_box::{
+            box_value::BoxValue, ErgoBoxCandidate, NonMandatoryRegisters,
+        };
+        use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
+
+        let inputs = inputs
+            .iter()
+            .map(|id| {
+                Input::new(
+                    *id,
+                    ProverResult {
+                        proof: ProofBytes::Empty,
+                        extension: extension.clone(),
+                    },
+                )
+            })
+            .collect();
+        let output = ErgoBoxCandidate {
+            value: BoxValue::try_from(900_000u64).unwrap(),
+            ergo_tree: ErgoTree::sigma_parse_bytes(&hex::decode(VF_P2PK_TREE_HEX).unwrap())
+                .unwrap(),
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height: 685,
+        };
+        ergo_validation::Transaction::new_from_vec(inputs, vec![], vec![output]).unwrap()
+    }
+
+    /// Serialized length of `spend` over three inputs with empty extensions.
+    const CHILD_TX_LEN: usize = 149;
+
+    /// A pool whose `child` spends three boxes: `confirmed`, in the UTXO set;
+    /// an output of `parent`, another pool transaction; and a box neither
+    /// holds. Returns `(state, parent, child)`.
+    fn unconfirmed_fixture() -> (
+        ApiState,
+        ergo_validation::Transaction,
+        ergo_validation::Transaction,
+    ) {
+        let confirmed = make_vf_p2pk_box(1_000_000);
+        let parent = make_vf_p2pk_tx(&make_vf_p2pk_box(2_000_000));
+        let unknown = BoxId::from(Digest32::from([0xEE; 32]));
+        let child = spend(
+            &[confirmed.box_id(), parent.outputs.first().box_id(), unknown],
+            &ContextExtension::empty(),
+        );
+
+        let mut state = empty_state();
+        state.utxo_reader = Arc::new(BoxUtxo::holding(&[confirmed]));
+        add_to_pool(
+            &state,
+            vec![
+                pool_entry(&parent, 1_000_000, None, Instant::now()),
+                pool_entry(&child, 5_000_000, Some(12_345), Instant::now()),
+            ],
+        );
+        (state, parent, child)
+    }
+
+    fn digest_mode(mut state: ApiState) -> ApiState {
+        state.node_info = Arc::new(NodeMeta {
+            state_type: "digest".into(),
+            ..(*state.node_info).clone()
+        });
+        state
+    }
+
+    fn unconfirmed_by_id(state: ApiState, tx: &ergo_validation::Transaction) -> Served {
+        let uri = format!(
+            "/transactions/unconfirmed/byTransactionId/{}",
+            hex::encode(tx.id().0 .0)
+        );
+        let served = get(state, &uri);
+        assert_json_ok(&served, &uri);
+        served
+    }
+
+    /// An input rendered as the transaction carries it, and nothing more.
+    fn assert_unresolved(input: &serde_json::Value, box_id: BoxId) {
+        assert_eq!(
+            *input,
+            serde_json::json!({
+                "boxId": hex::encode(box_id_bytes(box_id)),
+                "spendingProof": { "proofBytes": "", "extension": {} },
+            })
+        );
+    }
+
+    #[test]
+    fn unconfirmed_resolves_inputs_from_the_utxo_set_then_the_pool() {
+        let (state, parent, child) = unconfirmed_fixture();
+        let served = unconfirmed_by_id(state, &child);
+        let tx: serde_json::Value = serde_json::from_str(&served.body).unwrap();
+
+        assert_eq!(tx["id"], serde_json::json!(hex::encode(child.id().0 .0)));
+        assert_eq!(tx["size"], serde_json::json!(CHILD_TX_LEN));
+        assert_eq!(tx["cost"], serde_json::json!(12_345));
+        assert_eq!(tx["dataInputs"], serde_json::json!([]));
+        assert_eq!(tx["outputs"].as_array().map(Vec::len), Some(1));
+
+        // From the UTXO set: `make_vf_p2pk_box(1_000_000)`, whole.
+        assert_eq!(
+            tx["inputs"][0],
+            serde_json::json!({
+                "boxId": hex::encode(box_id_bytes(child.inputs.first().box_id)),
+                "value": 1_000_000,
+                "ergoTree": VF_P2PK_TREE_HEX,
+                "assets": [],
+                "additionalRegisters": {},
+                "creationHeight": 684,
+                "transactionId": VF_SRC_TX_HEX,
+                "index": 0,
+                "spendingProof": { "proofBytes": "", "extension": {} },
+            })
+        );
+        // From the pool: `parent`'s output.
+        assert_eq!(
+            tx["inputs"][1],
+            serde_json::json!({
+                "boxId": hex::encode(box_id_bytes(parent.outputs.first().box_id())),
+                "value": 900_000,
+                "ergoTree": VF_P2PK_TREE_HEX,
+                "assets": [],
+                "additionalRegisters": {},
+                "creationHeight": 685,
+                "transactionId": hex::encode(parent.id().0 .0),
+                "index": 0,
+                "spendingProof": { "proofBytes": "", "extension": {} },
+            })
+        );
+        // Neither holds it.
+        assert_unresolved(&tx["inputs"][2], child.inputs.as_vec()[2].box_id);
+
+        // A `Value` keeps the last of a repeated key, so count them in the
+        // text: one per input and one per output.
+        assert_eq!(served.body.matches("\"boxId\"").count(), 4);
+    }
+
+    #[test]
+    fn unconfirmed_lists_the_pool_by_weight_with_size_and_cost() {
+        let (state, parent, child) = unconfirmed_fixture();
+        let uri = "/transactions/unconfirmed";
+        let served = get(state, uri);
+        assert_json_ok(&served, uri);
+        let txs: serde_json::Value = serde_json::from_str(&served.body).unwrap();
+
+        // `child` pays the higher fee per byte, so it comes first.
+        assert_eq!(txs.as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            txs[0]["id"],
+            serde_json::json!(hex::encode(child.id().0 .0))
+        );
+        assert_eq!(txs[0]["size"], serde_json::json!(CHILD_TX_LEN));
+        assert_eq!(txs[0]["cost"], serde_json::json!(12_345));
+        assert_eq!(txs[0]["inputs"][0]["value"], serde_json::json!(1_000_000));
+        assert_eq!(txs[0]["inputs"][1]["value"], serde_json::json!(900_000));
+        assert!(txs[0]["inputs"][2].get("value").is_none());
+
+        // Returned by a rollback and not validated since: `cost` is null.
+        assert_eq!(
+            txs[1]["id"],
+            serde_json::json!(hex::encode(parent.id().0 .0))
+        );
+        assert_eq!(txs[1]["size"], serde_json::json!(VF_TX_LEN));
+        assert_eq!(txs[1]["cost"], serde_json::Value::Null);
+        // `parent`'s own input is in neither the UTXO set nor the pool.
+        assert_unresolved(&txs[1]["inputs"][0], parent.inputs.first().box_id);
+
+        assert_eq!(served.body.matches("\"boxId\"").count(), 6);
+    }
+
+    /// The JVM's digest node resolves no input, and neither does this one:
+    /// not from the UTXO set, not from the pool.
+    #[test]
+    fn unconfirmed_resolves_nothing_in_digest_mode() {
+        let (state, _parent, child) = unconfirmed_fixture();
+        let served = unconfirmed_by_id(digest_mode(state), &child);
+        let tx: serde_json::Value = serde_json::from_str(&served.body).unwrap();
+        for (i, input) in child.inputs.iter().enumerate() {
+            assert_unresolved(&tx["inputs"][i], input.box_id);
+        }
+        assert_eq!(tx["cost"], serde_json::json!(12_345));
+    }
+
+    #[test]
+    fn unconfirmed_by_id_answers_404_for_a_transaction_outside_the_pool() {
+        let uri = format!(
+            "/transactions/unconfirmed/byTransactionId/{}",
+            "ab".repeat(32)
+        );
+        assert_api_error(&get(empty_state(), &uri), StatusCode::NOT_FOUND, &uri);
     }
 }
