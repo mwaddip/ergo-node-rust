@@ -15,8 +15,9 @@ use ergo_chain_types::{ADDigest, Header};
 pub use digest::DigestValidator;
 pub use prover_memory::ProverMemoryEstimate;
 pub use sections::{
-    parse_block_transactions, parse_extension, serialize_ad_proofs, serialize_block_transactions,
-    serialize_extension, ExtensionField, ParsedAdProofs, ParsedBlockTransactions, ParsedExtension,
+    parse_block_transactions, parse_extension, serialize_ad_proofs, serialize_block_transaction,
+    serialize_block_transactions, serialize_extension, ExtensionField, ParsedAdProofs,
+    ParsedBlockTransactions, ParsedExtension,
 };
 pub use state_changes::{
     compute_state_changes, transactions_to_summaries, Insertion, StateChanges,

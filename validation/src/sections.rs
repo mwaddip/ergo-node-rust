@@ -246,18 +246,13 @@ pub fn serialize_ad_proofs(header_id: &[u8; 32], proof_bytes: &[u8]) -> Vec<u8> 
 /// only above block version 1 as the JVM writes it: a v1 section is
 /// `[header_id: 32B] [tx_count: VLQ] [txs...]`.
 ///
-/// Each transaction is written at `enr_chain::block_transactions_write_version`
-/// of `block_version`: version 3 from block version 3, version 0 below (JVM
-/// `BlockTransactionsSerializer.serialize`). A v3 block is written at 3 and
-/// read back at 0; the asymmetry is the JVM's own. `sigma_serialize_bytes()`
-/// is not this rule: it writes every block at the fork's highest version.
+/// Each transaction is written by [`serialize_block_transaction`].
 pub fn serialize_block_transactions(
     header_id: &[u8; 32],
     block_version: u8,
     transactions: &[Transaction],
 ) -> Result<Vec<u8>, ValidationError> {
     const TYPE_ID: u8 = 102;
-    let tree_version = block_transactions_write_version(block_version);
 
     let mut out = Vec::new();
     out.extend_from_slice(header_id);
@@ -278,13 +273,39 @@ pub fn serialize_block_transactions(
     WriteSigmaVlqExt::put_u32(&mut count_buf, transactions.len() as u32).unwrap();
     out.extend_from_slice(&count_buf);
 
-    // Transactions, on one writer as the JVM's serializer writes them
-    let mut w = SigmaByteWriter::new(&mut out, None);
+    // Transactions
     for (i, tx) in transactions.iter().enumerate() {
-        w.with_tree_version(tree_version, |w| tx.sigma_serialize(w))
-            .map_err(|e| section_parse_err(TYPE_ID, format!("transaction {i} serialize: {e}")))?;
+        let tx_bytes = serialize_block_transaction(tx, block_version).map_err(|e| match e {
+            ValidationError::SectionParse { reason, .. } => {
+                section_parse_err(TYPE_ID, format!("transaction {i}: {reason}"))
+            }
+            other => other,
+        })?;
+        out.extend_from_slice(&tx_bytes);
     }
 
+    Ok(out)
+}
+
+/// Serialize one transaction as a block of `block_version` writes it: at
+/// `enr_chain::block_transactions_write_version(block_version)`, version 3
+/// from block version 3 and version 0 below (JVM
+/// `BlockTransactionsSerializer.serialize`). A v3 block is written at 3 and
+/// read back at 0; the asymmetry is the JVM's own. `sigma_serialize_bytes()`
+/// is not this rule: it writes every block at the fork's highest version.
+///
+/// [`serialize_block_transactions`] writes each transaction through it, and
+/// the API's `validation-fragments` calls it directly (facts/validation.md
+/// § Section Parsing).
+pub fn serialize_block_transaction(
+    tx: &Transaction,
+    block_version: u8,
+) -> Result<Vec<u8>, ValidationError> {
+    let tree_version = block_transactions_write_version(block_version);
+    let mut out = Vec::new();
+    SigmaByteWriter::new(&mut out, None)
+        .with_tree_version(tree_version, |w| tx.sigma_serialize(w))
+        .map_err(|e| section_parse_err(102, format!("serialize at {tree_version:?}: {e}")))?;
     Ok(out)
 }
 
@@ -637,6 +658,20 @@ mod tests {
                 Err(other) => panic!("expected SectionParse, got {other:?}"),
                 Ok(_) => panic!("block version {block_version}: an undefined ValUse parsed"),
             }
+        }
+    }
+
+    /// One transaction as its block writes it: X15's `Upcast` written as `1`
+    /// in a v2 block, at version 0, and kept in a v3 block, at version 3.
+    #[test]
+    fn serialize_block_transaction_writes_a_v2_block_s_at_0_and_a_v3_block_s_at_3() {
+        let tx = tx_read_at(EXTENSION_TX, ErgoTreeVersion::V3);
+        for (block_version, written) in [(2, EXTENSION_TX_AT_0), (3, EXTENSION_TX)] {
+            assert_eq!(
+                hex::encode(serialize_block_transaction(&tx, block_version).unwrap()),
+                written,
+                "block version {block_version}"
+            );
         }
     }
 
