@@ -105,18 +105,40 @@ pub fn block_sections_to_modifiers(block: &JvmFullBlock, header: &Header) -> Res
 // BlockTransactions (type 102)
 // ---------------------------------------------------------------------------
 
+/// The ErgoTree version a block's transactions are written at: V3 from block
+/// version 3, V0 below (JVM `BlockTransactionsSerializer.serialize`).
+///
+/// A copy of `enr_chain::block_transactions_write_version`, the node's one
+/// definition (`facts/chain.md` § "The tree version a block's transactions
+/// are read at"). fastsync is outside the workspace and doesn't depend on
+/// `enr-chain`. Keep the two in step.
+fn block_transactions_write_version(
+    block_version: u32,
+) -> ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion {
+    use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
+    if block_version >= 3 {
+        ErgoTreeVersion::V3
+    } else {
+        ErgoTreeVersion::V0
+    }
+}
+
 /// Serialize block transactions from JVM JSON to wire format.
 ///
 /// Wire: `[header_id: 32B] [version_sentinel: VLQ] [tx_count: VLQ] [txs...]`
 ///
 /// Transactions are deserialized via ergo-lib's Transaction JSON support,
-/// then sigma-serialized to bytes.
+/// then written at the block's write version (see
+/// [`block_transactions_write_version`]).
 fn block_transactions_to_modifier(
     bt: &JvmBlockTransactions,
     header_id: &[u8; 32],
     header: &Header,
 ) -> Result<Modifier> {
     use ergo_lib::chain::transaction::Transaction;
+    use ergo_lib::ergotree_ir::serialization::sigma_byte_writer::{
+        SigmaByteWrite, SigmaByteWriter,
+    };
     use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 
     let mut out = Vec::new();
@@ -133,13 +155,13 @@ fn block_transactions_to_modifier(
     out.extend_from_slice(&buf);
 
     // Serialize each transaction
+    let version = block_transactions_write_version(bt.block_version);
     for (i, tx_json) in bt.transactions.iter().enumerate() {
         let tx: Transaction = serde_json::from_value(tx_json.clone())
             .with_context(|| format!("parse transaction {i} JSON"))?;
-        let tx_bytes = tx
-            .sigma_serialize_bytes()
+        let mut w = SigmaByteWriter::new(&mut out, None);
+        w.with_tree_version(version, |w| tx.sigma_serialize(w))
             .with_context(|| format!("serialize transaction {i}"))?;
-        out.extend_from_slice(&tx_bytes);
     }
 
     let modifier_id = prefixed_hash(
@@ -261,6 +283,17 @@ mod tests {
         let hash = blake2b256(b"test");
         assert_eq!(hash.len(), 32);
         assert_ne!(hash, [0u8; 32]);
+    }
+
+    /// The JVM's serializer table (`BlockTransactions.scala:142-160`): the
+    /// same values `enr_chain::block_transactions_write_version` pins.
+    #[test]
+    fn write_version_follows_the_jvm_serializer() {
+        use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
+        assert_eq!(block_transactions_write_version(1), ErgoTreeVersion::V0);
+        assert_eq!(block_transactions_write_version(2), ErgoTreeVersion::V0);
+        assert_eq!(block_transactions_write_version(3), ErgoTreeVersion::V3);
+        assert_eq!(block_transactions_write_version(4), ErgoTreeVersion::V3);
     }
 
     #[test]

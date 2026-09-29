@@ -5,7 +5,6 @@ use axum::Json;
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
 use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
-use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -216,7 +215,11 @@ pub(crate) async fn compose_box_bytes(
         }
     };
 
-    let bytes = match ergo_box.sigma_serialize_bytes() {
+    // The box as the JVM's `ErgoBox.bytes` writes it, at ErgoTree version 0:
+    // the bytes its id hashes. `sigma_serialize_bytes()` writes at 3, which
+    // keeps a register's `Upcast` of a constant that version 0 drops
+    // (facts/indexer.md § `GET /api/v1/boxes/{box_id}/bytes`).
+    let bytes = match ergo_box.bytes() {
         Ok(b) => b,
         Err(e) => {
             return BoxBytesOutcome::Internal {
