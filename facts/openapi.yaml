@@ -414,7 +414,11 @@ paths:
       description: |
         Compatibility: `full`. Local submissions bypass mempool rate limiting.
         HTTP-level rate limiting (per-IP) is a deployment concern, not
-        enforced by the node.
+        enforced by the node. A transaction whose serialization is longer
+        than 98,304 bytes (`ergo_mempool::MAX_TRANSACTION_SIZE`, the JVM's
+        `maxTransactionSize`) is refused with 400 before it is validated,
+        also while the node is syncing (`facts/api.md` § Transaction
+        Submission Flow, step 2a).
       operationId: postTransaction
       requestBody:
         required: true
@@ -430,7 +434,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/HexId32'
         '400':
-          description: Validation failure (invalid script, double-spend conflict, declined, etc.).
+          description: Too large, or a validation failure (invalid script, double-spend conflict, declined, etc.).
           content:
             application/json:
               schema:
@@ -448,7 +452,7 @@ paths:
       summary: Validate a transaction without adding to mempool or broadcasting.
       description: |
         Compatibility: `full`. Same validation as `POST /transactions`,
-        discards the result.
+        size limit included, and discards the result.
       operationId: checkTransaction
       requestBody:
         required: true
@@ -464,7 +468,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/HexId32'
         '400':
-          description: Validation failure.
+          description: Too large, or a validation failure.
           content:
             application/json:
               schema:
@@ -481,8 +485,10 @@ paths:
       tags: [transactions]
       summary: List unconfirmed transactions from the mempool.
       description: |
-        Compatibility: `partial`. Ordered by priority (highest fee weight
-        first). `limit` capped at 100; `offset` capped at 100,000.
+        Compatibility: `full` up to the caps: `limit` at 100 and `offset` at
+        100,000, where the JVM has none. Ordered by priority (highest fee
+        weight first), each transaction rendered as `UnconfirmedTransaction`:
+        inputs resolved, size, and validation cost.
       operationId: getUnconfirmed
       parameters:
         - $ref: '#/components/parameters/Offset'
@@ -495,7 +501,7 @@ paths:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/Transaction'
+                  $ref: '#/components/schemas/UnconfirmedTransaction'
 
   /transactions/unconfirmed/transactionIds:
     get:
@@ -537,7 +543,10 @@ paths:
     get:
       tags: [transactions]
       summary: Single unconfirmed transaction by ID.
-      description: 'Compatibility: `full`.'
+      description: |
+        Compatibility: `full`. The transaction rendered as
+        `UnconfirmedTransaction`, the same shape `/transactions/unconfirmed`
+        lists.
       operationId: getUnconfirmedById
       parameters:
         - name: tx_id
@@ -551,15 +560,15 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Transaction'
-        '404':
-          description: Not in mempool.
+                $ref: '#/components/schemas/UnconfirmedTransaction'
+        '400':
+          description: Malformed transaction ID.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiError'
-        '500':
-          description: Serialization failure.
+        '404':
+          description: Not in mempool.
           content:
             application/json:
               schema:
@@ -568,31 +577,30 @@ paths:
   /transactions/getFee:
     get:
       tags: [transactions]
-      summary: Recommended fee for a target confirmation time.
+      summary: Recommended fee for a transaction to be confirmed within a wait time.
       description: |
-        Compatibility: `full`. `waitTime` is in blocks (capped at 100);
-        `txSize` is in bytes (capped at 1,000,000). Returns the recommended
-        fee in nanoERG. Internal conversion uses a target block time of
-        ~2 minutes.
+        Compatibility: `full`. The fee in nanoERG as a bare JSON integer,
+        never below the node's `min_fee` (`facts/mempool.md` § Fee queries,
+        `recommended_fee`). It answers with `min_fee` when the node has no
+        statistics yet. A negative or malformed parameter is refused with
+        400, where the JVM answers a negative one.
       operationId: getRecommendedFee
       parameters:
         - name: waitTime
           in: query
-          description: Target wait time in blocks.
+          description: Wait time in minutes.
           schema:
             type: integer
-            format: int64
+            format: int32
             minimum: 0
-            maximum: 100
             default: 1
         - name: txSize
           in: query
           description: Transaction size in bytes.
           schema:
             type: integer
-            format: int64
+            format: int32
             minimum: 0
-            maximum: 1000000
             default: 100
       responses:
         '200':
@@ -600,9 +608,11 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/FeeResponse'
+                type: integer
+                format: int64
+                minimum: 0
         '400':
-          description: Insufficient fee history to compute a recommendation.
+          description: Negative or malformed parameter.
           content:
             application/json:
               schema:
@@ -613,35 +623,41 @@ paths:
       tags: [transactions]
       summary: Expected confirmation wait time for a given fee.
       description: |
-        Compatibility: `full`. `fee` is in nanoERG; `txSize` is in bytes
-        (capped at 1,000,000). Returns the expected wait time in blocks
-        (target block time ~2 minutes used for ms→blocks conversion).
+        Compatibility: `full`. The expected wait in milliseconds as a bare
+        JSON integer (`facts/mempool.md` § Fee queries, `expected_wait_ms`).
+        It is 0 until blocks have confirmed pool transactions in the current
+        measurement window. A negative or malformed parameter, or `txSize`
+        0, is refused with 400. The JVM answers a negative one and fails
+        with 500 on `txSize` 0.
       operationId: getWaitTime
       parameters:
         - name: fee
           in: query
-          required: true
+          description: Fee in nanoERG.
           schema:
             type: integer
             format: int64
             minimum: 0
+            default: 1000
         - name: txSize
           in: query
+          description: Transaction size in bytes.
           schema:
             type: integer
-            format: int64
-            minimum: 0
-            maximum: 1000000
+            format: int32
+            minimum: 1
             default: 100
       responses:
         '200':
-          description: Expected wait time (blocks).
+          description: Expected wait (milliseconds).
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/WaitTimeResponse'
+                type: integer
+                format: int64
+                minimum: 0
         '400':
-          description: Insufficient fee history.
+          description: Negative, zero-size or malformed parameter.
           content:
             application/json:
               schema:
@@ -650,30 +666,50 @@ paths:
   /transactions/poolHistogram:
     get:
       tags: [transactions]
-      summary: Fee distribution histogram of the mempool.
+      summary: The mempool binned by how long each transaction has waited.
       description: |
-        Compatibility: `partial`. `bins` is the number of histogram buckets
-        (default 10, capped at 50). Each entry has a min/max fee range and
-        a count.
+        Compatibility: `full`. The current pool binned by how long each
+        transaction has waited so far (`facts/mempool.md` § Fee queries,
+        `pool_histogram`): `bins` bins of `maxtime / bins` milliseconds,
+        then one more for transactions that have waited `maxtime` or longer,
+        so `bins + 1` entries. Each counts its transactions and sums their
+        fee per factor. `bins` outside 1–1000, `maxtime` below `bins`, or a
+        malformed value is refused with 400. The JVM has no bound on `bins`
+        and fails with 500 when `maxtime` is below `bins`.
       operationId: getPoolHistogram
       parameters:
         - name: bins
           in: query
+          description: Number of bins before the last one.
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 1000
+            default: 10
+        - name: maxtime
+          in: query
+          description: Wait covered by the first `bins` bins, in milliseconds. At least `bins`.
           schema:
             type: integer
             format: int64
             minimum: 1
-            maximum: 50
-            default: 10
+            default: 60000
       responses:
         '200':
-          description: Fee histogram.
+          description: '`bins + 1` bins, shortest wait first.'
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: '#/components/schemas/FeeHistogramBin'
+        '400':
+          description: Parameter out of range or malformed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
 
   # -------------------------------------------------------------------------
   # UTXO
@@ -1088,37 +1124,14 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiError'
 
-  /nipopow/popowHeader/last:
-    get:
-      tags: [nipopow]
-      summary: PoPowHeader for the chain tip.
-      description: 'Compatibility: `full`.'
-      operationId: getPopowHeaderLast
-      responses:
-        '200':
-          description: PoPowHeader.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PoPowHeader'
-        '404':
-          description: Chain is empty (no tip).
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ApiError'
-        '500':
-          description: Internal failure constructing or parsing the header.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ApiError'
-
-  /nipopow/popowHeader/{header_id}:
+  /nipopow/popowHeaderById/{header_id}:
     get:
       tags: [nipopow]
       summary: PoPowHeader for a specific header.
-      description: 'Compatibility: `full`.'
+      description: |
+        Compatibility: `full`, except when the header is in the chain but its
+        PoPowHeader can't be built (its extension missing or unparseable):
+        this node answers 500 there, and the JVM 404.
       operationId: getPopowHeaderById
       parameters:
         - $ref: '#/components/parameters/HeaderIdPath'
@@ -1137,6 +1150,51 @@ paths:
                 $ref: '#/components/schemas/ApiError'
         '404':
           description: Header not in chain.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '500':
+          description: Internal failure constructing or parsing the header.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /nipopow/popowHeaderByHeight/{height}:
+    get:
+      tags: [nipopow]
+      summary: PoPowHeader for the best-chain header at a height.
+      description: |
+        Compatibility: `full`, with two exceptions. A header whose
+        PoPowHeader can't be built answers 500, as on `popowHeaderById`. A
+        malformed height answers 400, where the JVM's route doesn't match
+        and it answers 404.
+      operationId: getPopowHeaderByHeight
+      parameters:
+        - name: height
+          in: path
+          required: true
+          description: Block height. The genesis block is height 1.
+          schema:
+            type: integer
+            format: int32
+            minimum: 0
+      responses:
+        '200':
+          description: PoPowHeader.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PoPowHeader'
+        '400':
+          description: Malformed height.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '404':
+          description: No header at that height (0, or above the chain's tip).
           content:
             application/json:
               schema:
@@ -1902,7 +1960,10 @@ components:
               type: object
               additionalProperties:
                 type: string
-              description: Context-extension map (index → hex-encoded sigma value).
+              description: |
+                Context-extension map (index → hex-encoded sigma value). In a
+                response, the entries come in the order the transaction
+                serializes them (`facts/api.md` § Transaction JSON).
 
     DataInput:
       type: object
@@ -1959,43 +2020,94 @@ components:
           minimum: 0
           description: Output index of the box within its creating transaction.
 
+    UnconfirmedTransaction:
+      type: object
+      description: |
+        A pool transaction, rendered as the JVM's `/transactions/unconfirmed*`
+        endpoints render it (`TransactionsApiRoute.createTransactionWithResolvedInputs`,
+        v6.0.6 :109).
+      required: [id, inputs, dataInputs, outputs, size, cost]
+      properties:
+        id:
+          $ref: '#/components/schemas/HexId32'
+        inputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/UnconfirmedInput'
+        dataInputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/DataInput'
+        outputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/ErgoBox'
+        size:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Length of the serialized transaction the pool holds (`UnconfirmedTx.tx_bytes`), in bytes.
+        cost:
+          type: [integer, 'null']
+          format: int64
+          minimum: 0
+          description: |
+            The cost the transaction's most recent validation measured
+            (`facts/mempool.md` § `UnconfirmedTx`, `validation_cost`). Null
+            when it hasn't been validated since a rollback returned it to the
+            pool.
+
+    UnconfirmedInput:
+      description: |
+        An input, with the box it spends merged in when the node finds that
+        box: in the UTXO set, else among the pool's unconfirmed outputs. A
+        resolved input carries every `ErgoBox` field beside `spendingProof`,
+        and a single `boxId`. An unresolved one carries only `boxId` and
+        `spendingProof`. A node without a UTXO set (digest mode) resolves no
+        input, as the JVM doesn't.
+      allOf:
+        - $ref: '#/components/schemas/Input'
+        - type: object
+          properties:
+            value:
+              type: integer
+              format: int64
+              minimum: 0
+            ergoTree:
+              $ref: '#/components/schemas/HexString'
+            creationHeight:
+              type: integer
+              format: int64
+              minimum: 0
+            assets:
+              type: array
+              items:
+                type: object
+            additionalRegisters:
+              type: object
+            transactionId:
+              $ref: '#/components/schemas/HexId32'
+            index:
+              type: integer
+              format: int64
+              minimum: 0
+
     # ---- Fees ----
-    FeeResponse:
-      type: object
-      required: [fee]
-      properties:
-        fee:
-          type: integer
-          format: int64
-          minimum: 0
-          description: Fee in nanoERG.
-
-    WaitTimeResponse:
-      type: object
-      required: [waitTime]
-      properties:
-        waitTime:
-          type: integer
-          format: int64
-          minimum: 0
-          description: Expected wait in blocks.
-
     FeeHistogramBin:
       type: object
-      required: [minFee, maxFee, count]
+      description: The JVM's `FeeHistogramBin`.
+      required: [nTxns, totalFee]
       properties:
-        minFee:
+        nTxns:
           type: integer
           format: int64
           minimum: 0
-        maxFee:
+          description: Transactions in the bin.
+        totalFee:
           type: integer
           format: int64
           minimum: 0
-        count:
-          type: integer
-          format: int64
-          minimum: 0
+          description: Sum of their fee per factor (fee × 1024 / size, or / cost).
 
     # ---- UTXO snapshots ----
     SnapshotsInfo:

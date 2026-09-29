@@ -235,7 +235,9 @@ internal information (stack traces, component errors) and should be omitted
 in production or restricted to authenticated requests.
 
 All endpoints, including Rust-only ones, return errors via the standard
-`ApiError` shape above. Endpoints that need to expose a programmatic
+`ApiError` shape above. That includes a request refused before any handler
+logic runs: a malformed query string or path segment, or a body that isn't
+valid JSON for the endpoint. Endpoints that need to expose a programmatic
 dispatch key (the cross-validator harness keying off
 `/blocks/{id}/validation-fragments`, the capture endpoints' on/off probe)
 carry a short code string in `reason` and any context in `detail`. See
@@ -296,7 +298,7 @@ bind_address = "127.0.0.1:9055"   # Loopback-only by default
 
 - **Paths** use kebab-case multi-word segments (`validation-fragments`,
   `api-urls`) and lowerCamelCase for JVM-aligned segments (`lastHeaders`,
-  `byTransactionId`, `getSnapshotsInfo`, `popowHeader`). JVM-aligned segments
+  `byTransactionId`, `getSnapshotsInfo`, `popowHeaderById`). JVM-aligned segments
   keep the JVM spelling exactly so existing tooling works; new Rust-only
   paths use kebab-case.
 - **JSON keys** use camelCase. The `serde(rename_all = "camelCase")`
@@ -322,6 +324,17 @@ hit the cap must check the returned length against the requested limit.
 - Block listings: descending by height (newest first).
 - Mempool listings: descending by priority (highest fee weight first).
 - Peer listings: insertion / observation order; not stable across restarts.
+
+### Transaction JSON
+
+Every response that renders a transaction lists each input's
+context-extension entries in the order the transaction serializes them: the
+order its id is computed over. A client that re-serializes the JSON, taking
+the entries in the order given, must get the transaction's id back. JSON
+object keys are otherwise unordered, but this map's order is part of the
+transaction. The rendering must not re-sort it: a `serde_json::Value` object
+built without `preserve_order` sorts its keys as strings, so `"8"` would come
+after `"4"`, and `"10"` before `"2"`.
 
 ### Synced-state semantics
 
