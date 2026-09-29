@@ -17,6 +17,17 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default max re-request attempts before abandoning (JVM: `maxDeliveryChecks`).
 const DEFAULT_MAX_CHECKS: u32 = 100;
 
+/// Whether a request that ends undelivered, by a timeout or by its peer's
+/// disconnect, is forgotten instead of re-sent to another peer.
+///
+/// Only a transaction's. The peer may have dropped it from its mempool, so no
+/// peer is at fault, and a later `Inv` can request it again (JVM
+/// `CheckDelivery`, `ErgoNodeViewSynchronizer` v6.0.6 :1260-1265;
+/// `../facts/sync.md` § "Delivery timeouts").
+fn forgotten_when_undelivered(type_id: u8) -> bool {
+    type_id == TRANSACTION_TYPE_ID
+}
+
 /// Control-plane events from the pipeline.
 /// Rare and critical — losing one is unrecoverable.
 /// Sent via unbounded channel, checked with priority in every select branch.
@@ -173,11 +184,9 @@ impl DeliveryTracker {
     /// Check for timed-out requests and queued re-requests.
     /// Caller handles the actual network sends.
     ///
-    /// A timed-out transaction is forgotten rather than retried: its entry is
-    /// removed and it is reported in [`CheckResult::forgotten`]. The peer may
-    /// have dropped it from its mempool, so no peer is at fault, and a later
-    /// `Inv` can request it again (JVM `CheckDelivery`,
-    /// `ErgoNodeViewSynchronizer` v6.0.6 :1260-1265).
+    /// A timed-out transaction is forgotten rather than retried
+    /// ([`forgotten_when_undelivered`]): its entry is removed and it is
+    /// reported in [`CheckResult::forgotten`].
     pub fn check_timeouts(&mut self) -> CheckResult {
         let mut retries = Vec::new();
         let mut abandoned = Vec::new();
@@ -188,7 +197,7 @@ impl DeliveryTracker {
 
         for (id, req) in &mut self.pending {
             if now.duration_since(req.requested_at) >= self.timeout {
-                if req.type_id == TRANSACTION_TYPE_ID {
+                if forgotten_when_undelivered(req.type_id) {
                     forgotten.push(*id);
                     to_remove.push(*id);
                     continue;
@@ -222,19 +231,22 @@ impl DeliveryTracker {
         }
     }
 
-    /// Remove all pending requests for a peer. Returns their IDs for re-request.
-    pub fn purge_peer(&mut self, peer: PeerId) -> Vec<[u8; 32]> {
-        let orphaned: Vec<[u8; 32]> = self
-            .pending
-            .iter()
-            .filter(|(_, req)| req.peer == peer)
-            .map(|(id, _)| *id)
-            .collect();
-
-        for id in &orphaned {
-            self.pending.remove(id);
-        }
-
+    /// Remove all pending requests for a peer, orphaned by its disconnect.
+    ///
+    /// Returns the ids to re-request from another peer, by modifier type.
+    /// Transactions are not among them: an orphaned transaction request is
+    /// forgotten, as a timed-out one is ([`forgotten_when_undelivered`]).
+    pub fn purge_peer(&mut self, peer: PeerId) -> HashMap<u8, Vec<[u8; 32]>> {
+        let mut orphaned: HashMap<u8, Vec<[u8; 32]>> = HashMap::new();
+        self.pending.retain(|id, req| {
+            if req.peer != peer {
+                return true;
+            }
+            if !forgotten_when_undelivered(req.type_id) {
+                orphaned.entry(req.type_id).or_default().push(*id);
+            }
+            false
+        });
         orphaned
     }
 
@@ -412,8 +424,32 @@ mod tests {
         tracker.mark_requested(&[id(3)], peer(2), 101);
 
         let orphaned = tracker.purge_peer(peer(1));
-        assert_eq!(orphaned.len(), 2);
+        assert_eq!(orphaned[&101].len(), 2);
         assert_eq!(tracker.pending_count(), 1); // peer(2) still there
+    }
+
+    #[test]
+    fn purge_peer_returns_orphans_by_type_and_forgets_transactions() {
+        let mut tracker = DeliveryTracker::new();
+        tracker.mark_requested(&[id(1), id(2)], peer(1), 101);
+        tracker.mark_requested(&[id(3)], peer(1), 102);
+        tracker.mark_requested(&[id(4), id(5)], peer(1), TRANSACTION_TYPE_ID);
+
+        let mut orphaned = tracker.purge_peer(peer(1));
+
+        if let Some(headers) = orphaned.get_mut(&101) {
+            headers.sort_unstable();
+        }
+        assert_eq!(
+            orphaned,
+            HashMap::from([(101, vec![id(1), id(2)]), (102, vec![id(3)])]),
+            "headers and sections come back by type, transactions do not"
+        );
+        assert_eq!(
+            tracker.pending_count(),
+            0,
+            "the transactions are forgotten, not left pending"
+        );
     }
 
     #[test]

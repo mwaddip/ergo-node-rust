@@ -948,11 +948,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                                     return SyncOutcome::SwitchPeer;
                                 }
                                 EventResult::PeerGone => {
-                                    // Re-request any modifiers that were pending from this peer
-                                    let orphaned = self.tracker.purge_peer(peer);
-                                    if !orphaned.is_empty() {
-                                        self.rerequest_from_any(HEADER_TYPE_ID, &orphaned).await;
-                                    }
+                                    self.rerequest_orphans(peer).await;
                                     return SyncOutcome::PeerDisconnected;
                                 }
                             }
@@ -1806,6 +1802,17 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         }
     }
 
+    /// Re-request what a disconnected peer still owed us from another peer,
+    /// one request per modifier type. Transactions are not among them: the
+    /// tracker forgets an orphaned transaction request
+    /// (`../facts/sync.md` § "Delivery timeouts").
+    async fn rerequest_orphans(&mut self, peer: PeerId) {
+        let orphaned = self.tracker.purge_peer(peer);
+        for (modifier_type, ids) in orphaned {
+            self.rerequest_from_any(modifier_type, &ids).await;
+        }
+    }
+
     /// Re-request modifier IDs from any available outbound peer.
     async fn rerequest_from_any(&mut self, modifier_type: u8, ids: &[[u8; 32]]) {
         let peers = self.transport.outbound_peers().await;
@@ -2092,6 +2099,10 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     /// finds sections not yet in the store and not already pending in the tracker,
     /// and requests them. Recomputed each cycle — no persistent queue.
     ///
+    /// The window goes to one peer, the first outbound peer, one request per
+    /// section type (`../facts/sync.md` § "Download cycle"). The JVM spreads a
+    /// window across peers (`requestDownload`); this does not yet.
+    ///
     /// Mirrors JVM's `ToDownloadProcessor.nextModifiersToDownload` with a 192-block
     /// forward window.
     async fn request_next_sections(&mut self) {
@@ -2100,10 +2111,9 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             return;
         }
 
-        let peers = self.transport.outbound_peers().await;
-        if peers.is_empty() {
+        let Some(&peer) = self.transport.outbound_peers().await.first() else {
             return;
-        }
+        };
 
         let window_end =
             std::cmp::min(self.downloaded_height + Self::DOWNLOAD_WINDOW, chain_height);
@@ -2134,26 +2144,16 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             return;
         }
 
-        // Send to all outbound peers — distribute the load
-        let mut sent = 0usize;
-        for (type_id, ids) in &by_type {
-            if ids.is_empty() {
-                continue;
-            }
-            for &peer in &peers {
-                self.request_announced(peer, *type_id, ids.clone()).await;
-            }
-            sent += ids.len();
+        for (type_id, ids) in by_type {
+            self.request_announced(peer, type_id, ids).await;
         }
 
-        if sent > 0 {
-            tracing::debug!(
-                sent,
-                peer_count = peers.len(),
-                window = format!("{}..{}", self.downloaded_height + 1, window_end),
-                "requested block sections"
-            );
-        }
+        tracing::debug!(
+            sent = total,
+            peer = %peer,
+            window = format!("{}..{}", self.downloaded_height + 1, window_end),
+            "requested block sections"
+        );
     }
 
     /// Send our current SyncInfo to a peer, respecting the JVM's PerPeerSyncLockTime.
@@ -4935,12 +4935,15 @@ mod serve_continuation_tests {
 }
 
 #[cfg(test)]
-mod delivery_check_tests {
-    //! What one delivery check sends (`../facts/sync.md` § "Delivery
-    //! timeouts"). A timed-out transaction is forgotten. A timed-out header
-    //! or section is re-requested from another peer, batched into one
-    //! `ModifierRequest` per (target peer, modifier type) of at most 400 ids,
-    //! until the attempt limit abandons it.
+mod request_tests {
+    //! What sync sends when it requests and re-requests modifiers
+    //! (`../facts/sync.md` § "Download cycle" and § "Delivery timeouts"). A
+    //! download window goes to one peer, one request per section type. A
+    //! transaction request that ends undelivered, by a timeout or by its
+    //! peer's disconnect, is forgotten. A header or section is re-requested
+    //! from another peer, batched into one `ModifierRequest` per (target
+    //! peer, modifier type) of at most 400 ids, until the attempt limit
+    //! abandons it.
     //!
     //! History (2026-09-29): the check sent a single-id request per
     //! timed-out modifier to the first outbound peer that had not failed it,
@@ -4959,11 +4962,12 @@ mod delivery_check_tests {
 
     const P1: PeerId = PeerId(1);
     const P2: PeerId = PeerId(2);
+    const P3: PeerId = PeerId(3);
 
     /// Messages recorded by [`RecordingTransport`], shared with the test.
     type SentLog = Arc<Mutex<Vec<(PeerId, ProtocolMessage)>>>;
 
-    type TestSync = HeaderSync<RecordingTransport, UnusedChain, EmptyStore, UnusedValidator>;
+    type TestSync = HeaderSync<RecordingTransport, TestChain, EmptyStore, UnusedValidator>;
 
     /// Transport with a fixed outbound peer set, recording every send.
     struct RecordingTransport {
@@ -4998,7 +5002,7 @@ mod delivery_check_tests {
             false
         }
         async fn get_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> Option<Vec<u8>> {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
         async fn validated_height(&self) -> Option<u32> {
             None
@@ -5010,80 +5014,84 @@ mod delivery_check_tests {
             _horizon: u32,
             _type_ids: &[u8],
         ) -> Result<usize, String> {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
         async fn min_height_present(&self, _type_id: u8) -> Result<Option<u32>, String> {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
     }
 
-    /// Never consulted: neither the check nor the Inv path reads the chain.
-    struct UnusedChain;
+    /// A header chain `tip` blocks long, read only by the download window.
+    struct TestChain {
+        tip: u32,
+    }
 
-    impl SyncChain for UnusedChain {
+    impl SyncChain for TestChain {
         async fn chain_height(&self) -> u32 {
-            unreachable!("not called in delivery check tests")
+            self.tip
         }
         async fn build_sync_info(&self) -> Vec<u8> {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
-        async fn header_at(&self, _height: u32) -> Option<Header> {
-            unreachable!("not called in delivery check tests")
+        async fn header_at(&self, height: u32) -> Option<Header> {
+            (1..=self.tip)
+                .contains(&height)
+                .then(|| test_header(height))
         }
         async fn header_state_root(&self, _height: u32) -> Option<[u8; 33]> {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
         fn parse_sync_info(&self, _body: &[u8]) -> Result<SyncInfo, ChainError> {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
         async fn continuation_ids(
             &self,
             _peer_last_ids: &[BlockId],
             _limit: usize,
         ) -> Vec<[u8; 32]> {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
         async fn active_parameters(&self) -> Parameters {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
         async fn is_epoch_boundary(&self, _height: u32) -> bool {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
         async fn voting_length(&self) -> u32 {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
         async fn compute_expected_parameters(
             &self,
             _epoch_boundary_height: u32,
             _block_proposed_update: &[u8],
         ) -> Result<Parameters, ChainError> {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
         async fn apply_epoch_boundary_parameters(
             &self,
             _params: Parameters,
             _proposed_update_bytes: Vec<u8>,
         ) {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
         async fn active_proposed_update_bytes(&self) -> Vec<u8> {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
         async fn verify_nipopow_envelope(
             &self,
             _envelope_body: &[u8],
         ) -> Result<Vec<Header>, ChainError> {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
         async fn is_better_nipopow(&self, _this: &[u8], _than: &[u8]) -> Result<bool, ChainError> {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
         async fn install_nipopow_suffix(
             &self,
             _suffix_head: Header,
             _suffix_tail: Vec<Header>,
         ) -> Result<(), ChainError> {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
     }
 
@@ -5102,16 +5110,16 @@ mod delivery_check_tests {
             _expected_boundary_params: Option<&Parameters>,
             _expected_proposed_update: Option<&[u8]>,
         ) -> Result<ApplyStateOutcome, ValidationError> {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
         fn validated_height(&self) -> u32 {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
         fn current_digest(&self) -> &ADDigest {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
         fn reset_to(&mut self, _height: u32, _digest: ADDigest) -> Result<(), ValidationError> {
-            unreachable!("not called in delivery check tests")
+            unreachable!("not called in request tests")
         }
         fn state_persistence(&self) -> Option<&dyn StatePersistence> {
             None
@@ -5137,7 +5145,7 @@ mod delivery_check_tests {
                 peers,
                 sent: Arc::clone(&sent),
             },
-            UnusedChain,
+            TestChain { tip: 0 },
             EmptyStore,
             None,
             progress_rx,
@@ -5176,6 +5184,34 @@ mod delivery_check_tests {
     fn sorted(mut ids: Vec<[u8; 32]>) -> Vec<[u8; 32]> {
         ids.sort_unstable();
         ids
+    }
+
+    /// A header whose id encodes its height, so that every height's section
+    /// ids differ.
+    fn test_header(height: u32) -> Header {
+        use ergo_chain_types::*;
+        let mut id = [0u8; 32];
+        id[..4].copy_from_slice(&height.to_le_bytes());
+        Header {
+            version: 2,
+            id: BlockId(Digest32::from(id)),
+            parent_id: BlockId(Digest32::zero()),
+            ad_proofs_root: Digest32::zero(),
+            state_root: ADDigest::zero(),
+            transaction_root: Digest32::zero(),
+            timestamp: 1_000_000 + height as u64,
+            n_bits: 100_000,
+            height,
+            extension_root: Digest32::zero(),
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce: vec![0; 8],
+                pow_distance: None,
+            },
+            votes: Votes([0, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        }
     }
 
     /// Every `ModifierRequest` sent, in send order.
@@ -5370,6 +5406,72 @@ mod delivery_check_tests {
             sync.tracker.pending_count(),
             0,
             "an abandoned request leaves the tracker"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_peers_requests_go_elsewhere_by_type_and_transactions_are_forgotten() {
+        // P1 has disconnected, so the transport no longer lists it.
+        let (mut sync, sent) = build_sync(vec![P2], 100);
+        let headers = ids(0x65, 3);
+        let sections = ids(0x66, 5);
+        let txs = ids(0x02, 60);
+        sync.tracker.mark_requested(&headers, P1, HEADER_TYPE_ID);
+        sync.tracker
+            .mark_requested(&sections, P1, BLOCK_TRANSACTIONS_TYPE_ID);
+        sync.tracker.mark_requested(&txs, P1, TRANSACTION_TYPE_ID);
+
+        sync.rerequest_orphans(P1).await;
+
+        let mut got: Vec<(PeerId, u8, Vec<[u8; 32]>)> = requests(&sent)
+            .into_iter()
+            .map(|(to, t, ids)| (to, t, sorted(ids)))
+            .collect();
+        got.sort_unstable_by_key(|(_, t, _)| *t);
+        assert_eq!(
+            got,
+            vec![
+                (P2, HEADER_TYPE_ID, sorted(headers)),
+                (P2, BLOCK_TRANSACTIONS_TYPE_ID, sorted(sections)),
+            ],
+            "each type is asked for as itself, one request per type, and the \
+             transactions are not asked for at all"
+        );
+        assert!(
+            txs.iter().all(|id| !sync.tracker.is_pending(id)),
+            "an orphaned transaction request is forgotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_download_window_goes_to_the_first_peer_one_request_per_type() {
+        let (mut sync, sent) = build_sync(vec![P1, P2, P3], 100);
+        sync.chain.tip = 3;
+
+        sync.request_next_sections().await;
+
+        let mut window: HashMap<u8, Vec<[u8; 32]>> = HashMap::new();
+        for height in 1..=3 {
+            for (type_id, id) in
+                enr_chain::required_section_ids(&test_header(height), StateType::Utxo)
+            {
+                window.entry(type_id).or_default().push(id);
+            }
+        }
+        let mut got = requests(&sent);
+        got.sort_unstable_by_key(|(_, t, _)| *t);
+        assert_eq!(
+            got,
+            vec![
+                (
+                    P1,
+                    BLOCK_TRANSACTIONS_TYPE_ID,
+                    window[&BLOCK_TRANSACTIONS_TYPE_ID].clone()
+                ),
+                (P1, EXTENSION_TYPE_ID, window[&EXTENSION_TYPE_ID].clone()),
+            ],
+            "the first outbound peer is asked for the whole window, one \
+             request per section type, and no other peer is asked"
         );
     }
 }
