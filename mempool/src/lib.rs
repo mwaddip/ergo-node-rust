@@ -3,6 +3,7 @@ pub mod expiring_cache;
 pub mod family;
 pub mod pool;
 pub mod process;
+pub mod reader;
 pub mod stats;
 pub mod types;
 pub mod weight;
@@ -14,6 +15,7 @@ use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
 use expiring_cache::ExpiringCache;
 use pool::OrderedPool;
+use reader::MempoolReader;
 use stats::FeeStats;
 use types::{MempoolConfig, UnconfirmedTx};
 use weight::TxWeight;
@@ -81,6 +83,12 @@ impl Mempool {
     }
     pub fn tx_ids(&self) -> Vec<[u8; 32]> {
         self.pool.tx_ids()
+    }
+
+    /// A handle for serving pool transactions to peers without this owner's
+    /// lock — see `facts/mempool.md` § Serving reader.
+    pub fn reader(&self) -> MempoolReader {
+        self.pool.reader()
     }
 
     pub fn unconfirmed_box(

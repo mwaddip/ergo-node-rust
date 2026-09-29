@@ -248,7 +248,7 @@ fn revalidate_still_invalidates_genuine_failures() {
     mempool.return_to_pool(vec![UnconfirmedTx {
         cost: tx_bytes.len() as u32,
         tx,
-        tx_bytes,
+        tx_bytes: tx_bytes.into(),
         fee: 0,
         created: now,
         last_checked: now,

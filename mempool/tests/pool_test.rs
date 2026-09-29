@@ -107,7 +107,7 @@ fn make_utx(tx: Transaction, fee: u64) -> UnconfirmedTx {
     let now = Instant::now();
     UnconfirmedTx {
         tx,
-        tx_bytes,
+        tx_bytes: tx_bytes.into(),
         fee,
         cost,
         created: now,
