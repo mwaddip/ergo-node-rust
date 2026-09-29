@@ -1756,11 +1756,11 @@ fn conv_modifier_map(
     let mut out = std::collections::BTreeMap::new();
     for (&k, &v) in m {
         let key = match k {
-            1 => K::Header,
-            2 => K::Transaction,
-            3 => K::BlockTransactions,
-            4 => K::AdProofs,
-            5 => K::Extension,
+            enr_chain::HEADER_TYPE_ID => K::Header,
+            enr_chain::TRANSACTION_TYPE_ID => K::Transaction,
+            enr_chain::BLOCK_TRANSACTIONS_TYPE_ID => K::BlockTransactions,
+            enr_chain::AD_PROOFS_TYPE_ID => K::AdProofs,
+            enr_chain::EXTENSION_TYPE_ID => K::Extension,
             _ => continue,
         };
         out.insert(key, conv_p2p_counter(v));
@@ -4908,6 +4908,37 @@ mod tests {
                 "pct {pct} should be accepted"
             );
         }
+    }
+
+    /// facts/stats.md § Modifier-type keys: the JVM's `NetworkObjectTypeId`
+    /// bytes, pinned as literals. The keys once mapped from 1, 3, 4 and 5, so
+    /// header and section traffic (101, 102, 104, 108) was never counted.
+    #[test]
+    fn stats_modifier_keys_use_the_jvm_type_bytes() {
+        use ergo_api::stats::ModifierTypeKey as K;
+        let counted = |out_count| enr_p2p::protocol::counters::DirectionalCounter {
+            out_count,
+            ..Default::default()
+        };
+        let raw: std::collections::BTreeMap<u8, _> = [
+            (101u8, counted(1)),
+            (2, counted(2)),
+            (102, counted(3)),
+            (104, counted(4)),
+            (108, counted(5)),
+            (1, counted(90)),
+            (3, counted(91)),
+        ]
+        .into_iter()
+        .collect();
+        let keyed = conv_modifier_map(&raw);
+        let out = |k| keyed.get(&k).map(|c| c.out_count);
+        assert_eq!(out(K::Header), Some(1));
+        assert_eq!(out(K::Transaction), Some(2));
+        assert_eq!(out(K::BlockTransactions), Some(3));
+        assert_eq!(out(K::AdProofs), Some(4));
+        assert_eq!(out(K::Extension), Some(5));
+        assert_eq!(keyed.len(), 5, "bytes 1 and 3 are not modifier types");
     }
 
     fn announce_test_header(id_byte: u8, timestamp: u64) -> ergo_chain_types::Header {

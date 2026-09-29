@@ -111,11 +111,15 @@ bind is the security mechanism).
 
 | Key | Modifier byte | Semantic |
 |---|---|---|
-| `header` | 1 | Block header |
+| `header` | 101 | Block header |
 | `transaction` | 2 | Mempool transaction |
-| `block_transactions` | 3 | Block transactions section |
-| `ad_proofs` | 4 | AVL+ authenticated data proofs |
-| `extension` | 5 | Block extension section |
+| `block_transactions` | 102 | Block transactions section |
+| `ad_proofs` | 104 | AVL+ authenticated data proofs |
+| `extension` | 108 | Block extension section |
+
+The bytes are the JVM's `NetworkObjectTypeId` values, the first byte of an
+`Inv`, `ModifierRequest` or `ModifierResponse` body. Any other byte is not
+counted under these keys.
 
 New modifier types defined upstream get new keys in additive minor
 versions.
