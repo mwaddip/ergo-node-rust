@@ -303,7 +303,11 @@ paths:
       tags: [blocks]
       summary: Transactions in a block.
       description: |
-        Compatibility: `full`. Returns `{ headerId, transactions }`.
+        Compatibility: `full`. The block's transactions section as the JVM
+        renders it (`BlockTransactions` JSON, v6.0.6): `headerId`,
+        `transactions`, `blockVersion`, and the section's serialized `size`
+        in bytes. The same object `/blocks/{header_id}` carries as
+        `blockTransactions`.
       operationId: getBlockTransactions
       parameters:
         - $ref: '#/components/parameters/HeaderIdPath'
@@ -313,15 +317,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                required: [headerId, transactions]
-                properties:
-                  headerId:
-                    $ref: '#/components/schemas/HexId32'
-                  transactions:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/Transaction'
+                $ref: '#/components/schemas/BlockTransactionsSection'
         '404':
           description: Header not found or transactions section not stored.
           content:

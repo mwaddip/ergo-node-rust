@@ -239,7 +239,10 @@ in production or restricted to authenticated requests.
 All endpoints, including Rust-only ones, return errors via the standard
 `ApiError` shape above. That includes a request refused before any handler
 logic runs: a malformed query string or path segment, or a body that isn't
-valid JSON for the endpoint. Endpoints that need to expose a programmatic
+valid JSON for the endpoint. It also includes a request no route matches
+(404), a known path asked with a method it doesn't serve (405), and a
+response that fails to serialize (500). HEAD answers keep an empty body.
+Endpoints that need to expose a programmatic
 dispatch key (the cross-validator harness keying off
 `/blocks/{id}/validation-fragments`, the capture endpoints' on/off probe)
 carry a short code string in `reason` and any context in `detail`. See
@@ -382,6 +385,10 @@ uptime as `currentTime - launchTime`.
 - The API crate never mutates chain, state, or store. It has read-only access.
 - The API crate mutates mempool only through `mempool.process()`. No direct
   pool manipulation.
+- A handler that reads the pool holds the mempool lock only to copy out
+  what it needs. The P2P transaction intake waits on the same lock, so
+  UTXO-set reads and serialization happen after the handler releases it.
+  `process()` is the exception: it validates under the lock by design.
 - All box IDs and transaction IDs in responses are hex-encoded (matching JVM).
 - All header IDs in responses are hex-encoded (matching JVM).
 - All ERG amounts are in nanoERG (1 ERG = 10^9 nanoERG).
