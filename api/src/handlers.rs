@@ -1,4 +1,4 @@
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
@@ -12,6 +12,7 @@ use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_mempool::Mempool;
 use sigma_ser::ScorexSerializable;
 
+use crate::extract::{ApiBytes, ApiJson, ApiPath, ApiQuery};
 use crate::types::*;
 use crate::ApiState;
 
@@ -28,7 +29,7 @@ fn err<T>(status: StatusCode, reason: impl Into<String>) -> ApiResult<T> {
 /// Build an `(StatusCode, Json<ApiError>)` tuple ready for `Err(...)`, `ok_or_else`,
 /// or `map_err`. The `error` field mirrors the HTTP status code, matching the JVM
 /// node's `ApiError` shape.
-fn api_error(
+pub(crate) fn api_error(
     status: StatusCode,
     reason: impl Into<String>,
     detail: Option<String>,
@@ -241,7 +242,7 @@ pub async fn get_info(State(state): State<ApiState>) -> Json<NodeInfo> {
 
 pub async fn get_block_ids_at_height(
     State(state): State<ApiState>,
-    Path(height): Path<u32>,
+    ApiPath(height): ApiPath<u32>,
 ) -> ApiResult<Vec<String>> {
     match state.chain.header_at(height) {
         Some(header) => Ok(Json(vec![hex::encode(header.id.0.as_ref())])),
@@ -255,7 +256,7 @@ pub async fn get_block_ids_at_height(
 
 pub async fn get_block_header(
     State(state): State<ApiState>,
-    Path(header_id): Path<String>,
+    ApiPath(header_id): ApiPath<String>,
 ) -> ApiResult<ergo_chain_types::Header> {
     let id = hex_to_id(&header_id)?;
     match state.chain.header_by_id(&id) {
@@ -273,7 +274,7 @@ const BLOCK_TRANSACTIONS_TYPE: u8 = 102;
 
 pub async fn get_block_transactions(
     State(state): State<ApiState>,
-    Path(header_id): Path<String>,
+    ApiPath(header_id): ApiPath<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -334,7 +335,7 @@ pub async fn get_block_transactions(
 
 pub async fn get_last_headers(
     State(state): State<ApiState>,
-    Path(count): Path<u32>,
+    ApiPath(count): ApiPath<u32>,
 ) -> Json<Vec<ergo_chain_types::Header>> {
     let count = count.min(100);
     let height = state.chain.height();
@@ -353,7 +354,7 @@ pub async fn get_last_headers(
 
 pub async fn post_transaction(
     State(state): State<ApiState>,
-    Json(tx): Json<ergo_validation::Transaction>,
+    ApiJson(tx): ApiJson<ergo_validation::Transaction>,
 ) -> ApiResult<String> {
     process_transaction(state, tx, true).await
 }
@@ -364,7 +365,7 @@ pub async fn post_transaction(
 
 pub async fn check_transaction(
     State(state): State<ApiState>,
-    Json(tx): Json<ergo_validation::Transaction>,
+    ApiJson(tx): ApiJson<ergo_validation::Transaction>,
 ) -> ApiResult<String> {
     process_transaction(state, tx, false).await
 }
@@ -628,7 +629,7 @@ async fn render_unconfirmed<T: Send + 'static>(
 
 pub async fn get_unconfirmed(
     State(state): State<ApiState>,
-    Query(params): Query<PaginationParams>,
+    ApiQuery(params): ApiQuery<PaginationParams>,
 ) -> ApiResult<Vec<UnconfirmedTransaction>> {
     let limit = params.limit.min(100);
     let offset = params.offset.min(100_000);
@@ -668,7 +669,7 @@ pub async fn get_unconfirmed_ids(State(state): State<ApiState>) -> Json<Vec<Stri
 
 pub async fn get_unconfirmed_by_id(
     State(state): State<ApiState>,
-    Path(tx_id): Path<String>,
+    ApiPath(tx_id): ApiPath<String>,
 ) -> ApiResult<UnconfirmedTransaction> {
     let id = hex_to_id(&tx_id)?;
     let resolve = resolves_inputs(&state.node_info);
@@ -727,7 +728,7 @@ fn default_wait_minutes() -> i32 {
 
 pub async fn get_recommended_fee(
     State(state): State<ApiState>,
-    Query(params): Query<FeeParams>,
+    ApiQuery(params): ApiQuery<FeeParams>,
 ) -> ApiResult<u64> {
     let wait_minutes = non_negative(params.wait_time, "waitTime")?;
     let tx_size = non_negative(params.tx_size, "txSize")?;
@@ -755,7 +756,7 @@ fn default_wait_fee() -> i64 {
 
 pub async fn get_wait_time(
     State(state): State<ApiState>,
-    Query(params): Query<WaitTimeParams>,
+    ApiQuery(params): ApiQuery<WaitTimeParams>,
 ) -> ApiResult<u64> {
     let fee = non_negative(params.fee, "fee")?;
     let tx_size = match u32::try_from(params.tx_size) {
@@ -788,7 +789,7 @@ fn default_max_wait_ms() -> i64 {
 
 pub async fn get_pool_histogram(
     State(state): State<ApiState>,
-    Query(params): Query<HistogramParams>,
+    ApiQuery(params): ApiQuery<HistogramParams>,
 ) -> ApiResult<Vec<ergo_mempool::stats::FeeHistogramBin>> {
     let bins = match u32::try_from(params.bins) {
         Ok(bins) if (1..=MAX_HISTOGRAM_BINS).contains(&bins) => bins,
@@ -813,7 +814,7 @@ pub async fn get_pool_histogram(
 
 pub async fn get_utxo_by_id(
     State(state): State<ApiState>,
-    Path(box_id): Path<String>,
+    ApiPath(box_id): ApiPath<String>,
 ) -> ApiResult<ergo_validation::ErgoBox> {
     let id = hex_to_id(&box_id)?;
     match state.utxo_reader.box_by_id(&id) {
@@ -828,7 +829,7 @@ pub async fn get_utxo_by_id(
 
 pub async fn get_utxo_with_pool(
     State(state): State<ApiState>,
-    Path(box_id): Path<String>,
+    ApiPath(box_id): ApiPath<String>,
 ) -> ApiResult<ergo_validation::ErgoBox> {
     let id = hex_to_id(&box_id)?;
     // Check confirmed UTXO set first
@@ -913,7 +914,7 @@ fn url_host_matches_addr(url: &str, addr: &std::net::SocketAddr) -> bool {
 pub async fn post_ingest_modifiers(
     axum::extract::ConnectInfo(remote): axum::extract::ConnectInfo<std::net::SocketAddr>,
     State(state): State<ApiState>,
-    body: axum::body::Bytes,
+    ApiBytes(body): ApiBytes,
 ) -> ApiResult<serde_json::Value> {
     // Localhost-only: reject requests from non-loopback addresses
     if !remote.ip().is_loopback() {
@@ -977,7 +978,7 @@ pub async fn post_ingest_modifiers(
 /// unbounded iteration (the loop is O(height)).
 const MAX_EMISSION_HEIGHT: u32 = 2_100_000;
 
-pub async fn get_emission_at(Path(height): Path<u32>) -> ApiResult<EmissionInfo> {
+pub async fn get_emission_at(ApiPath(height): ApiPath<u32>) -> ApiResult<EmissionInfo> {
     use ergo_lib::chain::emission::{EmissionRules, MonetarySettings};
 
     if height > MAX_EMISSION_HEIGHT {
@@ -1012,14 +1013,14 @@ pub async fn get_emission_at(Path(height): Path<u32>) -> ApiResult<EmissionInfo>
 
 pub async fn get_nipopow_proof(
     State(state): State<ApiState>,
-    Path((m, k)): Path<(u32, u32)>,
+    ApiPath((m, k)): ApiPath<(u32, u32)>,
 ) -> ApiResult<serde_json::Value> {
     nipopow_proof_response(Arc::clone(&state.chain), m, k, None).await
 }
 
 pub async fn get_nipopow_proof_by_header(
     State(state): State<ApiState>,
-    Path((m, k, header_id)): Path<(u32, u32, String)>,
+    ApiPath((m, k, header_id)): ApiPath<(u32, u32, String)>,
 ) -> ApiResult<serde_json::Value> {
     let id = hex_to_id(&header_id)?;
     // Surface "unknown header_id" as 404 before kicking off the (potentially
@@ -1185,7 +1186,7 @@ pub struct SolutionSubmission {
 
 pub async fn post_mining_solution(
     State(state): State<ApiState>,
-    Json(submission): Json<SolutionSubmission>,
+    ApiJson(submission): ApiJson<SolutionSubmission>,
 ) -> ApiResult<serde_json::Value> {
     let mining = state.mining.as_ref().ok_or_else(mining_err)?;
 
@@ -1387,7 +1388,7 @@ pub struct WaitQuery {
 
 pub async fn info_wait(
     State(state): State<ApiState>,
-    Query(params): Query<WaitQuery>,
+    ApiQuery(params): ApiQuery<WaitQuery>,
 ) -> Result<Json<crate::types::NodeInfo>, StatusCode> {
     let current = state
         .validated_height
@@ -1519,7 +1520,7 @@ pub struct CaptureDumpQuery {
 /// subsystem to be on, in contrast to `/info`'s probe-friendly 200.
 pub async fn get_capture_dump(
     State(state): State<ApiState>,
-    Query(query): Query<CaptureDumpQuery>,
+    ApiQuery(query): ApiQuery<CaptureDumpQuery>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -1710,7 +1711,7 @@ fn read_proc_memory() -> ProcessMemory {
 
 pub async fn get_blocks(
     State(state): State<ApiState>,
-    Query(params): Query<PaginationParams>,
+    ApiQuery(params): ApiQuery<PaginationParams>,
 ) -> Json<Vec<String>> {
     let limit = params.limit.min(100) as u32;
     let offset = params.offset.min(u32::MAX as usize) as u32;
@@ -1729,7 +1730,7 @@ const HEADER_TYPE: u8 = 101;
 
 pub async fn get_full_block(
     State(state): State<ApiState>,
-    Path(header_id): Path<String>,
+    ApiPath(header_id): ApiPath<String>,
 ) -> ApiResult<FullBlock> {
     let id = hex_to_id(&header_id)?;
     let header = match state.chain.header_by_id(&id) {
@@ -1825,7 +1826,7 @@ pub async fn get_full_block(
 
 pub async fn get_block_modifier(
     State(state): State<ApiState>,
-    Path(modifier_id): Path<String>,
+    ApiPath(modifier_id): ApiPath<String>,
 ) -> ApiResult<BlockModifier> {
     let id = hex_to_id(&modifier_id)?;
     for &type_id in &[
@@ -1945,7 +1946,7 @@ fn hex_to_id_status(hex_str: &str) -> Result<[u8; 32], ()> {
 
 pub async fn post_utxo_with_pool_by_ids(
     State(state): State<ApiState>,
-    Json(ids): Json<Vec<String>>,
+    ApiJson(ids): ApiJson<Vec<String>>,
 ) -> ApiResult<Vec<Option<ergo_validation::ErgoBox>>> {
     if ids.len() > 100 {
         return err(StatusCode::BAD_REQUEST, "max 100 box IDs per request");
@@ -2039,9 +2040,12 @@ pub async fn get_blacklisted_peers(State(state): State<ApiState>) -> Json<PeersB
 pub async fn post_peers_connect(
     State(state): State<ApiState>,
     headers: axum::http::HeaderMap,
-    body: String,
+    ApiBytes(body): ApiBytes,
 ) -> ApiResult<serde_json::Value> {
     check_api_key(&state, &headers)?;
+    let Ok(body) = std::str::from_utf8(&body) else {
+        return err(StatusCode::BAD_REQUEST, "request body is not UTF-8");
+    };
     // Body is a JSON string like "1.2.3.4:9030". Strip surrounding quotes.
     let trimmed = body.trim();
     let addr_str = trimmed
@@ -2071,7 +2075,7 @@ pub async fn post_peers_connect(
 
 pub async fn get_popow_header_by_id(
     State(state): State<ApiState>,
-    Path(header_id): Path<String>,
+    ApiPath(header_id): ApiPath<String>,
 ) -> ApiResult<serde_json::Value> {
     let id = hex_to_id(&header_id)?;
     popow_header_response(&state, id).await
@@ -2137,7 +2141,7 @@ async fn popow_header_response(
 
 pub async fn get_block_validation_fragments(
     State(state): State<ApiState>,
-    Path(header_id): Path<String>,
+    ApiPath(header_id): ApiPath<String>,
 ) -> ApiResult<ValidationFragments> {
     // Echo whatever the client sent (preserving case) when surfacing it in
     // the `detail` field — clients dispatch on `reason`, not on the echo.
@@ -3110,7 +3114,7 @@ mod tests {
         let rt = build_runtime();
         let Json(result) = rt.block_on(get_blocks(
             State(state),
-            Query(PaginationParams {
+            ApiQuery(PaginationParams {
                 offset: 0,
                 limit: 2,
             }),
@@ -3128,7 +3132,7 @@ mod tests {
         let Json(result) = rt.block_on(get_blocks(
             State(state),
             // Request 500, hard cap is 100.
-            Query(PaginationParams {
+            ApiQuery(PaginationParams {
                 offset: 0,
                 limit: 500,
             }),
@@ -3173,7 +3177,7 @@ mod tests {
         let state = test_state(chain);
         let rt = build_runtime();
         let ids: Vec<String> = (0..101).map(|_| "00".repeat(32)).collect();
-        let result = rt.block_on(post_utxo_with_pool_by_ids(State(state), Json(ids)));
+        let result = rt.block_on(post_utxo_with_pool_by_ids(State(state), ApiJson(ids)));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::BAD_REQUEST),
             Ok(_) => panic!("expected 400 for >100 IDs"),
@@ -3190,10 +3194,11 @@ mod tests {
         let state = test_state(chain);
         let rt = build_runtime();
         let ids = vec!["00".repeat(32), "zz".repeat(32), "11".repeat(32)];
-        let Json(results) = match rt.block_on(post_utxo_with_pool_by_ids(State(state), Json(ids))) {
-            Ok(v) => v,
-            Err((status, body)) => panic!("expected 200, got {status} / {}", body.reason),
-        };
+        let Json(results) =
+            match rt.block_on(post_utxo_with_pool_by_ids(State(state), ApiJson(ids))) {
+                Ok(v) => v,
+                Err((status, body)) => panic!("expected 200, got {status} / {}", body.reason),
+            };
         // All three positions present, all null (empty UTXO + empty mempool + bad hex).
         assert_eq!(results.len(), 3);
         assert!(results.iter().all(Option::is_none));
@@ -3283,7 +3288,7 @@ mod tests {
         let result = rt.block_on(post_peers_connect(
             State(state),
             axum::http::HeaderMap::new(),
-            "\"not-an-address\"".into(),
+            ApiBytes("\"not-an-address\"".into()),
         ));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::BAD_REQUEST),
@@ -3309,7 +3314,7 @@ mod tests {
         let result = rt.block_on(post_peers_connect(
             State(state),
             axum::http::HeaderMap::new(),
-            "\"1.2.3.4:9030\"".into(),
+            ApiBytes("\"1.2.3.4:9030\"".into()),
         ));
         assert!(result.is_ok());
         let received = called.lock().unwrap().unwrap();
@@ -3329,7 +3334,7 @@ mod tests {
         let result = rt.block_on(post_peers_connect(
             State(state),
             axum::http::HeaderMap::new(),
-            "\"1.2.3.4:9030\"".into(),
+            ApiBytes("\"1.2.3.4:9030\"".into()),
         ));
         match result {
             Err((status, body)) => {
@@ -3354,7 +3359,7 @@ mod tests {
         let result = rt.block_on(post_peers_connect(
             State(state),
             axum::http::HeaderMap::new(),
-            "\"1.2.3.4:9030\"".into(),
+            ApiBytes("\"1.2.3.4:9030\"".into()),
         ));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::FORBIDDEN),
@@ -3377,7 +3382,7 @@ mod tests {
         let result = rt.block_on(post_peers_connect(
             State(state),
             headers,
-            "\"1.2.3.4:9030\"".into(),
+            ApiBytes("\"1.2.3.4:9030\"".into()),
         ));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::FORBIDDEN),
@@ -3408,7 +3413,7 @@ mod tests {
         let result = rt.block_on(post_peers_connect(
             State(state),
             headers,
-            "\"1.2.3.4:9030\"".into(),
+            ApiBytes("\"1.2.3.4:9030\"".into()),
         ));
         assert!(result.is_ok());
     }
@@ -3422,7 +3427,7 @@ mod tests {
         });
         let state = test_state(chain);
         let rt = build_runtime();
-        let result = rt.block_on(get_block_modifier(State(state), Path("aa".repeat(32))));
+        let result = rt.block_on(get_block_modifier(State(state), ApiPath("aa".repeat(32))));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::NOT_FOUND),
             Ok(_) => panic!("expected 404"),
@@ -3438,7 +3443,7 @@ mod tests {
         });
         let state = test_state(chain);
         let rt = build_runtime();
-        let result = rt.block_on(get_block_modifier(State(state), Path("zzz".into())));
+        let result = rt.block_on(get_block_modifier(State(state), ApiPath("zzz".into())));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::BAD_REQUEST),
             Ok(_) => panic!("expected 400"),
@@ -3454,7 +3459,10 @@ mod tests {
         });
         let state = test_state(chain);
         let rt = build_runtime();
-        let result = rt.block_on(get_popow_header_by_id(State(state), Path("aa".repeat(32))));
+        let result = rt.block_on(get_popow_header_by_id(
+            State(state),
+            ApiPath("aa".repeat(32)),
+        ));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::NOT_FOUND),
             Ok(_) => panic!("expected 404"),
@@ -3486,7 +3494,7 @@ mod tests {
         });
         let state = test_state(chain);
         let rt = build_runtime();
-        let result = rt.block_on(get_full_block(State(state), Path("aa".repeat(32))));
+        let result = rt.block_on(get_full_block(State(state), ApiPath("aa".repeat(32))));
         match result {
             Err((status, _)) => assert_eq!(status, StatusCode::NOT_FOUND),
             Ok(_) => panic!("expected 404"),
@@ -3716,7 +3724,7 @@ mod tests {
         let rt = build_runtime();
         let result = rt.block_on(get_block_validation_fragments(
             State(state),
-            Path(target_id_hex.clone()),
+            ApiPath(target_id_hex.clone()),
         ));
         let Json(body) = match result {
             Ok(v) => v,
@@ -3751,7 +3759,7 @@ mod tests {
         let rt = build_runtime();
         let result = rt.block_on(get_block_validation_fragments(
             State(state),
-            Path("aa".repeat(32)),
+            ApiPath("aa".repeat(32)),
         ));
         match result {
             Err((status, Json(body))) => {
@@ -3798,7 +3806,7 @@ mod tests {
         let rt = build_runtime();
         let result = rt.block_on(get_block_validation_fragments(
             State(state),
-            Path(target_id_hex),
+            ApiPath(target_id_hex),
         ));
         let Json(body) = result.expect("200");
         assert_eq!(
@@ -3989,7 +3997,7 @@ mod tests {
         let state = test_state(chain);
         let rt = build_runtime();
         let status = rt.block_on(async {
-            get_block_transactions(State(state), Path("aa".repeat(32)))
+            get_block_transactions(State(state), ApiPath("aa".repeat(32)))
                 .await
                 .status()
         });
@@ -4126,7 +4134,7 @@ mod tests {
         let rt = build_runtime();
         let response = rt.block_on(get_capture_dump(
             State(state),
-            Query(CaptureDumpQuery::default()),
+            ApiQuery(CaptureDumpQuery::default()),
         ));
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
@@ -4139,7 +4147,7 @@ mod tests {
         let rt = build_runtime();
         let response = rt.block_on(get_capture_dump(
             State(state),
-            Query(CaptureDumpQuery::default()),
+            ApiQuery(CaptureDumpQuery::default()),
         ));
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -4171,7 +4179,7 @@ mod tests {
         let rt = build_runtime();
         let response = rt.block_on(get_capture_dump(
             State(state),
-            Query(CaptureDumpQuery {
+            ApiQuery(CaptureDumpQuery {
                 peer: Some("10.0.0.7".to_string()),
                 since_secs: Some(120),
                 direction: Some("outbound".to_string()),
@@ -4197,7 +4205,7 @@ mod tests {
         let rt = build_runtime();
         let response = rt.block_on(get_capture_dump(
             State(state),
-            Query(CaptureDumpQuery {
+            ApiQuery(CaptureDumpQuery {
                 peer: None,
                 since_secs: None,
                 direction: Some("sideways".to_string()),
@@ -4213,7 +4221,7 @@ mod tests {
         let rt = build_runtime();
         let response = rt.block_on(get_capture_dump(
             State(state),
-            Query(CaptureDumpQuery {
+            ApiQuery(CaptureDumpQuery {
                 peer: Some("not-an-ip".to_string()),
                 since_secs: None,
                 direction: None,
@@ -4399,7 +4407,7 @@ mod tests {
         let rt = build_runtime();
         let result = rt.block_on(post_mining_solution(
             State(state),
-            Json(SolutionSubmission {
+            ApiJson(SolutionSubmission {
                 n: "0000000000000001".into(),
             }),
         ));
@@ -4429,7 +4437,7 @@ mod tests {
         let rt = build_runtime();
         let result = rt.block_on(post_mining_solution(
             State(state),
-            Json(SolutionSubmission {
+            ApiJson(SolutionSubmission {
                 n: "0000000000000001".into(),
             }),
         ));
@@ -4464,7 +4472,7 @@ mod tests {
         let rt = build_runtime();
         let result = rt.block_on(post_mining_solution(
             State(state),
-            Json(SolutionSubmission { n: nonce_hex }),
+            ApiJson(SolutionSubmission { n: nonce_hex }),
         ));
         match result {
             Ok(Json(v)) => assert_eq!(v["status"], "accepted"),
@@ -4481,7 +4489,7 @@ mod tests {
         let state2 = mining_state(make_minimal_header(4), generator2);
         let result2 = rt.block_on(post_mining_solution(
             State(state2),
-            Json(SolutionSubmission {
+            ApiJson(SolutionSubmission {
                 n: "0000000000000001".into(),
             }),
         ));
@@ -4573,7 +4581,7 @@ mod tests {
         let rt = build_runtime();
         let result = rt.block_on(post_mining_solution(
             State(state),
-            Json(SolutionSubmission { n: nonce_hex }),
+            ApiJson(SolutionSubmission { n: nonce_hex }),
         ));
         match result {
             Err((status, body)) => {
@@ -4616,7 +4624,7 @@ mod tests {
         for attempt in 0..2 {
             let result = rt.block_on(post_mining_solution(
                 State(state.clone()),
-                Json(SolutionSubmission {
+                ApiJson(SolutionSubmission {
                     n: nonce_hex.clone(),
                 }),
             ));
@@ -4660,7 +4668,7 @@ mod tests {
         let rt = build_runtime();
         let result = rt.block_on(post_mining_solution(
             State(state),
-            Json(SolutionSubmission { n: nonce_hex }),
+            ApiJson(SolutionSubmission { n: nonce_hex }),
         ));
         match result {
             Err((status, body)) => {
@@ -5204,5 +5212,74 @@ mod tests {
             "ab".repeat(32)
         );
         assert_api_error(&get(empty_state(), &uri), StatusCode::NOT_FOUND, &uri);
+    }
+
+    // -----------------------------------------------------------------------
+    // Refused requests answer the ApiError body (facts/api.md § Error Model)
+    // -----------------------------------------------------------------------
+
+    fn get_request(uri: &str) -> Request<Body> {
+        Request::get(uri).body(Body::empty()).unwrap()
+    }
+
+    fn post_json(uri: &str, body: impl Into<Body>) -> Request<Body> {
+        Request::post(uri)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(body.into())
+            .unwrap()
+    }
+
+    #[test]
+    fn refused_requests_answer_the_api_error_body() {
+        let bad = StatusCode::BAD_REQUEST;
+        let cases = [
+            // Malformed query strings.
+            (get_request("/transactions/getFee?waitTime=abc"), bad),
+            (get_request("/transactions/waitTime?fee=1.5"), bad),
+            (get_request("/transactions/poolHistogram?bins=ten"), bad),
+            (get_request("/transactions/unconfirmed?limit=-1"), bad),
+            (get_request("/blocks?offset=first"), bad),
+            (get_request("/info/wait"), bad),
+            (get_request("/debug/p2p-capture/dump?since_secs=soon"), bad),
+            // Malformed path segments.
+            (get_request("/blocks/at/abc"), bad),
+            (get_request("/blocks/lastHeaders/-1"), bad),
+            (get_request("/emission/at/x"), bad),
+            (get_request("/nipopow/proof/x/1"), bad),
+            (get_request("/nipopow/proof/1/1/zz"), bad),
+            (
+                get_request("/transactions/unconfirmed/byTransactionId/zz"),
+                bad,
+            ),
+            (get_request("/utxo/byId/zz"), bad),
+            (get_request("/blocks/zz"), bad),
+            // Bodies that aren't valid JSON for the endpoint: malformed, and
+            // well-formed but not the shape the endpoint takes.
+            (post_json("/transactions", r#"{"inputs": ["#), bad),
+            (post_json("/transactions/check", "{}"), bad),
+            (post_json("/utxo/withPool/byIds", "[1, 2]"), bad),
+            (post_json("/mining/solution", r#""n""#), bad),
+            (
+                Request::post("/peers/connect")
+                    .body(Body::from(vec![0xFF, 0xFE]))
+                    .unwrap(),
+                bad,
+            ),
+            // The two refusals HTTP names more precisely.
+            (
+                Request::post("/transactions")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                post_json("/transactions", vec![b' '; 2 * 1024 * 1024 + 1]),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ];
+        for (request, status) in cases {
+            let uri = request.uri().to_string();
+            assert_api_error(&serve(empty_state(), request), status, &uri);
+        }
     }
 }

@@ -1,3 +1,4 @@
+mod extract;
 mod handlers;
 pub mod stats;
 pub mod types;
