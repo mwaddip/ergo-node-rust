@@ -1,6 +1,6 @@
 //! P2P node entry point.
 //!
-//! The caller provides a config and an optional modifier sink, then calls
+//! The caller provides a config and a modifier sink, then calls
 //! `P2pNode::start()`. The P2P layer spawns listeners, outbound connections,
 //! and the event loop as background tokio tasks. The returned `P2pNode` is a
 //! handle for observing and controlling state — the caller owns the tokio runtime.
@@ -12,7 +12,6 @@ use crate::protocol::address_sanity::is_bogus_address;
 use crate::protocol::counters::{self, TrafficCounters, TrafficSnapshot};
 use crate::protocol::messages::ProtocolMessage;
 use crate::protocol::peer::ProtocolEvent;
-use crate::routing::latency::LatencyStats;
 use crate::routing::router::{Action, Router};
 use crate::transport::connection::Connection;
 use crate::transport::frame::Frame;
@@ -129,7 +128,7 @@ impl PeerLink {
 
 /// A peer's outbound queue, as held in the `peer_senders` map for everything
 /// that writes to the peer: the event loop, the keepalive, `send_to` and
-/// `broadcast_outbound`. The peer's writer task drains the other end.
+/// `broadcast`. The peer's writer task drains the other end.
 struct PeerSender {
     peer_id: PeerId,
     queue: mpsc::Sender<Frame>,
@@ -345,9 +344,12 @@ impl P2pNode {
     /// - **Precondition**: `config` has at least one listener and one seed peer
     ///   (enforced by `Config::load()`).
     /// - **Postcondition**: Background tasks are spawned and running.
+    /// - Every modifier a peer delivers in a `ModifierResponse` is sent to
+    ///   `modifier_sink`, without waiting: a node that drops the modifiers it
+    ///   receives cannot sync, so the sink is required.
     pub async fn start(
         config: Config,
-        modifier_sink: Option<ModifierSink>,
+        modifier_sink: ModifierSink,
         mode_config: handshake::ModeConfig,
         peer_storage: Box<dyn PeerStorage>,
         capture_tap: Option<Arc<crate::capture::tap::Tap>>,
@@ -570,11 +572,6 @@ impl P2pNode {
         self.router.lock().await.inbound_peers()
     }
 
-    /// Aggregate latency statistics across all tracked peers.
-    pub async fn latency_stats(&self) -> Option<LatencyStats> {
-        self.router.lock().await.latency_stats()
-    }
-
     /// Send a protocol message to a specific peer.
     ///
     /// # Contract
@@ -593,19 +590,19 @@ impl P2pNode {
         sender.enqueue(frame)
     }
 
-    /// Send a protocol message to all connected outbound peers.
+    /// Send a protocol message to every connected peer, inbound and
+    /// outbound: the JVM's `SendToNetwork(msg, Broadcast)`, which it uses to
+    /// announce blocks and transactions. Every connected peer has a queue in
+    /// `peer_senders`, so the broadcast goes to each queue there.
     ///
     /// Never waits: a peer whose queue is full is aborted, as for `send_to`,
     /// and the broadcast goes on to the rest. A peer that is disconnecting
     /// is skipped.
-    pub async fn broadcast_outbound(&self, message: ProtocolMessage) {
-        let outbound = self.router.lock().await.outbound_peers();
+    pub async fn broadcast(&self, message: ProtocolMessage) {
         let frame = message.to_frame();
         let senders = self.peer_senders.lock().expect("peer_senders poisoned");
-        for pid in outbound {
-            if let Some(sender) = senders.get(&pid) {
-                let _ = sender.enqueue(frame.clone());
-            }
+        for sender in senders.values() {
+            let _ = sender.enqueue(frame.clone());
         }
     }
 
@@ -643,17 +640,11 @@ impl P2pNode {
         }
     }
 
-    /// Register a message code as consumed by the caller's event stream.
-    /// Unknown messages with this code will not be forwarded to peers.
-    pub async fn register_consumed_code(&self, code: u8) {
-        self.router.lock().await.register_consumed_code(code);
-    }
-
     /// Install the router's local-serve hook for ModifierRequests: the
-    /// callback answers `(modifier_type, id)` with locally-stored
-    /// modifier bytes, short-circuiting relay for ids we can serve
-    /// ourselves (rust-to-rust sync serving). Misses fall back to the
-    /// legacy relay path. See `facts/p2p-routing.md`.
+    /// callback answers `(modifier_type, id)` with the modifier's bytes
+    /// when the node has it. The hits go back to the requester; a miss
+    /// gets no answer, and no request is ever passed on to another peer.
+    /// See `facts/p2p-routing.md`.
     pub async fn set_local_serve(&self, serve: crate::routing::router::LocalServeFn) {
         self.router.lock().await.set_local_serve(serve);
     }
@@ -781,7 +772,7 @@ async fn event_loop(
     router: Arc<Mutex<Router>>,
     peer_senders: PeerSenders,
     subscriber: Arc<Mutex<Option<mpsc::Sender<ProtocolEvent>>>>,
-    modifier_sink: Option<ModifierSink>,
+    modifier_sink: ModifierSink,
     last_incoming_ms: Arc<AtomicU64>,
 ) {
     loop {
@@ -825,16 +816,15 @@ async fn event_loop(
                             data,
                             peer_id,
                         } => {
-                            if let Some(ref sink) = modifier_sink {
-                                if modifier_type != 101 {
-                                    tracing::debug!(
-                                        modifier_type,
-                                        data_len = data.len(),
-                                        "delivering non-header to pipeline"
-                                    );
-                                }
-                                let _ = sink.try_send((modifier_type, id, data, Some(peer_id.0)));
+                            if modifier_type != 101 {
+                                tracing::debug!(
+                                    modifier_type,
+                                    data_len = data.len(),
+                                    "delivering non-header to pipeline"
+                                );
                             }
+                            let _ =
+                                modifier_sink.try_send((modifier_type, id, data, Some(peer_id.0)));
                         }
                     }
                 }
@@ -1560,7 +1550,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broadcast_outbound_sends_to_all_outbound_peers() {
+    async fn broadcast_reaches_inbound_and_outbound_peers() {
         let TestHarness {
             node,
             router,
@@ -1568,50 +1558,39 @@ mod tests {
             ..
         } = test_node();
 
-        let peer_a = PeerId(1);
-        let peer_b = PeerId(2);
-        let peer_inbound = PeerId(3);
+        let outbound_a = PeerId(1);
+        let outbound_b = PeerId(2);
+        let inbound = PeerId(3);
+        for (peer, direction) in [
+            (outbound_a, Direction::Outbound),
+            (outbound_b, Direction::Outbound),
+            (inbound, Direction::Inbound),
+        ] {
+            router.lock().await.register_peer(
+                peer,
+                direction,
+                ProxyMode::Full,
+                dummy_addr(),
+                None,
+                None,
+            );
+        }
 
-        router.lock().await.register_peer(
-            peer_a,
-            Direction::Outbound,
-            ProxyMode::Full,
-            dummy_addr(),
-            None,
-            None,
-        );
-        router.lock().await.register_peer(
-            peer_b,
-            Direction::Outbound,
-            ProxyMode::Full,
-            dummy_addr(),
-            None,
-            None,
-        );
-        router.lock().await.register_peer(
-            peer_inbound,
-            Direction::Inbound,
-            ProxyMode::Full,
-            dummy_addr(),
-            None,
-            None,
-        );
+        let (mut rx_a, _) = add_queue(&peer_senders, outbound_a);
+        let (mut rx_b, _) = add_queue(&peer_senders, outbound_b);
+        let (mut rx_in, _) = add_queue(&peer_senders, inbound);
 
-        let (mut rx_a, _) = add_queue(&peer_senders, peer_a);
-        let (mut rx_b, _) = add_queue(&peer_senders, peer_b);
-        let (mut rx_in, _) = add_queue(&peer_senders, peer_inbound);
+        node.broadcast(ProtocolMessage::GetPeers).await;
 
-        node.broadcast_outbound(ProtocolMessage::GetPeers).await;
-
-        // Outbound peers should receive the message
-        assert!(rx_a.try_recv().is_ok());
-        assert!(rx_b.try_recv().is_ok());
-        // Inbound peer should NOT
-        assert!(rx_in.try_recv().is_err());
+        // Every connected peer gets one copy, whichever side dialed.
+        for rx in [&mut rx_a, &mut rx_b, &mut rx_in] {
+            assert_eq!(rx.try_recv().unwrap().code, MessageCode::GET_PEERS);
+            assert!(rx.try_recv().is_err(), "exactly one copy");
+        }
     }
 
     #[tokio::test]
-    async fn broadcast_outbound_aborts_a_full_peer_and_goes_on() {
+    async fn broadcast_aborts_a_full_peer_and_goes_on() {
         let TestHarness {
             node,
             router,
@@ -1621,23 +1600,19 @@ mod tests {
 
         let peer_ok = PeerId(1);
         let peer_full = PeerId(2);
-
-        router.lock().await.register_peer(
-            peer_ok,
-            Direction::Outbound,
-            ProxyMode::Full,
-            dummy_addr(),
-            None,
-            None,
-        );
-        router.lock().await.register_peer(
-            peer_full,
-            Direction::Outbound,
-            ProxyMode::Full,
-            dummy_addr(),
-            None,
-            None,
-        );
+        for (peer, direction) in [
+            (peer_ok, Direction::Outbound),
+            (peer_full, Direction::Inbound),
+        ] {
+            router.lock().await.register_peer(
+                peer,
+                direction,
+                ProxyMode::Full,
+                dummy_addr(),
+                None,
+                None,
+            );
+        }
 
         let (mut rx_ok, ok_link) = add_queue(&peer_senders, peer_ok);
         // The full peer's writer never takes a frame.
@@ -1650,10 +1625,10 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            node.broadcast_outbound(ProtocolMessage::GetPeers),
+            node.broadcast(ProtocolMessage::GetPeers),
         )
         .await
-        .expect("broadcast_outbound never waits for queue space");
+        .expect("broadcast never waits for queue space");
 
         assert_eq!(
             full_link.reason.get(),
@@ -1724,8 +1699,9 @@ mod tests {
         let ps = peer_senders.clone();
         let sub = subscriber.clone();
         let last = last_incoming_ms.clone();
+        let (modifier_sink, _modifiers) = mpsc::channel::<ModifierDelivery>(16);
         let handle = tokio::spawn(async move {
-            event_loop(event_rx, r, ps, sub, None, last).await;
+            event_loop(event_rx, r, ps, sub, modifier_sink, last).await;
         });
 
         // Register a peer so the router doesn't choke
@@ -1821,8 +1797,9 @@ mod tests {
         let ps = peer_senders.clone();
         let sub = subscriber.clone();
         let last = last_incoming_ms.clone();
+        let (modifier_sink, _modifiers) = mpsc::channel::<ModifierDelivery>(16);
         let handle = tokio::spawn(async move {
-            event_loop(event_rx, r, ps, sub, None, last).await;
+            event_loop(event_rx, r, ps, sub, modifier_sink, last).await;
         });
 
         router.lock().await.register_peer(
@@ -2119,18 +2096,24 @@ mod tests {
     }
 
     /// Run the event loop over the harness state, fed through the returned
-    /// sender.
-    fn spawn_event_loop(h: &TestHarness) -> mpsc::Sender<ProtocolEvent> {
+    /// sender. The receiver gets what the loop delivers to the modifier sink.
+    fn spawn_event_loop(
+        h: &TestHarness,
+    ) -> (
+        mpsc::Sender<ProtocolEvent>,
+        mpsc::Receiver<ModifierDelivery>,
+    ) {
         let (event_tx, event_rx) = mpsc::channel::<ProtocolEvent>(16);
+        let (modifier_sink, modifiers) = mpsc::channel::<ModifierDelivery>(16);
         tokio::spawn(event_loop(
             event_rx,
             h.router.clone(),
             h.peer_senders.clone(),
             h.node.subscriber.clone(),
-            None,
+            modifier_sink,
             h.node.last_incoming_ms.clone(),
         ));
-        event_tx
+        (event_tx, modifiers)
     }
 
     fn message(peer_id: PeerId, message: ProtocolMessage) -> ProtocolEvent {
@@ -2146,7 +2129,7 @@ mod tests {
         // The stuck peer's writer never takes a frame.
         let (stuck_rx, stuck_link) = add_queue(&h.peer_senders, stuck);
         let (mut healthy_rx, _) = add_queue(&h.peer_senders, healthy);
-        let event_tx = spawn_event_loop(&h);
+        let (event_tx, _modifiers) = spawn_event_loop(&h);
 
         tokio::time::timeout(Duration::from_secs(5), async {
             // Each GetPeers from the stuck peer queues a Peers reply to it:
@@ -2189,7 +2172,7 @@ mod tests {
             .set_local_serve(Arc::new(|_, _| Some(vec![0u8; MAX_QUEUED_BYTES / 2])));
         let (stuck_rx, stuck_link) = add_queue(&h.peer_senders, stuck);
         let (mut healthy_rx, _) = add_queue(&h.peer_senders, healthy);
-        let event_tx = spawn_event_loop(&h);
+        let (event_tx, _modifiers) = spawn_event_loop(&h);
 
         tokio::time::timeout(Duration::from_secs(5), async {
             // Two responses to the stuck peer, which together exceed the
@@ -2217,6 +2200,47 @@ mod tests {
         // One response queued: the byte bound refused the second, not the
         // frame bound.
         assert_eq!(stuck_rx.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn event_loop_delivers_received_modifiers_to_the_sink() {
+        let h = test_node();
+        let (source, other) = (PeerId(1), PeerId(2));
+        register_outbound(&h.router, source).await;
+        register_outbound(&h.router, other).await;
+        let (mut source_rx, _) = add_queue(&h.peer_senders, source);
+        let (mut other_rx, _) = add_queue(&h.peer_senders, other);
+        let (event_tx, mut modifiers) = spawn_event_loop(&h);
+
+        let response = ProtocolMessage::ModifierResponse {
+            modifier_type: 102,
+            modifiers: vec![([7u8; 32], vec![1, 2, 3]), ([8u8; 32], vec![4, 5])],
+        };
+        event_tx.send(message(source, response)).await.unwrap();
+        for expected in [
+            (102, [7u8; 32], vec![1, 2, 3], Some(source.0)),
+            (102, [8u8; 32], vec![4, 5], Some(source.0)),
+        ] {
+            let delivered = tokio::time::timeout(Duration::from_secs(5), modifiers.recv())
+                .await
+                .expect("a delivery within 5 s")
+                .expect("sink open");
+            assert_eq!(delivered, expected);
+        }
+
+        // Validation is the only destination. Events are handled in order,
+        // so the reply to this later GetPeers is the first frame `other`
+        // gets unless the response sent it something.
+        event_tx
+            .send(message(other, ProtocolMessage::GetPeers))
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(5), other_rx.recv())
+            .await
+            .expect("a reply within 5 s")
+            .unwrap();
+        assert_eq!(reply.code, MessageCode::PEERS);
+        assert!(source_rx.try_recv().is_err(), "nothing sent back");
     }
 
     /// Our side's handshake settings.

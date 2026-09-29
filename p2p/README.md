@@ -8,13 +8,13 @@ Handles everything between "TCP socket" and "typed protocol message":
 
 - **Transport** -- TCP connections (inbound + outbound, IPv4 + IPv6), Ergo P2P handshake with Scorex VLQ serialization, message framing with blake2b checksums
 - **Protocol** -- Message parsing into typed variants (Inv, ModifierRequest, ModifierResponse, SyncInfo, etc.), peer lifecycle state machine
-- **Routing** -- Inv table, request tracking, sync pairing, message forwarding between inbound and outbound peers
+- **Routing** -- Replies to the peer that sent each message (`GetPeers`, locally served modifier requests), records gossiped peers, and hands received modifiers to validation. It never forwards a message from one peer to another.
 
-The crate exposes `P2pNode` as its public API. Callers start it with a config, then use `send_to()` / `broadcast_outbound()` to send messages, and `subscribe()` to observe protocol events. The node runs as background tokio tasks.
+The crate exposes `P2pNode` as its public API. Callers start it with a config and a modifier sink, then use `send_to()` / `broadcast()` to send messages, and `subscribe()` to observe protocol events. The node runs as background tokio tasks.
 
 ## Role in ergo-node-rust
 
-This is the network boundary. Every byte from a peer is untrusted until validated. The P2P layer doesn't interpret block content or validate chain state -- it routes messages and lets higher layers (chain validation, sync state machine) decide what to do with them.
+This is the network boundary. Every byte from a peer is untrusted until validated. The P2P layer doesn't interpret block content or validate chain state -- it answers what it can and hands everything else to higher layers (chain validation, sync state machine, mempool) through the event subscriber and the modifier sink. The node is a peer, not a proxy: nothing one peer sends is passed on to another.
 
 ```
                       ergo-node-rust (main crate)
@@ -25,26 +25,24 @@ This is the network boundary. Every byte from a peer is untrusted until validate
          (this crate)   (validation)   (UTXO/storage)
 ```
 
-Started as a message-forwarding proxy (`ergo-proxy-node`). Now gradually gaining awareness of what it forwards as validation components come online. The proxy behavior is the fallback: if we can't validate it, forward it and let someone else decide.
-
 ## Architecture
 
-Three layers, each with a documented [Design by Contract](facts/) boundary:
+Three layers, each with a documented [Design by Contract](../facts/) boundary:
 
 ```
-Routing    -- Inv table, request tracking, mode filtering, forwarding decisions
+Routing    -- Replies to the sender, light-listener filtering, validation hand-off, peer registry
 Protocol   -- Message parsing, peer lifecycle state machine
 Transport  -- TCP streams, frame encoding, handshake, checksum verification
 ```
 
-Messages flow up from transport (raw frames) through protocol (typed messages) to routing (forwarding decisions), and back down as outgoing frames.
+Messages flow up from transport (raw frames) through protocol (typed messages) to routing. Before the router sees an event, the subscriber gets a copy (a `ModifierResponse`'s modifiers go to the modifier sink instead). The router's replies go back down as frames, to the peer that sent the message.
 
-### Proxy modes
+### Listener modes
 
-Each listener can operate in one of two modes:
+Each listener runs in one of two modes, set by its `mode` key (the `ProxyMode` type):
 
-- **Full** -- forwards everything: Inv, modifiers, SyncInfo, peer exchange. Advertises as a full archival node.
-- **Light** -- gossip only: Inv relay, transaction broadcast, peer exchange. Advertises as a NiPoPoW-bootstrapped node.
+- **Full** -- advertises as a full archival node. Every modifier request goes to the local-serve hook.
+- **Light** -- advertises as a NiPoPoW-bootstrapped node. Requests for block sections (header, block transactions, AD proofs, extension) get nothing; transaction requests and peer exchange work as in full mode.
 
 ## Protocol notes
 
@@ -67,7 +65,7 @@ cargo test
 
 ## Configuration
 
-See `ergo-proxy.toml` for an example config. The `[network]` section is optional -- all fields default to values matching the JVM reference node (v6.0.3).
+The crate reads its sections of the node's config: `[proxy]`, `[listen.ipv4]` / `[listen.ipv6]`, `[outbound]` and `[identity]`, plus the optional `[network]` and `[upnp]`. The main repo's `deploy/defaults/mainnet.toml` has an example. The `[network]` section is optional -- all fields default to values matching the JVM reference node (v6.0.3).
 
 ## License
 

@@ -1,15 +1,20 @@
+//! Multi-message router scenarios (`facts/p2p-routing.md`): whatever peers
+//! announce, request and deliver, nothing one peer sends is passed on to
+//! another.
+
 use enr_p2p::protocol::messages::ProtocolMessage;
 use enr_p2p::protocol::peer::ProtocolEvent;
 use enr_p2p::routing::router::{Action, Router};
 use enr_p2p::types::{Direction, Network, PeerId, ProxyMode};
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 fn dummy_addr() -> SocketAddr {
     "127.0.0.1:9000".parse().unwrap()
 }
 
 #[test]
-fn full_tx_relay_scenario() {
+fn tx_announce_request_deliver_scenario() {
     let mut router = Router::new(Network::Mainnet);
     let outbound = PeerId(1);
     let inbound = PeerId(2);
@@ -32,9 +37,8 @@ fn full_tx_relay_scenario() {
 
     let tx_id = [0x42; 32];
 
-    // Outbound announces tx — full-node semantics: router records the
-    // (id, peer) entry in its inv_table but does NOT re-broadcast the
-    // announcement. Peers are expected to talk to each other directly.
+    // Outbound announces the tx. The mempool task reads the Inv from the
+    // subscriber; the router does nothing with it.
     let actions = router.handle_event(ProtocolEvent::Message {
         peer_id: outbound,
         message: ProtocolMessage::Inv {
@@ -44,8 +48,8 @@ fn full_tx_relay_scenario() {
     });
     assert!(actions.is_empty(), "Inv must not be relayed to other peers");
 
-    // A request for the same tx from the inbound side still resolves via
-    // the inv_table to the source peer — the record path stays intact.
+    // The inbound peer asks us for it. We don't have it, so it gets no
+    // answer, and the request is not passed to the announcer.
     let actions = router.handle_event(ProtocolEvent::Message {
         peer_id: inbound,
         message: ProtocolMessage::ModifierRequest {
@@ -53,23 +57,45 @@ fn full_tx_relay_scenario() {
             ids: vec![tx_id],
         },
     });
-    assert_eq!(actions.len(), 1);
-    assert!(matches!(&actions[0], Action::Send { target, .. } if *target == outbound));
+    assert!(actions.is_empty(), "{actions:?}");
 
-    // Outbound delivers — ModifierResponse still fans Validate + the
-    // forwarded copy to the original requester (tracked by request_tracker).
+    // Outbound delivers it (to our own request): validation only, and no
+    // copy for the inbound peer.
+    let tx_bytes = vec![0xde, 0xad, 0xbe, 0xef];
     let actions = router.handle_event(ProtocolEvent::Message {
         peer_id: outbound,
         message: ProtocolMessage::ModifierResponse {
             modifier_type: 2,
-            modifiers: vec![(tx_id, vec![0xde, 0xad, 0xbe, 0xef])],
+            modifiers: vec![(tx_id, tx_bytes.clone())],
         },
     });
-    assert_eq!(actions.len(), 2); // Validate + Send
-    assert!(actions.iter().any(|a| matches!(a, Action::Validate { .. })));
-    assert!(actions
-        .iter()
-        .any(|a| matches!(a, Action::Send { target, .. } if *target == inbound)));
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::Validate { id, peer_id, .. }] if *id == tx_id && *peer_id == outbound
+    ));
+
+    // Once the node has the tx, the hook serves it, to the requester only.
+    let served = tx_bytes.clone();
+    router.set_local_serve(Arc::new(move |_, id| {
+        (*id == tx_id).then(|| served.clone())
+    }));
+    let actions = router.handle_event(ProtocolEvent::Message {
+        peer_id: inbound,
+        message: ProtocolMessage::ModifierRequest {
+            modifier_type: 2,
+            ids: vec![tx_id],
+        },
+    });
+    match actions.as_slice() {
+        [Action::Send {
+            target,
+            message: ProtocolMessage::ModifierResponse { modifiers, .. },
+        }] => {
+            assert_eq!(*target, inbound);
+            assert_eq!(modifiers.as_slice(), &[(tx_id, tx_bytes)]);
+        }
+        other => panic!("expected one response to the requester, got {other:?}"),
+    }
 }
 
 #[test]
@@ -117,9 +143,10 @@ fn disconnect_cleanup_scenario() {
         peer_id: out1,
         reason: "gone".into(),
     });
+    assert_eq!(router.outbound_peers(), vec![out2]);
 
-    // Inv entry for out1 was purged on disconnect. With fallback routing,
-    // the request goes to out2 (the remaining outbound peer).
+    // The announcer is gone, and the remaining outbound peer is not asked
+    // on the requester's behalf either.
     let actions = router.handle_event(ProtocolEvent::Message {
         peer_id: inb,
         message: ProtocolMessage::ModifierRequest {
@@ -127,18 +154,14 @@ fn disconnect_cleanup_scenario() {
             ids: vec![tx_id],
         },
     });
-    assert_eq!(actions.len(), 1);
-    assert!(matches!(&actions[0], Action::Send { target, .. } if *target == out2));
+    assert!(actions.is_empty(), "{actions:?}");
 }
 
 #[test]
 fn inv_does_not_fanout() {
-    // Full-node semantics: receiving an Inv updates the router's inv_table
-    // so that subsequent ModifierRequests can be routed to the announcing
-    // peer, but the Inv itself is NOT relayed to any other peer. Relaying
-    // was leftover from the transparent-proxy origin of this crate and
-    // is protocol-incorrect for a full node (peers announce to each other
-    // directly, and relayed Invs can exceed the 400-modifier cap).
+    // Peers announce to each other directly. A relayed Inv is also
+    // protocol-incorrect for a full node: relayed batches can exceed the
+    // 400-modifier cap.
     let mut router = Router::new(Network::Mainnet);
     let outbound = PeerId(1);
     router.register_peer(
@@ -172,8 +195,8 @@ fn inv_does_not_fanout() {
 
     assert!(actions.is_empty(), "Inv must not fanout to other peers");
 
-    // Inv was recorded — an inbound ModifierRequest for this tx still
-    // routes to the announcing outbound peer via the inv_table lookup.
+    // Nor does the announcement make the announcer a target: an inbound
+    // request for the tx is not sent to it.
     let actions = router.handle_event(ProtocolEvent::Message {
         peer_id: PeerId(2),
         message: ProtocolMessage::ModifierRequest {
@@ -181,8 +204,7 @@ fn inv_does_not_fanout() {
             ids: vec![tx_id],
         },
     });
-    assert_eq!(actions.len(), 1);
-    assert!(matches!(&actions[0], Action::Send { target, .. } if *target == outbound));
+    assert!(actions.is_empty(), "{actions:?}");
 }
 
 #[test]
@@ -215,7 +237,7 @@ fn light_mode_blocks_sync() {
 }
 
 #[test]
-fn full_mode_sync_flow() {
+fn full_mode_sync_exchange_is_never_paired() {
     let mut router = Router::new(Network::Mainnet);
     router.register_peer(
         PeerId(1),
@@ -234,14 +256,15 @@ fn full_mode_sync_flow() {
         None,
     );
 
+    // The inbound peer's SyncInfo is not sent to the outbound peer, and the
+    // outbound peer's is not sent back: sync answers each peer itself.
     let actions = router.handle_event(ProtocolEvent::Message {
         peer_id: PeerId(2),
         message: ProtocolMessage::SyncInfo {
             body: vec![1, 2, 3],
         },
     });
-    assert_eq!(actions.len(), 1);
-    assert!(matches!(&actions[0], Action::Send { target, .. } if *target == PeerId(1)));
+    assert!(actions.is_empty(), "{actions:?}");
 
     let actions = router.handle_event(ProtocolEvent::Message {
         peer_id: PeerId(1),
@@ -249,6 +272,5 @@ fn full_mode_sync_flow() {
             body: vec![4, 5, 6],
         },
     });
-    assert_eq!(actions.len(), 1);
-    assert!(matches!(&actions[0], Action::Send { target, .. } if *target == PeerId(2)));
+    assert!(actions.is_empty(), "{actions:?}");
 }
