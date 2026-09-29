@@ -693,9 +693,8 @@ pub async fn get_unconfirmed(
 // ---------------------------------------------------------------------------
 
 pub async fn get_unconfirmed_ids(State(state): State<ApiState>) -> Json<Vec<String>> {
-    let pool = state.mempool.lock().await;
-    let ids: Vec<String> = pool.tx_ids().into_iter().map(hex::encode).collect();
-    Json(ids)
+    let ids = state.mempool.lock().await.tx_ids();
+    Json(ids.into_iter().map(hex::encode).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1986,26 +1985,30 @@ pub async fn post_utxo_with_pool_by_ids(
     if ids.len() > 100 {
         return err(StatusCode::BAD_REQUEST, "max 100 box IDs per request");
     }
-    // Parse and lookup. Malformed IDs are treated as "not found" (return null),
-    // not as a 400 — the contract is positional, and rejecting the whole batch
-    // for one bad ID would be operationally hostile.
-    let mut results: Vec<Option<ergo_validation::ErgoBox>> = Vec::with_capacity(ids.len());
-    let pool = state.mempool.lock().await;
-    for hex_id in &ids {
-        let parsed = hex::decode(hex_id)
-            .ok()
-            .and_then(|b| <[u8; 32]>::try_from(b).ok());
-        match parsed {
-            Some(id) => {
-                let found = state
-                    .utxo_reader
-                    .box_by_id(&id)
-                    .or_else(|| pool.unconfirmed_box(&id).cloned());
-                results.push(found);
-            }
-            None => results.push(None),
-        }
-    }
+    // Malformed IDs are treated as "not found" (return null), not as a 400 —
+    // the contract is positional, and rejecting the whole batch for one bad
+    // ID would be operationally hostile.
+    let ids: Vec<Option<[u8; 32]>> = ids
+        .iter()
+        .map(|hex_id| hex::decode(hex_id).ok().and_then(|b| b.try_into().ok()))
+        .collect();
+    // The P2P intake waits on the mempool lock, so the pool's outputs among
+    // the ids are copied out under it and the UTXO set is read after.
+    let pool_outputs: Vec<Option<ergo_validation::ErgoBox>> = {
+        let pool = state.mempool.lock().await;
+        ids.iter()
+            .map(|id| id.and_then(|id| pool.unconfirmed_box(&id).cloned()))
+            .collect()
+    };
+    // The UTXO set first, then the pool, as `/utxo/withPool/byId` looks.
+    let results = ids
+        .iter()
+        .zip(pool_outputs)
+        .map(|(id, pool_output)| {
+            id.and_then(|id| state.utxo_reader.box_by_id(&id))
+                .or(pool_output)
+        })
+        .collect();
     Ok(Json(results))
 }
 
@@ -5547,5 +5550,80 @@ mod tests {
             assert_eq!(served.status, status, "HEAD {uri}");
             assert_eq!(served.body, "", "HEAD {uri}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // POST /utxo/withPool/byIds: the mempool lock (facts/api.md § Invariants)
+    // -----------------------------------------------------------------------
+
+    /// A UTXO set of `boxes`, keyed as given, that records at each read
+    /// whether the mempool lock was free.
+    struct LockProbeUtxo {
+        mempool: Arc<tokio::sync::Mutex<Mempool>>,
+        boxes: HashMap<[u8; 32], ergo_validation::ErgoBox>,
+        lock_free_at_read: std::sync::Mutex<Vec<bool>>,
+    }
+
+    impl UtxoAccess for LockProbeUtxo {
+        fn box_by_id(&self, id: &[u8; 32]) -> Option<ergo_validation::ErgoBox> {
+            let free = self.mempool.try_lock().is_ok();
+            self.lock_free_at_read.lock().unwrap().push(free);
+            self.boxes.get(id).cloned()
+        }
+        fn cache_bytes_used(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    #[test]
+    fn utxo_with_pool_by_ids_reads_the_utxo_set_after_releasing_the_pool() {
+        let confirmed = make_vf_p2pk_box(1_000_000);
+        let parent = make_vf_p2pk_tx(&make_vf_p2pk_box(2_000_000));
+        let shadowed = make_vf_p2pk_tx(&make_vf_p2pk_box(3_000_000));
+        let pool_output = parent.outputs.first().box_id();
+        let shadowed_output = shadowed.outputs.first().box_id();
+
+        let mut state = empty_state();
+        add_to_pool(
+            &state,
+            vec![
+                pool_entry(&parent, 1_000_000, None, Instant::now()),
+                pool_entry(&shadowed, 1_000_000, None, Instant::now()),
+            ],
+        );
+        // Under `shadowed`'s output id the UTXO set holds `confirmed`, whose
+        // 1,000,000 against the pool's 900,000 shows which one answered.
+        let probe = Arc::new(LockProbeUtxo {
+            mempool: Arc::clone(&state.mempool),
+            boxes: HashMap::from([
+                (box_id_bytes(confirmed.box_id()), confirmed.clone()),
+                (box_id_bytes(shadowed_output), confirmed.clone()),
+            ]),
+            lock_free_at_read: Default::default(),
+        });
+        state.utxo_reader = probe.clone();
+
+        let ids = [
+            hex::encode(box_id_bytes(confirmed.box_id())),
+            hex::encode(box_id_bytes(pool_output)),
+            hex::encode(box_id_bytes(shadowed_output)),
+            "ee".repeat(32),
+            "zz".to_string(),
+        ];
+        let uri = "/utxo/withPool/byIds";
+        let served = serve(state, post_json(uri, serde_json::to_string(&ids).unwrap()));
+        assert_json_ok(&served, uri);
+        let boxes: serde_json::Value = serde_json::from_str(&served.body).unwrap();
+        assert_eq!(boxes.as_array().map(Vec::len), Some(5));
+        assert_eq!(boxes[0]["boxId"], serde_json::json!(ids[0]));
+        assert_eq!(boxes[0]["value"], serde_json::json!(1_000_000));
+        assert_eq!(boxes[1]["boxId"], serde_json::json!(ids[1]));
+        assert_eq!(boxes[1]["value"], serde_json::json!(900_000));
+        assert_eq!(boxes[2]["value"], serde_json::json!(1_000_000));
+        assert_eq!(boxes[3], serde_json::Value::Null);
+        assert_eq!(boxes[4], serde_json::Value::Null);
+
+        // One read per well-formed id, each with the lock free.
+        assert_eq!(*probe.lock_free_at_read.lock().unwrap(), [true; 4]);
     }
 }
