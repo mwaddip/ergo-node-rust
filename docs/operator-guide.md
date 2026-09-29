@@ -243,8 +243,8 @@ curl -s localhost:9053/blocks/<header_id> | jq
 ### Check the fee curve
 
 ```sh
-# What fee should I pay for a tx of <bytes> bytes to confirm soon?
-curl -s "localhost:9053/transactions/getFee?bytes=<bytes>&waitTime=<seconds>"
+# What fee (nanoERG) should a tx of <bytes> bytes pay to confirm within <minutes>?
+curl -s "localhost:9053/transactions/getFee?txSize=<bytes>&waitTime=<minutes>"
 ```
 
 ### Pull a mining candidate
