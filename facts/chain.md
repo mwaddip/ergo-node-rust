@@ -495,6 +495,19 @@ All three are pure and exported from the crate root. `fastsync` is outside
 the workspace and doesn't depend on this crate. Its section writer keeps a
 copy of the write rule, with a comment pointing here.
 
+**Block version 5 and later don't exist yet**, and these functions return 3
+for them.
+- **What the JVM does there:** it would read and write such a block at
+  `(bv − 1, bv − 1)`, which is (4, 4) at bv 5. The pinned fork's highest
+  version is 3.
+- **Where 3 and 4 part:** every sigmastate 6.0.6 gate is `≥ 2` or `≥ 3`, so the
+  two agree everywhere except one place. `VersionContext` requires
+  `ergoTreeVersion ≤ activatedVersion` from activated version 2, and
+  `ErgoTreeSerializer.deserializeErgoTree` checks it for each box tree. A
+  version-4 box tree in a v5 block passes at (4, 4) and throws at (3, 3).
+- **What a v5 soft-fork needs:** the fork gains version 4, and these functions
+  and their tests move with it.
+
 - **The version is the one the section encodes**, not the header's. The two
   agree on every block a miner builds. The section id does not commit to the
   encoding, and the JVM keys off the section's too.
