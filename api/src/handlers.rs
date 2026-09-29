@@ -375,17 +375,6 @@ async fn process_transaction(
     tx: ergo_validation::Transaction,
     add_to_pool: bool,
 ) -> ApiResult<String> {
-    let ctx_guard = state.state_context.read().await;
-    let ctx = match ctx_guard.as_ref() {
-        Some(c) => c,
-        None => {
-            return err(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "node is syncing, cannot validate transactions yet",
-            )
-        }
-    };
-
     // Compute tx_id hex string
     let tx_id_hex = String::from(tx.id());
 
@@ -396,6 +385,31 @@ async fn process_transaction(
             return err(
                 StatusCode::BAD_REQUEST,
                 format!("transaction serialization failed: {e}"),
+            )
+        }
+    };
+
+    // The JVM refuses a transaction over `maxTransactionSize` before it
+    // verifies anything, so while the node is syncing too (facts/api.md
+    // § Transaction Submission Flow, step 2a).
+    if tx_bytes.len() > ergo_mempool::MAX_TRANSACTION_SIZE {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "transaction is {} bytes, over the {} byte limit",
+                tx_bytes.len(),
+                ergo_mempool::MAX_TRANSACTION_SIZE
+            ),
+        );
+    }
+
+    let ctx_guard = state.state_context.read().await;
+    let ctx = match ctx_guard.as_ref() {
+        Some(c) => c,
+        None => {
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "node is syncing, cannot validate transactions yet",
             )
         }
     };
@@ -5390,6 +5404,61 @@ mod tests {
                 StatusCode::NOT_FOUND,
                 "{uri}"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // POST /transactions, /transactions/check: the size limit
+    // -----------------------------------------------------------------------
+
+    /// A transaction that serializes to exactly `size` bytes, most of them
+    /// in its two inputs' proofs. Proof lengths from 16,384 to 65,535 take
+    /// three VLQ bytes, so one more proof byte is one more transaction byte.
+    fn transaction_of_size(size: usize) -> ergo_validation::Transaction {
+        use ergo_lib::chain::transaction::input::prover_result::ProverResult;
+        use ergo_lib::ergotree_interpreter::sigma_protocol::prover::ProofBytes;
+
+        let spent = [
+            make_vf_p2pk_box(1_000_000).box_id(),
+            make_vf_p2pk_box(2_000_000).box_id(),
+        ];
+        let outputs = spend(&spent, &ContextExtension::empty())
+            .output_candidates
+            .as_vec()
+            .clone();
+        let proof = |len: usize| ProverResult {
+            proof: ProofBytes::Some(vec![0xAB; len]),
+            extension: ContextExtension::empty(),
+        };
+        let with_second_proof = |len: usize| {
+            let inputs = vec![
+                Input::new(spent[0], proof(40_000)),
+                Input::new(spent[1], proof(len)),
+            ];
+            ergo_validation::Transaction::new_from_vec(inputs, vec![], outputs.clone()).unwrap()
+        };
+        let base = with_second_proof(20_000)
+            .sigma_serialize_bytes()
+            .unwrap()
+            .len();
+        let tx = with_second_proof(20_000 + size - base);
+        assert_eq!(tx.sigma_serialize_bytes().unwrap().len(), size);
+        tx
+    }
+
+    /// With no state context, a transaction the size check lets through is
+    /// refused next with 503; one it refuses answers 400.
+    #[test]
+    fn transactions_over_the_size_limit_are_refused_while_syncing() {
+        for uri in ["/transactions", "/transactions/check"] {
+            for (size, status) in [
+                (98_305, StatusCode::BAD_REQUEST),
+                (98_304, StatusCode::SERVICE_UNAVAILABLE),
+            ] {
+                let body = serde_json::to_string(&transaction_of_size(size)).unwrap();
+                let served = serve(empty_state(), post_json(uri, body));
+                assert_api_error(&served, status, &format!("{uri}, {size} bytes"));
+            }
         }
     }
 }
