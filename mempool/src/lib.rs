@@ -9,6 +9,7 @@ pub mod types;
 pub mod weight;
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use ergo_lib::chain::ergo_tree_predef;
 use ergo_lib::chain::transaction::Transaction;
@@ -16,7 +17,7 @@ use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
 use expiring_cache::ExpiringCache;
 use pool::OrderedPool;
 use reader::MempoolReader;
-use stats::FeeStats;
+use stats::{FeeHistogramBin, FeeStats};
 use types::{MempoolConfig, UnconfirmedTx};
 use weight::TxWeight;
 
@@ -54,7 +55,7 @@ impl Mempool {
         Self {
             pool: OrderedPool::new(capacity),
             invalidated: ExpiringCache::new(config.invalidation_ttl, config.invalidation_capacity),
-            stats: FeeStats::new(1000),
+            stats: FeeStats::new(Instant::now()),
             config,
             fee_proposition,
             interblock_cost: 0,
@@ -106,19 +107,77 @@ impl Mempool {
         self.pool.spent_inputs()
     }
 
-    pub fn fee_histogram(&self, buckets: usize) -> Vec<stats::FeeBucket> {
-        self.stats.histogram(buckets)
-    }
+    // --- Fee queries: facts/mempool.md § Fee queries ---
 
-    pub fn expected_wait_time(&self, fee: u64, tx_size: usize) -> Option<u64> {
-        let fee_per_factor = fee * 1024 / tx_size.max(1) as u64;
-        self.stats.expected_wait(fee_per_factor)
-    }
-
-    pub fn recommended_fee(&self, target_wait_ms: u64, tx_size: usize) -> Option<u64> {
+    /// Fee in nanoERG for a transaction of `tx_size` bytes to be confirmed
+    /// within `wait_minutes`: `GET /transactions/getFee`. Never below
+    /// `min_fee`. Reads no clock: nothing in the answer depends on the time.
+    pub fn recommended_fee(&self, wait_minutes: u32, tx_size: u32) -> u64 {
+        let min_fee = self.config.min_fee;
         self.stats
-            .recommended_fee(target_wait_ms)
-            .map(|fpf| fpf * tx_size.max(1) as u64 / 1024)
+            .fee_for_wait(wait_minutes, tx_size)
+            .map_or(min_fee, |fee| fee.max(min_fee))
+    }
+
+    /// Expected wait in milliseconds for a transaction of `tx_size` bytes
+    /// paying `fee` nanoERG: `GET /transactions/waitTime`.
+    /// Precondition: `tx_size > 0`.
+    pub fn expected_wait_ms(&self, fee: u64, tx_size: u32) -> u64 {
+        self.expected_wait_ms_at(Instant::now(), fee, tx_size)
+    }
+
+    /// [`Self::expected_wait_ms`] as of `now`.
+    pub fn expected_wait_ms_at(&self, now: Instant, fee: u64, tx_size: u32) -> u64 {
+        debug_assert!(tx_size > 0, "expected_wait_ms: tx_size must be positive");
+        let fee_per_kb = stats::saturating_u64(u128::from(fee) * 1024 / u128::from(tx_size));
+        // Heaviest first, so the transactions ahead are a prefix. Equal
+        // weight isn't ahead.
+        let position = self
+            .pool
+            .ordered
+            .keys()
+            .take_while(|w| w.weight > fee_per_kb)
+            .count();
+        self.stats.wait_for_position(now, position as u64)
+    }
+
+    /// The pool binned by how long each transaction has waited so far:
+    /// `GET /transactions/poolHistogram`. Returns `bins + 1` bins, the last
+    /// for waits of `max_wait_ms` or longer.
+    /// Preconditions: `bins >= 1`, `max_wait_ms >= bins`.
+    pub fn pool_histogram(&self, bins: u32, max_wait_ms: u64) -> Vec<FeeHistogramBin> {
+        self.pool_histogram_at(Instant::now(), bins, max_wait_ms)
+    }
+
+    /// [`Self::pool_histogram`] as of `now`.
+    pub fn pool_histogram_at(
+        &self,
+        now: Instant,
+        bins: u32,
+        max_wait_ms: u64,
+    ) -> Vec<FeeHistogramBin> {
+        debug_assert!(bins >= 1, "pool_histogram: bins must be at least 1");
+        debug_assert!(
+            max_wait_ms >= u64::from(bins),
+            "pool_histogram: max_wait_ms must be at least bins"
+        );
+        let last = u64::from(bins);
+        let interval = max_wait_ms / last;
+        let mut histogram = vec![FeeHistogramBin::default(); bins as usize + 1];
+        for (weight, utx) in &self.pool.ordered {
+            let wait =
+                stats::saturating_u64(now.saturating_duration_since(utx.created).as_millis());
+            // Short of `max_wait_ms`, `wait / interval` can still pass `bins`
+            // when `max_wait_ms` isn't a multiple of it. The JVM indexes past
+            // its array there; here the transaction lands in the last bin.
+            let bin = if wait < max_wait_ms {
+                (wait / interval).min(last)
+            } else {
+                last
+            };
+            histogram[bin as usize].add(weight.fee_per_factor);
+        }
+        histogram
     }
 
     pub fn invalidate(&mut self, tx_id: &[u8; 32]) {
@@ -128,23 +187,26 @@ impl Mempool {
 
     // --- Block interaction ---
 
-    /// Remove confirmed transactions and their double-spends.
+    /// Remove confirmed transactions and their double-spends. Each confirmed
+    /// transaction the pool held is recorded in the fee statistics; the
+    /// double-spends are not.
     pub fn apply_block(&mut self, confirmed_txs: &[Transaction]) -> Vec<[u8; 32]> {
+        self.apply_block_at(Instant::now(), confirmed_txs)
+    }
+
+    /// [`Self::apply_block`] as of `now`, the confirmation time the fee
+    /// statistics record.
+    pub fn apply_block_at(&mut self, now: Instant, confirmed_txs: &[Transaction]) -> Vec<[u8; 32]> {
         let mut removed = Vec::new();
 
         for tx in confirmed_txs {
             let tx_id = process::tx_id_bytes(tx);
 
-            // Record stats if tx was in our pool
-            if let Some(utx) = self.pool.get(&tx_id) {
-                let wait_ms = utx.created.elapsed().as_millis() as u64;
-                let fee_per_factor = self
-                    .pool
-                    .by_id
-                    .get(&tx_id)
-                    .map(|w| w.fee_per_factor)
-                    .unwrap_or(0);
-                self.stats.record_confirmation(fee_per_factor, wait_ms);
+            // A confirmation of a transaction the pool held: the only thing
+            // the fee statistics record.
+            if let Some((weight, utx)) = self.pool.get_weighted(&tx_id) {
+                self.stats
+                    .record_confirmation(now, utx.created, weight.fee_per_factor);
             }
 
             // Remove the confirmed tx
@@ -152,7 +214,8 @@ impl Mempool {
                 removed.push(tx_id);
             }
 
-            // Remove any pool tx that double-spends confirmed inputs
+            // Remove any pool tx that double-spends confirmed inputs. It
+            // wasn't confirmed, so it isn't recorded.
             for input in tx.inputs.iter() {
                 let input_id = process::input_box_id_raw(&input.box_id);
                 if let Some(conflict_weight) = self.pool.spending_tx(&input_id).cloned() {
@@ -175,7 +238,9 @@ impl Mempool {
         removed
     }
 
-    /// Return rolled-back transactions to the pool (no re-validation).
+    /// Return rolled-back transactions to the pool (no re-validation). Each
+    /// goes in as given: callers pass `validation_cost: None`, and the next
+    /// revalidation measures it.
     pub fn return_to_pool(&mut self, txs: Vec<UnconfirmedTx>) {
         for utx in txs {
             let tx_id = process::tx_id_bytes(&utx.tx);

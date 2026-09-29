@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::process;
 use crate::types::UtxoReader;
 use ergo_validation::{validate_single_transaction, ErgoStateContext};
@@ -9,11 +11,25 @@ impl super::Mempool {
     /// - Skip if last_checked within cleanup_interval
     /// - Resolve inputs from utxo_reader + unconfirmed
     /// - Re-run validate_single_transaction()
+    /// - If valid: record the measured cost as `validation_cost` and now as
+    ///   `last_checked` (the JVM's `UnconfirmedTransaction.withCost`)
     /// - Remove if invalid or inputs missing
     ///
     /// Cost-bounded to avoid stalling.
     pub fn revalidate(
         &mut self,
+        utxo_reader: &dyn UtxoReader,
+        state_context: &ErgoStateContext,
+    ) -> Vec<[u8; 32]> {
+        self.revalidate_at(Instant::now(), utxo_reader, state_context)
+    }
+
+    /// [`Self::revalidate`] as of `now`, which decides whether
+    /// `cleanup_interval` has passed since each `last_checked`, and becomes
+    /// the `last_checked` of each transaction that passes.
+    pub fn revalidate_at(
+        &mut self,
+        now: Instant,
         utxo_reader: &dyn UtxoReader,
         state_context: &ErgoStateContext,
     ) -> Vec<[u8; 32]> {
@@ -33,7 +49,7 @@ impl super::Mempool {
             };
 
             // Skip recently checked
-            if utx.last_checked.elapsed() < self.config.cleanup_interval {
+            if now.saturating_duration_since(utx.last_checked) < self.config.cleanup_interval {
                 continue;
             }
 
@@ -93,7 +109,12 @@ impl super::Mempool {
             let tx_clone = utx.tx.clone();
 
             match validate_single_transaction(&tx_clone, input_boxes, data_boxes, state_context) {
-                Ok(_) => {}
+                Ok(measured) => {
+                    if let Some(utx) = self.pool.get_mut(&tx_id) {
+                        utx.validation_cost = Some(measured);
+                        utx.last_checked = now;
+                    }
+                }
                 Err(e) => {
                     tracing::info!(
                         tx_id = %hex::encode(tx_id),

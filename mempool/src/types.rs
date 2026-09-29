@@ -22,11 +22,19 @@ pub struct UnconfirmedTx {
     pub tx_bytes: Arc<[u8]>,
     /// Transaction fee in nanoERG.
     pub fee: u64,
-    /// Validation cost (script cost or tx byte size as fallback).
+    /// Weighting cost: the entry validation's cost, floored at the serialized
+    /// size. `FeePerCycle` divides by it and the rate limits sum it.
     pub cost: u32,
+    /// The cost the transaction's most recent successful validation measured,
+    /// at entry or at revalidation. `None` until one has run: a transaction
+    /// handed to `return_to_pool` carries `None`. The JVM's
+    /// `UnconfirmedTransaction.lastCost`; `GET /transactions/unconfirmed*`
+    /// reports it as `cost`.
+    pub validation_cost: Option<u64>,
     /// When this transaction entered the pool.
     pub created: Instant,
-    /// When this transaction was last revalidated.
+    /// When this transaction was last validated: at entry, then at each
+    /// successful revalidation.
     pub last_checked: Instant,
     /// Source peer (None if locally submitted via API).
     pub source: Option<u64>,
@@ -57,7 +65,7 @@ pub enum ProcessingOutcome {
 pub enum FeeStrategy {
     /// fee * 1024 / tx_byte_size
     FeePerByte,
-    /// fee * 1024 / validation_cost
+    /// fee * 1024 / cost (the weighting `cost`, not `validation_cost`)
     FeePerCycle,
 }
 
