@@ -1899,10 +1899,13 @@ components:
         bytes:
           $ref: '#/components/schemas/HexString'
           description: |
-            Full canonical transaction bytes —
-            `Transaction::sigma_serialize_bytes()`: each input as
-            boxId + spending proof + ContextExtension, then data-inputs, then
-            outputs. The on-chain ContextExtension wire order is preserved
+            Full canonical transaction bytes, as the JVM's block serializer
+            writes them. That is ErgoTree version 3 from block version 3, and
+            version 0 below: the rule `serialize_block_transactions` follows,
+            `facts/validation.md` § Section Parsing. It is not
+            `Transaction::sigma_serialize_bytes()`, which writes at 3 for
+            every block. The layout is each input as boxId + spending proof +
+            ContextExtension, then data-inputs, then outputs. The on-chain ContextExtension wire order is preserved
             byte-for-byte (sigma stores it order-faithfully as an `IndexMap`),
             as the JSON endpoints preserve it too (`facts/api.md` §
             Transaction JSON). NOTE: the tx id is

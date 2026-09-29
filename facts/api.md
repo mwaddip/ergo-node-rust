@@ -404,7 +404,7 @@ Client
   ▼
 API handler
   │ 1. Deserialize JSON → Transaction
-  │ 2. Serialize → tx_bytes (sigma format, for P2P)
+  │ 2. Serialize → tx_bytes (sigma format, for P2P), at the activated script version
   │ 2a. tx_bytes longer than ergo_mempool::MAX_TRANSACTION_SIZE → 400
   │ 3. Acquire state_context read lock
   │ 4. Build MempoolUtxoReader (UTXO state + mempool unconfirmed outputs)
@@ -419,6 +419,15 @@ ProcessingOutcome
   ▼
 Response: 200 "txId" or 400 { error, reason }
 ```
+
+Step 2 writes the transaction at the activated script version: the
+`ErgoTreeVersion` equal to `block_version() − 1` of the parameters in effect,
+which is 3 since 6.0 (`enr_chain::activated_tree_version`). That is the
+version a peer reads the relayed bytes at
+(`facts/mempool.md` § P2P Transaction Intake). Written at any other version,
+the bytes can hash to an id other than the one the node announces.
+`Transaction::sigma_serialize_bytes()` writes at the fork's highest version,
+which is not the same thing once the two differ.
 
 Step 2a is the JVM's size check (`TransactionsApiRoute.validateTransactionAndProcess`,
 v6.0.6 :165-168): a transaction over `maxTransactionSize` is refused before it

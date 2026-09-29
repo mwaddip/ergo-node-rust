@@ -442,7 +442,9 @@ pub struct SectionIdentity {
     (`Header.version`); larger is `Err`. A count of zero is `Err` — the
     JVM's `BlockTransactions` requires at least one transaction, so an
     empty body does not parse there either. Each tx is parsed with
-    `Transaction::sigma_parse`. `digest = transactions_root(txs, block_version)`.
+    `Transaction::sigma_parse` at the ErgoTree version `block_version`
+    selects (§ "The tree version a block's transactions are read at" below).
+    `digest = transactions_root(txs, block_version)`.
   - **104 ADProofs**: `header_id[32] || size: u32 || proof_bytes[size]`.
     `digest = ad_proofs_digest(proof_bytes)`.
   - **108 Extension**: `header_id[32] || count: u16 || (key[2] || len: u8 || value[len]) × count`.
@@ -456,11 +458,71 @@ pub struct SectionIdentity {
   error carries the type id and a reason; the pipeline logs it with the
   delivering peer and drops the bytes.
 
+**The tree version a block's transactions are read at.** The JVM reads a
+block's transactions under a `VersionContext` chosen by the section's
+`block_version` (`BlockTransactionsSerializer.parse`, v6.0.6
+`BlockTransactions.scala:184-202`):
+
+| `block_version` | Transactions are read at |
+|---|---|
+| ≥ 4 | `ErgoTreeVersion::V3`: `r.with_tree_version(ErgoTreeVersion::V3, Transaction::sigma_parse)`. The JVM's `withVersions(3, 3)`, from `Header.scriptAndTreeFromBlockVersions` |
+| 1–3 | version 0, the reader's default. The JVM reads these outside any `withVersions` |
+
+The node states each version rule once, in this crate, and every reader and
+writer calls these functions. Nobody hard-codes a version:
+
+```rust
+/// The ErgoTree version a block's transactions are read at: V3 from block
+/// version 4, V0 below (JVM `BlockTransactionsSerializer.parse`).
+pub fn block_transactions_read_version(block_version: u8) -> ErgoTreeVersion;
+
+/// The version a block's transactions are written at: V3 from block version
+/// 3, V0 below (JVM `BlockTransactionsSerializer.serialize`, which wraps each
+/// transaction in `withVersions(blockVersion, blockVersion)` from
+/// `VersionContext.V6SoftForkVersion` = 3). A v3 block is written at 3 and
+/// read at 0. The asymmetry is the JVM's own.
+pub fn block_transactions_write_version(block_version: u8) -> ErgoTreeVersion;
+
+/// The script version activated at `block_version`: `block_version − 1`,
+/// saturating at 0 (JVM `Header.scriptFromBlockVersion`). A pool
+/// transaction is read at it (`facts/mempool.md` § P2P Transaction Intake),
+/// and one the node relays is written at it (`facts/api.md` § Transaction
+/// Submission Flow).
+pub fn activated_tree_version(block_version: u8) -> ErgoTreeVersion;
+```
+
+All three are pure and exported from the crate root. `fastsync` is outside
+the workspace and doesn't depend on this crate. Its section writer keeps a
+copy of the write rule, with a comment pointing here.
+
+- **The version is the one the section encodes**, not the header's. The two
+  agree on every block a miner builds. The section id does not commit to the
+  encoding, and the JVM keys off the section's too.
+- **It decides the transaction ids.** The fork computes a transaction's id
+  and `bytes_to_sign()` at the version it was read at, as ergo computes
+  `serializedId` at parse (`ErgoTransaction.scala:68`). The same bytes read
+  at 0 and at 3 differ in two ways:
+  - Content gated to version 3 in a register or context-extension value (a
+    function type, a v6 method) fails to parse at 0.
+  - An `Upcast` of a constant is written back as the bare constant below
+    version 3 and kept at 3, so the id differs.
+
+  A v4 block's transactions read at 0 can therefore fail to bind.
+- **No exception for the retired testnet.** The JVM also reads one block,
+  `3f5a4acbdfd76a97f2fdf387559c2a67b4ea5f9e9bcf66ef079cde766c6e9398`, at (1, 1)
+  (`:188-193`). Its comment reads "public testnet bug with v7 tree included in
+  v4 block, remove after testnet relaunch", and it was added in ergo
+  `f16fd3cc3` on 2025-06-07. That block is on the testnet the relaunch
+  retired. The relaunch, ergo `91aa8056a` on 2025-11-16, changed the magic to
+  `2,3,2,3` and the port to 9023 and starts at block version 4 from genesis.
+  Block ids chain back to genesis, so no network the node joins can hold that
+  block. The node carries no exception for it.
+
 **Two parsers, one wire format.** `ergo-validation` keeps its own
 `parse_block_transactions` / `parse_extension` / `parse_ad_proofs` because
 it needs the typed transactions for application, not just the digest. Both
-read the formats above; a divergence between them is a bug in whichever side
-disagrees with the JVM serializer.
+read the formats above, at the tree versions above. A divergence between them
+is a bug in whichever side disagrees with the JVM serializer.
 
 ## Phase 6: Soft-Fork Voting
 

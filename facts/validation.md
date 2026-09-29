@@ -830,7 +830,8 @@ DigestValidator::new(
    - Strip 32-byte header_id prefix
    - Read block version (VLQ sentinel: if > 10M, subtract 10M for version,
      read separate VLQ tx_count; else value IS tx_count and version = 1)
-   - Parse tx_count transactions via `Transaction::sigma_parse()`
+   - Parse tx_count transactions via `Transaction::sigma_parse()`, at the
+     tree version the section's block version selects (§ Section Parsing)
 
 1b. **Block-version gate** (consensus check, added 2026-06-10; **narrowed to
    epoch boundaries same day** after JVM cross-reference by the implementing
@@ -864,9 +865,10 @@ DigestValidator::new(
    - Inputs -> `Remove(box_id)` operations, BUT: if a box was created by
      an earlier tx in this block, remove from insertions instead (net-zero,
      never hits the tree). Double-spend within block is an error.
-   - Outputs -> `Insert(box_id, serialized_box_bytes)` operations
-     where serialized_box_bytes = `ErgoBox::sigma_serialize_bytes()`
-     (full box: candidate + txId + index)
+   - Outputs -> `Insert(box_id, box_bytes)` operations
+     where box_bytes = `ErgoBox::bytes()`
+     (full box: candidate + txId + index, written at tree version 0;
+     § Insert Values)
    - **CRITICAL: Removes and Inserts are sorted by box ID** (unsigned
      lexicographic byte order). The JVM uses `mutable.TreeMap[ModifierId, _]`
      which sorts by hex-encoded box ID — equivalent to byte ordering.
@@ -920,8 +922,29 @@ DigestValidator::new(
 [header_id: 32B] [ver_or_count: VLQ] [tx_count: VLQ if ver>1] [txs...]
 ```
 - Each transaction: sigma-serializable with per-tx indexed token digests
-- Use `Transaction::sigma_parse()` from ergo-lib for each tx
+- **Reading:** `Transaction::sigma_parse()` for each tx, at the ErgoTree
+  version the section's own block version selects: `ErgoTreeVersion::V3` from
+  block version 4, version 0 below. Get it from
+  `enr_chain::block_transactions_read_version`. The rule, and why it decides
+  the transaction ids, is in `facts/chain.md` § "The tree version a block's
+  transactions are read at". This parser and `section_id_from_body` must
+  agree.
+- An output whose register holds a function-typed value fails to parse,
+  because its box id can't be written at version 0 (§ Insert Values). The JVM
+  parses that transaction and then fails the block in its output checks. The
+  verdict is the same, reached earlier.
 - Block version extracted but not validated here (header owns version)
+- **Writing:** `serialize_block_transactions(header_id, block_version, txs)`,
+  the inverse, used by mining and the API. It writes each transaction at
+  `ErgoTreeVersion::V3` from block version **3**, and at version 0 below. Get
+  it from `enr_chain::block_transactions_write_version`.
+  - That is the JVM's serializer (`BlockTransactions.scala:142-160`). It
+    wraps each transaction in `withVersions(blockVersion, blockVersion)` from
+    `VersionContext.V6SoftForkVersion` = 3.
+  - So a v3 block is written at 3 and read at 0. The asymmetry is the JVM's
+    own; follow it.
+  - `Transaction::sigma_serialize_bytes()` is not this rule: it writes at the
+    fork's highest version, 3, for every block.
 
 ### ADProofs (type 104)
 ```
@@ -1129,10 +1152,22 @@ to traverse wrong tree paths, hitting nodes not covered by the proof.
 
 ### Insert Values
 
-The AVL+ tree Insert value is `ErgoBox::sigma_serialize_bytes()` — the
-full box serialization including candidate fields + txId (32 bytes) +
-index (u16). NOT just the candidate (without ref). Matches JVM's
-`ErgoBox.bytes` via `ErgoBox.sigmaSerializer.toBytes()`.
+The AVL+ tree Insert value is `ErgoBox::bytes()`: the full box, candidate
+fields + txId (32 bytes) + index (u16). NOT just the candidate (without ref).
+
+- **An output is written at ErgoTree version 0.** That matches the JVM's
+  `ErgoBox.bytes`, which is first read in the dust check of
+  `ErgoTransaction.validateStateful` (v6.0.6 `ErgoTransaction.scala:171-175`).
+  That read happens outside any `withVersions`, so under the default context
+  (1, 1). The box id is written at version 0 the same way, and the fork does
+  both.
+- **Not `ErgoBox::sigma_serialize_bytes()`.** That writes at the fork's
+  highest version, 3. The two differ when a register holds an `Upcast` of a
+  constant, which version 0 writes as the bare constant. A different insert
+  value gives a different state root.
+- **A box read back from the state** (an input or a data input) is parsed at
+  version 0, as the JVM's `boxById` reads outside any `withVersions`. The fork
+  keeps the slice it read, so that box's `bytes()` are the stored bytes.
 
 ### ADDigest Format
 

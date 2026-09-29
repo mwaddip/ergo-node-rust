@@ -729,6 +729,21 @@ v6.0.6 :785-792):
   logged, not banned (`facts/journal-events.md` § `peer_penalised`).
 - **At or under it:** forwarded to the mempool task.
 
+The mempool task parses the transaction at the **activated script version**:
+the `ErgoTreeVersion` equal to `block_version() − 1` of the parameters in
+effect after the last applied block, which is 3 since 6.0
+(`enr_chain::activated_tree_version`). The call is
+`r.with_tree_version(activated, Transaction::sigma_parse)`.
+
+- That is the JVM's `withVersions(activatedScriptVersion,
+  activatedScriptVersion)` (:793). Its `activatedScriptVersion` follows the
+  state context's block version (:1536).
+- The version decides both what parses and the id (`facts/chain.md` § "The
+  tree version a block's transactions are read at"). A transaction read at the
+  wrong version can fail to parse, or hash to an id other than the one its
+  sender declared.
+- The bytes the pool stores and relays are the bytes the peer delivered.
+
 The mempool crate exports the limit, so the P2P intake and the REST API
 (`facts/api.md` § Transaction Submission Flow) share one definition:
 
@@ -740,10 +755,10 @@ pub const MAX_TRANSACTION_SIZE: usize = 98_304;
 
 Two parts of the JVM's intake are not followed yet:
 - It also penalizes a peer whose transaction fails to parse, or whose id
-  differs from the one it declared (:794-805). Our parser still rejects some
-  transactions the JVM accepts (context-extension values encoded as
-  expressions), and our id can differ on a non-canonically encoded tree, so
-  those penalties would land on honest peers. They wait for both fixes.
+  differs from the one it declared (:794-805). Our id can still differ on a
+  non-canonically encoded tree, because a tree's bytes are re-serialized
+  rather than retained. Those penalties would land on honest peers, so they
+  wait for that fix.
 - It stops requesting a declared id that proved oversized (`setInvalid`).
   Transaction requests here keep no memory of invalid ids.
 

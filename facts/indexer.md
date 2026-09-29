@@ -492,10 +492,17 @@ GET  /api/v1/tokens/{token_id}/boxes           → boxes containing token
 
 ### `GET /api/v1/boxes/{box_id}/bytes`
 
-Canonical `ErgoBox::sigma_serialize` bytes for any box the indexer
-has ever indexed — spent or unspent. Returns the same byte sequence
-that lives in the originating tx's outputs section on the wire,
-hex-encoded.
+Canonical box bytes for any box the indexer has ever indexed, spent or
+unspent, hex-encoded.
+
+- **The bytes are `ErgoBox::bytes()`**: the box as the JVM's `ErgoBox.bytes`
+  writes it, at ErgoTree version 0 (`facts/validation.md` § Insert Values).
+  Their blake2b256 is the box id.
+- **They can differ from the output as the transaction's wire bytes carry it.**
+  A v4 block's transactions are written at version 3, and version 0 writes a
+  register's `Upcast` of a constant as the bare constant.
+- **Not `ErgoBox::sigma_serialize_bytes()`.** That writes at version 3, and for
+  such a box its hash is not the box id.
 
 **Path param:** `box_id` — 32-byte box id, hex-encoded.
 
