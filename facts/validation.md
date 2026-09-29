@@ -927,17 +927,30 @@ DigestValidator::new(
   block version 4, version 0 below. Get it from
   `enr_chain::block_transactions_read_version`. The rule, and why it decides
   the transaction ids, is in `facts/chain.md` § "The tree version a block's
-  transactions are read at". This parser and `section_id_from_body` must
-  agree.
+  transactions are read at".
+- **This parser and `section_id_from_body` agree on every input.** Each of the
+  following is a `SectionParse` error here, as it is an error there:
+  - a block version that doesn't fit `u8`
+  - a transaction count of zero (the JVM's `BlockTransactions` requires
+    `txs.nonEmpty`)
+  - bytes left over after the last transaction
+
+  Stored sections have passed the binding, so none of these reaches this
+  parser from the network. It rejects them anyway so the two can't drift.
 - An output whose register holds a function-typed value fails to parse,
   because its box id can't be written at version 0 (§ Insert Values). The JVM
   parses that transaction and then fails the block in its output checks. The
   verdict is the same, reached earlier.
-- Block version extracted but not validated here (header owns version)
-- **Writing:** `serialize_block_transactions(header_id, block_version, txs)`,
-  the inverse, used by mining and the API. It writes each transaction at
-  `ErgoTreeVersion::V3` from block version **3**, and at version 0 below. Get
-  it from `enr_chain::block_transactions_write_version`.
+- `ParsedBlockTransactions.block_version` is a `u8`: the section's own
+  version, extracted but not validated against the header here (the header
+  owns the version).
+- **Writing:** `serialize_block_transactions(header_id: &[u8; 32],
+  block_version: u8, txs)`, the inverse, used by mining and the API. It writes
+  each transaction at `ErgoTreeVersion::V3` from block version **3**, and at
+  version 0 below. Get it from `enr_chain::block_transactions_write_version`.
+  - The version sentinel is written only above block version 1, as the JVM
+    writes it (`if (blockVersion > 1)`). A v1 section is
+    `header_id || count || txs`.
   - That is the JVM's serializer (`BlockTransactions.scala:142-160`). It
     wraps each transaction in `withVersions(blockVersion, blockVersion)` from
     `VersionContext.V6SoftForkVersion` = 3.
@@ -1024,6 +1037,9 @@ On `DeliveryControl::Reorg { fork_point, .. }` (received via unbounded control c
 
 ## Dependencies
 
+- `enr-chain` — the tree versions a block's transactions are read and
+  written at (`facts/chain.md` § "The tree version a block's transactions are
+  read at")
 - `ergo-chain-types` — Header, ADDigest, Digest32, BlockId
 - `ergo-lib` — Transaction, ErgoBox, TransactionContext, ErgoStateContext
 - `ergo_avltree_rust` — BatchAVLVerifier, Operation, KeyValue
@@ -1156,11 +1172,19 @@ The AVL+ tree Insert value is `ErgoBox::bytes()`: the full box, candidate
 fields + txId (32 bytes) + index (u16). NOT just the candidate (without ref).
 
 - **An output is written at ErgoTree version 0.** That matches the JVM's
-  `ErgoBox.bytes`, which is first read in the dust check of
-  `ErgoTransaction.validateStateful` (v6.0.6 `ErgoTransaction.scala:171-175`).
-  That read happens outside any `withVersions`, so under the default context
-  (1, 1). The box id is written at version 0 the same way, and the fork does
-  both.
+  `ErgoBox.bytes`. The JVM first reads it when `applyTransactions` keys the
+  created outputs by box id (v6.0.6 `UtxoState.scala:77`, where `o.id` hashes
+  `o.bytes`), then in the dust and box-size checks of `validateStateful`
+  (`ErgoTransaction.scala:171-175`). Both reads happen outside any
+  `withVersions`, so under the default context (1, 1). The box id is written
+  at version 0 the same way, and the fork does both.
+- **The output checks measure the same bytes.** The dust minimum
+  (`out.bytes.length × minValuePerByte`) and `MaxBoxSize` use `bytes()`, the
+  version-0 box. At the pin `3b23f47e`, ergo-lib's `verify_output`
+  (`wallet/tx_context.rs:337`) measures `sigma_serialize_bytes()` instead,
+  which is written at 3. It counts each `Upcast` of a constant in a register
+  two bytes too many, so it rejects outputs the JVM accepts. The fix goes in
+  the fork.
 - **Not `ErgoBox::sigma_serialize_bytes()`.** That writes at the fork's
   highest version, 3. The two differ when a register holds an `Upcast` of a
   constant, which version 0 writes as the bare constant. A different insert
