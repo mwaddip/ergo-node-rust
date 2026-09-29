@@ -21,7 +21,8 @@ pub struct ParsedAdProofs {
 /// Parsed BlockTransactions section (type 102).
 pub struct ParsedBlockTransactions {
     pub header_id: [u8; 32],
-    pub block_version: u32,
+    /// The version the section encodes, not checked against the header's.
+    pub block_version: u8,
     pub transactions: Vec<Transaction>,
 }
 
@@ -84,11 +85,14 @@ const BLOCK_VERSION_SENTINEL: u32 = 10_000_000;
 /// Wire format: `[header_id: 32B] [ver_or_count: VLQ] [tx_count: VLQ if ver>1] [txs...]`
 ///
 /// Version hack: if first VLQ > 10M, subtract 10M for block_version, read separate tx_count.
-/// Otherwise first VLQ IS the tx_count and block_version = 1. A block_version
-/// that does not fit `u8` is a parse error.
+/// Otherwise first VLQ IS the tx_count and block_version = 1.
 ///
 /// Each transaction is read at `enr_chain::block_transactions_read_version`
 /// of that block_version: version 3 from block version 4, version 0 below.
+///
+/// Agrees with `enr_chain::section_id_from_body` on every input. A
+/// block_version that does not fit `u8`, a transaction count of zero, and
+/// bytes left over after the last transaction are each a parse error.
 pub fn parse_block_transactions(data: &[u8]) -> Result<ParsedBlockTransactions, ValidationError> {
     const TYPE_ID: u8 = 102;
     if data.len() < 33 {
@@ -116,6 +120,13 @@ pub fn parse_block_transactions(data: &[u8]) -> Result<ParsedBlockTransactions, 
     } else {
         (1, ver_or_count as usize)
     };
+    // The JVM's `BlockTransactions` requires `txs.nonEmpty`.
+    if tx_count == 0 {
+        return Err(section_parse_err(
+            TYPE_ID,
+            "no transactions: a block carries at least one",
+        ));
+    }
     // The version the section encodes, not the header's, selects the tree
     // version its transactions are read at, and the fork computes each
     // transaction's id at the version it read it at (facts/chain.md § "The
@@ -139,9 +150,22 @@ pub fn parse_block_transactions(data: &[u8]) -> Result<ParsedBlockTransactions, 
         transactions.push(tx);
     }
 
+    // The section ends where its last transaction does. A cursor over the
+    // slice never reads past its end, so only a shortfall is possible.
+    let consumed = reader
+        .position()
+        .map_err(|e| section_parse_err(TYPE_ID, format!("transaction stream position: {e}")))?;
+    let trailing = ((data.len() - pos) as u64).saturating_sub(consumed);
+    if trailing != 0 {
+        return Err(section_parse_err(
+            TYPE_ID,
+            format!("{trailing} trailing bytes after the last transaction"),
+        ));
+    }
+
     Ok(ParsedBlockTransactions {
         header_id,
-        block_version: u32::from(block_version),
+        block_version,
         transactions,
     })
 }
@@ -218,36 +242,36 @@ pub fn serialize_ad_proofs(header_id: &[u8; 32], proof_bytes: &[u8]) -> Vec<u8> 
 /// Serialize a BlockTransactions section to wire format.
 ///
 /// Wire format: `[header_id: 32B] [version_sentinel: VLQ] [tx_count: VLQ] [txs...]`
-/// where `version_sentinel = BLOCK_VERSION_SENTINEL + block_version` for v2+.
+/// where `version_sentinel = BLOCK_VERSION_SENTINEL + block_version`, written
+/// only above block version 1 as the JVM writes it: a v1 section is
+/// `[header_id: 32B] [tx_count: VLQ] [txs...]`.
 ///
 /// Each transaction is written at `enr_chain::block_transactions_write_version`
 /// of `block_version`: version 3 from block version 3, version 0 below (JVM
 /// `BlockTransactionsSerializer.serialize`). A v3 block is written at 3 and
 /// read back at 0; the asymmetry is the JVM's own. `sigma_serialize_bytes()`
 /// is not this rule: it writes every block at the fork's highest version.
-/// A `block_version` that does not fit `u8` is an error.
 pub fn serialize_block_transactions(
     header_id: &[u8; 32],
-    block_version: u32,
+    block_version: u8,
     transactions: &[Transaction],
 ) -> Result<Vec<u8>, ValidationError> {
     const TYPE_ID: u8 = 102;
-    // `Header.version` is a byte, and neither parser reads a larger one back.
-    let version = u8::try_from(block_version).map_err(|_| {
-        section_parse_err(
-            TYPE_ID,
-            format!("block version {block_version} does not fit u8"),
-        )
-    })?;
-    let tree_version = block_transactions_write_version(version);
+    let tree_version = block_transactions_write_version(block_version);
 
     let mut out = Vec::new();
     out.extend_from_slice(header_id);
 
     // Version sentinel for v2+
-    let mut sentinel_buf = Vec::new();
-    WriteSigmaVlqExt::put_u32(&mut sentinel_buf, BLOCK_VERSION_SENTINEL + block_version).unwrap();
-    out.extend_from_slice(&sentinel_buf);
+    if block_version > 1 {
+        let mut sentinel_buf = Vec::new();
+        WriteSigmaVlqExt::put_u32(
+            &mut sentinel_buf,
+            BLOCK_VERSION_SENTINEL + u32::from(block_version),
+        )
+        .unwrap();
+        out.extend_from_slice(&sentinel_buf);
+    }
 
     // Transaction count
     let mut count_buf = Vec::new();
@@ -337,22 +361,50 @@ mod tests {
 
     // --- BlockTransactions tests ---
 
+    /// The JVM's `BlockTransactions` requires `txs.nonEmpty`, and
+    /// `section_id_from_body` rejects a count of zero. So does this parser,
+    /// with the version framing and without it.
     #[test]
-    fn parse_block_transactions_empty_block() {
-        let mut data = Vec::new();
-        let header_id = [0xBB; 32];
-        data.extend_from_slice(&header_id);
-        // VLQ encode 10_000_002 (version 2 sentinel)
-        let mut sentinel_buf = Vec::new();
-        WriteSigmaVlqExt::put_u32(&mut sentinel_buf, 10_000_002).unwrap();
-        data.extend_from_slice(&sentinel_buf);
-        // VLQ encode 0 (tx_count)
-        data.push(0);
+    fn parse_block_transactions_empty_block_is_err() {
+        for block_version in [1, 2] {
+            match parse_block_transactions(&raw_section(block_version, &[])) {
+                Err(ValidationError::SectionParse {
+                    section_type,
+                    reason,
+                }) => {
+                    assert_eq!(section_type, 102);
+                    assert!(
+                        reason.contains("no transactions"),
+                        "block version {block_version}: {reason}"
+                    );
+                }
+                Err(other) => panic!("expected SectionParse, got {other:?}"),
+                Ok(_) => panic!("block version {block_version}: an empty section parsed"),
+            }
+        }
+    }
 
-        let parsed = parse_block_transactions(&data).unwrap();
-        assert_eq!(parsed.header_id, header_id);
-        assert_eq!(parsed.block_version, 2);
-        assert!(parsed.transactions.is_empty());
+    /// The section ends where its last transaction does: one byte more is a
+    /// parse error, as it is for `section_id_from_body`.
+    #[test]
+    fn a_byte_after_the_last_transaction_is_a_parse_error() {
+        let mut body = raw_section(4, &[EXTENSION_TX]);
+        assert!(parse_block_transactions(&body).is_ok());
+        body.push(0);
+        match parse_block_transactions(&body) {
+            Err(ValidationError::SectionParse {
+                section_type,
+                reason,
+            }) => {
+                assert_eq!(section_type, 102);
+                assert!(
+                    reason.contains("1 trailing bytes after the last transaction"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            Err(other) => panic!("expected SectionParse, got {other:?}"),
+            Ok(_) => panic!("a trailing byte parsed"),
+        }
     }
 
     #[test]
@@ -516,8 +568,8 @@ mod tests {
     /// version framing and reads at 0 as well.
     #[test]
     fn below_v4_a_section_reads_the_same_transactions_at_0() {
-        for block_version in [1, 2, 3] {
-            let body = raw_section(block_version, &[EXTENSION_TX, REGISTER_TX]);
+        for block_version in [1u8, 2, 3] {
+            let body = raw_section(block_version.into(), &[EXTENSION_TX, REGISTER_TX]);
             let parsed = parse_block_transactions(&body).unwrap();
             assert_eq!(parsed.block_version, block_version);
             assert_eq!(ids(&parsed), IDS_AT_0, "block version {block_version}");
@@ -601,10 +653,30 @@ mod tests {
                     .unwrap();
             assert_eq!(
                 hex::encode(body),
-                hex::encode(raw_section(block_version, &[written])),
+                hex::encode(raw_section(block_version.into(), &[written])),
                 "block version {block_version}"
             );
         }
+    }
+
+    /// The version sentinel is written only above block version 1, as the
+    /// JVM writes it: a v1 section is `header_id || count || txs`, at tree
+    /// version 0, and reads back as block version 1.
+    #[test]
+    fn serialize_writes_no_version_sentinel_for_block_version_1() {
+        let tx = tx_read_at(EXTENSION_TX, ErgoTreeVersion::V3);
+        let body = serialize_block_transactions(&HEADER_ID, 1, std::slice::from_ref(&tx)).unwrap();
+        let mut expected = HEADER_ID.to_vec();
+        expected.push(1); // the count, with nothing before it
+        expected.extend(hex::decode(EXTENSION_TX_AT_0).unwrap());
+        assert_eq!(hex::encode(&body), hex::encode(expected));
+
+        let parsed = parse_block_transactions(&body).unwrap();
+        assert_eq!(parsed.block_version, 1);
+        let [read] = &parsed.transactions[..] else {
+            panic!("one transaction, got {}", parsed.transactions.len());
+        };
+        assert_eq!(hex::encode(read.id().as_ref()), EXTENSION_TX_ID_AT_0);
     }
 
     /// A v4 section written and read back keeps the ids: both sides are at 3.
@@ -620,24 +692,6 @@ mod tests {
             let body = serialize_block_transactions(&HEADER_ID, block_version, &txs).unwrap();
             let parsed = parse_block_transactions(&body).unwrap();
             assert_eq!(ids(&parsed), expected, "block version {block_version}");
-        }
-    }
-
-    #[test]
-    fn serialize_rejects_a_block_version_beyond_u8() {
-        match serialize_block_transactions(&HEADER_ID, 256, &[]) {
-            Err(ValidationError::SectionParse {
-                section_type,
-                reason,
-            }) => {
-                assert_eq!(section_type, 102);
-                assert!(
-                    reason.contains("block version 256 does not fit u8"),
-                    "unexpected reason: {reason}"
-                );
-            }
-            Err(other) => panic!("expected SectionParse, got {other:?}"),
-            Ok(_) => panic!("block version 256 must not be written"),
         }
     }
 }

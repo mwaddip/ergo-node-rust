@@ -9,16 +9,17 @@
 //! `header.version`).
 //!
 //! The gate runs after section parsing and the boundary parameter check,
-//! before any proof verification — so these tests get away with empty
-//! sections and garbage proofs: a rejection at the gate surfaces as
-//! `BlockVersionMismatch`, while sailing past it surfaces as the
+//! before any proof verification — so these tests get away with a minimal
+//! transactions section and garbage proofs: a rejection at the gate surfaces
+//! as `BlockVersionMismatch`, while sailing past it surfaces as the
 //! downstream `ProofDigestMismatch`.
 
 use ergo_chain_types::{ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint, Header, Votes};
 use ergo_lib::chain::parameters::Parameter;
+use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_validation::{
     serialize_ad_proofs, serialize_block_transactions, serialize_extension, BlockValidator,
-    DigestValidator, Parameters, ValidationError,
+    DigestValidator, Parameters, Transaction, ValidationError,
 };
 
 fn make_header(height: u32, version: u8) -> Header {
@@ -62,10 +63,24 @@ struct Fixture {
     proofs: Vec<u8>,
 }
 
+/// The least a transactions section carries, since the parser rejects an
+/// empty one as the JVM does: box `0…0` spent with an empty proof into one
+/// 1 ERG `sigmaProp(true)` output.
+fn one_transaction() -> Transaction {
+    let bytes = hex::decode(format!(
+        "01{}0000000001{}",
+        "00".repeat(32),
+        "8094ebdc030008d3010000"
+    ))
+    .expect("fixture hex");
+    Transaction::sigma_parse_bytes(&bytes).expect("the transaction parses")
+}
+
 fn make_sections() -> Fixture {
     let hid = [0u8; 32];
     Fixture {
-        txs: serialize_block_transactions(&hid, 2, &[]).expect("empty tx section"),
+        txs: serialize_block_transactions(&hid, 2, &[one_transaction()])
+            .expect("one-transaction section"),
         proofs: serialize_ad_proofs(&hid, &[]),
     }
 }
