@@ -2510,15 +2510,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?,
     );
 
+    // Mempool — in-memory transaction pool. Built here, before the serve
+    // hook, so the hook can answer transaction requests from it.
+    let mempool = Arc::new(Mutex::new(ergo_mempool::Mempool::new(
+        ergo_mempool::types::MempoolConfig {
+            capacity: node_config.mempool_capacity,
+            min_fee: node_config.min_fee,
+            ..Default::default()
+        },
+    )));
+
     // Local-serve hook: the router answers ModifierRequest with what this
     // closure returns, and a miss gets no answer (facts/p2p-routing.md
-    // § ModifierRequest). Store-blind router, store-aware closure. redb reads
-    // are sync + cheap.
+    // § ModifierRequest). Store-blind router, store-aware closure: block
+    // sections from the store (redb reads are sync + cheap), transactions
+    // from the mempool's serving reader, which never takes the mempool lock
+    // (facts/mempool.md § Serving reader).
     {
         let serve_store = store.clone();
+        let serve_mempool = mempool.lock().await.reader();
         p2p.set_local_serve(std::sync::Arc::new(
             move |modifier_type: u8, id: &[u8; 32]| {
-                serve_store.get(modifier_type, id).ok().flatten()
+                if modifier_type == enr_chain::TRANSACTION_TYPE_ID {
+                    serve_mempool.tx_bytes(id).map(|bytes| bytes.to_vec())
+                } else {
+                    serve_store.get(modifier_type, id).ok().flatten()
+                }
             },
         ))
         .await;
@@ -3652,15 +3669,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
-
-    // Mempool — in-memory transaction pool with P2P transaction receiver
-    let mempool = Arc::new(Mutex::new(ergo_mempool::Mempool::new(
-        ergo_mempool::types::MempoolConfig {
-            capacity: node_config.mempool_capacity,
-            min_fee: node_config.min_fee,
-            ..Default::default()
-        },
-    )));
 
     // Mempool task: validates incoming transactions, applies confirmed blocks,
     // and runs periodic cleanup/revalidation.
