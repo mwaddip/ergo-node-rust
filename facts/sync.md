@@ -31,8 +31,18 @@ How the sync machine sends messages and observes the network.
 How the sync machine queries persistent storage.
 
 #### `has_modifier(type_id, id) -> bool`
-- Returns true if the modifier exists in the store.
-- Used to determine which block sections need downloading.
+- Returns true if the node already has the modifier. For a header or block
+  section that means the modifier store. For a transaction (type 2) it means
+  the mempool, which the main crate's adapter asks through the mempool's
+  serving reader (`facts/mempool.md` § Serving reader); the store holds no
+  transactions.
+- Used to decide what to request: block sections that need downloading, and
+  announced transactions the node does not hold yet. The JVM likewise asks
+  its mempool before requesting an announced transaction (`processInv`,
+  `ErgoNodeViewSynchronizer` v6.0.6 :1127-1145). It also skips invalidated,
+  recently applied and recently declined transactions, and caps a batch by
+  cost; the reader answers only pool membership, so those filters are not
+  applied here.
 - Must not block the async runtime (the bridge impl handles this).
 
 #### `get_modifier(type_id, id) -> Option<Vec<u8>>`

@@ -577,9 +577,11 @@ transactions (source = None) bypass rate limiting.
 ## P2P Transaction Broadcast and Serving (main crate responsibility)
 
 The mempool crate neither broadcasts nor serves transactions. The main crate
-takes one `reader()` at startup and answers type-2 ids in the local-serve
-closure it injects into the P2P router with `tx_bytes`; block sections still
-come from the modifier store. The mempool task handles broadcast after
+takes `reader()` handles at startup. With one it answers type-2 ids in the
+local-serve closure it injects into the P2P router; block sections still
+come from the modifier store. With another, sync's store adapter answers
+whether the node already holds an announced transaction, so it is not
+requested again (`facts/sync.md` § `SyncStore`). The mempool task handles broadcast after
 `process()` returns. Every broadcast reaches all connected peers, inbound and
 outbound, as the JVM's `SuccessfulTransaction` → `broadcastModifierInv`
 does (`facts/p2p-node.md` § `broadcast`):
