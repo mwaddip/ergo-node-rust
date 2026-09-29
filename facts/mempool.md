@@ -601,6 +601,36 @@ does (`facts/p2p-node.md` § `broadcast`):
 - Declined, Invalidated, DoubleSpendLoser, AlreadyInPool outcomes
 - Transactions removed by `apply_block()` or `revalidate()`
 
+## P2P Transaction Intake (main crate responsibility)
+
+A transaction a peer delivers is size-checked before anything parses it, as
+the JVM's `parseAndProcessTransaction` does (`ErgoNodeViewSynchronizer`
+v6.0.6 :785-792):
+
+- **Over `MAX_TRANSACTION_SIZE`** (98,304 bytes, the JVM's
+  `maxTransactionSize` default): dropped unparsed, and the sender gets a
+  `PENALTY` with kind `oversized_transaction`. That is a misbehavior kind:
+  logged, not banned (`facts/journal-events.md` § `peer_penalised`).
+- **At or under it:** forwarded to the mempool task.
+
+The mempool crate exports the limit, so the P2P intake and the REST API
+(`facts/api.md` § Transaction Submission Flow) share one definition:
+
+```rust
+/// Largest serialized transaction the node accepts from a peer or the API.
+/// The JVM's `maxTransactionSize` default (`application.conf`).
+pub const MAX_TRANSACTION_SIZE: usize = 98_304;
+```
+
+Two parts of the JVM's intake are not followed yet:
+- It also penalizes a peer whose transaction fails to parse, or whose id
+  differs from the one it declared (:794-805). Our parser still rejects some
+  transactions the JVM accepts (context-extension values encoded as
+  expressions), and our id can differ on a non-canonically encoded tree, so
+  those penalties would land on honest peers. They wait for both fixes.
+- It stops requesting a declared id that proved oversized (`setInvalid`).
+  Transaction requests here keep no memory of invalid ids.
+
 ## Configuration
 
 ```toml
