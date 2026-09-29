@@ -171,8 +171,10 @@ impl Ord for TxWeight {
 pub struct UnconfirmedTx {
     /// The transaction.
     pub tx: Transaction,
-    /// Serialized transaction bytes (cached for P2P propagation).
-    pub tx_bytes: Vec<u8>,
+    /// Serialized transaction bytes: what a peer sent, or the node's own
+    /// serialization for an API submission. One allocation, shared with the
+    /// serving reader (§ Serving reader).
+    pub tx_bytes: Arc<[u8]>,
     /// Transaction fee in nanoERG.
     pub fee: u64,
     /// Validation cost from ErgoScript evaluation.
@@ -384,6 +386,44 @@ impl Mempool {
     pub fn recommended_fee(&self, target_wait_ms: u64, tx_size: usize) -> Option<u64>;
 ```
 
+### Serving reader
+
+```rust
+    /// A handle for serving pool transactions to peers without the owner's lock.
+    pub fn reader(&self) -> MempoolReader;
+
+/// Clone + Send + Sync. Every handle from one `Mempool` sees the same index.
+impl MempoolReader {
+    /// The bytes the pool holds for `id`, or `None` if it isn't in the pool.
+    pub fn tx_bytes(&self, id: &[u8; 32]) -> Option<Arc<[u8]>>;
+}
+```
+
+The P2P router answers a `ModifierRequest` synchronously, inside the P2P
+event loop (`facts/p2p-routing.md` § ModifierRequest), and the main crate
+keeps the `Mempool` behind an async mutex that is held for whole validations.
+The serve path can't wait for that lock, because the event loop must never
+block (`facts/p2p-node.md` § Invariants), and a `try_lock` would miss exactly
+when the pool is busy. The reader is the JVM's split: its synchronizer serves
+transactions from a published mempool reader, not from the live pool
+(`ErgoNodeViewSynchronizer.modifiersReq`, `mp.getAll(ids)`, v6.0.6
+:1189-1194).
+
+- **Never waits on the mempool's owner.** `tx_bytes` holds the index's own
+  `std` lock for one map lookup, and nothing else.
+- **Exactly the pool's membership.** The index changes in the same step as
+  the pool, at insertion and at removal. Every eviction, replacement,
+  confirmation and revalidation removal goes through the pool's single
+  removal path, so none can leave a stale entry behind. A re-weight doesn't
+  change membership and doesn't touch the index.
+- **The bytes are the entry's `tx_bytes`, shared, not copied.** For a
+  transaction relayed by a peer they are the bytes that peer sent; for an API
+  submission, the node's serialization. The JVM serves the same:
+  `transactionBytes.getOrElse(transaction.bytes)`.
+- **A poisoned lock doesn't panic the reader.** Each index update is a single
+  map operation, so the map is consistent even after a writer panicked. Read
+  through the poison.
+
 ### Block interaction
 
 ```rust
@@ -534,14 +574,19 @@ peers between blocks:
 These are checked in `process()` before validation. Locally submitted
 transactions (source = None) bypass rate limiting.
 
-## P2P Transaction Broadcast (main crate responsibility)
+## P2P Transaction Broadcast and Serving (main crate responsibility)
 
-The mempool crate does not broadcast transactions. The main crate's mempool
-task handles broadcast after `process()` returns:
+The mempool crate neither broadcasts nor serves transactions. The main crate
+takes one `reader()` at startup and answers type-2 ids in the local-serve
+closure it injects into the P2P router with `tx_bytes`; block sections still
+come from the modifier store. The mempool task handles broadcast after
+`process()` returns. Every broadcast reaches all connected peers, inbound and
+outbound, as the JVM's `SuccessfulTransaction` → `broadcastModifierInv`
+does (`facts/p2p-node.md` § `broadcast`):
 
 **On acceptance (Accepted or Replaced):**
 - Build `Inv { modifier_type: 2, ids: [tx_id] }` message
-- `broadcast_outbound()` to all connected outbound peers
+- `broadcast()` to all connected peers
 - For P2P-sourced transactions, this relays to peers that haven't seen it
 - For API-sourced transactions, this announces the new tx to the network
 
@@ -549,7 +594,7 @@ task handles broadcast after `process()` returns:
 - `select_for_rebroadcast()` returns up to `rebroadcast_count` transactions
   whose inputs still exist in the confirmed UTXO set
 - Build `Inv { modifier_type: 2, ids: [tx_ids...] }` message
-- `broadcast_outbound()` to all connected outbound peers
+- `broadcast()` to all connected peers
 - Peers that already have the tx in their pool will ignore the Inv
 
 **Not broadcast:**
@@ -590,6 +635,7 @@ rebroadcast_count = 3          # txs rebroadcast per cleanup cycle
 - No two transactions in the pool spend the same input box (enforced by
   replace-by-fee on every insertion).
 - `by_id`, `by_input`, `by_output` are always consistent with `pool`.
+- `reader().tx_bytes(id)` is `Some` exactly while `id` is in the pool.
 - `len() <= capacity` after every mutation.
 - Every transaction in the pool passed `validate_single_transaction()` at
   the time of insertion (may become invalid later — caught by revalidation).

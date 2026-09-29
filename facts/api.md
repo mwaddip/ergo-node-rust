@@ -398,7 +398,7 @@ Response: 200 "txId" or 400 { error, reason }
 ```
 
 P2P broadcast happens separately in the mempool task (main crate), which
-broadcasts Inv type 2 to outbound peers for every accepted transaction.
+broadcasts Inv type 2 to all connected peers for every accepted transaction.
 The API handler returns immediately after `process()` — it does not wait
 for broadcast. This is the same path used by P2P transaction relay, with
 `source: None` instead of a peer ID.
