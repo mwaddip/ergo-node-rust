@@ -80,6 +80,8 @@ where
 {
     type Rejection = Refusal;
 
+    // axum's `Json` as an extractor. Only its response side is disallowed.
+    #[allow(clippy::disallowed_types)]
     async fn from_request(req: Request, state: &S) -> Result<Self, Refusal> {
         match axum::Json::from_request(req, state).await {
             Ok(axum::Json(value)) => Ok(Self(value)),

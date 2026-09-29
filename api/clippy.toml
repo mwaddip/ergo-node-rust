@@ -1,0 +1,7 @@
+# Handlers respond through crate::response::Json. axum's own answers a body
+# that fails to serialize with plain text, where facts/api.md § Error Model
+# promises the ApiError body. extract.rs reads requests with axum's, under
+# an allow.
+disallowed-types = [
+    { path = "axum::Json", reason = "respond with crate::response::Json, which answers a serialization failure with the ApiError body" },
+]
