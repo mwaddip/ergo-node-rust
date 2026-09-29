@@ -946,6 +946,11 @@ for block sections that need downloading. The queue is populated from two source
 Block section requests follow the same pattern as header requests:
 - Send `ModifierRequest` with the section type and IDs
 - Track delivery via the `DeliveryTracker`
+- One download window's section requests go to **one** peer, the first
+  outbound peer, as one `ModifierRequest` per section type (up to 400 ids
+  each). The JVM spreads them across peers (`requestDownload`); we don't yet,
+  and a loop that sends the same ids to every peer is not a spread, because
+  the first request marks them pending and the rest skip them.
 - On timeout: re-request from a different peer (§ Delivery timeouts)
 - On receive: the pipeline binds the bytes to the delivered id and stores
   them only if they bind (§ Receive-path binding). A body that does not
@@ -960,7 +965,9 @@ happens next depends on the modifier type, as in the JVM's `CheckDelivery`
 
 - **A transaction is forgotten, not re-requested.** Its pending entry is
   cleared and no peer is penalized, because the peer may have dropped it from
-  its mempool (JVM :1262-1265). A later `Inv` can request it again.
+  its mempool (JVM :1262-1265). A later `Inv` can request it again. The same
+  holds whatever ends the request: a transaction request orphaned by its
+  peer's disconnect is forgotten too, never re-sent to another peer.
 - **A header or block section is re-requested from another peer**, up to the
   maximum delivery attempts. The re-requests of one check are **batched**: one
   `ModifierRequest` per (target peer, modifier type), up to 400 ids each (the
