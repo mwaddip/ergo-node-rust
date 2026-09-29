@@ -190,7 +190,11 @@ writer:
 | Bound | Value | JVM v6.0.6 `PeerConnectionHandler` |
 |---|---|---|
 | Frames | 64 | `MaxBufferedOutboundMessages = 64` |
-| Bytes, at wire size (13-byte header + body) | 16,388,621 | `MaxBufferedOutboundBytes = MaxMessageSize + HeaderLength + ChecksumLength` |
+| Bytes, at wire size | 16,388,621 | `MaxBufferedOutboundBytes = MaxMessageSize + HeaderLength + ChecksumLength` |
+
+A frame's wire size is its serialized length, as the JVM's `msg.length`: the
+9-byte header, plus the 4-byte checksum and the body when the body is
+non-empty. An empty-body frame counts 9.
 
 The JVM applies them in `buffer()` (`PeerConnectionHandler.scala` :239-256,
 constants :290-294). The byte bound is one maximum-size frame: the largest
@@ -210,6 +214,11 @@ legal frame always fits, and a backlog beyond it means the peer is not reading.
 - Reader tasks may wait on the shared event channel (256). That backpressures
   the one peer's socket, not the event loop, and no protocol message is
   dropped to avoid it.
+- **A peer's queue is in place before it is announced.** It exists before the
+  peer is registered with the router or announced by `PeerConnected`, and it
+  is removed at the start of the teardown, before `PeerDisconnected`. So
+  `send_to` can return `UnknownPeer` for a peer being torn down, but never for
+  one whose teardown has not begun.
 
 ## Aborting a connection
 
