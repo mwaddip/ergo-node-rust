@@ -2506,25 +2506,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // capture_tap from [debug.p2p_capture] in ergo.toml — None when the
     // section is absent or `enabled = false`. See facts/p2p-capture.md.
     let p2p = Arc::new(
-        enr_p2p::node::P2pNode::start(
-            config,
-            Some(modifier_tx),
-            mode_config,
-            peer_storage,
-            capture_tap,
-        )
-        .await?,
+        enr_p2p::node::P2pNode::start(config, modifier_tx, mode_config, peer_storage, capture_tap)
+            .await?,
     );
 
-    // Register message codes consumed by the main crate's event stream so
-    // the router doesn't blindly forward them to all peers.
-    for code in [76u8, 78, 80, 90, 91] {
-        p2p.register_consumed_code(code).await;
-    }
-
-    // Local-serve hook: answer ModifierRequest from our own store before the
-    // router's relay fallback (facts/p2p-routing.md § Local serve hook).
-    // Store-blind router, store-aware closure. redb reads are sync + cheap.
+    // Local-serve hook: the router answers ModifierRequest with what this
+    // closure returns, and a miss gets no answer (facts/p2p-routing.md
+    // § ModifierRequest). Store-blind router, store-aware closure. redb reads
+    // are sync + cheap.
     {
         let serve_store = store.clone();
         p2p.set_local_serve(std::sync::Arc::new(
@@ -3758,7 +3747,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     modifier_type: 2,
                                     ids: vec![*tx_id],
                                 };
-                                p2p_for_mempool.broadcast_outbound(inv).await;
+                                p2p_for_mempool.broadcast(inv).await;
                             }
                             ergo_mempool::types::ProcessingOutcome::Replaced { tx_id, removed } => {
                                 tracing::info!(
@@ -3770,7 +3759,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     modifier_type: 2,
                                     ids: vec![*tx_id],
                                 };
-                                p2p_for_mempool.broadcast_outbound(inv).await;
+                                p2p_for_mempool.broadcast(inv).await;
                             }
                             ergo_mempool::types::ProcessingOutcome::Invalidated { reason } => {
                                 tracing::debug!(
@@ -3827,7 +3816,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     modifier_type: 2,
                                     ids,
                                 };
-                                p2p_for_mempool.broadcast_outbound(inv).await;
+                                p2p_for_mempool.broadcast(inv).await;
                             }
                         }
                     }
