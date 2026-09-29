@@ -501,6 +501,10 @@ pub fn router(state: ApiState) -> Router {
             "/debug/p2p-capture/reset",
             post(handlers::post_capture_reset),
         )
+        // Requests no route serves. Last: the 405 fallback applies only to
+        // routes already added.
+        .fallback(handlers::unknown_path)
+        .method_not_allowed_fallback(handlers::method_not_allowed)
         .with_state(state)
 }
 

@@ -167,6 +167,32 @@ fn subtle_constant_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Requests no route serves: the router's fallbacks
+// ---------------------------------------------------------------------------
+
+/// A path no route matches.
+pub async fn unknown_path(uri: axum::http::Uri) -> (StatusCode, Json<ApiError>) {
+    api_error(
+        StatusCode::NOT_FOUND,
+        "unknown endpoint",
+        Some(format!("path={}", uri.path())),
+    )
+}
+
+/// A path a route matches, asked with a method it doesn't serve. axum adds
+/// the `Allow` header.
+pub async fn method_not_allowed(
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+) -> (StatusCode, Json<ApiError>) {
+    api_error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method not allowed",
+        Some(format!("{method} {}", uri.path())),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // GET /info
 // ---------------------------------------------------------------------------
 
@@ -4736,6 +4762,8 @@ mod tests {
     struct Served {
         status: StatusCode,
         content_type: Option<String>,
+        /// The `Allow` header, which a 405 carries.
+        allow: Option<String>,
         body: String,
     }
 
@@ -4760,16 +4788,23 @@ mod tests {
         build_runtime().block_on(async {
             let response = serve_one(crate::router(state), request).await;
             let status = response.status();
-            let content_type = response
-                .headers()
-                .get(axum::http::header::CONTENT_TYPE)
-                .map(|v| v.to_str().expect("ASCII content type").to_string());
+            let header = |name| {
+                response
+                    .headers()
+                    .get(name)
+                    .map(|v: &axum::http::HeaderValue| {
+                        v.to_str().expect("ASCII header").to_string()
+                    })
+            };
+            let content_type = header(axum::http::header::CONTENT_TYPE);
+            let allow = header(axum::http::header::ALLOW);
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .expect("in-memory body");
             Served {
                 status,
                 content_type,
+                allow,
                 body: String::from_utf8(body.to_vec()).expect("UTF-8 body"),
             }
         })
@@ -5394,11 +5429,7 @@ mod tests {
             "/nipopow/popowHeader/last".to_string(),
             format!("/nipopow/popowHeader/{id}"),
         ] {
-            assert_eq!(
-                get(popow_state(), &uri).status,
-                StatusCode::NOT_FOUND,
-                "{uri}"
-            );
+            assert_api_error(&get(popow_state(), &uri), StatusCode::NOT_FOUND, &uri);
         }
     }
 
@@ -5454,6 +5485,67 @@ mod tests {
                 let served = serve(empty_state(), post_json(uri, body));
                 assert_api_error(&served, status, &format!("{uri}, {size} bytes"));
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Requests no route serves: 404 and 405 with the ApiError body
+    // -----------------------------------------------------------------------
+
+    fn request(method: &str, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn a_path_no_route_matches_answers_404_with_the_api_error_body() {
+        for (method, uri) in [
+            ("GET", "/nope"),
+            ("POST", "/nope"),
+            ("GET", "/blocks/at/1/extra"),
+            ("GET", "/utxo/byId"),
+        ] {
+            let served = serve(empty_state(), request(method, uri));
+            assert_api_error(&served, StatusCode::NOT_FOUND, &format!("{method} {uri}"));
+        }
+    }
+
+    #[test]
+    fn a_method_a_path_does_not_serve_answers_405_with_the_api_error_body() {
+        let unknown_tx = format!("/transactions/unconfirmed/{}", "ab".repeat(32));
+        for (method, uri, allow) in [
+            ("POST", "/info", "GET,HEAD"),
+            ("DELETE", "/blocks", "GET,HEAD"),
+            ("GET", "/transactions", "POST"),
+            ("GET", unknown_tx.as_str(), "HEAD"),
+        ] {
+            let served = serve(empty_state(), request(method, uri));
+            assert_api_error(
+                &served,
+                StatusCode::METHOD_NOT_ALLOWED,
+                &format!("{method} {uri}"),
+            );
+            assert_eq!(served.allow.as_deref(), Some(allow), "{method} {uri}");
+        }
+    }
+
+    /// A HEAD answer has no body, whoever answers it: a route of its own, a
+    /// GET route, or either fallback.
+    #[test]
+    fn head_answers_keep_an_empty_body() {
+        let unknown_tx = format!("/transactions/unconfirmed/{}", "ab".repeat(32));
+        for (uri, status) in [
+            (unknown_tx.as_str(), StatusCode::NOT_FOUND),
+            ("/info", StatusCode::OK),
+            ("/nope", StatusCode::NOT_FOUND),
+            ("/transactions", StatusCode::METHOD_NOT_ALLOWED),
+        ] {
+            let served = serve(empty_state(), request("HEAD", uri));
+            assert_eq!(served.status, status, "HEAD {uri}");
+            assert_eq!(served.body, "", "HEAD {uri}");
         }
     }
 }
