@@ -298,6 +298,21 @@ pub async fn get_block_header(
 /// Block transactions section type ID (Ergo modifier type 102).
 const BLOCK_TRANSACTIONS_TYPE: u8 = 102;
 
+/// The block transactions section stored as `data`, as the JVM renders its
+/// `BlockTransactions` (v6.0.6): the one object `/blocks/{id}/transactions`,
+/// `/blocks/{id}` as `blockTransactions`, and `/blocks/modifier/{id}` answer.
+/// `size` is the stored section's length in bytes.
+fn block_transactions_section(data: &[u8]) -> Result<BlockTransactionsSection, String> {
+    let parsed = ergo_validation::parse_block_transactions(data)
+        .map_err(|e| format!("failed to parse stored transactions: {e}"))?;
+    Ok(BlockTransactionsSection {
+        header_id: hex::encode(parsed.header_id),
+        transactions: parsed.transactions,
+        block_version: parsed.block_version,
+        size: data.len(),
+    })
+}
+
 pub async fn get_block_transactions(
     State(state): State<ApiState>,
     ApiPath(header_id): ApiPath<String>,
@@ -326,13 +341,8 @@ pub async fn get_block_transactions(
     // block); parse+serialize go on the blocking pool to avoid starving the
     // async reactor under concurrent load.
     let rendered = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        let parsed = ergo_validation::parse_block_transactions(&data)
-            .map_err(|e| format!("failed to parse stored transactions: {e}"))?;
-        let body = BlockTransactions {
-            header_id,
-            transactions: parsed.transactions,
-        };
-        serde_json::to_vec(&body).map_err(|e| format!("failed to serialize transactions: {e}"))
+        let section = block_transactions_section(&data)?;
+        serde_json::to_vec(&section).map_err(|e| format!("failed to serialize transactions: {e}"))
     })
     .await;
 
@@ -1780,24 +1790,8 @@ pub async fn get_full_block(
         header.transaction_root.0.as_ref(),
     );
     let block_transactions = match state.store.get(BLOCK_TRANSACTIONS_TYPE, &txs_modifier_id) {
-        Some(data) => {
-            let parsed = ergo_validation::parse_block_transactions(&data).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError {
-                        error: 500,
-                        reason: format!("failed to parse stored transactions: {e}"),
-                        detail: None,
-                    }),
-                )
-            })?;
-            BlockTransactionsSection {
-                header_id: header_id_hex.clone(),
-                transactions: parsed.transactions,
-                block_version: parsed.block_version,
-                size: data.len(),
-            }
-        }
+        Some(data) => block_transactions_section(&data)
+            .map_err(|reason| api_error(StatusCode::INTERNAL_SERVER_ERROR, reason, None))?,
         None => return err(StatusCode::NOT_FOUND, "transactions not found"),
     };
 
@@ -1884,24 +1878,10 @@ pub async fn get_block_modifier(
                     },
                 }
             }
-            BLOCK_TRANSACTIONS_TYPE => {
-                let parsed = ergo_validation::parse_block_transactions(&data).map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiError {
-                            error: 500,
-                            reason: format!("parse failed: {e}"),
-                            detail: None,
-                        }),
-                    )
-                })?;
-                BlockModifier::BlockTransactions(BlockTransactionsSection {
-                    header_id: hex::encode(parsed.header_id),
-                    transactions: parsed.transactions,
-                    block_version: parsed.block_version,
-                    size: data.len(),
-                })
-            }
+            BLOCK_TRANSACTIONS_TYPE => BlockModifier::BlockTransactions(
+                block_transactions_section(&data)
+                    .map_err(|reason| api_error(StatusCode::INTERNAL_SERVER_ERROR, reason, None))?,
+            ),
             AD_PROOFS_TYPE => {
                 // Stored: [header_id: 32B] [proof_size: VLQ] [proof_bytes].
                 if data.len() < 32 {
@@ -3885,12 +3865,44 @@ mod tests {
         let served = get(state, &uri);
         assert_json_ok(&served, &uri);
 
+        // The JVM's `BlockTransactions`: the block version, and the stored
+        // section's length. 118 bytes: the 32-byte header id; the version
+        // marker 10,000,000 + 2, a 4-byte VLQ; a 1-byte count; and the
+        // 81-byte transaction.
         let value: serde_json::Value = serde_json::from_str(&served.body).unwrap();
         assert_eq!(value["headerId"], serde_json::Value::String(target_id_hex));
         assert_eq!(
             value["transactions"].as_array().map(Vec::len),
             Some(expected_tx_count)
         );
+        assert_eq!(value["blockVersion"], serde_json::json!(2));
+        assert_eq!(value["size"], serde_json::json!(118));
+    }
+
+    /// `/blocks/{id}/transactions` answers the object `/blocks/{id}` carries
+    /// as `blockTransactions`.
+    #[test]
+    fn block_transactions_answer_what_the_full_block_carries() {
+        let (state, tx, header_id, _) = extension_order_fixture();
+        let uri = format!("/blocks/{header_id}/transactions");
+        let served = get(state.clone(), &uri);
+        assert_json_ok(&served, &uri);
+        let section: serde_json::Value = serde_json::from_str(&served.body).unwrap();
+        assert_eq!(section["headerId"], serde_json::json!(header_id));
+        assert_eq!(section["blockVersion"], serde_json::json!(2));
+        // 32 + 4 + 1 as above, and an 87-byte transaction: the 81 of
+        // `make_vf_p2pk_tx` with two extension entries of 3 bytes each.
+        assert_eq!(section["size"], serde_json::json!(124));
+        assert_eq!(
+            section["transactions"][0]["id"],
+            serde_json::json!(hex::encode(tx.id().0 .0))
+        );
+
+        let uri = format!("/blocks/{header_id}");
+        let block = get(state, &uri);
+        assert_json_ok(&block, &uri);
+        let block: serde_json::Value = serde_json::from_str(&block.body).unwrap();
+        assert_eq!(block["blockTransactions"], section);
     }
 
     // -----------------------------------------------------------------------

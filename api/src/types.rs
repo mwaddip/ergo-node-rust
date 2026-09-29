@@ -63,16 +63,8 @@ pub struct EmissionInfo {
 // transaction holds it (`facts/api.md` § Transaction JSON). A
 // `serde_json::Value` on the way would sort those keys as strings.
 
-/// `GET /blocks/{headerId}/transactions` response.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BlockTransactions {
-    /// As the request spelled it.
-    pub header_id: String,
-    pub transactions: Vec<Transaction>,
-}
-
-/// A block's transactions section: `blockTransactions` in
+/// A block's transactions section, the JVM's `BlockTransactions` JSON:
+/// `GET /blocks/{headerId}/transactions`, `blockTransactions` in
 /// `GET /blocks/{headerId}`, and `GET /blocks/modifier/{id}` for one.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
