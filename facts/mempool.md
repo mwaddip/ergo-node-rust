@@ -143,7 +143,7 @@ pub struct Mempool {
 ```rust
 /// Ordering key for mempool transactions.
 /// Sorted by weight descending, then tx_id for deterministic tiebreak.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct TxWeight {
     /// Effective weight — starts as fee_per_factor, increased by family weighting.
     pub weight: u64,
@@ -151,8 +151,6 @@ pub struct TxWeight {
     pub fee_per_factor: u64,
     /// Transaction ID — tiebreaker for deterministic ordering.
     pub tx_id: [u8; 32],
-    /// Insertion timestamp (for statistics and cleanup ordering).
-    pub created: Instant,
 }
 
 impl Ord for TxWeight {
@@ -163,6 +161,10 @@ impl Ord for TxWeight {
     }
 }
 ```
+
+Equality is the ordering's: two weights are equal exactly when `cmp` says
+`Equal`, on `weight` and `tx_id`, as `Ord` requires. A transaction's times
+live on its `UnconfirmedTx` (`created`, `last_checked`), not here.
 
 ### `UnconfirmedTx`
 
@@ -537,17 +539,21 @@ transactions from a published mempool reader, not from the live pool
 ```rust
     /// Revalidate pool transactions against current state.
     ///
-    /// Iterates transactions in priority order. For each:
-    /// - Skip if `last_checked` is within `cleanup_interval`
+    /// Iterates transactions in priority order, highest weight first, so a
+    /// parent comes before its children. For each:
+    /// - Skip if no more than `cleanup_interval` has passed since `last_checked`
+    /// - Stop the pass if its accumulated cost has reached `CLEANUP_COST_LIMIT`
     /// - Resolve inputs from `utxo_reader`
     /// - Re-run `validate_single_transaction()`
     /// - If valid: set `validation_cost` to the measured cost and
-    ///   `last_checked` to now (the JVM's `UnconfirmedTransaction.withCost`)
+    ///   `last_checked` to now (the JVM's `UnconfirmedTransaction.withCost`),
+    ///   and add the measured cost to the pass's
     /// - If invalid: remove and invalidate
     /// - If inputs missing: remove (declined, not invalidated — may reappear)
+    /// - Either removal adds the transaction's previous `validation_cost`
+    ///   to the pass's cost, 0 when it has none
     ///
-    /// Stops when cumulative validation cost exceeds `cost_per_block` or
-    /// all transactions have been checked. Returns IDs of removed transactions.
+    /// A skipped transaction adds nothing. Returns IDs of removed transactions.
     pub fn revalidate(
         &mut self,
         utxo_reader: &dyn UtxoReader,
@@ -562,6 +568,15 @@ transactions from a published mempool reader, not from the live pool
         utxo_reader: &dyn UtxoReader,
     ) -> Vec<&UnconfirmedTx>;
 }
+```
+
+The pass's budget is a crate-level constant:
+
+```rust
+/// Validation cost one revalidation pass may spend: the JVM's
+/// `CleanupWorker.CostLimit` (v6.0.6 :27). Separate from `cost_per_block`,
+/// which limits what remote peers' transactions may cost between blocks.
+pub const CLEANUP_COST_LIMIT: u64 = 7_000_000;
 ```
 
 ## Processing a Transaction: Detailed Flow
@@ -601,7 +616,8 @@ code. Nothing may reorder them ahead of step 5.
    raised by a replacement; this is not an invalidation).
 8. **Compute weight**: `fee_per_factor = fee * 1024 / fee_factor` where `fee_factor`
    is `tx_bytes.len()` (FeePerByte) or `cost` (FeePerCycle, with `FakeCost = 1000`
-   fallback if cost is 0).
+   fallback if cost is 0). The product is computed wider than `u64`, and a
+   quotient that doesn't fit saturates at `u64::MAX`.
 9. **Check double-spends**: For each input box ID, check `by_input`:
    - Collect all conflicting transactions.
    - Compute `avg_conflict_weight = sum(weights) / count`.
