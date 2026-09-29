@@ -543,7 +543,14 @@ transactions from a published mempool reader, not from the live pool
     /// parent comes before its children. For each:
     /// - Skip if no more than `cleanup_interval` has passed since `last_checked`
     /// - Stop the pass if its accumulated cost has reached `CLEANUP_COST_LIMIT`
-    /// - Resolve inputs from `utxo_reader`
+    /// - Skip, unvalidated, a transaction with an output above the preheader
+    ///   height: step 6a's transient guard, since a reorg can move the
+    ///   preheader back. The JVM has no such guard, and invalidates it
+    /// - Resolve inputs from `utxo_reader`, then from the pool as the pass
+    ///   has left it. A child of a transaction removed earlier in the same
+    ///   pass is removed as inputs-missing; the JVM resolves against the
+    ///   pool as of the pass's start, so there the child survives until
+    ///   its next pass
     /// - Re-run `validate_single_transaction()`
     /// - If valid: set `validation_cost` to the measured cost and
     ///   `last_checked` to now (the JVM's `UnconfirmedTransaction.withCost`),
