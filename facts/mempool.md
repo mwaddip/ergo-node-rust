@@ -442,7 +442,11 @@ impl Mempool {
 
 ### Fee queries
 
-Each reads the clock once, as `now`. The arithmetic is integer, every
+`expected_wait_ms` and `pool_histogram` read the clock once, as `now`;
+`recommended_fee` depends on no time and reads none. Each clock-reading
+method, these two and `apply_block` and `revalidate`, has an
+`_at(now: Instant)` form that takes `now` instead. The tests drive those;
+everything else calls the plain form. The arithmetic is integer, every
 division truncates, and nothing overflows: a product that could exceed `u64`
 is computed wider, and a result that doesn't fit saturates.
 
