@@ -739,8 +739,8 @@ seconds when it never does.
 
 ## v0.7.9 — 2026-07-30
 
-- **Bump P2P frame cap to match JVM v6.0.4 `MaxMessageSize`.** The frame layer's
-  `MAX_BODY_SIZE` was 2 MiB. v6.0.4 sets `MaxMessageSize = 16,388,608` at the
+- **Bump P2P frame cap to match JVM v6.0.3 `MaxMessageSize`.** The frame layer's
+  `MAX_BODY_SIZE` was 2 MiB. v6.0.3 sets `MaxMessageSize = 16,388,608` at the
   serializer level. Both `MAX_BODY_SIZE` (frame) and `MAX_VLQ_LENGTH`
   (per-modifier data lengths) now match the JVM's cap.
 

@@ -52,9 +52,11 @@ mode = "full"
 max_inbound = 20
 ```
 
-`mode = "full"` advertises the node as a full archival peer and forwards
-everything. `mode = "light"` advertises as NiPoPoW-bootstrapped and
-gossips a reduced subset; pair with `state_type = "light"`.
+`mode = "full"` advertises the node as a full archival peer, and peers on
+that listener are served blocks. `mode = "light"` advertises it as
+NiPoPoW-bootstrapped: peers on that listener get no block data, only gossip
+(peer lists and transactions); pair with `state_type = "light"`. Either way
+the node never passes one peer's messages on to another.
 
 ### Seed peers
 

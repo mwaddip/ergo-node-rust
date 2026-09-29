@@ -3,7 +3,8 @@
 ## Module: `transport::frame`
 
 ### `encode(magic, frame) -> Vec<u8>`
-- **Precondition**: `magic` is 4 bytes; `frame.body.len() <= 256KB`.
+- **Precondition**: `magic` is 4 bytes; `frame.body.len() <= 16,388,608`, the JVM's
+  `MessageConstants.MaxMessageSize` (since v6.0.3).
 - **Postcondition**: Output is `[magic:4][code:1][length:4 BE][checksum:4][body:N]` where checksum = first 4 bytes of blake2b256(body).
 - **Invariant**: `decode(magic, encode(magic, frame)) == Ok(frame)`.
 
