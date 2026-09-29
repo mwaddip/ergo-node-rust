@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use enr_chain::TRANSACTION_TYPE_ID;
 use enr_p2p::types::PeerId;
 use tokio::time::{Duration, Instant};
 
@@ -66,6 +67,8 @@ pub struct CheckResult {
     pub fresh: Vec<[u8; 32]>,
     /// Abandoned IDs (exceeded max_checks).
     pub abandoned: Vec<[u8; 32]>,
+    /// Timed-out transaction IDs, dropped from the tracker without a retry.
+    pub forgotten: Vec<[u8; 32]>,
 }
 
 /// Tracks pending modifier requests with timeout-based retry.
@@ -74,7 +77,9 @@ pub struct CheckResult {
 /// ```text
 /// Unknown → Requested → Received
 ///               ↓
-///          (timeout) → re-request (different peer)
+///          (timeout) → transaction: Forgotten
+///               ↓
+///          re-request (different peer, attempt count kept)
 ///               ↓
 ///          (max checks) → Abandoned
 /// ```
@@ -112,6 +117,9 @@ impl DeliveryTracker {
     }
 
     /// Mark modifier IDs as requested from a peer.
+    ///
+    /// Starts each at zero attempts. A re-request after a timeout goes
+    /// through [`Self::mark_retried`] instead, which keeps the count.
     pub fn mark_requested(&mut self, ids: &[[u8; 32]], peer: PeerId, type_id: u8) {
         let now = Instant::now();
         for id in ids {
@@ -124,6 +132,26 @@ impl DeliveryTracker {
                     checks: 0,
                 },
             );
+        }
+    }
+
+    /// Record that timed-out requests were re-requested from `peer`.
+    ///
+    /// Each entry keeps its attempt count, so `max_checks` still bounds the
+    /// retries (JVM: `setRequested(…, checksDone)`). [`Self::check_timeouts`]
+    /// has already counted the attempt and restarted the clock. This moves
+    /// the request to the peer now being asked, so that the next timeout
+    /// names it as the peer that failed.
+    ///
+    /// PRECONDITION: every id is pending. They are the `retries` of the check
+    /// just run.
+    pub fn mark_retried(&mut self, ids: &[[u8; 32]], peer: PeerId) {
+        for id in ids {
+            let req = self.pending.get_mut(id);
+            debug_assert!(req.is_some(), "mark_retried on an id that is not pending");
+            if let Some(req) = req {
+                req.peer = peer;
+            }
         }
     }
 
@@ -144,15 +172,27 @@ impl DeliveryTracker {
 
     /// Check for timed-out requests and queued re-requests.
     /// Caller handles the actual network sends.
+    ///
+    /// A timed-out transaction is forgotten rather than retried: its entry is
+    /// removed and it is reported in [`CheckResult::forgotten`]. The peer may
+    /// have dropped it from its mempool, so no peer is at fault, and a later
+    /// `Inv` can request it again (JVM `CheckDelivery`,
+    /// `ErgoNodeViewSynchronizer` v6.0.6 :1260-1265).
     pub fn check_timeouts(&mut self) -> CheckResult {
         let mut retries = Vec::new();
         let mut abandoned = Vec::new();
+        let mut forgotten = Vec::new();
 
         let now = Instant::now();
         let mut to_remove = Vec::new();
 
         for (id, req) in &mut self.pending {
             if now.duration_since(req.requested_at) >= self.timeout {
+                if req.type_id == TRANSACTION_TYPE_ID {
+                    forgotten.push(*id);
+                    to_remove.push(*id);
+                    continue;
+                }
                 req.checks += 1;
                 if req.checks >= self.max_checks {
                     abandoned.push(*id);
@@ -178,6 +218,7 @@ impl DeliveryTracker {
             retries,
             fresh,
             abandoned,
+            forgotten,
         }
     }
 
@@ -318,6 +359,49 @@ mod tests {
         let r2 = tracker.check_timeouts();
         assert_eq!(r2.abandoned.len(), 1); // check 2 = max_checks
         assert!(r2.retries.is_empty());
+        assert_eq!(tracker.pending_count(), 0);
+    }
+
+    #[test]
+    fn timed_out_transaction_is_forgotten_not_retried() {
+        let mut tracker = DeliveryTracker::with_config(Duration::ZERO, 100);
+        tracker.mark_requested(&[id(1)], peer(1), TRANSACTION_TYPE_ID);
+        tracker.mark_requested(&[id(2)], peer(1), 101);
+
+        let result = tracker.check_timeouts();
+
+        assert_eq!(result.forgotten, vec![id(1)]);
+        assert_eq!(result.retries.len(), 1);
+        assert_eq!(result.retries[0].id, id(2), "only the header is retried");
+        assert!(result.abandoned.is_empty(), "forgetting is not abandoning");
+        assert!(!tracker.is_pending(&id(1)));
+        assert!(tracker.is_pending(&id(2)));
+    }
+
+    #[test]
+    fn mark_retried_moves_the_request_and_keeps_its_attempt_count() {
+        let mut tracker = DeliveryTracker::with_config(Duration::ZERO, 3);
+        tracker.mark_requested(&[id(1)], peer(1), 101);
+
+        let r1 = tracker.check_timeouts(); // attempt 1
+        assert_eq!(r1.retries[0].failed_peer, peer(1));
+        tracker.mark_retried(&[id(1)], peer(2));
+
+        let r2 = tracker.check_timeouts(); // attempt 2
+        assert_eq!(
+            r2.retries[0].failed_peer,
+            peer(2),
+            "the next timeout names the peer asked last"
+        );
+        tracker.mark_retried(&[id(1)], peer(1));
+
+        let r3 = tracker.check_timeouts(); // attempt 3 = max_checks
+        assert!(r3.retries.is_empty());
+        assert_eq!(
+            r3.abandoned,
+            vec![id(1)],
+            "the re-requests kept the count, so the limit is reached"
+        );
         assert_eq!(tracker.pending_count(), 0);
     }
 

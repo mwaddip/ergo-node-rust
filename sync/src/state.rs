@@ -29,6 +29,10 @@ fn is_block_section_type(type_id: u8) -> bool {
 /// SyncInfo (JVM `processSyncV1`/`V2`: `continuationIds(syncInfo, size = 400)`).
 const CONTINUATION_IDS_LIMIT: usize = 400;
 
+/// Most ids one `ModifierRequest` may carry. The JVM parses a request as an
+/// `Inv` and rejects more than `InvSpec.maxInvObjects` (400).
+const MAX_MODIFIER_REQUEST_IDS: usize = 400;
+
 /// Anchor ids from a parsed SyncInfo, newest first — the order
 /// `SyncChain::continuation_ids` expects. V2 headers arrive tip-first on the
 /// wire; V1 ids arrive oldest-first (JVM `lastHeaderIds` convention) and are
@@ -1019,8 +1023,8 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     /// Request announced modifiers from a peer and track delivery.
     ///
     /// Filters out IDs already in the store or pending in the delivery
-    /// tracker before sending. Chunks into messages of at most 400 IDs
-    /// to stay within the JVM's `desiredInvObjects` limit.
+    /// tracker before sending. Chunks into messages of at most
+    /// [`MAX_MODIFIER_REQUEST_IDS`] IDs.
     async fn request_announced(&mut self, peer: PeerId, modifier_type: u8, ids: Vec<[u8; 32]>) {
         if !self
             .block_request_gate
@@ -1052,8 +1056,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
             return;
         }
         self.tracker.mark_requested(&needed, peer, modifier_type);
-        // JVM rejects ModifierRequest with >400 elements
-        for chunk in needed.chunks(400) {
+        for chunk in needed.chunks(MAX_MODIFIER_REQUEST_IDS) {
             if let Err(e) = self
                 .transport
                 .send_to(
@@ -1724,6 +1727,12 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
     }
 
     /// Handle delivery check results: re-request timed-out and evicted modifiers.
+    ///
+    /// The re-requests go out batched: one `ModifierRequest` per (target
+    /// peer, modifier type), of at most [`MAX_MODIFIER_REQUEST_IDS`] ids,
+    /// never one per id. A peer's write queue holds 64 frames and a full
+    /// queue aborts the peer (`../facts/sync.md` § "Delivery timeouts").
+    /// Timed-out transactions are not among them: the tracker forgets those.
     async fn handle_delivery_check(&mut self, result: crate::delivery::CheckResult) {
         // Re-request timed-out modifiers from a different peer
         if !result.retries.is_empty()
@@ -1732,29 +1741,50 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 .load(std::sync::atomic::Ordering::Relaxed)
         {
             let peers = self.transport.outbound_peers().await;
+            let mut batches: HashMap<(PeerId, u8), Vec<[u8; 32]>> = HashMap::new();
             for retry in &result.retries {
                 let target = peers
                     .iter()
                     .find(|&&p| p != retry.failed_peer)
                     .copied()
                     .unwrap_or(retry.failed_peer);
+                batches
+                    .entry((target, retry.type_id))
+                    .or_default()
+                    .push(retry.id);
+            }
 
-                self.tracker
-                    .mark_requested(&[retry.id], target, retry.type_id);
-                let _ = self
-                    .transport
-                    .send_to(
-                        target,
-                        ProtocolMessage::ModifierRequest {
-                            modifier_type: retry.type_id,
-                            ids: vec![retry.id],
-                        },
-                    )
-                    .await;
+            let batch_count = batches.len();
+            for ((target, modifier_type), ids) in batches {
+                self.tracker.mark_retried(&ids, target);
+                for chunk in ids.chunks(MAX_MODIFIER_REQUEST_IDS) {
+                    if let Err(e) = self
+                        .transport
+                        .send_to(
+                            target,
+                            ProtocolMessage::ModifierRequest {
+                                modifier_type,
+                                ids: chunk.to_vec(),
+                            },
+                        )
+                        .await
+                    {
+                        tracing::warn!(peer = %target, "modifier re-request send failed: {e}");
+                        break;
+                    }
+                }
             }
             tracing::debug!(
                 count = result.retries.len(),
+                batches = batch_count,
                 "re-requested timed-out modifiers"
+            );
+        }
+
+        if !result.forgotten.is_empty() {
+            tracing::debug!(
+                count = result.forgotten.len(),
+                "forgot timed-out transaction requests"
             );
         }
 
@@ -4900,6 +4930,446 @@ mod serve_continuation_tests {
         assert_eq!(
             *ids, expected,
             "ids ascend from the common point (372) + 1 to our tip"
+        );
+    }
+}
+
+#[cfg(test)]
+mod delivery_check_tests {
+    //! What one delivery check sends (`../facts/sync.md` § "Delivery
+    //! timeouts"). A timed-out transaction is forgotten. A timed-out header
+    //! or section is re-requested from another peer, batched into one
+    //! `ModifierRequest` per (target peer, modifier type) of at most 400 ids,
+    //! until the attempt limit abandons it.
+    //!
+    //! History (2026-09-29): the check sent a single-id request per
+    //! timed-out modifier to the first outbound peer that had not failed it,
+    //! the same peer for nearly all of them. Sixty transaction retries in one
+    //! burst filled that peer's 64-frame write queue before its writer ran,
+    //! the full queue aborted the peer, and the next check's burst went to
+    //! the next peer, until none were left.
+    use super::*;
+    use enr_chain::{ChainError, SyncInfo};
+    use ergo_chain_types::{ADDigest, Header};
+    use ergo_validation::{
+        ApplyStateOutcome, BlockValidator, Parameters, StatePersistence, ValidationError,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+    use std::sync::{Arc, Mutex};
+
+    const P1: PeerId = PeerId(1);
+    const P2: PeerId = PeerId(2);
+
+    /// Messages recorded by [`RecordingTransport`], shared with the test.
+    type SentLog = Arc<Mutex<Vec<(PeerId, ProtocolMessage)>>>;
+
+    type TestSync = HeaderSync<RecordingTransport, UnusedChain, EmptyStore, UnusedValidator>;
+
+    /// Transport with a fixed outbound peer set, recording every send.
+    struct RecordingTransport {
+        peers: Vec<PeerId>,
+        sent: SentLog,
+    }
+
+    impl SyncTransport for RecordingTransport {
+        async fn send_to(
+            &self,
+            peer: PeerId,
+            message: ProtocolMessage,
+        ) -> Result<(), Box<dyn std::error::Error + Send>> {
+            self.sent.lock().unwrap().push((peer, message));
+            Ok(())
+        }
+
+        async fn outbound_peers(&self) -> Vec<PeerId> {
+            self.peers.clone()
+        }
+
+        async fn next_event(&mut self) -> Option<ProtocolEvent> {
+            std::future::pending().await
+        }
+    }
+
+    /// A store holding nothing, so an announced id is always wanted.
+    struct EmptyStore;
+
+    impl SyncStore for EmptyStore {
+        async fn has_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> bool {
+            false
+        }
+        async fn get_modifier(&self, _type_id: u8, _id: &[u8; 32]) -> Option<Vec<u8>> {
+            unreachable!("not called in delivery check tests")
+        }
+        async fn validated_height(&self) -> Option<u32> {
+            None
+        }
+        async fn set_validated_height(&self, _height: u32) {}
+        async fn flush(&self) {}
+        async fn prune_below_height(
+            &self,
+            _horizon: u32,
+            _type_ids: &[u8],
+        ) -> Result<usize, String> {
+            unreachable!("not called in delivery check tests")
+        }
+        async fn min_height_present(&self, _type_id: u8) -> Result<Option<u32>, String> {
+            unreachable!("not called in delivery check tests")
+        }
+    }
+
+    /// Never consulted: neither the check nor the Inv path reads the chain.
+    struct UnusedChain;
+
+    impl SyncChain for UnusedChain {
+        async fn chain_height(&self) -> u32 {
+            unreachable!("not called in delivery check tests")
+        }
+        async fn build_sync_info(&self) -> Vec<u8> {
+            unreachable!("not called in delivery check tests")
+        }
+        async fn header_at(&self, _height: u32) -> Option<Header> {
+            unreachable!("not called in delivery check tests")
+        }
+        async fn header_state_root(&self, _height: u32) -> Option<[u8; 33]> {
+            unreachable!("not called in delivery check tests")
+        }
+        fn parse_sync_info(&self, _body: &[u8]) -> Result<SyncInfo, ChainError> {
+            unreachable!("not called in delivery check tests")
+        }
+        async fn continuation_ids(
+            &self,
+            _peer_last_ids: &[BlockId],
+            _limit: usize,
+        ) -> Vec<[u8; 32]> {
+            unreachable!("not called in delivery check tests")
+        }
+        async fn active_parameters(&self) -> Parameters {
+            unreachable!("not called in delivery check tests")
+        }
+        async fn is_epoch_boundary(&self, _height: u32) -> bool {
+            unreachable!("not called in delivery check tests")
+        }
+        async fn voting_length(&self) -> u32 {
+            unreachable!("not called in delivery check tests")
+        }
+        async fn compute_expected_parameters(
+            &self,
+            _epoch_boundary_height: u32,
+            _block_proposed_update: &[u8],
+        ) -> Result<Parameters, ChainError> {
+            unreachable!("not called in delivery check tests")
+        }
+        async fn apply_epoch_boundary_parameters(
+            &self,
+            _params: Parameters,
+            _proposed_update_bytes: Vec<u8>,
+        ) {
+            unreachable!("not called in delivery check tests")
+        }
+        async fn active_proposed_update_bytes(&self) -> Vec<u8> {
+            unreachable!("not called in delivery check tests")
+        }
+        async fn verify_nipopow_envelope(
+            &self,
+            _envelope_body: &[u8],
+        ) -> Result<Vec<Header>, ChainError> {
+            unreachable!("not called in delivery check tests")
+        }
+        async fn is_better_nipopow(&self, _this: &[u8], _than: &[u8]) -> Result<bool, ChainError> {
+            unreachable!("not called in delivery check tests")
+        }
+        async fn install_nipopow_suffix(
+            &self,
+            _suffix_head: Header,
+            _suffix_tail: Vec<Header>,
+        ) -> Result<(), ChainError> {
+            unreachable!("not called in delivery check tests")
+        }
+    }
+
+    /// Never invoked: nothing here applies a block.
+    struct UnusedValidator;
+
+    impl BlockValidator for UnusedValidator {
+        fn apply_state(
+            &mut self,
+            _header: &Header,
+            _block_txs: &[u8],
+            _ad_proofs: Option<&[u8]>,
+            _extension: &[u8],
+            _preceding_headers: &[Header],
+            _active_params: &Parameters,
+            _expected_boundary_params: Option<&Parameters>,
+            _expected_proposed_update: Option<&[u8]>,
+        ) -> Result<ApplyStateOutcome, ValidationError> {
+            unreachable!("not called in delivery check tests")
+        }
+        fn validated_height(&self) -> u32 {
+            unreachable!("not called in delivery check tests")
+        }
+        fn current_digest(&self) -> &ADDigest {
+            unreachable!("not called in delivery check tests")
+        }
+        fn reset_to(&mut self, _height: u32, _digest: ADDigest) -> Result<(), ValidationError> {
+            unreachable!("not called in delivery check tests")
+        }
+        fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+            None
+        }
+    }
+
+    /// A sync machine with the request gate open, whose every delivery check
+    /// finds every pending request timed out: one check is one attempt.
+    fn build_sync(peers: Vec<PeerId>, max_delivery_checks: u32) -> (TestSync, SentLog) {
+        let sent = SentLog::default();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (_progress_tx, progress_rx) = mpsc::channel(1);
+        let (_dc_tx, delivery_control_rx) = mpsc::unbounded_channel::<DeliveryControl>();
+        let (_dd_tx, delivery_data_rx) = mpsc::channel::<DeliveryData>(1);
+        let config = SyncConfig {
+            delivery_timeout: Duration::ZERO,
+            max_delivery_checks,
+            ..SyncConfig::default()
+        };
+        let sync = HeaderSync::new(
+            config,
+            RecordingTransport {
+                peers,
+                sent: Arc::clone(&sent),
+            },
+            UnusedChain,
+            EmptyStore,
+            None,
+            progress_rx,
+            delivery_control_rx,
+            delivery_data_rx,
+            None,
+            None,
+            Arc::new(AtomicU32::new(0)),
+            // Open. A closed gate sends nothing at all, which would pass
+            // every "nothing was sent" assertion below for the wrong reason.
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            shutdown_rx,
+        );
+        (sync, sent)
+    }
+
+    /// One delivery check, as both run-loop arms perform it.
+    async fn check(sync: &mut TestSync) {
+        let result = sync.tracker.check_timeouts();
+        sync.handle_delivery_check(result).await;
+    }
+
+    /// `n` distinct ids. The tag keeps different batches from colliding.
+    fn ids(tag: u8, n: u32) -> Vec<[u8; 32]> {
+        (0..n)
+            .map(|i| {
+                let mut id = [tag; 32];
+                id[..4].copy_from_slice(&i.to_le_bytes());
+                id
+            })
+            .collect()
+    }
+
+    fn sorted(mut ids: Vec<[u8; 32]>) -> Vec<[u8; 32]> {
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Every `ModifierRequest` sent, in send order.
+    fn requests(sent: &SentLog) -> Vec<(PeerId, u8, Vec<[u8; 32]>)> {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(peer, message)| match message {
+                ProtocolMessage::ModifierRequest { modifier_type, ids } => {
+                    Some((*peer, *modifier_type, ids.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn timed_out_transactions_are_forgotten_not_rerequested() {
+        let (mut sync, sent) = build_sync(vec![P1, P2], 100);
+        sync.tracker
+            .mark_requested(&ids(0x02, 60), P1, TRANSACTION_TYPE_ID);
+
+        check(&mut sync).await;
+
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a timed-out transaction is not re-requested (JVM CheckDelivery), \
+             got {} messages",
+            sent.lock().unwrap().len()
+        );
+        assert_eq!(
+            sync.tracker.pending_count(),
+            0,
+            "a forgotten transaction leaves no pending entry behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_transaction_is_requested_again_on_a_later_inv() {
+        let (mut sync, sent) = build_sync(vec![P1, P2], 100);
+        let tx = ids(0x02, 1);
+        sync.tracker.mark_requested(&tx, P1, TRANSACTION_TYPE_ID);
+        check(&mut sync).await;
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "forgotten, not re-requested"
+        );
+
+        let inv = ProtocolEvent::Message {
+            peer_id: P2,
+            message: ProtocolMessage::Inv {
+                modifier_type: TRANSACTION_TYPE_ID,
+                ids: tx.clone(),
+            },
+        };
+        let result = sync.handle_event(P1, inv).await;
+
+        assert!(matches!(result, EventResult::Continue));
+        assert_eq!(
+            requests(&sent),
+            vec![(P2, TRANSACTION_TYPE_ID, tx.clone())],
+            "the announcer is asked for it: a stale pending entry would have \
+             filtered the Inv out"
+        );
+        assert!(sync.tracker.is_pending(&tx[0]));
+    }
+
+    #[tokio::test]
+    async fn sixty_timed_out_sections_go_out_as_one_request() {
+        let (mut sync, sent) = build_sync(vec![P1, P2], 100);
+        let sections = ids(0x66, 60);
+        sync.tracker
+            .mark_requested(&sections, P1, BLOCK_TRANSACTIONS_TYPE_ID);
+
+        check(&mut sync).await;
+
+        let reqs = requests(&sent);
+        assert_eq!(
+            reqs.len(),
+            1,
+            "sixty ids for one target go out as one ModifierRequest"
+        );
+        let (to, modifier_type, got) = reqs.into_iter().next().unwrap();
+        assert_eq!(
+            to, P2,
+            "re-requested from a peer other than the one that failed"
+        );
+        assert_eq!(modifier_type, BLOCK_TRANSACTIONS_TYPE_ID);
+        assert_eq!(sorted(got), sorted(sections));
+    }
+
+    #[tokio::test]
+    async fn retries_beyond_400_ids_are_chunked_at_400() {
+        let (mut sync, sent) = build_sync(vec![P1, P2], 100);
+        let sections = ids(0x66, 450);
+        sync.tracker
+            .mark_requested(&sections, P1, BLOCK_TRANSACTIONS_TYPE_ID);
+
+        check(&mut sync).await;
+
+        let reqs = requests(&sent);
+        let sizes: Vec<usize> = reqs.iter().map(|(_, _, ids)| ids.len()).collect();
+        assert_eq!(sizes, vec![400, 50], "the JVM's per-message cap is 400 ids");
+        assert!(reqs
+            .iter()
+            .all(|(to, t, _)| *to == P2 && *t == BLOCK_TRANSACTIONS_TYPE_ID));
+        let all: Vec<[u8; 32]> = reqs.into_iter().flat_map(|(_, _, ids)| ids).collect();
+        assert_eq!(sorted(all), sorted(sections), "every id asked for once");
+    }
+
+    #[tokio::test]
+    async fn mixed_types_go_out_as_one_request_per_peer_and_type() {
+        let (mut sync, sent) = build_sync(vec![P1, P2], 100);
+        // Failed at P1, so bound for P2.
+        sync.tracker
+            .mark_requested(&ids(0x65, 5), P1, HEADER_TYPE_ID);
+        sync.tracker
+            .mark_requested(&ids(0x66, 7), P1, BLOCK_TRANSACTIONS_TYPE_ID);
+        sync.tracker
+            .mark_requested(&ids(0x6c, 4), P1, EXTENSION_TYPE_ID);
+        // Failed at P2, so bound for P1.
+        sync.tracker
+            .mark_requested(&ids(0x6d, 3), P2, EXTENSION_TYPE_ID);
+        // Forgotten.
+        sync.tracker
+            .mark_requested(&ids(0x02, 10), P1, TRANSACTION_TYPE_ID);
+
+        check(&mut sync).await;
+
+        let mut got: Vec<(u64, u8, usize)> = requests(&sent)
+            .into_iter()
+            .map(|(to, t, ids)| (to.0, t, ids.len()))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![
+                (1, EXTENSION_TYPE_ID, 3),
+                (2, HEADER_TYPE_ID, 5),
+                (2, BLOCK_TRANSACTIONS_TYPE_ID, 7),
+                (2, EXTENSION_TYPE_ID, 4),
+            ],
+            "one message per (peer, type), and none for the transactions"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_retry_goes_to_a_peer_other_than_the_last_one_asked() {
+        let (mut sync, sent) = build_sync(vec![P1, P2], 100);
+        sync.tracker
+            .mark_requested(&ids(0x65, 1), P1, HEADER_TYPE_ID);
+
+        check(&mut sync).await;
+        check(&mut sync).await;
+
+        let targets: Vec<PeerId> = requests(&sent).into_iter().map(|(to, _, _)| to).collect();
+        assert_eq!(
+            targets,
+            vec![P2, P1],
+            "P1 failed, so P2 is asked; then P2 failed, so P1 is"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_no_other_peer_the_failed_one_is_asked_again() {
+        let (mut sync, sent) = build_sync(vec![P1], 100);
+        let header = ids(0x65, 1);
+        sync.tracker.mark_requested(&header, P1, HEADER_TYPE_ID);
+
+        check(&mut sync).await;
+
+        assert_eq!(requests(&sent), vec![(P1, HEADER_TYPE_ID, header)]);
+    }
+
+    #[tokio::test]
+    async fn attempts_are_counted_across_retries_and_the_limit_abandons() {
+        let (mut sync, sent) = build_sync(vec![P1, P2], 3);
+        sync.tracker
+            .mark_requested(&ids(0x65, 1), P1, HEADER_TYPE_ID);
+
+        check(&mut sync).await; // attempt 1: re-requested
+        check(&mut sync).await; // attempt 2: re-requested
+        assert_eq!(requests(&sent).len(), 2);
+
+        check(&mut sync).await; // attempt 3 reaches max_delivery_checks
+        assert_eq!(
+            requests(&sent).len(),
+            2,
+            "the third timeout abandons: a re-request must not reset the count"
+        );
+        assert_eq!(
+            sync.tracker.pending_count(),
+            0,
+            "an abandoned request leaves the tracker"
         );
     }
 }
