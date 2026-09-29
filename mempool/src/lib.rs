@@ -20,6 +20,10 @@ use stats::FeeStats;
 use types::{MempoolConfig, UnconfirmedTx};
 use weight::TxWeight;
 
+/// Largest serialized transaction the node accepts from a peer or the API.
+/// The JVM's `maxTransactionSize` default (`application.conf`).
+pub const MAX_TRANSACTION_SIZE: usize = 98_304;
+
 pub struct Mempool {
     pool: OrderedPool,
     invalidated: ExpiringCache<[u8; 32]>,
