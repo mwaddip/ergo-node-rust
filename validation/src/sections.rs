@@ -2,9 +2,11 @@
 
 use std::io::Cursor;
 
+use enr_chain::{block_transactions_read_version, block_transactions_write_version};
 use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::ergotree_ir::serialization::constant_store::ConstantStore;
-use ergo_lib::ergotree_ir::serialization::sigma_byte_reader::SigmaByteReader;
+use ergo_lib::ergotree_ir::serialization::sigma_byte_reader::{SigmaByteRead, SigmaByteReader};
+use ergo_lib::ergotree_ir::serialization::sigma_byte_writer::{SigmaByteWrite, SigmaByteWriter};
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use sigma_ser::vlq_encode::ReadSigmaVlqExt;
 
@@ -82,7 +84,11 @@ const BLOCK_VERSION_SENTINEL: u32 = 10_000_000;
 /// Wire format: `[header_id: 32B] [ver_or_count: VLQ] [tx_count: VLQ if ver>1] [txs...]`
 ///
 /// Version hack: if first VLQ > 10M, subtract 10M for block_version, read separate tx_count.
-/// Otherwise first VLQ IS the tx_count and block_version = 1.
+/// Otherwise first VLQ IS the tx_count and block_version = 1. A block_version
+/// that does not fit `u8` is a parse error.
+///
+/// Each transaction is read at `enr_chain::block_transactions_read_version`
+/// of that block_version: version 3 from block version 4, version 0 below.
 pub fn parse_block_transactions(data: &[u8]) -> Result<ParsedBlockTransactions, ValidationError> {
     const TYPE_ID: u8 = 102;
     if data.len() < 33 {
@@ -97,6 +103,12 @@ pub fn parse_block_transactions(data: &[u8]) -> Result<ParsedBlockTransactions, 
 
     let (block_version, tx_count) = if ver_or_count > BLOCK_VERSION_SENTINEL {
         let version = ver_or_count - BLOCK_VERSION_SENTINEL;
+        // `Header.version` is a byte. `enr_chain::section_id_from_body`
+        // rejects a larger version, and the two parsers must agree
+        // (facts/chain.md § "Two parsers, one wire format").
+        let version = u8::try_from(version).map_err(|_| {
+            section_parse_err(TYPE_ID, format!("block version {version} does not fit u8"))
+        })?;
         let count = cursor
             .get_u32()
             .map_err(|e| section_parse_err(TYPE_ID, format!("tx_count VLQ: {e}")))?;
@@ -104,9 +116,16 @@ pub fn parse_block_transactions(data: &[u8]) -> Result<ParsedBlockTransactions, 
     } else {
         (1, ver_or_count as usize)
     };
+    // The version the section encodes, not the header's, selects the tree
+    // version its transactions are read at, and the fork computes each
+    // transaction's id at the version it read it at (facts/chain.md § "The
+    // tree version a block's transactions are read at").
+    let tree_version = block_transactions_read_version(block_version);
 
     // Parse individual transactions from the remaining byte stream.
     // Transaction::sigma_parse reads from a SigmaByteReader and advances the position.
+    // It starts each transaction on a fresh parse state (level 0, empty
+    // stores); `with_tree_version` swaps only the version around it.
     // The wire count bounds the loop trip count only — never a preallocation.
     let pos = 32 + cursor.position() as usize;
     let tx_cursor = Cursor::new(&data[pos..]);
@@ -114,14 +133,15 @@ pub fn parse_block_transactions(data: &[u8]) -> Result<ParsedBlockTransactions, 
     let mut transactions = Vec::new();
 
     for i in 0..tx_count {
-        let tx = Transaction::sigma_parse(&mut reader)
+        let tx = reader
+            .with_tree_version(tree_version, Transaction::sigma_parse)
             .map_err(|e| section_parse_err(TYPE_ID, format!("transaction {i}: {e}")))?;
         transactions.push(tx);
     }
 
     Ok(ParsedBlockTransactions {
         header_id,
-        block_version,
+        block_version: u32::from(block_version),
         transactions,
     })
 }
@@ -199,11 +219,28 @@ pub fn serialize_ad_proofs(header_id: &[u8; 32], proof_bytes: &[u8]) -> Vec<u8> 
 ///
 /// Wire format: `[header_id: 32B] [version_sentinel: VLQ] [tx_count: VLQ] [txs...]`
 /// where `version_sentinel = BLOCK_VERSION_SENTINEL + block_version` for v2+.
+///
+/// Each transaction is written at `enr_chain::block_transactions_write_version`
+/// of `block_version`: version 3 from block version 3, version 0 below (JVM
+/// `BlockTransactionsSerializer.serialize`). A v3 block is written at 3 and
+/// read back at 0; the asymmetry is the JVM's own. `sigma_serialize_bytes()`
+/// is not this rule: it writes every block at the fork's highest version.
+/// A `block_version` that does not fit `u8` is an error.
 pub fn serialize_block_transactions(
     header_id: &[u8; 32],
     block_version: u32,
     transactions: &[Transaction],
 ) -> Result<Vec<u8>, ValidationError> {
+    const TYPE_ID: u8 = 102;
+    // `Header.version` is a byte, and neither parser reads a larger one back.
+    let version = u8::try_from(block_version).map_err(|_| {
+        section_parse_err(
+            TYPE_ID,
+            format!("block version {block_version} does not fit u8"),
+        )
+    })?;
+    let tree_version = block_transactions_write_version(version);
+
     let mut out = Vec::new();
     out.extend_from_slice(header_id);
 
@@ -217,12 +254,11 @@ pub fn serialize_block_transactions(
     WriteSigmaVlqExt::put_u32(&mut count_buf, transactions.len() as u32).unwrap();
     out.extend_from_slice(&count_buf);
 
-    // Transactions
+    // Transactions, on one writer as the JVM's serializer writes them
+    let mut w = SigmaByteWriter::new(&mut out, None);
     for (i, tx) in transactions.iter().enumerate() {
-        let tx_bytes = tx
-            .sigma_serialize_bytes()
-            .map_err(|e| section_parse_err(102, format!("transaction {i} serialize: {e}")))?;
-        out.extend_from_slice(&tx_bytes);
+        w.with_tree_version(tree_version, |w| tx.sigma_serialize(w))
+            .map_err(|e| section_parse_err(TYPE_ID, format!("transaction {i} serialize: {e}")))?;
     }
 
     Ok(out)
@@ -260,6 +296,12 @@ pub fn serialize_extension(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        raw_section, tx_read_at, EXTENSION_TX, EXTENSION_TX_AT_0, EXTENSION_TX_ID_AT_0,
+        EXTENSION_TX_ID_AT_3, HEADER_ID, REGISTER_OUTPUT_ID_AT_0, REGISTER_OUTPUT_ID_AT_3,
+        REGISTER_TX, REGISTER_TX_ID_AT_0, REGISTER_TX_ID_AT_3,
+    };
+    use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
     use sigma_ser::vlq_encode::WriteSigmaVlqExt;
 
     // --- ADProofs tests ---
@@ -427,6 +469,175 @@ mod tests {
             }
             Err(other) => panic!("expected SectionParse, got {other:?}"),
             Ok(_) => panic!("u32::MAX transactions with none supplied must Err"),
+        }
+    }
+
+    // --- Tree versions (facts/chain.md § "The tree version a block's
+    // transactions are read at"). Fixtures in `test_support`. ---
+
+    /// The ids of a section holding [`EXTENSION_TX`] then [`REGISTER_TX`]:
+    /// both transaction ids, and the box id of the register transaction's
+    /// output.
+    fn ids(parsed: &ParsedBlockTransactions) -> [String; 3] {
+        let [extension, register] = &parsed.transactions[..] else {
+            panic!("two transactions, got {}", parsed.transactions.len());
+        };
+        [
+            hex::encode(extension.id().as_ref()),
+            hex::encode(register.id().as_ref()),
+            hex::encode(register.outputs.first().box_id().as_ref()),
+        ]
+    }
+
+    const IDS_AT_3: [&str; 3] = [
+        EXTENSION_TX_ID_AT_3,
+        REGISTER_TX_ID_AT_3,
+        REGISTER_OUTPUT_ID_AT_3,
+    ];
+    const IDS_AT_0: [&str; 3] = [
+        EXTENSION_TX_ID_AT_0,
+        REGISTER_TX_ID_AT_0,
+        REGISTER_OUTPUT_ID_AT_0,
+    ];
+
+    /// From block version 4 a section's transactions are read at tree
+    /// version 3, so X15's `Upcast` stays in the ids, in every transaction of
+    /// the section.
+    #[test]
+    fn a_v4_section_reads_its_transactions_at_3() {
+        let parsed =
+            parse_block_transactions(&raw_section(4, &[EXTENSION_TX, REGISTER_TX])).unwrap();
+        assert_eq!(parsed.block_version, 4);
+        assert_eq!(ids(&parsed), IDS_AT_3);
+    }
+
+    /// Below block version 4 the same bytes are read at 0, where X15's
+    /// `Upcast` is written as `1`: the ids are others. Version 1 carries no
+    /// version framing and reads at 0 as well.
+    #[test]
+    fn below_v4_a_section_reads_the_same_transactions_at_0() {
+        for block_version in [1, 2, 3] {
+            let body = raw_section(block_version, &[EXTENSION_TX, REGISTER_TX]);
+            let parsed = parse_block_transactions(&body).unwrap();
+            assert_eq!(parsed.block_version, block_version);
+            assert_eq!(ids(&parsed), IDS_AT_0, "block version {block_version}");
+        }
+    }
+
+    /// `Header.version` is a byte: 255 parses, 256 does not, as in
+    /// `enr_chain::section_id_from_body`.
+    #[test]
+    fn a_block_version_beyond_u8_is_a_parse_error() {
+        let parsed = parse_block_transactions(&raw_section(255, &[EXTENSION_TX])).unwrap();
+        assert_eq!(parsed.block_version, 255);
+        match parse_block_transactions(&raw_section(256, &[EXTENSION_TX])) {
+            Err(ValidationError::SectionParse {
+                section_type,
+                reason,
+            }) => {
+                assert_eq!(section_type, 102);
+                assert!(
+                    reason.contains("block version 256 does not fit u8"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            Err(other) => panic!("expected SectionParse, got {other:?}"),
+            Ok(_) => panic!("block version 256 must not parse"),
+        }
+    }
+
+    /// `Transaction::sigma_parse` starts each transaction on a fresh parse
+    /// state (facts/validation.md § Transaction rules taken from ergo-lib,
+    /// "Per transaction"), and reading at a tree version leaves it so: a
+    /// `ValUse(1)` without a `ValDef` of its own is rejected after a
+    /// transaction that defined 1, at both read versions.
+    #[test]
+    fn each_transaction_starts_on_a_fresh_parse_state_at_either_version() {
+        // Box `0…0` spent with an empty proof into one 1 ERG output guarded by
+        // `tree`.
+        let tx = |tree: &str| {
+            format!(
+                "01{}0000000001{}{tree}010000",
+                "00".repeat(32),
+                "8094ebdc03"
+            )
+        };
+        // `{ val v1 = sigmaProp(true); v1 }`, and `v1` with no definition
+        let defines = tx("00d801d60108d37201");
+        let uses_undefined = tx("007201");
+        for block_version in [3, 4] {
+            let both_define = raw_section(block_version, &[&defines, &defines]);
+            assert!(
+                parse_block_transactions(&both_define).is_ok(),
+                "block version {block_version}"
+            );
+            match parse_block_transactions(&raw_section(
+                block_version,
+                &[&defines, &uses_undefined],
+            )) {
+                Err(ValidationError::SectionParse {
+                    section_type: 102,
+                    reason,
+                }) => assert!(
+                    reason.starts_with("transaction 1: "),
+                    "block version {block_version}: {reason}"
+                ),
+                Err(other) => panic!("expected SectionParse, got {other:?}"),
+                Ok(_) => panic!("block version {block_version}: an undefined ValUse parsed"),
+            }
+        }
+    }
+
+    /// The writer follows the JVM's serializer: version 3 from block version
+    /// 3, version 0 below. X15's `Upcast` is the difference between the two.
+    #[test]
+    fn serialize_writes_a_v3_block_at_3_and_a_v2_block_at_0() {
+        let tx = tx_read_at(EXTENSION_TX, ErgoTreeVersion::V3);
+        for (block_version, written) in
+            [(2, EXTENSION_TX_AT_0), (3, EXTENSION_TX), (4, EXTENSION_TX)]
+        {
+            let body =
+                serialize_block_transactions(&HEADER_ID, block_version, std::slice::from_ref(&tx))
+                    .unwrap();
+            assert_eq!(
+                hex::encode(body),
+                hex::encode(raw_section(block_version, &[written])),
+                "block version {block_version}"
+            );
+        }
+    }
+
+    /// A v4 section written and read back keeps the ids: both sides are at 3.
+    /// A v3 one is written at 3 and read at 0, so X15's ids change: the JVM's
+    /// own asymmetry (facts/validation.md § Section Parsing, "Writing").
+    #[test]
+    fn written_then_read_a_v4_section_keeps_the_ids_and_a_v3_one_does_not() {
+        let txs = [
+            tx_read_at(EXTENSION_TX, ErgoTreeVersion::V3),
+            tx_read_at(REGISTER_TX, ErgoTreeVersion::V3),
+        ];
+        for (block_version, expected) in [(4, IDS_AT_3), (3, IDS_AT_0)] {
+            let body = serialize_block_transactions(&HEADER_ID, block_version, &txs).unwrap();
+            let parsed = parse_block_transactions(&body).unwrap();
+            assert_eq!(ids(&parsed), expected, "block version {block_version}");
+        }
+    }
+
+    #[test]
+    fn serialize_rejects_a_block_version_beyond_u8() {
+        match serialize_block_transactions(&HEADER_ID, 256, &[]) {
+            Err(ValidationError::SectionParse {
+                section_type,
+                reason,
+            }) => {
+                assert_eq!(section_type, 102);
+                assert!(
+                    reason.contains("block version 256 does not fit u8"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            Err(other) => panic!("expected SectionParse, got {other:?}"),
+            Ok(_) => panic!("block version 256 must not be written"),
         }
     }
 }

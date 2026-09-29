@@ -793,7 +793,7 @@ mod tests {
     use enr_state::{AVLTreeParams, CacheSize, RedbAVLStorage};
     use ergo_chain_types::Digest32;
     use ergo_lib::chain::transaction::Transaction;
-    use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
+    use ergo_lib::ergotree_ir::ergo_tree::{ErgoTree, ErgoTreeVersion};
     use tempfile::TempDir;
     use tracing_test::traced_test;
 
@@ -1108,6 +1108,113 @@ mod tests {
             before,
             "computing mining proofs moved the validator's own prover"
         );
+    }
+
+    // ── Tree versions ────────────────────────────────────────────────────
+    //
+    // A v4 block whose output's R4 holds SANTA X15, `Tuple(1, Upcast(1,
+    // Long))`. Its transaction is read at tree version 3, so the transaction
+    // id keeps the `Upcast`. Its output enters the tree as `ErgoBox::bytes()`,
+    // written at 0, so the value does not (facts/validation.md § Insert
+    // Values). Written at 3, the value is two bytes longer and the state root
+    // another: the block would not apply and sync would stall on it. The
+    // values below were computed from the wire layout, apart from the code
+    // under test.
+
+    /// [`make_box`]`(true, 5)`'s id: the box the transaction spends.
+    const X15_INPUT_ID: &str = "8166424ca5266319d6ddd27bdef3a3107fccfdd1c2fc2a44608bbd540fa9fb01";
+    /// The transaction, written at 3: [`X15_INPUT_ID`] spent with an empty
+    /// proof into one 1 ERG `sigmaProp(true)` output at [`BLOCK_HEIGHT`], with
+    /// X15 as R4. Its id at 3 is `55c8b854…`.
+    const X15_TX: &str = "018166424ca5266319d6ddd27bdef3a3107fccfdd1c2fc2a44608bbd540fa9fb01\
+                          00000000018094ebdc030008d3e9070001860204027e040205";
+    /// The output as the tree stores it, written at 0: X15's `Upcast` as `1`,
+    /// then the transaction's id at 3 and index 0.
+    const X15_OUTPUT: &str = "8094ebdc030008d3e9070001860204020402\
+                              55c8b854992e5a898dee58b17eefac5874e3339f3fd31567d7b38cee6f67e45200";
+    /// The same output written at 3, the `Upcast` kept.
+    const X15_OUTPUT_AT_3: &str = "8094ebdc030008d3e9070001860204027e040205\
+                                   55c8b854992e5a898dee58b17eefac5874e3339f3fd31567d7b38cee6f67e45200";
+    /// blake2b256 of [`X15_OUTPUT`]: the output's box id.
+    const X15_OUTPUT_ID: &str = "d7f2c12cf1e29154436ae7fe5ab9dafe6df97ad947f8ece98123b03be8789490";
+
+    fn hex32(s: &str) -> [u8; 32] {
+        hex::decode(s)
+            .expect("fixture hex")
+            .try_into()
+            .expect("32 bytes")
+    }
+
+    /// The block's operations with its output inserted as `value`, written
+    /// by hand rather than through `transactions_to_summaries`.
+    fn x15_operations(input: &ErgoBox, value: &str) -> [Operation; 2] {
+        [
+            Operation::Remove(Bytes::copy_from_slice(&box_key(input))),
+            Operation::Insert(KeyValue {
+                key: Bytes::copy_from_slice(&hex32(X15_OUTPUT_ID)),
+                value: Bytes::from(hex::decode(value).expect("fixture hex")),
+            }),
+        ]
+    }
+
+    #[test]
+    fn a_v4_block_inserts_an_upcast_output_as_its_version_0_bytes() {
+        let input = make_box(true, 5);
+        assert_eq!(hex::encode(box_key(&input)), X15_INPUT_ID);
+        let (state_root, ad_root) = oracle(
+            std::slice::from_ref(&input),
+            &x15_operations(&input, X15_OUTPUT),
+        );
+        // Not vacuous: the output written at 3 makes another tree.
+        let (state_root_at_3, _) = oracle(
+            std::slice::from_ref(&input),
+            &x15_operations(&input, X15_OUTPUT_AT_3),
+        );
+        assert_ne!(state_root, state_root_at_3);
+
+        let mut header = make_header(BLOCK_HEIGHT, state_root, ad_root);
+        header.version = 4;
+        let block = Block {
+            header,
+            txs: raw_section(4, &[X15_TX]),
+            extension: crate::sections::serialize_extension(&HEADER_ID, &[])
+                .expect("extension section serialization"),
+            preceding: preceding_headers(),
+        };
+
+        let (mut validator, _dir) = seeded_validator(std::slice::from_ref(&input));
+        let outcome = block
+            .apply(&mut validator)
+            .expect("the v4 block applies under the root its output written at 0 gives");
+        assert!(outcome.block_cost.is_some(), "its scripts were evaluated");
+        assert_eq!(validator.validated_height(), BLOCK_HEIGHT);
+        assert_eq!(*validator.current_digest(), state_root);
+    }
+
+    /// The other two routes to an insert write the output the same way: the
+    /// emission scan's `insertions_of_block` and mining's
+    /// `proofs_for_transactions`.
+    #[test]
+    fn every_other_route_to_an_insert_writes_the_output_at_0() {
+        assert_eq!(
+            insertions_of_block(&raw_section(4, &[X15_TX])).expect("the v4 section parses"),
+            vec![(
+                hex32(X15_OUTPUT_ID),
+                hex::decode(X15_OUTPUT).expect("fixture hex")
+            )]
+        );
+
+        let input = make_box(true, 5);
+        let (state_root, ad_root) = oracle(
+            std::slice::from_ref(&input),
+            &x15_operations(&input, X15_OUTPUT),
+        );
+        let (validator, _dir) = seeded_validator(std::slice::from_ref(&input));
+        let (proof, root) = validator
+            .proofs_for_transactions(&[tx_read_at(X15_TX, ErgoTreeVersion::V3)])
+            .expect("mining proofs for the transaction");
+        assert_eq!(root, state_root);
+        assert_eq!(blake2b256_hash(&proof), ad_root);
     }
 
     // ── Prover memory attribution ────────────────────────────────────────

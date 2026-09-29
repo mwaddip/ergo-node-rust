@@ -20,12 +20,14 @@ use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::ergotree_ir::chain::ergo_box::box_value::BoxValue;
 use ergo_lib::ergotree_ir::chain::ergo_box::{ErgoBox, ErgoBoxCandidate, NonMandatoryRegisters};
 use ergo_lib::ergotree_ir::chain::tx_id::TxId;
-use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
+use ergo_lib::ergotree_ir::ergo_tree::{ErgoTree, ErgoTreeVersion};
+use ergo_lib::ergotree_ir::serialization::sigma_byte_reader::{from_bytes, SigmaByteRead};
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergotree_interpreter::sigma_protocol::prover::ProofBytes;
 use ergotree_ir::chain::context_extension::ContextExtension;
 use ergotree_ir::mir::bool_to_sigma::BoolToSigmaProp;
 use ergotree_ir::mir::expr::Expr;
+use sigma_ser::vlq_encode::WriteSigmaVlqExt;
 
 use crate::state_changes::{compute_state_changes, transactions_to_summaries};
 
@@ -71,8 +73,10 @@ pub fn box_key(ergo_box: &ErgoBox) -> [u8; 32] {
     id
 }
 
+/// A box as the UTXO set stores it: `ErgoBox::bytes()`, the value the
+/// validator inserts (facts/validation.md § Insert Values).
 pub fn serialized_box(ergo_box: &ErgoBox) -> Vec<u8> {
-    ergo_box.sigma_serialize_bytes().expect("box serialization")
+    ergo_box.bytes().expect("box serialization")
 }
 
 /// A transaction spending `inputs` into a single always-true output. Value is
@@ -188,4 +192,87 @@ pub fn sections(txs: &[Transaction]) -> (Vec<u8>, Vec<u8>) {
         crate::sections::serialize_extension(&HEADER_ID, &[])
             .expect("extension section serialization"),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Tree versions: SANTA X15, `Tuple(1, Upcast(1, Long))`.
+//
+// Below tree version 3 sigmastate writes an `Upcast` of a constant as the
+// constant (`ValueSerializer.scala:157-169`). The fork computes a
+// transaction's id at the version it read the transaction at, and writes a
+// box's bytes and id at 0. So the same transaction bytes read at 0 and at 3
+// are two transactions with two ids, and an output holding X15 has one byte
+// image at 3 and another at 0.
+//
+// The transactions spend box `0…0` with an empty proof, so a transaction's id
+// is the hash of its bytes as read: the `Upcast` kept at 3, written as `1` at
+// 0. Every id and byte string below was computed from the wire layout, apart
+// from the code under test, and matches what the fork produces.
+// ---------------------------------------------------------------------------
+
+/// One input spending box `0…0` with an empty proof and X15 as context
+/// variable 0, and one 1 ERG `sigmaProp(true)` output at height 1, written at
+/// tree version 3. The transaction `enr-chain`'s section tests build.
+pub const EXTENSION_TX: &str =
+    "01000000000000000000000000000000000000000000000000000000000000000000\
+     0100860204027e0402050000018094ebdc030008d3010000";
+/// [`EXTENSION_TX`] written below tree version 3: X15's `Upcast` as `1`.
+pub const EXTENSION_TX_AT_0: &str =
+    "01000000000000000000000000000000000000000000000000000000000000000000\
+     01008602040204020000018094ebdc030008d3010000";
+/// [`EXTENSION_TX`]'s id read at 3, and read at 0. `enr-chain` pins the same
+/// two for the same bytes.
+pub const EXTENSION_TX_ID_AT_3: &str =
+    "6b11fd0ea5f1e84782c15044f03cf10df48022ba7dcb8e6c0e48233b1cf9b0a1";
+pub const EXTENSION_TX_ID_AT_0: &str =
+    "b006736746ec23927fecfbaeb5a27bda4df791e5440eaba24e8aadb3072b3deb";
+
+/// [`EXTENSION_TX`] with an empty context extension, and X15 as its output's
+/// R4, written at tree version 3.
+pub const REGISTER_TX: &str =
+    "01000000000000000000000000000000000000000000000000000000000000000000\
+     000000018094ebdc030008d3010001860204027e040205";
+/// [`REGISTER_TX`]'s id read at 3, and read at 0.
+pub const REGISTER_TX_ID_AT_3: &str =
+    "b0294d43dcd9463459545070e9a85abb7c212028adca7a3f79e3b1e10b3290ea";
+pub const REGISTER_TX_ID_AT_0: &str =
+    "0995636c9856a9b28b049b208d74fbcfb8f9c69664a9b4d2aa96f66f08f294b9";
+/// The output of [`REGISTER_TX`] read at 3, as `ErgoBox::bytes()` writes it:
+/// at 0, X15's `Upcast` as `1`, then [`REGISTER_TX_ID_AT_3`] and index 0.
+/// The value the UTXO set inserts.
+pub const REGISTER_OUTPUT: &str = "8094ebdc030008d3010001860204020402\
+                                   b0294d43dcd9463459545070e9a85abb7c212028adca7a3f79e3b1e10b3290ea00";
+/// The same output written at 3, the `Upcast` kept: `sigma_serialize_bytes()`.
+pub const REGISTER_OUTPUT_AT_3: &str = "8094ebdc030008d3010001860204027e040205\
+                                        b0294d43dcd9463459545070e9a85abb7c212028adca7a3f79e3b1e10b3290ea00";
+/// The output's box id, the hash of [`REGISTER_OUTPUT`]: its transaction read
+/// at 3. And the box id when the transaction is read at 0, which differs only
+/// by the transaction id inside.
+pub const REGISTER_OUTPUT_ID_AT_3: &str =
+    "99ec0e43052429b24873210fa1971eb078cf90579028591279f2c6960e987ba1";
+pub const REGISTER_OUTPUT_ID_AT_0: &str =
+    "f22187bbb4130c471f20988713ae76a97b504cb2170115e9be41d98e7dc1b410";
+
+/// `tx` (hex) read as one transaction at `version`, straight through the
+/// fork: a `Transaction` that does not come out of the section parser.
+pub fn tx_read_at(tx: &str, version: ErgoTreeVersion) -> Transaction {
+    let bytes = hex::decode(tx).expect("fixture hex");
+    from_bytes(&bytes)
+        .with_tree_version(version, Transaction::sigma_parse)
+        .expect("fixture transaction parses")
+}
+
+/// A BlockTransactions section: [`HEADER_ID`], the version framing the JVM's
+/// serializer writes for `block_version` (none for version 1), the count,
+/// and `txs` (hex) as they stand.
+pub fn raw_section(block_version: u32, txs: &[&str]) -> Vec<u8> {
+    let mut out = HEADER_ID.to_vec();
+    if block_version > 1 {
+        out.put_u32(10_000_000 + block_version).expect("vlq");
+    }
+    out.put_u32(txs.len() as u32).expect("vlq");
+    for tx in txs {
+        out.extend(hex::decode(tx).expect("fixture hex"));
+    }
+    out
 }
