@@ -2699,7 +2699,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Validation pipeline — progress channel feeds sync, delivery channel feeds tracker
     let pipeline_chain = chain.clone();
     let api_store = store.clone(); // for REST API block queries
-    let sync_store = SharedStore::new(store.clone());
+    let sync_store = SharedStore::new(store.clone(), mempool.lock().await.reader());
     let revalidate_store = store.clone(); // for section scan during revalidation
     let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(4);
     // Control channel: unbounded — Reorg/NeedModifier must never be dropped

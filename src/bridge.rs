@@ -208,19 +208,31 @@ impl SyncChain for SharedChain {
     }
 }
 
-/// Wraps `Arc<RedbModifierStore>` to implement `SyncStore`.
+/// Wraps `Arc<RedbModifierStore>` to implement `SyncStore`. A transaction is
+/// looked up in the mempool instead, through its serving reader: the store
+/// holds none (facts/sync.md § SyncStore).
 pub struct SharedStore {
     store: Arc<RedbModifierStore>,
+    mempool: ergo_mempool::reader::MempoolReader,
 }
 
 impl SharedStore {
-    pub fn new(store: Arc<RedbModifierStore>) -> Self {
-        Self { store }
+    pub fn new(
+        store: Arc<RedbModifierStore>,
+        mempool: ergo_mempool::reader::MempoolReader,
+    ) -> Self {
+        Self { store, mempool }
     }
 }
 
 impl SyncStore for SharedStore {
     async fn has_modifier(&self, type_id: u8, id: &[u8; 32]) -> bool {
+        // An announced transaction already in the pool is not requested
+        // again, as the JVM's `processInv` asks its mempool. The reader holds
+        // its own lock for one lookup, never the mempool's.
+        if type_id == enr_chain::TRANSACTION_TYPE_ID {
+            return self.mempool.tx_bytes(id).is_some();
+        }
         let store = self.store.clone();
         let id = *id;
         match tokio::task::spawn_blocking(move || match store.contains(type_id, &id) {
@@ -342,5 +354,91 @@ impl SyncStore for SharedStore {
                 Err(format!("spawn_blocking panicked: {e}"))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A transaction the pool holds, built like the mempool's own fixtures:
+    /// the pool never validates what `return_to_pool` hands it.
+    fn pooled_tx() -> (ergo_mempool::types::UnconfirmedTx, [u8; 32]) {
+        use ergo_lib::chain::transaction::input::UnsignedInput;
+        use ergo_lib::chain::transaction::Transaction;
+        use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
+        use ergo_lib::ergotree_ir::chain::ergo_box::box_value::BoxValue;
+        use ergo_lib::ergotree_ir::chain::ergo_box::{
+            BoxId, ErgoBoxCandidate, NonMandatoryRegisters,
+        };
+        use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+
+        let input = UnsignedInput::new(
+            BoxId::from(ergo_chain_types::Digest32::from([7u8; 32])),
+            ContextExtension::empty(),
+        )
+        .input_to_sign();
+        let output = ErgoBoxCandidate {
+            value: BoxValue::new(1_000_000).unwrap(),
+            ergo_tree: ergo_lib::chain::ergo_tree_predef::fee_proposition(720).unwrap(),
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height: 1,
+        };
+        let tx = Transaction::new_from_vec(vec![input], vec![], vec![output]).unwrap();
+        let mut id = [0u8; 32];
+        id.copy_from_slice(tx.id().as_ref());
+        let tx_bytes = tx.sigma_serialize_bytes().unwrap();
+        let now = std::time::Instant::now();
+        let utx = ergo_mempool::types::UnconfirmedTx {
+            cost: tx_bytes.len() as u32,
+            tx_bytes: tx_bytes.into(),
+            tx,
+            fee: 1_000_000,
+            created: now,
+            last_checked: now,
+            source: None,
+        };
+        (utx, id)
+    }
+
+    /// facts/sync.md § SyncStore: a transaction is had when the mempool holds
+    /// it, and the modifier store is not asked.
+    #[tokio::test]
+    async fn has_modifier_answers_a_transaction_from_the_mempool() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(RedbModifierStore::new(&dir.path().join("t.redb"), 8 * 1024 * 1024).unwrap());
+        let mut mempool = ergo_mempool::Mempool::new(Default::default());
+        let sync_store = SharedStore::new(store.clone(), mempool.reader());
+        let (utx, id) = pooled_tx();
+
+        assert!(
+            !sync_store
+                .has_modifier(enr_chain::TRANSACTION_TYPE_ID, &id)
+                .await
+        );
+        mempool.return_to_pool(vec![utx]);
+        assert!(
+            sync_store
+                .has_modifier(enr_chain::TRANSACTION_TYPE_ID, &id)
+                .await
+        );
+
+        // A type-2 row in the modifier store does not count.
+        store
+            .put_batch(&[(
+                enr_chain::TRANSACTION_TYPE_ID,
+                [9u8; 32],
+                1,
+                vec![1u8],
+                None,
+            )])
+            .unwrap();
+        assert!(
+            !sync_store
+                .has_modifier(enr_chain::TRANSACTION_TYPE_ID, &[9u8; 32])
+                .await
+        );
     }
 }
