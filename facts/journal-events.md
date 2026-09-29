@@ -495,6 +495,12 @@ facts/sync.md § "Block Assembly".*
 - **Fields:** `peer` (string), `kind` (string: short identifier such
   as `header_parse_failed`, `invalid_pow`, `malformed_peers`), `detail`
   (string, optional)
+- **Logged-only kinds** (misbehavior, never actioned by the shipped fail2ban
+  filter): `message_parse_failed`, `connection_limit_exceeded`, and
+  `oversized_transaction`, a peer's transaction over `MAX_TRANSACTION_SIZE`,
+  dropped unparsed (`facts/mempool.md` § P2P Transaction Intake). The last is
+  emitted by the main crate's pipeline, which knows the peer by its connection
+  id, so it carries `peer_id` rather than `peer`.
 - **Since:** 1.0
 - **Stability:** stable
 - **Note:** existing emissions in v0.5.x use marker prefix `"PENALTY"`
