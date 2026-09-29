@@ -217,6 +217,19 @@ impl ValidationPipeline {
             if *type_id == HEADER_TYPE_ID {
                 raw_headers.push((data.as_slice(), *peer_id));
             } else if *type_id == TRANSACTION_TYPE_ID && !data.is_empty() {
+                // Over the JVM's `maxTransactionSize`: dropped before anything
+                // parses it, and its sender penalized (facts/mempool.md § P2P
+                // Transaction Intake; JVM `parseAndProcessTransaction`).
+                if data.len() > ergo_mempool::MAX_TRANSACTION_SIZE {
+                    tracing::warn!(
+                        peer_id = ?peer_id,
+                        kind = "oversized_transaction",
+                        size = data.len(),
+                        limit = ergo_mempool::MAX_TRANSACTION_SIZE,
+                        "PENALTY transaction over the size limit, dropped unparsed"
+                    );
+                    continue;
+                }
                 // Unconfirmed transaction — forward to the mempool, which binds
                 // it by `Transaction::id()` over the bytes. The delivered id is
                 // used for nothing beyond that channel's log lines.
@@ -1217,6 +1230,34 @@ mod tests {
         assert!(
             pipeline.reorg_requested.should_request([4; 32], later),
             "a request left unanswered past the TTL must release its slot"
+        );
+    }
+
+    /// facts/mempool.md § P2P Transaction Intake: a peer's transaction over
+    /// the JVM's `maxTransactionSize` never reaches the mempool task, and one
+    /// at the limit does (the JVM's check is a strict `>`).
+    #[tokio::test]
+    async fn an_oversized_transaction_is_dropped_before_the_mempool() {
+        let (mut pipeline, _tx, _progress_rx, _ctrl_rx, _data_rx, _dir) = test_pipeline();
+        let (tx_sender, mut tx_rx) = mpsc::channel(8);
+        pipeline.set_tx_sender(tx_sender);
+
+        let limit = ergo_mempool::MAX_TRANSACTION_SIZE;
+        pipeline
+            .process_batch(vec![
+                (TRANSACTION_TYPE_ID, [1; 32], vec![0u8; limit + 1], Some(7)),
+                (TRANSACTION_TYPE_ID, [2; 32], vec![0u8; limit], Some(7)),
+            ])
+            .await;
+
+        let (id, bytes) = tx_rx
+            .try_recv()
+            .expect("the at-limit transaction is forwarded");
+        assert_eq!(id, [2; 32]);
+        assert_eq!(bytes.len(), limit);
+        assert!(
+            tx_rx.try_recv().is_err(),
+            "the oversized transaction must not be forwarded"
         );
     }
 }
