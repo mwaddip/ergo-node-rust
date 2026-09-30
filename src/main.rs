@@ -832,6 +832,14 @@ impl ergo_api::ChainAccess for HeaderChainAdapter {
         let block_id = ergo_chain_types::BlockId(ergo_chain_types::Digest32::from(*id));
         self.with_chain(|c| enr_chain::popow_header_by_id(c, &block_id).map_err(|e| e.to_string()))
     }
+    /// The chain's rule applied to the chain's parameters in effect, which
+    /// it holds from startup (facts/api.md § Transaction Submission Flow).
+    fn activated_tree_version(&self) -> Option<ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion> {
+        let block_version = self.with_chain(|c| c.active_parameters().block_version());
+        u8::try_from(block_version)
+            .ok()
+            .map(enr_chain::activated_tree_version)
+    }
 }
 
 /// Adapter: RedbModifierStore → StoreAccess for the API crate.
