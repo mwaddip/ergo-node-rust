@@ -913,6 +913,7 @@ dependencies = [
  "enr-state",
  "ergo-chain-types",
  "ergo-lib",
+ "ergo-nipopow",
  "ergo_avltree_rust",
  "ergotree-interpreter",
  "ergotree-ir",
