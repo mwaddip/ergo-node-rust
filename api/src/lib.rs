@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::Router;
+use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
 use ergo_mempool::Mempool;
 use ergo_mining::CandidateGenerator;
 use ergo_validation::ErgoStateContext;
@@ -333,6 +334,16 @@ pub trait ChainAccess: Send + Sync {
     /// override it silently report zeros, which is precisely how the wrong
     /// `chainHeaderEstimateBytes` survived unnoticed.
     fn memory_estimate(&self) -> ChainMemory;
+
+    /// The script version activated by the parameters in effect after the
+    /// last applied block: `enr_chain::activated_tree_version` of their block
+    /// version. `None` only if that block version doesn't fit `u8`, which
+    /// voting can't produce. The handler answers 500.
+    ///
+    /// A submitted transaction is written at it (`facts/api.md` §
+    /// Transaction Submission Flow). The chain has its parameters from
+    /// startup, so it answers while the node is syncing too.
+    fn activated_tree_version(&self) -> Option<ErgoTreeVersion>;
 }
 
 /// Trait for block store access.

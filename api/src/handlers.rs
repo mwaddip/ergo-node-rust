@@ -1344,7 +1344,7 @@ pub async fn post_mining_solution(
 
     let block_txs_bytes = ergo_validation::serialize_block_transactions(
         &header_id,
-        candidate.version as u32,
+        candidate.version,
         &candidate.transactions,
     )
     .map_err(|e| {
@@ -2270,6 +2270,7 @@ pub async fn get_block_validation_fragments(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
     use std::net::SocketAddr;
 
     #[test]
@@ -2403,6 +2404,9 @@ mod tests {
                 header_cache_bytes: Self::HEADER_CACHE_BYTES,
                 score_cache_bytes: Self::SCORE_CACHE_BYTES,
             }
+        }
+        fn activated_tree_version(&self) -> Option<ErgoTreeVersion> {
+            Some(ErgoTreeVersion::V3)
         }
     }
 
@@ -2702,6 +2706,9 @@ mod tests {
         }
         fn memory_estimate(&self) -> ChainMemory {
             unreported_memory()
+        }
+        fn activated_tree_version(&self) -> Option<ErgoTreeVersion> {
+            Some(ErgoTreeVersion::V3)
         }
     }
 
@@ -3123,6 +3130,9 @@ mod tests {
         }
         fn memory_estimate(&self) -> ChainMemory {
             unreported_memory()
+        }
+        fn activated_tree_version(&self) -> Option<ErgoTreeVersion> {
+            Some(ErgoTreeVersion::V3)
         }
     }
 
@@ -3578,6 +3588,9 @@ mod tests {
         fn memory_estimate(&self) -> ChainMemory {
             unreported_memory()
         }
+        fn activated_tree_version(&self) -> Option<ErgoTreeVersion> {
+            Some(ErgoTreeVersion::V3)
+        }
     }
 
     /// Store mock: returns pre-loaded bytes keyed by `(type_id, modifier_id)`.
@@ -3921,8 +3934,8 @@ mod tests {
         use ergo_lib::ergotree_ir::mir::constant::Constant;
 
         let mut extension = ContextExtension::empty();
-        extension.values.insert(8, Constant::from(1i32));
-        extension.values.insert(4, Constant::from(2i32));
+        extension.values.insert(8, Constant::from(1i32).into());
+        extension.values.insert(4, Constant::from(2i32).into());
         let tx = spend(&[make_vf_p2pk_box(1_000_000).box_id()], &extension);
 
         let header = make_vf_header(685, BlockId(Digest32::zero()));
@@ -4357,6 +4370,9 @@ mod tests {
         fn memory_estimate(&self) -> ChainMemory {
             unreported_memory()
         }
+        fn activated_tree_version(&self) -> Option<ErgoTreeVersion> {
+            Some(ErgoTreeVersion::V3)
+        }
     }
 
     /// Submitter that accepts everything — the happy-path stand-in.
@@ -4579,6 +4595,9 @@ mod tests {
         }
         fn memory_estimate(&self) -> ChainMemory {
             unreported_memory()
+        }
+        fn activated_tree_version(&self) -> Option<ErgoTreeVersion> {
+            Some(ErgoTreeVersion::V3)
         }
     }
 
@@ -5389,6 +5408,9 @@ mod tests {
         }
         fn memory_estimate(&self) -> ChainMemory {
             unreported_memory()
+        }
+        fn activated_tree_version(&self) -> Option<ErgoTreeVersion> {
+            Some(ErgoTreeVersion::V3)
         }
     }
 

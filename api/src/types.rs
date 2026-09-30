@@ -71,7 +71,7 @@ pub struct EmissionInfo {
 pub struct BlockTransactionsSection {
     pub header_id: String,
     pub transactions: Vec<Transaction>,
-    pub block_version: u32,
+    pub block_version: u8,
     /// Length of the stored section, in bytes.
     pub size: usize,
 }
