@@ -67,6 +67,12 @@ const SNAPSHOT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_s
 const MEMPOOL_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 /// Mining task poll interval for new tip heights.
 const MINING_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// Versions the UTXO state keeps undo information for: how deep it can roll
+/// back. Sync keeps extensions just as deep (`SyncConfig.extension_keep_depth`,
+/// `facts/sync.md` § "Pruning at flush time"), so every fork point the state
+/// can return to still has the extension its successor's interlinks are
+/// checked against.
+const STATE_KEEP_VERSIONS: u32 = 256;
 /// Bounded wait on sync's `JoinHandle` during shutdown — caps how long
 /// the process will block for sync's final flush sequence before
 /// forcing exit. See facts/sync.md "Graceful shutdown".
@@ -1263,7 +1269,7 @@ struct NodeConfig {
     /// write to bring the store's recorded value forward). Larger gaps
     /// trigger a state rollback to the store's recorded value, forcing
     /// re-validation of the intermediate blocks. Bounded above by
-    /// state.keep_versions (currently 256) — gaps beyond that fall back
+    /// `STATE_KEEP_VERSIONS` — gaps beyond that fall back
     /// to forced trust with a loud warning. See `facts/sync.md`
     /// "Cross-DB Durability Handshake" § Configuration.
     #[serde(default = "default_reconciliation_trust_threshold")]
@@ -2199,8 +2205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             source.display(),
             dest.display(),
             stats.block_height,
-            // Mirrors the hardcoded keep_versions at the storage open site below.
-            256u32,
+            STATE_KEEP_VERSIONS,
         );
         return Ok(());
     }
@@ -2972,7 +2977,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 key_length: 32,
                 value_length: None,
             };
-            let keep_versions = 256u32;
+            let keep_versions = STATE_KEEP_VERSIONS;
             tracing::info!(
                 path = %state_path.display(),
                 // The split, not the configured total — logging cache_mb here
@@ -3650,7 +3655,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut storage = RedbAVLStorage::open(
                         &state_path,
                         params,
-                        256,
+                        STATE_KEEP_VERSIONS,
                         CacheSize::Bytes(state_cache_bytes),
                     )
                     .expect("failed to open state storage for snapshot");
