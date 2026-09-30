@@ -542,9 +542,17 @@ if blocks_to_keep >= 0 {
         chain.voting_length(),
     );
     if horizon > 0 {
-        match store.prune_below_height(horizon, &[102, 104, 108]) {
+        match store.prune_below_height(horizon, &[102, 104]) {
             Ok(n) => debug!("pruned {n} modifier rows below height {horizon}"),
             Err(e) => warn!("prune at horizon {horizon} failed: {e}"),
+        }
+    }
+    // Extensions outlive the other bodies by the state's rollback depth.
+    let ext_horizon = horizon.min(validated_height.saturating_sub(config.extension_keep_depth));
+    if ext_horizon > 0 {
+        match store.prune_below_height(ext_horizon, &[108]) {
+            Ok(n) => debug!("pruned {n} extension rows below height {ext_horizon}"),
+            Err(e) => warn!("extension prune at horizon {ext_horizon} failed: {e}"),
         }
     }
 }
@@ -554,6 +562,23 @@ Critical detail: horizon is computed against `validated_height`
 (state.redb's just-flushed height), not the chain tip. Bodies in
 `(validated_height, tip]` are always retained, so crash recovery's
 re-apply path is never starved.
+
+**Extensions are kept for the state's rollback depth, whatever
+`blocks_to_keep` says.** A block's interlinks are checked against its
+parent's extension (rules 401/402, `facts/validation.md` § "Block rules
+taken from `appendFullBlock`"). After a reorg, the parent is the fork point.
+- `SyncConfig.extension_keep_depth` is the UTXO state's `keep_versions`
+  (256), set by the main crate from the same value it builds the validator
+  with. Digest mode uses the same number.
+- Every extension at or above `validated_height − extension_keep_depth` is
+  kept. So every fork point the state can roll back to still has its
+  extension, and so does the steady-state parent, the block at
+  `validated_height`.
+- The JVM gets the same guarantee a different way: it keeps the last
+  extension in its state context, which is stored and rolled back with the
+  state (`UtxoState.scala:50-62, 269-278`), and pruning never touches it.
+- A test pins `ext_horizon` against `extension_keep_depth` for
+  `blocks_to_keep` of 0 and of values below it.
 
 `compute_prune_horizon` applies JVM-style voting-epoch alignment: if
 the raw horizon (`flushed - keep + 1`) lands inside a voting epoch,
@@ -1191,6 +1216,28 @@ in-flight bytes for.
 height, it computes `required_section_ids(header, state_type)` and checks the
 store for each. Advances as far as possible, stops at the first gap. On advance,
 calls `advance_state_applied_height()` to run the pipeline on newly downloaded blocks.
+
+### What `apply_state` is called with
+
+For each height `h` the sweep applies, sync reads from the chain and the store:
+- the header and its required sections (102 and 108, plus 104 in digest mode).
+  A missing one stops the sweep.
+- up to nine preceding headers (`facts/validation.md` § "Window size")
+- `active_params`, and at an epoch boundary the expected boundary parameters
+  and proposed update. `active_params` are those before the block. Picking the
+  parameters the block's transactions are validated with is the validator's
+  job (`facts/validation.md` § "Parameters a block's transactions are
+  validated with").
+- **the parent's extension:** the Extension section (108) of the header at
+  `h − 1`, looked up by that header's section id.
+  - It is `None` at `h = 1`, and whenever the store doesn't hold it: the first
+    block after a UTXO snapshot bootstrap, or a reorg deeper than
+    `extension_keep_depth` (§ "Pruning at flush time").
+  - Unlike a missing section of the block itself, `None` doesn't stop the
+    sweep. The validator skips the interlinks rules for that block and logs
+    it (`facts/validation.md` § "Block rules taken from `appendFullBlock`").
+  - Within one sweep, the previous height's `extension` is the parent's, so
+    the sweep may carry it forward instead of reading the store again.
 
 ### Trigger points
 
