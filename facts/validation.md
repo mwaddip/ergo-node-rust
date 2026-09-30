@@ -937,10 +937,14 @@ DigestValidator::new(
 
   Stored sections have passed the binding, so none of these reaches this
   parser from the network. It rejects them anyway so the two can't drift.
-- An output whose register holds a function-typed value fails to parse,
-  because its box id can't be written at version 0 (§ Insert Values). The JVM
-  parses that transaction and then fails the block in its output checks. The
-  verdict is the same, reached earlier.
+- **An output that version 0 can't write** (a register holding a
+  function-typed value or v6-only data) still parses. The fork takes its box
+  id from the box written at 3. Its `bytes()` fails, and two checks reject the
+  block for it:
+  - the output checks, as the JVM's do (`ErgoTransaction.scala:171-175`)
+  - this crate's state changes, which insert `bytes()` (§ Insert Values)
+
+  Either one gives the JVM's verdict.
 - `ParsedBlockTransactions.block_version` is a `u8`: the section's own
   version, extracted but not validated against the header here (the header
   owns the version).
@@ -1187,11 +1191,8 @@ fields + txId (32 bytes) + index (u16). NOT just the candidate (without ref).
   at version 0 the same way, and the fork does both.
 - **The output checks measure the same bytes.** The dust minimum
   (`out.bytes.length × minValuePerByte`) and `MaxBoxSize` use `bytes()`, the
-  version-0 box. At the pin `3b23f47e`, ergo-lib's `verify_output`
-  (`wallet/tx_context.rs:337`) measures `sigma_serialize_bytes()` instead,
-  which is written at 3. It counts each `Upcast` of a constant in a register
-  two bytes too many, so it rejects outputs the JVM accepts. The fix goes in
-  the fork.
+  version-0 box. ergo-lib's `verify_output` (`wallet/tx_context.rs:338`)
+  measures `bytes()` too.
 - **Not `ErgoBox::sigma_serialize_bytes()`.** That writes at the fork's
   highest version, 3. The two differ when a register holds an `Upcast` of a
   constant, which version 0 writes as the bare constant. A different insert
