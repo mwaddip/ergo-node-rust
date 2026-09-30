@@ -350,9 +350,13 @@ paths:
 
         Each transaction carries both `signingMessage`
         (`Transaction::bytes_to_sign()` — what every input signature commits
-        to) and `bytes` (the full canonical
-        `Transaction::sigma_serialize_bytes()`, byte-exact including the
-        on-chain ContextExtension wire order). The transaction id is
+        to) and `bytes` (the full canonical transaction as its block's
+        serializer writes it, `ergo_validation::serialize_block_transaction`,
+        byte-exact including the on-chain ContextExtension wire order).
+        Re-parse `bytes` at the block's *read* version to recover the
+        transaction (`facts/chain.md` § "The tree version a block's
+        transactions are read at"). A v3 block's transactions are written at
+        3 and read at 0, so parsing at 3 can give another id. The transaction id is
         `blake2b256(signingMessage)`, NOT `blake2b256(bytes)` — the spending
         proofs (carried in `bytes`, absent from the signing message) are not
         part of the id. ContextExtensions ARE in the signing message, in wire
@@ -441,6 +445,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiError'
+        '500':
+          description: |
+            The block version in effect does not fit `u8`, so there is no
+            activated script version to write the transaction at
+            (`facts/api.md` § Transaction Submission Flow). Voting cannot
+            produce such a version; the node logs it as an error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
 
   /transactions/check:
     post:
@@ -471,6 +485,14 @@ paths:
                 $ref: '#/components/schemas/ApiError'
         '503':
           description: Node still syncing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '500':
+          description: |
+            The block version in effect does not fit `u8`, as for
+            `POST /transactions`.
           content:
             application/json:
               schema:
@@ -1912,8 +1934,10 @@ components:
             `blake2b256(signingMessage)` (proofs stripped, ContextExtensions
             kept in wire order), NOT `blake2b256(bytes)`; to confirm `bytes`
             belongs to
-            `transactions[i]`, re-parse it (its id must equal
-            `transactions[i].id`) or hash its `signingMessage`. Intended for
+            `transactions[i]`, re-parse it at the block's read version (its
+            id must equal `transactions[i].id`) or hash its `signingMessage`.
+            At another version the same bytes can be another transaction. A
+            v3 block's `bytes` are written at 3 and read at 0. Intended for
             cross-impl conformance vectors that pin serialization-order rules.
 
     # ---- Transactions ----
