@@ -29,6 +29,7 @@ use ergo_lib::ergotree_ir::chain::token::{Token, TokenId};
 use ergo_lib::ergotree_ir::chain::tx_id::TxId;
 use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
 use ergo_lib::ergotree_ir::mir::expr::Expr;
+use ergo_lib::ergotree_ir::serialization::sigma_byte_writer::{SigmaByteWrite, SigmaByteWriter};
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::{ProveDlog, SigmaBoolean, SigmaProp};
 use ergo_mining::emission::ReemissionRules;
@@ -197,12 +198,12 @@ fn ordered_tokens(groups: &[Vec<Token>]) -> Vec<Token> {
     groups.iter().flat_map(|g| g.iter().cloned()).collect()
 }
 
-/// A box's serialized length as a validator counts it — `ErgoBox` bytes,
-/// transaction id and output index included, which is what `txBoxSize` is
-/// measured against. The candidate body is 33 bytes shorter and would let a
-/// box over the window look like it fits.
+/// A box's serialized length as a validator counts it — `ErgoBox::bytes()`,
+/// the box at version 0 with transaction id and output index included, which
+/// is what `txBoxSize` is measured against. The candidate body is 33 bytes
+/// shorter and would let a box over the window look like it fits.
 fn box_bytes(b: &ErgoBox) -> usize {
-    b.sigma_serialize_bytes().unwrap().len()
+    b.bytes().unwrap().len()
 }
 
 /// The same box re-measured with one more token on it.
@@ -393,16 +394,20 @@ fn is_fee_tx(tx: &Transaction) -> bool {
 /// ```
 ///
 /// (`BlockTransactionsSerializer.serialize`; the sentinel offset is how a
-/// reader tells a versioned section from a pre-v2 one.) Independent of
-/// `block_transactions_overhead`, so it is free to disagree with it — which is
-/// the only reason it is worth writing out.
+/// reader tells a versioned section from a pre-v2 one.) The transactions are
+/// written at `enr_chain::block_transactions_write_version`, as the serializer
+/// writes them. Independent of `block_transactions_overhead`, so it is free to
+/// disagree with it — which is the only reason it is worth writing out.
 fn serialized_section(block: &CandidateBlock) -> Vec<u8> {
     // The header id is not known until a solution lands; its 32 bytes are.
     let mut out: Vec<u8> = vec![0u8; 32];
     out.put_u64(10_000_000 + u64::from(block.version)).unwrap();
     out.put_u64(block.transactions.len() as u64).unwrap();
+    let version = enr_chain::block_transactions_write_version(block.version);
+    let mut w = SigmaByteWriter::new(&mut out, None);
     for tx in &block.transactions {
-        out.extend_from_slice(&tx.sigma_serialize_bytes().unwrap());
+        w.with_tree_version(version, |w| tx.sigma_serialize(w))
+            .unwrap();
     }
     out
 }

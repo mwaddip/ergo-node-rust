@@ -48,7 +48,9 @@ pub fn build_fee_tx(
     reward_delay: i32,
     miner_pk: &ProveDlog,
 ) -> Result<Option<Transaction>, MiningError> {
-    // Get fee proposition ErgoTree bytes for matching
+    // Get fee proposition ErgoTree bytes for matching. `sigma_serialize_bytes()`
+    // is right for a tree, unlike for a box or a transaction: a tree writes its
+    // body at its own header's version, whatever version the writer is at.
     let fee_tree = ergo_tree_predef::fee_proposition(reward_delay)
         .map_err(|e| MiningError::Emission(format!("fee proposition: {e}")))?;
     let fee_tree_bytes = fee_tree
@@ -175,9 +177,9 @@ pub fn build_fee_tx(
 ///
 /// The rule is `txBoxSize`: `out.bytes.length <= MaxBoxSize` (4096), JVM
 /// `ErgoTransaction.scala:175`, ergo-lib `BoxSizeExceeded`. It is checked
-/// against the bytes a validator counts — `ErgoBox::sigma_serialize`,
-/// transaction id and output index included, not the candidate body, which is
-/// 33 bytes shorter and would put the cut one token too high.
+/// against the bytes a validator counts — `ErgoBox::bytes()`, transaction id
+/// and output index included, not the candidate body, which is 33 bytes
+/// shorter and would put the cut one token too high.
 ///
 /// ⚠ Nothing here is arithmetic over assumed widths. The reward tree's length
 /// is a function of `reward_delay` and the miner key; a token entry is 32
@@ -229,7 +231,15 @@ fn fit_tokens(
     Ok(kept)
 }
 
-/// Serialized length of the reward box exactly as a validator measures it.
+/// Serialized length of the reward box exactly as a validator measures it:
+/// `ErgoBox::bytes()`, the box written at ErgoTree version 0, which is how the
+/// JVM's output checks read `out.bytes` (`facts/validation.md` § Insert
+/// Values). Not `sigma_serialize_bytes()`, which writes at version 3.
+///
+/// The two cannot differ for this box today: the writer's version reaches only
+/// a box's registers — its tree writes at the tree's own version — and the
+/// reward box has none. Measuring `bytes()` means the cap doesn't rest on that
+/// staying true.
 ///
 /// The placeholder transaction id measures the real box to the byte: an id is
 /// a 32-byte digest whatever its value, and the index is 0 either way — the
@@ -254,7 +264,80 @@ fn reward_box_size(
         creation_height: height,
     };
     ErgoBox::from_box_candidate(&candidate, TxId::zero(), 0)
-        .and_then(|b| b.sigma_serialize_bytes())
+        .and_then(|b| b.bytes())
         .map(|bytes| bytes.len())
         .map_err(|e| MiningError::Emission(format!("fee reward box measure: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ergo_chain_types::ec_point::generator;
+    use ergo_chain_types::Digest32;
+    use ergo_lib::ergotree_ir::chain::ergo_box::BoxId;
+
+    const HEIGHT: u32 = 2;
+    const REWARD_DELAY: i32 = 720;
+
+    /// No reward box can tell `bytes()` from `sigma_serialize_bytes()`, so
+    /// there is no case to build where the two measures part: the writer's
+    /// version reaches only a box's registers, and the reward box carries
+    /// none. Pinned, so the day it gains one this says the two can part.
+    #[test]
+    fn the_reward_box_carries_no_registers_and_is_measured_by_its_bytes() {
+        // A fee box carrying a token, so the reward box carries one too.
+        let token = Token {
+            token_id: TokenId::from(Digest32::from([7; 32])),
+            amount: 1u64.try_into().unwrap(),
+        };
+        let fee_box = ErgoBoxCandidate {
+            value: BoxValue::SAFE_USER_MIN,
+            ergo_tree: ergo_tree_predef::fee_proposition(REWARD_DELAY).unwrap(),
+            tokens: Some(BoxTokens::from_vec(vec![token]).unwrap()),
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height: HEIGHT,
+        };
+        let input = Input::new(
+            BoxId::zero(),
+            ProverResult {
+                proof: ProofBytes::Empty,
+                extension: ContextExtension::empty(),
+            },
+        );
+        let block_tx = Transaction::new_from_vec(vec![input], vec![], vec![fee_box]).unwrap();
+
+        let miner_pk = ProveDlog::new(generator());
+        let fee_tx = build_fee_tx(&[block_tx], HEIGHT, REWARD_DELAY, &miner_pk)
+            .unwrap()
+            .expect("a fee box was offered");
+        let reward = fee_tx.outputs.first();
+
+        assert!(
+            reward.additional_registers.is_empty(),
+            "the reward box carries no registers"
+        );
+        let bytes = reward.bytes().unwrap();
+        assert_eq!(
+            bytes,
+            reward.sigma_serialize_bytes().unwrap(),
+            "so versions 0 and 3 write it alike"
+        );
+
+        // The token cap measures with `reward_box_size`: it measures this box.
+        let tokens: &[Token] = match reward.tokens.as_ref() {
+            Some(t) => t.as_ref(),
+            None => &[],
+        };
+        assert_eq!(tokens.len(), 1, "the fee box's token was collected");
+        assert_eq!(
+            reward_box_size(
+                reward.value,
+                &reward.ergo_tree,
+                tokens,
+                reward.creation_height
+            )
+            .unwrap(),
+            bytes.len()
+        );
+    }
 }
