@@ -836,9 +836,17 @@ impl ergo_api::ChainAccess for HeaderChainAdapter {
     /// it holds from startup (facts/api.md § Transaction Submission Flow).
     fn activated_tree_version(&self) -> Option<ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion> {
         let block_version = self.with_chain(|c| c.active_parameters().block_version());
-        u8::try_from(block_version)
-            .ok()
-            .map(enr_chain::activated_tree_version)
+        match u8::try_from(block_version) {
+            Ok(v) => Some(enr_chain::activated_tree_version(v)),
+            Err(_) => {
+                // Voting can't produce this; the api answers 500 on it.
+                tracing::error!(
+                    block_version,
+                    "active block version does not fit u8, no activated tree version"
+                );
+                None
+            }
+        }
     }
 }
 
