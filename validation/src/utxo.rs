@@ -15,6 +15,7 @@ use ergo_avltree_rust::versioned_avl_storage::VersionedAVLStorage;
 use ergo_chain_types::{blake2b256_hash, ADDigest, Header};
 use ergo_lib::chain::parameters::Parameters;
 
+use crate::block_rules::validate_block_rules;
 use crate::sections::{parse_block_transactions, parse_extension};
 use crate::state_changes::{compute_state_changes, transactions_to_summaries, Insertion};
 use crate::tx_validation;
@@ -295,6 +296,7 @@ impl BlockValidator for UtxoValidator {
         block_txs: &[u8],
         ad_proofs: Option<&[u8]>,
         extension: &[u8],
+        parent_extension: Option<&[u8]>,
         preceding_headers: &[Header],
         active_params: &Parameters,
         expected_boundary_params: Option<&Parameters>,
@@ -329,6 +331,7 @@ impl BlockValidator for UtxoValidator {
             block_txs,
             ad_proofs,
             extension,
+            parent_extension,
             preceding_headers,
             active_params,
             expected_boundary_params,
@@ -421,6 +424,7 @@ impl UtxoValidator {
         block_txs: &[u8],
         _ad_proofs: Option<&[u8]>,
         extension: &[u8],
+        parent_extension: Option<&[u8]>,
         preceding_headers: &[Header],
         active_params: &Parameters,
         expected_boundary_params: Option<&Parameters>,
@@ -470,6 +474,20 @@ impl UtxoValidator {
         if let Some(boundary) = expected_boundary_params {
             voting::check_block_version(boundary, header.version, header.height)?;
         }
+
+        // 1c. Block rules 306 and 400–406 (JVM `appendFullBlock`), before any
+        // state changes. Runs at every height, checkpoint or not — matching
+        // the JVM's `execTransactions` skip-only semantics.
+        let parent_parsed_ext = parent_extension.map(parse_extension).transpose()?;
+        validate_block_rules(
+            header,
+            preceding_headers.first(),
+            &parsed_ext,
+            parent_parsed_ext.as_ref(),
+            block_txs.len(),
+            extension.len(),
+            active_params,
+        )?;
 
         // 2. Compute state changes from transactions
         let summaries = transactions_to_summaries(&parsed_txs.transactions)?;
@@ -549,13 +567,27 @@ impl UtxoValidator {
                 proof_boxes.insert(*id, tx_validation::deserialize_box(bytes)?);
             }
 
+            // A block's transactions are validated with the parameters in
+            // effect **after** the block. Everywhere but an epoch boundary
+            // those are `active_params`; at a boundary they are the just-
+            // parsed `epoch_boundary_params` (facts/validation.md §
+            // "Parameters a block's transactions are validated with").
+            //
+            // Rule 306 keeps `active_params` — bounding a block's own
+            // section size by the parameters it introduces would be a
+            // liveness footgun and is not what the JVM does.
+            let tx_params = epoch_boundary_params
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| active_params.clone());
+
             let eval = ScriptEvalInputs {
                 height: header.height,
                 transactions: parsed_txs.transactions,
                 proof_boxes,
                 header: header.clone(),
                 preceding_headers: preceding_headers.to_vec(),
-                parameters: active_params.clone(),
+                parameters: tx_params,
             };
 
             block_cost = Some(tx_validation::evaluate_scripts(&eval)?);
@@ -907,6 +939,7 @@ mod tests {
                 &self.txs,
                 None,
                 &self.extension,
+                None,
                 &self.preceding,
                 &Parameters::default(),
                 None,
@@ -1177,8 +1210,14 @@ mod tests {
         let block = Block {
             header,
             txs: raw_section(4, &[X15_TX]),
-            extension: crate::sections::serialize_extension(&HEADER_ID, &[])
-                .expect("extension section serialization"),
+            // One dummy non-interlink field so rule 406 is satisfied (a
+            // non-genesis block must have at least one field). Same as the
+            // shared `sections` helper.
+            extension: crate::sections::serialize_extension(
+                &HEADER_ID,
+                &[([0x02, 0x00], vec![0xff])],
+            )
+            .expect("extension section serialization"),
             preceding: preceding_headers(),
         };
 
@@ -1619,6 +1658,162 @@ mod tests {
             Some(box_key(&emission)),
             "the genesis emission box was not recognised — `emission_box_prop` \
              and the genesis bootstrap have diverged"
+        );
+    }
+
+    // ── Item #25: transactions validated with the block's own boundary
+    //             parameters, not the pre-block ones ─────────────────────────
+    //
+    // At an epoch-boundary block, the JVM validates that block's transactions
+    // with the *newly computed* parameters the block carries in its extension
+    // — the block's `newStateContext`, in JVM terms
+    // (`ErgoStateContext.scala:138-139`). A parameter that changed at the
+    // boundary decides the block's own validity by its new value, not its
+    // old one. `MaxBlockCost` is the observable path here: it gates
+    // acceptance and it can grow at a boundary.
+
+    /// The load-bearing test: an old `maxBlockCost` too low for the block, a
+    /// new one high enough. If the transactions were validated with
+    /// `active_params`, the block is rejected as over-budget; if they are
+    /// validated with the block's own boundary parameters, it passes.
+    ///
+    /// Two facts are pinned. First, the same block against `active_params`
+    /// (no boundary) is rejected — a positive control that the cost really
+    /// exceeds the low limit. Second, with the boundary set attached, the
+    /// same block is accepted, and its reported cost is the same regardless
+    /// of which set is passed — so we know the accept arm did not merely
+    /// weaken the fold.
+    #[test]
+    fn epoch_boundary_block_validates_txs_with_boundary_max_block_cost() {
+        use ergo_lib::chain::parameters::Parameter;
+
+        // A block with one transaction — a real script eval, real cost.
+        let input = make_box(true, 200);
+        let tx = spend_tx(std::slice::from_ref(&input));
+        let ops = block_operations(std::slice::from_ref(&tx));
+        let (state_root, ad_root) = oracle(std::slice::from_ref(&input), &ops);
+
+        // Measure the block's real cost via a permissive-active run — the
+        // cost the validator would surface at accept. That way the "old
+        // maxBlockCost" is chosen relative to a measurement, not a guess.
+        let (mut probe_validator, _probe_dir) = seeded_validator(std::slice::from_ref(&input));
+        let permissive_block = Block::new(std::slice::from_ref(&tx), state_root, ad_root);
+        let probe_outcome = permissive_block
+            .apply(&mut probe_validator)
+            .expect("probe block applies with default parameters");
+        let block_cost = probe_outcome
+            .block_cost
+            .expect("script evaluation reports a cost above checkpoint");
+        assert!(block_cost > 0, "the probe transaction has zero cost");
+
+        // Build the "old" and "new" parameters. Old cost cap is below the
+        // block's cost; new cap is above it. Everything else is identical so
+        // the `matchParameters60` subset check sees a legal set.
+        let mut boundary_params = Parameters::default();
+        boundary_params
+            .parameters_table
+            .insert(Parameter::MaxBlockCost, (block_cost + 1_000) as i32);
+
+        let mut active_params = boundary_params.clone();
+        active_params
+            .parameters_table
+            .insert(Parameter::MaxBlockCost, (block_cost - 1) as i32);
+
+        // Pack the boundary parameters into an extension exactly as
+        // `check_parameters_v6` expects (Parameters.toExtensionCandidate
+        // parity). At the boundary, the block's extension carries them.
+        let mut fields = crate::voting::pack_parameters(&boundary_params);
+        // `pack_parameters` orders by param id. The block rules (405) run on
+        // top of this; they need no interlink fields at height BLOCK_HEIGHT
+        // — this test uses `parent_extension = None` (JVM
+        // exIlUnableToValidate) so 401/402 are skipped.
+        // The extension does need a field for rule 406, which pack_parameters
+        // already satisfies (Parameters::default() has entries).
+        assert!(
+            !fields.is_empty(),
+            "packed boundary parameters must be non-empty for rule 406"
+        );
+        let extension_bytes = crate::sections::serialize_extension(&HEADER_ID, &fields)
+            .expect("extension serialization");
+
+        let block_txs_bytes =
+            crate::sections::serialize_block_transactions(&HEADER_ID, 3, std::slice::from_ref(&tx))
+                .expect("tx section serialization");
+
+        // Positive control: same block, active_params only (no boundary set,
+        // as at any mid-epoch height) — rejected as over-budget. This proves
+        // the cost really exceeds the low limit, so the boundary accept
+        // below is a genuine flip, not a vacuous pass.
+        //
+        // ergo-lib enforces the block cost per input, so the reject arm may
+        // surface as `TransactionInvalid` (per-input CostLimitExceeded) or
+        // `BlockCostExceeded` (post-fold check). Both are the same fact —
+        // the tx does not fit under active_params.
+        let (mut old_only_validator, _old_only_dir) =
+            seeded_validator(std::slice::from_ref(&input));
+        let old_header = make_header(BLOCK_HEIGHT, state_root, ad_root);
+        let err = old_only_validator
+            .apply_state(
+                &old_header,
+                &block_txs_bytes,
+                None,
+                &extension_bytes,
+                None,
+                &preceding_headers(),
+                &active_params,
+                None,
+                None,
+            )
+            .expect_err("with only the low active_params, the block must be over-budget");
+        assert!(
+            matches!(
+                err,
+                ValidationError::BlockCostExceeded { .. }
+                    | ValidationError::TransactionInvalid { .. }
+            ),
+            "expected an over-cost rejection, got: {err:?}"
+        );
+
+        // The accept arm: active_params still says the block is over-budget,
+        // but the boundary parameters override at a boundary block, and the
+        // block passes.
+        let (mut boundary_validator, _boundary_dir) =
+            seeded_validator(std::slice::from_ref(&input));
+        // The boundary path also runs `check_block_version`; its
+        // `Parameters::default()` inserts BlockVersion = 1, and `make_header`
+        // sets version = 3, so we need the extension to declare the header's
+        // version too. `Parameters::default()` starts with BlockVersion = 1;
+        // update the boundary set to match the header, then re-pack.
+        let mut boundary_params = boundary_params;
+        boundary_params
+            .parameters_table
+            .insert(Parameter::BlockVersion, i32::from(old_header.version));
+        fields = crate::voting::pack_parameters(&boundary_params);
+        let extension_bytes = crate::sections::serialize_extension(&HEADER_ID, &fields)
+            .expect("extension serialization");
+
+        let outcome = boundary_validator
+            .apply_state(
+                &old_header,
+                &block_txs_bytes,
+                None,
+                &extension_bytes,
+                None,
+                &preceding_headers(),
+                &active_params,
+                Some(&boundary_params),
+                None,
+            )
+            .expect("with boundary params supplying a higher maxBlockCost, the block is accepted");
+        assert_eq!(
+            outcome.block_cost,
+            Some(block_cost),
+            "the cost surfaced under boundary params must match the probe"
+        );
+        assert_eq!(
+            boundary_validator.validated_height(),
+            BLOCK_HEIGHT,
+            "an accepted boundary block advances state"
         );
     }
 }

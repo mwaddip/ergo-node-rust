@@ -16,6 +16,7 @@ json = ["ergo-lib/json", "ergo-chain-types/json"]
 [dependencies]
 ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "c6f8a395" }
 ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "c6f8a395" }
+ergo-nipopow = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "c6f8a395" }
 sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "c6f8a395" }
 ergo_avltree_rust = "0.1.1"
 # The tree-version rules for a block's transactions (facts/chain.md § "The

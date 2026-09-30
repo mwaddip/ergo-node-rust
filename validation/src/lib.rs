@@ -1,3 +1,4 @@
+mod block_rules;
 mod digest;
 mod prover_memory;
 mod sections;
@@ -12,6 +13,7 @@ use std::collections::HashMap;
 
 use ergo_chain_types::{ADDigest, Header};
 
+pub use block_rules::{validate_block_rules, MAX_EXTENSION_SIZE};
 pub use digest::DigestValidator;
 pub use prover_memory::ProverMemoryEstimate;
 pub use sections::{
@@ -98,15 +100,22 @@ pub struct ScriptEvalInputs {
 /// There is no mode and nothing the caller is left owing — see
 /// [`apply_state`](BlockValidator::apply_state).
 pub trait BlockValidator {
-    /// Apply state transition: parse sections, compute state changes,
-    /// apply AVL operations, verify digest, evaluate scripts, persist —
-    /// in that order.
+    /// Apply state transition: parse sections, enforce block rules 306 and
+    /// 400–406, compute state changes, apply AVL operations, verify digest,
+    /// evaluate scripts, persist — in that order.
+    ///
+    /// `parent_extension` is the raw Extension section of the block at
+    /// `header.height − 1` on the chain being applied. It feeds interlink
+    /// rules 401/402. Genesis has none; a non-genesis block with `None`
+    /// skips 401/402 with a `warn!` (JVM `exIlUnableToValidate`) — the
+    /// snapshot-bootstrap case and any reorg deeper than the store's
+    /// extension retention window.
     ///
     /// After Ok, state has advanced to this block's height AND the block's
     /// scripts have been evaluated and passed. `Ok` means exactly that;
     /// there is nothing left owed. Heights at or below the validator's
     /// `checkpoint_height` skip evaluation entirely — the state-root check
-    /// alone is the guarantee there.
+    /// alone is the guarantee there, but the block rules still run.
     ///
     /// On Err nothing moved: `validated_height()`, `current_digest()`, and
     /// the underlying prover are exactly as they were on entry, so the
@@ -118,6 +127,7 @@ pub trait BlockValidator {
         block_txs: &[u8],
         ad_proofs: Option<&[u8]>,
         extension: &[u8],
+        parent_extension: Option<&[u8]>,
         preceding_headers: &[Header],
         active_params: &Parameters,
         expected_boundary_params: Option<&Parameters>,
@@ -276,4 +286,7 @@ pub enum ValidationError {
         expected: Vec<u8>,
         actual: Vec<u8>,
     },
+
+    #[error("block rule {rule}: {reason}")]
+    BlockRule { rule: u16, reason: String },
 }

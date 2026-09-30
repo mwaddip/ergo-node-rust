@@ -185,11 +185,18 @@ pub fn preceding_headers() -> Vec<Header> {
 }
 
 /// Raw section bytes for a block carrying `txs`.
+///
+/// The extension carries a single dummy field so it satisfies block rule 406
+/// (a non-genesis block must have at least one extension field). These
+/// fixtures sit at [`BLOCK_HEIGHT`] > 1, so they exercise the same rules a
+/// mainnet block does. The field key is outside the interlink range so it
+/// doesn't collide with the interlink checks (401/402), and it carries no
+/// meaning to any test — the block rules just need one field.
 pub fn sections(txs: &[Transaction]) -> (Vec<u8>, Vec<u8>) {
     (
         crate::sections::serialize_block_transactions(&HEADER_ID, 3, txs)
             .expect("tx section serialization"),
-        crate::sections::serialize_extension(&HEADER_ID, &[])
+        crate::sections::serialize_extension(&HEADER_ID, &[([0x02u8, 0x00], vec![0xff])])
             .expect("extension section serialization"),
     )
 }
