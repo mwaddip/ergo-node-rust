@@ -7,7 +7,9 @@ use std::sync::Arc;
 use ergo_lib::chain::transaction::{DataInput, Input};
 use ergo_lib::ergotree_ir::chain::ergo_box::{BoxId, ErgoBox};
 use ergo_lib::ergotree_ir::chain::tx_id::TxId;
-use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
+use ergo_lib::ergotree_ir::serialization::sigma_byte_writer::{SigmaByteWrite, SigmaByteWriter};
+use ergo_lib::ergotree_ir::serialization::{SigmaSerializable, SigmaSerializationError};
 use ergo_mempool::Mempool;
 use sigma_ser::ScorexSerializable;
 
@@ -401,6 +403,17 @@ pub async fn check_transaction(
     process_transaction(state, tx, false).await
 }
 
+/// `tx` written at tree version `version`. `sigma_serialize_bytes()` writes
+/// at the fork's highest version, 3, whichever version the bytes are for.
+fn transaction_bytes_at(
+    tx: &ergo_validation::Transaction,
+    version: ErgoTreeVersion,
+) -> Result<Vec<u8>, SigmaSerializationError> {
+    let mut bytes = Vec::new();
+    SigmaByteWriter::new(&mut bytes, None).with_tree_version(version, |w| tx.sigma_serialize(w))?;
+    Ok(bytes)
+}
+
 async fn process_transaction(
     state: ApiState,
     tx: ergo_validation::Transaction,
@@ -409,8 +422,18 @@ async fn process_transaction(
     // Compute tx_id hex string
     let tx_id_hex = String::from(tx.id());
 
-    // Sigma-serialize for mempool storage (P2P wire format)
-    let tx_bytes = match tx.sigma_serialize_bytes() {
+    // The bytes the pool stores and relays, written at the script version
+    // the parameters in effect activate: the version a peer reads them at
+    // (facts/api.md § Transaction Submission Flow, step 2). The chain has its
+    // parameters from startup, so this and the size check run while the node
+    // is syncing too.
+    let Some(version) = state.chain.activated_tree_version() else {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the block version in effect does not fit u8",
+        );
+    };
+    let tx_bytes = match transaction_bytes_at(&tx, version) {
         Ok(b) => b,
         Err(e) => {
             return err(
@@ -2234,10 +2257,11 @@ pub async fn get_block_validation_fragments(
             max_block_cost: p.max_block_cost(),
         });
 
-    // Per-tx fragments. `signing_message` is bytes_to_sign() (Pitfall #1:
-    // strips proofs AND ContextExtensions). `bytes` is the full canonical
-    // sigma_serialize_bytes() — every input's spending proof + ContextExtension
-    // in on-chain wire order — whose blake2b256 IS the tx id.
+    // Per-tx fragments. `signing_message` is bytes_to_sign(): proofs stripped,
+    // ContextExtensions kept in wire order, written at the version the parser
+    // read the transaction at. Its blake2b256 is the tx id. `bytes` is the
+    // transaction as its block writes it, at the write version of the block
+    // version the section encodes (facts/openapi.yaml, ValidationFragmentsTx).
     let mut tx_fragments = Vec::with_capacity(parsed_txs.transactions.len());
     for tx in &parsed_txs.transactions {
         let signing_message = tx.bytes_to_sign().map_err(|e| {
@@ -2247,13 +2271,16 @@ pub async fn get_block_validation_fragments(
                 Some(format!("{e}")),
             )
         })?;
-        let canonical_bytes = tx.sigma_serialize_bytes().map_err(|e| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "tx-serialize-failed",
-                Some(format!("{e}")),
-            )
-        })?;
+        let canonical_bytes =
+            ergo_validation::serialize_block_transaction(tx, parsed_txs.block_version).map_err(
+                |e| {
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "tx-serialize-failed",
+                        Some(format!("{e}")),
+                    )
+                },
+            )?;
         tx_fragments.push(ValidationFragmentsTx {
             signing_message: hex::encode(&signing_message),
             bytes: hex::encode(&canonical_bytes),
@@ -2270,7 +2297,6 @@ pub async fn get_block_validation_fragments(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
     use std::net::SocketAddr;
 
     #[test]
@@ -3832,13 +3858,15 @@ mod tests {
             "tx count must match /blocks/{{id}}",
         );
 
-        // `bytes` is the full canonical sigma_serialize_bytes() (proofs +
+        // `bytes` is the transaction as its block writes it (proofs +
         // ContextExtension in wire order). The Ergo tx id is
         // blake2b256(bytes_to_sign), which strips proofs but KEEPS the
         // ContextExtensions (in wire order) — so it is NOT blake2b256(bytes)
         // (which adds the proofs back); identity is checked via
         // `signing_message`, and `bytes` is verified to re-parse to a tx with
-        // that same id. (This fixture is proof-less, so bytes == bytes_to_sign
+        // that same id. `sigma_parse_bytes` reads at tree version 3, and this
+        // fixture holds nothing a version changes, so any version gives that
+        // id. (This fixture is proof-less, so bytes == bytes_to_sign
         // here; ContextExtension order-preservation is sigma's IndexMap
         // property, exercised cross-impl by SANTA's conformance vectors.)
         use blake2::digest::consts::U32;
@@ -5659,5 +5687,293 @@ mod tests {
 
         // One read per well-formed id, each with the lock free.
         assert_eq!(*probe.lock_free_at_read.lock().unwrap(), [true; 4]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tree versions: SANTA X15, `Tuple(1, Upcast(1, Long))`
+    //
+    // Below tree version 3 an `Upcast` of a constant is written as the
+    // constant, so a transaction holding X15 has one byte image at 3 and
+    // another below. The fork computes a transaction's id at the version it
+    // read the transaction at. The bytes below are pinned as observed, and the
+    // ids are the ones `enr-chain` pins for the same bytes.
+    // -----------------------------------------------------------------------
+
+    use ergo_lib::chain::transaction::input::prover_result::ProverResult;
+    use ergo_lib::ergotree_interpreter::sigma_protocol::prover::ProofBytes;
+    use ergo_lib::ergotree_ir::chain::ergo_box::box_value::BoxValue;
+    use ergo_lib::ergotree_ir::chain::ergo_box::{ErgoBoxCandidate, NonMandatoryRegisters};
+    use ergo_lib::ergotree_ir::chain::evaluated_value::{EvaluatedExpr, EvaluatedValue};
+    use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
+    use ergo_lib::ergotree_ir::mir::constant::Constant;
+    use ergo_lib::ergotree_ir::mir::expr::Expr;
+    use ergo_lib::ergotree_ir::mir::upcast::Upcast;
+    use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::{SigmaBoolean, SigmaProp};
+    use ergo_lib::ergotree_ir::types::stype::SType;
+
+    /// One input spending box `0…0` with an empty proof and X15 as context
+    /// variable 0, and one 1 ERG `sigmaProp(true)` output at height 1, written
+    /// at tree version 3: the `Upcast` kept. `ergo-validation`'s
+    /// `EXTENSION_TX`, and this one below its `EXTENSION_TX_AT_0`.
+    const X15_TX_AT_3: &str =
+        "01000000000000000000000000000000000000000000000000000000000000000000\
+         0100860204027e0402050000018094ebdc030008d3010000";
+    /// [`X15_TX_AT_3`] written below tree version 3: the `Upcast` as `1`.
+    const X15_TX_AT_0: &str =
+        "01000000000000000000000000000000000000000000000000000000000000000000\
+         01008602040204020000018094ebdc030008d3010000";
+    /// [`X15_TX_AT_3`]'s id read at 3, and read at 0.
+    const X15_TX_ID_AT_3: &str = "6b11fd0ea5f1e84782c15044f03cf10df48022ba7dcb8e6c0e48233b1cf9b0a1";
+    const X15_TX_ID_AT_0: &str = "b006736746ec23927fecfbaeb5a27bda4df791e5440eaba24e8aadb3072b3deb";
+
+    fn blake2b256_hex(bytes: &[u8]) -> String {
+        use blake2::digest::consts::U32;
+        use blake2::{Blake2b, Digest};
+        hex::encode(Blake2b::<U32>::digest(bytes))
+    }
+
+    /// With an empty proof a transaction's bytes are its bytes to sign, so
+    /// each byte string above hashes to its id.
+    #[test]
+    fn x15_bytes_hash_to_the_ids_enr_chain_pins() {
+        for (bytes, id) in [(X15_TX_AT_3, X15_TX_ID_AT_3), (X15_TX_AT_0, X15_TX_ID_AT_0)] {
+            assert_eq!(blake2b256_hex(&hex::decode(bytes).unwrap()), id);
+        }
+    }
+
+    /// A block of `block_version` whose transactions section carries
+    /// [`X15_TX_AT_3`], stored under its header. Returns `(state, header id
+    /// hex)`. A v2 block's serializer writes X15 as `1`, but the section
+    /// holds what a peer delivered, which is what the endpoint answers for.
+    fn x15_block(block_version: u8) -> (ApiState, String) {
+        use sigma_ser::vlq_encode::WriteSigmaVlqExt;
+
+        let mut header = make_vf_header(685, BlockId(Digest32::zero()));
+        header.version = block_version;
+        header.id = Header::scorex_parse_bytes(&header.scorex_serialize_bytes().unwrap())
+            .unwrap()
+            .id;
+        let header_id = header.id.0 .0;
+
+        // The JVM's framing: the version sentinel, the count, then the
+        // transaction's bytes as they stand.
+        let mut section = header_id.to_vec();
+        section
+            .put_u32(10_000_000 + u32::from(block_version))
+            .unwrap();
+        section.put_u32(1).unwrap();
+        section.extend(hex::decode(X15_TX_AT_3).unwrap());
+        let txs_modifier_id = section_modifier_id(
+            BLOCK_TRANSACTIONS_TYPE,
+            &header_id,
+            header.transaction_root.0.as_ref(),
+        );
+
+        let mut state = test_state(Arc::new(MultiHeaderChain {
+            by_id: HashMap::from([(header_id, header)]),
+        }));
+        state.store = Arc::new(KeyedStore {
+            by_key: HashMap::from([((BLOCK_TRANSACTIONS_TYPE, txs_modifier_id), section)]),
+        });
+        (state, hex::encode(header_id))
+    }
+
+    /// `bytes` are the transaction as its block writes it: at 0 in a v2
+    /// block, at 3 in a v3 or v4 block. `signingMessage` is as the parser
+    /// read it: at 0 up to block version 3, at 3 from 4. So a v3 block's
+    /// `bytes` keep the `Upcast` and its `signingMessage` doesn't.
+    #[test]
+    fn validation_fragments_write_a_transaction_as_its_block_does() {
+        for (block_version, signing_message, bytes) in [
+            (2, X15_TX_AT_0, X15_TX_AT_0),
+            (3, X15_TX_AT_0, X15_TX_AT_3),
+            (4, X15_TX_AT_3, X15_TX_AT_3),
+        ] {
+            let (state, header_id) = x15_block(block_version);
+            let uri = format!("/blocks/{header_id}/validation-fragments");
+            let served = get(state, &uri);
+            assert_json_ok(&served, &uri);
+            let fragments: serde_json::Value = serde_json::from_str(&served.body).unwrap();
+            let tx = &fragments["transactions"][0];
+            assert_eq!(
+                tx["signingMessage"], signing_message,
+                "block version {block_version}"
+            );
+            assert_eq!(tx["bytes"], bytes, "block version {block_version}");
+        }
+    }
+
+    /// A chain whose parameters in effect activate script version `.0`. It
+    /// holds no headers.
+    struct ActivatedChain(Option<ErgoTreeVersion>);
+    impl ChainAccess for ActivatedChain {
+        fn height(&self) -> u32 {
+            0
+        }
+        fn header_at(&self, _h: u32) -> Option<Header> {
+            None
+        }
+        fn header_by_id(&self, _id: &[u8; 32]) -> Option<Header> {
+            None
+        }
+        fn tip(&self) -> Option<Header> {
+            None
+        }
+        fn build_nipopow_proof(
+            &self,
+            _m: u32,
+            _k: u32,
+            _h: Option<[u8; 32]>,
+        ) -> Result<Vec<u8>, String> {
+            Err("unused".into())
+        }
+        fn header_ids(&self, _o: u32, _l: u32) -> Vec<[u8; 32]> {
+            vec![]
+        }
+        fn popow_header_by_id(&self, _id: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
+            Ok(None)
+        }
+        fn memory_estimate(&self) -> ChainMemory {
+            unreported_memory()
+        }
+        fn activated_tree_version(&self) -> Option<ErgoTreeVersion> {
+            self.0
+        }
+    }
+
+    /// SANTA X15, `Tuple(1, Upcast(1, Long))`.
+    fn x15() -> EvaluatedValue {
+        let one = || Expr::Const(1i32.into());
+        EvaluatedValue::Expr(EvaluatedExpr::Tuple(vec![
+            one(),
+            Expr::Upcast(Upcast::new(one(), SType::SLong).unwrap()),
+        ]))
+    }
+
+    /// `sigmaProp(true)`. The interpreter doesn't evaluate a tree that is a
+    /// `SigmaProp` constant, so a spending extension's values are never
+    /// converted, X15 included.
+    fn always_true() -> ErgoTree {
+        let always = SigmaProp::new(SigmaBoolean::TrivialProp(true));
+        ErgoTree::try_from(Expr::Const(Constant::from(always))).unwrap()
+    }
+
+    /// 1 ERG under [`always_true`], created at height 684.
+    fn always_true_box() -> ergo_validation::ErgoBox {
+        ergo_validation::ErgoBox::new(
+            BoxValue::new(1_000_000_000).unwrap(),
+            always_true(),
+            None,
+            NonMandatoryRegisters::empty(),
+            684,
+            TxId::from(Digest32::from([0x11; 32])),
+            0,
+        )
+        .unwrap()
+    }
+
+    /// A transaction spending [`always_true_box`] with an empty proof and X15
+    /// as context variable 0, into the pool's minimum fee and the change,
+    /// back under [`always_true`].
+    fn x15_submission() -> ergo_validation::Transaction {
+        let mut extension = ContextExtension::empty();
+        extension.values.insert(0, x15());
+        let input = Input::new(
+            always_true_box().box_id(),
+            ProverResult {
+                proof: ProofBytes::Empty,
+                extension,
+            },
+        );
+        let config = ergo_mempool::types::MempoolConfig::default();
+        let fee = ErgoBoxCandidate {
+            value: BoxValue::new(config.min_fee).unwrap(),
+            ergo_tree: ergo_lib::chain::ergo_tree_predef::fee_proposition(config.reward_delay)
+                .unwrap(),
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height: 685,
+        };
+        let change = ErgoBoxCandidate {
+            value: BoxValue::new(1_000_000_000 - config.min_fee).unwrap(),
+            ergo_tree: always_true(),
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height: 685,
+        };
+        ergo_validation::Transaction::new_from_vec(vec![input], vec![], vec![fee, change]).unwrap()
+    }
+
+    /// [`x15_submission`] as the pool holds it when the parameters in effect
+    /// activate script version 3: the `Upcast` kept.
+    const X15_SUBMISSION_AT_3: &str =
+        "012032a6f21762e664f27f1bfb6bd4727b462cd63d80f8ccef4d871136195b3459\
+         000100860204027e040205000002c0843d1005040004000e36100204a00b08cd02\
+         79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ea\
+         02d192a39a8cc7a701730073011001020402d19683030193a38cc7b2a573000001\
+         93c2b2a57301007473027303830108cdeeac93b1a57304ad050000c08faedc0300\
+         08d3ad050000";
+    /// The same when they activate a version below 3: the `Upcast` as `1`.
+    const X15_SUBMISSION_BELOW_3: &str =
+        "012032a6f21762e664f27f1bfb6bd4727b462cd63d80f8ccef4d871136195b3459\
+         000100860204020402000002c0843d1005040004000e36100204a00b08cd0279be\
+         667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ea02d1\
+         92a39a8cc7a701730073011001020402d19683030193a38cc7b2a57300000193c2\
+         b2a57301007473027303830108cdeeac93b1a57304ad050000c08faedc030008d3\
+         ad050000";
+
+    /// Submit [`x15_submission`] through `POST /transactions` to a node whose
+    /// chain activates `activated`, whose UTXO set holds the box it spends,
+    /// and whose state context is for the block after height 685 at
+    /// `block_version`. Returns the id the node answers and the bytes its
+    /// pool holds, hex.
+    fn submit_x15(activated: ErgoTreeVersion, block_version: i32) -> (String, String) {
+        let parent = make_vf_header(684, BlockId(Digest32::zero()));
+        let last = make_vf_header(685, parent.id);
+        let mut parameters = ergo_validation::Parameters::default();
+        parameters
+            .parameters_table
+            .insert(ergo_validation::Parameter::BlockVersion, block_version);
+        let context = ergo_validation::build_upcoming_state_context(&last, &[parent], &parameters);
+
+        let mut state = test_state(Arc::new(ActivatedChain(Some(activated))));
+        state.utxo_reader = Arc::new(BoxUtxo::holding(&[always_true_box()]));
+        state.state_context = Arc::new(tokio::sync::RwLock::new(Some(context)));
+
+        let body = serde_json::to_string(&x15_submission()).unwrap();
+        let served = serve(state.clone(), post_json("/transactions", body));
+        assert_json_ok(&served, "/transactions");
+        let id: String = serde_json::from_str(&served.body).unwrap();
+        let pool = state.mempool.try_lock().expect("uncontended");
+        let id_bytes: [u8; 32] = hex::decode(&id).unwrap().try_into().unwrap();
+        let pooled = pool.get(&id_bytes).expect("the pool holds it");
+        (id, hex::encode(&pooled.tx_bytes[..]))
+    }
+
+    /// The pool holds a submitted transaction as the script version the
+    /// parameters in effect activate writes it: 3 at block version 4, 2 at
+    /// block version 3.
+    #[test]
+    fn a_submission_is_pooled_at_the_activated_version() {
+        let (id, pooled) = submit_x15(ErgoTreeVersion::V3, 4);
+        assert_eq!(pooled, X15_SUBMISSION_AT_3, "activated at 3");
+        // With an empty proof they are the bytes to sign, and they hash to
+        // the id the node answers.
+        assert_eq!(blake2b256_hex(&hex::decode(&pooled).unwrap()), id);
+
+        let (_, pooled) = submit_x15(ErgoTreeVersion::V2, 3);
+        assert_eq!(pooled, X15_SUBMISSION_BELOW_3, "activated at 2");
+    }
+
+    /// A block version in effect that doesn't fit `u8` is a bug upstream:
+    /// both routes answer 500, while the node is syncing too.
+    #[test]
+    fn a_submission_answers_500_without_an_activated_version() {
+        let body = serde_json::to_string(&x15_submission()).unwrap();
+        for uri in ["/transactions", "/transactions/check"] {
+            let state = test_state(Arc::new(ActivatedChain(None)));
+            let served = serve(state, post_json(uri, body.clone()));
+            assert_api_error(&served, StatusCode::INTERNAL_SERVER_ERROR, uri);
+        }
     }
 }

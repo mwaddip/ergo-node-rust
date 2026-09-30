@@ -362,17 +362,18 @@ pub struct ValidationFragmentsParameters {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ValidationFragmentsTx {
-    /// `Transaction::bytes_to_sign()` hex-encoded — inputs without
-    /// proofs/extensions, then data-inputs, then outputs concatenated. NOT
-    /// the full canonical tx bytes. This is what every input's signature
-    /// commits to.
+    /// `Transaction::bytes_to_sign()` hex-encoded — inputs without proofs
+    /// but with their ContextExtensions in wire order, then data-inputs, then
+    /// outputs. NOT the full canonical tx bytes. This is what every input's
+    /// signature commits to.
     pub signing_message: String,
-    /// Full canonical transaction bytes from
-    /// `Transaction::sigma_serialize_bytes()`, hex-encoded — each input as
-    /// boxId + spending proof + ContextExtension, then data-inputs, then
-    /// outputs. The on-chain ContextExtension wire order is preserved
-    /// byte-for-byte (NOT sorted). The tx id is `blake2b256(signingMessage)`
-    /// (proofs stripped, ContextExtensions kept in wire order), NOT
-    /// `blake2b256(bytes)`.
+    /// Full transaction bytes as the block serializer writes them,
+    /// hex-encoded: `ergo_validation::serialize_block_transaction` at the
+    /// block version the section encodes, which writes at tree version 3
+    /// from block version 3 and at 0 below. Each input as boxId + spending
+    /// proof + ContextExtension, then data-inputs, then outputs. The on-chain
+    /// ContextExtension wire order is preserved byte-for-byte (NOT sorted).
+    /// The tx id is `blake2b256(signingMessage)` (proofs stripped,
+    /// ContextExtensions kept in wire order), NOT `blake2b256(bytes)`.
     pub bytes: String,
 }
