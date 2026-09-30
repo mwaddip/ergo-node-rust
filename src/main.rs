@@ -400,6 +400,7 @@ impl BlockValidator for Validator {
         block_txs: &[u8],
         ad_proofs: Option<&[u8]>,
         extension: &[u8],
+        parent_extension: Option<&[u8]>,
         preceding_headers: &[ergo_chain_types::Header],
         active_params: &ergo_validation::Parameters,
         expected_boundary_params: Option<&ergo_validation::Parameters>,
@@ -411,6 +412,7 @@ impl BlockValidator for Validator {
                 block_txs,
                 ad_proofs,
                 extension,
+                parent_extension,
                 preceding_headers,
                 active_params,
                 expected_boundary_params,
@@ -421,6 +423,7 @@ impl BlockValidator for Validator {
                 block_txs,
                 ad_proofs,
                 extension,
+                parent_extension,
                 preceding_headers,
                 active_params,
                 expected_boundary_params,
@@ -3403,6 +3406,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             blocks_to_keep as i32
         },
+        // Extensions outlive `blocks_to_keep` by the state's rollback depth,
+        // so a fork point's interlinks can always be checked against
+        // (facts/sync.md § "Pruning at flush time").
+        extension_keep_depth: STATE_KEEP_VERSIONS,
 
         // Pacing constants: not operator-tunable, not consensus-relevant.
         // Named individually (no `..SyncConfig::default()`) so adding a
