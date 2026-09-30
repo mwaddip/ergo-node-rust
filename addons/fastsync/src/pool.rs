@@ -362,13 +362,12 @@ impl PeerPool {
                         let mut batch = Vec::with_capacity(hdrs.len());
                         for header in &hdrs {
                             // Autolykos v1 headers (version < 2) — skip PoW
-                            if header.version >= 2 {
-                                if !header
+                            if header.version >= 2
+                                && !header
                                     .check_pow()
                                     .with_context(|| format!("PoW at height {}", header.height))?
-                                {
-                                    bail!("PoW failed at height {}", header.height);
-                                }
+                            {
+                                bail!("PoW failed at height {}", header.height);
                             }
                             batch.push(header_to_modifier(header)?);
                         }
