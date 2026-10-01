@@ -387,9 +387,9 @@ pub async fn get_last_headers(
 
 pub async fn post_transaction(
     State(state): State<ApiState>,
-    ApiJson(tx): ApiJson<ergo_validation::Transaction>,
+    ApiJson(submission): ApiJson<TransactionSubmission>,
 ) -> ApiResult<String> {
-    process_transaction(state, tx, true).await
+    process_submission(state, submission, true).await
 }
 
 // ---------------------------------------------------------------------------
@@ -398,9 +398,9 @@ pub async fn post_transaction(
 
 pub async fn check_transaction(
     State(state): State<ApiState>,
-    ApiJson(tx): ApiJson<ergo_validation::Transaction>,
+    ApiJson(submission): ApiJson<TransactionSubmission>,
 ) -> ApiResult<String> {
-    process_transaction(state, tx, false).await
+    process_submission(state, submission, false).await
 }
 
 /// `tx` written at tree version `version`. `sigma_serialize_bytes()` writes
@@ -414,25 +414,84 @@ fn transaction_bytes_at(
     Ok(bytes)
 }
 
-async fn process_transaction(
+async fn process_submission(
     state: ApiState,
-    tx: ergo_validation::Transaction,
+    submission: TransactionSubmission,
     add_to_pool: bool,
 ) -> ApiResult<String> {
-    // Compute tx_id hex string
-    let tx_id_hex = String::from(tx.id());
-
-    // The bytes the pool stores and relays, written at the script version
-    // the parameters in effect activate: the version a peer reads them at
-    // (facts/api.md § Transaction Submission Flow, step 2). The chain has its
-    // parameters from startup, so this and the size check run while the node
-    // is syncing too.
+    // Build the transaction at the script version the parameters in effect
+    // activate: the version a peer reads the relayed bytes at
+    // (facts/api.md § Transaction Submission Flow, steps 1a and 2). The
+    // chain has its parameters from startup, so the version lookup, the id
+    // checks and the size check all run while the node is syncing too.
     let Some(version) = state.chain.activated_tree_version() else {
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "the block version in effect does not fit u8",
         );
     };
+
+    let TransactionSubmission {
+        id: body_id,
+        inputs,
+        data_inputs,
+        outputs,
+    } = submission;
+    let output_count = outputs.len();
+    let mut candidates = Vec::with_capacity(output_count);
+    let mut declared_box_ids = Vec::with_capacity(output_count);
+    for output in outputs {
+        candidates.push(output.candidate);
+        declared_box_ids.push(output.box_id);
+    }
+
+    let tx = match ergo_validation::Transaction::new_from_vec_at(
+        inputs,
+        data_inputs,
+        candidates,
+        version,
+    ) {
+        Ok(tx) => tx,
+        Err(e) => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "transaction build failed",
+                Some(format!("{e}")),
+            ))
+        }
+    };
+
+    // The body's `id` must match the id the node built. The JVM ignores both
+    // and computes them itself; we answer 400 so a client that computed one
+    // other than the node's learns it before anything is pooled or relayed
+    // (facts/api.md § Transaction Submission Flow, "The id checks").
+    if tx.id() != body_id {
+        let built = String::from(tx.id());
+        let submitted = String::from(body_id);
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "transaction id does not match the id the node built",
+            Some(format!("submitted {submitted}, built {built}")),
+        ));
+    }
+    for (index, (declared, output)) in declared_box_ids.iter().zip(tx.outputs.iter()).enumerate() {
+        let Some(declared) = declared else { continue };
+        let built_id = output.box_id();
+        if *declared != built_id {
+            let submitted = String::from(*declared);
+            let built = String::from(built_id);
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "output boxId does not match the id the node built",
+                Some(format!(
+                    "output {index}: submitted {submitted}, built {built}"
+                )),
+            ));
+        }
+    }
+
+    let tx_id_hex = String::from(tx.id());
+
     let tx_bytes = match transaction_bytes_at(&tx, version) {
         Ok(b) => b,
         Err(e) => {
@@ -5872,40 +5931,8 @@ mod tests {
         .unwrap()
     }
 
-    /// A transaction spending [`always_true_box`] with an empty proof and X15
-    /// as context variable 0, into the pool's minimum fee and the change,
-    /// back under [`always_true`].
-    fn x15_submission() -> ergo_validation::Transaction {
-        let mut extension = ContextExtension::empty();
-        extension.values.insert(0, x15());
-        let input = Input::new(
-            always_true_box().box_id(),
-            ProverResult {
-                proof: ProofBytes::Empty,
-                extension,
-            },
-        );
-        let config = ergo_mempool::types::MempoolConfig::default();
-        let fee = ErgoBoxCandidate {
-            value: BoxValue::new(config.min_fee).unwrap(),
-            ergo_tree: ergo_lib::chain::ergo_tree_predef::fee_proposition(config.reward_delay)
-                .unwrap(),
-            tokens: None,
-            additional_registers: NonMandatoryRegisters::empty(),
-            creation_height: 685,
-        };
-        let change = ErgoBoxCandidate {
-            value: BoxValue::new(1_000_000_000 - config.min_fee).unwrap(),
-            ergo_tree: always_true(),
-            tokens: None,
-            additional_registers: NonMandatoryRegisters::empty(),
-            creation_height: 685,
-        };
-        ergo_validation::Transaction::new_from_vec(vec![input], vec![], vec![fee, change]).unwrap()
-    }
-
-    /// [`x15_submission`] as the pool holds it when the parameters in effect
-    /// activate script version 3: the `Upcast` kept.
+    /// The submission `wallet_body_at_3` describes, as the pool holds it when
+    /// the parameters in effect activate script version 3: the `Upcast` kept.
     const X15_SUBMISSION_AT_3: &str =
         "012032a6f21762e664f27f1bfb6bd4727b462cd63d80f8ccef4d871136195b3459\
          000100860204027e040205000002c0843d1005040004000e36100204a00b08cd02\
@@ -5922,12 +5949,160 @@ mod tests {
          b2a57301007473027303830108cdeeac93b1a57304ad050000c08faedc030008d3\
          ad050000";
 
-    /// Submit [`x15_submission`] through `POST /transactions` to a node whose
-    /// chain activates `activated`, whose UTXO set holds the box it spends,
-    /// and whose state context is for the block after height 685 at
-    /// `block_version`. Returns the id the node answers and the bytes its
-    /// pool holds, hex.
-    fn submit_x15(activated: ErgoTreeVersion, block_version: i32) -> (String, String) {
+    // -----------------------------------------------------------------------
+    // POST /transactions, POST /transactions/check
+    // -----------------------------------------------------------------------
+    //
+    // The request bodies are written by hand, as a wallet sends them, and
+    // every id and `boxId` is pinned to a literal rather than derived from
+    // the fork's serde output. The transaction the submission describes is
+    // [`x15_submission`]: one empty-proof input spending [`always_true_box`]
+    // with X15 as context variable 0, into the pool's minimum fee and the
+    // change back under [`always_true`].
+
+    /// `blake2b256(X15_SUBMISSION_AT_3)`: the id of the submission as a peer
+    /// reads it at tree version 3. [`x15_submission`] has an empty proof, so
+    /// its bytes are its bytes-to-sign, and its id hashes them.
+    const X15_SUBMISSION_ID_AT_3: &str =
+        "895c146b123048bcd14f9ca372c1fa3a5431824cee1b663b1dbd8090fc3784b5";
+    /// `blake2b256(X15_SUBMISSION_BELOW_3)`: the same below version 3.
+    const X15_SUBMISSION_ID_BELOW_3: &str =
+        "8c11d6320823e8a2f5964fa7ae8a2ac0775312f4df6a44dbfa31c477a324a7cf";
+
+    /// `always_true_box().box_id()`, the input the submission spends.
+    const SPENT_BOX_ID: &str = "2032a6f21762e664f27f1bfb6bd4727b462cd63d80f8ccef4d871136195b3459";
+
+    /// Fee and change box ids as the node builds them at tree version 3:
+    /// `blake2b256(ergo_box_at_v0(parent_tx_id = X15_SUBMISSION_ID_AT_3,
+    /// index = i))`. The outputs carry no registers, so their bytes at V0 are
+    /// the same as their bytes at V3; only the parent tx_id in each box
+    /// differs between the two activated-version cases.
+    const FEE_BOX_ID_AT_3: &str =
+        "72eea8991e7a8958499ca0783e5ce06163afd31eea8aeae785013d317d4530e2";
+    const CHANGE_BOX_ID_AT_3: &str =
+        "5f63962c5b274ce399887de7fb15de70319dc958914553587be754bd9e51f8be";
+    const FEE_BOX_ID_BELOW_3: &str =
+        "29ef005c8a9e35cfbc2e1799ac2600a53d5aef0741245a91b788509b2eb3a95b";
+    const CHANGE_BOX_ID_BELOW_3: &str =
+        "836504bac5bb974177dd80a4e3a7503805c9b965458459f5c9fb25d9409e1363";
+
+    /// The fee output `ergoTree`: `fee_proposition(reward_delay)` serialized,
+    /// hex. Pinned so the body stays a wallet-shaped literal.
+    const FEE_TREE_HEX: &str = "1005040004000e36100204a00b08cd0279be667ef9dcbbac55a06295ce870b07\
+                                029bfcdb2dce28d959f2815b16f81798ea02d192a39a8cc7a7017300730110\
+                                01020402d19683030193a38cc7b2a57300000193c2b2a57301007473027303\
+                                830108cdeeac93b1a57304";
+    /// The change output `ergoTree`: `sigmaProp(true)` serialized, hex.
+    const ALWAYS_TRUE_TREE_HEX: &str = "0008d3";
+    /// `MempoolConfig::default().min_fee`, the fee output's value.
+    const MIN_FEE_NANOERG: u64 = 1_000_000;
+    /// Change = always_true_box.value − min_fee.
+    const CHANGE_NANOERG: u64 = 1_000_000_000 - MIN_FEE_NANOERG;
+    /// Outputs' creation height.
+    const SUBMISSION_HEIGHT: u32 = 685;
+
+    /// X15 as a context-extension entry writes at version 3.
+    const X15_EXTENSION_HEX_AT_3: &str = "860204027e040205";
+    /// The same below version 3: the `Upcast` as `1`.
+    const X15_EXTENSION_HEX_BELOW_3: &str = "860204020402";
+
+    /// Pin that each submission constant hashes to the id above and that the
+    /// pinned output box ids and the pinned `ergoTree` hex match what the fork
+    /// builds. Derives the literals once and leaves the body-authoring tests
+    /// pure string manipulation.
+    #[test]
+    fn x15_submission_constants_match_what_the_fork_builds() {
+        use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+        let config = ergo_mempool::types::MempoolConfig::default();
+        assert_eq!(
+            hex::encode(
+                ergo_lib::chain::ergo_tree_predef::fee_proposition(config.reward_delay)
+                    .unwrap()
+                    .sigma_serialize_bytes()
+                    .unwrap()
+            ),
+            FEE_TREE_HEX,
+        );
+        assert_eq!(
+            hex::encode(always_true().sigma_serialize_bytes().unwrap()),
+            ALWAYS_TRUE_TREE_HEX,
+        );
+        assert_eq!(MIN_FEE_NANOERG, config.min_fee);
+        for (bytes, id) in [
+            (X15_SUBMISSION_AT_3, X15_SUBMISSION_ID_AT_3),
+            (X15_SUBMISSION_BELOW_3, X15_SUBMISSION_ID_BELOW_3),
+        ] {
+            assert_eq!(blake2b256_hex(&hex::decode(bytes).unwrap()), id);
+        }
+        for (activated, expected_tx_id, expected_fee_id, expected_change_id) in [
+            (
+                ErgoTreeVersion::V3,
+                X15_SUBMISSION_ID_AT_3,
+                FEE_BOX_ID_AT_3,
+                CHANGE_BOX_ID_AT_3,
+            ),
+            (
+                ErgoTreeVersion::V2,
+                X15_SUBMISSION_ID_BELOW_3,
+                FEE_BOX_ID_BELOW_3,
+                CHANGE_BOX_ID_BELOW_3,
+            ),
+        ] {
+            let tx = build_x15_submission_at(activated);
+            assert_eq!(String::from(tx.id()), expected_tx_id);
+            assert_eq!(
+                String::from(tx.outputs.first().box_id()),
+                expected_fee_id,
+                "fee output at {activated:?}"
+            );
+            assert_eq!(
+                String::from(tx.outputs.get(1).unwrap().box_id()),
+                expected_change_id,
+                "change output at {activated:?}"
+            );
+        }
+        assert_eq!(String::from(always_true_box().box_id()), SPENT_BOX_ID);
+    }
+
+    /// [`x15_submission`] built at `activated`.
+    fn build_x15_submission_at(activated: ErgoTreeVersion) -> ergo_validation::Transaction {
+        let mut extension = ContextExtension::empty();
+        extension.values.insert(0, x15());
+        let input = Input::new(
+            always_true_box().box_id(),
+            ProverResult {
+                proof: ProofBytes::Empty,
+                extension,
+            },
+        );
+        let config = ergo_mempool::types::MempoolConfig::default();
+        let fee = ErgoBoxCandidate {
+            value: BoxValue::new(config.min_fee).unwrap(),
+            ergo_tree: ergo_lib::chain::ergo_tree_predef::fee_proposition(config.reward_delay)
+                .unwrap(),
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height: SUBMISSION_HEIGHT,
+        };
+        let change = ErgoBoxCandidate {
+            value: BoxValue::new(1_000_000_000 - config.min_fee).unwrap(),
+            ergo_tree: always_true(),
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height: SUBMISSION_HEIGHT,
+        };
+        ergo_validation::Transaction::new_from_vec_at(
+            vec![input],
+            vec![],
+            vec![fee, change],
+            activated,
+        )
+        .unwrap()
+    }
+
+    /// A node whose chain activates `activated`, holding `always_true_box` in
+    /// its UTXO set and a state context around height 685 at `block_version`.
+    fn x15_state(activated: ErgoTreeVersion, block_version: i32) -> ApiState {
         let parent = make_vf_header(684, BlockId(Digest32::zero()));
         let last = make_vf_header(685, parent.id);
         let mut parameters = ergo_validation::Parameters::default();
@@ -5939,37 +6114,451 @@ mod tests {
         let mut state = test_state(Arc::new(ActivatedChain(Some(activated))));
         state.utxo_reader = Arc::new(BoxUtxo::holding(&[always_true_box()]));
         state.state_context = Arc::new(tokio::sync::RwLock::new(Some(context)));
-
-        let body = serde_json::to_string(&x15_submission()).unwrap();
-        let served = serve(state.clone(), post_json("/transactions", body));
-        assert_json_ok(&served, "/transactions");
-        let id: String = serde_json::from_str(&served.body).unwrap();
-        let pool = state.mempool.try_lock().expect("uncontended");
-        let id_bytes: [u8; 32] = hex::decode(&id).unwrap().try_into().unwrap();
-        let pooled = pool.get(&id_bytes).expect("the pool holds it");
-        (id, hex::encode(&pooled.tx_bytes[..]))
+        state
     }
 
-    /// The pool holds a submitted transaction as the script version the
-    /// parameters in effect activate writes it: 3 at block version 4, 2 at
-    /// block version 3.
-    #[test]
-    fn a_submission_is_pooled_at_the_activated_version() {
-        let (id, pooled) = submit_x15(ErgoTreeVersion::V3, 4);
-        assert_eq!(pooled, X15_SUBMISSION_AT_3, "activated at 3");
-        // With an empty proof they are the bytes to sign, and they hash to
-        // the id the node answers.
-        assert_eq!(blake2b256_hex(&hex::decode(&pooled).unwrap()), id);
+    /// A wallet-shaped `TransactionSubmission` JSON body.
+    ///
+    /// `id` goes in the top-level `id`. `extension_hex` is the X15 value in
+    /// context variable 0. `fee_box_id` / `change_box_id` are the output ids
+    /// where given — `None` leaves them out. `fee_registers` / `change_registers`
+    /// go in `additionalRegisters` as `{"R4": "<hex>", ...}` entries; empty is
+    /// `{}`. Each output's `transactionId` / `index` is omitted when the field
+    /// is `None`.
+    #[allow(clippy::too_many_arguments)]
+    fn wallet_body(
+        id: &str,
+        extension_hex: &str,
+        fee_box_id: Option<&str>,
+        fee_registers: &[(&str, &str)],
+        change_box_id: Option<&str>,
+        change_registers: &[(&str, &str)],
+        fee_tx_id: Option<&str>,
+        fee_index: Option<u16>,
+        change_tx_id: Option<&str>,
+        change_index: Option<u16>,
+    ) -> String {
+        fn output(
+            box_id: Option<&str>,
+            value: u64,
+            tree_hex: &str,
+            registers: &[(&str, &str)],
+            tx_id: Option<&str>,
+            index: Option<u16>,
+        ) -> String {
+            let mut parts = Vec::new();
+            if let Some(id) = box_id {
+                parts.push(format!(r#""boxId":"{id}""#));
+            }
+            parts.push(format!(r#""value":{value}"#));
+            parts.push(format!(r#""ergoTree":"{tree_hex}""#));
+            parts.push(r#""assets":[]"#.to_string());
+            let regs: String = registers
+                .iter()
+                .map(|(k, v)| format!(r#""{k}":"{v}""#))
+                .collect::<Vec<_>>()
+                .join(",");
+            parts.push(format!(r#""additionalRegisters":{{{regs}}}"#));
+            parts.push(format!(r#""creationHeight":{SUBMISSION_HEIGHT}"#));
+            if let Some(tx_id) = tx_id {
+                parts.push(format!(r#""transactionId":"{tx_id}""#));
+            }
+            if let Some(index) = index {
+                parts.push(format!(r#""index":{index}"#));
+            }
+            format!("{{{}}}", parts.join(","))
+        }
 
-        let (_, pooled) = submit_x15(ErgoTreeVersion::V2, 3);
-        assert_eq!(pooled, X15_SUBMISSION_BELOW_3, "activated at 2");
+        let fee = output(
+            fee_box_id,
+            MIN_FEE_NANOERG,
+            FEE_TREE_HEX,
+            fee_registers,
+            fee_tx_id,
+            fee_index,
+        );
+        let change = output(
+            change_box_id,
+            CHANGE_NANOERG,
+            ALWAYS_TRUE_TREE_HEX,
+            change_registers,
+            change_tx_id,
+            change_index,
+        );
+        format!(
+            r#"{{"id":"{id}","inputs":[{{"boxId":"{SPENT_BOX_ID}","spendingProof":{{"proofBytes":"","extension":{{"0":"{extension_hex}"}}}}}}],"dataInputs":[],"outputs":[{fee},{change}]}}"#
+        )
+    }
+
+    /// `wallet_body` with every optional field set to the ids the node builds
+    /// at tree version 3.
+    fn wallet_body_at_3() -> String {
+        wallet_body(
+            X15_SUBMISSION_ID_AT_3,
+            X15_EXTENSION_HEX_AT_3,
+            Some(FEE_BOX_ID_AT_3),
+            &[],
+            Some(CHANGE_BOX_ID_AT_3),
+            &[],
+            Some(X15_SUBMISSION_ID_AT_3),
+            Some(0),
+            Some(X15_SUBMISSION_ID_AT_3),
+            Some(1),
+        )
+    }
+
+    /// Submit `body` through `uri` and return the served response.
+    fn submit(state: ApiState, uri: &str, body: String) -> Served {
+        serve(state, post_json(uri, body))
+    }
+
+    /// The pooled bytes under `id`.
+    fn pooled(state: &ApiState, id: &str) -> String {
+        let pool = state.mempool.try_lock().expect("uncontended");
+        let id_bytes: [u8; 32] = hex::decode(id).unwrap().try_into().unwrap();
+        let entry = pool.get(&id_bytes).expect("the pool holds it");
+        hex::encode(&entry.tx_bytes[..])
+    }
+
+    /// The pool holds a submission as the script version in effect writes it:
+    /// at 3 when activated 3 (block v4), with the `Upcast` kept.
+    #[test]
+    fn a_submission_is_pooled_at_the_activated_version_three() {
+        let state = x15_state(ErgoTreeVersion::V3, 4);
+        let body = wallet_body_at_3();
+        let served = submit(state.clone(), "/transactions", body);
+        assert_json_ok(&served, "/transactions");
+        let answered: String = serde_json::from_str(&served.body).unwrap();
+        assert_eq!(answered, X15_SUBMISSION_ID_AT_3);
+        assert_eq!(pooled(&state, &answered), X15_SUBMISSION_AT_3);
+    }
+
+    /// The pool holds the same submission as the script version in effect
+    /// writes it: below 3 when activated 2 (block v3), with the `Upcast` as
+    /// `1`.
+    #[test]
+    fn a_submission_is_pooled_at_the_activated_version_two() {
+        let state = x15_state(ErgoTreeVersion::V2, 3);
+        let body = wallet_body(
+            X15_SUBMISSION_ID_BELOW_3,
+            X15_EXTENSION_HEX_BELOW_3,
+            Some(FEE_BOX_ID_BELOW_3),
+            &[],
+            Some(CHANGE_BOX_ID_BELOW_3),
+            &[],
+            Some(X15_SUBMISSION_ID_BELOW_3),
+            Some(0),
+            Some(X15_SUBMISSION_ID_BELOW_3),
+            Some(1),
+        );
+        let served = submit(state.clone(), "/transactions", body);
+        assert_json_ok(&served, "/transactions");
+        let answered: String = serde_json::from_str(&served.body).unwrap();
+        assert_eq!(answered, X15_SUBMISSION_ID_BELOW_3);
+        assert_eq!(pooled(&state, &answered), X15_SUBMISSION_BELOW_3);
+    }
+
+    /// A body whose `id` disagrees with the id the node builds answers 400,
+    /// including the "no `id` at all" case (the schema requires `id`).
+    #[test]
+    fn a_submission_with_a_wrong_or_missing_id_answers_400() {
+        let state = x15_state(ErgoTreeVersion::V3, 4);
+        let wrong_id = "0000000000000000000000000000000000000000000000000000000000000000";
+        let body = wallet_body(
+            wrong_id,
+            X15_EXTENSION_HEX_AT_3,
+            Some(FEE_BOX_ID_AT_3),
+            &[],
+            Some(CHANGE_BOX_ID_AT_3),
+            &[],
+            None,
+            None,
+            None,
+            None,
+        );
+        let served = submit(state.clone(), "/transactions", body);
+        assert_api_error(&served, StatusCode::BAD_REQUEST, "/transactions");
+
+        // No `id` at all: the schema requires it, and the body refuses to
+        // deserialize.
+        let no_id = format!(
+            r#"{{"inputs":[{{"boxId":"{SPENT_BOX_ID}","spendingProof":{{"proofBytes":"","extension":{{"0":"{X15_EXTENSION_HEX_AT_3}"}}}}}}],"dataInputs":[],"outputs":[]}}"#,
+        );
+        let served = submit(state, "/transactions", no_id);
+        assert_api_error(&served, StatusCode::BAD_REQUEST, "/transactions");
+    }
+
+    /// An output's `boxId` must equal the id of the output the node builds.
+    /// A changed `boxId` answers 400, with the output's index in `detail`.
+    #[test]
+    fn a_submission_with_a_wrong_output_box_id_answers_400() {
+        let state = x15_state(ErgoTreeVersion::V3, 4);
+        let wrong = "0000000000000000000000000000000000000000000000000000000000000000";
+        let body = wallet_body(
+            X15_SUBMISSION_ID_AT_3,
+            X15_EXTENSION_HEX_AT_3,
+            Some(FEE_BOX_ID_AT_3),
+            &[],
+            Some(wrong),
+            &[],
+            None,
+            None,
+            None,
+            None,
+        );
+        let served = submit(state, "/transactions", body);
+        assert_api_error(&served, StatusCode::BAD_REQUEST, "/transactions");
+        let error: serde_json::Value = serde_json::from_str(&served.body).unwrap();
+        let detail = error["detail"].as_str().expect("detail present");
+        assert!(detail.contains("output 1"), "detail = {detail}");
+        assert!(detail.contains(wrong), "detail = {detail}");
+        assert!(detail.contains(CHANGE_BOX_ID_AT_3), "detail = {detail}");
+    }
+
+    /// An output's `boxId`, `transactionId` and `index` are all optional.
+    /// Missing on both outputs, the submission is pooled.
+    #[test]
+    fn a_submission_without_output_box_ids_is_pooled() {
+        let state = x15_state(ErgoTreeVersion::V3, 4);
+        let body = wallet_body(
+            X15_SUBMISSION_ID_AT_3,
+            X15_EXTENSION_HEX_AT_3,
+            None,
+            &[],
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        );
+        let served = submit(state.clone(), "/transactions", body);
+        assert_json_ok(&served, "/transactions");
+        assert_eq!(pooled(&state, X15_SUBMISSION_ID_AT_3), X15_SUBMISSION_AT_3);
+    }
+
+    /// `transactionId` is ignored: a wrong one beside a correct `boxId` is
+    /// pooled all the same.
+    #[test]
+    fn a_submission_with_a_wrong_transaction_id_is_pooled() {
+        let state = x15_state(ErgoTreeVersion::V3, 4);
+        let wrong_tx = "0000000000000000000000000000000000000000000000000000000000000000";
+        let body = wallet_body(
+            X15_SUBMISSION_ID_AT_3,
+            X15_EXTENSION_HEX_AT_3,
+            Some(FEE_BOX_ID_AT_3),
+            &[],
+            Some(CHANGE_BOX_ID_AT_3),
+            &[],
+            Some(wrong_tx),
+            Some(0),
+            Some(wrong_tx),
+            Some(1),
+        );
+        let served = submit(state.clone(), "/transactions", body);
+        assert_json_ok(&served, "/transactions");
+        assert_eq!(pooled(&state, X15_SUBMISSION_ID_AT_3), X15_SUBMISSION_AT_3);
+    }
+
+    /// A submission `/transactions/check` sees runs the same build and id
+    /// checks; a mismatched id answers 400 there too.
+    #[test]
+    fn transactions_check_runs_the_same_id_checks() {
+        let state = x15_state(ErgoTreeVersion::V3, 4);
+        let body = wallet_body_at_3();
+        let served = submit(state.clone(), "/transactions/check", body);
+        assert_json_ok(&served, "/transactions/check");
+        let answered: String = serde_json::from_str(&served.body).unwrap();
+        assert_eq!(answered, X15_SUBMISSION_ID_AT_3);
+        // `/check` doesn't add to the pool.
+        let pool = state.mempool.try_lock().expect("uncontended");
+        let id_bytes: [u8; 32] = hex::decode(&answered).unwrap().try_into().unwrap();
+        assert!(pool.get(&id_bytes).is_none());
+        drop(pool);
+
+        let wrong_id = "0000000000000000000000000000000000000000000000000000000000000000";
+        let body = wallet_body(
+            wrong_id,
+            X15_EXTENSION_HEX_AT_3,
+            None,
+            &[],
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        );
+        let served = submit(state, "/transactions/check", body);
+        assert_api_error(&served, StatusCode::BAD_REQUEST, "/transactions/check");
+    }
+
+    // -----------------------------------------------------------------------
+    // X15 in an output register
+    // -----------------------------------------------------------------------
+    //
+    // One empty-proof input spending always_true_box, into a min-fee fee
+    // output and a change `always_true` output at height 685 carrying R4 =
+    // X15. The input has no context extension. At activated 3 the output's
+    // bytes write the `Upcast` through, but its id hashes the output written
+    // at V0 where the `Upcast` is folded.
+
+    /// The id of the register-X15 submission as a peer reads it at version
+    /// 3. Empty proof, so bytes-to-sign are the bytes.
+    const X15_REGISTER_SUBMISSION_ID: &str =
+        "24b467310e9348e9fb41c7946f8a423fe781d2ab765838182dfc715ba8db5ffe";
+    /// The register output's `boxId`: `blake2b256(ergo_box_at_v0)`, where
+    /// R4 is the X15 with its `Upcast` folded to the constant.
+    const X15_REGISTER_OUTPUT_BOX_ID: &str =
+        "37fcc00f74b845d8f849923639e82678070bf1123ee3ec3b66645c55259d6b56";
+    /// The box id the register output would have if V0 kept the `Upcast`.
+    const X15_REGISTER_OUTPUT_BOX_ID_KEPT: &str =
+        "97d9162d412f200b57cdc88001baad58a7c43bce226196616524f7930e331338";
+    /// The fee output's `boxId` at the register-X15 submission's tx id.
+    const X15_REGISTER_FEE_BOX_ID: &str =
+        "54c25300f397d18e06e3f91247061553c76fbd2c53d13e518dffcbbd7fcc1675";
+    /// X15 as a register value at version 3: the `Upcast` kept.
+    const X15_REGISTER_HEX_AT_3: &str = "860204027e040205";
+
+    /// The `x15` as a register value. Serializes the evaluated expression at
+    /// version 3 (where the `Upcast` is kept) and parses it back as a
+    /// `RegisterValue`.
+    fn x15_as_register_entry() -> ergo_lib::ergotree_ir::chain::ergo_box::RegisterValue {
+        use ergo_lib::ergotree_ir::chain::ergo_box::RegisterValue;
+        let mut buf = Vec::<u8>::new();
+        SigmaByteWriter::new(&mut buf, None)
+            .with_tree_version(ErgoTreeVersion::V3, |w| x15().sigma_serialize(w))
+            .unwrap();
+        RegisterValue::sigma_parse_bytes(&buf)
+    }
+
+    /// The register-X15 submission: one empty-proof input, a min-fee fee
+    /// output, and a change output under `always_true` carrying X15 in R4.
+    fn build_register_x15_submission(activated: ErgoTreeVersion) -> ergo_validation::Transaction {
+        let input = Input::new(
+            always_true_box().box_id(),
+            ProverResult {
+                proof: ProofBytes::Empty,
+                extension: ContextExtension::empty(),
+            },
+        );
+        let config = ergo_mempool::types::MempoolConfig::default();
+        let fee = ErgoBoxCandidate {
+            value: BoxValue::new(config.min_fee).unwrap(),
+            ergo_tree: ergo_lib::chain::ergo_tree_predef::fee_proposition(config.reward_delay)
+                .unwrap(),
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height: SUBMISSION_HEIGHT,
+        };
+        let r4 = x15_as_register_entry();
+        let registers = NonMandatoryRegisters::try_from(vec![r4]).unwrap();
+        let change = ErgoBoxCandidate {
+            value: BoxValue::new(1_000_000_000 - config.min_fee).unwrap(),
+            ergo_tree: always_true(),
+            tokens: None,
+            additional_registers: registers,
+            creation_height: SUBMISSION_HEIGHT,
+        };
+        ergo_validation::Transaction::new_from_vec_at(
+            vec![input],
+            vec![],
+            vec![fee, change],
+            activated,
+        )
+        .unwrap()
+    }
+
+    /// Pin the register-X15 constants to what the fork builds. The register
+    /// output's `boxId` with the `Upcast` kept is the box id a sender would
+    /// compute if they used the activated-version bytes rather than V0.
+    #[test]
+    fn x15_register_submission_constants_match_what_the_fork_builds() {
+        let tx = build_register_x15_submission(ErgoTreeVersion::V3);
+        // The id the register output would have if V0 kept the `Upcast`.
+        let kept = {
+            use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+            let mut buf = Vec::<u8>::new();
+            SigmaByteWriter::new(&mut buf, None)
+                .with_tree_version(ErgoTreeVersion::V3, |w| {
+                    tx.outputs.get(1).unwrap().sigma_serialize(w)
+                })
+                .unwrap();
+            use blake2::digest::consts::U32;
+            use blake2::{Blake2b, Digest};
+            hex::encode(Blake2b::<U32>::digest(&buf))
+        };
+
+        assert_eq!(String::from(tx.id()), X15_REGISTER_SUBMISSION_ID);
+        assert_eq!(
+            String::from(tx.outputs.first().box_id()),
+            X15_REGISTER_FEE_BOX_ID
+        );
+        assert_eq!(
+            String::from(tx.outputs.get(1).unwrap().box_id()),
+            X15_REGISTER_OUTPUT_BOX_ID
+        );
+        assert_eq!(kept, X15_REGISTER_OUTPUT_BOX_ID_KEPT);
+    }
+
+    /// An output register's `boxId` is the id of the output written at
+    /// version 0, where `Upcast` is folded, even when the activated version
+    /// keeps it. Submitted with that id, the submission is pooled; submitted
+    /// with the box id of the Upcast-kept output, it answers 400.
+    #[test]
+    fn an_output_register_x15_box_id_hashes_at_version_zero() {
+        let outputs = |register_box_id: &str| {
+            format!(
+                r#"[{{"boxId":"{X15_REGISTER_FEE_BOX_ID}","value":{MIN_FEE_NANOERG},"ergoTree":"{FEE_TREE_HEX}","assets":[],"additionalRegisters":{{}},"creationHeight":{SUBMISSION_HEIGHT}}},{{"boxId":"{register_box_id}","value":{CHANGE_NANOERG},"ergoTree":"{ALWAYS_TRUE_TREE_HEX}","assets":[],"additionalRegisters":{{"R4":"{X15_REGISTER_HEX_AT_3}"}},"creationHeight":{SUBMISSION_HEIGHT}}}]"#
+            )
+        };
+        let body_with = |register_box_id: &str| {
+            format!(
+                r#"{{"id":"{X15_REGISTER_SUBMISSION_ID}","inputs":[{{"boxId":"{SPENT_BOX_ID}","spendingProof":{{"proofBytes":"","extension":{{}}}}}}],"dataInputs":[],"outputs":{}}}"#,
+                outputs(register_box_id)
+            )
+        };
+
+        // R4 at V3 keeps the Upcast; the register output's box id is at V0.
+        let state = x15_state(ErgoTreeVersion::V3, 4);
+        let served = submit(
+            state.clone(),
+            "/transactions",
+            body_with(X15_REGISTER_OUTPUT_BOX_ID),
+        );
+        assert_json_ok(&served, "/transactions");
+        let answered: String = serde_json::from_str(&served.body).unwrap();
+        assert_eq!(answered, X15_REGISTER_SUBMISSION_ID);
+
+        // The id of the output with the Upcast kept is not what the node
+        // builds.
+        let state = x15_state(ErgoTreeVersion::V3, 4);
+        let served = submit(
+            state,
+            "/transactions",
+            body_with(X15_REGISTER_OUTPUT_BOX_ID_KEPT),
+        );
+        assert_api_error(&served, StatusCode::BAD_REQUEST, "/transactions");
     }
 
     /// A block version in effect that doesn't fit `u8` is a bug upstream:
-    /// both routes answer 500, while the node is syncing too.
+    /// both routes answer 500, while the node is syncing too. The body is
+    /// hand-written: without an activated version there is no id to compute,
+    /// so the check runs ahead of the id-mismatch check.
     #[test]
     fn a_submission_answers_500_without_an_activated_version() {
-        let body = serde_json::to_string(&x15_submission()).unwrap();
+        let body = wallet_body(
+            X15_SUBMISSION_ID_AT_3,
+            X15_EXTENSION_HEX_AT_3,
+            None,
+            &[],
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        );
         for uri in ["/transactions", "/transactions/check"] {
             let state = test_state(Arc::new(ActivatedChain(None)));
             let served = serve(state, post_json(uri, body.clone()));

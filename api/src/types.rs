@@ -1,9 +1,9 @@
 use ergo_chain_types::Header;
 use ergo_lib::chain::transaction::input::prover_result::ProverResult;
 use ergo_lib::chain::transaction::{DataInput, Input, Transaction};
-use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
+use ergo_lib::ergotree_ir::chain::ergo_box::{BoxId, ErgoBox, ErgoBoxCandidate};
 use ergo_lib::ergotree_ir::chain::tx_id::TxId;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Standard error response matching the JVM node's format.
 #[derive(Serialize, Debug)]
@@ -376,4 +376,36 @@ pub struct ValidationFragmentsTx {
     /// The tx id is `blake2b256(signingMessage)` (proofs stripped,
     /// ContextExtensions kept in wire order), NOT `blake2b256(bytes)`.
     pub bytes: String,
+}
+
+/// `POST /transactions` and `POST /transactions/check` request body: the
+/// `TransactionSubmission` schema in `facts/openapi.yaml`. The handler builds
+/// the transaction from the fork's public parts at the activated script
+/// version and checks the body's `id` against the built id
+/// (`facts/api.md` § Transaction Submission Flow).
+///
+/// This crate deserializes the body itself, rather than straight into the
+/// fork's `Transaction`: the fork's `TryFrom<TransactionJson>` builds at
+/// its own version (3) and drops the outputs' `boxId`s, both of which this
+/// contract keeps under this crate's control.
+#[derive(Deserialize)]
+pub struct TransactionSubmission {
+    pub id: TxId,
+    pub inputs: Vec<Input>,
+    #[serde(default, rename = "dataInputs")]
+    pub data_inputs: Vec<DataInput>,
+    pub outputs: Vec<OutputSubmission>,
+}
+
+/// One output in a `TransactionSubmission`: a box candidate, as the JVM reads
+/// one, with its optional `boxId` kept beside it so the handler can check it
+/// against the output the node builds. `transactionId` and `index` may be
+/// present and are ignored — `ErgoBoxCandidate` deserializes through
+/// `ErgoBoxCandidateJson`, which has neither field, so serde drops them.
+#[derive(Deserialize)]
+pub struct OutputSubmission {
+    #[serde(default, rename = "boxId")]
+    pub box_id: Option<BoxId>,
+    #[serde(flatten)]
+    pub candidate: ErgoBoxCandidate,
 }
