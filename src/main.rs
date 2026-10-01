@@ -977,21 +977,27 @@ fn header_id_bytes(header: &ergo_chain_types::Header) -> [u8; 32] {
 
 /// Parse a transaction a peer delivered at the script version activated at
 /// `block_version`, as the JVM's `parseAndProcessTransaction` does. The
-/// version decides what parses and what the id is (facts/mempool.md § P2P
-/// Transaction Intake).
+/// version decides what parses and what the id is, so it comes back with the
+/// transaction: the pool keeps it as the entry's `id_version`
+/// (facts/mempool.md § P2P Transaction Intake).
 fn parse_pool_transaction(
     tx_bytes: &[u8],
     block_version: u8,
-) -> Result<ergo_validation::Transaction, ergo_lib::ergotree_ir::serialization::SigmaParsingError> {
+) -> Result<
+    (
+        ergo_validation::Transaction,
+        ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion,
+    ),
+    ergo_lib::ergotree_ir::serialization::SigmaParsingError,
+> {
     use ergo_lib::ergotree_ir::serialization::constant_store::ConstantStore;
     use ergo_lib::ergotree_ir::serialization::sigma_byte_reader::{SigmaByteRead, SigmaByteReader};
     use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 
+    let version = enr_chain::activated_tree_version(block_version);
     let mut reader = SigmaByteReader::new(std::io::Cursor::new(tx_bytes), ConstantStore::empty());
-    reader.with_tree_version(
-        enr_chain::activated_tree_version(block_version),
-        ergo_validation::Transaction::sigma_parse,
-    )
+    let tx = reader.with_tree_version(version, ergo_validation::Transaction::sigma_parse)?;
+    Ok((tx, version))
 }
 
 /// Decides which blocks the announcer broadcasts. It keeps the ids of the
@@ -3910,8 +3916,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                             continue;
                         };
-                        let tx = match parse_pool_transaction(&tx_bytes, block_version) {
-                            Ok(tx) => tx,
+                        let (tx, id_version) = match parse_pool_transaction(&tx_bytes, block_version) {
+                            Ok(parsed) => parsed,
                             Err(e) => {
                                 tracing::debug!(
                                     tx_id = hex::encode(tx_id),
@@ -3929,6 +3935,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let outcome = pool.process(
                             tx,
                             tx_bytes,
+                            id_version,
                             &utxo_reader,
                             ctx,
                             Some(0), // all P2P txs share one rate-limit budget for now
@@ -4673,19 +4680,25 @@ mod tests {
 
     /// The pool reads a peer's transaction at the activated script version:
     /// 3 at block version 4, 0 at block version 1. The ids are the ones
-    /// `chain/tests/section_binding.rs` observed for the same bytes.
+    /// `chain/tests/section_binding.rs` observed for the same bytes. The
+    /// version read at comes back with the transaction, for the pool entry's
+    /// `id_version`.
     #[test]
     fn a_pool_transaction_is_read_at_the_activated_version() {
+        use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
+
         let bytes = upcast_tx_bytes();
 
-        let at_v4 = parse_pool_transaction(&bytes, 4).unwrap();
+        let (at_v4, version) = parse_pool_transaction(&bytes, 4).unwrap();
+        assert_eq!(version, ErgoTreeVersion::V3);
         assert_eq!(
             hex::encode(at_v4.id().as_ref()),
             "6b11fd0ea5f1e84782c15044f03cf10df48022ba7dcb8e6c0e48233b1cf9b0a1",
             "block version 4 activates script version 3: the Upcast stays in the id"
         );
 
-        let at_v1 = parse_pool_transaction(&bytes, 1).unwrap();
+        let (at_v1, version) = parse_pool_transaction(&bytes, 1).unwrap();
+        assert_eq!(version, ErgoTreeVersion::V0);
         assert_eq!(
             hex::encode(at_v1.id().as_ref()),
             "b006736746ec23927fecfbaeb5a27bda4df791e5440eaba24e8aadb3072b3deb",
