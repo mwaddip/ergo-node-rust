@@ -8,6 +8,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 
 use common::{make_box, spend_tx, state_context_at, tx_id_bytes, StaticUtxo, TIP_HEIGHT};
@@ -40,6 +41,7 @@ fn cost_per_block_does_not_bound_a_pass() {
                 cost: tx_bytes.len() as u32,
                 tx,
                 tx_bytes: tx_bytes.into(),
+                id_version: ErgoTreeVersion::V3,
                 fee: 0,
                 validation_cost: None,
                 created: t0,

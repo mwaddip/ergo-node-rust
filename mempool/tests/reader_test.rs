@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
+use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 
 use common::{
@@ -59,6 +60,7 @@ fn submit(
     let outcome = mempool.process(
         tx.clone(),
         bytes.clone(),
+        ErgoTreeVersion::V3,
         utxo,
         &state_context_at(TIP_HEIGHT),
         None,
@@ -90,6 +92,7 @@ fn unconfirmed(tx: &Transaction, bytes: &Arc<[u8]>) -> UnconfirmedTx {
     UnconfirmedTx {
         tx: tx.clone(),
         tx_bytes: Arc::clone(bytes),
+        id_version: ErgoTreeVersion::V3,
         fee: FEE,
         cost: bytes.len() as u32,
         validation_cost: None,

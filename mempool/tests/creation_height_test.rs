@@ -9,6 +9,7 @@ mod common;
 
 use std::time::Instant;
 
+use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 
 use common::{make_box, spend_tx, state_context_at, tx_id_bytes, StaticUtxo, TIP_HEIGHT};
@@ -52,6 +53,7 @@ fn future_creation_height_declines_then_succeeds_next_block() {
     let outcome = mempool.process(
         tx.clone(),
         tx_bytes.clone(),
+        ErgoTreeVersion::V3,
         &utxo,
         &state_context_at(TIP_HEIGHT),
         Some(7),
@@ -84,6 +86,7 @@ fn future_creation_height_declines_then_succeeds_next_block() {
     let outcome = mempool.process(
         tx,
         tx_bytes,
+        ErgoTreeVersion::V3,
         &utxo,
         &state_context_at(TIP_HEIGHT + 1),
         Some(7),
@@ -109,7 +112,14 @@ fn creation_height_at_preheader_is_accepted() {
     let tx_id = tx_id_bytes(&tx);
     let tx_bytes = tx.sigma_serialize_bytes().expect("tx serialization");
 
-    let outcome = mempool.process(tx, tx_bytes, &utxo, &state_context_at(TIP_HEIGHT), Some(7));
+    let outcome = mempool.process(
+        tx,
+        tx_bytes,
+        ErgoTreeVersion::V3,
+        &utxo,
+        &state_context_at(TIP_HEIGHT),
+        Some(7),
+    );
 
     assert!(
         matches!(outcome, ProcessingOutcome::Accepted { tx_id: id } if id == tx_id),
@@ -135,6 +145,7 @@ fn unsatisfiable_script_still_invalidates_and_caches() {
     let outcome = mempool.process(
         tx.clone(),
         tx_bytes.clone(),
+        ErgoTreeVersion::V3,
         &utxo,
         &state_context_at(TIP_HEIGHT),
         Some(7),
@@ -150,7 +161,14 @@ fn unsatisfiable_script_still_invalidates_and_caches() {
     );
 
     // And the cache must still short-circuit the resubmission.
-    let outcome = mempool.process(tx, tx_bytes, &utxo, &state_context_at(TIP_HEIGHT), Some(7));
+    let outcome = mempool.process(
+        tx,
+        tx_bytes,
+        ErgoTreeVersion::V3,
+        &utxo,
+        &state_context_at(TIP_HEIGHT),
+        Some(7),
+    );
     assert!(
         matches!(outcome, ProcessingOutcome::Invalidated { ref reason } if reason.contains("previously invalidated")),
         "resubmission should be dropped by the cache, got {outcome:?}"
@@ -173,7 +191,14 @@ fn negative_creation_height_is_invalidated_not_declined() {
     let tx_id = tx_id_bytes(&tx);
     let tx_bytes = tx.sigma_serialize_bytes().expect("tx serialization");
 
-    let outcome = mempool.process(tx, tx_bytes, &utxo, &state_context_at(TIP_HEIGHT), Some(7));
+    let outcome = mempool.process(
+        tx,
+        tx_bytes,
+        ErgoTreeVersion::V3,
+        &utxo,
+        &state_context_at(TIP_HEIGHT),
+        Some(7),
+    );
 
     assert!(
         matches!(outcome, ProcessingOutcome::Invalidated { .. }),
@@ -203,7 +228,14 @@ fn revalidate_skips_pooled_tx_ahead_of_preheader() {
     let tx = spend_tx(&[input], TIP_HEIGHT + 1);
     let tx_id = tx_id_bytes(&tx);
     let tx_bytes = tx.sigma_serialize_bytes().expect("tx serialization");
-    let outcome = mempool.process(tx, tx_bytes, &utxo, &state_context_at(TIP_HEIGHT + 1), None);
+    let outcome = mempool.process(
+        tx,
+        tx_bytes,
+        ErgoTreeVersion::V3,
+        &utxo,
+        &state_context_at(TIP_HEIGHT + 1),
+        None,
+    );
     assert!(
         matches!(outcome, ProcessingOutcome::Accepted { .. }),
         "setup: expected the tx to enter the pool, got {outcome:?}"
@@ -250,6 +282,7 @@ fn revalidate_still_invalidates_genuine_failures() {
         validation_cost: None,
         tx,
         tx_bytes: tx_bytes.into(),
+        id_version: ErgoTreeVersion::V3,
         fee: 0,
         created: now,
         last_checked: now,

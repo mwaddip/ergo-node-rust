@@ -10,6 +10,7 @@
 
 mod common;
 
+use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 
 use common::{
@@ -120,6 +121,7 @@ fn no_fee_output_yields_zero_and_is_declined() {
     let outcome = mempool.process(
         tx,
         tx_bytes,
+        ErgoTreeVersion::V3,
         &StaticUtxo::new(&[input]),
         &state_context_at(TIP_HEIGHT),
         Some(7),
@@ -162,6 +164,7 @@ fn fee_paying_tx_is_accepted_at_the_default_min_fee() {
     let outcome = mempool.process(
         tx,
         tx_bytes,
+        ErgoTreeVersion::V3,
         &StaticUtxo::new(&[input]),
         &state_context_at(TIP_HEIGHT),
         Some(7),
