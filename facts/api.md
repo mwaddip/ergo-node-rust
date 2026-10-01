@@ -340,10 +340,21 @@ hit the cap must check the returned length against the requested limit.
 Every response that renders a transaction writes its context-extension and
 output register values at the version its id is written at. That is the version
 it was read at: for a block's transactions, `enr_chain::block_transactions_read_version`
-of the block; for a pool transaction, the version the pool read or built it at.
-A client that re-serializes the JSON at that version gets the transaction's id
-back. The fork's serde renders this way (fork PR #56); no handler renders a
-transaction's values at another version.
+of the block; for a pool transaction, the pool entry's `id_version`
+(`facts/mempool.md` § `UnconfirmedTx`). A client that re-serializes the JSON at
+that version gets the transaction's id back.
+
+How a route gets there depends on what it serializes:
+- **The fork's `Transaction`:** the fork's serde writes at the transaction's id
+  version (fork PR #56). The block routes render this way.
+- **The transaction's parts:** the pool routes build their JSON from parts, and
+  a part's own `Serialize` writes at version 0. So they write each input's
+  extension with `ContextExtension::json_at` and each output with
+  `ErgoBox::json_at`, at the entry's `id_version`. At version 0, an X15 pool
+  transaction would render without its `Upcast`, and an extension value that
+  version 0 can't write would fail the whole response.
+
+A resolved input's spent box is a box on its own, so it stays at 0.
 
 An output inside a transaction's JSON follows the transaction, but its `boxId`
 hashes the output written at version 0. That is how ergo computes an output's
@@ -446,7 +457,7 @@ API handler
   │ 4. Build MempoolUtxoReader (UTXO state + mempool unconfirmed outputs)
   │ 5. Acquire mempool lock
   ▼
-mempool.process(tx, tx_bytes, &utxo_reader, &state_context, None)
+mempool.process(tx, tx_bytes, version, &utxo_reader, &state_context, None)
   │ ... 13-step validation (see mempool contract) ...
   ▼
 ProcessingOutcome
@@ -466,6 +477,10 @@ same, at any activated version. Built or written at another version, an
 `Upcast` of a constant can make them differ. `Transaction::sigma_serialize_bytes()`
 writes at the fork's highest version, which isn't the activated version once
 the two differ.
+
+The handler hands `process()` the version it built at. The pool keeps it as
+the entry's `id_version` (`facts/mempool.md` § `UnconfirmedTx`), and the pool
+routes render the transaction at it (§ Transaction JSON).
 
 **This crate translates the request; the fork's transaction JSON doesn't.**
 The request body is this API's contract (`facts/openapi.yaml`

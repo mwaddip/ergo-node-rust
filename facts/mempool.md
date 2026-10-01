@@ -177,6 +177,12 @@ pub struct UnconfirmedTx {
     /// serialization for an API submission. One allocation, shared with the
     /// serving reader (§ Serving reader).
     pub tx_bytes: Arc<[u8]>,
+    /// The script version the transaction was read or built at: the version
+    /// its id is written at, and `tx_bytes` with it. Whoever hands the
+    /// transaction to the pool names it. A response that renders the
+    /// transaction writes its values at this version (`facts/api.md` §
+    /// Transaction JSON).
+    pub id_version: ErgoTreeVersion,
     /// Transaction fee in nanoERG.
     pub fee: u64,
     /// Weighting cost: the entry validation's cost, floored at the serialized
@@ -384,10 +390,16 @@ impl Mempool {
     /// 7. Evict if over capacity
     ///
     /// This is the primary entry point for both P2P and API submissions.
+    ///
+    /// `id_version` is the script version the caller read or built `tx` at.
+    /// Precondition: `tx`'s id is the id of its parts built at `id_version`
+    /// (`Transaction::new_from_vec_at`), enforced with a `debug_assert!`. The
+    /// pool stores the version on the entry and never changes it.
     pub fn process(
         &mut self,
         tx: Transaction,
         tx_bytes: Vec<u8>,
+        id_version: ErgoTreeVersion,
         utxo_reader: &dyn UtxoReader,
         state_context: &ErgoStateContext,
         source: Option<PeerId>,
@@ -525,6 +537,7 @@ transactions from a published mempool reader, not from the live pool
     /// Transactions from removed blocks that aren't in the new chain go back.
     /// These skip validation (they were valid in the previous chain state),
     /// so each carries `validation_cost: None` until a revalidation measures it.
+    /// Each carries the `id_version` its block's transactions were read at.
     pub fn return_to_pool(
         &mut self,
         txs: Vec<UnconfirmedTx>,
@@ -743,6 +756,7 @@ effect after the last applied block, which is 3 since 6.0
   wrong version can fail to parse, or hash to an id other than the one its
   sender declared.
 - The bytes the pool stores and relays are the bytes the peer delivered.
+- The task hands `process()` that version as the transaction's `id_version`.
 
 The mempool crate exports the limit, so the P2P intake and the REST API
 (`facts/api.md` § Transaction Submission Flow) share one definition:

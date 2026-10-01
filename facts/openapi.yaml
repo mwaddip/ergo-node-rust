@@ -2121,9 +2121,12 @@ components:
     UnconfirmedTransaction:
       type: object
       description: |
-        A pool transaction, rendered as the JVM's `/transactions/unconfirmed*`
-        endpoints render it (`TransactionsApiRoute.createTransactionWithResolvedInputs`,
-        v6.0.6 :109).
+        A pool transaction, in the shape the JVM's `/transactions/unconfirmed*`
+        endpoints give it (`TransactionsApiRoute.createTransactionWithResolvedInputs`,
+        v6.0.6 :109). Its extension and output register values are written at
+        the version of the transaction's id, as every rendered transaction's
+        are; a resolved input's spent box is written at version 0
+        (`facts/api.md` § Transaction JSON).
       required: [id, inputs, dataInputs, outputs, size, cost]
       properties:
         id:
