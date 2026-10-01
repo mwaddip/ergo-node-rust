@@ -590,6 +590,7 @@ async fn process_submission(
     let outcome = pool.process(
         tx,
         tx_bytes,
+        version,
         &UtxoReaderAdapter {
             utxo_reader: &*state.utxo_reader,
         },
@@ -672,6 +673,9 @@ struct PoolEntry {
     outputs: Vec<ErgoBox>,
     size: usize,
     cost: Option<u64>,
+    /// The entry's `id_version`: the script version its id is written at.
+    /// The pool routes render at it (`facts/api.md` § Transaction JSON).
+    id_version: ErgoTreeVersion,
 }
 
 impl PoolEntry {
@@ -700,6 +704,7 @@ impl PoolEntry {
             outputs: tx.outputs.as_vec().clone(),
             size: utx.tx_bytes.len(),
             cost: utx.validation_cost,
+            id_version: utx.id_version,
         }
     }
 
@@ -730,6 +735,7 @@ impl PoolEntry {
             outputs: self.outputs,
             size: self.size,
             cost: self.cost,
+            id_version: self.id_version,
         }
     }
 }
@@ -4962,17 +4968,34 @@ mod tests {
 
     /// `tx` as a pool entry that entered at `created`, the way a rollback
     /// hands one back: `return_to_pool` inserts it as given, unvalidated.
+    /// `tx_bytes` is written at the fork's highest version (3), as every
+    /// `sigma_serialize_bytes` call does; this helper is for tests that
+    /// don't exercise the version-sensitive rendering.
     fn pool_entry(
         tx: &ergo_validation::Transaction,
         fee: u64,
         validation_cost: Option<u64>,
         created: Instant,
     ) -> ergo_mempool::types::UnconfirmedTx {
-        let tx_bytes = tx.sigma_serialize_bytes().expect("tx serializes");
+        pool_entry_at(tx, fee, validation_cost, created, ErgoTreeVersion::V3)
+    }
+
+    /// `pool_entry` with the `id_version` the entry was read or built at.
+    /// Mirrors how the live pool receives transactions: the task that
+    /// delivers them hands the version alongside the bytes.
+    fn pool_entry_at(
+        tx: &ergo_validation::Transaction,
+        fee: u64,
+        validation_cost: Option<u64>,
+        created: Instant,
+        id_version: ErgoTreeVersion,
+    ) -> ergo_mempool::types::UnconfirmedTx {
+        let tx_bytes = transaction_bytes_at(tx, id_version).expect("tx serializes");
         ergo_mempool::types::UnconfirmedTx {
             cost: tx_bytes.len() as u32,
             tx: tx.clone(),
             tx_bytes: tx_bytes.into(),
+            id_version,
             fee,
             validation_cost,
             created,
@@ -6538,6 +6561,291 @@ mod tests {
             "/transactions",
             body_with(X15_REGISTER_OUTPUT_BOX_ID_KEPT),
         );
+        assert_api_error(&served, StatusCode::BAD_REQUEST, "/transactions");
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /transactions/unconfirmed renders at the pool entry's id_version
+    // -----------------------------------------------------------------------
+
+    /// A `UnconfirmedTransaction` served under its id, as JSON.
+    fn fetch_pool_entry(state: ApiState, id: &str) -> serde_json::Value {
+        let uri = format!("/transactions/unconfirmed/byTransactionId/{id}");
+        let served = get(state, &uri);
+        assert_json_ok(&served, &uri);
+        serde_json::from_str(&served.body).unwrap()
+    }
+
+    /// A `/transactions/unconfirmed` list, as JSON.
+    fn fetch_pool_list(state: ApiState) -> serde_json::Value {
+        let uri = "/transactions/unconfirmed";
+        let served = get(state, uri);
+        assert_json_ok(&served, uri);
+        serde_json::from_str(&served.body).unwrap()
+    }
+
+    /// At activated 3, the pool entry renders the input's X15 context
+    /// extension with its `Upcast` kept, and the GET's body resubmitted
+    /// gives the same id.
+    #[test]
+    fn an_x15_pool_entry_renders_the_extension_at_version_three() {
+        let state = x15_state(ErgoTreeVersion::V3, 4);
+        let body = wallet_body_at_3();
+        let served = submit(state.clone(), "/transactions", body);
+        assert_json_ok(&served, "/transactions");
+
+        let served = fetch_pool_entry(state.clone(), X15_SUBMISSION_ID_AT_3);
+        assert_eq!(
+            served["inputs"][0]["spendingProof"]["extension"]["0"],
+            X15_EXTENSION_HEX_AT_3
+        );
+        // Round-trip: the GET's JSON, submitted again, gives the same id.
+        let round_trip = submit(
+            x15_state(ErgoTreeVersion::V3, 4),
+            "/transactions",
+            serde_json::to_string(&served).unwrap(),
+        );
+        assert_json_ok(&round_trip, "/transactions");
+        let roundtripped: String = serde_json::from_str(&round_trip.body).unwrap();
+        assert_eq!(roundtripped, X15_SUBMISSION_ID_AT_3);
+    }
+
+    /// At activated 2, the pool entry renders the input's X15 context
+    /// extension with its `Upcast` folded to the constant.
+    #[test]
+    fn an_x15_pool_entry_renders_the_extension_at_version_two() {
+        let state = x15_state(ErgoTreeVersion::V2, 3);
+        let body = wallet_body(
+            X15_SUBMISSION_ID_BELOW_3,
+            X15_EXTENSION_HEX_BELOW_3,
+            Some(FEE_BOX_ID_BELOW_3),
+            &[],
+            Some(CHANGE_BOX_ID_BELOW_3),
+            &[],
+            None,
+            None,
+            None,
+            None,
+        );
+        let served = submit(state.clone(), "/transactions", body);
+        assert_json_ok(&served, "/transactions");
+
+        let served = fetch_pool_entry(state, X15_SUBMISSION_ID_BELOW_3);
+        assert_eq!(
+            served["inputs"][0]["spendingProof"]["extension"]["0"],
+            X15_EXTENSION_HEX_BELOW_3
+        );
+    }
+
+    /// At activated 3, the pool entry renders an output's R4 with its
+    /// `Upcast` kept, beside the output's version-0 `boxId`.
+    #[test]
+    fn an_output_register_renders_at_the_entry_version() {
+        let state = x15_state(ErgoTreeVersion::V3, 4);
+        let outputs = format!(
+            r#"[{{"boxId":"{X15_REGISTER_FEE_BOX_ID}","value":{MIN_FEE_NANOERG},"ergoTree":"{FEE_TREE_HEX}","assets":[],"additionalRegisters":{{}},"creationHeight":{SUBMISSION_HEIGHT}}},{{"boxId":"{X15_REGISTER_OUTPUT_BOX_ID}","value":{CHANGE_NANOERG},"ergoTree":"{ALWAYS_TRUE_TREE_HEX}","assets":[],"additionalRegisters":{{"R4":"{X15_REGISTER_HEX_AT_3}"}},"creationHeight":{SUBMISSION_HEIGHT}}}]"#
+        );
+        let body = format!(
+            r#"{{"id":"{X15_REGISTER_SUBMISSION_ID}","inputs":[{{"boxId":"{SPENT_BOX_ID}","spendingProof":{{"proofBytes":"","extension":{{}}}}}}],"dataInputs":[],"outputs":{outputs}}}"#
+        );
+        let served = submit(state.clone(), "/transactions", body);
+        assert_json_ok(&served, "/transactions");
+
+        let served = fetch_pool_entry(state, X15_REGISTER_SUBMISSION_ID);
+        assert_eq!(served["outputs"][1]["boxId"], X15_REGISTER_OUTPUT_BOX_ID);
+        assert_eq!(
+            served["outputs"][1]["additionalRegisters"]["R4"],
+            X15_REGISTER_HEX_AT_3
+        );
+    }
+
+    /// A resolved input's spent box renders on its own, at version 0: a box
+    /// outside a transaction (`facts/api.md` § Transaction JSON). An X15 in
+    /// its R4 is folded to the constant.
+    #[test]
+    fn a_resolved_input_spent_box_renders_at_version_zero() {
+        use ergo_lib::ergotree_ir::chain::ergo_box::NonMandatoryRegisters;
+        let spent = ergo_validation::ErgoBox::new(
+            BoxValue::new(1_000_000_000).unwrap(),
+            always_true(),
+            None,
+            NonMandatoryRegisters::try_from(vec![x15_as_register_entry()]).unwrap(),
+            684,
+            TxId::from(Digest32::from([0x11; 32])),
+            0,
+        )
+        .unwrap();
+        let spent_box_id = String::from(spent.box_id());
+
+        let fee_input = Input::new(
+            spent.box_id(),
+            ProverResult {
+                proof: ProofBytes::Empty,
+                extension: ContextExtension::empty(),
+            },
+        );
+        let config = ergo_mempool::types::MempoolConfig::default();
+        let fee = ErgoBoxCandidate {
+            value: BoxValue::new(config.min_fee).unwrap(),
+            ergo_tree: ergo_lib::chain::ergo_tree_predef::fee_proposition(config.reward_delay)
+                .unwrap(),
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height: SUBMISSION_HEIGHT,
+        };
+        let change = ErgoBoxCandidate {
+            value: BoxValue::new(1_000_000_000 - config.min_fee).unwrap(),
+            ergo_tree: always_true(),
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height: SUBMISSION_HEIGHT,
+        };
+        let tx = ergo_validation::Transaction::new_from_vec_at(
+            vec![fee_input],
+            vec![],
+            vec![fee, change],
+            ErgoTreeVersion::V3,
+        )
+        .unwrap();
+        let tx_id = String::from(tx.id());
+
+        let mut state = x15_state(ErgoTreeVersion::V3, 4);
+        state.utxo_reader = Arc::new(BoxUtxo::holding(&[spent]));
+        add_to_pool(
+            &state,
+            vec![pool_entry_at(
+                &tx,
+                config.min_fee,
+                Some(0),
+                Instant::now(),
+                ErgoTreeVersion::V3,
+            )],
+        );
+
+        let served = fetch_pool_entry(state, &tx_id);
+        // The resolved input carries the single `boxId` of the spent box.
+        assert_eq!(served["inputs"][0]["boxId"], spent_box_id);
+        // The spent box's R4 renders at V0 — the `Upcast` folded, as a box
+        // rendered on its own does.
+        assert_eq!(
+            served["inputs"][0]["additionalRegisters"]["R4"],
+            X15_EXTENSION_HEX_BELOW_3
+        );
+    }
+
+    /// A value that version 0 can't write. The old rendering wrote every
+    /// extension and register at version 0 — a `ProverResult::Serialize`
+    /// fallthrough — so this value would have failed the whole response.
+    /// Rendered at the entry's id_version (3) it succeeds. First show the
+    /// V0 serializer fails on this value, then confirm the pool route
+    /// answers 200 with the value's bytes.
+    #[test]
+    fn a_v0_unwritable_extension_value_renders_at_the_entry_version() {
+        use ergo_lib::ergotree_ir::chain::ergo_box::NonMandatoryRegisters;
+        use ergo_lib::ergotree_ir::mir::constant::{Constant, Literal};
+        use ergo_lib::ergotree_ir::types::stype::SType;
+        use ergo_lib::ergotree_ir::unsignedbigint256::UnsignedBigInt;
+
+        // `UnsignedBigInt` is a tree-version-3 feature; writing it at V0
+        // fails with `NotSupported`.
+        let value = UnsignedBigInt::from_be_slice(&[1]).unwrap();
+        let constant = Constant {
+            tpe: SType::SUnsignedBigInt,
+            v: Literal::UnsignedBigInt(value),
+        };
+        let mut ext = ContextExtension::empty();
+        ext.values.insert(0, EvaluatedValue::Constant(constant));
+
+        // The old rendering: `ContextExtension::serialize` writes each value
+        // at version 0 by default, which this value cannot do. Serde
+        // propagates the error; a response that embeds this extension at V0
+        // fails to serialize and returns 500 through axum.
+        assert!(serde_json::to_string(&ext).is_err());
+
+        // The new rendering, at version 3, writes the value.
+        assert!(serde_json::to_string(&ext.json_at(ErgoTreeVersion::V3)).is_ok());
+
+        // Expected value hex, at version 3.
+        let value_hex = {
+            use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+            let evaluated = ext.values.get(&0).unwrap();
+            let mut buf = Vec::<u8>::new();
+            SigmaByteWriter::new(&mut buf, None)
+                .with_tree_version(ErgoTreeVersion::V3, |w| evaluated.sigma_serialize(w))
+                .unwrap();
+            hex::encode(&buf)
+        };
+
+        // Pool a transaction whose input carries this extension, built at V3.
+        let input = Input::new(
+            always_true_box().box_id(),
+            ProverResult {
+                proof: ProofBytes::Empty,
+                extension: ext,
+            },
+        );
+        let config = ergo_mempool::types::MempoolConfig::default();
+        let fee = ErgoBoxCandidate {
+            value: BoxValue::new(config.min_fee).unwrap(),
+            ergo_tree: ergo_lib::chain::ergo_tree_predef::fee_proposition(config.reward_delay)
+                .unwrap(),
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height: SUBMISSION_HEIGHT,
+        };
+        let change = ErgoBoxCandidate {
+            value: BoxValue::new(1_000_000_000 - config.min_fee).unwrap(),
+            ergo_tree: always_true(),
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height: SUBMISSION_HEIGHT,
+        };
+        let tx = ergo_validation::Transaction::new_from_vec_at(
+            vec![input],
+            vec![],
+            vec![fee, change],
+            ErgoTreeVersion::V3,
+        )
+        .unwrap();
+        let tx_id = String::from(tx.id());
+
+        let state = x15_state(ErgoTreeVersion::V3, 4);
+        add_to_pool(
+            &state,
+            vec![pool_entry_at(
+                &tx,
+                config.min_fee,
+                Some(0),
+                Instant::now(),
+                ErgoTreeVersion::V3,
+            )],
+        );
+
+        // The list route renders every pool entry — the one here renders at
+        // its id_version, so the response answers 200 with the value's hex.
+        let served = fetch_pool_list(state.clone());
+        assert_eq!(served[0]["id"], tx_id);
+        assert_eq!(
+            served[0]["inputs"][0]["spendingProof"]["extension"]["0"],
+            value_hex
+        );
+
+        // The by-id route answers it the same way.
+        let served = fetch_pool_entry(state, &tx_id);
+        assert_eq!(
+            served["inputs"][0]["spendingProof"]["extension"]["0"],
+            value_hex
+        );
+    }
+
+    /// `dataInputs` is required by the submission schema and by the JVM.
+    #[test]
+    fn a_submission_without_data_inputs_answers_400() {
+        let state = x15_state(ErgoTreeVersion::V3, 4);
+        let body = format!(
+            r#"{{"id":"{X15_SUBMISSION_ID_AT_3}","inputs":[{{"boxId":"{SPENT_BOX_ID}","spendingProof":{{"proofBytes":"","extension":{{"0":"{X15_EXTENSION_HEX_AT_3}"}}}}}}],"outputs":[]}}"#,
+        );
+        let served = submit(state, "/transactions", body);
         assert_api_error(&served, StatusCode::BAD_REQUEST, "/transactions");
     }
 

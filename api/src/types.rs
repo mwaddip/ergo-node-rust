@@ -3,7 +3,9 @@ use ergo_lib::chain::transaction::input::prover_result::ProverResult;
 use ergo_lib::chain::transaction::{DataInput, Input, Transaction};
 use ergo_lib::ergotree_ir::chain::ergo_box::{BoxId, ErgoBox, ErgoBoxCandidate};
 use ergo_lib::ergotree_ir::chain::tx_id::TxId;
-use serde::{Deserialize, Serialize};
+use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
+use serde::ser::{SerializeSeq, SerializeStruct};
+use serde::{Deserialize, Serialize, Serializer};
 
 /// Standard error response matching the JVM node's format.
 #[derive(Serialize, Debug)]
@@ -131,9 +133,11 @@ pub enum BlockModifier {
 
 /// A pool transaction as `GET /transactions/unconfirmed*` renders it: the
 /// JVM's `TransactionsApiRoute.createTransactionWithResolvedInputs`
-/// (v6.0.6).
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
+/// (v6.0.6). Rendered at `id_version`, the pool entry's
+/// (`facts/mempool.md` § `UnconfirmedTx`), so each input's extension and
+/// each output's register values come out at the version the id is written
+/// at (`facts/api.md` § Transaction JSON). A resolved input's spent box is
+/// a box on its own and stays at 0.
 pub struct UnconfirmedTransaction {
     pub id: TxId,
     pub inputs: Vec<UnconfirmedInput>,
@@ -144,23 +148,145 @@ pub struct UnconfirmedTransaction {
     /// The cost the transaction's most recent validation measured. `null`
     /// when none has run since a rollback returned it to the pool.
     pub cost: Option<u64>,
+    /// The entry's `id_version`: the script version its id is written at,
+    /// used to render the transaction's part-wise values. Not serialized.
+    pub id_version: ErgoTreeVersion,
+}
+
+impl Serialize for UnconfirmedTransaction {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut st = serializer.serialize_struct("UnconfirmedTransaction", 6)?;
+        st.serialize_field("id", &self.id)?;
+        st.serialize_field(
+            "inputs",
+            &InputsAtVersion {
+                inputs: &self.inputs,
+                version: self.id_version,
+            },
+        )?;
+        st.serialize_field("dataInputs", &self.data_inputs)?;
+        st.serialize_field(
+            "outputs",
+            &OutputsAtVersion {
+                outputs: &self.outputs,
+                version: self.id_version,
+            },
+        )?;
+        st.serialize_field("size", &self.size)?;
+        st.serialize_field("cost", &self.cost)?;
+        st.end()
+    }
+}
+
+struct InputsAtVersion<'a> {
+    inputs: &'a [UnconfirmedInput],
+    version: ErgoTreeVersion,
+}
+
+impl Serialize for InputsAtVersion<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(self.inputs.len()))?;
+        for input in self.inputs {
+            seq.serialize_element(&InputAtVersion {
+                input,
+                version: self.version,
+            })?;
+        }
+        seq.end()
+    }
+}
+
+struct OutputsAtVersion<'a> {
+    outputs: &'a [ErgoBox],
+    version: ErgoTreeVersion,
+}
+
+impl Serialize for OutputsAtVersion<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(self.outputs.len()))?;
+        for b in self.outputs {
+            seq.serialize_element(&b.json_at(self.version))?;
+        }
+        seq.end()
+    }
 }
 
 /// An unconfirmed transaction's input, with the box it spends merged in
 /// when the node resolved that box.
-#[derive(Serialize)]
-#[serde(untagged)]
 pub enum UnconfirmedInput {
     /// Every field of the spent box, whose `boxId` is the input's, beside
-    /// the input's proof. One `boxId`, as the JVM's merge leaves one.
+    /// the input's proof. One `boxId`, as the JVM's merge leaves one. The
+    /// spent box renders at version 0 — it is a box on its own — but the
+    /// spending proof's extension renders at the transaction's id version.
     Resolved {
-        #[serde(flatten)]
         spent: Box<ErgoBox>,
-        #[serde(rename = "spendingProof")]
         spending_proof: ProverResult,
     },
     /// The input as the transaction carries it: `boxId` and `spendingProof`.
     Unresolved(Input),
+}
+
+struct InputAtVersion<'a> {
+    input: &'a UnconfirmedInput,
+    version: ErgoTreeVersion,
+}
+
+impl Serialize for InputAtVersion<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.input {
+            UnconfirmedInput::Resolved {
+                spent,
+                spending_proof,
+            } => ResolvedInputAtVersion {
+                spent,
+                spending_proof: ProverResultAtVersion {
+                    pr: spending_proof,
+                    version: self.version,
+                },
+            }
+            .serialize(serializer),
+            UnconfirmedInput::Unresolved(input) => {
+                let mut st = serializer.serialize_struct("Input", 2)?;
+                st.serialize_field("boxId", &input.box_id)?;
+                st.serialize_field(
+                    "spendingProof",
+                    &ProverResultAtVersion {
+                        pr: &input.spending_proof,
+                        version: self.version,
+                    },
+                )?;
+                st.end()
+            }
+        }
+    }
+}
+
+/// The resolved-input shape: the spent box's own JSON (at version 0, as the
+/// box renders on its own) flattened in, then the input's spending proof
+/// with its extension at the transaction's id version.
+#[derive(Serialize)]
+struct ResolvedInputAtVersion<'a> {
+    #[serde(flatten)]
+    spent: &'a ErgoBox,
+    #[serde(rename = "spendingProof")]
+    spending_proof: ProverResultAtVersion<'a>,
+}
+
+/// A `ProverResult` whose extension values are written at `version`
+/// (`facts/api.md` § Transaction JSON). The fork's own
+/// `ProverResult::Serialize` writes at version 0.
+struct ProverResultAtVersion<'a> {
+    pr: &'a ProverResult,
+    version: ErgoTreeVersion,
+}
+
+impl Serialize for ProverResultAtVersion<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut st = serializer.serialize_struct("ProverResult", 2)?;
+        st.serialize_field("proofBytes", &String::from(self.pr.proof.clone()))?;
+        st.serialize_field("extension", &self.pr.extension.json_at(self.version))?;
+        st.end()
+    }
 }
 
 /// GET /peers/api-urls response entry.
@@ -392,7 +518,7 @@ pub struct ValidationFragmentsTx {
 pub struct TransactionSubmission {
     pub id: TxId,
     pub inputs: Vec<Input>,
-    #[serde(default, rename = "dataInputs")]
+    #[serde(rename = "dataInputs")]
     pub data_inputs: Vec<DataInput>,
     pub outputs: Vec<OutputSubmission>,
 }
