@@ -62,6 +62,14 @@ struct Fixture {
     proofs: Vec<u8>,
 }
 
+/// Make the header commit to the (empty, version-2) tx section and the given
+/// extension fields — `apply_state` binds sections to header roots.
+fn bound(mut header: Header, fields: &[([u8; 2], Vec<u8>)]) -> Header {
+    header.transaction_root = Digest32::from(enr_chain::transactions_root(&[], 2));
+    header.extension_root = Digest32::from(enr_chain::extension_root(fields));
+    header
+}
+
 fn make_sections() -> Fixture {
     let hid = [0u8; 32];
     Fixture {
@@ -81,7 +89,9 @@ fn mid_epoch_version_divergence_not_checked() {
     let mut validator = DigestValidator::new(ADDigest::zero(), 0);
     let header = make_header(1, 4);
     let fx = make_sections();
-    let ext = serialize_extension(&[0u8; 32], &[]).expect("empty extension");
+    let fields: Vec<([u8; 2], Vec<u8>)> = [].to_vec();
+    let ext = serialize_extension(&[0u8; 32], &fields).expect("empty extension");
+    let header = bound(header, &fields);
     let active = make_params(Some(3));
 
     let err = validator
@@ -111,8 +121,10 @@ fn boundary_mismatch_rejected_against_recomputed_set() {
     let mut validator = DigestValidator::new(ADDigest::zero(), 0);
     let header = make_header(1, 4);
     let fx = make_sections();
-    let ext = serialize_extension(&[0u8; 32], &[([0x00, 123], 3i32.to_be_bytes().to_vec())])
+    let fields: Vec<([u8; 2], Vec<u8>)> = [([0x00, 123], 3i32.to_be_bytes().to_vec())].to_vec();
+    let ext = serialize_extension(&[0u8; 32], &fields)
         .expect("extension with params");
+    let header = bound(header, &fields);
     let active = make_params(Some(4));
     let boundary = make_params(Some(3));
 
@@ -144,8 +156,10 @@ fn matching_version_passes_gate_at_boundary() {
     let mut validator = DigestValidator::new(ADDigest::zero(), 0);
     let header = make_header(1, 4);
     let fx = make_sections();
-    let ext = serialize_extension(&[0u8; 32], &[([0x00, 123], 4i32.to_be_bytes().to_vec())])
+    let fields: Vec<([u8; 2], Vec<u8>)> = [([0x00, 123], 4i32.to_be_bytes().to_vec())].to_vec();
+    let ext = serialize_extension(&[0u8; 32], &fields)
         .expect("extension with params");
+    let header = bound(header, &fields);
     let active = make_params(Some(4));
     let boundary = make_params(Some(4));
 
@@ -178,8 +192,10 @@ fn absent_block_version_at_boundary_rejects_without_panicking() {
     let mut validator = DigestValidator::new(ADDigest::zero(), 0);
     let header = make_header(1, 4);
     let fx = make_sections();
-    let ext = serialize_extension(&[0u8; 32], &[([0x00, 123], 4i32.to_be_bytes().to_vec())])
+    let fields: Vec<([u8; 2], Vec<u8>)> = [([0x00, 123], 4i32.to_be_bytes().to_vec())].to_vec();
+    let ext = serialize_extension(&[0u8; 32], &fields)
         .expect("extension with params");
+    let header = bound(header, &fields);
     let active = make_params(Some(4));
     let boundary = make_params(None);
 
