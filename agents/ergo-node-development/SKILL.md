@@ -1,6 +1,6 @@
 ---
 name: ergo-node-development
-description: Use when working on the ergo-node-rust project or any of its submodules — covers architecture philosophy, interface contracts, multi-session workflow, Ergo protocol specifics, S.P.E.C.I.A.L. system, and development principles
+description: Use when working on the ergo-node-rust project or any of its crates — covers architecture philosophy, interface contracts, the single-session workflow, Ergo protocol specifics, S.P.E.C.I.A.L. system, and development principles
 ---
 
 # Ergo Node Development
@@ -9,13 +9,13 @@ description: Use when working on the ergo-node-rust project or any of its submod
 
 ergo-node-rust is a ground-up Rust implementation of the Ergo blockchain full node. Not a port of the JVM reference — a new implementation using the existing sigma-rust ecosystem for cryptography and script evaluation, with a custom P2P networking layer reverse-engineered from the JVM node's wire protocol.
 
-The codebase follows a multi-session development model: one main session coordinates interface contracts and integration, while submodule sessions implement individual components within their contract boundaries.
+The node is feature complete and gets bugfixes only. One session works across the whole repo, crate source included; nothing inside it is dispatched. Other projects (the sigma-rust fork, SANTA) keep their own sessions.
 
 ## Core Philosophy
 
 ### Design by Contract
 
-Every component boundary has explicit preconditions, postconditions, and invariants. Contracts are documented in `facts/` and enforced via `debug_assert!` in Rust. The contract change pipeline: update the contract first, push it, then implement against it. Never change code first and contract after.
+Every component boundary has explicit preconditions, postconditions, and invariants. Contracts are documented in `facts/` and enforced via `debug_assert!` in Rust. The contract change pipeline: update the contract in `facts/` and commit it first, then implement against it. Never change code first and contract after.
 
 ### The wire is the spec
 
@@ -42,12 +42,17 @@ If a crate does 300 things and you need 3, consider whether to use it or write t
 ### Repository structure
 
 ```
-ergo-node-rust/                     # Main repo — integration, orchestration
-  facts/                            # Interface contracts + SPECIAL.md
-  docs/protocol/                    # P2P wire format spec (reverse-engineered)
-  docs/                             # Roadmap, design docs
-  prompts/                          # Prompts for submodule sessions
+ergo-node-rust/                     # One Cargo workspace
+  CLAUDE.md                         # Project rules + what each crate owns
+  SPECIAL.md                        # Per-component attention weights
+  facts/                            # Interface contracts
+  p2p/ chain/ validation/ state/    # Component crates
+  store/ sync/ mempool/ mining/ api/
   src/                              # Main crate — wires components together
+  addons/fastsync addons/indexer    # Separate packages, own lockfiles
+  docs/protocol/                    # P2P wire format spec (reverse-engineered)
+  docs/                             # Design docs
+  prompts/                          # Requests to other projects' sessions (gitignored)
 ```
 
 ### Component model
@@ -81,69 +86,30 @@ A  Agility       Performance, lean code, efficient paths
 L  Luck          Edge cases, race conditions, consensus edge cases
 ```
 
-Full profiles are in `facts/SPECIAL.md`. Key highlights:
+Full profiles are in `SPECIAL.md` at the repo root. Key highlights:
 - P2P networking is P10 (untrusted peers send arbitrary bytes)
 - Block validation is S10 (wrong validation = corrupted state)
 - UTXO state management is E10 (crash recovery IS the product)
 - Chain sync is E10 + L9 (must survive anything and resume)
 - Integration/orchestration is I10 (architecture rot starts here)
 
-## Multi-Session Workflow
+## Workflow
 
-The dispatch mechanics — kitty automation, executor identity, anti-recursion guards — live in the `dispatching-prompts` and `receiving-prompts` skill pair at `github.com/mwaddip/claude-dbc`. Install both before working on this codebase if you intend to dispatch.
+### One session, the whole repo
 
-### Role Detection (read this first)
-
-This skill is loaded by both the main session and per-crate dispatched
-sessions. The rules below apply differently depending on which you are.
-Detect via your working directory:
-
-- **Main session**: `pwd` is the repo root (`…/ergo-node-rust`). You
-  coordinate, edit `facts/` + top-level docs + `prompts/`, and dispatch
-  per-crate work via the `dispatching-prompts` skill (kitty
-  `--type=window` + `ac` + send-text "use the receiving-prompts
-  skill..."). You do not edit crate-internal source — except uniform
-  cross-cutting housekeeping (e.g. a workspace-wide dependency pin/version
-  bump), which you do directly and verify.
-- **Per-crate dispatched session**: `pwd` is a crate subdirectory
-  (`…/ergo-node-rust/<crate>`). You edit files in your crate. You do
-  NOT dispatch further. The canonical mechanism for executor identity
-  + anti-recursion rules is the `receiving-prompts` skill (loaded by
-  the dispatch message). If you are reading THIS section as an
-  executor, you should have loaded `receiving-prompts` first; do so
-  now and follow its rules.
-
-### Session roles
-
-**Main session** (cwd = repo root):
-- Owns `facts/` — the interface contracts
-- Coordinates component integration
-- Writes prompts for per-crate sessions and dispatches them via the
-  `dispatching-prompts` skill (kitty `--type=window` + `ac`)
-- Pulls and integrates work from dispatched sessions
-- **Never edits crate-internal source code directly** — the one exception is
-  uniform cross-cutting housekeeping (workspace-wide dependency pin/version
-  bumps, global find-replace), which is release orchestration: done directly
-  and verified, not dispatched
-
-**Per-crate dispatched sessions** (cwd = a crate subdirectory):
-- Receive a prompt file path as their first instruction
-- Read the prompt, the boilerplate it references, and the relevant
-  `facts/<area>.md` contract
-- Implement within their crate's directory boundary
-- Report completion back to the main session via the coordination
-  block at the bottom of the prompt (kitty `send-text --match=id:<main>`)
-- Never edit files outside their crate. If a cross-cutting change
-  is needed (e.g. a contract update), stop and surface it to main
+The node is feature complete and gets bugfixes only, so one session edits every crate's source and tests, `facts/`, `addons/` and the top level. There are no per-crate sessions and no dispatch inside this repo. The crate scopes in the root `CLAUDE.md` still decide where a fix lands: in the crate that owns the behavior.
 
 ### Making interface changes
 
-1. Main session updates the contract in `facts/` first
-2. Main session dispatches per-crate sessions to implement against the
-   updated contract
-3. Main session verifies integration
+1. Update the contract in `facts/` and commit it
+2. Implement against it, in whichever crates it touches
+3. Gate: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, and the same for each addon that changed
 
 Never change code first and contract after. The contract leads.
+
+### Other projects
+
+The sigma-rust fork and SANTA are separate repos with their own sessions; never edit them from here. A request for one goes in `prompts/` as markdown: the user routes it, or it is sent to that project's kitty window. Window ids change (a reboot renumbers them), so resolve the target with `kitty @ ls` before every send, keep a message under 2 KB, send the `\r` separately, and check with `get-text` that it landed.
 
 ## Protocol Reference
 
@@ -176,7 +142,7 @@ The Ergo P2P protocol was reverse-engineered from pcap captures of JVM node traf
 
 ### Interfaces write themselves
 
-Good documentation in `facts/` produces correct implementations even when prompts don't explicitly specify details. If the contract is precise, the submodule session builds the right thing. Invest in the contract; save on the prompt.
+Good documentation in `facts/` produces correct implementations even when the task doesn't spell out the details. If the contract is precise, the implementation follows from it. Invest in the contract.
 
 ### Derivation over configuration
 
@@ -214,7 +180,7 @@ Any two agreeing against the third is a finding. The pcap is the tiebreaker — 
 
 | Mistake | Fix |
 |---------|-----|
-| Trusting VLQ-encoded lengths without bounds checking | Cap all allocations at sane maximums (256KB for P2P messages) |
+| Trusting VLQ-encoded lengths without bounds checking | Cap allocations at the JVM's own bounds (grep its `maxMessageSize` and friends). A cap smaller than the JVM's silently drops valid messages: a 256 KB guess once stalled testnet sync at ~30k |
 | Implementing fixed-width integer parsing for Scorex fields | Everything is VLQ. Check the pcap. |
 | Porting JVM code line-by-line | Understand the intent, implement idiomatically in Rust. The type system catches different bugs. |
 | Adding `unwrap()` in network-facing code | Use `?` or explicit error handling. A panic in the P2P layer is a remote crash vulnerability. |
