@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use ergo_chain_types::{
     ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint, Header, PreHeader, Votes,
 };
+use ergo_lib::chain::parameters::Parameter;
 use ergo_lib::chain::transaction::input::prover_result::ProverResult;
 use ergo_lib::chain::transaction::input::Input;
 use ergo_lib::chain::transaction::Transaction;
@@ -140,8 +141,10 @@ pub fn make_header(height: u32) -> Header {
 }
 
 /// A state context whose preheader sits at `preheader_height` — i.e. describing
-/// the block about to be mined. Version 3 so the monotonic-height rule is live,
-/// matching mainnet.
+/// the block about to be mined. Block version 3 in the pre-header and in the
+/// parameters, so the monotonic-height and negative-height rules are live: the
+/// fork's validation reads the parameters' `BlockVersion`, not the pre-header's,
+/// and `Parameters::default()` says 1.
 pub fn state_context_at(preheader_height: u32) -> ErgoStateContext {
     let pre_header = PreHeader {
         version: 3,
@@ -155,7 +158,11 @@ pub fn state_context_at(preheader_height: u32) -> ErgoStateContext {
     let headers = vec![make_header(preheader_height.saturating_sub(1))]
         .try_into()
         .expect("one header is within the 1..10 bound");
-    ErgoStateContext::new(pre_header, headers, Parameters::default())
+    let mut parameters = Parameters::default();
+    parameters
+        .parameters_table
+        .insert(Parameter::BlockVersion, 3);
+    ErgoStateContext::new(pre_header, headers, parameters)
 }
 
 /// A `UtxoReader` over a fixed set of boxes.
