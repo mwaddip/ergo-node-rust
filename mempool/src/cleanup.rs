@@ -191,6 +191,7 @@ mod tests {
 
     use ergo_lib::chain::transaction::Transaction;
     use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
+    use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
     use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 
     use crate::test_common::{
@@ -214,6 +215,7 @@ mod tests {
             cost: tx_bytes.len() as u32,
             tx,
             tx_bytes: tx_bytes.into(),
+            id_version: ErgoTreeVersion::V3,
             fee,
             validation_cost,
             created: checked,
@@ -281,7 +283,14 @@ mod tests {
         let x = paying(&x_input, 4_000_000);
         for tx in [&x, &p, &c] {
             let bytes = tx.sigma_serialize_bytes().expect("tx serialization");
-            let outcome = mempool.process(tx.clone(), bytes, &utxo, &context, None);
+            let outcome = mempool.process(
+                tx.clone(),
+                bytes,
+                ErgoTreeVersion::V3,
+                &utxo,
+                &context,
+                None,
+            );
             assert!(
                 matches!(outcome, ProcessingOutcome::Accepted { .. }),
                 "setup: expected the tx to enter the pool, got {outcome:?}"

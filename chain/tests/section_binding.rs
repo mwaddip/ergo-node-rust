@@ -10,6 +10,9 @@
 //! `BlockTransactionsSerializer` / `ADProofsSerializer` / `ExtensionSerializer`
 //! layouts, so the assertions bind the parser to the JVM layout and not to
 //! another serializer in the workspace.
+//!
+//! Section 6 adds a transaction built for the purpose, whose id depends on
+//! the tree version it is read at.
 
 use enr_chain::{
     ad_proofs_digest, extension_root, section_id, section_id_from_body, section_ids,
@@ -18,7 +21,22 @@ use enr_chain::{
     TRANSACTION_TYPE_ID,
 };
 use ergo_chain_types::blake2b256_hash;
+use ergo_lib::chain::transaction::input::prover_result::ProverResult;
+use ergo_lib::chain::transaction::Input;
+use ergo_lib::ergotree_interpreter::sigma_protocol::prover::ProofBytes;
+use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
+use ergo_lib::ergotree_ir::chain::ergo_box::box_value::BoxValue;
+use ergo_lib::ergotree_ir::chain::ergo_box::{BoxId, ErgoBoxCandidate, NonMandatoryRegisters};
+use ergo_lib::ergotree_ir::chain::evaluated_value::{EvaluatedExpr, EvaluatedValue};
+use ergo_lib::ergotree_ir::ergo_tree::{ErgoTree, ErgoTreeVersion};
+use ergo_lib::ergotree_ir::mir::constant::Constant;
+use ergo_lib::ergotree_ir::mir::expr::Expr;
+use ergo_lib::ergotree_ir::mir::upcast::Upcast;
+use ergo_lib::ergotree_ir::serialization::sigma_byte_reader::{from_bytes, SigmaByteRead};
+use ergo_lib::ergotree_ir::serialization::sigma_byte_writer::{SigmaByteWrite, SigmaByteWriter};
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::{SigmaBoolean, SigmaProp};
+use ergo_lib::ergotree_ir::types::stype::SType;
 use sigma_ser::vlq_encode::WriteSigmaVlqExt;
 use sigma_ser::ScorexSerializable;
 
@@ -114,17 +132,42 @@ fn vlq_u16(out: &mut Vec<u8>, v: u16) {
 }
 
 /// JVM `BlockTransactionsSerializer.serialize`: the version sentinel is
-/// written only for block versions above 1.
+/// written only for block versions above 1, and from block version 3 each
+/// transaction is written under `withVersions(blockVersion, blockVersion)`,
+/// which writes as tree version 3 does. The rule is stated here rather than
+/// taken from `block_transactions_write_version`, so the bodies stay
+/// independent of the crate under test.
 fn tx_body(header_id: &[u8; 32], block_version: u8, txs: &[Transaction]) -> Vec<u8> {
     let mut out = header_id.to_vec();
     if block_version > 1 {
         vlq_u32(&mut out, BLOCK_VERSION_SENTINEL + u32::from(block_version));
     }
     vlq_u32(&mut out, txs.len() as u32);
+    let version = if block_version >= 3 {
+        ErgoTreeVersion::V3
+    } else {
+        ErgoTreeVersion::V0
+    };
     for tx in txs {
-        out.extend(tx.sigma_serialize_bytes().unwrap());
+        out.extend(written_at(tx, version));
     }
     out
+}
+
+/// `tx` as a writer at tree version `version` writes it.
+fn written_at(tx: &Transaction, version: ErgoTreeVersion) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut w = SigmaByteWriter::new(&mut out, None);
+    w.with_tree_version(version, |w| tx.sigma_serialize(w))
+        .unwrap();
+    out
+}
+
+/// `bytes` read as a transaction at tree version `version`.
+fn read_at(bytes: &[u8], version: ErgoTreeVersion) -> Transaction {
+    from_bytes(bytes)
+        .with_tree_version(version, Transaction::sigma_parse)
+        .unwrap()
 }
 
 /// JVM `ADProofsSerializer.serialize`.
@@ -643,4 +686,166 @@ fn never_panics_on_truncations_or_noise() {
 
     assert!(ok > 0, "the sweep must include bodies that bind");
     assert!(err > 0, "the sweep must include bodies that fail");
+}
+
+// ---------------------------------------------------------------------------
+// 6. The tree version a section's transactions are read at.
+//
+// SANTA X15, `Tuple(1, Upcast(1, Long))`, as a context-extension value. Below
+// tree version 3 sigmastate writes an `Upcast` of a constant back as the
+// constant (`ValueSerializer.scala:157-169`), and the fork computes a
+// transaction's id at the version it read the transaction at, as ergo computes
+// `serializedId` at parse (`ErgoTransaction.scala:68`). The same bytes read at
+// 0 and at 3 are two transactions with two ids.
+//
+// Block versions 3 and 4 commit to the same leaves (ids, then witness ids), so
+// a v3 and a v4 section carrying the same transaction bytes differ only in the
+// version those bytes are read at.
+// ---------------------------------------------------------------------------
+
+/// [`upcast_tx`]'s id at 3: the hash of its bytes with the `Upcast` kept.
+const UPCAST_TX_ID_AT_3: &str = "6b11fd0ea5f1e84782c15044f03cf10df48022ba7dcb8e6c0e48233b1cf9b0a1";
+/// The id of the same bytes read at 0: the hash with the `Upcast` written as `1`.
+const UPCAST_TX_ID_AT_0: &str = "b006736746ec23927fecfbaeb5a27bda4df791e5440eaba24e8aadb3072b3deb";
+/// The section id a v4 header commits to for [`upcast_tx`] under
+/// [`UPCAST_HEADER_ID`]: its root over the transaction as built, id at 3.
+const UPCAST_SECTION_ID_AT_3: &str =
+    "3008411c73c67ba3a40000ea3a4848f5a7ed11543a0998269d65d51198b904c7";
+/// The section id the same transaction bytes give when read at 0.
+const UPCAST_SECTION_ID_AT_0: &str =
+    "19b7302a6820653cadb5ec78e3417c7386c92002dc9a443fba5ba631e3175428";
+
+/// The header id the sections below claim.
+const UPCAST_HEADER_ID: [u8; 32] = [0x44; 32];
+
+/// `Upcast(1, Long)` as sigmastate writes it from tree version 3: the opcode,
+/// the constant `1: Int`, the target type `Long`.
+const UPCAST: [u8; 4] = [0x7e, 0x04, 0x02, 0x05];
+/// `1: Int`, which sigmastate writes in the `Upcast`'s place below version 3.
+const CONSTANT_1: [u8; 2] = [0x04, 0x02];
+
+/// SANTA X15, `Tuple(1, Upcast(1, Long))`, built with the fork's API.
+fn x15() -> EvaluatedValue {
+    let one = || Expr::Const(1i32.into());
+    EvaluatedValue::Expr(EvaluatedExpr::Tuple(
+        [
+            one(),
+            Expr::Upcast(Upcast::new(one(), SType::SLong).unwrap()),
+        ]
+        .into(),
+    ))
+}
+
+/// One input spending box `0…0` with an empty proof and X15 as context
+/// variable 0, and one 1 ERG `sigmaProp(true)` output. Built, so the fork
+/// computes its id at 3, the version a v4 block's transactions are read at.
+fn upcast_tx() -> Transaction {
+    let mut extension = ContextExtension::empty();
+    extension.values.insert(0, x15());
+    let input = Input::new(
+        BoxId::zero(),
+        ProverResult {
+            proof: ProofBytes::Empty,
+            extension,
+        },
+    );
+    let always = SigmaProp::new(SigmaBoolean::TrivialProp(true));
+    let output = ErgoBoxCandidate {
+        value: BoxValue::new(1_000_000_000).unwrap(),
+        ergo_tree: ErgoTree::try_from(Expr::Const(Constant::from(always))).unwrap(),
+        tokens: None,
+        additional_registers: NonMandatoryRegisters::empty(),
+        creation_height: 1,
+    };
+    Transaction::new_from_vec(vec![input], vec![], vec![output]).unwrap()
+}
+
+/// `bytes` with each [`UPCAST`] written as [`CONSTANT_1`], as a writer below
+/// tree version 3 writes it.
+fn without_upcast(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some((&first, tail)) = rest.split_first() {
+        if let Some(after) = rest.strip_prefix(&UPCAST[..]) {
+            out.extend_from_slice(&CONSTANT_1);
+            rest = after;
+        } else {
+            out.push(first);
+            rest = tail;
+        }
+    }
+    out
+}
+
+#[test]
+fn the_upcast_transaction_has_one_id_at_3_and_another_at_0() {
+    let tx = upcast_tx();
+    let at_3 = written_at(&tx, ErgoTreeVersion::V3);
+    let at_0 = without_upcast(&at_3);
+    assert_eq!(at_0.len(), at_3.len() - 2, "one Upcast, kept at 3");
+    // The proof is empty, so the bytes to sign are the transaction's own
+    // bytes, and its id is their hash.
+    assert_eq!(hex::encode(tx.id().as_ref()), UPCAST_TX_ID_AT_3);
+    assert_eq!(hex::encode(blake2b256_hash(&at_3).0), UPCAST_TX_ID_AT_3);
+    let read_3 = read_at(&at_3, ErgoTreeVersion::V3);
+    assert_eq!(hex::encode(read_3.id().as_ref()), UPCAST_TX_ID_AT_3);
+    let read_0 = read_at(&at_3, ErgoTreeVersion::V0);
+    assert_eq!(hex::encode(read_0.id().as_ref()), UPCAST_TX_ID_AT_0);
+    assert_eq!(hex::encode(blake2b256_hash(&at_0).0), UPCAST_TX_ID_AT_0);
+}
+
+#[test]
+fn a_v4_section_binds_under_the_root_its_header_computes_at_3() {
+    let tx = upcast_tx();
+    let header_side = section_id(
+        BLOCK_TRANSACTIONS_TYPE_ID,
+        &UPCAST_HEADER_ID,
+        &transactions_root(std::slice::from_ref(&tx), 4),
+    );
+    assert_eq!(hex::encode(header_side), UPCAST_SECTION_ID_AT_3);
+
+    let got = identity(
+        BLOCK_TRANSACTIONS_TYPE_ID,
+        &tx_body(&UPCAST_HEADER_ID, 4, &[tx]),
+    );
+    assert_eq!(got.header_id, UPCAST_HEADER_ID);
+    assert_eq!(hex::encode(got.id), UPCAST_SECTION_ID_AT_3);
+}
+
+#[test]
+fn a_v4_section_read_at_0_does_not_bind() {
+    let tx = upcast_tx();
+    let body = tx_body(&UPCAST_HEADER_ID, 4, std::slice::from_ref(&tx));
+    let tx_bytes = written_at(&tx, ErgoTreeVersion::V3);
+    assert!(
+        body.ends_with(&tx_bytes),
+        "the v4 body carries the bytes read below"
+    );
+
+    let read_0 = read_at(&tx_bytes, ErgoTreeVersion::V0);
+    let at_0 = section_id(
+        BLOCK_TRANSACTIONS_TYPE_ID,
+        &UPCAST_HEADER_ID,
+        &transactions_root(&[read_0], 4),
+    );
+    assert_eq!(hex::encode(at_0), UPCAST_SECTION_ID_AT_0);
+    assert_ne!(at_0, identity(BLOCK_TRANSACTIONS_TYPE_ID, &body).id);
+}
+
+#[test]
+fn a_v3_section_with_the_same_transaction_is_read_at_0() {
+    // The JVM writes a v3 block's transactions at 3 and reads them at 0, so a
+    // v3 body carries the same bytes as a v4 one, and they get the id the v4
+    // body's would get if it were read at 0.
+    let tx = upcast_tx();
+    let v3 = tx_body(&UPCAST_HEADER_ID, 3, std::slice::from_ref(&tx));
+    let v4 = tx_body(&UPCAST_HEADER_ID, 4, std::slice::from_ref(&tx));
+    let tx_bytes = written_at(&tx, ErgoTreeVersion::V3);
+    assert!(v3.ends_with(&tx_bytes) && v4.ends_with(&tx_bytes));
+    assert_eq!(v3.len(), v4.len());
+
+    let got = identity(BLOCK_TRANSACTIONS_TYPE_ID, &v3);
+    assert_eq!(got.header_id, UPCAST_HEADER_ID);
+    assert_eq!(hex::encode(got.id), UPCAST_SECTION_ID_AT_0);
+    assert_ne!(got.id, identity(BLOCK_TRANSACTIONS_TYPE_ID, &v4).id);
 }

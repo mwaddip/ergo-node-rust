@@ -13,6 +13,7 @@ use std::io::Cursor;
 use ergo_chain_types::blake2b256_hash;
 use ergo_chain_types::Header;
 use ergo_lib::chain::transaction::Transaction;
+use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
 use ergo_lib::ergotree_ir::serialization::sigma_byte_reader::{from_bytes, SigmaByteRead};
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_merkle_tree::{MerkleNode, MerkleTree};
@@ -20,6 +21,7 @@ use sigma_ser::vlq_encode::{ReadSigmaVlqExt, VlqEncodingError};
 
 use crate::error::ChainError;
 use crate::state_type::StateType;
+use crate::tree_version::block_transactions_read_version;
 
 /// Modifier type IDs (Ergo `NetworkObjectTypeId`).
 ///
@@ -196,8 +198,11 @@ pub struct SectionIdentity {
 ///   and a separate `count` follows; otherwise the block version is 1 and
 ///   `ver_or_count` is the count. The version must fit `u8`; a count of 0
 ///   is rejected as the JVM does (`BlockTransactions` asserts `txs.nonEmpty`).
-///   Each transaction is parsed with `Transaction::sigma_parse`;
-///   `digest = transactions_root(txs, block_version)`.
+///   Each transaction is parsed with `Transaction::sigma_parse` at
+///   [`block_transactions_read_version`]`(block_version)`, the version the
+///   section encodes, not the header's. The read version decides the
+///   transaction ids: the same bytes read at 0 and at 3 can fail to parse or
+///   hash to another id. `digest = transactions_root(txs, block_version)`.
 /// - **104 ADProofs**: `header_id[32] || size: u32 || proof_bytes[size]`;
 ///   `digest = ad_proofs_digest(proof_bytes)`.
 /// - **108 Extension**: `header_id[32] || count: u16 || (key[2] || len: u8 || value[len]) × count`
@@ -231,7 +236,7 @@ pub fn section_id_from_body(type_id: u8, body: &[u8]) -> Result<SectionIdentity,
             if count == 0 {
                 return Err(body.err("no transactions: a block carries at least one"));
             }
-            let txs = body.transactions(count)?;
+            let txs = body.transactions(count, block_transactions_read_version(block_version))?;
             transactions_root(&txs, block_version)
         }
         AD_PROOFS_TYPE_ID => {
@@ -333,13 +338,19 @@ impl<'a> SectionBody<'a> {
         self.vlq(what, |c| c.get_u16())
     }
 
-    /// Parse `count` transactions with `Transaction::sigma_parse`, pushing
-    /// each as it is read, then advance past the bytes the parser consumed.
-    fn transactions(&mut self, count: u32) -> Result<Vec<Transaction>, ChainError> {
+    /// Parse `count` transactions with `Transaction::sigma_parse` at tree
+    /// version `version`, pushing each as it is read, then advance past the
+    /// bytes the parser consumed.
+    fn transactions(
+        &mut self,
+        count: u32,
+        version: ErgoTreeVersion,
+    ) -> Result<Vec<Transaction>, ChainError> {
         let mut reader = from_bytes(self.remaining());
         let mut txs = Vec::new();
         for i in 0..count {
-            let tx = Transaction::sigma_parse(&mut reader)
+            let tx = reader
+                .with_tree_version(version, Transaction::sigma_parse)
                 .map_err(|e| self.err(format!("transaction {i}: {e}")))?;
             txs.push(tx);
         }

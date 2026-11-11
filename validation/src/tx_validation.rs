@@ -23,6 +23,11 @@ use ergo_lib::wallet::tx_context::TransactionContext;
 use crate::ValidationError;
 
 /// Deserialize an ErgoBox from raw bytes (as returned by the AVL proof verifier).
+///
+/// Read at tree version 0, the reader's default, as the JVM's `boxById` reads
+/// outside any `withVersions`. The fork keeps the slice it read, so the box's
+/// `bytes()` are the stored bytes and its id is their hash (facts/validation.md
+/// § Insert Values).
 pub fn deserialize_box(bytes: &[u8]) -> Result<ErgoBox, ValidationError> {
     let cursor = Cursor::new(bytes);
     let mut reader = SigmaByteReader::new(cursor, ConstantStore::empty());
@@ -1591,5 +1596,71 @@ mod block_cost_tests {
             }
             other => panic!("expected BlockCostExceeded, got: {other}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod deserialize_box_tests {
+    //! A box read back from the state (facts/validation.md § Insert Values):
+    //! read at tree version 0, as the JVM's `boxById` reads outside any
+    //! `withVersions`, keeping the slice it was read from.
+
+    use super::*;
+    use crate::test_support::{REGISTER_OUTPUT, REGISTER_OUTPUT_AT_3};
+    use ergo_chain_types::blake2b256_hash;
+    use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
+    use ergo_lib::ergotree_ir::serialization::sigma_byte_reader::{from_bytes, SigmaByteRead};
+    use ergo_lib::ergotree_ir::serialization::sigma_byte_writer::{
+        SigmaByteWrite, SigmaByteWriter,
+    };
+
+    /// blake2b256 of [`REGISTER_OUTPUT_AT_3`].
+    const REGISTER_OUTPUT_AT_3_HASH: &str =
+        "69f20213a238ebe29fb2275e271de9c43a875c41a0bf3ee1823dff4e47656b40";
+
+    /// The fork keeps the slice a box was read from: `bytes()` are the stored
+    /// bytes verbatim, and the box id is their hash. The stored box holds X15
+    /// in R4 with its `Upcast`, which a writer at 0 drops, so only the kept
+    /// slice gives these bytes back.
+    #[test]
+    fn a_box_read_back_keeps_the_bytes_it_was_read_from() {
+        let stored = hex::decode(REGISTER_OUTPUT_AT_3).unwrap();
+        let read = deserialize_box(&stored).unwrap();
+        assert_eq!(hex::encode(read.bytes().unwrap()), REGISTER_OUTPUT_AT_3);
+        assert_eq!(
+            hex::encode(read.box_id().as_ref()),
+            REGISTER_OUTPUT_AT_3_HASH
+        );
+        assert_eq!(blake2b256_hash(&stored).0, box_id_bytes(&read.box_id()));
+
+        // Not vacuous: the same box written at 0 is another byte string.
+        let mut at_0 = Vec::new();
+        SigmaByteWriter::new(&mut at_0, None)
+            .with_tree_version(ErgoTreeVersion::V0, |w| read.sigma_serialize(w))
+            .unwrap();
+        assert_eq!(hex::encode(at_0), REGISTER_OUTPUT);
+    }
+
+    /// Read at 0: type code 112, the function type from tree version 3, is an
+    /// unknown type code below it. A stored box whose R4 holds an empty
+    /// `Coll[Int => Int]` does not parse, though the same bytes parse at 3.
+    #[test]
+    fn a_box_read_back_is_read_at_0() {
+        let stored = hex::decode(format!(
+            "8094ebdc030008d3010001{}{}00",
+            "83007001040400",
+            "11".repeat(32)
+        ))
+        .unwrap();
+        match deserialize_box(&stored) {
+            Err(ValidationError::TransactionInvalid { reason, .. }) => assert!(
+                reason.contains("invalid type code: 112"),
+                "unexpected reason: {reason}"
+            ),
+            Err(other) => panic!("expected TransactionInvalid, got {other:?}"),
+            Ok(_) => panic!("a function type parsed at tree version 0"),
+        }
+        let at_3 = from_bytes(&stored).with_tree_version(ErgoTreeVersion::V3, ErgoBox::sigma_parse);
+        assert!(at_3.is_ok(), "the fixture must parse at 3: {at_3:?}");
     }
 }

@@ -9,16 +9,17 @@
 //! `header.version`).
 //!
 //! The gate runs after section parsing and the boundary parameter check,
-//! before any proof verification — so these tests get away with empty
-//! sections and garbage proofs: a rejection at the gate surfaces as
-//! `BlockVersionMismatch`, while sailing past it surfaces as the
+//! before any proof verification — so these tests get away with a minimal
+//! transactions section and garbage proofs: a rejection at the gate surfaces
+//! as `BlockVersionMismatch`, while sailing past it surfaces as the
 //! downstream `ProofDigestMismatch`.
 
 use ergo_chain_types::{ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint, Header, Votes};
 use ergo_lib::chain::parameters::Parameter;
+use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_validation::{
     serialize_ad_proofs, serialize_block_transactions, serialize_extension, BlockValidator,
-    DigestValidator, Parameters, ValidationError,
+    DigestValidator, Parameters, Transaction, ValidationError,
 };
 
 fn make_header(height: u32, version: u8) -> Header {
@@ -57,15 +58,43 @@ fn make_params(block_version: Option<i32>) -> Parameters {
     params
 }
 
+/// Active parameters — the pre-block ones rule 306 reads for
+/// `MaxBlockSize`. The gate itself reads `boundary`, not this, so keeping
+/// them separate matters: adding MaxBlockSize to `boundary` would leak
+/// through the v6 matchParameters60 subset check and fire a
+/// `ParameterMismatch` before the version gate runs.
+fn active_params_with_version(block_version: i32) -> Parameters {
+    let mut params = make_params(Some(block_version));
+    // 1 MiB is comfortably above these tiny fixtures.
+    params
+        .parameters_table
+        .insert(Parameter::MaxBlockSize, 1024 * 1024);
+    params
+}
+
 struct Fixture {
     txs: Vec<u8>,
     proofs: Vec<u8>,
 }
 
+/// The least a transactions section carries, since the parser rejects an
+/// empty one as the JVM does: box `0…0` spent with an empty proof into one
+/// 1 ERG `sigmaProp(true)` output.
+fn one_transaction() -> Transaction {
+    let bytes = hex::decode(format!(
+        "01{}0000000001{}",
+        "00".repeat(32),
+        "8094ebdc030008d3010000"
+    ))
+    .expect("fixture hex");
+    Transaction::sigma_parse_bytes(&bytes).expect("the transaction parses")
+}
+
 fn make_sections() -> Fixture {
     let hid = [0u8; 32];
     Fixture {
-        txs: serialize_block_transactions(&hid, 2, &[]).expect("empty tx section"),
+        txs: serialize_block_transactions(&hid, 2, &[one_transaction()])
+            .expect("one-transaction section"),
         proofs: serialize_ad_proofs(&hid, &[]),
     }
 }
@@ -82,7 +111,7 @@ fn mid_epoch_version_divergence_not_checked() {
     let header = make_header(1, 4);
     let fx = make_sections();
     let ext = serialize_extension(&[0u8; 32], &[]).expect("empty extension");
-    let active = make_params(Some(3));
+    let active = active_params_with_version(3);
 
     let err = validator
         .apply_state(
@@ -90,6 +119,7 @@ fn mid_epoch_version_divergence_not_checked() {
             &fx.txs,
             Some(&fx.proofs),
             &ext,
+            None,
             &[],
             &active,
             None,
@@ -113,7 +143,7 @@ fn boundary_mismatch_rejected_against_recomputed_set() {
     let fx = make_sections();
     let ext = serialize_extension(&[0u8; 32], &[([0x00, 123], 3i32.to_be_bytes().to_vec())])
         .expect("extension with params");
-    let active = make_params(Some(4));
+    let active = active_params_with_version(4);
     let boundary = make_params(Some(3));
 
     let err = validator
@@ -122,6 +152,7 @@ fn boundary_mismatch_rejected_against_recomputed_set() {
             &fx.txs,
             Some(&fx.proofs),
             &ext,
+            None,
             &[],
             &active,
             Some(&boundary),
@@ -146,7 +177,7 @@ fn matching_version_passes_gate_at_boundary() {
     let fx = make_sections();
     let ext = serialize_extension(&[0u8; 32], &[([0x00, 123], 4i32.to_be_bytes().to_vec())])
         .expect("extension with params");
-    let active = make_params(Some(4));
+    let active = active_params_with_version(4);
     let boundary = make_params(Some(4));
 
     // Gate passes; the flow proceeds and fails downstream at the AD-proofs
@@ -157,6 +188,7 @@ fn matching_version_passes_gate_at_boundary() {
             &fx.txs,
             Some(&fx.proofs),
             &ext,
+            None,
             &[],
             &active,
             Some(&boundary),
@@ -180,7 +212,7 @@ fn absent_block_version_at_boundary_rejects_without_panicking() {
     let fx = make_sections();
     let ext = serialize_extension(&[0u8; 32], &[([0x00, 123], 4i32.to_be_bytes().to_vec())])
         .expect("extension with params");
-    let active = make_params(Some(4));
+    let active = active_params_with_version(4);
     let boundary = make_params(None);
 
     let err = validator
@@ -189,6 +221,7 @@ fn absent_block_version_at_boundary_rejects_without_panicking() {
             &fx.txs,
             Some(&fx.proofs),
             &ext,
+            None,
             &[],
             &active,
             Some(&boundary),

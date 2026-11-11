@@ -165,12 +165,18 @@ pub(crate) async fn complete_store_flush_pair<S: SyncStore>(outcome: FlushOutcom
 /// horizon. No-op when `blocks_to_keep < 0` (archival mode) or when the
 /// computed horizon is 0 (chain hasn't grown past the retention window).
 ///
-/// See `../facts/sync.md` § "Pruning at flush time".
+/// Extensions (108) are kept for at least `extension_keep_depth` blocks —
+/// their prune horizon is `min(horizon, flushed_height − extension_keep_depth)`,
+/// saturating. Every extension at or above `flushed_height − extension_keep_depth`
+/// stays, so a fork point the state can roll back to always has the parent's
+/// extension available for the interlink checks (rules 401/402). See
+/// `../facts/sync.md` § "Pruning at flush time".
 pub(crate) async fn maybe_prune_at_horizon<S: SyncStore, C: SyncChain>(
     store: &S,
     chain: &C,
     flushed_height: u32,
     blocks_to_keep: i32,
+    extension_keep_depth: u32,
 ) {
     if blocks_to_keep < 0 {
         return;
@@ -181,26 +187,32 @@ pub(crate) async fn maybe_prune_at_horizon<S: SyncStore, C: SyncChain>(
         blocks_to_keep as u32,
         voting_length,
     );
-    if horizon == 0 {
-        return;
+    if horizon > 0 {
+        match store
+            .prune_below_height(horizon, &[BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID])
+            .await
+        {
+            Ok(n) => tracing::debug!(pruned = n, horizon, "pruned modifier rows"),
+            Err(e) => tracing::warn!(
+                error = %e,
+                horizon,
+                "prune failed; next flush will retry"
+            ),
+        }
     }
-    match store
-        .prune_below_height(
-            horizon,
-            &[
-                BLOCK_TRANSACTIONS_TYPE_ID,
-                AD_PROOFS_TYPE_ID,
-                EXTENSION_TYPE_ID,
-            ],
-        )
-        .await
-    {
-        Ok(n) => tracing::debug!(pruned = n, horizon, "pruned modifier rows"),
-        Err(e) => tracing::warn!(
-            error = %e,
-            horizon,
-            "prune failed; next flush will retry"
-        ),
+    let ext_horizon = horizon.min(flushed_height.saturating_sub(extension_keep_depth));
+    if ext_horizon > 0 {
+        match store
+            .prune_below_height(ext_horizon, &[EXTENSION_TYPE_ID])
+            .await
+        {
+            Ok(n) => tracing::debug!(pruned = n, ext_horizon, "pruned extension rows"),
+            Err(e) => tracing::warn!(
+                error = %e,
+                ext_horizon,
+                "extension prune failed; next flush will retry"
+            ),
+        }
     }
 }
 
@@ -275,6 +287,15 @@ pub struct SyncConfig {
     ///
     /// See ../facts/sync.md § "Block Body Retention".
     pub blocks_to_keep: i32,
+    /// Depth for which Extension sections (type 108) are retained beyond the
+    /// main prune horizon. Every extension at or above
+    /// `flushed_height − extension_keep_depth` stays, so every fork point the
+    /// state can roll back to still has its parent's extension available for
+    /// the interlink checks (rules 401/402). Main sets this from the UTXO
+    /// state's `keep_versions` (256).
+    ///
+    /// See ../facts/sync.md § "Pruning at flush time".
+    pub extension_keep_depth: u32,
 }
 
 impl Default for SyncConfig {
@@ -307,6 +328,11 @@ impl Default for SyncConfig {
             // crate overrides from the node config's `blocks_to_keep` knob
             // when the operator opts in.
             blocks_to_keep: -1,
+            // Matches the UTXO state's default `keep_versions` (256). Main
+            // crate overrides from the same value it builds the validator
+            // with, so the extension horizon tracks the state's rollback
+            // depth in both directions.
+            extension_keep_depth: 256,
         }
     }
 }
@@ -852,7 +878,14 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         let outcome = try_flush_validator(self.validator.as_ref(), height);
         complete_store_flush_pair(outcome, &self.store).await;
         if let Some(m) = outcome.committed_height() {
-            maybe_prune_at_horizon(&self.store, &self.chain, m, self.config.blocks_to_keep).await;
+            maybe_prune_at_horizon(
+                &self.store,
+                &self.chain,
+                m,
+                self.config.blocks_to_keep,
+                self.config.extension_keep_depth,
+            )
+            .await;
         }
         if outcome.advances_last_flush() {
             self.last_flush_height = height;
@@ -1177,6 +1210,34 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         // default covers the rarer header/epoch-boundary breaks.
         let mut stall_detail = StallDetail::other();
 
+        // Extension of the block at `height − 1`, handed to `apply_state` for
+        // the interlink checks (rules 401/402, `../facts/validation.md` §
+        // "Block rules taken from `appendFullBlock`"). Seeded from the store
+        // once at sweep start, then carried forward across successful
+        // applications so the loop reads each extension exactly once.
+        //
+        // `None` at genesis, and when the store no longer holds the parent's
+        // extension (pre-`extension_keep_depth` history, a fresh UTXO snapshot
+        // bootstrap, or a reorg deeper than that depth). `None` does not stop
+        // the sweep — the validator skips the interlink rules for that block
+        // with a warn. See `../facts/sync.md` § "What `apply_state` is called
+        // with".
+        let mut parent_extension: Option<Vec<u8>> = if sweep_from <= 1 {
+            None
+        } else {
+            match self.chain.header_at(sweep_from - 1).await {
+                Some(parent) => {
+                    let ext_id = enr_chain::section_id(
+                        EXTENSION_TYPE_ID,
+                        &parent.id.0 .0,
+                        &parent.extension_root.0,
+                    );
+                    self.store.get_modifier(EXTENSION_TYPE_ID, &ext_id).await
+                }
+                None => None,
+            }
+        };
+
         for height in sweep_from..=sweep_to {
             let header = match self.chain.header_at(height).await {
                 Some(h) => h,
@@ -1276,6 +1337,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                 &block_txs,
                 ad_proofs.as_deref(),
                 &extension,
+                parent_extension.as_deref(),
                 &preceding,
                 &active_params,
                 expected_boundary_params.as_ref(),
@@ -1295,6 +1357,11 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                             .apply_epoch_boundary_parameters(new_params, new_pu)
                             .await;
                     }
+                    // Carry the extension we just applied forward as the next
+                    // block's parent extension, avoiding a re-read from the
+                    // store. On break/return, the outer sweep exits and the
+                    // next call re-seeds from the store.
+                    parent_extension = Some(extension);
                     validated_to = height;
 
                     tracing::info!(
@@ -1365,6 +1432,7 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
                                 &self.chain,
                                 m,
                                 self.config.blocks_to_keep,
+                                self.config.extension_keep_depth,
                             )
                             .await;
                         }
@@ -1473,7 +1541,14 @@ impl<T: SyncTransport, C: SyncChain, S: SyncStore, V: BlockValidator> HeaderSync
         let outcome = try_flush_validator(self.validator.as_ref(), self.state_applied_height);
         complete_store_flush_pair(outcome, &self.store).await;
         if let Some(m) = outcome.committed_height() {
-            maybe_prune_at_horizon(&self.store, &self.chain, m, self.config.blocks_to_keep).await;
+            maybe_prune_at_horizon(
+                &self.store,
+                &self.chain,
+                m,
+                self.config.blocks_to_keep,
+                self.config.extension_keep_depth,
+            )
+            .await;
         }
         if outcome.advances_last_flush() {
             self.last_flush_height = self.state_applied_height;
@@ -2360,6 +2435,7 @@ mod cross_db_flush_tests {
             _block_txs: &[u8],
             _ad_proofs: Option<&[u8]>,
             _extension: &[u8],
+            _parent_extension: Option<&[u8]>,
             _preceding_headers: &[Header],
             _active_params: &Parameters,
             _expected_boundary_params: Option<&Parameters>,
@@ -2416,6 +2492,7 @@ mod cross_db_flush_tests {
             _block_txs: &[u8],
             _ad_proofs: Option<&[u8]>,
             _extension: &[u8],
+            _parent_extension: Option<&[u8]>,
             _preceding_headers: &[Header],
             _active_params: &Parameters,
             _expected_boundary_params: Option<&Parameters>,
@@ -2653,6 +2730,7 @@ mod shutdown_flush_tests {
             _block_txs: &[u8],
             _ad_proofs: Option<&[u8]>,
             _extension: &[u8],
+            _parent_extension: Option<&[u8]>,
             _preceding_headers: &[Header],
             _active_params: &Parameters,
             _expected_boundary_params: Option<&Parameters>,
@@ -3038,6 +3116,7 @@ mod blocks_to_keep_tests {
             _block_txs: &[u8],
             _ad_proofs: Option<&[u8]>,
             _extension: &[u8],
+            _parent_extension: Option<&[u8]>,
             _preceding_headers: &[Header],
             _active_params: &Parameters,
             _expected_boundary_params: Option<&Parameters>,
@@ -3089,6 +3168,7 @@ mod blocks_to_keep_tests {
             _bt: &[u8],
             _ap: Option<&[u8]>,
             _e: &[u8],
+            _pe: Option<&[u8]>,
             _ph: &[Header],
             _p: &Parameters,
             _bp: Option<&Parameters>,
@@ -3262,12 +3342,30 @@ mod blocks_to_keep_tests {
         })
     }
 
+    /// Every prune call, in order emitted. With the extension-horizon split,
+    /// one flush now produces two prunes: `[102, 104]` at the main horizon and
+    /// `[108]` at the (possibly lower) extension horizon.
+    fn prune_calls(calls: &[StoreCall]) -> Vec<(u32, Vec<u8>)> {
+        calls
+            .iter()
+            .filter_map(|c| match c {
+                StoreCall::PruneBelowHeight { horizon, type_ids } => {
+                    Some((*horizon, type_ids.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn prune_called_with_raw_horizon_when_flushed_below_voting_length() {
-        // blocks_to_keep=50, validator at 1000, voting_length=1024.
+        // blocks_to_keep=50, validator at 1000, voting_length=1024,
+        // default extension_keep_depth=256.
         // raw = 1000 - 50 + 1 = 951; 951 <= 1024 → no alignment.
+        // ext_horizon = min(951, 1000 - 256) = 744.
         // The shutdown_flush path runs validator.flush() then triggers
-        // prune via maybe_prune_at_horizon.
+        // prune via maybe_prune_at_horizon, which now emits one call per
+        // horizon (the main horizon for 102/104, ext_horizon for 108).
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let mut sync = build_sync(
             config_with_keep(50),
@@ -3282,26 +3380,25 @@ mod blocks_to_keep_tests {
         shutdown_tx.send(()).unwrap();
         sync.run().await;
 
-        let calls = sync.store.calls();
-        let (horizon, type_ids) =
-            last_prune_call(&calls).expect("prune_below_height should be called once on shutdown");
-        assert_eq!(horizon, 951, "raw horizon = flushed - keep + 1");
         assert_eq!(
-            type_ids,
+            prune_calls(&sync.store.calls()),
             vec![
-                BLOCK_TRANSACTIONS_TYPE_ID,
-                AD_PROOFS_TYPE_ID,
-                EXTENSION_TYPE_ID,
+                (951, vec![BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID]),
+                (744, vec![EXTENSION_TYPE_ID]),
             ],
-            "prune MUST target only section bodies — never headers (101)"
+            "prune emits one call per horizon: 102/104 at the main horizon, \
+             108 at the extension horizon — and never targets headers (101)"
         );
     }
 
     #[tokio::test]
     async fn prune_horizon_pulled_back_to_voting_epoch_start_mid_epoch() {
-        // blocks_to_keep=50, validator at 2500, voting_length=1024.
+        // blocks_to_keep=50, validator at 2500, voting_length=1024,
+        // default extension_keep_depth=256.
         // raw = 2451 > 1024 → epoch_start = (2451/1024)*1024 = 2048.
         // raw.min(epoch_start) = 2048 → retains the current epoch.
+        // ext_horizon = min(2048, 2500 - 256) = min(2048, 2244) = 2048.
+        // Both horizons coincide; the split still emits two calls.
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let mut sync = build_sync(
             config_with_keep(50),
@@ -3316,11 +3413,120 @@ mod blocks_to_keep_tests {
         shutdown_tx.send(()).unwrap();
         sync.run().await;
 
-        let calls = sync.store.calls();
-        let (horizon, _) = last_prune_call(&calls).expect("prune should be called");
         assert_eq!(
-            horizon, 2048,
-            "raw horizon 2451 pulled back to voting-epoch start 2048 so extensions stay intact"
+            prune_calls(&sync.store.calls()),
+            vec![
+                (2048, vec![BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID]),
+                (2048, vec![EXTENSION_TYPE_ID]),
+            ],
+            "raw horizon 2451 pulled back to voting-epoch start 2048 so \
+             extensions stay intact; the main and extension horizons coincide \
+             when extension_keep_depth is deep enough"
+        );
+    }
+
+    /// Build a SyncConfig with a chosen `blocks_to_keep` AND a chosen
+    /// `extension_keep_depth`, everything else default.
+    fn config_with_keep_and_ext_depth(
+        blocks_to_keep: i32,
+        extension_keep_depth: u32,
+    ) -> SyncConfig {
+        SyncConfig {
+            blocks_to_keep,
+            extension_keep_depth,
+            ..SyncConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn extension_horizon_capped_by_extension_keep_depth_when_keep_is_zero() {
+        // blocks_to_keep=0 (per-block flush, aggressive pruning), validator
+        // at 1000, extension_keep_depth=256. Main horizon (raw = 1000-0+1 =
+        // 1001, unaligned because <= voting_length) is aggressive; the
+        // extension horizon must still stay `flushed - depth = 744`, so
+        // every extension at or above 744 survives even at the most
+        // aggressive setting.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut sync = build_sync(
+            config_with_keep_and_ext_depth(0, 256),
+            Some(FakeValidator::at(1000)),
+            MockStore::new(),
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
+            shutdown_rx,
+        );
+
+        shutdown_tx.send(()).unwrap();
+        sync.run().await;
+
+        assert_eq!(
+            prune_calls(&sync.store.calls()),
+            vec![
+                (1001, vec![BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID]),
+                (744, vec![EXTENSION_TYPE_ID]),
+            ],
+            "blocks_to_keep=0 prunes 102/104 aggressively but the extension \
+             horizon is pulled back to flushed - extension_keep_depth so the \
+             state can still resolve interlinks after any rollback within \
+             keep_versions"
+        );
+    }
+
+    #[tokio::test]
+    async fn extension_horizon_capped_when_blocks_to_keep_below_extension_depth() {
+        // blocks_to_keep=50 is well below extension_keep_depth=256, so the
+        // main horizon aggressively prunes but the extension horizon lags
+        // behind at flushed - depth = 744. Every extension at or above
+        // 744 survives, as the contract requires.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut sync = build_sync(
+            config_with_keep_and_ext_depth(50, 256),
+            Some(FakeValidator::at(1000)),
+            MockStore::new(),
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
+            shutdown_rx,
+        );
+
+        shutdown_tx.send(()).unwrap();
+        sync.run().await;
+
+        assert_eq!(
+            prune_calls(&sync.store.calls()),
+            vec![
+                (951, vec![BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID]),
+                (744, vec![EXTENSION_TYPE_ID]),
+            ],
+            "blocks_to_keep=50 below extension_keep_depth=256: main horizon at \
+             951, extension horizon capped at flushed - depth = 744"
+        );
+    }
+
+    #[tokio::test]
+    async fn extension_horizon_skipped_when_flushed_below_extension_depth() {
+        // flushed=200 < extension_keep_depth=256: saturating_sub yields 0,
+        // so no extension prune fires. 102/104 still prune normally.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut sync = build_sync(
+            config_with_keep_and_ext_depth(50, 256),
+            Some(FakeValidator::at(200)),
+            MockStore::new(),
+            FixedVotingLengthChain {
+                voting_length: 1024,
+            },
+            shutdown_rx,
+        );
+
+        shutdown_tx.send(()).unwrap();
+        sync.run().await;
+
+        assert_eq!(
+            prune_calls(&sync.store.calls()),
+            vec![(151, vec![BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID])],
+            "when flushed - depth saturates to 0, the extension prune is a \
+             no-op — every extension we hold is within the rollback window"
         );
     }
 
@@ -3363,6 +3569,7 @@ mod blocks_to_keep_tests {
                 _bt: &[u8],
                 _ap: Option<&[u8]>,
                 _e: &[u8],
+                _pe: Option<&[u8]>,
                 _ph: &[Header],
                 _p: &Parameters,
                 _bp: Option<&Parameters>,
@@ -3473,10 +3680,14 @@ mod blocks_to_keep_tests {
         shutdown_tx.send(()).unwrap();
         sync.run().await;
 
-        let calls = sync.store.calls();
-        let (horizon, _type_ids) = last_prune_call(&calls)
-            .expect("nothing-to-persist MUST still prune — same horizon as a real flush");
-        assert_eq!(horizon, 951, "raw horizon = validated_height - keep + 1");
+        assert_eq!(
+            prune_calls(&sync.store.calls()),
+            vec![
+                (951, vec![BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID]),
+                (744, vec![EXTENSION_TYPE_ID]),
+            ],
+            "nothing-to-persist MUST still prune — same split as a real flush"
+        );
     }
 
     // ----- startup WARN capture -----
@@ -3683,6 +3894,7 @@ mod sweep_resume_tests {
             _block_txs: &[u8],
             _ad_proofs: Option<&[u8]>,
             _extension: &[u8],
+            _parent_extension: Option<&[u8]>,
             _preceding_headers: &[Header],
             _active_params: &Parameters,
             _expected_boundary_params: Option<&Parameters>,
@@ -4416,6 +4628,399 @@ mod sweep_resume_tests {
 }
 
 #[cfg(test)]
+mod parent_extension_sweep_tests {
+    //! Tests for the sweep's parent-extension propagation
+    //! (`facts/sync.md` § "What `apply_state` is called with").
+    //!
+    //! The sweep reads the Extension (108) section of the block at `h − 1`
+    //! and passes it to `apply_state` as `parent_extension`. Genesis and a
+    //! missing parent extension both yield `None`; a missing parent
+    //! extension must not stop the sweep.
+    use super::*;
+    use enr_chain::{ChainError, SyncInfo};
+    use ergo_chain_types::{ADDigest, Header};
+    use ergo_validation::{
+        ApplyStateOutcome, BlockValidator, Parameters, StatePersistence, ValidationError,
+    };
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+    use std::sync::{Arc, Mutex};
+
+    /// Header whose `extension_root` is a distinctive per-height sentinel so
+    /// every parent's extension section id is unique — otherwise a single
+    /// mock byte per height indistinguishably satisfies every lookup.
+    fn header_with_ext_root(height: u32) -> Header {
+        use ergo_chain_types::*;
+        let mut ext_root = [0u8; 32];
+        ext_root[0..4].copy_from_slice(&height.to_be_bytes());
+        Header {
+            version: 2,
+            id: BlockId(Digest32::from([height as u8; 32])),
+            parent_id: BlockId(Digest32::zero()),
+            ad_proofs_root: Digest32::zero(),
+            state_root: ADDigest::zero(),
+            transaction_root: Digest32::zero(),
+            timestamp: 1_000_000 + height as u64,
+            n_bits: 100_000,
+            height,
+            extension_root: Digest32::from(ext_root),
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce: vec![0; 8],
+                pow_distance: None,
+            },
+            votes: Votes([0, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        }
+    }
+
+    /// A validator that records the `parent_extension` bytes it received for
+    /// each applied height, in call order. Otherwise identical to a
+    /// consecutive-height-only stub.
+    struct RecordingValidator {
+        validated_height: u32,
+        digest: ADDigest,
+        seen: Vec<(u32, Option<Vec<u8>>)>,
+    }
+
+    impl RecordingValidator {
+        fn at(height: u32) -> Self {
+            Self {
+                validated_height: height,
+                digest: ADDigest::zero(),
+                seen: Vec::new(),
+            }
+        }
+    }
+
+    impl BlockValidator for RecordingValidator {
+        fn apply_state(
+            &mut self,
+            header: &Header,
+            _block_txs: &[u8],
+            _ad_proofs: Option<&[u8]>,
+            _extension: &[u8],
+            parent_extension: Option<&[u8]>,
+            _preceding_headers: &[Header],
+            _active_params: &Parameters,
+            _expected_boundary_params: Option<&Parameters>,
+            _expected_proposed_update: Option<&[u8]>,
+        ) -> Result<ApplyStateOutcome, ValidationError> {
+            let expected = self.validated_height + 1;
+            if header.height != expected {
+                return Err(ValidationError::HeightMismatch {
+                    expected,
+                    got: header.height,
+                });
+            }
+            self.seen
+                .push((header.height, parent_extension.map(|b| b.to_vec())));
+            self.validated_height = header.height;
+            Ok(ApplyStateOutcome {
+                epoch_boundary_params: None,
+                epoch_boundary_proposed_update: None,
+                block_cost: None,
+            })
+        }
+
+        fn validated_height(&self) -> u32 {
+            self.validated_height
+        }
+
+        fn current_digest(&self) -> &ADDigest {
+            &self.digest
+        }
+
+        fn reset_to(&mut self, _height: u32, _digest: ADDigest) -> Result<(), ValidationError> {
+            unreachable!("reset_to not exercised in parent-extension tests")
+        }
+
+        fn state_persistence(&self) -> Option<&dyn StatePersistence> {
+            None
+        }
+    }
+
+    type StoreMap = HashMap<(u8, [u8; 32]), Vec<u8>>;
+
+    /// Store backed by an id-keyed map. `get_modifier` returns the mapped
+    /// bytes or a per-type default: for extensions, `None` (so the sweep
+    /// tests the "missing parent extension" path); for the block's own
+    /// mandatory sections, a stub body (so the sweep does not abort loading
+    /// its own block).
+    struct KeyedStore {
+        map: Mutex<StoreMap>,
+    }
+
+    impl KeyedStore {
+        fn new() -> Self {
+            Self {
+                map: Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn insert(&self, type_id: u8, id: [u8; 32], bytes: Vec<u8>) {
+            self.map.lock().unwrap().insert((type_id, id), bytes);
+        }
+    }
+
+    impl SyncStore for KeyedStore {
+        async fn has_modifier(&self, type_id: u8, id: &[u8; 32]) -> bool {
+            self.map.lock().unwrap().contains_key(&(type_id, *id))
+        }
+
+        async fn get_modifier(&self, type_id: u8, id: &[u8; 32]) -> Option<Vec<u8>> {
+            if let Some(bytes) = self.map.lock().unwrap().get(&(type_id, *id)) {
+                return Some(bytes.clone());
+            }
+            // Fall through: the sweep needs the block's OWN mandatory
+            // sections to keep going. A missing extension for the parent
+            // header is the interesting case — leave those absent so the
+            // seed returns None.
+            if type_id == EXTENSION_TYPE_ID {
+                None
+            } else {
+                Some(vec![0])
+            }
+        }
+
+        async fn validated_height(&self) -> Option<u32> {
+            None
+        }
+
+        async fn set_validated_height(&self, _height: u32) {}
+
+        async fn flush(&self) {}
+
+        async fn prune_below_height(
+            &self,
+            _horizon: u32,
+            _type_ids: &[u8],
+        ) -> Result<usize, String> {
+            Ok(0)
+        }
+
+        async fn min_height_present(&self, _type_id: u8) -> Result<Option<u32>, String> {
+            Ok(None)
+        }
+    }
+
+    struct FixedChain {
+        tip: u32,
+    }
+
+    impl SyncChain for FixedChain {
+        async fn chain_height(&self) -> u32 {
+            self.tip
+        }
+        async fn build_sync_info(&self) -> Vec<u8> {
+            unreachable!()
+        }
+        async fn header_at(&self, height: u32) -> Option<Header> {
+            (height >= 1 && height <= self.tip).then(|| header_with_ext_root(height))
+        }
+        async fn header_state_root(&self, _height: u32) -> Option<[u8; 33]> {
+            Some([0u8; 33])
+        }
+        fn parse_sync_info(&self, _body: &[u8]) -> Result<SyncInfo, ChainError> {
+            unreachable!()
+        }
+        async fn continuation_ids(
+            &self,
+            _peer_last_ids: &[BlockId],
+            _limit: usize,
+        ) -> Vec<[u8; 32]> {
+            unreachable!()
+        }
+        async fn active_parameters(&self) -> Parameters {
+            Parameters::default()
+        }
+        async fn is_epoch_boundary(&self, _height: u32) -> bool {
+            false
+        }
+        async fn compute_expected_parameters(
+            &self,
+            _epoch_boundary_height: u32,
+            _block_proposed_update: &[u8],
+        ) -> Result<Parameters, ChainError> {
+            unreachable!()
+        }
+        async fn apply_epoch_boundary_parameters(
+            &self,
+            _params: Parameters,
+            _proposed_update_bytes: Vec<u8>,
+        ) {
+            unreachable!()
+        }
+        async fn active_proposed_update_bytes(&self) -> Vec<u8> {
+            unreachable!()
+        }
+        async fn verify_nipopow_envelope(
+            &self,
+            _envelope_body: &[u8],
+        ) -> Result<Vec<Header>, ChainError> {
+            unreachable!()
+        }
+        async fn is_better_nipopow(&self, _this: &[u8], _than: &[u8]) -> Result<bool, ChainError> {
+            unreachable!()
+        }
+        async fn install_nipopow_suffix(
+            &self,
+            _suffix_head: Header,
+            _suffix_tail: Vec<Header>,
+        ) -> Result<(), ChainError> {
+            unreachable!()
+        }
+        async fn voting_length(&self) -> u32 {
+            1024
+        }
+    }
+
+    struct HangingTransport;
+
+    impl SyncTransport for HangingTransport {
+        async fn send_to(
+            &self,
+            _peer: PeerId,
+            _message: ProtocolMessage,
+        ) -> Result<(), Box<dyn std::error::Error + Send>> {
+            unreachable!()
+        }
+        async fn outbound_peers(&self) -> Vec<PeerId> {
+            Vec::new()
+        }
+        async fn next_event(&mut self) -> Option<ProtocolEvent> {
+            std::future::pending().await
+        }
+    }
+
+    type PxSync = HeaderSync<HangingTransport, FixedChain, KeyedStore, RecordingValidator>;
+
+    fn build_sync(validator: RecordingValidator, store: KeyedStore, chain: FixedChain) -> PxSync {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (_progress_tx, progress_rx) = mpsc::channel(1);
+        let (_dc_tx, delivery_control_rx) = mpsc::unbounded_channel::<DeliveryControl>();
+        let (_dd_tx, delivery_data_rx) = mpsc::channel::<DeliveryData>(1);
+        HeaderSync::new(
+            SyncConfig::default(),
+            HangingTransport,
+            chain,
+            store,
+            Some(validator),
+            progress_rx,
+            delivery_control_rx,
+            delivery_data_rx,
+            None,
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            shutdown_rx,
+        )
+    }
+
+    /// Compute the extension section id for the header at `height`.
+    fn ext_id_at(height: u32) -> [u8; 32] {
+        let h = header_with_ext_root(height);
+        enr_chain::section_id(EXTENSION_TYPE_ID, &h.id.0 .0, &h.extension_root.0)
+    }
+
+    #[tokio::test]
+    async fn sweep_hands_parent_extension_at_height_gt_1() {
+        // Applied tip = 100, downloaded tip = 102. The store holds the
+        // extension bodies for heights 100 (parent of the first applied
+        // block), 101 (parent of the second, and block 101's own body), and
+        // 102 (block 102's own body). The validator must see the
+        // predecessor's bytes for each apply.
+        let store = KeyedStore::new();
+        let ext_100_bytes = b"ext-at-100".to_vec();
+        let ext_101_bytes = b"ext-at-101".to_vec();
+        let ext_102_bytes = b"ext-at-102".to_vec();
+        store.insert(EXTENSION_TYPE_ID, ext_id_at(100), ext_100_bytes.clone());
+        store.insert(EXTENSION_TYPE_ID, ext_id_at(101), ext_101_bytes.clone());
+        store.insert(EXTENSION_TYPE_ID, ext_id_at(102), ext_102_bytes);
+
+        let mut sync = build_sync(
+            RecordingValidator::at(100),
+            store,
+            FixedChain { tip: 1_000_000 },
+        );
+        sync.downloaded_height = 102;
+
+        sync.advance_state_applied_height().await;
+
+        assert_eq!(
+            sync.validator.as_ref().unwrap().seen,
+            vec![(101, Some(ext_100_bytes)), (102, Some(ext_101_bytes)),],
+            "the sweep MUST hand each block the extension of its predecessor: \
+             block 101 → parent 100's extension, block 102 → parent 101's, \
+             carried forward from the previous iteration without an extra \
+             store read"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_hands_none_at_genesis() {
+        // Applied tip = 0, downloaded tip = 1. Block 1 is genesis — no
+        // parent — so parent_extension MUST be None. The block's OWN
+        // extension is still required for the sweep to run at all.
+        let store = KeyedStore::new();
+        store.insert(EXTENSION_TYPE_ID, ext_id_at(1), b"ext-at-1".to_vec());
+
+        let mut sync = build_sync(
+            RecordingValidator::at(0),
+            store,
+            FixedChain { tip: 1_000_000 },
+        );
+        sync.downloaded_height = 1;
+
+        sync.advance_state_applied_height().await;
+
+        assert_eq!(
+            sync.validator.as_ref().unwrap().seen,
+            vec![(1, None)],
+            "genesis (h=1) has no parent extension"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_continues_when_parent_extension_missing_from_store() {
+        // Applied tip = 100, downloaded tip = 102. The extension at height
+        // 100 (parent of block 101) is intentionally NOT in the store —
+        // matching a snapshot bootstrap or a reorg deeper than
+        // extension_keep_depth. That must not stop the sweep: the validator
+        // sees None for block 101 and Some(bytes) for block 102 (carried
+        // forward from block 101's own extension).
+        //
+        // The blocks' OWN extensions must be present, though: a missing
+        // block-level section DOES stop the sweep, unlike a missing parent.
+        let store = KeyedStore::new();
+        let ext_101_bytes = b"ext-at-101".to_vec();
+        let ext_102_bytes = b"ext-at-102".to_vec();
+        store.insert(EXTENSION_TYPE_ID, ext_id_at(101), ext_101_bytes.clone());
+        store.insert(EXTENSION_TYPE_ID, ext_id_at(102), ext_102_bytes);
+
+        let mut sync = build_sync(
+            RecordingValidator::at(100),
+            store,
+            FixedChain { tip: 1_000_000 },
+        );
+        sync.downloaded_height = 102;
+
+        sync.advance_state_applied_height().await;
+
+        assert_eq!(
+            sync.validator.as_ref().unwrap().seen,
+            vec![(101, None), (102, Some(ext_101_bytes)),],
+            "a missing parent extension yields None for that block but MUST \
+             NOT stop the sweep; block 102 still gets block 101's extension \
+             carried forward"
+        );
+    }
+}
+
+#[cfg(test)]
 mod serve_continuation_tests {
     //! Tests for the serve side of the sync exchange (`facts/sync.md`
     //! § "Serving sync (peer behind us)").
@@ -4677,6 +5282,7 @@ mod serve_continuation_tests {
             _block_txs: &[u8],
             _ad_proofs: Option<&[u8]>,
             _extension: &[u8],
+            _parent_extension: Option<&[u8]>,
             _preceding_headers: &[Header],
             _active_params: &Parameters,
             _expected_boundary_params: Option<&Parameters>,
@@ -5105,6 +5711,7 @@ mod request_tests {
             _block_txs: &[u8],
             _ad_proofs: Option<&[u8]>,
             _extension: &[u8],
+            _parent_extension: Option<&[u8]>,
             _preceding_headers: &[Header],
             _active_params: &Parameters,
             _expected_boundary_params: Option<&Parameters>,

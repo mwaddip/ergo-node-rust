@@ -177,6 +177,12 @@ pub struct UnconfirmedTx {
     /// serialization for an API submission. One allocation, shared with the
     /// serving reader (§ Serving reader).
     pub tx_bytes: Arc<[u8]>,
+    /// The script version the transaction was read or built at: the version
+    /// its id is written at, and `tx_bytes` with it. Whoever hands the
+    /// transaction to the pool names it. A response that renders the
+    /// transaction writes its values at this version (`facts/api.md` §
+    /// Transaction JSON).
+    pub id_version: ErgoTreeVersion,
     /// Transaction fee in nanoERG.
     pub fee: u64,
     /// Weighting cost: the entry validation's cost, floored at the serialized
@@ -384,10 +390,16 @@ impl Mempool {
     /// 7. Evict if over capacity
     ///
     /// This is the primary entry point for both P2P and API submissions.
+    ///
+    /// `id_version` is the script version the caller read or built `tx` at.
+    /// Precondition: `tx`'s id is the id of its parts built at `id_version`
+    /// (`Transaction::new_from_vec_at`), enforced with a `debug_assert!`. The
+    /// pool stores the version on the entry and never changes it.
     pub fn process(
         &mut self,
         tx: Transaction,
         tx_bytes: Vec<u8>,
+        id_version: ErgoTreeVersion,
         utxo_reader: &dyn UtxoReader,
         state_context: &ErgoStateContext,
         source: Option<PeerId>,
@@ -525,6 +537,7 @@ transactions from a published mempool reader, not from the live pool
     /// Transactions from removed blocks that aren't in the new chain go back.
     /// These skip validation (they were valid in the previous chain state),
     /// so each carries `validation_cost: None` until a revalidation measures it.
+    /// Each carries the `id_version` its block's transactions were read at.
     pub fn return_to_pool(
         &mut self,
         txs: Vec<UnconfirmedTx>,
@@ -729,6 +742,22 @@ v6.0.6 :785-792):
   logged, not banned (`facts/journal-events.md` § `peer_penalised`).
 - **At or under it:** forwarded to the mempool task.
 
+The mempool task parses the transaction at the **activated script version**:
+the `ErgoTreeVersion` equal to `block_version() − 1` of the parameters in
+effect after the last applied block, which is 3 since 6.0
+(`enr_chain::activated_tree_version`). The call is
+`r.with_tree_version(activated, Transaction::sigma_parse)`.
+
+- That is the JVM's `withVersions(activatedScriptVersion,
+  activatedScriptVersion)` (:793). Its `activatedScriptVersion` follows the
+  state context's block version (:1536).
+- The version decides both what parses and the id (`facts/chain.md` § "The
+  tree version a block's transactions are read at"). A transaction read at the
+  wrong version can fail to parse, or hash to an id other than the one its
+  sender declared.
+- The bytes the pool stores and relays are the bytes the peer delivered.
+- The task hands `process()` that version as the transaction's `id_version`.
+
 The mempool crate exports the limit, so the P2P intake and the REST API
 (`facts/api.md` § Transaction Submission Flow) share one definition:
 
@@ -740,10 +769,10 @@ pub const MAX_TRANSACTION_SIZE: usize = 98_304;
 
 Two parts of the JVM's intake are not followed yet:
 - It also penalizes a peer whose transaction fails to parse, or whose id
-  differs from the one it declared (:794-805). Our parser still rejects some
-  transactions the JVM accepts (context-extension values encoded as
-  expressions), and our id can differ on a non-canonically encoded tree, so
-  those penalties would land on honest peers. They wait for both fixes.
+  differs from the one it declared (:794-805). Our id can still differ on a
+  non-canonically encoded tree, because a tree's bytes are re-serialized
+  rather than retained. Those penalties would land on honest peers, so they
+  wait for that fix.
 - It stops requesting a declared id that proved oversized (`setInvalid`).
   Transaction requests here keep no memory of invalid ids.
 

@@ -594,6 +594,12 @@ See "Ownership" above for why it spent v0.8.0 development with no caller.
 4. For each candidate transaction (in priority order):
    a. Check cumulative size: if adding this tx exceeds `max_block_size`,
       skip. Size is known from the serialized bytes without validating.
+      A transaction's size is its length as the block will write it, at
+      `enr_chain::block_transactions_write_version(block_version)`:
+      `ErgoTreeVersion::V3` from block version 3 and version 0 below
+      (`facts/validation.md` § Section Parsing). The budget then counts the bytes the size rule measures. The
+      section itself is written by `serialize_block_transactions` at the
+      candidate's block version.
    b. Validate the transaction against the "accumulated state" — the UTXO
       set augmented with outputs from the emission tx and already-selected
       transactions. Use `validate_single_transaction()` with the upcoming
@@ -689,6 +695,11 @@ serialized `ErgoBox`, which carries 32 bytes of transaction id plus the output
 index on top of the `ErgoBoxCandidate` body — 33 bytes that an
 estimate-from-the-candidate misses. Any implementation must grow the real box
 and measure it rather than assuming a per-token width.
+
+`out.bytes` is `ErgoBox::bytes()`, the box written at ErgoTree version 0.
+That is the form in which the JVM's output checks read it, outside any
+`withVersions` (`facts/validation.md` § Insert Values). Don't use
+`sigma_serialize_bytes()`: it writes at version 3.
 
 The JVM caps by the same wrong constant — `flatMap(_.additionalTokens).take(MaxAssetsPerBox)`,
 unsorted — and loses the same fees. **We diverge deliberately.** Which fee

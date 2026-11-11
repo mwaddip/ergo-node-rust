@@ -18,53 +18,21 @@ Full Ergo blockchain node in Rust. Not a port of the JVM node — a ground-up im
 
 **When interfaces don't match, fix the interface — never wrap the mismatch.** If two components miscommunicate, the problem is in the contract definition, not in missing glue code. Do not write adapters, shims, or wrappers to paper over interface disagreements. Trace the mismatch to whichever side is wrong and fix it at the source. This applies across all boundaries: crate APIs, P2P message parsing, trait contracts, and inter-component protocols.
 
-## Interface Contracts (REFERENCE)
+## Interface Contracts (RULE)
 
-**Contract specs live in the `facts/` directory.** Read and internalize the relevant contract before modifying any code that touches that boundary. Do not rely on memory or assumptions about how a component interfaces — read the contract. When a contract needs changing, change it first, then update the implementations.
+**Contract specs live in the `facts/` directory, and a contract always changes before the code.** Read the relevant contract before modifying any code that touches that boundary; do not rely on memory or assumptions about how a component interfaces. When a contract needs changing, update `facts/` and commit it first, then implement against it.
 
-## Per-Crate Dispatch (RULE)
+## One Session, the Whole Repo (RULE)
 
-**Main session does not edit crate-internal source files.** All work
-inside `sync/`, `validation/`, `state/`, `store/`, `mempool/`, `api/`,
-`mining/`, `p2p/`, or `chain/` is dispatched to a
-per-crate Claude session via the `dispatching-prompts` skill. Main
-session edits are limited to top-level orchestration: `Cargo.toml`
-(workspace), `README.md`, `CHANGELOG.md`, `LICENSE`, `build-deb`,
-`deploy/`, `man/`, top-level docs, scripts under repo root, the
-prompt files in `prompts/`, **the `addons/` tree** (see below),
-**and the `facts/` directory** — the
-contracts are main session's responsibility. Dispatched sessions
-read contracts via `../facts/` and deliver code that conforms to
-them; they do not edit those contracts. When a contract needs
-updating, main session writes the update first, then dispatches
-the implementation.
+**The node is feature complete and gets bugfixes only, so one session works across the whole repo:** every crate's source and tests, `facts/`, `addons/`, and the top level. Nothing inside this repo is dispatched to per-crate sessions. The crate scopes under **Crates** below still decide where a change belongs: a fix lands in the crate that owns the behavior.
 
-The dispatched session runs in `cd <crate>` and operates within that
-directory's boundary — it does not edit parent or sibling
-directories. The repo-root `facts/` directory is the single source
-of truth for cross-crate contracts.
+**Other projects keep their own sessions.** The sigma-rust fork and SANTA are separate repos with their own sessions; never edit them from here. Requests for them go in `prompts/` (gitignored) as markdown: the user routes them, or they are sent to that project's kitty window.
 
-**`addons/` is main session's, including source.** `addons/fastsync`
-and `addons/indexer` are small, focused packages that don't warrant
-their own session and the scaffolding it needs — and they have none
-of it: no per-crate `CLAUDE.md`, no `SPECIAL.md`, no contract in
-`facts/`. They are also `exclude`d from the workspace with their own
-lockfiles. Dispatching into them would land a session in a directory
-with none of the context the dispatch protocol assumes. Main session
-edits them directly, source included. (Their version bumps and
-lockfile re-syncs at release time were always main's anyway, under
-the mechanical-housekeeping exception below.)
+**A sigma-rust pin bump touches every manifest.** The rev is pinned in seven workspace `Cargo.toml`s and both addons. Grep the old rev to zero, re-lock the workspace and each addon (`cargo metadata --manifest-path …`), and check that the lock diff swaps only sigma-rust sources. Cargo can't pin an unpushed rev.
 
-**Exception — mechanical housekeeping crosses boundaries.** Uniform,
-cross-cutting metadata edits applied identically across the workspace —
-dependency pin/rev bumps (e.g. bumping the sigma-rust git rev in every
-crate's `Cargo.toml`), workspace version bumps, and similar workspace-wide
-find-replace — are release orchestration and are done directly by the main
-session, **without** dispatch. Verify completeness (grep the old string
-across all `Cargo.toml`s; `cargo build` hard-fails on a missed file via a
-conflicting-rev error). This is distinct from editing a single crate's
-content — logic, source, a doc-comment typo, or that one crate's own
-dependency decision — which still dispatches.
+## S.P.E.C.I.A.L.
+
+**`SPECIAL.md` at the repo root sets per-component attention weights.** Apply the profile of the crate you are editing.
 
 ## Skill Ownership (PERSISTENT RULE)
 
@@ -76,9 +44,7 @@ Replace the JVM reference node with a Rust implementation that is memory-safe, e
 
 ## Architecture
 
-Single-repo, multi-session development:
-- **Main session**: interface contracts, orchestration, integration. Does not edit crate-internal source.
-- **Per-crate sessions**: dispatched on demand via the `dispatching-prompts` skill, scoped to a single crate directory.
+One Cargo workspace. Each crate owns one component; **Crates** below says what each owns, what it doesn't, and where its contract is. The main crate (`src/`) wires them together.
 
 ### Components
 
@@ -96,6 +62,51 @@ Single-repo, multi-session development:
 | Soft-fork voting | (in `chain/`, `validation/`) | **Done** | Epoch-boundary parameter tracking, v6.0.3-compatible |
 | At-tip memory tuning | (in `sync/`) | **Done** | Runtime AVL DB cache resize on synced() (v0.4.0+) |
 | Contracts | `facts/` | — | Per-component contract markdown |
+
+## Crates
+
+### `p2p/` (enr-p2p)
+The network boundary: TCP (IPv4 and IPv6), handshake, framing, message parsing, routing, peer management (connect, disconnect, bounded write queues, penalties, keepalive, the PeerDb), broadcast. **Every byte from a peer is untrusted.** Contracts: `facts/p2p-transport.md`, `p2p-protocol.md`, `p2p-routing.md`, `p2p-node.md`, `p2p-peerdb.md`, `p2p-capture.md`.
+- **The node is a peer, not a proxy.** The router answers the peer that sent a message, from what the node has, or does nothing; it never passes a message from one peer to another, and every `Action::Send` it emits targets that sender (a `debug_assert!` enforces it).
+- **Three layers.** Transport encodes and decodes frames and runs the handshake; it never interprets content. Protocol parses messages into typed variants and runs the peer state machine. Router decides what to do: it answers `GetPeers` from the PeerDb and `ModifierRequest`s through the local-serve hook, records gossiped `Peers`, emits each received modifier as `Action::Validate`, and does nothing with `Inv`, `SyncInfo` or unknown codes. A light listener's peers get nothing for block-related requests (101, 102, 104, 108).
+- **The main crate owns the edges.** It injects the local-serve hook and owns the modifier sink's receiver; every other event reaches its consumer (sync, the mempool task, the snapshot and NiPoPoW handlers) through the event subscriber.
+- **Wire facts.** VLQ everywhere: Scorex method names like `putUShort`/`putUInt` mislead. The exception is the frame header's body length, 4-byte big-endian. Magic: mainnet `[01,00,02,04]`, testnet `[02,03,02,03]`. Modifier types: 101 Header, 2 Transaction, 102 BlockTransactions, 104 ADProofs, 108 Extension. Full spec: `docs/protocol/ergo-p2p-wire-format.md`.
+- Doesn't own: validation, storage, chain or UTXO state, what to sync or when, what the node has to serve.
+
+### `chain/` (enr-chain)
+The single authority on whether a chain of headers is valid: header parsing, best-height tracking, Autolykos v2 PoW, epoch difficulty adjustment (ported from `ergo-core`), parent linkage and timestamps, NiPoPoW verification. It also states the tree-version rules once (`block_transactions_read_version`, `block_transactions_write_version`, `activated_tree_version`). Contract: `facts/chain.md`. Doesn't own block bodies, persistence, request timing or network I/O. Depends on `ergo-chain-types`, `ergo-nipopow`, `sigma-ser`.
+
+### `validation/` (ergo-validation)
+The final arbiter on block validity, and consensus-critical glue: header checks from `chain/`, transaction validation through `ergo-lib`, AD proofs, UTXO lookups from `state/`. Digest and UTXO modes share section parsing, state-change computation and transaction validation; only state-root verification differs (`BatchAVLVerifier` against `PersistentBatchAVLProver`). It also extracts parameters at voting-epoch boundaries, checks the block rules, and owns `reset_to`. Contract: `facts/validation.md`. Doesn't own header chain logic, AVL persistence, the mempool, or script-evaluation internals (sigma-rust).
+
+### `state/` (enr-state)
+The UTXO state: `RedbAVLStorage`, the `VersionedAVLStorage` impl for the forked `ergo_avltree_rust`. It persists tree nodes by digest label, keeps a version chain for rollback within `keep_versions`, records the block height, bootstraps genesis, and rolls back a half-applied update on the next open. Contract: `facts/state.md`.
+- **Durability.** `update()` writes with `Durability::None`; the caller flushes periodically and on shutdown. Every write transaction sets `set_quick_repair(true)`: without it, opening after an unclean shutdown scans the whole file (~2 min on mainnet).
+- JVM parity is required on rollback semantics and version metadata (`avldb`).
+
+### `store/` (enr-store)
+Persistence for headers and block sections (101, 102, 104, 108), fork-aware header tables (PRIMARY, HEADER_FORKS, HEADER_SCORES, BEST_CHAIN), cumulative scores, chain metadata, and one-shot schema migrations on open. Contract: `facts/store.md`.
+- **No dependency on any Ergo domain crate**, and that isolation is load-bearing: the store stays a byte-keyed KV layer that never tracks sigma-rust upgrades. Work that needs domain types (e.g. computing scores from `n_bits`) runs in the main crate over primitives the store exposes.
+- Writes use `Durability::None` plus a caller `flush()`; `put_batch` is atomic across tables.
+- No JVM analog: the schema follows Ergo's access patterns, not the JVM's LevelDB layout.
+
+### `sync/` (ergo-sync)
+The sync state machine across full, digest and UTXO-snapshot modes: request and download coordination (the sliding window, delivery tracking), reorgs, restart and resume (watermarks, gap recovery, sweep and backoff), at-tip behavior (the AVL cache resize on `synced()`). It drives the router; it doesn't implement it. It must survive partitions, reorgs and restarts at any point. Contract: `facts/sync.md`.
+
+### `mempool/` (ergo-mempool)
+The transaction pool, in memory by design: a crash means an empty pool. Validate on entry, ordering, eviction, conflict detection, replace-by-fee, family weighting, fee statistics, rate limiting. The validation itself is `ergo-lib`, through `validation/`. Contract: `facts/mempool.md`.
+
+### `mining/` (ergo-mining)
+The logic behind the mining endpoints: candidate assembly (selection bounded by cost and serialized size, the transactions root), emission and fee transactions, `WorkMessage` shaping, PoW solution validation, voting fields. Contract: `facts/mining.md`.
+- **A real GPU miner consumes `WorkMessage`**, so field types and omitted fields matter: `b` is a bare number, `proof`/`h` are left out when absent, and the candidate is served by validated height.
+- **`WorkMessage.b` comes only from `enr_chain::pow_target(n_bits)`.** Never re-derive it from `decode_compact_bits`, which returns the difficulty; that is how v0.8.0 shipped a serve path no miner could satisfy.
+
+### `api/` (ergo-api)
+The REST API: axum handlers, request validation, response shaping, and the `ApiError` envelope (`reason` + `detail`). It reads the other crates through shared state and their public APIs and owns no business logic. Contract: `facts/openapi.yaml` (every endpoint, schema and error reason) and `facts/api.md` (conventions and the compatibility tags `full`, `deviation`, `rust-only`).
+- **`api/clippy.toml` bans `axum::Json`.** Handlers use the crate's `ApiJson`, `ApiQuery`, `ApiPath`, `ApiBytes` and `response::Json`, so every error keeps the envelope.
+
+### The main crate (`src/`) and `addons/`
+`src/` wires the components together: startup, layered configuration (`conf.d/`), component lifecycle, the validation pipeline, and the local-serve hook. `addons/fastsync` and `addons/indexer` are separate packages, `exclude`d from the workspace with their own lockfiles. They pin the same sigma-rust rev as the node; when one changes, its version and lockfile change with it.
 
 ## Design Principles
 
@@ -203,6 +214,17 @@ The JVM reference is at `ergoplatform/ergo` on GitHub. Key sub-modules:
 - `avldb` — authenticated AVL+ tree persistence (Rust port exists as `ergo_avltree_rust`)
 
 A local checkout for reference is at `~/projects/ergo-node-build` (v6.0.3 branch).
+
+**When behavior is ambiguous, the JVM source is correct. When it disagrees with observed traffic or network behavior, the traffic wins.** For the mining serve format, a real miner's parsing wins: it is the consumer.
+
+Where each component's behavior lives in the JVM source (`ergo-core/src/main/scala/org/ergoplatform/` unless noted):
+- **P2P:** `network/` and `network/peer/`; connection handling and the penalty system in `src/main/scala/scorex/core/network/`
+- **Headers, PoW, difficulty:** `modifiers/history/header/`, `mining/`, `nodeView/history/`
+- **Blocks and sections:** `modifiers/`; transaction validation is `ergo-wallet` (already in `ergo-lib`)
+- **Sync:** `nodeView/` (`NodeViewSynchronizer`, modifier download and apply)
+- **Mempool:** `nodeView/mempool/` (`ErgoMemPool`, `OrderedTxPool`)
+- **Mining:** `mining/` (`CandidateGenerator`, `AutolykosPowScheme`), plus `ErgoMiner` and the `/mining/*` routes
+- **UTXO state:** the `avldb` module
 
 ## Related Projects
 

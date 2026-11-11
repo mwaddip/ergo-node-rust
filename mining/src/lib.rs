@@ -16,9 +16,9 @@ use ergo_chain_types::{ADDigest, AutolykosSolution, BlockId, Digest, Digest32, H
 use ergo_lib::chain::parameters::Parameters;
 use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
-use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_validation::{
-    build_state_context, validate_single_transaction, ErgoStateContext, ValidationError,
+    build_state_context, serialize_block_transaction, validate_single_transaction,
+    ErgoStateContext, ValidationError,
 };
 
 use crate::selection::{id_bytes, CostedTx};
@@ -346,7 +346,7 @@ fn select_and_collect_fees(
     };
     let emission = CostedTx {
         cost: emission_cost,
-        size: serialized_size(&emission_tx)?,
+        size: serialized_size(&emission_tx, block_version)?,
         tx: emission_tx,
     };
 
@@ -371,7 +371,7 @@ fn select_and_collect_fees(
         block_txs.extend(selected.iter().map(|c| c.tx.clone()));
 
         let (fee_tx, fee_cost, fee_size) =
-            match measure_fee_tx(&block_txs, height, config, state_context) {
+            match measure_fee_tx(&block_txs, height, block_version, config, state_context) {
                 Ok(Some((tx, cost, size))) => (Some(tx), cost, size),
                 Ok(None) => (None, 0, 0),
                 Err(reason) => {
@@ -439,10 +439,14 @@ type MeasuredFeeTx = Option<(Transaction, u64, usize)>;
 /// block. `Ok(None)` means there was nothing to collect — a zero-fee block is
 /// a normal outcome, not an error.
 ///
+/// `block_version` is the candidate's: the size is measured as that block
+/// writes the transaction (`serialized_size`).
+///
 /// `Err` carries a reason for the caller to log and continue without fees.
 fn measure_fee_tx(
     block_txs: &[Transaction],
     height: u32,
+    block_version: u8,
     config: &MinerConfig,
     state_context: &ErgoStateContext,
 ) -> Result<MeasuredFeeTx, String> {
@@ -470,15 +474,23 @@ fn measure_fee_tx(
 
     let cost = validate_single_transaction(&fee_tx, input_boxes, vec![], state_context)
         .map_err(|e| format!("validation: {e}"))?;
-    let size = serialized_size(&fee_tx).map_err(|e| format!("{e}"))?;
+    let size = serialized_size(&fee_tx, block_version).map_err(|e| format!("{e}"))?;
 
     Ok(Some((fee_tx, cost, size)))
 }
 
-/// Serialized size of a transaction — the unit both the JVM generator and the
-/// block-transactions size limit count in.
-fn serialized_size(tx: &Transaction) -> Result<usize, MiningError> {
-    tx.sigma_serialize_bytes()
+/// A transaction's length as a block of `block_version` writes it — the unit
+/// the block-transactions size limit counts in (`facts/mining.md`, Step
+/// 3.4a).
+///
+/// Measured with `serialize_block_transaction`, which
+/// `serialize_block_transactions` writes each of the section's transactions
+/// through: at `enr_chain::block_transactions_write_version(block_version)`.
+/// Not `sigma_serialize_bytes()`, which writes at the fork's highest version,
+/// 3, for every block. The two part when a value holds an `Upcast` of a
+/// constant: below version 3 it is written as the bare constant.
+fn serialized_size(tx: &Transaction, block_version: u8) -> Result<usize, MiningError> {
+    serialize_block_transaction(tx, block_version)
         .map(|bytes| bytes.len())
         .map_err(|e| MiningError::AssemblyFailed(format!("transaction serialize: {e}")))
 }
@@ -652,7 +664,91 @@ impl CandidateGenerator {
 mod tests {
     use super::*;
     use ergo_chain_types::EcPoint;
-    use ergo_validation::build_state_context;
+    use ergo_lib::chain::transaction::input::prover_result::ProverResult;
+    use ergo_lib::chain::transaction::Input;
+    use ergo_lib::ergotree_interpreter::sigma_protocol::prover::ProofBytes;
+    use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
+    use ergo_lib::ergotree_ir::chain::ergo_box::box_value::BoxValue;
+    use ergo_lib::ergotree_ir::chain::ergo_box::{
+        BoxId, ErgoBoxCandidate, NonMandatoryRegisters, RegisterValue,
+    };
+    use ergo_lib::ergotree_ir::chain::evaluated_value::{EvaluatedExpr, EvaluatedValue};
+    use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
+    use ergo_lib::ergotree_ir::mir::expr::Expr;
+    use ergo_lib::ergotree_ir::mir::upcast::Upcast;
+    use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::{SigmaBoolean, SigmaProp};
+    use ergo_lib::ergotree_ir::types::stype::SType;
+    use ergo_validation::{build_state_context, serialize_block_transactions};
+
+    /// SANTA X15, `Tuple(1, Upcast(1, Long))`. From tree version 3 the
+    /// `Upcast` is written; below it the bare constant 1 is, two bytes shorter:
+    /// no `Upcast` opcode, no target type (`facts/chain.md` § "The tree version
+    /// a block's transactions are read at").
+    fn upcast_value() -> EvaluatedValue {
+        let one = Expr::Const(1i32.into());
+        EvaluatedValue::Expr(EvaluatedExpr::Tuple(
+            [
+                one.clone(),
+                Expr::Upcast(Upcast::new(one, SType::SLong).unwrap()),
+            ]
+            .into(),
+        ))
+    }
+
+    /// A transaction holding the value twice: as its input's context extension
+    /// value and as its output's R4.
+    fn upcast_tx() -> Transaction {
+        let mut extension = ContextExtension::empty();
+        extension.values.insert(0, upcast_value());
+        let input = Input::new(
+            BoxId::zero(),
+            ProverResult {
+                proof: ProofBytes::Empty,
+                extension,
+            },
+        );
+        let always_true = SigmaProp::new(SigmaBoolean::TrivialProp(true));
+        let output = ErgoBoxCandidate {
+            value: BoxValue::SAFE_USER_MIN,
+            ergo_tree: ErgoTree::try_from(Expr::Const(always_true.into())).unwrap(),
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::try_from(vec![RegisterValue::from(
+                upcast_value(),
+            )])
+            .unwrap(),
+            creation_height: 1,
+        };
+        Transaction::new_from_vec(vec![input], vec![], vec![output]).unwrap()
+    }
+
+    /// A transaction is measured as its block writes it (`facts/mining.md`,
+    /// Step 3.4a): at version 3 from block version 3, at version 0 below.
+    /// Block version 3 is where the rules part: its transactions are written at
+    /// 3 and read at 0, and the size budget follows the write.
+    #[test]
+    fn a_transaction_is_measured_at_its_block_s_write_version() {
+        let tx = upcast_tx();
+
+        // Pinned as observed. Both `Upcast`s are written at version 3...
+        assert_eq!(serialized_size(&tx, 4).unwrap(), 64, "v4 candidate");
+        assert_eq!(serialized_size(&tx, 3).unwrap(), 64, "v3 candidate");
+        // ...and each is the bare constant at version 0, two bytes shorter.
+        assert_eq!(serialized_size(&tx, 2).unwrap(), 60, "v2 candidate");
+
+        // The measure is the transaction's share of the section the block is
+        // written as.
+        for block_version in [2, 3, 4] {
+            let section =
+                serialize_block_transactions(&[0; 32], block_version, std::slice::from_ref(&tx))
+                    .unwrap();
+            assert_eq!(
+                serialized_size(&tx, block_version).unwrap()
+                    + selection::block_transactions_overhead(block_version, 1),
+                section.len(),
+                "block version {block_version}"
+            );
+        }
+    }
 
     /// A syntactically complete header at `height`, distinguishable by `seed`.
     /// Nothing here is chain-valid — the window is a slice operation and never

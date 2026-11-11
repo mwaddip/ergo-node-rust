@@ -196,6 +196,11 @@ Known structural deviations:
   `GET /peers/all`, filtered to connected peers. JVM additionally emits
   `lastHandshake` and `restApiUrl` per entry; the latter is surfaced via
   `GET /peers/api-urls` instead.
+- Transaction JSON, both ways. A rendered transaction writes its values at
+  the version of its id, where the JVM writes them at its default context
+  (§ Transaction JSON). A JSON submission is built at the activated version,
+  with its `id` and any output `boxId` checked, where the JVM builds at its
+  default context and ignores both (§ Transaction Submission Flow).
 
 ## Endpoints NOT Implemented (First Release)
 
@@ -332,6 +337,44 @@ hit the cap must check the returned length against the requested limit.
 
 ### Transaction JSON
 
+Every response that renders a transaction writes its context-extension and
+output register values at the version its id is written at. That is the version
+it was read at: for a block's transactions, `enr_chain::block_transactions_read_version`
+of the block; for a pool transaction, the pool entry's `id_version`
+(`facts/mempool.md` § `UnconfirmedTx`). A client that re-serializes the JSON at
+that version gets the transaction's id back.
+
+How a route gets there depends on what it serializes:
+- **The fork's `Transaction`:** the fork's serde writes at the transaction's id
+  version (fork PR #56). The block routes render this way.
+- **The transaction's parts:** the pool routes build their JSON from parts, and
+  a part's own `Serialize` writes at version 0. So they write each input's
+  extension with `ContextExtension::json_at` and each output with
+  `ErgoBox::json_at`, at the entry's `id_version`. At version 0, an X15 pool
+  transaction would render without its `Upcast`, and an extension value that
+  version 0 can't write would fail the whole response.
+
+A resolved input's spent box is a box on its own, so it stays at 0.
+
+An output inside a transaction's JSON follows the transaction, but its `boxId`
+hashes the output written at version 0. That is how ergo computes an output's
+id: its `ErgoBox.bytes`, first written in the output checks at the JVM's default
+context (1, 1), below version 3. A register holding an `Upcast` of a constant
+(SANTA's X15) shows the difference. Its rendered hex keeps the `Upcast`, and
+the box id hashes the output without it. Re-serialize the output at 0 to get
+its id; hashing the rendered hex gives another. A box rendered on its own, not
+inside a transaction, writes its values at 0.
+
+`size` in a pool transaction's JSON is the length of the bytes the pool holds,
+which are the bytes it relays.
+
+**The JVM renders every transaction at its default version context (1, 1),**
+whatever version its id was computed at. For a v4 block's transaction holding
+an `Upcast` of a constant, its JSON drops the `Upcast`, so its hex no longer
+hashes to its own `id`, and its `size` is the length of that write, not of the
+bytes read. SANTA measured both on its v6.0.6 oracle. The node doesn't copy
+this. The fork's parser refuses such JVM JSON with `InvalidTxId`.
+
 Every response that renders a transaction lists each input's
 context-extension entries in the order the transaction serializes them: the
 order its id is computed over. A client that re-serializes the JSON, taking
@@ -403,14 +446,18 @@ Client
   │ POST /transactions { ErgoTransaction JSON }
   ▼
 API handler
-  │ 1. Deserialize JSON → Transaction
-  │ 2. Serialize → tx_bytes (sigma format, for P2P)
+  │ 1. Deserialize JSON → this crate's request type: id, inputs, dataInputs,
+  │    and outputs read as candidates, each with its boxId where given
+  │ 1a. Build the Transaction at the activated script version
+  │     (Transaction::new_from_vec_at); the JSON's id ≠ the built id, or an
+  │     output's boxId, where given, ≠ the built output's id → 400
+  │ 2. Serialize → tx_bytes (sigma format, for P2P), at the same version
   │ 2a. tx_bytes longer than ergo_mempool::MAX_TRANSACTION_SIZE → 400
   │ 3. Acquire state_context read lock
   │ 4. Build MempoolUtxoReader (UTXO state + mempool unconfirmed outputs)
   │ 5. Acquire mempool lock
   ▼
-mempool.process(tx, tx_bytes, &utxo_reader, &state_context, None)
+mempool.process(tx, tx_bytes, version, &utxo_reader, &state_context, None)
   │ ... 13-step validation (see mempool contract) ...
   ▼
 ProcessingOutcome
@@ -419,6 +466,73 @@ ProcessingOutcome
   ▼
 Response: 200 "txId" or 400 { error, reason }
 ```
+
+Steps 1a and 2 build and write the transaction at the activated script
+version: the `ErgoTreeVersion` equal to `block_version() − 1` of the parameters
+in effect, which is 3 since 6.0. That is the version a peer reads the relayed
+bytes at (`facts/mempool.md` § P2P Transaction Intake). Built there, the
+transaction's id is the id of the bytes the node relays. The id the handler
+answers with, the id the node announces and the id a peer reads are then the
+same, at any activated version. Built or written at another version, an
+`Upcast` of a constant can make them differ. `Transaction::sigma_serialize_bytes()`
+writes at the fork's highest version, which isn't the activated version once
+the two differ.
+
+The handler hands `process()` the version it built at. The pool keeps it as
+the entry's `id_version` (`facts/mempool.md` § `UnconfirmedTx`), and the pool
+routes render the transaction at it (§ Transaction JSON).
+
+**This crate translates the request; the fork's transaction JSON doesn't.**
+The request body is this API's contract (`facts/openapi.yaml`
+`TransactionSubmission`). The handler deserializes it into a type of its own,
+built from the fork's public parts (`TxId`, `Input`, `DataInput`,
+`ErgoBoxCandidate`, `BoxId`), and builds with `Transaction::new_from_vec_at`.
+It doesn't deserialize `Transaction`. That is the fork's wallet-facing format:
+it builds at version 3, and it drops the outputs' `boxId`s. Which version to
+build at, and which ids to check, are this API's decisions, so they stay in
+this crate.
+
+**The id checks.** The JVM ignores the JSON's `id` and each output's `boxId`
+and computes both itself: its decoder (sigmastate
+`JsonCodecs.ergoLikeTransactionDecoder`) reads only inputs, data inputs and
+output candidates. The node requires `id`, and answers 400 when it differs from
+the id the node builds. An output's `boxId` is optional. Where the JSON gives
+one, it must equal the id of the output the node builds, or 400. So a client
+that computed an id other than the node's learns it before anything is pooled
+or relayed. It doesn't meet a proof failure instead, or an id it didn't expect.
+Outputs are read as candidates, as the JVM reads them, so `transactionId` and
+`index` may be omitted and are ignored. `POST /transactions/check` builds and
+checks the same way.
+
+**The JVM builds a JSON submission at its default version context (1, 1),**
+not at the version its bytes route parses at (`withVersions(protocolVersion,
+protocolVersion)`). An `Upcast` of a constant drops out of the id there. So a
+transaction signed over its version-3 message is invalid through the JVM's
+`POST /transactions` and valid through its `/transactions/bytes`. SANTA
+measured both on its v6.0.6 oracle. The node builds at the activated version,
+the version it writes and relays the bytes at.
+
+**The handler gets the version from `ChainAccess`, not from the state
+context.** The parameters in effect belong to the chain, which has them from
+startup. The state context exists only after the first applied block. So steps
+1a to 2a need no state context. An oversized transaction or a mismatched id
+gets 400 while the node is syncing too.
+
+```rust
+// on ChainAccess:
+/// The script version activated by the parameters in effect after the last
+/// applied block: `enr_chain::activated_tree_version` of their block
+/// version. `None` only if that block version doesn't fit `u8`, which voting
+/// can't produce. The handler answers 500.
+fn activated_tree_version(&self) -> Option<ErgoTreeVersion>;
+```
+
+The main crate's adapter implements it from the chain's active parameters.
+This crate still doesn't depend on `enr-chain`, and any chain rule it needs
+comes through `ChainAccess` like this one.
+`GET /blocks/{header_id}/validation-fragments` writes each transaction with
+`ergo_validation::serialize_block_transaction` (`facts/validation.md` §
+Section Parsing), not with a version of its own.
 
 Step 2a is the JVM's size check (`TransactionsApiRoute.validateTransactionAndProcess`,
 v6.0.6 :165-168): a transaction over `maxTransactionSize` is refused before it

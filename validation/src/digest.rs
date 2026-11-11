@@ -12,6 +12,7 @@ use ergo_avltree_rust::operation::{KeyValue, Operation};
 use ergo_chain_types::{ADDigest, Header};
 use ergo_lib::chain::parameters::Parameters;
 
+use crate::block_rules::validate_block_rules;
 use crate::sections::{parse_ad_proofs, parse_block_transactions, parse_extension};
 use crate::state_changes::{compute_state_changes, transactions_to_summaries};
 use crate::tx_validation;
@@ -77,6 +78,7 @@ impl BlockValidator for DigestValidator {
         block_txs: &[u8],
         ad_proofs: Option<&[u8]>,
         extension: &[u8],
+        parent_extension: Option<&[u8]>,
         preceding_headers: &[Header],
         active_params: &Parameters,
         expected_boundary_params: Option<&Parameters>,
@@ -130,6 +132,20 @@ impl BlockValidator for DigestValidator {
         if let Some(boundary) = expected_boundary_params {
             voting::check_block_version(boundary, header.version, header.height)?;
         }
+
+        // 1c. Block rules 306 and 400–406 (JVM `appendFullBlock`), before any
+        // state changes. Runs at every height, checkpoint or not — matching
+        // the JVM's `execTransactions` skip-only semantics.
+        let parent_parsed_ext = parent_extension.map(parse_extension).transpose()?;
+        validate_block_rules(
+            header,
+            preceding_headers.first(),
+            &parsed_ext,
+            parent_parsed_ext.as_ref(),
+            block_txs.len(),
+            extension.len(),
+            active_params,
+        )?;
 
         // 2. Verify AD proofs digest matches header
         let proof_digest: [u8; 32] =
@@ -236,13 +252,27 @@ impl BlockValidator for DigestValidator {
                 proof_boxes.insert(*id, tx_validation::deserialize_box(bytes)?);
             }
 
+            // A block's transactions are validated with the parameters in
+            // effect **after** the block. Everywhere but an epoch boundary
+            // those are `active_params`; at a boundary they are the just-
+            // parsed `epoch_boundary_params` (facts/validation.md §
+            // "Parameters a block's transactions are validated with").
+            //
+            // Rule 306 keeps `active_params` — bounding a block's own
+            // section size by the parameters it introduces would be a
+            // liveness footgun and is not what the JVM does.
+            let tx_params = epoch_boundary_params
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| active_params.clone());
+
             let eval = ScriptEvalInputs {
                 height: header.height,
                 transactions: parsed_txs.transactions,
                 proof_boxes,
                 header: header.clone(),
                 preceding_headers: preceding_headers.to_vec(),
-                parameters: active_params.clone(),
+                parameters: tx_params,
             };
 
             block_cost = Some(tx_validation::evaluate_scripts(&eval)?);
@@ -363,6 +393,7 @@ mod tests {
                 &self.txs,
                 Some(&self.proofs),
                 &self.extension,
+                None,
                 &self.preceding,
                 &Parameters::default(),
                 None,

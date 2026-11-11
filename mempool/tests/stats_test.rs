@@ -14,6 +14,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use ergo_lib::chain::transaction::Transaction;
+use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 
 use common::{make_box, spend_tx, tx_id_bytes, TIP_HEIGHT};
@@ -45,6 +46,7 @@ fn entry(tx: &Transaction, fee_per_factor: u64, created: Instant) -> Unconfirmed
     UnconfirmedTx {
         tx: tx.clone(),
         tx_bytes: tx.sigma_serialize_bytes().expect("tx serialization").into(),
+        id_version: ErgoTreeVersion::V3,
         fee: fee_per_factor,
         cost: 1024,
         validation_cost: None,

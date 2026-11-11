@@ -72,9 +72,19 @@ pub trait BlockValidator {
     ///   - `ad_proofs` is the raw ADProofs section (type 104), required
     ///     for digest mode, None for UTXO mode
     ///   - `extension` is the raw Extension section (type 108)
+    ///   - `parent_extension` is the raw Extension section of the block at
+    ///     `header.height − 1` on the chain being applied (the block whose
+    ///     header is `preceding_headers[0]`). None at genesis, and when the
+    ///     store doesn't hold it. See § "Block rules taken from
+    ///     `appendFullBlock`" for what None means, and `facts/sync.md` §
+    ///     "Pruning" for when the store must hold it.
     ///   - `preceding_headers` contains up to 10 headers before this block,
     ///     newest first (for ErgoStateContext in ScriptEvalInputs)
-    ///   - `active_params` is the current chain parameters
+    ///   - `active_params` is the parameters in effect BEFORE this block: at
+    ///     an epoch-boundary block, the previous epoch's. They bound the
+    ///     block's size (rule 306). They are not the parameters its
+    ///     transactions are validated with at a boundary (§ "Parameters a
+    ///     block's transactions are validated with").
     ///   - `expected_boundary_params` is Some iff header.height is an
     ///     epoch boundary
     ///
@@ -100,6 +110,7 @@ pub trait BlockValidator {
         block_txs: &[u8],
         ad_proofs: Option<&[u8]>,
         extension: &[u8],
+        parent_extension: Option<&[u8]>,
         preceding_headers: &[Header],
         active_params: &Parameters,
         expected_boundary_params: Option<&Parameters>,
@@ -515,6 +526,97 @@ caller must perform. `ApplyStateOutcome::block_cost` surfaces it as
 `Option<u64>`: `Some` when scripts were evaluated, `None` when the block was
 at or below `checkpoint_height` and evaluation was skipped.
 
+### Parameters a block's transactions are validated with
+
+A block's transactions are validated with the parameters in effect **after**
+the block. Everywhere but an epoch boundary those are `active_params`. At an
+epoch-boundary block they are the boundary parameters the block carries in its
+extension, the ones `ApplyStateOutcome.epoch_boundary_params` returns, after
+they have matched `expected_boundary_params`.
+
+- **What they cover:** everything a transaction's validity reads from the
+  parameters:
+  - `ScriptEvalInputs.parameters` (and through it the `ErgoStateContext` the
+    scripts see)
+  - `maxBlockCost`
+  - the input, data-input, output and token-access costs
+  - `minValuePerByte`
+  - `storageFeeFactor`
+- **Why:** the JVM validates the block's transactions against `newStateContext`,
+  the context after `appendFullBlock` (`UtxoState.scala:138-139`,
+  `DigestState.scala:72-75`). At a boundary, that context's parameters are the
+  ones `processExtension` parsed from the block, and `validateStateful` reads
+  them (`ErgoTransaction.scala:120, 186, 191, 372-377`).
+- **Not rule 306.** Rule 306 bounds the same block's size with the parameters in
+  effect **before** it (§ "Block rules taken from `appendFullBlock`"), which
+  are `active_params`. At a boundary the two differ.
+
+### Block rules taken from `appendFullBlock`
+
+Before the JVM executes a block's transactions, `ErgoStateContext.appendFullBlock`
+(v6.0.6 `ErgoStateContext.scala:323-337`) validates the extension
+(`ExtensionValidator.scala:15-45`) and both sections' sizes. The node applies
+the same rules in `apply_state`.
+- **Every height, including at or below `checkpoint_height`.** The JVM's
+  checkpoint skips only transaction execution (`ErgoState.scala:135-137`).
+- **Before the state changes, so an `Err` leaves the prover untouched.**
+- **A violation is `ValidationError::BlockRule { rule, reason }`**, where `rule`
+  is the JVM's rule id. The rules can fail in any order; the verdict is the
+  contract, as in § Block cost semantics.
+
+| Rule | JVM name | The block is invalid when |
+|---|---|---|
+| 306 | `bsBlockTransactionsSize` | the BlockTransactions section is longer than `active_params.max_block_size()`. These are the parameters **before** the block, the JVM's `currentParameters` of the pre-block context |
+| 400 | `exSize` | the Extension section is longer than `MaxExtensionSize` = 32,768 bytes |
+| 401 | `exIlEncoding` | a field whose key starts with `0x01` has a value of any length other than 33 bytes |
+| 402 | `exIlStructure` | the block's interlinks differ from those its parent's give (below) |
+| 404 | `exValueLength` | a field's value is longer than 64 bytes |
+| 405 | `exDuplicateKeys` | two fields share a key |
+| 406 | `exEmpty` | the block isn't genesis (height ≠ 1) and its extension has no fields |
+
+- **403 `exKeyLength` holds by construction.** The extension parse reads each
+  key as exactly 2 bytes.
+- **A section's size is its length as the node holds it.** The section
+  binding rejects trailing bytes (`facts/chain.md` § Section bodies), so that
+  length is the byte count the JVM's parse consumes, its `size`.
+- **Interlinks, 401/402** (`ExtensionValidator.scala:28-45`,
+  `NipopowAlgos.scala:35-90, 193-215`):
+  - **Unpacking** takes the fields whose key starts with `0x01`, in field order.
+    Each value is a quantity byte (unsigned, 0 allowed) and a 32-byte block id,
+    and unpacking appends that many copies of the id. This is
+    `NipopowAlgos::unpack_interlinks`.
+  - **Expected** = `NipopowAlgos::update_interlinks(parent_header,
+    unpack(parent_extension))`, where `parent_header` is
+    `preceding_headers[0]`. It is **402** when the parent's interlinks don't
+    unpack, or when `update_interlinks` returns `Err`. The fork returns
+    `EmptyInterlinks` for an empty vector under a non-genesis parent (fork
+    `c6f8a395`), which is the JVM's `require` failing inside the validator's
+    `Try`.
+  - **402 is** expected ≠ the block's own unpacked vector, compared element by
+    element.
+  - **The parent header is a validated chain header**, so its `n_bits` passed
+    the difficulty check and decodes to a non-zero difficulty. That is a
+    precondition of `max_level_of`, which divides by it.
+- **When the interlinks aren't checked:**
+  - **At genesis** (height 1) there is no parent, and the JVM checks nothing.
+  - **With `parent_extension` None and a non-genesis block**, 401 and 402 are
+    skipped with a `warn!` that names the height. This is the JVM's
+    `exIlUnableToValidate` (413), a recoverable rule that passes when there is
+    no previous extension.
+  - **When None happens:**
+    - the first block after a UTXO snapshot bootstrap, which the JVM skips too
+      (`ErgoStateReader.reconstructStateContextBeforeEpoch` leaves
+      `lastExtensionOpt` empty)
+    - a reorg deeper than the window `facts/sync.md` keeps extensions for.
+      In UTXO mode that window is the state's own rollback depth, so no
+      reorg the state can make reaches it. Digest mode's `reset_to` has no
+      depth limit.
+- **Rules a soft-fork may disable.** Every rule above except 403 is
+  `mayBeDisabled` (`ValidationRules.scala:172-229`). The node keeps no
+  rule-status state, so it enforces them unconditionally. That is correct
+  while none of them is in the active disabled set, which is `{215, 409}` on
+  mainnet (key `0200` at boundary 1,882,112).
+
 ## New Types
 
 ```rust
@@ -830,7 +932,8 @@ DigestValidator::new(
    - Strip 32-byte header_id prefix
    - Read block version (VLQ sentinel: if > 10M, subtract 10M for version,
      read separate VLQ tx_count; else value IS tx_count and version = 1)
-   - Parse tx_count transactions via `Transaction::sigma_parse()`
+   - Parse tx_count transactions via `Transaction::sigma_parse()`, at the
+     tree version the section's block version selects (§ Section Parsing)
 
 1b. **Block-version gate** (consensus check, added 2026-06-10; **narrowed to
    epoch boundaries same day** after JVM cross-reference by the implementing
@@ -854,6 +957,9 @@ DigestValidator::new(
      SANTA re-donors the mutation over a boundary block — finding relayed;
      a red cell is the runner working.
 
+1c. **Block rules 306 and 400–406**, at every height, before the state
+   changes: § "Block rules taken from `appendFullBlock`".
+
 2. **Verify AD proofs digest**
    - `blake2b256(proof_bytes) == header.ad_proofs_root`
    - Proof bytes: strip 32-byte header_id prefix, read VLQ proof_size,
@@ -864,9 +970,10 @@ DigestValidator::new(
    - Inputs -> `Remove(box_id)` operations, BUT: if a box was created by
      an earlier tx in this block, remove from insertions instead (net-zero,
      never hits the tree). Double-spend within block is an error.
-   - Outputs -> `Insert(box_id, serialized_box_bytes)` operations
-     where serialized_box_bytes = `ErgoBox::sigma_serialize_bytes()`
-     (full box: candidate + txId + index)
+   - Outputs -> `Insert(box_id, box_bytes)` operations
+     where box_bytes = `ErgoBox::bytes()`
+     (full box: candidate + txId + index, written at tree version 0;
+     § Insert Values)
    - **CRITICAL: Removes and Inserts are sorted by box ID** (unsigned
      lexicographic byte order). The JVM uses `mutable.TreeMap[ModifierId, _]`
      which sorts by hex-encoded box ID — equivalent to byte ordering.
@@ -889,7 +996,9 @@ DigestValidator::new(
 5. **Evaluate scripts** (skipped below checkpoint_height) — BEFORE persisting
    - Deserialize old values from step 4 into `ErgoBox` instances
    - Bundle transactions, proof boxes, header, preceding headers, and
-     parameters into `ScriptEvalInputs`
+     parameters into `ScriptEvalInputs`. The parameters are those in effect
+     after the block: the boundary ones at an epoch boundary (§ "Parameters a
+     block's transactions are validated with")
    - Call `evaluate_scripts()`, which uses rayon `par_iter` for intra-block
      parallelism and returns the block-accumulated cost (see "Block cost
      semantics"). On `Err` the block is rejected and the prover is rolled
@@ -911,6 +1020,9 @@ DigestValidator::new(
   `parameters.max_block_cost()`. The budget is per block, not per transaction
 - `BlockVersionMismatch { expected, got }` — governing parameters'
   `block_version()` != `header.version` (JVM `exBlockVersion`)
+- `BlockRule { rule: u16, reason: String }` — one of the block rules 306 or
+  400–406 failed. `rule` is the JVM's rule id (§ "Block rules taken from
+  `appendFullBlock`")
 - `MissingProof` — ad_proofs is None but validator requires proofs
 
 ## Section Parsing (internal)
@@ -920,8 +1032,53 @@ DigestValidator::new(
 [header_id: 32B] [ver_or_count: VLQ] [tx_count: VLQ if ver>1] [txs...]
 ```
 - Each transaction: sigma-serializable with per-tx indexed token digests
-- Use `Transaction::sigma_parse()` from ergo-lib for each tx
-- Block version extracted but not validated here (header owns version)
+- **Reading:** `Transaction::sigma_parse()` for each tx, at the ErgoTree
+  version the section's own block version selects: `ErgoTreeVersion::V3` from
+  block version 4, version 0 below. Get it from
+  `enr_chain::block_transactions_read_version`. The rule, and why it decides
+  the transaction ids, is in `facts/chain.md` § "The tree version a block's
+  transactions are read at".
+- **This parser and `section_id_from_body` agree on every input.** Each of the
+  following is a `SectionParse` error here, as it is an error there:
+  - a block version that doesn't fit `u8`
+  - a transaction count of zero (the JVM's `BlockTransactions` requires
+    `txs.nonEmpty`)
+  - bytes left over after the last transaction
+
+  Stored sections have passed the binding, so none of these reaches this
+  parser from the network. It rejects them anyway so the two can't drift.
+- **An output that version 0 can't write** (a register holding a
+  function-typed value or v6-only data) still parses. The fork takes its box
+  id from the box written at 3. Its `bytes()` fails, and two checks reject the
+  block for it:
+  - the output checks, as the JVM's do (`ErgoTransaction.scala:171-175`)
+  - this crate's state changes, which insert `bytes()` (§ Insert Values)
+
+  Either one gives the JVM's verdict.
+- `ParsedBlockTransactions.block_version` is a `u8`: the section's own
+  version, extracted but not validated against the header here (the header
+  owns the version).
+- **Writing:** `serialize_block_transactions(header_id: &[u8; 32],
+  block_version: u8, txs)`, the inverse, used by mining and the API. It writes
+  each transaction at `ErgoTreeVersion::V3` from block version **3**, and at
+  version 0 below. Get it from `enr_chain::block_transactions_write_version`.
+  - The version sentinel is written only above block version 1, as the JVM
+    writes it (`if (blockVersion > 1)`). A v1 section is
+    `header_id || count || txs`.
+  - That is the JVM's serializer (`BlockTransactions.scala:142-160`). It
+    wraps each transaction in `withVersions(blockVersion, blockVersion)` from
+    `VersionContext.V6SoftForkVersion` = 3.
+  - So a v3 block is written at 3 and read at 0. The asymmetry is the JVM's
+    own; follow it.
+  - `Transaction::sigma_serialize_bytes()` is not this rule: it writes at the
+    fork's highest version, 3, for every block.
+- **One transaction, as its block writes it:**
+  `serialize_block_transaction(tx: &Transaction, block_version: u8) ->
+  Result<Vec<u8>, ValidationError>`. It writes the transaction at
+  `block_transactions_write_version(block_version)`.
+  `serialize_block_transactions` writes each transaction through it. The API's
+  `validation-fragments` endpoint calls it directly, because the api crate
+  keeps off `enr-chain` (`facts/api.md` § Transaction Submission Flow).
 
 ### ADProofs (type 104)
 ```
@@ -935,8 +1092,9 @@ DigestValidator::new(
 [header_id: 32B] [field_count: VLQ] [fields: {key: 2B, val_len: 1B, val}...]
 ```
 - Key prefix `0x00` = protocol parameters, `0x01` = interlinks, `0x02` = rules
-- Parsed when building ErgoStateContext for script validation (Phase 4a+)
-- Ignored below checkpoint_height
+- Parsed for every block, at every height: rules 400–406 apply to it
+  (§ "Block rules taken from `appendFullBlock`"). So does the parent's
+  extension, for the interlinks.
 
 ## Integration: Sync Machine
 
@@ -961,7 +1119,8 @@ application *is* verification and `state_applied_height` carries both facts.
 Triggered after `downloaded_height` advances or on a timer. For each height
 from `state_applied_height + 1` to `downloaded_height`:
 
-1. Get header, sections, preceding headers, active params
+1. Get header, sections, the parent's extension, preceding headers, active
+   params (`facts/sync.md` § "What `apply_state` is called with")
 2. Call `validator.apply_state(...)`
 3. On Ok: advance `state_applied_height`, apply epoch boundary params. The
    block's scripts have already passed — `Ok` is the only assertion sync
@@ -1001,6 +1160,9 @@ On `DeliveryControl::Reorg { fork_point, .. }` (received via unbounded control c
 
 ## Dependencies
 
+- `enr-chain` — the tree versions a block's transactions are read and
+  written at (`facts/chain.md` § "The tree version a block's transactions are
+  read at")
 - `ergo-chain-types` — Header, ADDigest, Digest32, BlockId
 - `ergo-lib` — Transaction, ErgoBox, TransactionContext, ErgoStateContext
 - `ergo_avltree_rust` — BatchAVLVerifier, Operation, KeyValue
@@ -1129,10 +1291,27 @@ to traverse wrong tree paths, hitting nodes not covered by the proof.
 
 ### Insert Values
 
-The AVL+ tree Insert value is `ErgoBox::sigma_serialize_bytes()` — the
-full box serialization including candidate fields + txId (32 bytes) +
-index (u16). NOT just the candidate (without ref). Matches JVM's
-`ErgoBox.bytes` via `ErgoBox.sigmaSerializer.toBytes()`.
+The AVL+ tree Insert value is `ErgoBox::bytes()`: the full box, candidate
+fields + txId (32 bytes) + index (u16). NOT just the candidate (without ref).
+
+- **An output is written at ErgoTree version 0.** That matches the JVM's
+  `ErgoBox.bytes`. The JVM first reads it when `applyTransactions` keys the
+  created outputs by box id (v6.0.6 `UtxoState.scala:77`, where `o.id` hashes
+  `o.bytes`), then in the dust and box-size checks of `validateStateful`
+  (`ErgoTransaction.scala:171-175`). Both reads happen outside any
+  `withVersions`, so under the default context (1, 1). The box id is written
+  at version 0 the same way, and the fork does both.
+- **The output checks measure the same bytes.** The dust minimum
+  (`out.bytes.length × minValuePerByte`) and `MaxBoxSize` use `bytes()`, the
+  version-0 box. ergo-lib's `verify_output` (`wallet/tx_context.rs:338`)
+  measures `bytes()` too.
+- **Not `ErgoBox::sigma_serialize_bytes()`.** That writes at the fork's
+  highest version, 3. The two differ when a register holds an `Upcast` of a
+  constant, which version 0 writes as the bare constant. A different insert
+  value gives a different state root.
+- **A box read back from the state** (an input or a data input) is parsed at
+  version 0, as the JVM's `boxById` reads outside any `withVersions`. The fork
+  keeps the slice it read, so that box's `bytes()` are the stored bytes.
 
 ### ADDigest Format
 

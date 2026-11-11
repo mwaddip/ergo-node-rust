@@ -16,6 +16,7 @@ use ergo_lib::ergotree_interpreter::sigma_protocol::prover::ProofBytes;
 use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
 use ergo_lib::ergotree_ir::chain::ergo_box::box_value::BoxValue;
 use ergo_lib::ergotree_ir::chain::ergo_box::{ErgoBox, ErgoBoxCandidate, NonMandatoryRegisters};
+use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
 use ergo_lib::ergotree_ir::mir::constant::Constant;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 
@@ -69,6 +70,7 @@ fn returned(tx: &Transaction, validation_cost: Option<u64>, at: Instant) -> Unco
         cost: tx_bytes.len() as u32,
         tx: tx.clone(),
         tx_bytes: tx_bytes.into(),
+        id_version: ErgoTreeVersion::V3,
         fee: 0,
         validation_cost,
         created: at,
@@ -93,6 +95,7 @@ fn entry_records_the_measured_cost_without_the_floor() {
     let outcome = mempool.process(
         tx,
         tx_bytes,
+        ErgoTreeVersion::V3,
         &StaticUtxo::new(&[input]),
         &state_context_at(TIP_HEIGHT),
         None,

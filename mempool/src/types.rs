@@ -1,5 +1,6 @@
 use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
+use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,12 @@ pub struct UnconfirmedTx {
     /// serialization for an API submission. One allocation, shared with the
     /// serving reader.
     pub tx_bytes: Arc<[u8]>,
+    /// The script version the transaction was read or built at: the version
+    /// its id is written at, and `tx_bytes` with it. Whoever hands the
+    /// transaction to the pool names it. A response that renders the
+    /// transaction writes its values at this version (`facts/api.md` §
+    /// Transaction JSON).
+    pub id_version: ErgoTreeVersion,
     /// Transaction fee in nanoERG.
     pub fee: u64,
     /// Weighting cost: the entry validation's cost, floored at the serialized

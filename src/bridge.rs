@@ -394,6 +394,8 @@ mod tests {
             cost: tx_bytes.len() as u32,
             validation_cost: None,
             tx_bytes: tx_bytes.into(),
+            // `new_from_vec` builds at 3, and `sigma_serialize_bytes` writes there.
+            id_version: ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion::V3,
             tx,
             fee: 1_000_000,
             created: now,

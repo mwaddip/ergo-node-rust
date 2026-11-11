@@ -1,6 +1,6 @@
 use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
-use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
+use ergo_lib::ergotree_ir::ergo_tree::{ErgoTree, ErgoTreeVersion};
 use ergo_validation::{validate_single_transaction, ErgoStateContext};
 
 use crate::family::propagate_family_weight;
@@ -72,14 +72,36 @@ pub fn output_boxes(tx: &Transaction) -> Vec<([u8; 32], ErgoBox)> {
 
 impl super::Mempool {
     /// Validate and add a transaction to the pool.
+    ///
+    /// `id_version` is the script version the caller read or built `tx` at.
+    /// Precondition: `tx`'s id is the id of its parts rebuilt at `id_version`
+    /// via [`Transaction::new_from_vec_at`]. The pool stores the version on
+    /// the entry and never changes it (see `facts/mempool.md` § Processing
+    /// transactions).
     pub fn process(
         &mut self,
         tx: Transaction,
         tx_bytes: Vec<u8>,
+        id_version: ErgoTreeVersion,
         utxo_reader: &dyn UtxoReader,
         state_context: &ErgoStateContext,
         source: Option<u64>,
     ) -> ProcessingOutcome {
+        debug_assert!(
+            {
+                let inputs = tx.inputs.as_vec().clone();
+                let data_inputs = tx
+                    .data_inputs
+                    .as_ref()
+                    .map(|d| d.as_vec().clone())
+                    .unwrap_or_default();
+                let output_candidates = tx.output_candidates.as_vec().clone();
+                Transaction::new_from_vec_at(inputs, data_inputs, output_candidates, id_version)
+                    .map(|rebuilt| rebuilt.id() == tx.id())
+                    .unwrap_or(false)
+            },
+            "tx.id() must match the id of its parts rebuilt at id_version"
+        );
         let tx_id = tx_id_bytes(&tx);
 
         // 1. Check invalidation cache
@@ -250,6 +272,7 @@ impl super::Mempool {
             // Converted once, here: the pool entry and the serving index share
             // this allocation.
             tx_bytes: tx_bytes.into(),
+            id_version,
             fee,
             cost,
             validation_cost: Some(validation_cost),

@@ -3,7 +3,6 @@
 use std::collections::HashSet;
 
 use ergo_lib::chain::transaction::Transaction;
-use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 
 use crate::ValidationError;
 
@@ -122,20 +121,24 @@ pub fn transactions_to_summaries(
             .map(|dis| dis.iter().map(|di| box_id_to_bytes(&di.box_id)).collect())
             .unwrap_or_default();
 
-        let output_entries: Vec<([u8; 32], Vec<u8>)> =
-            tx.outputs
-                .iter()
-                .map(|output| {
-                    let id = box_id_to_bytes(&output.box_id());
-                    let box_bytes = output.sigma_serialize_bytes().map_err(|e| {
-                        ValidationError::SectionParse {
-                            section_type: 102,
-                            reason: format!("output serialization: {e}"),
-                        }
-                    })?;
-                    Ok((id, box_bytes))
-                })
-                .collect::<Result<Vec<_>, ValidationError>>()?;
+        // The insert value is `ErgoBox::bytes()`: the box written at tree
+        // version 0, as the JVM's `ErgoBox.bytes` is, and the bytes its id
+        // hashes (facts/validation.md § Insert Values). Not
+        // `sigma_serialize_bytes()`, which writes at the fork's highest
+        // version and keeps an `Upcast` of a constant that version 0 writes
+        // as the constant: another value, another state root.
+        let output_entries: Vec<([u8; 32], Vec<u8>)> = tx
+            .outputs
+            .iter()
+            .map(|output| {
+                let id = box_id_to_bytes(&output.box_id());
+                let box_bytes = output.bytes().map_err(|e| ValidationError::SectionParse {
+                    section_type: 102,
+                    reason: format!("output serialization: {e}"),
+                })?;
+                Ok((id, box_bytes))
+            })
+            .collect::<Result<Vec<_>, ValidationError>>()?;
 
         summaries.push(TxSummary {
             input_ids,
@@ -242,5 +245,36 @@ mod tests {
         assert_eq!(changes.lookups[0], data_box);
         assert_eq!(changes.removals.len(), 1);
         assert_eq!(changes.insertions.len(), 1);
+    }
+
+    /// facts/validation.md § Insert Values: an output enters the tree as
+    /// `ErgoBox::bytes()`, written at tree version 0, and their blake2b256 is
+    /// its box id. The output's R4 holds X15, and its transaction is read at
+    /// 3, as a v4 block's is: at 3 the `Upcast` is kept, at 0 it is written
+    /// as `1`.
+    #[test]
+    fn an_output_is_inserted_as_its_version_0_bytes() {
+        use crate::test_support::{
+            tx_read_at, REGISTER_OUTPUT, REGISTER_OUTPUT_AT_3, REGISTER_OUTPUT_ID_AT_3, REGISTER_TX,
+        };
+        use ergo_chain_types::blake2b256_hash;
+        use ergo_lib::ergotree_ir::ergo_tree::ErgoTreeVersion;
+        use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+
+        let tx = tx_read_at(REGISTER_TX, ErgoTreeVersion::V3);
+        let summaries = transactions_to_summaries(std::slice::from_ref(&tx)).unwrap();
+        let [(id, value)] = &summaries[0].output_entries[..] else {
+            panic!("one output");
+        };
+        assert_eq!(hex::encode(value), REGISTER_OUTPUT);
+        assert_eq!(hex::encode(id), REGISTER_OUTPUT_ID_AT_3);
+        assert_eq!(blake2b256_hash(value).0, *id);
+
+        // Not vacuous: written at 3, the same output is another byte string,
+        // the value an insert through `sigma_serialize_bytes()` would carry.
+        assert_eq!(
+            hex::encode(tx.outputs.first().sigma_serialize_bytes().unwrap()),
+            REGISTER_OUTPUT_AT_3
+        );
     }
 }

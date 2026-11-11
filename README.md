@@ -76,9 +76,11 @@ Components communicate through traits — the P2P layer doesn't know what valida
 
 ## Development
 
-This project is built with a multi-session AI workflow: one main session coordinates interface contracts (in `facts/`) and integration; per-crate dispatched sessions implement against those contracts within their crate's directory boundary. Every cross-crate disagreement is resolved by updating the contract first, not by writing glue code — "fix the interface, never wrap the mismatch."
+The node is feature complete and maintained with bug fixes. Every component boundary has a contract in `facts/`, and a contract changes before the code: a cross-crate disagreement is resolved by updating the contract, not by writing glue code — "fix the interface, never wrap the mismatch."
 
-Codebase-specific guidance — design principles, S.P.E.C.I.A.L. attention weights, common mistakes, protocol references — lives in [`agents/ergo-node-development/SKILL.md`](agents/ergo-node-development/SKILL.md). The dispatch mechanics (kitty window automation, executor identity, anti-recursion guards) live in [`mwaddip/claude-dbc`](https://github.com/mwaddip/claude-dbc) — install that skill pair (`dispatching-prompts` + `receiving-prompts`) to use the same workflow.
+[`CLAUDE.md`](CLAUDE.md) holds the project rules and what each crate owns, and [`SPECIAL.md`](SPECIAL.md) the per-component attention weights. Codebase-specific guidance — design principles, common mistakes, protocol references — lives in [`agents/ergo-node-development/SKILL.md`](agents/ergo-node-development/SKILL.md).
+
+The node was built with a multi-session AI workflow, per-crate sessions implementing against the contracts; its dispatch mechanics are in [`mwaddip/claude-dbc`](https://github.com/mwaddip/claude-dbc). Now one session maintains the whole repo.
 
 ## Building
 

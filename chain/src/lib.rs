@@ -13,6 +13,7 @@ mod sync_info;
 #[cfg(test)]
 mod tests;
 mod tracker;
+mod tree_version;
 pub mod voting;
 
 pub use cache::{HeaderLoader, ScoreLoader, DEFAULT_CACHE_CAPACITY};
@@ -36,6 +37,9 @@ pub use section::{
 pub use state_type::StateType;
 pub use sync_info::{build_sync_info, parse_sync_info, SyncInfo};
 pub use tracker::HeaderTracker;
+pub use tree_version::{
+    activated_tree_version, block_transactions_read_version, block_transactions_write_version,
+};
 pub use voting::{
     check_fork_vote, compute_boundary_parameters, encode_validation_settings_update,
     extract_disabling_rules_from_kv, pack_extension_bytes, pack_parameters_to_kv,

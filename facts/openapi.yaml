@@ -350,9 +350,13 @@ paths:
 
         Each transaction carries both `signingMessage`
         (`Transaction::bytes_to_sign()` — what every input signature commits
-        to) and `bytes` (the full canonical
-        `Transaction::sigma_serialize_bytes()`, byte-exact including the
-        on-chain ContextExtension wire order). The transaction id is
+        to) and `bytes` (the full canonical transaction as its block's
+        serializer writes it, `ergo_validation::serialize_block_transaction`,
+        byte-exact including the on-chain ContextExtension wire order).
+        Re-parse `bytes` at the block's *read* version to recover the
+        transaction (`facts/chain.md` § "The tree version a block's
+        transactions are read at"). A v3 block's transactions are written at
+        3 and read at 0, so parsing at 3 can give another id. The transaction id is
         `blake2b256(signingMessage)`, NOT `blake2b256(bytes)` — the spending
         proofs (carried in `bytes`, absent from the signing message) are not
         part of the id. ContextExtensions ARE in the signing message, in wire
@@ -408,9 +412,15 @@ paths:
       tags: [transactions]
       summary: Submit a transaction to the mempool and broadcast to peers.
       description: |
-        Compatibility: `full`. Local submissions bypass mempool rate limiting.
-        HTTP-level rate limiting (per-IP) is a deployment concern, not
-        enforced by the node. A transaction whose serialization is longer
+        Compatibility: `partial`. The node builds the transaction at the
+        activated script version. The JSON's `id` must match the id it
+        builds, and so must each output's `boxId` where the JSON gives one.
+        Outputs are read as candidates, as the JVM reads them. The JVM
+        builds at its default version context and reads neither `id` nor
+        `boxId` (`facts/api.md` § Transaction Submission Flow). Local
+        submissions bypass mempool rate limiting. HTTP-level rate limiting
+        (per-IP) is a deployment concern, not enforced by the node. A
+        transaction whose serialization is longer
         than 98,304 bytes (`ergo_mempool::MAX_TRANSACTION_SIZE`, the JVM's
         `maxTransactionSize`) is refused with 400 before it is validated,
         also while the node is syncing (`facts/api.md` § Transaction
@@ -421,7 +431,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/Transaction'
+              $ref: '#/components/schemas/TransactionSubmission'
       responses:
         '200':
           description: Accepted. Body is the hex-encoded transaction ID (JSON string).
@@ -430,7 +440,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/HexId32'
         '400':
-          description: Too large, or a validation failure (invalid script, double-spend conflict, declined, etc.).
+          description: Too large, an `id` or `boxId` that differs from what the node builds, or a validation failure (invalid script, double-spend conflict, declined, etc.).
           content:
             application/json:
               schema:
@@ -441,21 +451,31 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiError'
+        '500':
+          description: |
+            The block version in effect does not fit `u8`, so there is no
+            activated script version to write the transaction at
+            (`facts/api.md` § Transaction Submission Flow). Voting cannot
+            produce such a version; the node logs it as an error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
 
   /transactions/check:
     post:
       tags: [transactions]
       summary: Validate a transaction without adding to mempool or broadcasting.
       description: |
-        Compatibility: `full`. Same validation as `POST /transactions`,
-        size limit included, and discards the result.
+        Compatibility: `partial`. Same build, id checks and validation as
+        `POST /transactions`, size limit included, and discards the result.
       operationId: checkTransaction
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/Transaction'
+              $ref: '#/components/schemas/TransactionSubmission'
       responses:
         '200':
           description: Transaction is valid. Body is the hex-encoded ID.
@@ -464,13 +484,21 @@ paths:
               schema:
                 $ref: '#/components/schemas/HexId32'
         '400':
-          description: Too large, or a validation failure.
+          description: Too large, an `id` or `boxId` that differs from what the node builds, or a validation failure.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiError'
         '503':
           description: Node still syncing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '500':
+          description: |
+            The block version in effect does not fit `u8`, as for
+            `POST /transactions`.
           content:
             application/json:
               schema:
@@ -1899,18 +1927,23 @@ components:
         bytes:
           $ref: '#/components/schemas/HexString'
           description: |
-            Full canonical transaction bytes —
-            `Transaction::sigma_serialize_bytes()`: each input as
-            boxId + spending proof + ContextExtension, then data-inputs, then
-            outputs. The on-chain ContextExtension wire order is preserved
+            Full canonical transaction bytes, as the JVM's block serializer
+            writes them. That is ErgoTree version 3 from block version 3, and
+            version 0 below: the rule `serialize_block_transactions` follows,
+            `facts/validation.md` § Section Parsing. It is not
+            `Transaction::sigma_serialize_bytes()`, which writes at 3 for
+            every block. The layout is each input as boxId + spending proof +
+            ContextExtension, then data-inputs, then outputs. The on-chain ContextExtension wire order is preserved
             byte-for-byte (sigma stores it order-faithfully as an `IndexMap`),
             as the JSON endpoints preserve it too (`facts/api.md` §
             Transaction JSON). NOTE: the tx id is
             `blake2b256(signingMessage)` (proofs stripped, ContextExtensions
             kept in wire order), NOT `blake2b256(bytes)`; to confirm `bytes`
             belongs to
-            `transactions[i]`, re-parse it (its id must equal
-            `transactions[i].id`) or hash its `signingMessage`. Intended for
+            `transactions[i]`, re-parse it at the block's read version (its
+            id must equal `transactions[i].id`) or hash its `signingMessage`.
+            At another version the same bytes can be another transaction. A
+            v3 block's `bytes` are written at 3 and read at 0. Intended for
             cross-impl conformance vectors that pin serialization-order rules.
 
     # ---- Transactions ----
@@ -1918,7 +1951,12 @@ components:
       type: object
       description: |
         Ergo transaction. Field names and shape follow `ergo-lib`'s serde
-        output (and the JVM `ErgoTransaction` shape).
+        output (and the JVM `ErgoTransaction` shape). In a response, the
+        context-extension and output register values are written at the
+        version of the transaction's id, so the JSON re-serializes to its
+        id. Each output's `boxId` hashes the output written at version 0.
+        The JVM writes the values at its default version context instead
+        (`facts/api.md` § Transaction JSON).
       required: [id, inputs, outputs]
       properties:
         id:
@@ -1939,6 +1977,70 @@ components:
           type: integer
           format: int64
           minimum: 0
+
+    TransactionSubmission:
+      type: object
+      description: |
+        A transaction as `POST /transactions` and `POST /transactions/check`
+        read it. The node builds it at the activated script version from
+        its inputs, data inputs and outputs. `id` must match the id the node
+        builds (`facts/api.md` § Transaction Submission Flow).
+      required: [id, inputs, dataInputs, outputs]
+      properties:
+        id:
+          $ref: '#/components/schemas/HexId32'
+        inputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Input'
+        dataInputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/DataInput'
+        outputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/OutputSubmission'
+
+    OutputSubmission:
+      type: object
+      description: |
+        An output as a submission reads it: a box candidate, as the JVM
+        reads one. `boxId` is optional; where given, it must match the id
+        of the output the node builds. `transactionId` and `index` may be
+        present and are ignored.
+      required: [value, ergoTree, assets, additionalRegisters, creationHeight]
+      properties:
+        boxId:
+          $ref: '#/components/schemas/HexId32'
+        value:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Value in nanoERG.
+        ergoTree:
+          $ref: '#/components/schemas/HexString'
+        creationHeight:
+          type: integer
+          format: int64
+          minimum: 0
+        assets:
+          type: array
+          items:
+            type: object
+            required: [tokenId, amount]
+            properties:
+              tokenId:
+                $ref: '#/components/schemas/HexId32'
+              amount:
+                type: integer
+                format: int64
+                minimum: 0
+        additionalRegisters:
+          type: object
+          description: 'R4..R9 as `{ "R4": "<hex>", ... }`. Optional registers may be absent.'
+          additionalProperties:
+            type: string
 
     Input:
       type: object
@@ -2019,9 +2121,12 @@ components:
     UnconfirmedTransaction:
       type: object
       description: |
-        A pool transaction, rendered as the JVM's `/transactions/unconfirmed*`
-        endpoints render it (`TransactionsApiRoute.createTransactionWithResolvedInputs`,
-        v6.0.6 :109).
+        A pool transaction, in the shape the JVM's `/transactions/unconfirmed*`
+        endpoints give it (`TransactionsApiRoute.createTransactionWithResolvedInputs`,
+        v6.0.6 :109). Its extension and output register values are written at
+        the version of the transaction's id, as every rendered transaction's
+        are; a resolved input's spent box is written at version 0
+        (`facts/api.md` § Transaction JSON).
       required: [id, inputs, dataInputs, outputs, size, cost]
       properties:
         id:

@@ -14,10 +14,14 @@ description = "Block validation for the Ergo Rust node"
 json = ["ergo-lib/json", "ergo-chain-types/json"]
 
 [dependencies]
-ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "0bd7199f" }
-ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "0bd7199f" }
-sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "0bd7199f" }
+ergo-lib = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "a7656774" }
+ergo-chain-types = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "a7656774" }
+ergo-nipopow = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "a7656774" }
+sigma-ser = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "a7656774" }
 ergo_avltree_rust = "0.1.1"
+# The tree-version rules for a block's transactions (facts/chain.md § "The
+# tree version a block's transactions are read at"): stated once, there.
+enr-chain = { path = "../chain" }
 enr-state = { path = "../state" }
 rayon = "1"
 blake2 = "0.10"
@@ -27,8 +31,8 @@ tracing = "0.1"
 thiserror = "2"
 
 [dev-dependencies]
-ergotree-interpreter = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "0bd7199f" }
-ergotree-ir = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "0bd7199f" }
+ergotree-interpreter = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "a7656774" }
+ergotree-ir = { git = "https://github.com/mwaddip/sigma-rust.git", rev = "a7656774" }
 tempfile = "3"
 # `no-env-filter` is required, not cosmetic: without it the default filter
 # drops the emits under test and a "and warns" assertion silently passes on

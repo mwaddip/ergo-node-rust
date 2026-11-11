@@ -17,7 +17,19 @@ use crate::types::{JvmFullBlock, PeerNodeInfo};
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Max header IDs per POST /blocks/headerIds request.
-const BLOCK_BATCH_SIZE: usize = 32;
+///
+/// The whole request, head and body, has to reach the JVM in one TCP
+/// segment. Its `BlocksApiRoute` tries `postBlocksR`, which has no path
+/// matcher, before the `headerIds` route. akka-http 10.2.4 keeps a body
+/// readable twice only when it arrives in the same read as the head.
+/// Otherwise `postBlocksR` consumes it, and the peer answers 400
+/// `DecodingFailure at .header` (every JVM from v5.0.15 through v6.0.7,
+/// SANTA 2026-09-30).
+///
+/// A body of n ids is `67n + 1` bytes. At 15 ids that is 1006 bytes, and with
+/// a head under 200 bytes the request fits the ~1208-byte MSS of the IPv6
+/// minimum MTU, 1280. That also covers PPPoE, VPNs and tunnels.
+const BLOCK_BATCH_SIZE: usize = 15;
 
 /// Peer fetcher — wraps a reqwest client targeting a single JVM peer.
 pub struct PeerFetcher {
@@ -101,4 +113,28 @@ impl PeerFetcher {
 /// Batch size for POST /blocks/headerIds.
 pub fn block_batch_size() -> usize {
     BLOCK_BATCH_SIZE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A full batch, with room for the request head, fits one TCP segment on
+    /// the IPv6 minimum-MTU path (see [`BLOCK_BATCH_SIZE`]). The body is the
+    /// JSON array of ids: `"` + 64 hex + `"` per id, commas between, brackets
+    /// around.
+    #[test]
+    fn a_full_batch_fits_one_segment_at_the_minimum_mtu() {
+        let ids = vec!["00".repeat(32); BLOCK_BATCH_SIZE];
+        let body = serde_json::to_string(&ids).unwrap();
+        assert_eq!(body.len(), 67 * BLOCK_BATCH_SIZE + 1);
+
+        const IPV6_MIN_MSS: usize = 1280 - 40 - 32; // MTU − IPv6 − TCP with timestamps
+        const HEAD_ALLOWANCE: usize = 200;
+        assert!(
+            body.len() + HEAD_ALLOWANCE <= IPV6_MIN_MSS,
+            "{} + {HEAD_ALLOWANCE} > {IPV6_MIN_MSS}",
+            body.len()
+        );
+    }
 }

@@ -6,7 +6,7 @@ use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
 use ergo_lib::ergotree_ir::chain::ergo_box::{
     box_value::BoxValue, BoxId, ErgoBox, ErgoBoxCandidate, NonMandatoryRegisters,
 };
-use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
+use ergo_lib::ergotree_ir::ergo_tree::{ErgoTree, ErgoTreeVersion};
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 
 use ergo_chain_types::Digest32;
@@ -108,6 +108,7 @@ fn make_utx(tx: Transaction, fee: u64) -> UnconfirmedTx {
     UnconfirmedTx {
         tx,
         tx_bytes: tx_bytes.into(),
+        id_version: ErgoTreeVersion::V3,
         fee,
         cost,
         validation_cost: None,
