@@ -727,10 +727,13 @@ const CONSTANT_1: [u8; 2] = [0x04, 0x02];
 /// SANTA X15, `Tuple(1, Upcast(1, Long))`, built with the fork's API.
 fn x15() -> EvaluatedValue {
     let one = || Expr::Const(1i32.into());
-    EvaluatedValue::Expr(EvaluatedExpr::Tuple(vec![
-        one(),
-        Expr::Upcast(Upcast::new(one(), SType::SLong).unwrap()),
-    ]))
+    EvaluatedValue::Expr(EvaluatedExpr::Tuple(
+        [
+            one(),
+            Expr::Upcast(Upcast::new(one(), SType::SLong).unwrap()),
+        ]
+        .into(),
+    ))
 }
 
 /// One input spending box `0…0` with an empty proof and X15 as context

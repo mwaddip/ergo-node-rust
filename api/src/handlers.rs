@@ -5926,10 +5926,13 @@ mod tests {
     /// SANTA X15, `Tuple(1, Upcast(1, Long))`.
     fn x15() -> EvaluatedValue {
         let one = || Expr::Const(1i32.into());
-        EvaluatedValue::Expr(EvaluatedExpr::Tuple(vec![
-            one(),
-            Expr::Upcast(Upcast::new(one(), SType::SLong).unwrap()),
-        ]))
+        EvaluatedValue::Expr(EvaluatedExpr::Tuple(
+            [
+                one(),
+                Expr::Upcast(Upcast::new(one(), SType::SLong).unwrap()),
+            ]
+            .into(),
+        ))
     }
 
     /// `sigmaProp(true)`. The interpreter doesn't evaluate a tree that is a

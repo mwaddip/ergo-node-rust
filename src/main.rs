@@ -4648,10 +4648,13 @@ mod tests {
         use ergo_lib::ergotree_ir::types::stype::SType;
 
         let one = || Expr::Const(1i32.into());
-        let x15 = EvaluatedValue::Expr(EvaluatedExpr::Tuple(vec![
-            one(),
-            Expr::Upcast(Upcast::new(one(), SType::SLong).unwrap()),
-        ]));
+        let x15 = EvaluatedValue::Expr(EvaluatedExpr::Tuple(
+            [
+                one(),
+                Expr::Upcast(Upcast::new(one(), SType::SLong).unwrap()),
+            ]
+            .into(),
+        ));
         let mut extension = ContextExtension::empty();
         extension.values.insert(0, x15);
         let input = Input::new(

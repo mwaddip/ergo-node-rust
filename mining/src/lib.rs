@@ -686,10 +686,13 @@ mod tests {
     /// a block's transactions are read at").
     fn upcast_value() -> EvaluatedValue {
         let one = Expr::Const(1i32.into());
-        EvaluatedValue::Expr(EvaluatedExpr::Tuple(vec![
-            one.clone(),
-            Expr::Upcast(Upcast::new(one, SType::SLong).unwrap()),
-        ]))
+        EvaluatedValue::Expr(EvaluatedExpr::Tuple(
+            [
+                one.clone(),
+                Expr::Upcast(Upcast::new(one, SType::SLong).unwrap()),
+            ]
+            .into(),
+        ))
     }
 
     /// A transaction holding the value twice: as its input's context extension
