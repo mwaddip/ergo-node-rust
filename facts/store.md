@@ -703,4 +703,4 @@ S7  P5  E9  C6  I7  A8  L7
 ```
 
 Internal component — no untrusted input (callers validate first). Durability and
-performance are the primary concerns. See `facts/SPECIAL.md`.
+performance are the primary concerns. See `SPECIAL.md` at the repo root.
